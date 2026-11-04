@@ -109,7 +109,9 @@ fn tagged_union_member_reads_honour_the_active_tag() {
         5,
         "t.Valid did not read the stored value"
     );
-    // Reading a member that is not the active one is invalid -> X.
+    // §11.9: reading a member that is not the active one is a run-time
+    // error (reported as `** Error: Read of inactive tagged union member`
+    // since #470); the value such a read yields is X.
     assert_eq!(line(&sim, "INACTIVE="), "INACTIVE=1");
 }
 

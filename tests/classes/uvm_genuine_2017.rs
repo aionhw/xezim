@@ -75,8 +75,7 @@ fn messages(sim: &xezim::compiler::Simulator) -> Vec<String> {
     sim.output.iter().map(|o| o.message.clone()).collect()
 }
 
-#[test]
-fn objection_gated_run_phase_reaches_target_time() {
+pub(super) fn objection_gated_run_phase_reaches_target_time() {
     let sim = simulate(SRC, 1000).expect("simulate failed");
     let msgs = messages(&sim);
 

@@ -48,3 +48,25 @@ endmodule
         sim.output
     );
 }
+
+/// The base class may come from a package or the compilation unit, found in
+/// the map of classes every module sees, which the lint builds once per run
+/// and shares with modules that declare no class of their own (#872).
+#[test]
+fn derived_class_uses_local_of_a_package_or_unit_base() {
+    for (base, ext) in [
+        (
+            "package pk;\n  class a_cls;\n    local int a_loc = 21;\n  endclass\nendpackage\n",
+            "pk::a_cls",
+        ),
+        ("class a_cls;\n  local int a_loc = 21;\nendclass\n", "a_cls"),
+    ] {
+        let src = format!(
+            "{base}module other(); int x; endmodule\nmodule top();\n  other o();\n  \
+             class b_cls extends {ext};\n    function void fun();\n      $display(a_loc);\n    \
+             endfunction\n  endclass\n  b_cls b_obj;\n  initial begin\n    b_obj = new;\n    \
+             b_obj.fun();\n  end\nendmodule\n"
+        );
+        assert!(simulate(&src, 10).is_err(), "accepted:\n{src}");
+    }
+}

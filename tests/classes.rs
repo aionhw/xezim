@@ -23,8 +23,12 @@ mod block_local_shadows_enclosing;
 mod blocking_task_super_dispatch;
 #[path = "classes/blocklocal_struct_named_like_member.rs"]
 mod blocklocal_struct_named_like_member;
+#[path = "classes/call_actual_formal_width_557.rs"]
+mod call_actual_formal_width;
 #[path = "classes/class_assoc_struct_string_keys.rs"]
 mod class_assoc_struct_string_keys;
+#[path = "classes/class_typedef_assoc_key.rs"]
+mod class_typedef_assoc_key;
 #[path = "classes/class_descending_array_members.rs"]
 mod class_descending_array_members;
 #[path = "classes/class_formal_named_like_struct.rs"]
@@ -35,6 +39,8 @@ mod class_formal_typedef_widen;
 mod class_interface_same_name;
 #[path = "classes/class_member_name_clash.rs"]
 mod class_member_name_clash;
+#[path = "classes/class_member_operand_width_557.rs"]
+mod class_member_operand_width;
 #[path = "classes/class_method_named_put_from_function.rs"]
 mod class_method_named_put_from_function;
 #[path = "classes/class_scope_array_const_whole_refs.rs"]
@@ -43,12 +49,16 @@ mod class_scope_array_const_whole_refs;
 mod compiled_method_static_locals;
 #[path = "classes/class_param_default_scope.rs"]
 mod class_param_default_scope;
+#[path = "classes/class_queue_struct_prop_copy.rs"]
+mod class_queue_struct_prop_copy;
 #[path = "classes/class_property_x_default.rs"]
 mod class_property_x_default;
 #[path = "classes/issue320_harness_mwe.rs"]
 mod issue320_harness_mwe;
 #[path = "classes/vif_specialization_keys.rs"]
 mod vif_specialization_keys;
+#[path = "classes/package_scoped_type_args.rs"]
+mod package_scoped_type_args;
 #[path = "classes/x_default_neighbours.rs"]
 mod x_default_neighbours;
 #[path = "classes/x_default_open.rs"]
@@ -109,14 +119,22 @@ mod pure_constraint_nonvirtual;
 mod rand_array_elem_signedness;
 #[path = "classes/rand_obj_array_elem_constraints.rs"]
 mod rand_obj_array_elem_constraints;
+#[path = "classes/rand_package_struct_enum_member.rs"]
+mod rand_package_struct_enum_member;
 #[path = "classes/randomize_args_name_object_members.rs"]
 mod randomize_args_name_object_members;
+#[path = "classes/randomize_assoc_joint_solve.rs"]
+mod randomize_assoc_joint_solve;
+#[path = "classes/randomize_assoc_keys_joint_solve.rs"]
+mod randomize_assoc_keys_joint_solve;
 #[path = "classes/randomize_failure_diag.rs"]
 mod randomize_failure_diag;
 #[path = "classes/static_fixed_array_storage.rs"]
 mod static_fixed_array_storage;
 #[path = "classes/static_param_class_collection_reuse.rs"]
 mod static_param_class_collection_reuse;
+#[path = "classes/package_param_spec_args.rs"]
+mod package_param_spec_args;
 #[path = "classes/struct_member_bitselect_frame_local.rs"]
 mod struct_member_bitselect_frame_local;
 #[path = "classes/struct_member_class_handle_new.rs"]
@@ -153,9 +171,13 @@ mod vif_output_actual_property;
 mod virtual_method_in_binary_is_evaluated_once;
 #[path = "classes/wait_level_sensitive_inactive_delta.rs"]
 mod wait_level_sensitive_inactive_delta;
+#[path = "classes/owner_qualified_operand_width_559.rs"]
+mod owner_qualified_operand_width;
 
 #[path = "classes/bare_parameterless_method_call.rs"]
 mod bare_parameterless_method_call;
+#[path = "classes/bytecode_wider_formal_width_557.rs"]
+mod bytecode_wider_formal_width;
 #[path = "classes/blocking_method_keyed_method_local_base.rs"]
 mod blocking_method_keyed_method_local_base;
 #[path = "classes/chained_member_element_access.rs"]
@@ -183,6 +205,8 @@ mod compiled_method_collection_calls;
 mod compiled_method_enum_formals;
 #[path = "classes/compiled_method_ref_formals.rs"]
 mod compiled_method_ref_formals;
+#[path = "classes/ref_formal_array_of_collections_row.rs"]
+mod ref_formal_array_of_collections_row;
 #[path = "classes/compiled_method_string_members.rs"]
 mod compiled_method_string_members;
 
@@ -338,6 +362,10 @@ mod issue4_coupled_constraints;
 mod ivtest_class_struct_cluster;
 #[path = "classes/local_shadows_sig.rs"]
 mod local_shadows_sig;
+#[path = "classes/scalar_local_shadows_collection.rs"]
+mod scalar_local_shadows_collection;
+#[path = "classes/scalar_local_shadows_module_collection.rs"]
+mod scalar_local_shadows_module_collection;
 #[path = "classes/localparam_class_not_parameterized.rs"]
 mod localparam_class_not_parameterized;
 #[path = "classes/method_default_this_call.rs"]
@@ -368,6 +396,8 @@ mod process_class_9_7;
 mod pure_sv_phase_objection;
 #[path = "classes/randomize_countones_count.rs"]
 mod randomize_countones_count;
+#[path = "classes/randomize_countones_wide.rs"]
+mod randomize_countones_wide;
 #[path = "classes/randomize_dist_weights.rs"]
 mod randomize_dist_weights;
 #[path = "classes/randomize_foreach_accept.rs"]
@@ -412,16 +442,26 @@ mod randomize_member_subset;
 mod randomize_nonrand_members;
 #[path = "classes/randomize_soft_solver_gave_up.rs"]
 mod randomize_soft_solver_gave_up;
+#[path = "classes/randomize_soft_sub_object_pushdown.rs"]
+mod randomize_soft_sub_object_pushdown;
 #[path = "classes/randomize_solve_before.rs"]
 mod randomize_solve_before;
+#[path = "classes/randomize_sub_object_array_method.rs"]
+mod randomize_sub_object_array_method;
 #[path = "classes/randomize_with_this_and_subset.rs"]
 mod randomize_with_this_and_subset;
+#[path = "classes/null_receiver_static_spec_544.rs"]
+mod null_receiver_static_spec;
 #[path = "classes/randomize_work_budget.rs"]
 mod randomize_work_budget;
+#[path = "classes/enum_string_valued_scope_546.rs"]
+mod enum_string_valued_scope;
 #[path = "classes/scope_randomize_dist_and_foreach.rs"]
 mod scope_randomize_dist_and_foreach;
 #[path = "classes/shadowed_property_storage.rs"]
 mod shadowed_property_storage;
+#[path = "classes/spec_key_class_spelling_542.rs"]
+mod spec_key_class_spelling;
 #[path = "classes/static_member_method_collision.rs"]
 mod static_member_method_collision;
 #[path = "classes/std_randomize_struct.rs"]
@@ -444,6 +484,8 @@ mod super_property_access;
 mod this_chain_edge_sensitivity;
 #[path = "classes/type_param_struct_formal.rs"]
 mod type_param_struct_formal;
+#[path = "classes/struct_formal_pattern_actual.rs"]
+mod struct_formal_pattern_actual;
 #[path = "classes/typedef_extends_cast.rs"]
 mod typedef_extends_cast;
 #[path = "classes/typedef_param_base_inherits_spec_arg.rs"]
@@ -465,6 +507,9 @@ mod forward_declared_class_formal_member_write;
 
 #[path = "classes/forward_class_formal_vs_caller_struct_collision.rs"]
 mod forward_class_formal_vs_caller_struct_collision;
+
+#[path = "classes/forward_class_string_member_compare.rs"]
+mod forward_class_string_member_compare;
 
 #[path = "classes/pkg_assoc_elem_read_neq.rs"]
 mod pkg_assoc_elem_read_neq;
@@ -528,12 +573,16 @@ mod interface_array_handle_new;
 mod nested_rand_inline_constraints;
 #[path = "classes/nested_rand_joint_solve.rs"]
 mod nested_rand_joint_solve;
+#[path = "classes/cast_defaulted_extends_type_argument.rs"]
+mod cast_defaulted_extends_type_argument;
 #[path = "classes/null_deref_fatal.rs"]
 mod null_deref_fatal;
 #[path = "classes/shadowed_property_initializers.rs"]
 mod shadowed_property_initializers;
 #[path = "classes/std_randomize_object_member.rs"]
 mod std_randomize_object_member;
+#[path = "classes/rand_unread_sub_object_joint_solve.rs"]
+mod rand_unread_sub_object_joint_solve;
 #[path = "classes/two_state_property_writes.rs"]
 mod two_state_property_writes;
 #[path = "classes/typedef_param_class_construction.rs"]
@@ -587,8 +636,54 @@ mod compiled_task_and_free_fn_chain;
 mod compiled_collection_return_store;
 #[path = "classes/compiled_string_local_byte.rs"]
 mod compiled_string_local_byte;
+#[path = "classes/compiled_string_formal_byte.rs"]
+mod compiled_string_formal_byte;
 #[path = "classes/compiled_member_redeclared.rs"]
 mod compiled_member_redeclared;
+#[path = "classes/compiled_string_member_shadow_store.rs"]
+mod compiled_string_member_shadow_store;
+#[path = "classes/compiled_member_operand_width.rs"]
+mod compiled_member_operand_width;
+
+#[path = "classes/compiled_member_operand_signedness.rs"]
+mod compiled_member_operand_signedness;
+
+#[path = "classes/compiled_unpacked_formal.rs"]
+mod compiled_unpacked_formal;
+
+#[path = "classes/compiled_bare_member_store_width.rs"]
+mod compiled_bare_member_store_width;
+
+#[path = "classes/compiled_short_circuit.rs"]
+mod compiled_short_circuit;
+#[path = "classes/stale_enum_local_name.rs"]
+mod stale_enum_local_name;
+#[path = "classes/compiled_method_stmt_fallback.rs"]
+mod compiled_method_stmt_fallback;
+#[path = "classes/compiled_method_handle_carry.rs"]
+mod compiled_method_handle_carry;
+#[path = "classes/compiled_fallback_member_named_local.rs"]
+mod compiled_fallback_member_named_local;
+#[path = "classes/compiled_type_param_formals.rs"]
+mod compiled_type_param_formals;
+#[path = "classes/compiled_coll_elem_signed_compare.rs"]
+mod compiled_coll_elem_signed_compare;
+#[path = "classes/compiled_foreach_handle_member.rs"]
+mod compiled_foreach_handle_member;
+
+#[path = "classes/compiled_string_member_methods.rs"]
+mod compiled_string_member_methods;
+
+#[path = "classes/compiled_coll_elem_store_width.rs"]
+mod compiled_coll_elem_store_width;
+#[path = "classes/compiled_ctor_decl_init.rs"]
+mod compiled_ctor_decl_init;
+
+#[path = "classes/compiled_fallback_nested_handle.rs"]
+mod compiled_fallback_nested_handle;
+
+#[path = "classes/compiled_method_loop_tier.rs"]
+mod compiled_method_loop_tier;
 #[path = "classes/int_property_named_like_struct_property.rs"]
 mod int_property_named_like_struct_property;
 #[path = "classes/compiled_method_test_env.rs"]
@@ -625,6 +720,16 @@ mod interface_class_extends_type_param;
 mod issue_246_struct_member_randomize;
 #[path = "classes/issue_249_rand_mode_receiver.rs"]
 mod issue_249_rand_mode_receiver;
+#[path = "classes/rand_mode_element_769.rs"]
+mod rand_mode_element_769;
+#[path = "classes/dist_zero_weights_770.rs"]
+mod dist_zero_weights_770;
+#[path = "classes/class_param_sized_formals_768.rs"]
+mod class_param_sized_formals_768;
+#[path = "classes/rand_mode_handle_element.rs"]
+mod rand_mode_handle_element;
+#[path = "classes/rand_mode_handle_property.rs"]
+mod rand_mode_handle_property;
 #[path = "classes/lrm_chained_handle_writes.rs"]
 mod lrm_chained_handle_writes;
 #[path = "classes/lrm_class_queue_locator_in_expr.rs"]
@@ -705,8 +810,28 @@ mod uvm_feature_coverage;
 mod uvm_ral_coverage;
 #[path = "classes/uvm_tlm_coverage.rs"]
 mod uvm_tlm_coverage;
+#[path = "classes/uvm_groups.rs"]
+mod uvm_groups;
 #[path = "classes/vif_member_read_nested_receiver.rs"]
 mod vif_member_read_nested_receiver;
+#[path = "classes/vif_null_compare_this_receiver.rs"]
+mod vif_null_compare_this_receiver;
+#[path = "classes/vif_clocking_bare_event.rs"]
+mod vif_clocking_bare_event;
+#[path = "classes/vif_inherited_type_param.rs"]
+mod vif_inherited_type_param;
+#[path = "classes/class_event_bare_triggered.rs"]
+mod class_event_bare_triggered;
+#[path = "classes/class_event_assign_alias.rs"]
+mod class_event_assign_alias;
+#[path = "classes/class_event_forever_wait.rs"]
+mod class_event_forever_wait;
+#[path = "classes/string_local_name_leak.rs"]
+mod string_local_name_leak;
+#[path = "classes/vif_null_compare_indexed_receiver.rs"]
+mod vif_null_compare_indexed_receiver;
+#[path = "classes/vif_return_own_definition_name.rs"]
+mod vif_return_own_definition_name;
 #[path = "classes/vif_property_named_like_instance.rs"]
 mod vif_property_named_like_instance;
 #[path = "classes/vif_receiver_neighbor_shapes.rs"]
@@ -748,6 +873,10 @@ mod class_in_module_instance;
 mod static_task_bare_call;
 #[path = "classes/static_class_event.rs"]
 mod static_class_event;
+#[path = "classes/static_new_initializer_once.rs"]
+mod static_new_initializer_once;
+#[path = "classes/static_actual_caller_spec.rs"]
+mod static_actual_caller_spec;
 #[path = "classes/member_shadows_package_var.rs"]
 mod member_shadows_package_var;
 
@@ -800,3 +929,189 @@ mod review_array_constants;
 
 #[path = "classes/review_randomize_rollback.rs"]
 mod review_randomize_rollback;
+#[path = "classes/bare_self_reference_typedef_spec.rs"]
+mod bare_self_reference_typedef_spec;
+
+#[path = "classes/compiled_call_actual_width.rs"]
+mod compiled_call_actual_width;
+
+#[path = "classes/null_handle_method_call_532.rs"]
+mod null_handle_method_call_532;
+
+#[path = "classes/alias_spec_array_const_535.rs"]
+mod alias_spec_array_const_535;
+
+#[path = "classes/local_shadows_class_array_const_534.rs"]
+mod local_shadows_class_array_const_534;
+
+#[path = "classes/class_lparam_chain_76.rs"]
+mod class_lparam_chain_76;
+
+#[path = "classes/extern_unsigned_method_scope_541.rs"]
+mod extern_unsigned_method_scope_541;
+
+#[path = "classes/class_handle_operand_width_564.rs"]
+mod class_handle_operand_width_564;
+
+#[path = "classes/subroutine_lhs_operand_width_565.rs"]
+mod subroutine_lhs_operand_width_565;
+
+#[path = "classes/nba_member_target_object_569.rs"]
+mod nba_member_target_object_569;
+
+#[path = "classes/randomize_nd_arrays_519.rs"]
+mod randomize_nd_arrays_519;
+
+#[path = "classes/method_array_write_shadows_module_array.rs"]
+mod method_array_write_shadows_module_array;
+
+#[path = "classes/constructor_default_args_2023.rs"]
+mod constructor_default_args_2023;
+#[path = "classes/randomize_type_param_576.rs"]
+mod randomize_type_param_576;
+#[path = "classes/nested_dyn_members.rs"]
+mod nested_dyn_members;
+#[path = "classes/randomize_fill_literal.rs"]
+mod randomize_fill_literal;
+#[path = "classes/randomize_nested_dyn_scope.rs"]
+mod randomize_nested_dyn_scope;
+#[path = "classes/shadowed_member_same_named_formal.rs"]
+mod shadowed_member_same_named_formal;
+#[path = "classes/member_multidim_copy.rs"]
+mod member_multidim_copy;
+#[path = "classes/packed_struct_pattern_class_vif_dest_587.rs"]
+mod packed_struct_pattern_class_vif_dest;
+#[path = "classes/rand_wide_elem_draw_sum_588.rs"]
+mod rand_wide_elem_draw_sum;
+#[path = "classes/member_new_owner_spec_596.rs"]
+mod member_new_owner_spec_596;
+#[path = "classes/super_call_formal_widths_593.rs"]
+mod super_call_formal_widths_593;
+#[path = "classes/randomize_foreach_empty_dyn_599.rs"]
+mod randomize_foreach_empty_dyn_599;
+#[path = "classes/nested_class_out_of_block_617.rs"]
+mod nested_class_out_of_block_617;
+#[path = "classes/nba_member_root_613.rs"]
+mod nba_member_root_613;
+#[path = "classes/relax_static_out_of_block_621.rs"]
+mod relax_static_out_of_block_621;
+#[path = "classes/class_event_array_element.rs"]
+mod class_event_array_element;
+#[path = "classes/local_event_wait.rs"]
+mod local_event_wait;
+#[path = "classes/static_spec_actual_lexical.rs"]
+mod static_spec_actual_lexical;
+#[path = "classes/virtual_named_class_param.rs"]
+mod virtual_named_class_param;
+#[path = "classes/vif_type_param_module_var.rs"]
+mod vif_type_param_module_var;
+#[path = "classes/queue_last_member.rs"]
+mod queue_last_member;
+#[path = "classes/package_constructor_scope.rs"]
+mod package_constructor_scope;
+#[path = "classes/class_ref_signature.rs"]
+mod class_ref_signature;
+#[path = "classes/package_class_constraint.rs"]
+mod package_class_constraint;
+
+#[path = "classes/nonrand_handle_constraint_state.rs"]
+mod nonrand_handle_constraint_state;
+
+#[path = "classes/conditional_enum_exclusions.rs"]
+mod conditional_enum_exclusions;
+
+#[path = "classes/default_argument_width.rs"]
+mod default_argument_width;
+
+#[path = "classes/inline_collection_caller_handle.rs"]
+mod inline_collection_caller_handle;
+
+#[path = "classes/enum_collection_domains.rs"]
+mod enum_collection_domains;
+
+#[path = "classes/state_array_size_bound.rs"]
+mod state_array_size_bound;
+
+#[path = "classes/argument_binding_selected_and_output.rs"]
+mod argument_binding_selected_and_output;
+
+#[path = "classes/compiled_method_scope_and_member_stores.rs"]
+mod compiled_method_scope_and_member_stores;
+
+#[path = "classes/randomize_no_parentheses.rs"]
+mod randomize_no_parentheses;
+
+#[path = "classes/inside_shift_width.rs"]
+mod inside_shift_width;
+
+#[path = "classes/random_mode_reenable.rs"]
+mod random_mode_reenable;
+
+#[path = "classes/parenthesized_collection_return.rs"]
+mod parenthesized_collection_return;
+
+#[path = "classes/class_concat_unpack.rs"]
+mod class_concat_unpack;
+
+#[path = "classes/compiled_member_store_carry.rs"]
+mod compiled_member_store_carry;
+#[path = "classes/review_pr720_followups.rs"]
+mod review_pr720_followups;
+#[path = "classes/class_param_local_width_681.rs"]
+mod class_param_local_width_681;
+#[path = "classes/randc_wide_699.rs"]
+mod randc_wide_699;
+
+#[path = "classes/class_string_queue_concatenation.rs"]
+mod class_string_queue_concatenation;
+
+#[path = "classes/class_queue_empty_pattern_through_handle.rs"]
+mod class_queue_empty_pattern_through_handle;
+
+#[path = "classes/package_type_identity_roundtrip.rs"]
+mod package_type_identity_roundtrip;
+
+#[path = "classes/review_collection_pattern_gaps.rs"]
+mod review_collection_pattern_gaps;
+
+#[path = "classes/review_compiled_method_shapes.rs"]
+mod review_compiled_method_shapes;
+
+#[path = "classes/review_event_and_frame_routing.rs"]
+mod review_event_and_frame_routing;
+
+#[path = "classes/cast_to_interface_class_806.rs"]
+mod cast_to_interface_class_806;
+
+#[path = "classes/concurrent_local_type_metadata.rs"]
+mod concurrent_local_type_metadata;
+
+#[path = "classes/renamed_local_member_reads.rs"]
+mod renamed_local_member_reads;
+
+#[path = "classes/randomize_size_dist_redraw.rs"]
+mod randomize_size_dist_redraw;
+
+#[path = "classes/randomize_array_reductions.rs"]
+mod randomize_array_reductions;
+
+#[path = "classes/randomize_elem_dist_weights.rs"]
+mod randomize_elem_dist_weights;
+
+#[path = "classes/property_hides_module_variable.rs"]
+mod property_hides_module_variable;
+
+#[path = "classes/unit_class_out_of_block_members_843.rs"]
+mod unit_class_out_of_block_members_843;
+
+#[path = "classes/recent_846_854_856_858.rs"]
+mod recent_846_854_856_858;
+
+#[path = "classes/nested_extern_methods_842.rs"]
+mod nested_extern_methods_842;
+
+#[path = "classes/recent_constraints_848_850_852_860_862.rs"]
+mod recent_constraints_848_850_852_860_862;
+
+#[path = "classes/module_parameter_specialization_874.rs"]
+mod module_parameter_specialization_874;

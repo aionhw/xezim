@@ -14,6 +14,10 @@
 //! bit-slice lost the member's signedness.
 //!
 //! TAGGED unions are tag-checked (§7.3.2) and keep their own storage.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -119,10 +123,10 @@ fn union_nested_in_struct_and_array_aliases() {
 #[test]
 fn p_format_prints_union_members_off_shared_storage() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(line(&sim, "U="), "U='{packet_id:12345, raw_crc:12345}");
+    assert_eq!(line(&sim, "U="), "U='{packet_id:12345, raw_crc:'h3039}");
     assert_eq!(
         line(&sim, "S="),
-        "S='{cid:1, meta:'{packet_id:777, raw_crc:777}}"
+        "S='{cid:1, meta:'{packet_id:777, raw_crc:'h309}}"
     );
 }
 
@@ -144,6 +148,6 @@ fn p_format_keeps_member_signedness_across_a_slice() {
     let sim = simulate(SIGNED, 100).expect("simulate failed");
     assert_eq!(
         line(&sim, "U="),
-        "U='{signed_id:-559038737, unsigned_crc:3735928559}"
+        "U='{signed_id:-559038737, unsigned_crc:'hdeadbeef}"
     );
 }

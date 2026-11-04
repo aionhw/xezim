@@ -137,7 +137,8 @@ static void reg_task(const char *name, PLI_INT32 (*fn)(PLI_BYTE8 *)) {
 "###;
 
 /// The design the first three walks share. Line numbers are asserted, so
-/// keep its text stable.
+/// keep its text stable. The program's initial procedure waits past the
+/// walk: the run ends when it does (§24.3).
 const DESIGN: &str = r###"`timescale 1ns/1ps
 package cfg_pkg;
   parameter int WIDTH = 8;
@@ -181,7 +182,7 @@ module dff_chk (input clk, input d, output reg q);
 endmodule
 program prog (input logic clk);
   int pcount;
-  initial pcount = 7;
+  initial begin pcount = 7; #100; end
 endprogram
 module top;
   import cfg_pkg::*;

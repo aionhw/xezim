@@ -122,8 +122,7 @@ T|WOS|a5|ff|ff|ff
 T|W1|a5|0f|0f|3c
 T|WO1|a5|0f|0f|0f";
 
-#[test]
-fn uvm_ral_field_access_policies() {
+pub(super) fn uvm_ral_field_access_policies() {
     let src = include_str!("../uvm/uvm_ral_access_policies.sv");
     let want: Vec<&str> = ACCESS_POLICIES.lines().collect();
     for v in VERSIONS {
@@ -184,8 +183,7 @@ const RIGHTS_WO_2020: [&str; 9] = [
     "T|WO|WO1|WO1|0f",
 ];
 
-#[test]
-fn uvm_ral_map_rights() {
+pub(super) fn uvm_ral_map_rights() {
     let src = include_str!("../uvm/uvm_ral_map_rights.sv");
     for v in VERSIONS {
         let wo = if v == "1.2" {
@@ -223,8 +221,7 @@ fn bus(v: &str, test: &str) -> Vec<String> {
 /// `read`+`peek` before the two writes push the inlined chain past the
 /// trampoline depth. 1800.2-2020 only: UVM 1.2's `UVM_NO_DPI` build has
 /// backdoor uvm_hdl compiled off and aborts before the loop.
-#[test]
-fn uvm_ral_backdoor_second_write_keeps_this() {
+pub(super) fn uvm_ral_backdoor_second_write_keeps_this() {
     let src = include_str!("../uvm/uvm_ral_backdoor_toggle_write2.sv");
     let out = lines(&run("1800.2-2020", src, &[]));
     assert_eq!(
@@ -242,8 +239,7 @@ fn uvm_ral_backdoor_second_write_keeps_this() {
     );
 }
 
-#[test]
-fn uvm_ral_frontdoor_policies_and_update() {
+pub(super) fn uvm_ral_frontdoor_policies_and_update() {
     for v in VERSIONS {
         let out = bus(v, "ral_fd_test");
         assert_eq!(
@@ -264,8 +260,7 @@ fn uvm_ral_frontdoor_policies_and_update() {
     }
 }
 
-#[test]
-fn uvm_ral_hw_reset_seq() {
+pub(super) fn uvm_ral_hw_reset_seq() {
     for v in VERSIONS {
         let out = bus(v, "ral_reset_seq_test");
         assert_eq!(tagged(&out), ["T|reset_seq|done"], "UVM {v}");
@@ -273,8 +268,7 @@ fn uvm_ral_hw_reset_seq() {
     }
 }
 
-#[test]
-fn uvm_ral_mirror_check_mismatch() {
+pub(super) fn uvm_ral_mirror_check_mismatch() {
     for v in VERSIONS {
         let out = bus(v, "ral_mismatch_test");
         assert_eq!(
@@ -306,8 +300,7 @@ fn uvm_ral_mirror_check_mismatch() {
 /// the struct's member layout once leaked onto the task's handle, and the
 /// task's `rw.status = ...` then wrote a bit slice into the handle (the read
 /// data was lost and the library reported null dereferences).
-#[test]
-fn uvm_ral_explicit_predictor() {
+pub(super) fn uvm_ral_explicit_predictor() {
     for v in VERSIONS {
         let out = bus(v, "ral_pred_test");
         assert_eq!(
@@ -323,8 +316,7 @@ fn uvm_ral_explicit_predictor() {
     }
 }
 
-#[test]
-fn uvm_ral_mem_access() {
+pub(super) fn uvm_ral_mem_access() {
     for v in VERSIONS {
         let out = bus(v, "ral_mem_test");
         assert_eq!(

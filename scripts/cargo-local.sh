@@ -17,7 +17,13 @@ ARGS=("$@")
 # Prepend so a caller's RUSTFLAGS (e.g. frame pointers for profiling) wins
 # on conflicts. XEZIM_NO_NATIVE_CPU=1 opts out.
 if [ -z "${XEZIM_NO_NATIVE_CPU:-}" ]; then
-  export RUSTFLAGS="-C target-cpu=native ${RUSTFLAGS:-}"
+  if [ "${CARGO_ENCODED_RUSTFLAGS+x}" = x ]; then
+    # Cargo gives encoded flags precedence, even when they are empty.
+    # Keep each encoded argument intact and let later caller flags win.
+    export CARGO_ENCODED_RUSTFLAGS="-Ctarget-cpu=native${CARGO_ENCODED_RUSTFLAGS:+$'\x1f'$CARGO_ENCODED_RUSTFLAGS}"
+  else
+    export RUSTFLAGS="-C target-cpu=native ${RUSTFLAGS:-}"
+  fi
 fi
 
 if [ -f ../xezim-core/Cargo.toml ]; then

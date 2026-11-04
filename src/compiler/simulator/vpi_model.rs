@@ -4067,7 +4067,7 @@ fn edge_code(mask: u16) -> c_int {
 }
 
 /// A bare identifier expression.
-fn ident_expr(name: &str) -> Expression {
+pub(super) fn ident_expr(name: &str) -> Expression {
     Expression::new(
         ExprKind::Ident(HierarchicalIdentifier {
             root: None,
@@ -5664,7 +5664,7 @@ fn op_type(e: &Expression) -> c_int {
         ExprKind::Concatenation(_) => 33,
         ExprKind::Replication { .. } => 34,
         ExprKind::Inside { .. } => 95,
-        ExprKind::AssignmentPattern(_) => 75,
+        ExprKind::AssignmentPattern(_) | ExprKind::TypedPattern { .. } => 75,
         ExprKind::StreamOp { left_to_right, .. } => {
             if *left_to_right {
                 71

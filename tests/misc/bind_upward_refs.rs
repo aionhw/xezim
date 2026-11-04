@@ -14,6 +14,10 @@
 //!  - `$strobe` with `%m` from that block: the postponed-region drain
 //!    formatted with whatever scope the last process left, naming the top
 //!    module instead of the bound instance.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use std::process::Command;
 
@@ -92,14 +96,14 @@ endmodule
     assert_eq!(pvals.len(), 2, "both proxies must run:\n{}", text);
     for l in &pvals {
         assert_eq!(
-            *l, "PVAL '{id:777, active:1}",
+            *l, "PVAL '{id:777, active:'h1}",
             "%p upward struct:\n{}",
             text
         );
     }
     let p0vals: Vec<&str> = text.lines().filter(|l| l.starts_with("P0VAL ")).collect();
     for l in &p0vals {
-        assert_eq!(*l, "P0VAL 777 1", "%0p compact form:\n{}", text);
+        assert_eq!(*l, "P0VAL '{id:777, active:'h1}", "%0p prints as %p:\n{}", text);
     }
     // %m = creation scope + class + method, one per instance.
     let mut mpaths: Vec<&str> = text.lines().filter(|l| l.starts_with("MPATH ")).collect();

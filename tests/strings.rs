@@ -51,6 +51,8 @@ mod fwrite_mcd_fd;
 mod hierarchical_string_method;
 #[path = "strings/interface_event_and_submodule_string.rs"]
 mod interface_event_and_submodule_string;
+#[path = "strings/issue548_unescaped_percent.rs"]
+mod issue548_unescaped_percent;
 #[path = "strings/local_string_array_init.rs"]
 mod local_string_array_init;
 #[path = "strings/local_string_dynamic.rs"]
@@ -147,3 +149,9 @@ mod vpi_clocking_357;
 
 #[path = "strings/literal_order_360.rs"]
 mod next_twelve_literal_order_360;
+
+#[path = "strings/format_unknown_spec_no_eval.rs"]
+mod format_unknown_spec_no_eval;
+
+#[path = "strings/p_format_aggregates_566.rs"]
+mod p_format_aggregates_566;

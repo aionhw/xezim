@@ -135,7 +135,7 @@ endmodule
 fn a_node_can_be_read_and_driven_through_one_port() {
     let src = format!(
         "{PKG}
-module pump import p::*; #(parameter real G = 2.0e-3) (inout nd dra);
+module pump import p::*; #(parameter real G = 2.0e-2) (inout nd dra);
   nd_t t;
   always_comb begin
     t.i = G * (3.3 - dra.v);
@@ -156,7 +156,7 @@ module top;
   pump u_p (dra);
   filt u_f (dra);
   initial begin
-    #6000;
+    #600;
     $display(\"NOTE: settled v=%0.2f i_small=%0b\", dra.v, dra.i < 1.0e-3);
     $finish;
   end
@@ -164,7 +164,9 @@ endmodule
 "
     );
     // The pump's current falls as the node it drives against rises, so the
-    // node charges to the supply and the current goes to nothing. Staged
-    // through a variable on purpose: that is the form that used to fail.
+    // node charges to the supply and the current goes to nothing: it moves
+    // G * (3.3 - v) per step, a time constant of 50 steps, so it has settled
+    // by #600. Staged through a variable on purpose: that is the form that
+    // used to fail.
     assert_eq!(notes(&src), vec!["NOTE: settled v=3.30 i_small=1"]);
 }

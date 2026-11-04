@@ -27,10 +27,14 @@ pub(super) struct SvFile {
     buffered: bool,
     /// (device, inode) of a regular file, to find two handles on one file.
     ident: Option<(u64, u64)>,
+    /// The path and `$fopen` mode it was opened with, so a checkpoint can
+    /// open it again.
+    path: String,
+    mode: String,
 }
 
 impl SvFile {
-    pub(super) fn new(file: File, path: &str) -> Self {
+    pub(super) fn new(file: File, path: &str, mode: &str) -> Self {
         let ident = regular_file_ident(&file);
         let buffered = ident.is_some() && !path.starts_with("/dev/") && !path.starts_with("/proc/");
         SvFile {
@@ -38,7 +42,14 @@ impl SvFile {
             buf: Vec::new(),
             buffered,
             ident,
+            path: path.to_string(),
+            mode: mode.to_string(),
         }
+    }
+
+    /// The path and mode the file was opened with.
+    pub(super) fn origin(&self) -> (&str, &str) {
+        (&self.path, &self.mode)
     }
 
     pub(super) fn ident(&self) -> Option<(u64, u64)> {

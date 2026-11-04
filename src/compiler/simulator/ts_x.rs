@@ -599,8 +599,15 @@ impl Simulator {
                         let (mut av, mut ax) =
                             parts.first().map_or((0, 0), |&(r, _)| (v!(r), x!(r)));
                         for &(r, w) in parts.iter().skip(1) {
-                            av = (av << w) | v!(r);
-                            ax = (ax << w) | x!(r);
+                            // A 64-bit later part follows only zero-width
+                            // parts (`{{0{b}}, word}`): it IS the result.
+                            if w >= 64 {
+                                av = v!(r);
+                                ax = x!(r);
+                            } else {
+                                av = (av << w) | v!(r);
+                                ax = (ax << w) | x!(r);
+                            }
                         }
                         set!(*d, (av, ax));
                     }

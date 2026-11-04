@@ -23,6 +23,9 @@ impl Simulator {
 
     #[inline]
     pub(super) fn stdout_write(&mut self, s: &str) {
+        if self.checkpoint_muted {
+            return;
+        }
         self.stdout_unsynced = true;
         let threaded = self.stdout_threaded();
         let sink = self.stdout_sink.get_or_insert_with(|| {
@@ -37,6 +40,9 @@ impl Simulator {
 
     #[inline]
     pub(super) fn stdout_writeln(&mut self, s: &str) {
+        if self.checkpoint_muted {
+            return;
+        }
         self.stdout_unsynced = true;
         let threaded = self.stdout_threaded();
         let sink = self.stdout_sink.get_or_insert_with(|| {
@@ -614,7 +620,7 @@ impl Simulator {
             opts.read(true);
         }
         let mut file = match opts.open(path) {
-            Ok(f) => sv_file::SvFile::new(f, path),
+            Ok(f) => sv_file::SvFile::new(f, path, mode),
             Err(_) => return Value::zero(32),
         };
         // A second handle on an open file: both write through, so their

@@ -763,11 +763,7 @@ impl Simulator {
                 ) && !b.is_wildcard
                     && b.transitions.is_empty()
             })
-            .flat_map(|b| {
-                b.values
-                    .iter()
-                    .filter_map(|r| self.cg_range_bounds(r, ctor))
-            })
+            .flat_map(|b| self.cg_bin_value_ranges(b, ctor))
             .collect();
         Self::cg_merge_ranges(v)
     }
@@ -870,11 +866,11 @@ impl Simulator {
         let mut bins = Vec::new();
         for b in &explicit {
             let key = format!("{}.{}", cp_name, b.name.name);
-            let ranges: Vec<(i64, i64)> = b
+            let constant = b
                 .values
                 .iter()
-                .filter_map(|r| self.cg_range_bounds(r, ctor))
-                .collect();
+                .all(|r| self.cg_range_bounds(r, ctor).is_some());
+            let ranges = self.cg_bin_value_ranges(b, ctor);
             if b.array_form && !b.transitions.is_empty() {
                 // §19.5.2 `name[] = (...)`: one bin per value sequence.
                 for (label, _) in self.cg_trans_sequences(b, ctor) {
@@ -903,7 +899,8 @@ impl Simulator {
                     }
                 }
             } else if b.array_form && !b.is_wildcard {
-                // §19.5.1 `name[]`: one bin per value, `cp.name[<value>]`.
+                // §19.5.1 `name[]`: one bin per value, `cp.name[<value>]`;
+                // §19.5.1.1 only the values its `with` filter admits.
                 let mut n = 0u64;
                 for (l, h) in Self::cg_merge_ranges(ranges) {
                     for v in l..=h {
@@ -921,14 +918,15 @@ impl Simulator {
                     }
                 }
             } else if b.values.is_empty()
-                || ranges.len() < b.values.len()
+                || !constant
                 || ranges
                     .iter()
                     .any(|&(l, h)| Self::cg_count_outside(l, h, &excl) > 0)
             {
                 // A scalar bin exists unless every one of its values is
-                // excluded (bins whose ranges are not constants, and
-                // transition/wildcard bins, always count).
+                // excluded or filtered out by its `with` (bins whose ranges
+                // are not constants, and transition/wildcard bins, always
+                // count).
                 bins.push(CgBin {
                     key: Some(key),
                     name: b.name.name.clone(),
@@ -1539,11 +1537,7 @@ impl Simulator {
         ctor: &[(String, Value)],
     ) -> Option<(u64, u64, Vec<(i64, i64)>)> {
         let n = self.cg_const_i64(bin.array_size.as_ref()?, ctor)?.max(0) as u64;
-        let segs: Vec<(i64, i64)> = bin
-            .values
-            .iter()
-            .filter_map(|r| self.cg_range_bounds(r, ctor))
-            .collect();
+        let segs = self.cg_bin_value_ranges(bin, ctor);
         let m: u64 = segs.iter().map(|&(l, h)| (h - l) as u64 + 1).sum();
         Some((n, m / n.max(1), segs))
     }
@@ -1598,6 +1592,106 @@ impl Simulator {
     /// The `bin_hits` keys a matching value adds for bin `bin`: the bin
     /// itself, or its array element (`name[value]` for `name[]`, the
     /// sub-bin index for `name[N]`).
+    /// §19.5.1.1: whether bin `bin`'s `with (expr)` filter admits value `v`
+    /// (`item` bound to it). The filter is a constant expression of `item`.
+    pub(super) fn cg_with_admits(&self, bin: &crate::ast::decl::CoverBin, v: i64) -> bool {
+        let Some(f) = &bin.with_filter else {
+            return true;
+        };
+        let mut e = f.clone();
+        let lit = Expression::new(
+            ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                size: None,
+                signed: true,
+                base: crate::ast::expr::NumberBase::Decimal,
+                value: v.to_string(),
+                cached_val: std::cell::Cell::new(None),
+            }),
+            f.span,
+        );
+        Self::subst_ident_expr(&mut e, "item", &lit);
+        self.cg_const_bool(&e).unwrap_or(true)
+    }
+
+    /// The constant value ranges of bin `bin`, in the order written, keeping
+    /// only the values its `with` filter admits (§19.5.1.1): a filtered
+    /// bin's values, and an array bin's distribution, are those values. At
+    /// most 1 << 20 values are tried, so a wide range with a selective filter
+    /// stays bounded.
+    pub(super) fn cg_bin_value_ranges(
+        &self,
+        bin: &crate::ast::decl::CoverBin,
+        ctor: &[(String, Value)],
+    ) -> Vec<(i64, i64)> {
+        let segs = bin
+            .values
+            .iter()
+            .filter_map(|r| self.cg_range_bounds(r, ctor));
+        if bin.with_filter.is_none() {
+            return segs.collect();
+        }
+        let mut out: Vec<(i64, i64)> = Vec::new();
+        let mut tried = 0u64;
+        'segs: for (l, h) in segs {
+            let mut run: Option<(i64, i64)> = None;
+            for v in l..=h {
+                if tried >= 1 << 20 {
+                    out.extend(run);
+                    break 'segs;
+                }
+                tried += 1;
+                if self.cg_with_admits(bin, v) {
+                    run = Some(run.map_or((v, v), |(a, _)| (a, v)));
+                } else if let Some(r) = run.take() {
+                    out.push(r);
+                }
+            }
+            out.extend(run);
+        }
+        out
+    }
+
+    /// A constant Boolean: `inside` (values and `[lo:hi]` ranges), `&&`,
+    /// `||`, `!` and parentheses here, anything else through the constant
+    /// evaluator. None when it is not constant.
+    fn cg_const_bool(&self, e: &Expression) -> Option<bool> {
+        use crate::ast::expr::{BinaryOp, UnaryOp};
+        let num = |x: &Expression| {
+            super::elaborate::const_eval_i64_with_params(x, Some(&self.module.parameters))
+        };
+        match &e.kind {
+            ExprKind::Paren(x) => self.cg_const_bool(x),
+            ExprKind::Unary {
+                op: UnaryOp::LogNot,
+                operand,
+            } => self.cg_const_bool(operand).map(|b| !b),
+            ExprKind::Binary {
+                op: BinaryOp::LogAnd,
+                left,
+                right,
+            } => Some(self.cg_const_bool(left)? && self.cg_const_bool(right)?),
+            ExprKind::Binary {
+                op: BinaryOp::LogOr,
+                left,
+                right,
+            } => Some(self.cg_const_bool(left)? || self.cg_const_bool(right)?),
+            ExprKind::Inside { expr, ranges } => {
+                let v = num(expr)?;
+                for r in ranges {
+                    let hit = match &r.kind {
+                        ExprKind::Range(lo, hi) => (num(lo)?..=num(hi)?).contains(&v),
+                        _ => num(r)? == v,
+                    };
+                    if hit {
+                        return Some(true);
+                    }
+                }
+                Some(false)
+            }
+            _ => num(e).map(|r| r != 0),
+        }
+    }
+
     pub(super) fn cg_value_bin_keys(
         &self,
         bin: &crate::ast::decl::CoverBin,
@@ -1840,10 +1934,20 @@ impl Simulator {
                         } else {
                             self.value_in_ranges(&val, &bin.values)
                         };
-                        if !matched {
+                        // §19.5.1.1: a value the bin's `with` filter rejects
+                        // is not in the bin at all (a `default` bin may take it).
+                        if !matched || vi.is_some_and(|v| !self.cg_with_admits(bin, v)) {
                             continue;
                         }
                         any_value_match = true;
+                        // §19.5: a bin's own `iff` guard keeps it from
+                        // counting while false (#605); the value still
+                        // belongs to it, so no `default` bin takes it.
+                        if let Some(g) = &bin.iff_guard
+                            && !self.eval_expr(g).is_true()
+                        {
+                            continue;
+                        }
                         match bin.kind {
                             crate::ast::decl::CoverBinKind::Bins if !excluded => {
                                 bin_increments
@@ -1904,17 +2008,30 @@ impl Simulator {
                         }
                         // §19.6: a crossed VARIABLE with no coverpoint of its
                         // own gets an implicit coverpoint over it. It used to
-                        // be recorded as a constant 0.
+                        // be recorded as a constant 0. A dotted item is a
+                        // hierarchical reference (XEZIM_RELAX_CROSS_HIER_ITEM).
                         let val = match val {
                             Some(v) => v,
                             None => {
                                 let e = Expression::new(
                                     ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
                                         root: None,
-                                        path: vec![crate::ast::expr::HierPathSegment {
-                                            name: id.clone(),
+                                        // An escaped name (`\a.b`) keeps its dot
+                                        // unless the switch made it a path.
+                                        path: (if sv_parser::RELAX_CROSS_HIER_ITEM.get() {
+                                            id.name.split('.').collect::<Vec<_>>()
+                                        } else {
+                                            vec![id.name.as_str()]
+                                        })
+                                        .into_iter()
+                                        .map(|n| crate::ast::expr::HierPathSegment {
+                                            name: crate::ast::Identifier {
+                                                name: n.to_string(),
+                                                span: id.span,
+                                            },
                                             selects: Vec::new(),
-                                        }],
+                                        })
+                                        .collect(),
                                         span: id.span,
                                         cached_signal_id: std::cell::Cell::new(None),
                                         cached_resolved_name: std::cell::OnceCell::new(),

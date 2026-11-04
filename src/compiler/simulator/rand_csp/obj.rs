@@ -75,6 +75,9 @@ impl Simulator {
     /// call, a null or self-referencing plain handle, an associative or
     /// multi-dimensional array of handles, a dynamic array whose size a
     /// constraint draws, or one object reached through two array slots.
+    /// A member no constraint of the class reads shares no constraint with
+    /// it and is left out: each trial draws it with its own solve first
+    /// (`randomize_nested_with`), which gives the same solutions.
     pub(crate) fn rand_csp_subs(
         &self,
         handle: usize,
@@ -86,7 +89,12 @@ impl Simulator {
         let mut out: Vec<(String, usize)> = Vec::new();
         let mut seen: HashSet<usize> = HashSet::default();
         let mut elems_in = false;
+        // §18.8: element handles whose rand_mode is off are not solved.
+        let off = self.rand_mode_disabled.get(&handle);
         for p in rand_obj_props {
+            if !Self::csp_constraints_read(p, constraints) {
+                continue;
+            }
             let scoped = format!("{}#{}", handle, p);
             if self.is_associative_array(&scoped)
                 || cd.is_some_and(|cd| {
@@ -120,10 +128,14 @@ impl Simulator {
                         if sub == 0 || self.heap.get(sub).and_then(|o| o.as_ref()).is_none() {
                             continue;
                         }
+                        let name = format!("{}[{}]", p, idx);
+                        if off.is_some_and(|d| d.contains(&name)) {
+                            continue;
+                        }
                         if sub == handle || !seen.insert(sub) {
                             return None;
                         }
-                        out.push((format!("{}[{}]", p, idx), sub));
+                        out.push((name, sub));
                     }
                 }
                 None => {
@@ -144,6 +156,80 @@ impl Simulator {
             return None;
         }
         Some(out)
+    }
+
+    /// Whether some item of `constraints` may read member `prop`: a name or
+    /// member access spelled `prop` anywhere in it. An expression form the
+    /// walk does not look inside counts as a read.
+    fn csp_constraints_read(prop: &str, constraints: &[ClassConstraint]) -> bool {
+        let reads = |e: &Expression| {
+            let mut hit = false;
+            Self::walk_operands(e, &mut |x| match &x.kind {
+                ExprKind::Ident(h) => hit |= h.path.iter().any(|s| s.name.name == prop),
+                ExprKind::MemberAccess { member, .. } => hit |= member.name == prop,
+                ExprKind::Number(_)
+                | ExprKind::StringLiteral(_)
+                | ExprKind::Unary { .. }
+                | ExprKind::Binary { .. }
+                | ExprKind::Conditional { .. }
+                | ExprKind::Concatenation(_)
+                | ExprKind::Replication { .. }
+                | ExprKind::Call { .. }
+                | ExprKind::SystemCall { .. }
+                | ExprKind::Inside { .. }
+                | ExprKind::Paren(_)
+                | ExprKind::Index { .. }
+                | ExprKind::RangeSelect { .. }
+                | ExprKind::Range(..)
+                | ExprKind::Dollar
+                | ExprKind::Null
+                | ExprKind::This
+                | ExprKind::Empty => {}
+                _ => hit = true,
+            });
+            hit
+        };
+        let mut hit = false;
+        for c in constraints {
+            for it in &c.items {
+                Self::csp_item_walk(it, &mut |i| {
+                    hit |= match i {
+                        ConstraintItem::Expr(e) => reads(e),
+                        ConstraintItem::Inside {
+                            expr,
+                            range,
+                            dist_weights,
+                            ..
+                        } => {
+                            reads(expr)
+                                || range.iter().any(|r| match r {
+                                    ConstraintRange::Value(v) => reads(v),
+                                    ConstraintRange::Range { lo, hi } => reads(lo) || reads(hi),
+                                })
+                                || dist_weights.iter().flatten().any(|w| match w {
+                                    DistWeight::Each(e) | DistWeight::Total(e) => reads(e),
+                                })
+                        }
+                        ConstraintItem::Implication { condition, .. }
+                        | ConstraintItem::IfElse { condition, .. } => reads(condition),
+                        ConstraintItem::Foreach { array, .. } => reads(array),
+                        ConstraintItem::Solve {
+                            before,
+                            after,
+                            before_paths,
+                            after_paths,
+                            ..
+                        } => {
+                            before.iter().chain(after).any(|n| n.name == prop)
+                                || before_paths.iter().chain(after_paths).any(reads)
+                        }
+                        ConstraintItem::Unique { exprs, .. } => exprs.iter().any(reads),
+                        ConstraintItem::Soft(_) | ConstraintItem::Block(_) => false,
+                    }
+                });
+            }
+        }
+        hit
     }
 
     /// §18.5.9: the rand sub-objects of sub-object `sub` (member path

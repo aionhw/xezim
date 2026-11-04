@@ -10,6 +10,9 @@
 //! (XEZIM_WAITERS_FIRST=1 XEZIM_ACTIVE_REGION=0) was unaffected, matching a
 //! customer report of "worked in an earlier release". All expected values
 //! reference-verified.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! `%0p` as `%p`, and no space before an associative array's closing brace.
 
 use std::process::Command;
 
@@ -59,10 +62,10 @@ fn waiter_continuation_write_wakes_anyedge_comb_block() {
 endmodule
 "#,
     );
-    assert!(text.contains("T|t=11 o='{vld:1, addr:33}"), "{text}");
-    assert!(text.contains("T|t=17 o='{vld:1, addr:33}"), "{text}");
-    assert!(text.contains("T|t=27 o='{vld:1, addr:33}"), "{text}");
-    assert!(text.contains("T|t=31 o='{vld:1, addr:49}"), "{text}");
+    assert!(text.contains("T|t=11 o='{vld:'h1, addr:'h21}"), "{text}");
+    assert!(text.contains("T|t=17 o='{vld:'h1, addr:'h21}"), "{text}");
+    assert!(text.contains("T|t=27 o='{vld:'h1, addr:'h21}"), "{text}");
+    assert!(text.contains("T|t=31 o='{vld:'h1, addr:'h31}"), "{text}");
 }
 
 #[test]
@@ -91,8 +94,8 @@ fn zero_delay_continuation_write_wakes_anyedge_comb_block() {
 endmodule
 "#,
     );
-    assert!(text.contains("T|t=11 o='{vld:1, addr:33}"), "{text}");
-    assert!(text.contains("T|t=21 o='{vld:1, addr:33}"), "{text}");
+    assert!(text.contains("T|t=11 o='{vld:'h1, addr:'h21}"), "{text}");
+    assert!(text.contains("T|t=21 o='{vld:'h1, addr:'h21}"), "{text}");
 }
 
 #[test]
@@ -113,7 +116,7 @@ fn delay_driven_input_still_works() {
 endmodule
 "#,
     );
-    assert!(text.contains("T|t=11 o='{vld:1, addr:33}"), "{text}");
+    assert!(text.contains("T|t=11 o='{vld:'h1, addr:'h21}"), "{text}");
 }
 
 #[test]

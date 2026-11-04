@@ -35,13 +35,13 @@ fn concurrent_for_loop_indices_are_independent() {
 module tb;
   localparam int N = 200;
   int a = 0, b = 0;
+  logic tick = 0;
   initial begin
     fork
       begin for (int i = 0; i < N; i++) begin @(posedge tick); a++; end end
       begin for (int i = 0; i < N; i++) begin @(posedge tick); b++; end end
     join
   end
-  logic tick = 0;
   always #1 tick = ~tick;
 endmodule
 "#;

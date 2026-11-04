@@ -37,5 +37,22 @@ mod cmp_branch_const;
 #[path = "perf/named_event_intern.rs"]
 mod named_event_intern;
 
+#[path = "perf/direct_scoped_calls.rs"]
+mod direct_scoped_calls;
+
+#[path = "perf/direct_ref_formal_calls.rs"]
+mod direct_ref_formal_calls;
+#[path = "perf/condition_waiter_gate.rs"]
+mod condition_waiter_gate;
+
 #[path = "perf/eqc_branch.rs"]
 mod eqc_branch;
+
+#[path = "perf/struct_resolver_compiled.rs"]
+mod struct_resolver_compiled;
+
+#[path = "perf/displaced_local_meta_reapply.rs"]
+mod displaced_local_meta_reapply;
+
+#[path = "perf/const_index_array_arming.rs"]
+mod const_index_array_arming;

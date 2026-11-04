@@ -2,6 +2,10 @@
 //! with no driver at z; 2-state variables start at 0. Pins what `$display`
 //! shows at time 0 for every kind of declaration, so no later change turns an
 //! x into a 0. Expected lines are the reference simulator's output.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -83,7 +87,7 @@ fn every_declaration_kind_starts_unknown_at_time_zero() {
     let want = [
         "T|a=xxxx b=x arr0=xxxx st.f=xxxx r=xxxx w=zzzz i=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx ii=0 u.s=xxxx p::pv=xxxx ff=xxxxxxxx",
         "T|initial local li=xxxx",
-        "T|%d a=x %h a=x %p arr='{x, x}",
+        "T|%d a=x %h a=x %p arr='{'hX, 'hX}",
         "T|func local lf=xxxx",
         "T|task auto local lt=xxxx",
         "T|class m=xxxx arr0=xxxx",

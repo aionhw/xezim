@@ -2260,6 +2260,24 @@ impl Simulator {
         // `fst_sink::repair_time_tables`).
         if let Some(sink) = self.fst_writer.take() {
             sink.finish();
+            // `--fst-repack`: gzip-wrap the finished dump the way GTKWave's
+            // repack-on-close does, now that the trailer is on disk.
+            if let (Some(path), Some(level)) =
+                (&self.fst_file, super::fst_sink::fst_repack_level())
+            {
+                let t0 = std::time::Instant::now();
+                match super::fst_sink::repack_on_close(path, level) {
+                    Ok((before, after)) => eprintln!(
+                        "[FST] repacked {}: {} -> {} bytes ({:.2}x) in {:.2}s",
+                        path,
+                        before,
+                        after,
+                        before as f64 / after.max(1) as f64,
+                        t0.elapsed().as_secs_f64()
+                    ),
+                    Err(e) => eprintln!("[FST] repack of {} failed: {}", path, e),
+                }
+            }
         }
     }
 }

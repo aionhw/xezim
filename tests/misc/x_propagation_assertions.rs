@@ -7,6 +7,10 @@
 //! `$countbits`, `$onehot` (§20.9), `assume`/`cover`, severity tasks. Every
 //! expected line is the reference simulator's output, printed by the design
 //! itself so no simulator message format is compared.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -284,7 +288,7 @@ endmodule
 "#,
         "xp_x5",
     );
-    let want = ["T|nba ai='{0, 0, 3, 4} ab='{0, 0, 0, 0} by='{0, 0}"];
+    let want = ["T|nba ai='{0, 0, 3, 4} ab='{'h0, 'h0, 'h0, 'h0} by='{0, 0}"];
     assert_eq!(got, want);
 }
 
@@ -319,7 +323,7 @@ endmodule
     let want = [
         "T|m=2 s=2 u=2 m2=2 st=2 au=2 sc=2",
         "T|eq m=1 s=1 u=1 st=1 au=1 gt=1",
-        "T|p s='{0, 1, 2, 3}",
+        "T|p s='{'h0, 'h1, 'h2, 'h3}",
     ];
     assert_eq!(got, want);
 }

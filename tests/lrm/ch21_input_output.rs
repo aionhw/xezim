@@ -1,4 +1,8 @@
 //! IEEE 1800-2023 clause 21: input/output system tasks.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use crate::harness::{Order, check, check_files};
 
@@ -23,7 +27,7 @@ fn c21_4_readmem_address_records() {
         include_str!("sv/f_readmemdyn2.sv"),
         "frd2",
         Order::Exact,
-        &["T|21.4|dyn='{17, 0, 26, 0} fixed='{17, x, 26, x}"],
+        &["T|21.4|dyn='{17, 0, 26, 0} fixed='{'h11, 'hXX, 'h1a, 'hXX}"],
         &[],
         &[],
         &[],
@@ -66,7 +70,7 @@ fn c21_input_output() {
             "T|21.2.1m|AC",
             "T|21.2.1n|c21",
             "T|21.2.1o|                   0",
-            r#"T|21.2.1q|'{a:1, b:x, c:"zz"}"#,
+            r#"T|21.2.1q|'{a:1, b:'hX, c:"zz"}"#,
             "T|21.2.1r|E1 165",
             "T|21.2.1v| A",
             "T|21.2.1w|AB|",
@@ -88,7 +92,7 @@ fn c21_input_output() {
             "T|21.2.1Q|",
             "T|21.2.1R|          1",
             "T|21.2.1S|4142",
-            r#"T|21.2.1V|'{1, 2} '{"k":5 }"#,
+            r#"T|21.2.1V|'{1, 2} '{"k":5}"#,
             "T|21.2.1W|165   -5         -42",
             "T|21.2.1X|a5 ffffffd6",
             "T|21.2.1Y|0101",
@@ -121,11 +125,11 @@ fn c21_input_output() {
             "T|21.3.4m|1 7",
             "T|21.3.4n|1 65",
             "T|21.4a|00000011 0000dead 0000001a 0000002b xxxxxxxf 00000004",
-            "T|21.4b|'{165, 3, 0, Z}",
-            "T|21.4c|'{0, 165, 3, 0}",
-            "T|21.4d|'{Z, 0, 3, 165}",
-            "T|21.4.1|'{Z, 0, 3, 165}",
-            "T|21.4.1b|'{x, 0, 3, x}",
+            "T|21.4b|'{'ha5, 'h3, 'h0, 'hZf}",
+            "T|21.4c|'{'h0, 'ha5, 'h3, 'h0}",
+            "T|21.4d|'{'hZf, 'h0, 'h3, 'ha5}",
+            "T|21.4.1|'{'hZf, 'h0, 'h3, 'ha5}",
+            "T|21.4.1b|'{'hXX, 'h0, 'h3, 'hXX}",
             "T|21.6a|0 1",
             "T|21.6b|1",
             "T|21.2.3|fmon v8=a5",

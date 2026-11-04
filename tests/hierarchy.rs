@@ -125,6 +125,8 @@ mod nonansi_port_expressions;
 mod nonansi_port_redeclaration;
 #[path = "hierarchy/nonansi_ports_and_vif_accessors.rs"]
 mod nonansi_ports_and_vif_accessors;
+#[path = "hierarchy/nonzero_lsb_port_select.rs"]
+mod nonzero_lsb_port_select;
 #[path = "hierarchy/null_ports_lib_defines_nowarn.rs"]
 mod null_ports_lib_defines_nowarn;
 #[path = "hierarchy/package_scoped_vars_and_methods.rs"]
@@ -333,3 +335,42 @@ mod vif_defaults_469;
 mod static_init_dependency_order;
 #[path = "hierarchy/review_static_init_dependencies.rs"]
 mod review_static_init_dependencies;
+#[path = "hierarchy/descending_array_port_inside_instance_keeps_index.rs"]
+mod descending_array_port_inside_instance_keeps_index;
+
+#[path = "hierarchy/port_fill_literal_width.rs"]
+mod port_fill_literal_width;
+
+#[path = "hierarchy/upward_module_name_actual_561.rs"]
+mod upward_module_name_actual_561;
+
+#[path = "hierarchy/nested_iface_write_after_sync_568.rs"]
+mod nested_iface_write_after_sync_568;
+
+#[path = "hierarchy/vif_nested_instance_570.rs"]
+mod vif_nested_instance_570;
+
+#[path = "hierarchy/nonansi_child_port_width_572.rs"]
+mod nonansi_child_port_width_572;
+#[path = "hierarchy/nested_iface_vif_612.rs"]
+mod nested_iface_vif_612;
+#[path = "hierarchy/own_definition_name_assign_target.rs"]
+mod own_definition_name_assign_target;
+
+#[path = "hierarchy/generate_nested_instance_port.rs"]
+mod generate_nested_instance_port;
+
+#[path = "hierarchy/prepared_body_shared_across_ancestors.rs"]
+mod prepared_body_shared_across_ancestors;
+
+#[path = "hierarchy/param_port_actual_no_implicit_net.rs"]
+mod param_port_actual_no_implicit_net;
+
+#[path = "hierarchy/generate_region_parameter_override.rs"]
+mod generate_region_parameter_override;
+
+#[path = "hierarchy/param_override_lists.rs"]
+mod param_override_lists;
+
+#[path = "hierarchy/static_memory_member_paths.rs"]
+mod static_memory_member_paths;

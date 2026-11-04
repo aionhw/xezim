@@ -150,12 +150,12 @@ module m; initial begin
 end endmodule
 "#);
     assert!(
-        o.contains(r#"AI='{0:"x", 1:"y" }"#),
+        o.contains(r#"AI='{0:"x", 1:"y"}"#),
         "int-keyed string assoc %p: {}",
         o
     );
     assert!(
-        o.contains(r#"SK='{"a":"apple" }"#),
+        o.contains(r#"SK='{"a":"apple"}"#),
         "string-keyed string assoc %p: {}",
         o
     );

@@ -41,6 +41,16 @@ impl Simulator {
         if self.condition_waiters.is_empty() {
             return;
         }
+        // §6.21: an automatic of the running process's own call frame is
+        // private storage. No parked waiter can read it here — another
+        // process sees it only once the fork merge copies it into its frame,
+        // and that merge promotes the waiters reading it. Re-evaluating every
+        // waiter that merely names the same identifier (a loop counter `f`
+        // against a parked `wait (f.go)`) cost a context switch per waiter
+        // per write.
+        if self.lvalue_is_frame_private(lhs) {
+            return;
+        }
         // Cheap reject first: nothing the lvalue names is read by any parked
         // waiter. The union is rebuilt only after the waiter set changed.
         if self.cond_read_union_dirty {
@@ -68,6 +78,32 @@ impl Simulator {
         }
 
         self.promote_condition_waiters_for_names(&target_names);
+    }
+
+    /// Whether `lhs` (`x`, `x[i]`, `x[a:b]`) writes an automatic that lives
+    /// in the running process's current call frame and is not bound by
+    /// `ref` to another variable.
+    fn lvalue_is_frame_private(&self, lhs: &Expression) -> bool {
+        let mut base = lhs;
+        while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &base.kind {
+            base = expr;
+        }
+        let ExprKind::Ident(h) = &base.kind else {
+            return false;
+        };
+        if h.root.is_some() || h.path.len() != 1 {
+            return false;
+        }
+        let name = h.path[0].name.name.as_str();
+        // A `static` local's frame entry is a copy of one cell that every
+        // call of the subroutine shares (§6.21), so another process can be
+        // parked on it.
+        if self.static_local_names.contains(name) {
+            return false;
+        }
+        self.local_stack.last().is_some_and(|frame| frame.contains_key(name))
+            && !self.ref_binding_stack.last().is_some_and(|m| m.contains_key(name))
+            && !self.ref_alias_stack.last().is_some_and(|m| m.contains_key(name))
     }
 
     /// Re-check parked condition waiters whose condition names one of
@@ -382,7 +418,7 @@ impl Simulator {
             eprintln!(
                 "               Raise XEZIM_CASCADE_LIMIT=<n> if the design legitimately needs deeper same-time NBA cascades."
             );
-            self.finished = true;
+            self.abort_run();
         }
         // Final propagation pass: level-sensitive always blocks fired by the
         // last check_edges may have done blocking-writes to regs that feed
@@ -534,6 +570,11 @@ impl Simulator {
         for (p, c) in inact {
             self.event_queue.schedule(ft, p, c);
         }
+        // #t0-comb-defer: the abandoned slot's unrun starts are re-dated to
+        // `ft` — they are no longer time-0 starts, so reopen the deferred
+        // drain (a stuck counter would hold every cont-assign propagation
+        // forever).
+        self.t0_starts_remaining = 0;
         // Close out the slot being abandoned before the clock jumps. Every
         // other time advance services the postponed region first; this
         // recovery path is the last one that did not, and skipping it would
@@ -779,6 +820,17 @@ impl Simulator {
     /// same offset stay apart.
     pub(super) fn assert_stat_key(span_start: usize, src_file: Option<u32>) -> usize {
         span_start | (src_file.map_or(0, |f| f as usize + 1) << 40)
+    }
+
+    /// §16.5 / §16.14 / §9.3.1: remember a labelled assertion site's label
+    /// for the coverage results file. The first registration's label stays;
+    /// instances of one module share the site.
+    pub(super) fn note_assert_label(&mut self, stat_key: usize, label: Option<&str>) {
+        if let Some(l) = label {
+            self.assertion_labels
+                .entry(stat_key)
+                .or_insert_with(|| l.to_string());
+        }
     }
 
     /// Source file of the running process's module (memoized per process).
@@ -1236,19 +1288,22 @@ impl Simulator {
             // ~40 µs per tick, most of a 5 GHz-clock UVM run. A gated
             // waiter (`cond_gate_for`) is skipped until one of the names it
             // reads is written.
-            let parked = std::mem::take(&mut self.condition_waiters);
+            let mut parked = std::mem::take(&mut self.condition_waiters);
             let written = take_store_writes();
-            let mut still_parked: Vec<(usize, ProcCont)> = Vec::new();
-            for (cpid, cont) in parked {
-                if let Some(Some(bits)) = self.cond_waiter_gate.get(&cpid) {
-                    if !bits.iter().any(|&b| written & b == b) {
-                        still_parked.push((cpid, cont));
-                        continue;
+            // Decide first, then move only the woken entries out: the ones
+            // that stay parked keep their place and their pid counts.
+            let wake: Vec<bool> = parked
+                .iter()
+                .map(|(cpid, _)| {
+                    if let Some(Some(bits)) = self.cond_waiter_gate.get(cpid) {
+                        bits.iter().any(|&b| written & b == b)
+                    } else {
+                        !(from_repass && self.cond_repass_recheck.get(cpid) == Some(&self.time))
                     }
-                } else if from_repass && self.cond_repass_recheck.get(&cpid) == Some(&self.time) {
-                    still_parked.push((cpid, cont));
-                    continue;
-                }
+                })
+                .collect();
+            let woken = parked.take_marked(&wake);
+            for (cpid, cont) in woken {
                 if from_repass {
                     // Entries only matter for the current time slot; drop
                     // older ones so the map stays bounded.
@@ -1262,10 +1317,11 @@ impl Simulator {
                 self.cond_waiter_reads.remove(&cpid);
                 self.cond_read_union_dirty = true;
                 self.cond_waiter_conditions.remove(&cpid);
+                self.cond_waiter_rechecks += 1;
                 self.event_queue.schedule(self.time, cpid, cont);
             }
             let newly = std::mem::take(&mut self.condition_waiters);
-            self.condition_waiters = still_parked;
+            self.condition_waiters = parked;
             self.condition_waiters.extend(newly);
             while self.event_queue.next_time() == Some(self.time)
                 && !self.finished
@@ -1447,6 +1503,19 @@ impl Simulator {
                 self.run_scheduled_process(pid, &stmts);
                 if !self.is_pid_suspended(pid) {
                     self.child_finished(pid);
+                }
+                // #t0-comb-defer: this pop consumed one of the compile-time
+                // time-0 starts (fork children re-queued at the front are not
+                // starts — `last_pop_front` marks them). When the LAST start
+                // has run, the batch is complete and the cont-assign /
+                // port-connect updates deferred from its writes become
+                // runnable, matching the commercial FIFO that queues them
+                // after every start activation of the slot.
+                if self.t0_starts_remaining > 0 && !self.event_queue.last_pop_front {
+                    self.t0_starts_remaining -= 1;
+                    if self.t0_starts_remaining == 0 {
+                        self.drain_deferred_proc_settle();
+                    }
                 }
             }
             // §4.4.2 interleave (reference-simulator verified): a clock
@@ -1904,7 +1973,8 @@ impl Simulator {
         // compare; ~1.1-1.6x on c910). Set XEZIM_EVENT_EDGE=0 to disable.
         let event_skip = std::env::var("XEZIM_EVENT_EDGE").ok().as_deref() != Some("0");
         let event_meas = std::env::var("XEZIM_EVENT_EDGE_MEASURE").ok().as_deref() == Some("1");
-        if event_skip || event_meas {
+        // A restored run carries the measure state its checkpoint saved.
+        if (event_skip || event_meas) && !self.checkpoint_restored {
             self.event_measure = true; // enables stamping + state + phase clock
             self.event_skip = event_skip;
             self.event_after = std::env::var("XEZIM_EVENT_AFTER")
@@ -1936,6 +2006,14 @@ impl Simulator {
         // skip that slot, so the combinational logic read the old value until
         // the next one and toggle coverage never saw the written value as a
         // baseline. `start` holds the loop at time 0 until that slot has run.
+        // #t0-comb-defer: capture the size of the time-0 start batch (the
+        // compile-time process activations) before the first pop. Entries
+        // APPENDED while the batch runs (wakeups, continuations) are not
+        // starts; plain FIFO keeps them behind the batch anyway, and
+        // `schedule_front` fork children are exempted at pop time.
+        if !self.checkpoint_restored {
+            self.t0_starts_remaining = self.event_queue.slot_len(0);
+        }
         while !self.finished && iters < max_iters {
             iters += 1;
             if HANG_REPORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
@@ -2245,6 +2323,20 @@ impl Simulator {
                 }
                 break;
             }
+            // #t0-comb-defer: leaving time 0 ends the start batch however
+            // its entries were popped. The main loop counts its own pops,
+            // but a nested loop (`run_events_until` for a `#delay` inside a
+            // statement), the condition-waiter drain and the post-NBA
+            // assertion pass pop the same slot without counting, and a
+            // counter left above zero would hold every deferred
+            // cont-assign propagation for the rest of the run. Release the
+            // deferrals before the slot closes; their settle may schedule
+            // same-time work, so look again.
+            if next_time > self.time && self.t0_starts_remaining > 0 {
+                self.t0_starts_remaining = 0;
+                self.drain_deferred_proc_settle();
+                continue;
+            }
             // §16.4: the time slot is over — deferred assertion reports
             // mature. Their actions may schedule same-time work, so look
             // again before advancing.
@@ -2260,6 +2352,18 @@ impl Simulator {
             }
             if next_time > self.time {
                 self.dump_slot_end();
+                // The slot is complete and every process is parked in traced
+                // scheduler state: a safe point for class reclamation.
+                self.maybe_collect_class_heap();
+                // ... and for a checkpoint; after a `$restart` the queues
+                // are the checkpoint's, so look at them again.
+                if self.checkpoint_audit.is_some() {
+                    super::checkpoint::audit::slot(self);
+                }
+                if self.checkpoint_due(next_time) && self.serve_checkpoints(next_time) {
+                    continue;
+                }
+                self.growth_trace();
                 self.time = next_time;
                 publish_sim_time(next_time);
                 self.refresh_edge_skip_after_t0();
@@ -2294,7 +2398,7 @@ impl Simulator {
                     // livelock with NOTHING ahead is fatal.
                     if !self.try_break_zero_delay_livelock() {
                         self.report_zero_delay_stall(None);
-                        self.finished = true;
+                        self.abort_run();
                         break;
                     }
                 }
@@ -2307,7 +2411,7 @@ impl Simulator {
                 self.zero_delay_defer_pending = false;
                 if !self.try_break_zero_delay_livelock() {
                     self.report_zero_delay_stall(None);
-                    self.finished = true;
+                    self.abort_run();
                     break;
                 }
             }
@@ -2338,7 +2442,7 @@ impl Simulator {
                         "[INLINE_BITS] ABORTING at iter={} due to {} mismatches",
                         iters, mismatches
                     );
-                    self.finished = true;
+                    self.abort_run();
                     break;
                 }
             }
@@ -2518,6 +2622,12 @@ impl Simulator {
             .iter()
             .filter(|e| e.has_unresolved_reads)
             .count();
+        chatter!(
+            "[PROF] condition_waiter_rechecks={}",
+            self.cond_waiter_rechecks
+        );
+        chatter!("[PROF] vm_direct_calls={}", self.vm_direct_calls);
+        chatter!("[PROF] local_meta_reapplies={}", self.local_meta_reapplies);
         chatter!(
             "[PROF] edge_waiters={:.1}ms edge_cg={:.1}ms waiter_iters={}",
             self.prof_edge_waiters as f64 / 1e6,

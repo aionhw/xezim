@@ -518,6 +518,17 @@ fn dpi_issue_306_enum_shapes_test() {
 }
 
 #[test]
+fn dpi_bitvec_xz_actual_test() {
+    // IEEE 1800-2017 §35.6.1 / §6.11.2: x and z bits of a logic actual bound
+    // to a `bit [N]` formal reach C as 0 in the svBitVecVal words.
+    assert_dpi_pass(
+        "tests/dpi/bitvec_xz_actual.c",
+        "bitvec_xz_actual",
+        "tests/dpi/bitvec_xz_actual_test.sv",
+    );
+}
+
+#[test]
 fn dpi_audit_scalar_arrays_test() {
     // §35.5.6.1 / H.7.4 (DPI audit, family A): unpacked arrays of scalar
     // bit / logic hold one svBit / svLogic byte per element.
@@ -552,6 +563,23 @@ fn dpi_audit_binding_test() {
 }
 
 #[test]
+fn dpi_string_return_display_test() {
+    // IEEE 1800-2017 §21.2.1 / §35.5.5: `$display(f())` with `f` an import
+    // declared `string` printed a decimal integer instead of the returned
+    // text.
+    let so = compile_dpi_lib(
+        "tests/dpi/string_return_display.c",
+        "string_return_display",
+    );
+    let log = run_xezim_with_dpi(&so, "tests/dpi/string_return_display_test.sv");
+    assert!(log.contains("TEST_PASS"), "missing TEST_PASS:\n{log}");
+    assert!(
+        log.lines().any(|l| l == "hello from C"),
+        "bare $display of the import did not print its text:\n{log}"
+    );
+}
+
+#[test]
 fn dpi_audit_types_test() {
     // §35.5.6 / H.7 (DPI audit, family B): integer / time formals are
     // svLogicVecVal*, unpacked structs pass as C structs.
@@ -560,4 +588,12 @@ fn dpi_audit_types_test() {
         "dpi_audit_types",
         "tests/dpi/dpi_audit_types_test.sv",
     );
+}
+
+#[test]
+fn dpi_string_return_respects_local_declaration_shadowing() {
+    let so = compile_dpi_lib("tests/dpi/string_return_display.c", "string_return_shadow");
+    let text = run_xezim_with_dpi(&so, "tests/dpi/string_return_shadow_test.sv");
+    let _ = std::fs::remove_file(so);
+    assert!(text.contains("TEST_PASS"), "{text}");
 }

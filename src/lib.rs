@@ -196,6 +196,11 @@ fn design_cache_key(
     hash.bytes(&[xezim_core::elaborate::relax_driver_conflicts() as u8]);
     // §6.21: the accepted initializer's lifetime changes elaboration.
     hash.bytes(&[xezim_core::elaborate::relax_implicit_static() as u8]);
+    // An opt-in parser relaxation or keyword set accepts other source.
+    for f in sv_parser::relax_flags() {
+        hash.bytes(&[f.get() as u8]);
+    }
+    hash.bytes(&[sv_parser::lexer::scanner::default_keywords_key()]);
 
     // Invalidate after a local rebuild even when the package version did not
     // change, since the executable may contain elaboration fixes.
@@ -1054,12 +1059,19 @@ fn reinstall_ooc_constraint_bodies(
     }
 }
 
+/// The encoded size of a value in the artifact format, for the memory
+/// diagnostics: counted through a sink, never buffered.
+pub(crate) fn serialized_len<T: serde::Serialize>(v: &T) -> usize {
+    bincode::serde::encode_into_std_write(v, &mut std::io::sink(), xezim_core::xez_bincode_config())
+        .unwrap_or(0)
+}
+
 /// `XEZIM_MEM_CENSUS`: the elaborated design as elaboration hands it over —
 /// serialized size per field (a stand-in for heap size that ranks them) and
 /// the sizes of the AST node types that make up most of it.
 fn elab_census(elab: &elaborate::ElaboratedModule) {
     fn ser<T: serde::Serialize>(v: &T) -> usize {
-        bincode::serialized_size(v).unwrap_or(0) as usize
+        serialized_len(v)
     }
     let mut rows: Vec<(&str, usize)> = vec![
         ("signals", ser(&elab.signals)),
@@ -1307,14 +1319,28 @@ fn simulate_multi_inner(
     let mut pre = take_preprocessed(raw_sources, source_paths, include_dirs, defines)
         .filter(|_| sources.as_slice() == raw_sources);
     let cache = design_cache_config();
-    if cache.is_some() && pre.is_none() {
-        // One pass serves both the cache key and (on a miss) elaboration.
+    if pre.is_none() {
+        // One pass serves the cache key, the intra-assignment delay rewrite
+        // below and (on a miss) elaboration.
         pre = Some(xezim_core::preprocess_design(
             &sources,
             source_paths,
             include_dirs,
             defines,
         ));
+    }
+    // §9.4.5 / §22.4 (#567): text spliced in by `include or by a macro
+    // exists only after preprocessing, so the pre-parse rewrite above never
+    // saw a delay written there. Rewrite the preprocessed texts too; the
+    // pass keeps every byte of whitespace, so the line maps stay valid, and
+    // a delay already rewritten is left alone.
+    if let Some(p) = pre.as_mut() {
+        for t in p.texts.iter_mut() {
+            let rewritten = intra_delay::rewrite_intra_assignment_delays(t);
+            if rewritten != *t {
+                *t = rewritten;
+            }
+        }
     }
     let mut cache_pp_texts: Vec<String> = Vec::new();
     let mut cache_line_maps = Vec::new();

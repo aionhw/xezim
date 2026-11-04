@@ -1,4 +1,8 @@
 //! Declared element types determine aggregate class-property defaults.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 fn check(source: &str, expected: &[&str]) {
     if !super::compiled_method_test_env::policies(&[("0", "1000"), ("1", "0"), ("1", "1000")]) {
@@ -48,7 +52,7 @@ endmodule
         &[
             "VALUES|xxxx xxxx xxxx xx xx xxxxx xxxxx 00000 00000 xxxx",
             "CHECK|1 1 1 1",
-            "ARRAY|'{x, x} '{x, x}",
+            "ARRAY|'{'hX, 'hX} '{x, x}",
         ],
     );
 }
@@ -81,7 +85,7 @@ endmodule
         &[
             "METHOD|xxxx xxxx xxxx 0000",
             "STRUCT|xxxx 0000 1 1 xxxx",
-            "SHAPE|'{'{data:x, flags:0, count:x, id:0}, '{data:x, flags:0, count:x, id:0}}",
+            "SHAPE|'{'{data:'hX, flags:'h0, count:x, id:0}, '{data:'hX, flags:'h0, count:x, id:0}}",
         ],
     );
 }
@@ -117,7 +121,7 @@ endmodule
 "#,
         &[
             "DYNAMIC|0011 xxxx xxxx xxxx 1 0000",
-            "RECORDS|'{'{data:x, flags:1}, '{data:x, flags:0}}",
+            "RECORDS|'{'{data:'hX, flags:'h1}, '{data:'hX, flags:'h0}}",
             "REPLACE|1 xxxx",
         ],
     );
@@ -201,7 +205,7 @@ endmodule
 "#,
         &[
             "DEFAULTS|0101 xxxx 0101 xxxx",
-            "INITIALIZED|'{data:1, other:2, flags:3} '{7, 8} xxxx",
+            "INITIALIZED|'{data:'h1, other:'h2, flags:'h3} '{'h7, 'h8} xxxx",
         ],
     );
 }
@@ -244,7 +248,7 @@ module tb;
   end
 endmodule
 "#,
-        &["STATIC|xxxx 1 0000", "STATIC_SHAPE|'{x, x}"],
+        &["STATIC|xxxx 1 0000", "STATIC_SHAPE|'{'hX, 'hX}"],
     );
 }
 
@@ -312,7 +316,7 @@ endmodule
 "#,
         &[
             "BOUND_STRUCT|xxxx 0000 xxxx 0000 xxxx 0",
-            "BOUND_SHAPE|'{'{data:x, flags:0}, '{data:x, flags:0}} '{'{data:x, flags:0}, '{data:x, flags:0}}",
+            "BOUND_SHAPE|'{'{data:'hX, flags:'h0}, '{data:'hX, flags:'h0}} '{'{data:'hX, flags:'h0}, '{data:'hX, flags:'h0}}",
         ],
     );
 }

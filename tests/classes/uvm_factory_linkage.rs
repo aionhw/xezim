@@ -25,8 +25,7 @@ fn messages(sim: &xezim::compiler::Simulator) -> Vec<String> {
 
 /// Bug 1: a `function C::new(...)` written at unit scope must run when `C`
 /// is constructed. Pre-fix the body was never linked, so `x` stayed 0.
-#[test]
-fn unit_scope_extern_method_body_runs_and_persists_writes() {
+pub(super) fn unit_scope_extern_method_body_runs_and_persists_writes() {
     let src = r#"
 class C;
   int x;
@@ -70,8 +69,7 @@ endmodule
 /// Bug 2: a class-local typedef aliased to a parameterized specialization of
 /// itself (`typedef C#(T) this_type;`) is used as the type of a field. The
 /// typedef must resolve back to the underlying class so the field constructs.
-#[test]
-fn class_local_typedef_resolves_to_underlying_class() {
+pub(super) fn class_local_typedef_resolves_to_underlying_class() {
     let src = r#"
 class Port;
   int id;

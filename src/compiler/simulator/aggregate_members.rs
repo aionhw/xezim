@@ -237,13 +237,13 @@ impl Simulator {
             .and_then(|(head, _)| head.split_once('#'))
             .map(|(b, sig)| (b.to_string(), sig.to_string()));
         let h = self.heap.len();
-        self.heap.push(Some(ClassInstance {
+        self.heap.push(Some(Box::new(ClassInstance {
             class_name: decl,
             properties: PropMap::default(),
             type_bindings: HashMap::default(),
             spec,
             creation_scope: String::new(),
-        }));
+        })));
         self.seed_class_struct_cells(h, prop, &su);
         self.static_struct_holders.insert(key, h);
         Some(h)
@@ -1065,6 +1065,33 @@ impl Simulator {
 
     /// Declared (post-type-parameter-resolution) return type of a call's
     /// callee, resolving the receiver with the same rules as the result layout.
+    /// The declared return type of `name` as the first class in `cls`'s
+    /// lexical chain declares it (§8.20: a non-virtual bare call binds to
+    /// the first defining class; an override keeps the prototype).
+    fn class_method_return_type(&self, cls: &str, name: &str) -> Option<DataType> {
+        use crate::ast::decl::ClassMethodKind as Kind;
+        let mut seen: HashSet<String> = HashSet::default();
+        let mut cur = cls.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            if let Some(md) = cd.methods.get(name) {
+                return match &md.kind {
+                    Kind::Function(f) | Kind::Extern(f) | Kind::PureVirtual(f) => {
+                        Some(f.return_type.clone())
+                    }
+                    Kind::Task(_) => None,
+                };
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        None
+    }
+
     pub(super) fn call_return_type(&mut self, func: &Expression) -> Option<DataType> {
         // Split the callee into (receiver expression, method name). A method
         // call parses as EITHER `MemberAccess(recv, m)` OR a flat hier ident
@@ -1103,12 +1130,22 @@ impl Simulator {
             _ => return None,
         };
         let ret: DataType = match recv_expr {
+            // §8.20/§23.9: a bare call inside a class method binds to the
+            // enclosing class chain before any module-scope function of
+            // the same name (`index >= size()` in `queue_c` read the return
+            // type of an unrelated `size`, turning the compare unsigned).
             None => self
-                .module
-                .functions
-                .get(method_name.as_str())?
-                .return_type
-                .clone(),
+                .class_context_stack
+                .last()
+                .cloned()
+                .flatten()
+                .and_then(|cls| self.class_method_return_type(&cls, &method_name))
+                .or_else(|| {
+                    self.module
+                        .functions
+                        .get(method_name.as_str())
+                        .map(|f| f.return_type.clone())
+                })?,
             Some(recv) => {
                 if let ExprKind::Ident(h) = &recv.kind
                     && h.path.len() == 1
@@ -1280,6 +1317,27 @@ impl Simulator {
         }
         let staged = self.pending_ret_struct.clone()?;
         Some(format!("{}.{}", staged, sfx))
+    }
+
+    /// Whether `e` reads a member or element of a call result that is an
+    /// unpacked struct (`f().v`, `q.pop_front().v`), as
+    /// `eval_unpacked_call_member` reads it.
+    pub(super) fn unpacked_call_member(&mut self, e: &Expression) -> bool {
+        let mut cur = e;
+        while let ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } = &cur.kind {
+            cur = expr;
+        }
+        let ExprKind::Call { func, .. } = &cur.kind else {
+            return false;
+        };
+        if std::ptr::eq(cur, e) {
+            return false;
+        }
+        if let Some(ret) = self.call_return_type(func) {
+            return self.unpacked_struct_of(&ret).is_some();
+        }
+        matches!(self.collection_method_of(func),
+            Some((obj, m)) if (m == "pop_front" || m == "pop_back") && self.queue_elem_struct(&obj).is_some())
     }
 
     pub(super) fn eval_unpacked_call_member(&mut self, e: &Expression) -> Option<Value> {
@@ -3754,7 +3812,7 @@ impl Simulator {
         rvalue: &Expression,
         su: &crate::ast::types::StructUnionType,
     ) {
-        let items = match &rvalue.kind {
+        let items = match &self.unpacked_pattern(rvalue).kind {
             ExprKind::AssignmentPattern(its) => Some(its.as_slice()),
             _ => None,
         };
@@ -4397,7 +4455,8 @@ impl Simulator {
 
     /// §13.4.1 / §6.8: the initial leaves of a function's unpacked-struct
     /// return variable `ret_name` — each member starts at its type's default,
-    /// x for a 4-state member and 0 for a 2-state one.
+    /// x for a 4-state member and 0 for a 2-state one, or at its declared
+    /// default (§7.2.2), as for any variable of the type.
     pub(super) fn struct_return_leaf_seeds(
         &mut self,
         ret_name: &str,
@@ -4406,9 +4465,25 @@ impl Simulator {
         let mut defaults = Vec::new();
         self.struct_leaf_plain_defaults(ret_name, su, 0, &mut defaults);
         let defaults: HashMap<String, Value> = defaults.into_iter().collect();
+        let mut inits = Vec::new();
+        self.struct_member_defaults(ret_name, su, 0, &mut inits);
+        let mut declared: HashMap<String, Value> = HashMap::default();
+        if !inits.is_empty() {
+            let mut leaves = Vec::new();
+            self.unpacked_struct_leaf_defaults(ret_name, su, 0, &mut leaves);
+            let keys: HashSet<&str> = inits.iter().map(|(k, _, _)| k.as_str()).collect();
+            declared = leaves
+                .into_iter()
+                .filter(|(k, _, _)| keys.contains(k.as_str()))
+                .map(|(k, v, _)| (k, v))
+                .collect();
+        }
         self.unpacked_struct_leaf_keys(ret_name, su)
             .into_iter()
             .map(|(k, w, is_real)| {
+                if let Some(v) = declared.remove(&k) {
+                    return (k, v);
+                }
                 let seed = if is_real {
                     Value::from_f64(0.0)
                 } else {

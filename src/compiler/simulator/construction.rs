@@ -5,6 +5,65 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// Register the object-scoped dynamic or queue member `scoped` in the
+    /// array tables with the shape a module-scope declaration of the same
+    /// form gets: a fixed tail (`T a[][N]`, `T a[][N][M]`) makes it a 2-D or
+    /// N-D array whose outer dimension is the dynamic one, so `a[i][j]`
+    /// names an element instead of a bit of a scalar row (§7.4.5); any other
+    /// member is a 1-D collection, rows of a dynamic tail (`T a[][]`) being
+    /// collections of their own once `a[i] = new[n]` sizes them.
+    pub(super) fn register_dyn_member_shape(
+        &mut self,
+        cdef: &crate::compiler::elaborate::ElaboratedClass,
+        params: &HashMap<String, Value>,
+        prop: &str,
+        scoped: &str,
+        width: u32,
+    ) {
+        let fixed_tail: Option<Vec<(i64, i64)>> =
+            cdef.dynamic_tail_properties.get(prop).and_then(|tail| {
+                tail.iter()
+                    .map(|d| match d {
+                        crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
+                            let l =
+                                super::elaborate::const_eval_i64_with_params(left, Some(params))?;
+                            let r =
+                                super::elaborate::const_eval_i64_with_params(right, Some(params))?;
+                            Some((l.min(r), l.max(r)))
+                        }
+                        crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
+                            match super::elaborate::const_eval_i64_with_params(expr, Some(params)) {
+                                Some(n) if n > 0 => Some((0, n - 1)),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            });
+        match fixed_tail.as_deref() {
+            Some([d2]) => {
+                self.module.arrays.remove(scoped);
+                self.module
+                    .arrays_2d
+                    .insert(scoped.to_string(), ((0, 63), *d2, width));
+            }
+            Some(dims) if dims.len() >= 2 => {
+                self.module.arrays.remove(scoped);
+                let mut shape = vec![(0, 63)];
+                shape.extend_from_slice(dims);
+                self.module
+                    .arrays_nd
+                    .insert(scoped.to_string(), (shape, width));
+            }
+            _ => {
+                self.module
+                    .arrays
+                    .insert(scoped.to_string(), (0, 63, width));
+            }
+        }
+    }
+
     /// Shallow copy constructor: clone `src_handle`'s instance (scalar
     /// properties plus instance-scoped queue/assoc members) into a fresh heap
     /// object. Returns the new handle.
@@ -32,7 +91,13 @@ impl Simulator {
                 let s_name = format!("{}#{}", src_handle, prop);
                 let n_name = format!("{}#{}", new_handle, prop);
                 self.module.dynamic_arrays.insert(n_name.clone());
-                self.module.arrays.insert(n_name.clone(), (0, 63, w));
+                if let Some(&t) = self.module.arrays_2d.get(&s_name) {
+                    self.module.arrays_2d.insert(n_name.clone(), t);
+                } else if let Some(t) = self.module.arrays_nd.get(&s_name).cloned() {
+                    self.module.arrays_nd.insert(n_name.clone(), t);
+                } else {
+                    self.module.arrays.insert(n_name.clone(), (0, 63, w));
+                }
                 if let Some(m) = max {
                     self.module.queue_max_sizes.insert(n_name.clone(), m);
                 }
@@ -43,6 +108,27 @@ impl Simulator {
                         self.set_signal_value_by_name(&format!("{}[{}]", n_name, i), v);
                     }
                 }
+                // §8.12/§7.4.5: rows of a dynamic outer dimension over unpacked
+                // arrays (`a[i][j]`, a dynamic row's own size) are copied too,
+                // each dynamic row registered under the copy.
+                if cd.dynamic_tail_properties.contains_key(prop) {
+                    for k in self.signals.keys_with_elem_prefix(&format!("{}[", s_name)) {
+                        let Some(v) = self.signals.get(&k).cloned() else {
+                            continue;
+                        };
+                        let nk = format!("{}{}", n_name, &k[s_name.len()..]);
+                        if let Some(row) = k.strip_suffix(".size") {
+                            let nrow = format!("{}{}", n_name, &row[s_name.len()..]);
+                            if self.module.dynamic_arrays.contains(row) {
+                                self.module.dynamic_arrays.insert(nrow.clone());
+                            }
+                            if let Some(&t) = self.module.arrays.get(row) {
+                                self.module.arrays.insert(nrow, t);
+                            }
+                        }
+                        self.signals.insert(nk, v);
+                    }
+                }
             }
             for (prop, &is_str) in &cd.assoc_properties {
                 let s_pre = format!("{}#{}[", src_handle, prop);
@@ -50,18 +136,33 @@ impl Simulator {
                 self.module
                     .associative_arrays
                     .insert(n_name.clone(), is_str);
+                let widths = &mut self.module.assoc_index_widths;
+                if let Some(&kw) = widths.get(&s_pre[..s_pre.len() - 1]) {
+                    widths.insert(n_name.clone(), kw);
+                }
+                // §7.4.5: a row that is a queue or dynamic array keeps its
+                // size (`<h>#m[k].size`) and its registration in the copy.
                 let entries: Vec<(String, Value)> = self
                     .signals
                     .keys_with_elem_prefix(&s_pre)
                     .into_iter()
-                    .filter(|k| k.ends_with(']'))
+                    .filter(|k| k.ends_with(']') || k.ends_with("].size"))
                     .filter_map(|k| {
                         let v = self.signals.get(&k)?.clone();
-                        Some((k[s_pre.len()..k.len() - 1].to_string(), v))
+                        Some((k[s_pre.len()..].to_string(), v))
                     })
                     .collect();
-                for (key, v) in entries {
-                    self.signals.insert(format!("{}[{}]", n_name, key), v);
+                for (rest, v) in entries {
+                    if let Some(row) = rest.strip_suffix(".size") {
+                        let (srow, nrow) = (format!("{s_pre}{row}"), format!("{n_name}[{row}"));
+                        if self.module.dynamic_arrays.contains(&srow) {
+                            self.module.dynamic_arrays.insert(nrow.clone());
+                        }
+                        if let Some(&t) = self.module.arrays.get(&srow) {
+                            self.module.arrays.insert(nrow, t);
+                        }
+                    }
+                    self.signals.insert(format!("{}[{}", n_name, rest), v);
                 }
             }
             // §8.12: a shallow copy copies every property's value — a fixed
@@ -811,6 +912,16 @@ impl Simulator {
                     &cd.param_order
                 };
                 if let Some(idx) = order.iter().position(|p| p == tn) {
+                    // `param_order` interleaves value parameters so a TYPE
+                    // parameter's fragment index is right. The name itself
+                    // still has to be a type parameter. A value parameter's
+                    // fragment is a number (`H` -> `32` on `my_seq #(32, 194)`).
+                    // Returning it made `is_definite_type_arg` treat
+                    // `item #(H, D)` as a type-argument list, the values were
+                    // dropped, and `new` built the default specialization.
+                    if !cd.type_param_names.iter().any(|t| t == tn) {
+                        return None;
+                    }
                     if let Some(v) = Self::spec_arg_at(sig, idx) {
                         let v = v.trim();
                         if !v.is_empty() {
@@ -1008,6 +1119,29 @@ impl Simulator {
     /// through the ENCLOSING spec, so `resource#(T)::get_type()` invoked
     /// from inside `config_db#(int)` keys `resource#(int)` — the same
     /// per-spec cell the concrete resource uses.
+    /// §8.25: the specialization against which a `C#(T)` written in the
+    /// running code resolves its parameter names — the lexical class's. While
+    /// a specialized static call's actuals are evaluated, `current_spec` is
+    /// already the CALLEE's (`eval_call`), so `registry#(B)::add(seq#(T)::cb)`
+    /// in `drv#(byte)` read `T` as `registry`'s parameter; the caller's spec
+    /// is the nearest one on `spec_scope_stack` that applies to the lexical
+    /// class.
+    pub(super) fn lexical_spec(&self) -> Option<(String, String)> {
+        let Some(Some(lex)) = self.class_context_stack.last() else {
+            return self.current_spec.clone();
+        };
+        let applies = |(b, _): &(String, String)| b == lex || self.class_is_a(lex, b);
+        if self.current_spec.as_ref().is_none_or(|c| applies(c)) {
+            return self.current_spec.clone();
+        }
+        self.spec_scope_stack
+            .iter()
+            .rev()
+            .find(|s| applies(s))
+            .cloned()
+            .or_else(|| self.current_spec.clone())
+    }
+
     pub(super) fn resolve_call_spec_params(
         &self,
         spec: Option<(String, String)>,
@@ -1230,14 +1364,41 @@ impl Simulator {
     pub(super) fn typedef_alias_frag(&self, name: &str) -> Option<String> {
         use crate::ast::types::DataType;
         let name = name.trim();
-        if !self.class_member_names().alias_typedefs.contains(name) {
+        // §6.18: a typedef stands for its target type — including one
+        // declared at MODULE scope (`typedef my_pkg::Cfg CfgTQ;`), not
+        // only a class-member alias. Restrict the module-table opening to
+        // plain class targets so builtin-type typedefs keep their
+        // existing (verbatim) keying.
+        let module_class_alias = self
+            .module
+            .typedef_types
+            .get(name)
+            .map(|dt| {
+                matches!(
+                    dt,
+                    DataType::TypeReference {
+                        dimensions,
+                        type_args,
+                        ..
+                    } if dimensions.is_empty() && type_args.is_empty()
+                )
+            })
+            .unwrap_or(false);
+        if !self.class_member_names().alias_typedefs.contains(name)
+            && !module_class_alias
+        {
             return None;
         }
         let mut cur = name.to_string();
         for _ in 0..8 {
-            if self.module.classes.contains_key(&cur)
-                || self.module.typedef_unpacked_dims.contains_key(&cur)
-            {
+            if self.module.classes.contains_key(&cur) {
+                // The chain reached a CLASS. The original name already
+                // spells that class (nothing to rewrite); an alias step
+                // in, though, stands for the class it names — spell it
+                // so the caller canonicalizes it like a direct naming.
+                return if cur != name { Some(cur) } else { None };
+            }
+            if self.module.typedef_unpacked_dims.contains_key(&cur) {
                 return None;
             }
             let dt = self.lookup_typedef_target(&cur)?;
@@ -1280,11 +1441,19 @@ impl Simulator {
                     dimensions,
                     type_args,
                     ..
-                } if dimensions.is_empty() && type_args.is_empty() && !tn.has_scope() => {
-                    if tn.name.name == cur {
+                } if dimensions.is_empty() && type_args.is_empty() => {
+                    // Follow the target whether it is bare (`Cfg`) or
+                    // scoped (`my_pkg::Cfg`): both are class keys in
+                    // `module.classes`.
+                    let target = if tn.has_scope() {
+                        tn.qualified()
+                    } else {
+                        tn.name.name.clone()
+                    };
+                    if target == cur {
                         return None;
                     }
-                    cur = tn.name.name.clone();
+                    cur = target;
                 }
                 _ => return None,
             }
@@ -1824,6 +1993,54 @@ impl Simulator {
         out
     }
 
+    /// Value parameters of the running instance, for a specialization
+    /// argument evaluated in that instance's scope (`item #(H, D)` inside
+    /// `my_seq #(32, 194)`). A static/free frame is a boundary: its caller's
+    /// object does not supply the callee's lexical parameters.
+    pub(super) fn enclosing_value_params(&mut self) -> Option<HashMap<String, Value>> {
+        let lexical = self.class_context_stack.last()?.as_ref()?.clone();
+        let mut map: HashMap<String, Value> = HashMap::default();
+        let mut names = Vec::new();
+        let instance = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .and_then(|h| self.heap.get(h))
+            .and_then(|o| o.as_ref());
+        let mut cn: Option<&str> = Some(&lexical);
+        for _ in 0..64 {
+            let Some(cd) = cn.and_then(|c| self.module.classes.get(c)) else {
+                break;
+            };
+            for (n, _) in &cd.param_defaults {
+                if cd.type_param_names.iter().any(|t| t == n) {
+                    continue;
+                }
+                if !names.contains(n) {
+                    names.push(n.clone());
+                }
+                if let Some(v) = instance.and_then(|inst| {
+                    inst.properties
+                        .get(&format!("{}::{}", cd.name, n))
+                        .or_else(|| inst.properties.get(n))
+                }) {
+                    map.entry(n.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            cn = cd.extends.as_deref();
+        }
+        let saved = self.current_spec.clone();
+        self.current_spec = self.lexical_value_spec();
+        for name in names {
+            if let Some(value) = self.resolve_value_param_in_current(&name) {
+                map.insert(name, value);
+            }
+        }
+        self.current_spec = saved;
+        (!map.is_empty()).then_some(map)
+    }
+
     /// IEEE 1800-2017 §6.20.2 / §8.25: the value of the declared default `e`
     /// of a parameter of `chain[0]` (the declaring class, `chain[1..]` its
     /// ancestors) for an object under construction. A default belongs to the
@@ -2154,13 +2371,22 @@ impl Simulator {
         let ancestor_value_args: HashMap<String, HashMap<String, Value>> = if !chain_has_params {
             HashMap::default()
         } else {
+            // An actual `#(...)` argument is an expression in the
+            // specialization site's scope. Inside a method that is the
+            // running instance, so `item #(H, D)` sees this object's
+            // value parameters. Evaluating it with an empty map used the
+            // global default (32) and the new object's properties
+            // disagreed with the specialization `$cast` checks.
+            let enclosing_params = self.enclosing_value_params();
             let mut leaf_params: HashMap<String, Value> = HashMap::default();
             for (pname, pdefault) in class_def.param_defaults.iter() {
                 // An actual argument belongs to the specialization site's
                 // scope; a default to the class's, where the parameters
                 // before it are visible (§6.20.2, `int B = A*2`).
                 let v = match (arg_map.get(pname), pdefault) {
-                    (Some(e), _) => crate::elaborate::const_eval_i64_with_params(e, None),
+                    (Some(e), _) => {
+                        crate::elaborate::const_eval_i64_with_params(e, enclosing_params.as_ref())
+                    }
                     (None, Some(e)) => {
                         crate::elaborate::const_eval_i64_with_params(e, Some(&leaf_params))
                     }
@@ -2301,8 +2527,9 @@ impl Simulator {
                     self.shadowed_prop_names.insert(sp.clone());
                 }
             }
+            // The object is not on the heap yet, so no parked waiter reads
+            // these properties: seeding them notes no name.
             if t.property_seed_keys.is_none() {
-                bump_store_gen();
                 instance.properties = PropMap(t.base_props.clone());
             }
         }
@@ -2497,6 +2724,16 @@ impl Simulator {
                     .associative_arrays
                     .insert(format!("{}#{}", handle, prop), is_str);
             }
+            // §8.25: a key sized by a class parameter takes this object's
+            // specialization, not the default `assoc_index_props` holds.
+            for (prop, kdt) in &cdef.assoc_key_decl_types {
+                if let Some(kw) = self.param_sized_key_width(kdt, &instance, &classes_to_init) {
+                    let signed = cdef.assoc_index_props.get(prop).is_some_and(|&(_, s)| s);
+                    self.module
+                        .assoc_index_widths
+                        .insert(format!("{}#{}", handle, prop), (kw, signed));
+                }
+            }
             // Per-instance queue / dynamic-array members. Register the instance-
             // scoped name `<handle>#<member>` in the array tables (mirroring the
             // package/module array path) so push_back/size/index/foreach resolve
@@ -2512,7 +2749,15 @@ impl Simulator {
                     self.signed_class_colls.insert(scoped.clone());
                 }
                 self.module.dynamic_arrays.insert(scoped.clone());
-                self.module.arrays.insert(scoped.clone(), (0, 63, width));
+                // The object is not on the heap yet: its value parameters
+                // are read from the instance being built.
+                let mut params = self.module.parameters.clone();
+                for (pn, _) in &cdef.param_defaults {
+                    if let Some(v) = instance.properties.get(pn) {
+                        params.insert(pn.clone(), v.clone());
+                    }
+                }
+                self.register_dyn_member_shape(cdef, &params, prop, &scoped, width);
                 if let Some(m) = max {
                     self.module.queue_max_sizes.insert(scoped.clone(), m);
                 }
@@ -2757,7 +3002,7 @@ impl Simulator {
                 }
             }
         }
-        self.heap.push(Some(instance));
+        self.heap.push(Some(Box::new(instance)));
         // §8.25 / §6.20.2: the ELEMENT width of a fixed-array or queue member
         // follows this specialization too (`bit [W-1:0] a[2]`, `T q[$]`).
         // The per-instance storage registered above used the class table's
@@ -2919,6 +3164,35 @@ impl Simulator {
         }
         self.restore_spec_pooled(saved_spec);
         Value::from_u64(handle as u64, 32)
+    }
+
+    /// §8.4: a method call on a null handle. At the top level (a module or
+    /// testbench process body) the run aborts, like the reference simulator;
+    /// inside class code (deep library code, where an emulation gap can leave
+    /// a handle null) the call is reported once per site and skipped, the
+    /// policy `blocking_call_on_null_receiver` and the property-read path
+    /// apply.
+    pub(super) fn report_null_handle_call(&mut self, method_name: &str) {
+        let in_method = self.this_stack.last().copied().flatten().is_some()
+            || self.class_context_stack.last().cloned().flatten().is_some()
+            || !self.local_stack.is_empty();
+        let m = format!(
+            "[xezim][error] null handle at time {} — method `{}` called on a null \
+             class handle (§8.4); the call runs nothing{}",
+            self.time,
+            method_name,
+            if in_method { "" } else { ", aborting" }
+        );
+        if in_method {
+            if self.null_call_reported.insert(method_name.to_string()) {
+                self.record_output(m.clone());
+                self.stdout_writeln(&m);
+            }
+            return;
+        }
+        self.record_output(m.clone());
+        self.stdout_writeln(&m);
+        self.abort_run();
     }
 
     pub(super) fn exec_method_call(
@@ -3167,6 +3441,21 @@ impl Simulator {
         let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
             inst.class_name.clone()
         } else {
+            // §8.4: calling a method through a null handle dereferences
+            // null; the reference simulator reports it and aborts. This
+            // ran nothing and returned 0 silently, so a test whose handle
+            // was never constructed printed no trace at all. A static
+            // method needs no object (§8.7) — the receiver's declared
+            // class dispatches it earlier; any static method of that name
+            // keeps the silent path for the shapes that still reach here.
+            if !self
+                .module
+                .classes
+                .values()
+                .any(|cd| cd.static_methods.contains(method_name))
+            {
+                self.report_null_handle_call(method_name);
+            }
             return Value::zero(32);
         };
         // LRM §8.7/§8.23: a STATIC method is resolved/stored separately from

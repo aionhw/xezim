@@ -4,6 +4,88 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// An associative array's index type, for `item.index` (§7.12.4) and
+/// `_index` locator results (§7.12.1).
+#[derive(Clone, Copy)]
+pub(super) enum AssocKeyTy {
+    Str,
+    Int { width: u32, signed: bool },
+}
+
+impl AssocKeyTy {
+    /// Stored key `k` as a value of this type.
+    pub(super) fn value(self, k: &str) -> Value {
+        if let AssocKeyTy::Int { width, signed } = self
+            && width > 64
+        {
+            // Keyed by hex digits (`assoc_key_str`).
+            let mut v = Value::from_str_radix(k, 16, width);
+            v.is_signed = signed;
+            return v;
+        }
+        match (self, k.parse::<i128>()) {
+            (AssocKeyTy::Int { width, signed }, Ok(n)) => {
+                let mut v = Value::from_u64(n as u64, width.clamp(1, 64));
+                v.is_signed = signed;
+                v
+            }
+            _ => Simulator::name_key_value(k),
+        }
+    }
+}
+
+/// An `int` array index (§7.12.1, §7.12.4).
+fn int_index(i: usize) -> Value {
+    let mut v = Value::from_u64(i as u64, 32);
+    v.is_signed = true;
+    v
+}
+
+/// The select of a picked element: its stored key, or its index.
+pub(super) enum Sel<'a> {
+    Key(&'a str),
+    Pos(usize),
+}
+
+impl std::fmt::Display for Sel<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Sel::Key(k) => f.write_str(k),
+            Sel::Pos(p) => write!(f, "{}", p),
+        }
+    }
+}
+
+/// The elements a locator method picked (§7.12.1): positions in the
+/// array's index order, or in the key list of an associative array.
+pub(super) struct LocatorPicks {
+    assoc: Option<(Arc<Vec<String>>, AssocKeyTy)>,
+    picks: Vec<usize>,
+}
+
+impl LocatorPicks {
+    pub(super) fn len(&self) -> usize {
+        self.picks.len()
+    }
+
+    pub(super) fn sel(&self, i: usize) -> Sel<'_> {
+        let p = self.picks[i];
+        match &self.assoc {
+            Some((k, _)) => Sel::Key(&k[p]),
+            None => Sel::Pos(p),
+        }
+    }
+
+    /// The `_index` result for pick `i`.
+    pub(super) fn index_value(&self, i: usize) -> Value {
+        let p = self.picks[i];
+        match &self.assoc {
+            Some((k, ty)) => ty.value(&k[p]),
+            None => int_index(p),
+        }
+    }
+}
+
 impl Simulator {
     /// If `e` names a plain object-typed lvalue holding a live class handle,
     /// returns that handle; otherwise `None`. Used by `std::randomize(obj)`
@@ -562,7 +644,7 @@ impl Simulator {
             );
             let r = if dims.len() > 1 {
                 let inner = descending.get(1..).unwrap_or(&[]);
-                match &e.kind {
+                match &self.unpacked_pattern(e).kind {
                     ExprKind::AssignmentPattern(sub) => {
                         self.pattern_cmp_dims(&elem, &dims[1..], inner, sub, case)
                     }
@@ -594,6 +676,7 @@ impl Simulator {
         // §10.9: an item is assignment-like to its ELEMENT — an integral
         // item converts to the element type first, so `-1` matches a
         // `bit [7:0]` element holding 255.
+        let item = self.unpacked_pattern(item);
         if !matches!(item.kind, ExprKind::AssignmentPattern(_))
             && !self.operand_is_string(&elem)
             && self.unpacked_struct_type_of(&elem).is_none()
@@ -655,9 +738,9 @@ impl Simulator {
         }
     }
 
-    /// IEEE 1800-2017 §7.3.2: a tagged union stores ONE member at a time. A
-    /// member expression yields the stored value only when that member is the
-    /// active one; reading any other member is not valid and yields X.
+    /// IEEE 1800-2023 §7.3.2/§11.9: a tagged union stores ONE member at a
+    /// time. Reading the active member yields the stored value; reading any
+    /// other member is a run-time error.
     pub(super) fn tagged_union_member(&mut self, base: &str, member: &str) -> Option<Value> {
         let tag = self.active_union_tag.get(base)?.clone();
         let w = self.lookup_signal_width(base).unwrap_or(32);
@@ -667,7 +750,27 @@ impl Simulator {
                     .unwrap_or_else(|| Value::new(w)),
             )
         } else {
+            let body = format!(
+                "Read of inactive tagged union member '{}.{}' (active member is '{}')",
+                base, member, tag
+            );
+            self.emit_severity_text("Error", &body);
             Some(Value::new(w))
+        }
+    }
+
+    /// Whether `e` is shaped like a locator call (`q.find with (..)`,
+    /// `q.unique()`), without resolving its receiver.
+    pub(super) fn ends_in_locator(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Paren(inner) => Self::ends_in_locator(inner),
+            ExprKind::WithClause { expr, .. } => Self::ends_in_locator(expr),
+            ExprKind::Call { func, .. } => Self::ends_in_locator(func),
+            ExprKind::MemberAccess { member, .. } => Self::is_locator_method(&member.name),
+            ExprKind::Ident(h) => {
+                h.path.len() >= 2 && Self::is_locator_method(&h.path[h.path.len() - 1].name.name)
+            }
+            _ => false,
         }
     }
 
@@ -866,9 +969,13 @@ impl Simulator {
                     Some(a) => a,
                     // A receiver reached through selects — a struct's
                     // dynamic member (`fa[1].q`), an element of a fixed
-                    // array of queues (`q3[1]`, `s.sp[2]`) — names its
-                    // store through the collection resolver.
-                    None if Self::is_locator_method(&member.name) => self.expr_assoc_name(expr)?,
+                    // array of queues (`q3[1]`, `s.sp[2]`), a row of a
+                    // nested collection (`m["a"]`) — names its store
+                    // through the collection resolvers.
+                    None if Self::is_locator_method(&member.name) => self
+                        .expr_assoc_name(expr)
+                        .or_else(|| self.coll_elem_expr_key(expr))
+                        .or_else(|| self.flat_member_name(expr))?,
                     None => return None,
                 };
                 (arr, member.name.clone())
@@ -920,30 +1027,24 @@ impl Simulator {
         method: &str,
         filter: Option<&Expression>,
         iter_name: Option<&str>,
-    ) -> Vec<usize> {
-        // §7.12.1, §7.8.2: an associative array is searched in index order,
-        // its elements living at `arr[key]`; the `_index` forms yield keys.
-        // With integral non-negative keys the key doubles as the position
-        // every caller names an element by. The positional walk below saw an
-        // associative array as empty, so every locator on one (the axi4
-        // AVIP scoreboard's `find_first_index` over its address tables)
-        // found nothing. String or negative keys keep the old answer.
-        let order: Vec<usize> = if self.is_associative_array(arr) {
-            match self
-                .assoc_top_level_keys(arr)
-                .iter()
-                .map(|k| k.parse::<usize>().ok())
-                .collect::<Option<Vec<_>>>()
-            {
-                Some(ks) => ks,
-                None => return Vec::new(),
-            }
-        } else {
-            (0..self.get_queue_size(arr) as usize).collect()
+    ) -> LocatorPicks {
+        // §7.12.1: an associative array is searched in first()/next() key
+        // order (§7.9); picks index that key list.
+        let assoc = self.is_associative_array(arr).then(|| {
+            (
+                self.assoc_top_level_keys_shared(arr),
+                self.assoc_key_ty(arr),
+            )
+        });
+        let size = match &assoc {
+            Some((k, _)) => k.len(),
+            None => self.get_queue_size(arr) as usize,
         };
-        let size = order.len();
         if size == 0 {
-            return Vec::new();
+            return LocatorPicks {
+                assoc,
+                picks: Vec::new(),
+            };
         }
         let elem_su = self.queue_elem_struct(arr);
         let pushed_frame = if self.local_stack.is_empty() {
@@ -967,41 +1068,30 @@ impl Simulator {
         // §7.12/§7.2.1: a PACKED-struct element binds its fields too, so
         // `find with (item.lo > 2)` slices them out of `item`.
         let pfields = if elem_su.is_none() {
-            match self.module.packed_struct_fields.get(arr) {
-                Some(f) => Some(f.clone()),
-                // A struct's dynamic member (`s.sp[2]`): its declared type.
-                None if arr.contains('.') && self.struct_colls_possible() => {
-                    self.struct_member_coll_of(arr).and_then(|(_, dt, _)| {
-                        super::elaborate::packed_struct_field_layout(
-                            &dt,
-                            &self.module.parameters,
-                            &self.module.typedefs,
-                            &self.module.typedef_types,
-                        )
-                    })
-                }
-                None => None,
-            }
-            .filter(|f| !f.is_empty())
+            self.coll_packed_elem_fields(arr)
         } else {
             None
         };
         let mut keys: Vec<i64> = Vec::with_capacity(size);
         let mut truth: Vec<bool> = Vec::with_capacity(size);
-        for &i in &order {
-            let elem = format!("{}[{}]", arr, i);
+        for i in 0..size {
+            let elem = match &assoc {
+                Some((k, _)) => format!("{}[{}]", arr, k[i]),
+                None => format!("{}[{}]", arr, i),
+            };
             if elem_su.is_some() {
                 self.item_alias = Some(elem.clone());
             }
             let v = self
                 .get_signal_value_by_name(&elem)
                 .unwrap_or_else(|| Value::zero(32));
+            // §7.12.4: `item.index` (or `<iterator>.index`) is the
+            // element's index, an int, or an associative array's key.
+            let ix = match &assoc {
+                Some((k, ty)) => ty.value(&k[i]),
+                None => int_index(i),
+            };
             if let Some(f) = self.local_stack.last_mut() {
-                // §7.12.4: `item.index` (or `<iterator>.index`) is the
-                // element's index, an int; it was never bound here, so
-                // `find with (item == item.index)` compared against 0.
-                let mut ix = Value::from_u64(i as u64, 32);
-                ix.is_signed = true;
                 f.insert("item".to_string(), v.clone());
                 f.insert("item.index".to_string(), ix.clone());
                 if let Some(nm) = iter_name {
@@ -1082,7 +1172,10 @@ impl Simulator {
             }
             _ => Vec::new(),
         };
-        picked.into_iter().map(|p| order[p]).collect()
+        LocatorPicks {
+            assoc,
+            picks: picked,
+        }
     }
 
     /// Write a locator result into the destination queue `dst`. The `_index`
@@ -1093,20 +1186,18 @@ impl Simulator {
         dst: &str,
         arr: &str,
         method: &str,
-        idxs: &[usize],
+        picks: &LocatorPicks,
     ) {
         let index_form = method.ends_with("_index");
-        for (i, &src_i) in idxs.iter().enumerate() {
+        for i in 0..picks.len() {
             if index_form {
-                self.set_signal_value_by_name(
-                    &format!("{}[{}]", dst, i),
-                    Value::from_u64(src_i as u64, 32),
-                );
+                let v = picks.index_value(i);
+                self.set_signal_value_by_name(&format!("{}[{}]", dst, i), v);
             } else {
-                self.queue_copy_elem(arr, src_i as u64, dst, i as u64);
+                self.queue_copy_elem(arr, picks.sel(i), dst, i as u64);
             }
         }
-        self.set_queue_size(dst, idxs.len() as u64);
+        self.set_queue_size(dst, picks.len() as u64);
     }
 
     /// Will `sort_with` order by the STRING text of each element's key?
@@ -1153,6 +1244,17 @@ impl Simulator {
             ExprKind::Paren(inner) => self.sort_key_is_string(arr, inner, iter),
             _ => false,
         }
+    }
+
+    /// Whether class collection store `<handle>#<member>` holds strings.
+    pub(super) fn class_coll_holds_strings(&self, store: &str) -> bool {
+        let Some((h, m)) = store.split_once('#') else {
+            return false;
+        };
+        h.parse::<usize>()
+            .ok()
+            .and_then(|h| self.heap.get(h)?.as_ref())
+            .is_some_and(|o| self.class_prop_is_string(&o.class_name, m))
     }
 
     /// Is `prop` on `cls` (or an ancestor) a STRING-typed class property?
@@ -1234,6 +1336,47 @@ impl Simulator {
         self.collection_element_class_named(leaf)
     }
 
+    /// The named key type of associative array `arr` in scope: a local's
+    /// typedef, else the module-scope table.
+    fn scope_assoc_key_type(&self, arr: &str) -> Option<String> {
+        let local_kt = self.local_typedef_type_of(&format!("{}[]", arr));
+        if local_kt.as_deref() == Some("") {
+            return None;
+        }
+        local_kt.or_else(|| self.module.assoc_key_type_names.get(arr).cloned())
+    }
+
+    /// The named key type of associative array `arr`: in scope (a local's
+    /// `@name#N` store by its name), else a class member's (`<handle>#m`)
+    /// from its declaring class.
+    pub(super) fn assoc_key_type_name(&self, arr: &str) -> Option<String> {
+        let local = arr
+            .strip_prefix('@')
+            .and_then(|s| s.rsplit_once('#'))
+            .map(|(n, _)| n);
+        if let Some(kt) = self
+            .scope_assoc_key_type(arr)
+            .or_else(|| local.and_then(|n| self.scope_assoc_key_type(n)))
+        {
+            return Some(kt);
+        }
+        let (h, member) = arr.split_once('#')?;
+        let mut cur = self
+            .heap
+            .get(h.parse::<usize>().ok()?)?
+            .as_ref()?
+            .class_name
+            .clone();
+        for _ in 0..16 {
+            let cd = self.module.classes.get(&cur)?;
+            if let Some(kt) = cd.assoc_key_types.get(member) {
+                return Some(kt.clone());
+            }
+            cur = cd.extends.clone()?;
+        }
+        None
+    }
+
     /// The CLASS an associative collection's loop variable names, when its
     /// KEY type is a class handle — `foreach (m_successors[succ])` over
     /// `bit m_successors[uvm_phase]` binds `succ` to the KEY (§12.7.3), and
@@ -1242,11 +1385,7 @@ impl Simulator {
     /// `assoc_key_type_names` map) and resolves it to a registered class.
     /// Returns None unless the key type names a class.
     pub(super) fn assoc_key_class_of_arr(&self, arr: &str) -> Option<String> {
-        let local_kt = self.local_typedef_type_of(&format!("{}[]", arr));
-        if local_kt.as_deref() == Some("") {
-            return None;
-        }
-        let kt = local_kt.or_else(|| self.module.assoc_key_type_names.get(arr).cloned())?;
+        let kt = self.scope_assoc_key_type(arr)?;
         let cls = if self.module.classes.contains_key(&kt) {
             kt
         } else {
@@ -1447,6 +1586,16 @@ impl Simulator {
         }
     }
 
+    /// The index type of associative array `arr`. Wildcard indices are not
+    /// rejected, though §7.12.1 and §7.12.4 forbid them here.
+    pub(super) fn assoc_key_ty(&self, arr: &str) -> AssocKeyTy {
+        if self.is_string_keyed_array(arr) {
+            return AssocKeyTy::Str;
+        }
+        let (width, signed) = self.assoc_index_width_for(arr).unwrap_or((32, true));
+        AssocKeyTy::Int { width, signed }
+    }
+
     pub(super) fn reduce_with(
         &mut self,
         arr: &str,
@@ -1456,11 +1605,14 @@ impl Simulator {
     ) -> Value {
         // §7.8 / §7.12.3: an associative array reduces over its populated
         // keys in key order, and `item.index` is the key.
-        let assoc_keys = self
-            .is_associative_array(arr)
-            .then(|| self.assoc_top_level_keys(arr));
-        let size = match &assoc_keys {
-            Some(k) => k.len() as u64,
+        let assoc = self.is_associative_array(arr).then(|| {
+            (
+                self.assoc_top_level_keys_shared(arr),
+                self.assoc_key_ty(arr),
+            )
+        });
+        let size = match &assoc {
+            Some((k, _)) => k.len() as u64,
             None => self.get_queue_size(arr),
         };
         // Ensure a local frame exists so `item` has somewhere to live.
@@ -1479,7 +1631,14 @@ impl Simulator {
             .last()
             .and_then(|f| f.get("item.index").cloned());
         let iter_index = iter.map(|nm| format!("{}.index", nm));
-        let mut acc: Option<i64> = None;
+        // §7.12.3/§7.2.1: a packed-struct element binds its fields, as for
+        // the locators: `sum() with (item.code)` read 0 for every element.
+        let pfields = self.coll_packed_elem_fields(arr);
+        // §7.12.3: accumulate at 128 bits — the `with` expression's type can
+        // be wider than 64 bits (`q.sum() with (item)` over `logic [95:0]`),
+        // and an i64 accumulator wrapped there, building a result capped at
+        // `expr_w.min(64)` that could never equal a wide target.
+        let mut acc: Option<i128> = None;
         // §7.12.3: with a `with` clause the result type is the type of the
         // EXPRESSION, so the accumulation wraps at that width. A 1-bit
         // predicate like `q.sum with (item > 4)` therefore counts modulo 2 —
@@ -1488,30 +1647,18 @@ impl Simulator {
         let mut expr_w: u32 = 0;
         let mut expr_s = false;
         for i in 0..size {
-            let key = assoc_keys.as_ref().map(|k| k[i as usize].as_str());
+            let key = assoc.as_ref().map(|(k, ty)| (k[i as usize].as_str(), *ty));
             let elem = self
                 .get_signal_value_by_name(&match key {
-                    Some(k) => format!("{}[{}]", arr, k),
+                    Some((k, _)) => format!("{}[{}]", arr, k),
                     None => format!("{}[{}]", arr, i),
                 })
                 .unwrap_or_else(|| Value::zero(32));
             // §7.12.4: `item.index` is the element's index (an int), or the
             // key of an associative array.
             let ix = match key {
-                Some(k) => match k.parse::<i128>() {
-                    Ok(n) => {
-                        let (kw, ks) = self.assoc_index_width_for(arr).unwrap_or((32, true));
-                        let mut v = Value::from_u64(n as u64, kw.clamp(1, 64));
-                        v.is_signed = ks;
-                        v
-                    }
-                    Err(_) => Value::from_string(k),
-                },
-                None => {
-                    let mut v = Value::from_u64(i, 32);
-                    v.is_signed = true;
-                    v
-                }
+                Some((k, ty)) => ty.value(k),
+                None => int_index(i as usize),
             };
             if let Some(f) = self.local_stack.last_mut() {
                 if let Some(nm) = iter {
@@ -1519,6 +1666,13 @@ impl Simulator {
                 }
                 if let Some(k) = &iter_index {
                     f.insert(k.clone(), ix.clone());
+                }
+                if let Some(fields) = &pfields {
+                    let it = iter.unwrap_or("item");
+                    for (fname, off, w) in fields {
+                        let slice = elem.range_select((off + w - 1) as usize, *off as usize);
+                        f.insert(format!("{}.{}", it, fname), slice);
+                    }
                 }
                 f.insert("item".to_string(), elem);
                 f.insert("item.index".to_string(), ix);
@@ -1528,11 +1682,17 @@ impl Simulator {
                 expr_w = fv.width.max(1);
                 expr_s = fv.is_signed;
             }
-            let v = fv.to_i64().unwrap_or(0);
+            // Read the item's value at its own width: `to_i64` gives only the
+            // low word of a wide (>64-bit) element.
+            let mut raw = fv.to_u128();
+            if fv.is_signed && fv.width > 0 && fv.width < 128 && (raw >> (fv.width - 1)) & 1 == 1 {
+                raw |= !0u128 << (fv.width - 1);
+            }
+            let v = raw as i128;
             acc = Some(match (acc, method) {
                 (None, _) => v,
-                (Some(a), "sum") => a + v,
-                (Some(a), "product") => a * v,
+                (Some(a), "sum") => a.wrapping_add(v),
+                (Some(a), "product") => a.wrapping_mul(v),
                 (Some(a), "min") => a.min(v),
                 (Some(a), "max") => a.max(v),
                 (Some(a), "and") => a & v,
@@ -1540,6 +1700,12 @@ impl Simulator {
                 (Some(a), "xor") => a ^ v,
                 (Some(a), _) => a,
             });
+        }
+        if let (Some(fields), Some(f)) = (&pfields, self.local_stack.last_mut()) {
+            let it = iter.unwrap_or("item");
+            for (fname, _, _) in fields {
+                f.remove(&format!("{}.{}", it, fname));
+            }
         }
         // Restore the prior `item` binding (if any); drop the iterator's.
         if let Some(f) = self.local_stack.last_mut() {
@@ -1572,9 +1738,9 @@ impl Simulator {
         // Truncate to the expression's width for the accumulating reductions;
         // min/max/and/or/xor cannot exceed an operand and need no masking.
         let w = if expr_w == 0 { 32 } else { expr_w };
-        let raw = acc.unwrap_or(0) as u64;
-        let out = if matches!(method, "sum" | "product") && w < 64 {
-            raw & ((1u64 << w) - 1)
+        let raw = acc.unwrap_or(0) as u128;
+        let out = if matches!(method, "sum" | "product") && w < 128 {
+            raw & ((1u128 << w) - 1)
         } else {
             raw
         };
@@ -1582,12 +1748,13 @@ impl Simulator {
         // width (`$bits(a.sum() with (16'(item)))` is 16) and signedness
         // (`sb.sum() with (item) == -56` over bytes holds).
         if matches!(method, "sum" | "product" | "and" | "or" | "xor") && expr_w > 0 {
-            let w = expr_w.min(64);
-            let mut v = Value::from_u64(if w < 64 { out & ((1u64 << w) - 1) } else { out }, w);
+            let w = expr_w.min(128);
+            let mut v =
+                Value::from_u128(if w < 128 { out & ((1u128 << w) - 1) } else { out }, w);
             v.is_signed = expr_s;
             return v;
         }
-        Value::from_u64(out, w.max(32))
+        Value::from_u64(out as u64, w.max(32))
     }
 
     /// The subroutine call a method-call receiver is reached through
@@ -1687,12 +1854,15 @@ impl Simulator {
         ) {
             return None;
         }
+        if let Some(selected) = self.selected_aggregate_formal_rhs(queue_data_type, dims, arg) {
+            return self.bind_queue_param(pname, dims, &selected, queue_data_type, dir);
+        }
         // A queue literal / assignment pattern (`{"a", "b"}` or `'{...}`) passed
         // directly as the actual: bind each top-level element as one queue
         // entry.
-        let literal_elems: Option<Vec<&Expression>> = match &arg.kind {
+        let literal_elems: Option<Vec<&Expression>> = match &self.unpacked_pattern(arg).kind {
             ExprKind::Concatenation(parts) => Some(parts.iter().collect()),
-            ExprKind::AssignmentPattern(items) => Some(items.iter().map(|it| it.expr()).collect()),
+            ExprKind::AssignmentPattern(items) => Some(self.pattern_ordered(items)),
             _ => None,
         };
         // When the queue's element type is a struct, copy the struct's
@@ -1742,7 +1912,10 @@ impl Simulator {
             // An element that is itself a `'{..}` pattern (a dynamic array of
             // UNPACKED structs) is scattered member-wise, not evaluated.
             for (j, part) in parts.iter().enumerate() {
-                if matches!(part.kind, ExprKind::AssignmentPattern(_)) {
+                if matches!(
+                    self.unpacked_pattern(part).kind,
+                    ExprKind::AssignmentPattern(_)
+                ) {
                     self.assign_pattern_or_leaf(&format!("{}[{}]", key, j), queue_data_type, part);
                     continue;
                 }
@@ -1776,6 +1949,7 @@ impl Simulator {
         };
         let w = self.module.arrays.get(&*cname).map(|t| t.2).unwrap_or(32);
         let key = self.formal_dyn_key(pname, queue_data_type);
+        self.register_formal_shape(&key, dims);
         // A queue of unpacked structs keeps its members as separate leaves
         // (`q[0].addr`); those are copied element-wise below.
         let elem_struct = (cname != key)
@@ -1801,6 +1975,18 @@ impl Simulator {
         }
         for (j, v) in vals.into_iter().enumerate() {
             self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
+        }
+        // §13.5.1: a by-value `int o[][]` gets a copy of each row too; read
+        // as one value per row it arrived with every row empty (#595).
+        if cname != key {
+            for j in 0..size {
+                let srow = format!("{cname}[{j}]");
+                if self.module.dynamic_arrays.contains(&srow) {
+                    let drow = format!("{key}[{j}]");
+                    self.register_dyn_row_like(&drow, &srow);
+                    self.copy_dyn_tree(&drow, &srow);
+                }
+            }
         }
         self.set_queue_size(&key, size);
         Some((key, cname))
@@ -1893,6 +2079,26 @@ impl Simulator {
     /// `@q#7`), or a member chain `obj.q` / `a.b.q` mapped to the owning
     /// object's `<handle>#q` storage. `None` when `arg` names no collection.
     pub(super) fn queue_actual_storage(&mut self, arg: &Expression) -> Option<String> {
+        // §13.5.2 (#854): resolve selected rows through one path, which
+        // captures side-effectful receivers and evaluates selectors once.
+        // Repeated probes would consume an actual's selectors again.
+        if matches!(&arg.kind, ExprKind::Index { .. }) {
+            let name = self.indexed_coll_name_gated(arg)?;
+            let is_collection = self.module.arrays.contains_key(&name)
+                || self.module.dynamic_arrays.contains(&name);
+            return is_collection.then_some(name);
+        }
+        // An element of a fixed array of queues / dynamic arrays
+        // (`sub_program[hart]`).
+        let indexed = match &arg.kind {
+            ExprKind::Ident(h) if h.path.last().is_some_and(|s| !s.selects.is_empty()) => {
+                self.selected_ident_coll_name(arg)
+            }
+            _ => None,
+        };
+        if let Some(n) = indexed.filter(|n| self.module.dynamic_arrays.contains(n)) {
+            return Some(n);
+        }
         // §7.2.1/§7.5: a dynamic / queue member of an unpacked STRUCT (`s.d`,
         // `s.in.q`, `a[k].q`) is a collection of its own, named by its path
         // wherever the struct lives (a variable, a formal, a subroutine
@@ -1948,7 +2154,9 @@ impl Simulator {
                 self.handle_collection_name(handle, &leaf)?
             }
             ExprKind::MemberAccess { expr, member } => {
-                let handle = self.eval_handle_expr(expr)?;
+                // Actuals are evaluated in the caller, including selected
+                // handles in local/formal collections (`q[i].data`).
+                let handle = self.eval_live_object_receiver(expr)?;
                 self.handle_collection_name(handle, &member.name)?
             }
             _ => return None,
@@ -2332,6 +2540,17 @@ impl Simulator {
                         _inst_scoped = scoped;
                         _inst_scoped.as_str()
                     }
+                    // §23.9 / §8.10: a bare name that is a scalar of the
+                    // running frame or of `this` is not the module-level
+                    // collection of that name (`str.len()` on a `string
+                    // str` formal beside a module `string str[$]`).
+                    None if (self.module.dynamic_arrays.contains(obj_name)
+                        || self.module.arrays.contains_key(obj_name)
+                        || self.module.associative_arrays.contains_key(obj_name))
+                        && self.scalar_hides_module_coll(obj_name) =>
+                    {
+                        return None;
+                    }
                     None => obj_name,
                 },
                 // A local under its per-call storage key: a same-named
@@ -2501,9 +2720,14 @@ impl Simulator {
                 for k in self.signals.elem_keys_with_prefix(&prefix) {
                     count += 1;
                     // §7.9.1: an element that is an unpacked struct is
-                    // stored as member cells (`aa[k].m`), several per key.
+                    // stored as member cells (`aa[k].m`), several per key
+                    // (a key holds no raw `]`, `encode_name_key`).
                     let rest = &k[prefix.len()..];
-                    compound = compound || rest.contains("][") || Self::key_has_member_suffix(rest);
+                    compound = compound
+                        || rest.contains("][")
+                        || rest
+                            .find(']')
+                            .is_some_and(|e| rest[e + 1..].starts_with('.'));
                 }
                 if compound {
                     let n = self.assoc_top_level_keys(obj_name).len();
@@ -2632,6 +2856,18 @@ impl Simulator {
                     }
                 }
             }
+        }
+        // §7.8.7, §7.10.1: a mutating method writes its receiver: a declared
+        // row it selects is created first if its parent allows, else the
+        // write is ignored (§7.4.5).
+        if matches!(
+            bm,
+            BuiltinM::PushBack | BuiltinM::PushFront | BuiltinM::Insert
+        ) && obj_name.ends_with(']')
+            && self.is_declared_row(obj_name)
+            && !self.ensure_row(obj_name)
+        {
+            return Some(Value::zero(32));
         }
         if bm == BuiltinM::PushBack {
             if let Some(arg) = args.first() {
@@ -2807,11 +3043,41 @@ impl Simulator {
             // first-`]` extraction + dedup is uniform across plain assoc,
             // assoc-of-queue, queues, and dynamic arrays.
             return Some(Self::int_count(
-                self.assoc_top_level_keys(obj_name).len() as u64
+                self.assoc_top_level_keys_shared(obj_name).len() as u64
             ));
         }
         if matches!(bm, BuiltinM::Sum | BuiltinM::Product) {
             let (w, signed) = self.array_elem_sign_width(obj_name);
+            // §7.12.3: the reduction is computed at the element's own width
+            // and wraps there. A wide (>64-bit) element type needs a 128-bit
+            // accumulator: the u64 one wrapped every partial sum at 64 bits
+            // and the result was built at `w.min(64)`, so a 96-bit target
+            // like `ws.sum() == 96'h1_0000_0000_0000_0000` could never hold
+            // (the sum read as its low word, 0).
+            if w > 64 {
+                let mut total: u128 = if bm == BuiltinM::Sum { 0 } else { 1 };
+                for elem in self.reduction_elem_names(obj_name) {
+                    if let Some(v) = self.get_signal_value_by_name(&elem) {
+                        let mut x = v.to_u128();
+                        if signed && w < 128 && (x >> (w - 1)) & 1 == 1 {
+                            x |= !0u128 << (w - 1);
+                        }
+                        total = if bm == BuiltinM::Sum {
+                            total.wrapping_add(x)
+                        } else {
+                            total.wrapping_mul(x)
+                        };
+                    }
+                }
+                let out = if w < 128 {
+                    total & ((1u128 << w) - 1)
+                } else {
+                    total
+                };
+                let mut val = Value::from_u128(out, w);
+                val.is_signed = signed;
+                return Some(val);
+            }
             let mut total: u64 = if bm == BuiltinM::Sum { 0 } else { 1 };
             for elem in self.reduction_elem_names(obj_name) {
                 if let Some(v) = self.get_signal_value_by_name(&elem) {
@@ -3096,11 +3362,19 @@ impl Simulator {
             || bm == BuiltinM::Prev)
             && self.is_associative_array(obj_name)
         {
-            let keys = self.assoc_top_level_keys(obj_name);
+            let keys = self.assoc_top_level_keys_shared(obj_name);
             // i128, not i64: a full-range unsigned 64-bit key
             // (18446744073709551615) is numeric too — treating it as a
             // string wrote the key's ASCII bytes into the ref arg.
-            let all_numeric = keys.iter().all(|k| k.parse::<i128>().is_ok());
+            // A key type wider than 64 bits is keyed by fixed-width hex
+            // digits (`assoc_key_str`), which order as the values do.
+            let wide = self
+                .assoc_index_width_for(obj_name)
+                .filter(|&(kw, _)| kw > 64);
+            // §7.8.2, §7.9.4: string keys are strings however they read.
+            let all_numeric = wide.is_none()
+                && !self.is_string_keyed_array(obj_name)
+                && keys.iter().all(|k| k.parse::<i128>().is_ok());
             if keys.is_empty() {
                 return Some(Value::zero(32));
             }
@@ -3115,40 +3389,48 @@ impl Simulator {
                     // (assoc_key_str): a signed ref var must read back
                     // "-3", not its zero-extended u64 form — otherwise
                     // next()/prev() never find the current position.
-                    let cur = if all_numeric {
-                        self.assoc_key_str(obj_name, &cur_val)
+                    // §7.8.5: the given index need not exist.
+                    let (cur_num, cur_str) = if all_numeric {
+                        (
+                            self.assoc_key_str(obj_name, &cur_val).parse::<i128>().ok(),
+                            String::new(),
+                        )
+                    } else if wide.is_some() {
+                        (None, self.assoc_key_str(obj_name, &cur_val))
                     } else {
-                        cur_val.to_sv_string()
+                        (None, cur_val.to_sv_string())
                     };
-                    if let Some(pos) = keys.iter().position(|k| *k == cur) {
-                        if bm == BuiltinM::Next {
-                            if pos + 1 < keys.len() {
-                                Some(keys[pos + 1].clone())
-                            } else {
-                                None
-                            }
+                    let order = |k: &str| {
+                        if all_numeric {
+                            k.parse::<i128>().ok().cmp(&cur_num)
+                        } else if wide.is_some() {
+                            k.cmp(cur_str.as_str())
                         } else {
-                            if pos > 0 {
-                                Some(keys[pos - 1].clone())
-                            } else {
-                                None
-                            }
+                            (*decode_name_key(k)).cmp(cur_str.as_str())
                         }
+                    };
+                    let found = if bm == BuiltinM::Next {
+                        keys.iter().find(|k| order(k).is_gt())
                     } else {
-                        None
-                    }
+                        keys.iter().rev().find(|k| order(k).is_lt())
+                    };
+                    found.cloned()
                 } else {
                     None
                 }
             };
             if let Some(key) = result_key {
                 if let Some(arg) = args.first() {
-                    if all_numeric {
+                    if let Some((kw, ks)) = wide {
+                        let mut v = Value::from_str_radix(&key, 16, kw);
+                        v.is_signed = ks;
+                        self.assign_value(arg, &v);
+                    } else if all_numeric {
                         let key_int = key.parse::<i128>().unwrap_or(0);
                         let w = self.infer_width(arg);
                         self.assign_value(arg, &Value::from_u64(key_int as u64, w));
                     } else {
-                        let key_val = Value::from_string(&key);
+                        let key_val = Self::name_key_value(&key);
                         self.assign_value(arg, &key_val);
                     }
                 }

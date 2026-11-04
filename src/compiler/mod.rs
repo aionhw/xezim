@@ -13,10 +13,12 @@ mod fb_scan;
 pub mod fst_sink;
 mod interrupt;
 pub mod jit;
+pub(crate) mod packed_assignment_pattern_plan;
 pub mod prof_sampler;
 pub(crate) mod scoped_arrays;
 pub mod simulator;
 pub mod soa;
+pub(crate) mod struct_sra;
 pub mod ts_jit;
 
 pub use arena::{Arena, ArenaGuard, ArenaVec};

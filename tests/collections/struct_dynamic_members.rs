@@ -13,6 +13,10 @@
 //!   classified from the declared types wherever the struct lives.
 //!
 //! Expected values come from the reference simulator.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -144,7 +148,7 @@ fn print_compare_and_subroutine_formals() {
         "T|grow sz=4 e3=42",
         "T|ret x=5 sz=2 e1=6",
         "T|pc '{x:5, ql:'{5, 6}}",
-        "T|paa 2 4 '{\"p\":'{x:1, y:2}, \"q\":'{x:3, y:4} }",
+        "T|paa 2 4 '{\"p\":'{x:1, y:2}, \"q\":'{x:3, y:4}}",
     ];
     assert_eq!(t_lines(include_str!("struct_dyn_ops.sv")), expected);
 }
@@ -177,7 +181,7 @@ fn associative_members() {
         "T|e asg n=1 r=5",
         "T|e pat n=3 e7=2 b=20",
         "T|copy n=2 a=10",
-        "T|p '{x:1, m:'{\"a\":10, \"b\":20 }}",
+        "T|p '{x:1, m:'{\"a\":10, \"b\":20}}",
     ];
     assert_eq!(
         t_lines(include_str!("struct_dyn_assoc_members.sv")),

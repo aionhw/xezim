@@ -189,3 +189,55 @@ endmodule
     assert_eq!(u(&sim, "q7"), 5);
     assert_eq!(u(&sim, "q0"), 10);
 }
+
+/// §7.4.4, §7.8.7, §7.10.2.7: an element of a collection of collections is
+/// itself a collection. `m[k].push_back(o)` appends to the queue `m[k]`,
+/// allocating the entry first.
+#[test]
+fn nested_coll_of_handles_elem_is_a_coll() {
+    if !gate_on() {
+        return;
+    }
+    let src = r#"
+class c; int id; endclass
+class h;
+  c m[int][$];
+  c fx[2][$];
+  function void f(c o);
+    for (int i = 0; i < 2; i++) begin
+      m[0].push_back(o);
+      fx[1].push_front(o);
+    end
+  endfunction
+  function int first_id();
+    for (int i = 0; i < 1; i++) return m[0][0].id;
+  endfunction
+endclass
+
+module top;
+  int msz, fsz, fsz0, id, id0, n;
+  initial begin
+    h x;
+    c o;
+    x = new();
+    o = new();
+    o.id = 7;
+    x.f(o);
+    x.f(o);
+    msz = x.m[0].size();
+    fsz = x.fx[1].size();
+    fsz0 = x.fx[0].size();
+    id = x.m[0][3].id;
+    id0 = x.first_id();
+    n = x.m.num();
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulation should run");
+    assert_eq!(u(&sim, "msz"), 4);
+    assert_eq!(u(&sim, "fsz"), 4);
+    assert_eq!(u(&sim, "fsz0"), 0);
+    assert_eq!(u(&sim, "id"), 7);
+    assert_eq!(u(&sim, "id0"), 7);
+    assert_eq!(u(&sim, "n"), 1);
+}

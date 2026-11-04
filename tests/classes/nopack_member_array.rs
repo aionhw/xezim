@@ -31,6 +31,7 @@ endclass
 class mid_class;
   int a;
   base_class base[];
+  function new(string name="mid"); endfunction
 endclass
 
 class my_class;

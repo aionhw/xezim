@@ -1,4 +1,8 @@
 //! IEEE 1800-2023 clause 8: classes.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use crate::harness::{Order, check};
 
@@ -207,7 +211,7 @@ fn c8_classes() {
             "T|8.9|static shared 5",
             "T|8.11|this 1",
             "T|8.4|null 1 1",
-            r#"T|8.5|props q='{1} aa='{"k":9 } dyn='{0, 0, -1}"#,
+            r#"T|8.5|props q='{1} aa='{"k":9} dyn='{0, 0, -1}"#,
             "T|8.13|a=7 who=Derived nv=Derived.nv b.nv=Base.nv calc=63",
             "T|8.14|shadow d.v=2 b.v=1",
             "T|8.20|implicit virtual D2 a=3",

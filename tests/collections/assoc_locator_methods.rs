@@ -6,6 +6,10 @@
 //! came back empty and every read was checked against entry 0.
 //!
 //! Expected values are the reference simulator's.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -93,7 +97,7 @@ fn assoc_locators_over_integral_keys() {
             "T|3 '{10, 30, 70}",
             "T|4 '{30}",
             "T|5 '{10}",
-            "T|6 '{200}",
+            "T|6 '{'hc8}",
             "T|8 '{1, 3, 7}",
         ]
     );

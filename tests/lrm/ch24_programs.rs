@@ -87,24 +87,29 @@ fn c24_7_program_control() {
 // §24.7: Program control: simulation ends when all programs' initial blocks finish
 #[test]
 fn c24_7_program_implicit_finish() {
-    // Known gap (§24.7): `24.7c` reference `p2 final t=35`, xezim `p2 final t=100000000`
-    // Known gap (§24.7): `24.7e` reference `module final t=35`, xezim `module final t=100000000`
-    // Known gap (§24.7): `24.7d`: xezim prints extra `module still running t=1000 (should not print)`
+    // §24.3, §24.7: the run ends when both programs have, at t=35, not at
+    // the module's #1000; the final procedures run in an arbitrary order
+    // (§9.2.3).
     check(
         "24.7_program_implicit_finish",
         include_str!("sv/24.7_program_implicit_finish.sv"),
         "c24x",
-        Order::Exact,
-        &["T|24.7a|p1 done t=15", "T|24.7b|p2 done t=35"],
-        &["T|24.7c|", "T|24.7e|", "T|24.7d|"],
+        Order::Multiset,
+        &[
+            "T|24.7a|p1 done t=15",
+            "T|24.7b|p2 done t=35",
+            "T|24.7c|p2 final t=35",
+            "T|24.7e|module final t=35",
+        ],
+        &[],
     );
 }
 
 // §24: module vs program processes at the same edge
 #[test]
 fn c24_program_region_order() {
-    // Known gap (§24.3): program processes print before the module's inactive and NBA-triggered lines; the reference runs them after (Reactive region)
-    // Known gap (§24.7): `24.7f` reference `module final t=25`, xezim `module final t=30`
+    // §24.3: a program process resumes in the Reactive region, after the
+    // module's inactive and NBA work of the slot.
     check(
         "p24b",
         include_str!("sv/p24b.sv"),
@@ -114,19 +119,26 @@ fn c24_program_region_order() {
             "T|24.ord|t=5 module active",
             "T|24.ord|t=5 module inactive",
             "T|24.ord|t=5 module after nba q=1",
+            "T|24.ord|t=5 program",
             "T|24.ord|t=15 module active",
             "T|24.ord|t=15 module inactive",
             "T|24.ord|t=15 module after nba q=0",
+            "T|24.ord|t=15 program",
             "T|24.ord|t=25 module active",
             "T|24.ord|t=25 module inactive",
             "T|24.ord|t=25 module after nba q=1",
-            "T|24.7f|program final",
-        ],
-        &[
-            "T|24.ord|t=5 program",
-            "T|24.ord|t=15 program",
             "T|24.ord|t=25 program",
-            "T|24.7f|module final t=",
         ],
+        &["T|24.7f|"],
+    );
+    // §24.7: the run ends when the program does, at t=25; the final
+    // procedures run in an arbitrary order (§9.2.3).
+    check(
+        "p24b",
+        include_str!("sv/p24b.sv"),
+        "t24b",
+        Order::Multiset,
+        &["T|24.7f|program final", "T|24.7f|module final t=25"],
+        &["T|24.ord|"],
     );
 }

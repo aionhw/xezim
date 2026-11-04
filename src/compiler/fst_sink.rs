@@ -1088,3 +1088,133 @@ impl Staged {
         Ok(())
     }
 }
+
+/// `--fst-repack[=level]`, process-wide like the other dump knobs: 0 is off.
+static FST_REPACK_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Set (or clear) the deflate level `--fst-repack` wraps a finished dump at.
+pub fn set_fst_repack(level: Option<u8>) {
+    FST_REPACK_LEVEL.store(level.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// The `--fst-repack` level in force, if any.
+pub fn fst_repack_level() -> Option<u8> {
+    match FST_REPACK_LEVEL.load(Ordering::Relaxed) {
+        0 => None,
+        l => Some(l),
+    }
+}
+
+/// GTKWave's "repack on close" (`fstWriterSetRepackOnClose`): the finished
+/// dump, gzip-compressed as one stream and wrapped in a `FST_BL_ZWRAPPER`
+/// (254) block — the type byte, the section length and the uncompressed
+/// length as big-endian 64-bit integers, then the gzip stream. Readers
+/// (GTKWave, `fst-reader`) inflate it on open, so the wrapper trades open
+/// time and a temporary copy for a smaller file. Runs only on a clean
+/// close, after the trailer is on disk; a run that dies earlier leaves the
+/// unwrapped, crash-safe dump as before. Streams through fixed buffers, so
+/// a dump larger than memory repacks too. Returns (before, after) sizes.
+pub fn repack_on_close(path: &str, level: u8) -> std::io::Result<(u64, u64)> {
+    use miniz_oxide::deflate::core::{CompressorOxide, create_comp_flags_from_zip_params};
+    use miniz_oxide::deflate::stream::deflate;
+    use miniz_oxide::{MZFlush, MZStatus};
+    use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+
+    // A linked dump path is repacked into the link's target: renaming over
+    // the link itself made it a regular file and left the target holding
+    // the uncompressed dump (#598). The FST writer writes through links too.
+    let resolved = std::fs::canonicalize(path)?;
+    let path = resolved.to_str().unwrap_or(path);
+    let src_len = std::fs::metadata(path)?.len();
+    let tmp = format!("{path}.repack.{}", std::process::id());
+    let result = (|| -> std::io::Result<u64> {
+        let mut inp = BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
+        let mut out = BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
+        out.write_all(&[254u8])?;
+        out.write_all(&0u64.to_be_bytes())?; // section length, patched below
+        out.write_all(&src_len.to_be_bytes())?;
+        // gzip member header: magic, deflate, no flags, no mtime, OS = Unix.
+        out.write_all(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3])?;
+        let mut gz_len: u64 = 10;
+        let flags = create_comp_flags_from_zip_params(i32::from(level.clamp(1, 10)), 0, 0);
+        let mut comp = Box::new(CompressorOxide::new(flags));
+        let mut inbuf = vec![0u8; 1 << 20];
+        let mut outbuf = vec![0u8; 1 << 20];
+        let mut crc = Crc32::new();
+        loop {
+            let n = inp.read(&mut inbuf)?;
+            let eof = n == 0;
+            crc.update(&inbuf[..n]);
+            let flush = if eof { MZFlush::Finish } else { MZFlush::None };
+            let mut pos = 0;
+            loop {
+                let res = deflate(&mut comp, &inbuf[pos..n], &mut outbuf, flush);
+                pos += res.bytes_consumed;
+                out.write_all(&outbuf[..res.bytes_written])?;
+                gz_len += res.bytes_written as u64;
+                match res.status {
+                    Ok(MZStatus::StreamEnd) => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(std::io::Error::other(format!("deflate: {e:?}")));
+                    }
+                }
+                if !eof && pos >= n {
+                    break;
+                }
+            }
+            if eof {
+                break;
+            }
+        }
+        out.write_all(&crc.finish().to_le_bytes())?;
+        out.write_all(&(src_len as u32).to_le_bytes())?;
+        gz_len += 8;
+        out.flush()?;
+        let mut f = out.into_inner().map_err(|e| e.into_error())?;
+        f.seek(SeekFrom::Start(1))?;
+        f.write_all(&(8 + 8 + gz_len).to_be_bytes())?;
+        f.sync_all()?;
+        Ok(1 + 8 + 8 + gz_len)
+    })();
+    // A failed rename is cleaned up like a failed compression, so repeated
+    // failures do not leave dump-sized files beside the dump (#598).
+    match result.and_then(|total| std::fs::rename(&tmp, path).map(|()| total)) {
+        Ok(total) => Ok((src_len, total)),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// CRC-32 (IEEE 802.3), as the gzip member trailer needs it.
+struct Crc32 {
+    table: [u32; 256],
+    state: u32,
+}
+
+impl Crc32 {
+    fn new() -> Self {
+        let mut table = [0u32; 256];
+        for (i, slot) in table.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+            *slot = c;
+        }
+        Self {
+            table,
+            state: 0xFFFF_FFFF,
+        }
+    }
+    fn update(&mut self, data: &[u8]) {
+        for &b in data {
+            self.state = self.table[((self.state ^ b as u32) & 0xFF) as usize] ^ (self.state >> 8);
+        }
+    }
+    fn finish(&self) -> u32 {
+        self.state ^ 0xFFFF_FFFF
+    }
+}

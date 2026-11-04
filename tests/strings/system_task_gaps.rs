@@ -409,8 +409,6 @@ module tb;
   wire w;
   initial begin
     m[0] = 8'h5A;
-    $save("cp.dat");
-    $restart("cp.dat");
     $sreadmemh("nope.dat", m);
     n = $countdrivers(w);
     $countdrivers(w);
@@ -429,8 +427,6 @@ endmodule
     assert_eq!(u(&sim, "m0"), 0x5A, "$sreadmemh leaves memory unchanged");
     let warned = sim.warned_system_task_names();
     for name in [
-        "$save",
-        "$restart",
         "$sreadmemh",
         "$countdrivers",
         "$key",

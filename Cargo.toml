@@ -1,6 +1,6 @@
 [package]
 name = "xezim"
-version = "0.11.3"
+version = "0.11.4"
 build = "src/build.rs"
 edition = "2024"
 rust-version = "1.92"
@@ -20,13 +20,13 @@ rand = "0.8"
 # `./scripts/use-local-core.sh` once (or use scripts/cargo-local.sh per
 # invocation) and plain `cargo build` uses it — no network, no git dep.
 # See "Modifying xezim-core" in README.md.
-xezim-core = { git = "https://github.com/aionhw/xezim-core.git", rev = "92cce4dfcb0bbb37bed28a5c3d2b454a003a4c7c" }
-sv-parser = { git = "https://github.com/aionhw/xezim-core.git", rev = "92cce4dfcb0bbb37bed28a5c3d2b454a003a4c7c" }
+xezim-core = { git = "https://github.com/aionhw/xezim-core.git", rev = "53579d605596e64821cfb49c73a688ba2612ba04" }
+sv-parser = { git = "https://github.com/aionhw/xezim-core.git", rev = "53579d605596e64821cfb49c73a688ba2612ba04" }
 libloading = "0.8"
 libffi = "3"
 libc = "0.2"
 serde = { version = "1", features = ["derive", "rc"] }
-bincode = "1.3"
+bincode = { version = "2", default-features = false, features = ["std", "serde"] }
 once_cell = "1.18"
 # JIT: enabled with `--features jit`. Kept optional to avoid adding the
 # cranelift build dependency to users who only want the interpreter.
@@ -35,6 +35,9 @@ cranelift-jit = { version = "0.131", optional = true }
 cranelift-module = { version = "0.131", optional = true }
 cranelift-native = { version = "0.131", optional = true }
 fst-writer = "0.3"
+# Checkpoint files (`$save`, `--save-at`). Same version xezim-core compresses
+# artifacts with, so no second copy is built.
+zstd = "0.14"
 # Inflate only, for the FST time-table repair in `fst_finish`. Already in the
 # tree via fst-writer, so this adds no build cost.
 miniz_oxide = "0.8"
@@ -64,10 +67,6 @@ corosensei = { version = "0.3", default-features = false }
 # shelling out to GTKWave's `fst2vcd` would put a system tool on the test path.
 # Reader half of the `fst-writer` above, same author and format revision.
 fst-reader = "0.17"
-# `tests/xtrace_conformance.rs` reads a zstd-compressed XTrace dump back to
-# check that its header declares the compression (XTrace §6.8). Same version
-# xezim-core writes the stream with.
-zstd = "0.13"
 
 [build-dependencies]
 cc = "1"

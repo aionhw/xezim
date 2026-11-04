@@ -170,6 +170,10 @@ module randomize_issue_298_distribution ;
    initial begin
       XPortTransfer tr = mk_cfg_cmd() ;
       int fails = 0, bad = 0, acs = 0, low = 0;
+      // Scalar-only probe; array coverage: issue_298_size_coupled_struct_arrays
+      // and size_phase_class_shapes in randomize_issues_298_299.rs.
+      tr.wr_beats.rand_mode(0);
+      tr.rd_beats.rand_mode(0);
       for (int it = 0; it < 100; it++) begin
          if (tr.randomize() == 0) fails++ ;
          else begin

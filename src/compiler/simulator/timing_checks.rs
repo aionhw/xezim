@@ -55,7 +55,7 @@ pub fn set_no_tchk_msg(v: bool) {
 }
 
 /// A reference or data terminal of a check.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct TcTerm {
     sig: usize,
     /// Physical bit of a bit-select terminal; `None` watches the whole signal.
@@ -74,6 +74,7 @@ const ROLE_CLOSE: u8 = 1;
 const ROLE_DATA: u8 = 2;
 
 /// The terminals watching one signal, indexed by `CombItem::TimingCheck`.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct TcWatch {
     sig: usize,
     /// Value last seen: raw planes, or the whole value past 64 bits.
@@ -98,7 +99,7 @@ fn level(v: u64, x: u64, b: u32) -> u8 {
     ((((x >> b) & 1) << 1) | ((v >> b) & 1)).min(2) as u8
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum TcKind {
     /// `$setup`/`$hold`/`$setuphold` and `$recovery`/`$removal`/`$recrem`:
     /// a data event in `(ref - setup, ref + hold)` violates; a data event
@@ -144,7 +145,7 @@ enum TcKind {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct TimingCheckRt {
     kind: TcKind,
     notifier: Option<BitRef>,
@@ -173,7 +174,7 @@ const COND_CHECK: u8 = 8;
 
 /// The parts of a check that events rarely read: diagnostics, SDF matching
 /// and the condition expressions.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct TcCold {
     name: String,
     /// Instance scope and module definition, for SDF matching.

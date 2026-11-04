@@ -57,8 +57,7 @@ module top;
 endmodule
 "#;
 
-#[test]
-fn raise_then_drop_idiom_blocks_until_drop_not_t0() {
+pub(super) fn raise_then_drop_idiom_blocks_until_drop_not_t0() {
     let sim = simulate(SRC, 200).expect("simulate failed");
     let msgs = messages(&sim);
     let waiter = msgs
@@ -77,8 +76,7 @@ fn raise_then_drop_idiom_blocks_until_drop_not_t0() {
 
 /// The threshold/event may be a VARIABLE (a task argument), not only a
 /// literal. A wait driven by a runtime value must re-evaluate correctly.
-#[test]
-fn wait_idiom_works_with_a_variable_threshold() {
+pub(super) fn wait_idiom_works_with_a_variable_threshold() {
     let src = r#"
 class objection;
   int total;

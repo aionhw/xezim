@@ -3,6 +3,10 @@
 //! property, array element), and a member's declared default applies to a
 //! block-local or class-property struct too. Expected values come from the
 //! reference simulator.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -101,7 +105,7 @@ endmodule"#;
             "T|r8|0 0",
             "T|r9|0 0 0 0",
             "T|r10|3 4 3 4 3 4",
-            "T|r11|'{a:0, c:0, d:0}",
+            "T|r11|'{a:0, c:'h0, d:0}",
         ],
     );
 }

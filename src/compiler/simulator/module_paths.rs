@@ -26,6 +26,7 @@
 use super::*;
 
 /// The design's module paths, resolved to signal ids.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct ModulePaths {
     /// Path table index by destination signal id.
     dst: HashMap<usize, usize>,
@@ -35,10 +36,16 @@ pub(super) struct ModulePaths {
     /// the delay-scheduling path into the expression evaluator changed how
     /// the optimizer inlined the hot settle loop — about 1% more
     /// instructions on a design with no specify paths at all.
+    #[serde(skip, default = "cond_true_default")]
     cond_true: fn(&mut Simulator, &Option<Arc<Expression>>) -> bool,
 }
 
+fn cond_true_default() -> fn(&mut Simulator, &Option<Arc<Expression>>) -> bool {
+    Simulator::timing_cond_true
+}
+
 /// A module path into one net.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PathRt {
     delays: [u64; 12],
     /// Indices into `ModulePaths::srcs`.
@@ -49,6 +56,7 @@ struct PathRt {
 
 /// A path input terminal: its signal, the watch stamping its changes, and
 /// the time of its last change.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PathSrc {
     sig: usize,
     watch: usize,

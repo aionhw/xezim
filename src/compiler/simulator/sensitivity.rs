@@ -4,7 +4,192 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+thread_local! {
+    /// Origins used to exclude self-written members and packed selections
+    /// before their surviving dependencies resolve to backing signal ids.
+    static WHOLE_READS: RefCell<Option<ImplicitReadOrigins>> = const { RefCell::new(None) };
+    /// While a function body's reads are collected: the reads of the
+    /// functions it calls, kept apart from its own (`collect_callee_reads`).
+    static CALLEE_READS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+}
+
+#[derive(Default)]
+pub(super) struct ImplicitReadOrigins {
+    whole: HashSet<String>,
+    whole_writes: HashSet<String>,
+    packed: HashMap<String, PackedAccesses>,
+}
+
+#[derive(Default)]
+struct PackedAccesses {
+    width: u64,
+    reads: Vec<(u64, u64)>,
+    writes: Vec<(u64, u64)>,
+}
+
+struct PackedSelection {
+    name: String,
+    offset: u64,
+    width: u64,
+    total_width: u64,
+    dims: Vec<(i64, i64)>,
+    dynamic: bool,
+}
+
+/// Record `name` as read whole, when `collect_stmt_reads_whole` is collecting.
+fn note_whole_read(name: &str) {
+    WHOLE_READS.with(|c| {
+        if let Some(set) = c.borrow_mut().as_mut() {
+            set.whole.insert(name.to_string());
+        }
+    });
+}
+
+fn note_packed_access(selection: &PackedSelection, write: bool) {
+    WHOLE_READS.with(|c| {
+        if let Some(origins) = c.borrow_mut().as_mut() {
+            let access = origins.packed.entry(selection.name.clone()).or_default();
+            access.width = selection.total_width;
+            let ranges = if write {
+                &mut access.writes
+            } else {
+                &mut access.reads
+            };
+            ranges.push((selection.offset, selection.offset + selection.width));
+        }
+    });
+}
+
 impl Simulator {
+    /// §9.2.2.2.1 / §11.5 (#844): keep the longest static packed prefix
+    /// until self-written regions have been excluded. Signal ids alone lose
+    /// the distinction between, for example, `ds[0]` and `ds[1]`.
+    fn packed_sensitivity_selection(
+        expr: &Expression,
+        module: &ElaboratedModule,
+    ) -> Option<PackedSelection> {
+        match &expr.kind {
+            ExprKind::Paren(e) => Self::packed_sensitivity_selection(e, module),
+            ExprKind::Ident(h) => {
+                let name = Self::resolve_hier_name_static(h, module);
+                if module.arrays.contains_key(&name)
+                    || module.arrays_2d.contains_key(&name)
+                    || module.arrays_nd.contains_key(&name)
+                    || module.dynamic_arrays.contains(&name)
+                    || module.queue_vars.contains(&name)
+                    || module.associative_arrays.contains_key(&name)
+                {
+                    return None;
+                }
+                let mut dims = module
+                    .packed_full_dims
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_default();
+                let width = if !dims.is_empty() {
+                    dims.iter().try_fold(1u64, |w, &(l, r)| {
+                        w.checked_mul(l.abs_diff(r).checked_add(1)?)
+                    })?
+                } else {
+                    let w = module.signals.get(&name).map(|s| s.width).or_else(|| {
+                        module.var_decl_types.get(&name).map(|dt| {
+                            super::elaborate::resolve_type_width(
+                                dt,
+                                Some(&module.parameters),
+                                Some(&module.typedefs),
+                            )
+                        })
+                    })?;
+                    dims.push(
+                        module
+                            .ascending_packed
+                            .get(&name)
+                            .copied()
+                            .unwrap_or((i64::from(w).checked_sub(1)?, 0)),
+                    );
+                    u64::from(w)
+                };
+                (width > 0).then_some(PackedSelection {
+                    name,
+                    offset: 0,
+                    width,
+                    total_width: width,
+                    dims,
+                    dynamic: false,
+                })
+            }
+            ExprKind::Index { expr: base, index } => {
+                let mut selection = Self::packed_sensitivity_selection(base, module)?;
+                if selection.dynamic {
+                    return Some(selection);
+                }
+                let Some(index) = Self::constant_array_index(index, module) else {
+                    selection.dynamic = true;
+                    return Some(selection);
+                };
+                let (left, right) = *selection.dims.first()?;
+                if !(left.min(right)..=left.max(right)).contains(&index) {
+                    return None;
+                }
+                let element = selection
+                    .width
+                    .checked_div(left.abs_diff(right).checked_add(1)?)?;
+                let pos = if left < right {
+                    right - index
+                } else {
+                    index - right
+                };
+                selection.offset += u64::try_from(pos).ok()?.checked_mul(element)?;
+                selection.width = element;
+                selection.dims.remove(0);
+                if selection.dims.is_empty() && element > 1 {
+                    selection.dims.push((i64::try_from(element).ok()? - 1, 0));
+                }
+                Some(selection)
+            }
+            ExprKind::RangeSelect {
+                expr: base,
+                kind,
+                left,
+                right,
+            } => {
+                let mut selection = Self::packed_sensitivity_selection(base, module)?;
+                if selection.dynamic {
+                    return Some(selection);
+                }
+                let (Some(a), Some(b)) = (
+                    Self::constant_array_index(left, module),
+                    Self::constant_array_index(right, module),
+                ) else {
+                    selection.dynamic = true;
+                    return Some(selection);
+                };
+                use crate::ast::expr::RangeKind;
+                let (l, r) = *selection.dims.first()?;
+                let (a, b) = match kind {
+                    RangeKind::Constant => (a, b),
+                    RangeKind::IndexedUp if b > 0 && l >= r => (a.checked_add(b - 1)?, a),
+                    RangeKind::IndexedUp if b > 0 => (a, a.checked_add(b - 1)?),
+                    RangeKind::IndexedDown if b > 0 && l >= r => (a, a.checked_sub(b - 1)?),
+                    RangeKind::IndexedDown if b > 0 => (a.checked_sub(b - 1)?, a),
+                    _ => return None,
+                };
+                let lo = a.min(b);
+                let hi = a.max(b);
+                if lo < l.min(r) || hi > l.max(r) || (a != b && (a > b) != (l > r)) {
+                    return None;
+                }
+                let element = selection.width.checked_div(l.abs_diff(r).checked_add(1)?)?;
+                let pos = if l < r { r - hi } else { lo - r };
+                selection.offset += u64::try_from(pos).ok()?.checked_mul(element)?;
+                selection.width = lo.abs_diff(hi).checked_add(1)?.checked_mul(element)?;
+                selection.dims[0] = (a, b);
+                Some(selection)
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn collect_leaf_idents(expr: &Expression, out: &mut HashSet<String>) {
         match &expr.kind {
             ExprKind::Ident(hier) if hier.path.len() == 1 => {
@@ -47,6 +232,7 @@ impl Simulator {
                     Self::collect_leaf_idents(p.expr(), out);
                 }
             }
+            ExprKind::TypedPattern { pattern, .. } => Self::collect_leaf_idents(pattern, out),
             ExprKind::Replication { count, exprs } => {
                 Self::collect_leaf_idents(count, out);
                 for e in exprs {
@@ -258,6 +444,26 @@ impl Simulator {
         v
     }
 
+    /// The reads of the function `name` a call reaches (`collect_function_reads`).
+    /// Inside another function's body they go to that function's
+    /// `CALLEE_READS` sink, apart from its own reads, so its frame names
+    /// (formals, locals) do not filter them (§13.4: the callee's `x` is not
+    /// the caller's formal `x`).
+    fn collect_callee_reads(name: &str, module: &ElaboratedModule, reads: &mut HashSet<String>) {
+        let mut got: HashSet<String> = HashSet::default();
+        Self::collect_function_reads(name, module, &mut got);
+        let rest = CALLEE_READS.with(|c| match c.borrow_mut().as_mut() {
+            Some(sink) => {
+                sink.extend(got);
+                None
+            }
+            None => Some(got),
+        });
+        if let Some(got) = rest {
+            reads.extend(got);
+        }
+    }
+
     pub(super) fn collect_function_reads(
         name: &str,
         module: &ElaboratedModule,
@@ -292,8 +498,14 @@ impl Simulator {
         if !entered {
             return;
         }
+        // Callee frame writes must not classify a caller's same-named
+        // packed signal as wholly written (#844). Collect the function with
+        // ordinary conservative dependencies, then record only its external
+        // reads after removing formals and locals below.
+        let outer_origins = WHOLE_READS.with(|c| c.replace(None));
         let mut scratch_writes: HashSet<String> = HashSet::default();
         let mut body_reads: HashSet<String> = HashSet::default();
+        let outer = CALLEE_READS.with(|c| c.replace(Some(HashSet::default())));
         // §13.4.3: a default-argument expression is evaluated at call time, so
         // its reads are part of the caller's sensitivity too.
         for port in &fdecl.ports {
@@ -304,12 +516,36 @@ impl Simulator {
         for item in &fdecl.items {
             Self::collect_stmt_reads(item, module, &mut body_reads, &mut scratch_writes);
         }
+        let callee_reads = CALLEE_READS.with(|c| c.replace(outer)).unwrap_or_default();
+        // §13.4: the formals, the return variable and the block locals are
+        // frame state, not module signals the caller can be sensitive to. A
+        // formal named like a design net (`uj_imm(logic [31:0] instruction_i)`
+        // beside a decoder port `instruction_i`) made the calling assign
+        // depend on that unrelated net — and trip the elided-port report.
+        let leaf = name.rsplit('.').next().unwrap_or(name);
+        let mut frame: HashSet<&str> = fdecl.ports.iter().map(|p| p.name.name.as_str()).collect();
+        frame.insert(leaf);
+        fn local_names<'a>(items: &'a [Statement], out: &mut HashSet<&'a str>) {
+            for st in items {
+                match &st.kind {
+                    StatementKind::VarDecl { declarators, .. } => {
+                        out.extend(declarators.iter().map(|d| d.name.name.as_str()));
+                    }
+                    StatementKind::SeqBlock { stmts, .. } => local_names(stmts, out),
+                    _ => {}
+                }
+            }
+        }
+        local_names(&fdecl.items, &mut frame);
+        body_reads.retain(|r| !frame.contains(r.as_str()));
+        body_reads.extend(callee_reads);
         // A bare read in the body of an INSTANCE's function names that
         // instance's variable (`internal_func_dep` inside
         // `dut.eval_with_hidden_dep` is `dut.internal_func_dep`) — the bare
         // spelling resolves to a nonexistent top-level signal and drops out of
         // the sensitivity set. Qualify it wherever only the scoped one exists.
         let scope = name.rsplit_once('.').map(|(s, _)| s);
+        WHOLE_READS.with(|c| c.replace(outer_origins));
         for r in body_reads {
             if let Some(scope) = scope {
                 // The body may be unrewritten (bare spellings), and a same-named
@@ -317,9 +553,12 @@ impl Simulator {
                 // a superset sensitivity is always safe, and the sensitivity
                 // builder drops whichever spelling resolves to no signal.
                 if !r.contains('.') {
-                    reads.insert(format!("{}.{}", scope, r));
+                    let scoped = format!("{}.{}", scope, r);
+                    note_whole_read(&scoped);
+                    reads.insert(scoped);
                 }
             }
+            note_whole_read(&r);
             reads.insert(r);
         }
         ACTIVE.with(|a| {
@@ -585,6 +824,9 @@ impl Simulator {
                     Self::collect_rooted_ident_names(it.expr(), out);
                 }
             }
+            ExprKind::TypedPattern { pattern, .. } => {
+                Self::collect_rooted_ident_names(pattern, out)
+            }
             ExprKind::Inside { expr, ranges } => {
                 Self::collect_rooted_ident_names(expr, out);
                 for r in ranges {
@@ -619,6 +861,17 @@ impl Simulator {
         module: &ElaboratedModule,
         reads: &mut HashSet<String>,
     ) {
+        if matches!(
+            expr.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+        ) && WHOLE_READS.with(|c| c.borrow().is_some())
+            && let Some(selection) = Self::packed_sensitivity_selection(expr, module)
+        {
+            note_packed_access(&selection, false);
+            reads.insert(selection.name);
+            Self::collect_lhs_index_reads(expr, module, reads);
+            return;
+        }
         // §14.13: a clocking-signal read (`cb.sig`, `iface.cb.sig`, either the
         // flat-Ident or MemberAccess shape) depends on the hidden sample mirror,
         // NOT on the underlying net — the sample only moves at the block's clock
@@ -691,6 +944,13 @@ impl Simulator {
                         reads.insert(parent.to_string());
                     }
                 }
+                note_whole_read(&name);
+                // §9.2.2.2.1, §7.6: a whole fixed unpacked array, or a slice
+                // of one (the range arm recurses here), has no signal of its
+                // own: its elements are the signals that change, so depend on
+                // them. `always_comb s = b;` never re-fired after time zero
+                // (#867).
+                Self::insert_unpacked_elem_reads(&name, module, reads);
                 reads.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
@@ -743,6 +1003,7 @@ impl Simulator {
                             }
                         }
                     } else {
+                        note_whole_read(&name);
                         reads.insert(name);
                     }
                 } else if let Some(elems) = Self::multi_dim_elem_names(base, index, module) {
@@ -822,6 +1083,9 @@ impl Simulator {
                     Self::collect_expr_reads(p.expr(), module, reads);
                 }
             }
+            ExprKind::TypedPattern { pattern, .. } => {
+                Self::collect_expr_reads(pattern, module, reads)
+            }
             ExprKind::Replication { count, exprs } => {
                 Self::collect_expr_reads(count, module, reads);
                 for e in exprs {
@@ -854,9 +1118,9 @@ impl Simulator {
                             // and would collect unprefixed, unresolvable reads.
                             let full = Self::resolve_hier_name_static(hier, module);
                             if full != seg.name.name && module.functions.contains_key(&full) {
-                                Self::collect_function_reads(&full, module, reads);
+                                Self::collect_callee_reads(&full, module, reads);
                             } else {
-                                Self::collect_function_reads(&seg.name.name, module, reads);
+                                Self::collect_callee_reads(&seg.name.name, module, reads);
                             }
                         }
                     }
@@ -919,7 +1183,9 @@ impl Simulator {
                                 parts.push(seg.name.name.clone());
                             }
                             parts.reverse();
-                            reads.insert(parts.join("."));
+                            let name = parts.join(".");
+                            note_whole_read(&name);
+                            reads.insert(name);
                             // A member of a PACKED struct/union has no separate
                             // leaf signal — the value lives in the parent's bit
                             // slice. Register the parent when it is an actual
@@ -1050,9 +1316,25 @@ impl Simulator {
         writes: &mut HashSet<String>,
         mut arrays: Option<&mut HashSet<String>>,
     ) {
+        if matches!(
+            lhs.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+        ) && WHOLE_READS.with(|c| c.borrow().is_some())
+            && let Some(selection) = Self::packed_sensitivity_selection(lhs, module)
+        {
+            note_packed_access(&selection, true);
+            writes.insert(selection.name);
+            return;
+        }
         match &lhs.kind {
             ExprKind::Ident(hier) => {
-                writes.insert(Self::resolve_hier_name_static(hier, module));
+                let name = Self::resolve_hier_name_static(hier, module);
+                WHOLE_READS.with(|c| {
+                    if let Some(origins) = c.borrow_mut().as_mut() {
+                        origins.whole_writes.insert(name.clone());
+                    }
+                });
+                writes.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
                 if let Some(elems) = Self::multi_dim_elem_names(base, index, module) {
@@ -1122,6 +1404,41 @@ impl Simulator {
             }
             _ => {}
         }
+    }
+
+    /// The element names of the fixed unpacked array `name` (`a[3]`,
+    /// `m[1][4]`), when it is one with at most 65,536 elements.
+    fn insert_unpacked_elem_reads(
+        name: &str,
+        module: &ElaboratedModule,
+        reads: &mut HashSet<String>,
+    ) {
+        if module.dynamic_arrays.contains(name) || module.associative_arrays.contains_key(name) {
+            return;
+        }
+        let dims: Vec<(i64, i64)> = if let Some(&(lo, hi, _)) = module.arrays.get(name) {
+            vec![(lo, hi)]
+        } else if let Some(&(d0, d1, _)) = module.arrays_2d.get(name) {
+            vec![d0, d1]
+        } else if let Some((d, _)) = module.arrays_nd.get(name) {
+            d.clone()
+        } else {
+            return;
+        };
+        let count = dims
+            .iter()
+            .try_fold(1u64, |n, &(l, r)| n.checked_mul(l.abs_diff(r) + 1));
+        if !count.is_some_and(|n| n <= 1 << 16) {
+            return;
+        }
+        let mut names = vec![name.to_string()];
+        for (l, r) in dims {
+            names = names
+                .iter()
+                .flat_map(|p| (l.min(r)..=l.max(r)).map(move |i| format!("{p}[{i}]")))
+                .collect();
+        }
+        reads.extend(names);
     }
 
     /// Collect reads/writes from a statement (for always @* / always_comb blocks).
@@ -1546,26 +1863,50 @@ impl Simulator {
                 let id = self.resolve_ident_id(hier, scope_hint)?;
                 let bit = Self::try_const_u64(index)?;
                 // §7.4.1: `bit` is a DECLARED index but `BitRef` addresses a
-                // PHYSICAL bit, so a non-zero-based vector needs rebasing —
-                // `logic [3:1] w` keeps declared bit 1 at offset 0. Fusing
-                // `assign y = w[1]` without this read declared bit 2 instead.
-                //
-                // Only the low index was wrong: `w[3]` failed the range check
-                // below, fell through to the bytecode path (which rebases) and
-                // came out right, so the two forms disagreed with each other.
-                let base_lo = self
+                // PHYSICAL bit. A descending `logic [3:1] w` keeps declared
+                // bit 1 at offset 0. An ascending `logic [0:N] v` mirrors:
+                // label 0 is the MSB. Subtracting only the low bound wrote
+                // `v[0] = in_valid` into the LSB, which the interpreter then
+                // read back as `v[N]` — a one-stage pipeline's out_valid
+                // tracked in_valid and its ready bit stayed x.
+                let scoped = scope_hint.map(|sc| format!("{}.{}", sc, name));
+                let dim = self
                     .module
                     .packed_full_dims
                     .get(&name)
+                    .or_else(|| {
+                        scoped
+                            .as_ref()
+                            .and_then(|k| self.module.packed_full_dims.get(k))
+                    })
                     .or_else(|| {
                         hier.path
                             .last()
                             .and_then(|s| self.module.packed_full_dims.get(s.name.name.as_str()))
                     })
                     .and_then(|d| d.first())
-                    .map(|&(l, r)| l.min(r))
-                    .unwrap_or(0);
-                let phys = (bit as i64) - base_lo;
+                    .copied()
+                    .or_else(|| {
+                        self.module
+                            .ascending_packed
+                            .get(&name)
+                            .or_else(|| {
+                                scoped
+                                    .as_ref()
+                                    .and_then(|k| self.module.ascending_packed.get(k))
+                            })
+                            .or_else(|| {
+                                hier.path.last().and_then(|s| {
+                                    self.module.ascending_packed.get(s.name.name.as_str())
+                                })
+                            })
+                            .copied()
+                    });
+                let phys = match dim {
+                    Some((l, r)) if l < r => r - bit as i64,
+                    Some((l, r)) => bit as i64 - l.min(r),
+                    None => bit as i64,
+                };
                 if phys >= 0 && (phys as u32) < self.signal_widths[id] {
                     Some(BitRef {
                         sig_id: id as u32,
@@ -1747,6 +2088,98 @@ impl Simulator {
         }
     }
 
+    /// `collect_stmt_reads`, also returning the names `stmt` reads as a whole
+    /// value (for `self_written_read`).
+    pub(super) fn collect_stmt_reads_whole(
+        stmt: &Statement,
+        module: &ElaboratedModule,
+        reads: &mut HashSet<String>,
+        writes: &mut HashSet<String>,
+    ) -> ImplicitReadOrigins {
+        let outer = WHOLE_READS.with(|c| c.replace(Some(ImplicitReadOrigins::default())));
+        Self::collect_stmt_reads(stmt, module, reads, writes);
+        WHOLE_READS.with(|c| c.replace(outer)).unwrap_or_default()
+    }
+
+    /// §9.2.2.2.1(b): is read `r` excluded from a block's implicit sensitivity
+    /// because the block writes it? Exact; a written '.'-prefix (`out` written,
+    /// `out.vld` read); or a bare base that is in `reads` only as the prefix of
+    /// member reads the block itself writes — `collect_expr_reads` records
+    /// `decoded.op` AND `decoded`, and with `decoded.op` written the surviving
+    /// `decoded` re-armed the block on its own two-step member write
+    /// (`decoded.op = 0; decoded.op = x;`) every settle pass, to the limit
+    /// (CVA6's decoder, which reads back the `op` it just wrote). A base with
+    /// any member read the block does NOT write stays: `s.a` written, `s.b`
+    /// read — `s` is the only signal that carries `s.b`.
+    pub(super) fn self_written_read(
+        r: &str,
+        reads: &HashSet<String>,
+        writes: &HashSet<String>,
+        origins: &ImplicitReadOrigins,
+    ) -> bool {
+        fn direct(r: &str, writes: &HashSet<String>) -> bool {
+            if writes.contains(r) {
+                return true;
+            }
+            let mut base: &str = r;
+            while let Some(pos) = base.rfind('.') {
+                base = &base[..pos];
+                if writes.contains(base) {
+                    return true;
+                }
+            }
+            false
+        }
+        if direct(r, writes) {
+            // Packed reads and writes share a signal id, but only overlapping
+            // static regions are excluded. Keep any portion read from outside
+            // this block, including a whole read beside a partial write.
+            if writes.contains(r)
+                && !origins.whole_writes.contains(r)
+                && let Some(access) = origins.packed.get(r)
+                && !access.writes.is_empty()
+            {
+                let covered = |(mut lo, end): (u64, u64)| {
+                    while lo < end {
+                        let next = access
+                            .writes
+                            .iter()
+                            .filter(|&&(a, b)| a <= lo && b > lo)
+                            .map(|&(_, b)| b)
+                            .max()
+                            .unwrap_or(lo);
+                        if next == lo {
+                            return false;
+                        }
+                        lo = next;
+                    }
+                    true
+                };
+                if access.reads.iter().any(|&range| !covered(range))
+                    || (origins.whole.contains(r) && !covered((0, access.width)))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+        // A base the block also reads as a whole (`out = s` beside
+        // `s.a = ...`) stays: every member it does not write reaches `out`
+        // through it.
+        if origins.whole.contains(r) {
+            return false;
+        }
+        let prefix = format!("{r}.");
+        if !writes.iter().any(|w| w.starts_with(&prefix)) {
+            return false;
+        }
+        let mut member_reads = reads.iter().filter(|x| x.starts_with(&prefix));
+        let Some(first) = member_reads.next() else {
+            return false;
+        };
+        direct(first, writes) && member_reads.all(|m| direct(m, writes))
+    }
+
     /// §9.4.2.2 — the inferred sensitivity of `@*` / `@(*)`: every signal READ
     /// by the statement it guards, minus the ones that statement writes (a
     /// variable assigned by the block is not part of its own sensitivity).
@@ -1762,7 +2195,7 @@ impl Simulator {
         let mut writes: HashSet<String> = HashSet::default();
         // §9.2.2.2: `@*` sensitivity excludes called-function CONTENTS.
         SKIP_FN_BODY_READS.with(|c| c.set(true));
-        Self::collect_stmt_reads(body, &self.module, &mut reads, &mut writes);
+        let whole = Self::collect_stmt_reads_whole(body, &self.module, &mut reads, &mut writes);
         SKIP_FN_BODY_READS.with(|c| c.set(false));
         // Registration usually runs with the hint unset (the process body
         // just executed); the executing instance's own scope is the correct
@@ -1777,22 +2210,8 @@ impl Simulator {
             // §9.2.2.2.1: exclude reads of variables this block writes —
             // at MEMBER granularity too (same rule as the comb-entry path),
             // or the base fallback below would re-introduce the self-dep.
-            if writes.contains(r) {
+            if Self::self_written_read(r, &reads, &writes, &whole) {
                 continue;
-            }
-            {
-                let mut wbase: &str = r.as_str();
-                let mut self_written = false;
-                while let Some(pos) = wbase.rfind('.') {
-                    wbase = &wbase[..pos];
-                    if writes.contains(wbase) {
-                        self_written = true;
-                        break;
-                    }
-                }
-                if self_written {
-                    continue;
-                }
             }
             // Prefer the instance-scoped name when one exists, mirroring the
             // scope-first resolution the rest of the runtime performs. A
@@ -3618,10 +4037,66 @@ impl Simulator {
                 .clone(),
             None => self.class_context_stack.last().cloned().flatten()?,
         };
-        if !self.cond_operand_gated(cond, handle.unwrap_or(0), &cls) {
+        if !Self::cond_triggered_monotone(cond)
+            || !self.cond_operand_gated(cond, handle.unwrap_or(0), &cls)
+        {
             return None;
         }
         Some(reads.iter().map(|n| name_bit(n)).collect())
+    }
+
+    /// `<ev>.triggered` as a whole operand: a two-or-more segment name ending
+    /// in `triggered`, or a member access of it. Returns the event operand.
+    fn cond_triggered_event(e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Ident(h)
+                if h.path.len() >= 2
+                    && h.path
+                        .last()
+                        .is_some_and(|s| s.name.name == "triggered" && s.selects.is_empty()) =>
+            {
+                Some(Expression::new(ExprKind::Ident(hier_prefix(h)), e.span))
+            }
+            ExprKind::MemberAccess { expr, member } if member.name == "triggered" => {
+                Some((**expr).clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// §15.5.3: `.triggered` turns false at the end of its time slot with no
+    /// write anyone could note, so a gated waiter may only depend on it where
+    /// that change cannot make the condition true: as an operand of `&&`,
+    /// `||` or parentheses. A trigger, which can, notes `triggered`.
+    fn cond_triggered_monotone(e: &Expression) -> bool {
+        fn mentions_triggered(e: &Expression) -> bool {
+            let mut names = HashSet::default();
+            Simulator::collect_condition_read_names(e, &mut names);
+            names.contains("triggered")
+        }
+        if Self::cond_triggered_event(e).is_some() {
+            return true;
+        }
+        match &e.kind {
+            ExprKind::Binary {
+                op: BinaryOp::LogAnd | BinaryOp::LogOr,
+                left,
+                right,
+            } => Self::cond_triggered_monotone(left) && Self::cond_triggered_monotone(right),
+            ExprKind::Paren(inner) => Self::cond_triggered_monotone(inner),
+            _ => !mentions_triggered(e),
+        }
+    }
+
+    /// §6.19 / §8.23 / §26.3: `scope::lit` names an enum literal declared by
+    /// class or package `scope`. A literal is a constant, so a wait reading
+    /// it never needs a re-check for it.
+    fn scoped_enum_literal(&self, scope: &str, lit: &str) -> bool {
+        if self.module.classes.contains_key(scope) {
+            self.class_enum_member(scope, lit).is_some()
+        } else {
+            self.package_enum_member(scope, lit).is_some()
+        }
     }
 
     /// `cond_gate_for`'s operand check.
@@ -3660,6 +4135,11 @@ impl Simulator {
                     .and_then(|o| o.as_ref())
                     .is_some_and(|i| i.properties.contains_key(n))
         };
+        // `ev.triggered` re-checks on every trigger (`note_event_trigger`)
+        // and on writes to the names reaching the event.
+        if let Some(ev) = Self::cond_triggered_event(e) {
+            return self.cond_operand_gated(&ev, this_h, this_cls);
+        }
         match &e.kind {
             ExprKind::Number(_) | ExprKind::StringLiteral(_) | ExprKind::This => true,
             ExprKind::Ident(h) => {
@@ -3667,6 +4147,15 @@ impl Simulator {
                     return false;
                 }
                 let head = h.path[0].name.name.as_str();
+                // `Cls::LIT` / `pkg::LIT` outside a subroutine body.
+                if h.path.len() == 2
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && !method_local(head)
+                    && !this_member(head)
+                    && self.scoped_enum_literal(head, &h.path[1].name.name)
+                {
+                    return true;
+                }
                 let head_ok = if method_local(head) {
                     !self.vif_local_names.contains(head)
                 } else {
@@ -3697,18 +4186,43 @@ impl Simulator {
                 true
             }
             ExprKind::MemberAccess { expr, member } => {
+                // `Cls::LIT` / `pkg::LIT` inside a subroutine body, which the
+                // elaborator leaves as a member access of the scope name.
+                if let ExprKind::Ident(h) = &expr.kind
+                    && h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && !method_local(&h.path[0].name.name)
+                    && !this_member(&h.path[0].name.name)
+                    && self.scoped_enum_literal(&h.path[0].name.name, &member.name)
+                {
+                    return true;
+                }
                 self.cond_operand_gated(expr, this_h, this_cls)
                     && obj_prop(self.eval_handle_expr(expr).unwrap_or(0), &member.name)
             }
-            // A collection builtin on a gated operand (`m_q.size()`).
+            // A collection builtin on a gated operand (`m_q.size()`). A
+            // user-defined method with the same name can read other fields;
+            // gating only on its receiver misses those dependencies and can
+            // repeatedly resume a false wait when call setup notes writes.
             ExprKind::Call { func, args } => {
                 let ExprKind::MemberAccess { expr, member } = &func.kind else {
                     return false;
                 };
+                // A mailbox's `num()` changes on put and get, which note no
+                // write (§15.4.3).
+                if member.name == "num"
+                    && self
+                        .eval_handle_expr(expr)
+                        .is_some_and(|h| self.mailboxes.contains_key(&h))
+                {
+                    return false;
+                }
                 matches!(
                     member.name.as_str(),
                     "size" | "num" | "exists" | "first" | "last" | "next" | "prev"
-                ) && self.cond_operand_gated(expr, this_h, this_cls)
+                ) && !self.class_expr_has_method(expr, &member.name)
+                    && self.cond_operand_gated(expr, this_h, this_cls)
                     && args
                         .iter()
                         .all(|a| self.cond_operand_gated(a, this_h, this_cls))

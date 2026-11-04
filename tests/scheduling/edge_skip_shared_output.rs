@@ -115,10 +115,10 @@ fn disjoint_bit_slices_stay_skippable() {
         r#"
 module tb;
   reg clk; reg [7:0] d;
+  reg [3:0] r;
   initial begin clk = 0; d = 0; #2000 $display("d=%0d r=%0d", d, r); $finish; end
   always #5 clk = ~clk;
   always @(posedge clk) d <= d + 8'd1;
-  reg [3:0] r;
   genvar i;
   generate for (i = 0; i < 4; i = i + 1) begin: H
       always @(posedge clk) r[i] <= d[i];

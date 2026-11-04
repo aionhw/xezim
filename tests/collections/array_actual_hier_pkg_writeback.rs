@@ -6,6 +6,10 @@
 //! spellings on their plain hierarchical name; it once returned no storage
 //! for them, so the call bound the formal as a scalar and the output was
 //! lost. Expected lines are the reference simulator's output.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -44,8 +48,8 @@ endmodule
 "#,
     );
     let want = [
-        "T| b3 u.A='{\"h\":8 } u.F='{1, 2}",
-        "T| b3 u.A='{\"h\":8, \"i\":9 }",
+        "T| b3 u.A='{\"h\":8} u.F='{1, 2}",
+        "T| b3 u.A='{\"h\":8, \"i\":9}",
         "T| b3 top.u.A num=1",
     ];
     assert_eq!(out, want, "{out:?}");
@@ -129,7 +133,7 @@ endmodule
     let want = [
         "T| e3 u.A num=1 t=2 F1=77",
         "T| e3 i.IA num=1 k=1 IF2=5",
-        "T| e3 PA='{-2:4 } PF1=77",
+        "T| e3 PA='{-2:4} PF1=77",
     ];
     assert_eq!(out, want, "{out:?}");
 }

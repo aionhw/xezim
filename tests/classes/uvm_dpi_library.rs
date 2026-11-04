@@ -166,8 +166,7 @@ module top;
 endmodule
 "#;
 
-#[test]
-fn uvm_1_2_dpi_regex_config_factory_cmdline() {
+pub(super) fn uvm_1_2_dpi_regex_config_factory_cmdline() {
     let sim = run_uvm_dpi(
         "1.2",
         REGEX_BENCH,
@@ -239,8 +238,7 @@ module top;
 endmodule
 "#;
 
-#[test]
-fn uvm_1_2_dpi_regex_diagnostics() {
+pub(super) fn uvm_1_2_dpi_regex_diagnostics() {
     let sim = run_uvm_dpi("1.2", REGEX_ERRORS_BENCH, &[]);
     let out = lines(&sim);
     assert_lines(
@@ -279,8 +277,7 @@ fn uvm_1_2_dpi_regex_diagnostics() {
 /// 1800.2 changed uvm_glob_to_re's answer for an empty glob from "" (a
 /// regex matching everything) to "/^$/"; the builtin follows the release
 /// it is compiled with.
-#[test]
-fn uvm_1800_2_2017_dpi_empty_glob_and_wildcard_config() {
+pub(super) fn uvm_1800_2_2017_dpi_empty_glob_and_wildcard_config() {
     const SRC: &str = r#"
 import uvm_pkg::*;
 `include "uvm_macros.svh"
@@ -401,8 +398,7 @@ module top;
 endmodule
 "#;
 
-#[test]
-fn uvm_1_2_dpi_hdl_backdoor_paths() {
+pub(super) fn uvm_1_2_dpi_hdl_backdoor_paths() {
     let sim = run_uvm_dpi("1.2", HDL_BENCH, &[]);
     let out = lines(&sim);
     // Reference-verified line for line, except `force_slice`: the C code

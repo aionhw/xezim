@@ -112,6 +112,51 @@ fn tagged(so: &Path, sv_file: &str) -> Vec<String> {
         .collect()
 }
 
+/// §26.3 / §35.5.4: identical SV names in separate packages bind independently.
+#[test]
+fn package_dpi_import_names_are_scoped_676() {
+    let so = compile("tests/dpi/scoped_imports_676.c");
+    let mut lines = tagged(&so, "tests/dpi/scoped_imports_676.sv");
+    lines.sort();
+    assert_eq!(lines, [
+        "T|design|306", "T|import|105", "T|scoped|101 202",
+        "T|tasks|11 22 2", "T|wrapper|103 204",
+    ]);
+}
+
+/// §23.9: a class property receiver shadows a package with the same name.
+#[test]
+fn package_dpi_name_does_not_capture_a_class_property_676() {
+    let so = compile("tests/dpi/scoped_imports_676.c");
+    let mut lines = tagged(&so, "tests/dpi/scoped_imports_shadow_676.sv");
+    lines.sort();
+    assert_eq!(lines, [
+        "T|design|306", "T|import|105", "T|scoped|101 202", "T|shadow|99",
+        "T|tasks|11 22 2", "T|wrapper|103 204",
+    ]);
+}
+
+/// §23.9 / §26.3: a wildcard import does not displace module/class declarations.
+#[test]
+fn package_dpi_alias_does_not_capture_local_subroutines() {
+    let so = compile("tests/dpi/scoped_imports_local_shadow.c");
+    let mut lines = tagged(&so, "tests/dpi/scoped_imports_local_shadow.sv");
+    lines.sort();
+    assert_eq!(
+        lines,
+        [
+            "T|import|12",
+            "T|local_task|42 1",
+            "T|local|42",
+            "T|method|93 99",
+            "T|package_task|11",
+            "T|package|12 12",
+            "T|receiver|99",
+            "T|wrapper_task|11",
+        ]
+    );
+}
+
 /// The `T|` lines with the same-time steps of different processes sorted
 /// (their order within a time slot is not defined).
 fn tagged_sorted(so: &Path, sv_file: &str) -> Vec<String> {

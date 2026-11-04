@@ -36,8 +36,7 @@ fn run_xezim(src: &str, tag: &str) -> String {
 // Bug 1: Static class property method calls
 // ============================================================================
 
-#[test]
-fn static_string_len_works() {
+pub(super) fn static_string_len_works() {
     let src = r#"
 class tprinter;
   local static string m_space;
@@ -68,8 +67,7 @@ endmodule
     );
 }
 
-#[test]
-fn static_string_substr_works() {
+pub(super) fn static_string_substr_works() {
     let src = r#"
 class tprinter;
   local static string m_space;
@@ -98,8 +96,7 @@ endmodule
 // Bug 2: String-returning method call in $write/$fwrite
 // ============================================================================
 
-#[test]
-fn fwrite_with_string_returning_call() {
+pub(super) fn fwrite_with_string_returning_call() {
     let src = r#"
 class box;
   string content = "Hello World";
@@ -128,8 +125,7 @@ endmodule
     assert!(out.contains("DONE"), "got:\n{}", out);
 }
 
-#[test]
-fn write_with_bare_string_call_in_class_method() {
+pub(super) fn write_with_bare_string_call_in_class_method() {
     let src = r#"
 class printer;
   string text = "Formatted-Output";
@@ -158,8 +154,7 @@ endmodule
 // Bug 3: Package-qualified static method call
 // ============================================================================
 
-#[test]
-fn pkg_qualified_static_call() {
+pub(super) fn pkg_qualified_static_call() {
     let src = r#"
 package my_pkg;
   class counter;
@@ -186,11 +181,11 @@ endmodule
     assert!(out.contains("COUNT 3"), "expected COUNT 3, got:\n{}", out);
 }
 
-#[test]
-fn pkg_qualified_static_factory_create() {
+pub(super) fn pkg_qualified_static_factory_create() {
     let src = r#"
 package factory_pkg;
   class product;
+    function new(string name = ""); endfunction
   endclass
   class maker;
     static function product create();

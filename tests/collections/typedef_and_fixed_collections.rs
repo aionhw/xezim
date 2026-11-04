@@ -14,6 +14,10 @@
 //!
 //! Expected values come from the reference simulator; `#[ignore]` pins are
 //! confirmed gaps with the reference's output.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -150,7 +154,7 @@ fn fixed_array_of_collections_module() {
             "T|16 ins/del '{100, 1, 2, 3, 4, 5, 6, 7}",
             "T|17 pop=100 7 size=6",
             "T|18 dyn '{0, 0, 9} '{0, 0, 9}",
-            "T|19 aa num=2 '{\"a\":1, \"b\":2 }",
+            "T|19 aa num=2 '{\"a\":1, \"b\":2}",
             "T|20 eq=1",
             "T|21 del size=0",
             "T|22 uniq='{1, 2, 3}",
@@ -187,7 +191,7 @@ fn typedef_collection_struct_members() {
             "T|09 fa al size=1",
             "T|10 daa d size=3 '{0, 0, 5}",
             "T|11 concat '{16, 32, 33, 34, 64, 65}",
-            "T|12 regs '{\"A\":'{al:'{16}, at:1}, \"B\":'{al:'{32, 33, 34}, at:2} }",
+            "T|12 regs '{\"A\":'{al:'{16}, at:'h1}, \"B\":'{al:'{32, 33, 34}, at:'h2}}",
             "T|13 key=A size=1",
             "T|13 key=B size=3",
             "T|14 B[0]=32",
@@ -208,11 +212,11 @@ fn typedef_collection_members_mixed() {
     assert_eq!(
         t_lines(include_str!("typedef_coll_mixed.sv")),
         [
-            "T|01 s q='{1, 2, 3} a='{\"k\":4 } dsize=3",
+            "T|01 s q='{1, 2, 3} a='{\"k\":4} dsize=3",
             "T|02 n '{9} '{9}",
-            "T|03 arr 2 1 '{q:'{7, 8}, a:'{\"z\":1 }, d:'{}}",
+            "T|03 arr 2 1 '{q:'{7, 8}, a:'{\"z\":1}, d:'{}}",
             "T|04 aa num=1 q='{11}",
-            "T|08 fa '{\"a\":1, \"b\":2 } num=2",
+            "T|08 fa '{\"a\":1, \"b\":2} num=2",
             "T|09 fq '{7, 8, 9}",
             "T|10 fq idx '{1, 2}",
             "T|11 fq[0][0]=7",
@@ -246,7 +250,7 @@ fn assoc_of_struct_delete_key() {
         [
             "T|01 d=1 t=1 i=1 di=1",
             "T|02 d=0 t=0 di=0",
-            "T|03 d='{\"b\":'{x:1} } di='{2:'{x:1} }",
+            "T|03 d='{\"b\":'{x:1}} di='{2:'{x:1}}",
             "T|04 d=0 di=0",
         ]
     );
@@ -258,14 +262,14 @@ fn class_struct_prop_string_keyed_member() {
         .into_iter()
         .filter(|l| !l.starts_with("T|02"))
         .collect();
-    assert_eq!(got, ["T|01 '{1} '{\"x\":3 }", "T|03 '{4}",]);
+    assert_eq!(got, ["T|01 '{1} '{\"x\":3}", "T|03 '{4}",]);
 }
 
 #[test]
 fn pin_class_queue_push_struct_with_dyn_member() {
     assert_eq!(
         t_lines(include_str!("class_struct_prop_colls.sv")),
-        ["T|01 '{1} '{\"x\":3 }", "T|02 '{1}", "T|03 '{4}",]
+        ["T|01 '{1} '{\"x\":3}", "T|02 '{1}", "T|03 '{4}",]
     );
 }
 
@@ -311,11 +315,11 @@ fn class_struct_prop_dyn_member_siblings() {
     assert_eq!(
         t_lines(include_str!("class_struct_prop_dyn_siblings.sv")),
         [
-            "T|01 '{1} '{\"x\":3 } 2",
+            "T|01 '{1} '{\"x\":3} 2",
             "T|02 '{1} '{1} '{1}",
             "T|03 c='{1} m='{}",
-            "T|04 '{q:'{1}, a:'{\"x\":3 }, k:5}",
-            "T|05 '{q:'{1}, a:'{\"x\":3 }, k:5}",
+            "T|04 '{q:'{1}, a:'{\"x\":3}, k:5}",
+            "T|05 '{q:'{1}, a:'{\"x\":3}, k:5}",
             "T|06 '{q:'{8}, k:2} '{8}",
         ]
     );

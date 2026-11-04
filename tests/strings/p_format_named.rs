@@ -6,6 +6,10 @@
 //!   null    -> null
 //! Previously xezim printed unnamed values (packed: reverse order; unpacked:
 //! alphabetical) and a bare handle for class objects.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -48,9 +52,9 @@ fn p_format_prints_named_members_in_declaration_order() {
     let sim = simulate(SRC, 100).expect("simulate failed");
 
     // Packed struct: named, declaration order (not bit-offset order).
-    assert_eq!(line(&sim, "PACKED="), "PACKED='{data:10, addr:20, vld:1}");
+    assert_eq!(line(&sim, "PACKED="), "PACKED='{data:'ha, addr:'h14, vld:'h1}");
     // Unpacked struct: named, declaration order (not alphabetical).
-    assert_eq!(line(&sim, "UNPACKED="), "UNPACKED='{data:30, addr:40}");
+    assert_eq!(line(&sim, "UNPACKED="), "UNPACKED='{data:'h1e, addr:'h28}");
     // Class: base-class member first, string quoted, real as real.
     assert_eq!(line(&sim, "CLASS="), r#"CLASS='{id:1, a:7, s:"hi", r:2.5}"#);
     // Null handle.

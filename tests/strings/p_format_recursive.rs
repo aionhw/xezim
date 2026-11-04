@@ -2,6 +2,9 @@
 //! descend through nested structs, unpacked arrays of structs and packed
 //! members, print enum members by LABEL, quote strings, and render reals as
 //! reals. Previously `%p` was one level deep — a nested aggregate printed `x`.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! `%0p` as `%p`, and no space before an associative array's closing brace.
 
 use xezim::simulate;
 
@@ -51,8 +54,8 @@ fn p_format_descends_nested_aggregates() {
         line(&sim, "CLUSTER="),
         concat!(
             "CLUSTER='{cid:999, nodes:'{",
-            "'{status:BUSY, tag:'{vlan:10, id:1523}, name:\"ALPHA\"}, ",
-            "'{status:ERR, tag:'{vlan:15, id:4095}, name:\"BETA\"}",
+            "'{status:BUSY, tag:'{vlan:'ha, id:'h5f3}, name:\"ALPHA\"}, ",
+            "'{status:ERR, tag:'{vlan:'hf, id:'hfff}, name:\"BETA\"}",
             "}, eff:0.5}"
         )
     );
@@ -62,8 +65,8 @@ fn p_format_descends_nested_aggregates() {
         line(&sim, "ARR="),
         concat!(
             "ARR='{",
-            "'{status:IDLE, tag:'{vlan:1, id:2}, name:\"A0\"}, ",
-            "'{status:BUSY, tag:'{vlan:3, id:4}, name:\"A1\"}",
+            "'{status:IDLE, tag:'{vlan:'h1, id:'h2}, name:\"A0\"}, ",
+            "'{status:BUSY, tag:'{vlan:'h3, id:'h4}, name:\"A1\"}",
             "}"
         )
     );

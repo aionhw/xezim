@@ -159,6 +159,9 @@ impl Simulator {
         self.current_static_task = ctx.current_static_task;
         self.current_auto_task = ctx.current_auto_task;
         self.task_string_formals = ctx.task_string_formals;
+        if !self.local_meta_saved.is_empty() {
+            self.reapply_local_meta();
+        }
     }
 
     /// Capture the current process context, including the current
@@ -177,6 +180,9 @@ impl Simulator {
         // §24.3: a fork child of a program process is a program process.
         if !self.program_pids.is_empty() && self.program_pids.contains(&parent) {
             self.program_pids.insert(child);
+            if let Some(scope) = self.program_pid_scope.get(&parent).cloned() {
+                self.program_pid_scope.insert(child, scope);
+            }
         }
         if let Some(l) = self.process_m_label.get(&parent) {
             let l = l.clone();
@@ -258,6 +264,10 @@ impl Simulator {
         let mut ctx = self.snapshot_process_context();
         // The parent's open block scopes close in the parent's stream, never
         // in the child's.
+        let mut local_scopes = self.fork_local_scopes.get(&self.current_pid)
+            .cloned().unwrap_or_default();
+        Self::overlay_fork_local_scopes(&mut local_scopes, &ctx.block_scope_saves);
+        self.fork_local_scopes.insert(pid, local_scopes);
         ctx.block_scope_saves.clear();
         // §6.21/§9.3.2: automatic block-locals (no call frame) live in
         // `self.signals` and are listed in `auto_loop_vars`. Copy their
@@ -295,6 +305,26 @@ impl Simulator {
                 }
             }
         }
+        let collections: HashSet<String> = ctx
+            .local_dyn
+            .iter()
+            .chain(ctx.formal_dyn.iter())
+            .flat_map(|frame| frame.iter().map(|(_, key)| key))
+            .filter(|key| key.starts_with('@'))
+            .cloned()
+            .collect();
+        // Index the child under every activation it holds, for the sibling
+        // write broadcast in `run_scheduled_process_inner`.
+        for &g in &ctx.local_gen_stack {
+            self.fork_gen_pids.entry(g).or_default().insert(pid);
+        }
+        self.fork_pid_gens.insert(pid, ctx.local_gen_stack.clone());
+        if !collections.is_empty() {
+            for key in &collections {
+                *self.fork_capture_refs.entry(key.clone()).or_default() += 1;
+            }
+            self.fork_collection_captures.insert(pid, collections);
+        }
         let trivial = ctx.this_stack.is_empty()
             && ctx.local_stack.is_empty()
             && ctx.class_context_stack.is_empty()
@@ -314,7 +344,8 @@ impl Simulator {
             // child later WRITES (value changes), not keys it merely inherited
             // (which the parent may have modified in the meantime — e.g. a
             // mailbox-get delivery into `phase` while this child runs).
-            self.fork_baselines.insert(pid, ctx.local_stack.clone());
+            self.fork_baselines
+                .insert(pid, Arc::new(ctx.local_stack.clone()));
             self.fork_signal_captures.insert(pid, signal_caps);
             self.process_contexts.insert(pid, ctx);
         }
@@ -568,6 +599,14 @@ impl Simulator {
             };
             let mut vpi_fired = false;
             if nt > self.time {
+                // #t0-comb-defer: this loop pops time-0 entries without
+                // counting them as starts; close the batch before leaving
+                // the slot (see the main loop's release).
+                if self.t0_starts_remaining > 0 {
+                    self.t0_starts_remaining = 0;
+                    self.drain_deferred_proc_settle();
+                    continue;
+                }
                 // §38.36.2: the slot's cbAtEndOfSimTime / cbReadOnlySynch run
                 // before time moves; look again if any did.
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
@@ -941,6 +980,9 @@ impl Simulator {
             &mut self.m_scope_stack,
             self.process_m_scope.remove(&pid).unwrap_or_default(),
         );
+        // §23.6: nested scheduled work must restore the caller's lexical
+        // scope, including a task body currently suspended on this stack.
+        let outer_scope = self.current_scope.clone();
 
         // A PROCESS is never "inside" an edge block, whatever stack frame it
         // happens to be serviced from. A fork child spawned by an edge block
@@ -967,6 +1009,7 @@ impl Simulator {
             self.drain_timing_pending();
         }
 
+        self.current_scope = outer_scope;
         let mine = std::mem::replace(&mut self.m_scope_stack, outer_m_scope);
         // Non-empty ⇒ suspended mid-task; keep it for the resume. A process
         // that ran to completion unwound its own pushes and parks nothing.
@@ -1026,16 +1069,6 @@ impl Simulator {
             self.current_scope.clone_from(scope);
         } else {
             self.current_scope.clear();
-        }
-        // A suspended-and-resumed process running INSIDE an inlined
-        // hierarchical/interface task must keep resolving the body's bare
-        // names under the task's instance scope, not the process's own.
-        if let Some(hint) = self
-            .task_cleanup
-            .last()
-            .and_then(|c| c.frame_scope_hint.clone())
-        {
-            *self.name_resolve_hint.borrow_mut() = Some(hint);
         }
         // A process is not a comb/edge block, so the scope the settle loop
         // last recorded must not leak into this process's `%m`.
@@ -1157,6 +1190,9 @@ impl Simulator {
         // every field, so a clone bought nothing) and moved back at the end.
         let mut saved = self.take_process_context();
         let ctx = self.process_contexts.remove(&pid).unwrap_or_default();
+        let sibling_baseline = self.fork_baselines.get(&pid).cloned();
+        let mut sibling_scopes = self.fork_local_scopes.get(&pid).cloned().unwrap_or_default();
+        let fork_parent = self.process_parents.get(&pid).copied();
         self.restore_process_context(ctx);
         self.run_process_payload(pid, stmts);
         let suspended = self.is_pid_suspended(pid);
@@ -1182,7 +1218,7 @@ impl Simulator {
         //       into `self.signals`, which is what the parent reads from.
         let child_frames: &[HashMap<String, Value>] = &child_ctx.local_stack;
         let child_frames_gen: &[u64] = &child_ctx.local_gen_stack;
-        let baseline = self.fork_baselines.get(&pid);
+        let baseline = self.fork_baselines.get(&pid).map(Arc::as_ref);
         let signal_caps = self.fork_signal_captures.get(&pid);
         // Parent-frame keys the child's writes reached, for the wake below.
         let mut written: Vec<String> = Vec::new();
@@ -1228,6 +1264,57 @@ impl Simulator {
                 }
             }
         }
+        // Match both task activation and lexical block activation. Repeated
+        // loop-block declarations share a flattened frame but not storage.
+        if let Some(sibling_baseline) = &sibling_baseline {
+            Self::overlay_fork_local_scopes(&mut sibling_scopes, &child_ctx.block_scope_saves);
+            let changes: Vec<HashMap<String, Value>> = child_frames.iter().enumerate()
+                .map(|(i, frame)| frame.iter().filter(|(k, v)| {
+                    sibling_baseline.get(i).and_then(|base| base.get(*k))
+                        .is_some_and(|old| old != *v)
+                }).map(|(k, v)| (k.clone(), v.clone())).collect()).collect();
+            if changes.iter().any(|frame| !frame.is_empty()) {
+                // Only a fork child holding one of the changed frames' own
+                // activations can receive a write (`merge_fork_writes`
+                // matches frames by generation), so visit just those, not
+                // every parked process.
+                let mut candidates: Vec<usize> = changes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, frame)| !frame.is_empty())
+                    .filter_map(|(i, _)| self.fork_gen_pids.get(child_frames_gen.get(i)?))
+                    .flatten()
+                    .copied()
+                    .filter(|&p| p != pid && Some(p) != fork_parent)
+                    .collect();
+                candidates.sort_unstable();
+                candidates.dedup();
+                for other_pid in candidates {
+                    let Some(other) = self.process_contexts.get_mut(&other_pid) else {
+                        continue;
+                    };
+                    if !self.fork_baselines.contains_key(&other_pid) {
+                        continue;
+                    }
+                    let other_pid = &other_pid;
+                    let mut other_scopes = self.fork_local_scopes.get(other_pid).cloned().unwrap_or_default();
+                    Self::overlay_fork_local_scopes(&mut other_scopes, &other.block_scope_saves);
+                    let mut visible = changes.clone();
+                    for (i, frame) in visible.iter_mut().enumerate() {
+                        let frame_generation = child_frames_gen.get(i).copied().unwrap_or(0);
+                        frame.retain(|key, _| {
+                            sibling_scopes.get(&frame_generation).and_then(|m| m.get(key))
+                                == other_scopes.get(&frame_generation).and_then(|m| m.get(key))
+                        });
+                    }
+                    let updates = Self::merge_fork_writes(
+                        &mut other.local_stack, &other.local_gen_stack,
+                        &visible, child_frames_gen, None,
+                    );
+                    written.extend(updates);
+                }
+            }
+        }
         if !written.is_empty() {
             // A child wrote a key a parked `wait` of the parent reads —
             // promote it to ready so a long-running edge cascade (which
@@ -1244,6 +1331,21 @@ impl Simulator {
         }
         self.restore_process_context(saved);
         self.auto_loop_vars.truncate(saved_auto_len);
+        *self.name_resolve_hint.borrow_mut() = saved_hint;
+    }
+
+    /// #35/#t0-comb-defer: the full settle that consumes
+    /// `deferred_proc_entries` (the cont-assign updates a yielding process
+    /// deferred). The drained entries must evaluate in a NEUTRAL scope: a
+    /// process's name-resolve hint (its instance path) would anchor a
+    /// same-named cont-assign LHS into the instance — the u_h.t
+    /// self-assign hazard (see tests/hierarchy/same_name_port_hop.rs).
+    pub(super) fn drain_deferred_proc_settle(&mut self) {
+        if self.deferred_proc_entries.is_empty() || self.proc_settle_defer {
+            return;
+        }
+        let saved_hint = self.name_resolve_hint.borrow_mut().take();
+        self.settle_combinatorial();
         *self.name_resolve_hint.borrow_mut() = saved_hint;
     }
 
@@ -1269,15 +1371,17 @@ impl Simulator {
         // #35: the process just YIELDED (parked or finished) — the
         // cont-assign update events its writes scheduled become runnable
         // now (§10.3), so the deferred entries drain before anything else
-        // in the slot observes the nets.
-        if !self.deferred_proc_entries.is_empty() && !self.proc_settle_defer {
-            // The drained entries must evaluate in a NEUTRAL scope: the
-            // process's name-resolve hint (its instance path) would anchor a
-            // same-named cont-assign LHS into the instance — the u_h.t
-            // self-assign hazard (see tests/hierarchy/same_name_port_hop.rs).
-            let saved_hint = self.name_resolve_hint.borrow_mut().take();
-            self.settle_combinatorial();
-            *self.name_resolve_hint.borrow_mut() = saved_hint;
+        // in the slot observes the nets — EXCEPT during the time-0 start
+        // batch (#t0-comb-defer): a commercial simulator keeps those update
+        // events behind the ENTIRE batch (active-region FIFO), so a
+        // source-later blocking-body `always` is parked and armed before
+        // the propagation fires. Draining per-process here would fire the
+        // edge while later starts have not run yet and silently lose it.
+        if !self.deferred_proc_entries.is_empty()
+            && !self.proc_settle_defer
+            && (self.time != 0 || self.t0_starts_remaining == 0)
+        {
+            self.drain_deferred_proc_settle();
         }
     }
 
@@ -1897,6 +2001,19 @@ impl Simulator {
         self.fast_delay_always.insert(pid, fast);
     }
 
+    /// Track lexical declarations separately from flattened frame slots.
+    fn overlay_fork_local_scopes(
+        scopes: &mut HashMap<u64, HashMap<String, u64>>,
+        blocks: &[BlockScopeSave],
+    ) {
+        for block in blocks {
+            for name in &block.declared_names {
+                scopes.entry(block.frame_gen).or_default()
+                    .insert(name.clone(), block.scope_gen);
+            }
+        }
+    }
+
     /// Merge a fork child's local-frame writes into a parent's `local_stack`.
     ///
     /// §9.3.2 baseline: only the keys the child WROTE (its value now differs
@@ -2017,6 +2134,13 @@ impl Simulator {
         d: &Expression,
         precision_diff: i32,
     ) -> u64 {
+        // §3.14.3: `1step` is one tick of the global precision, whatever
+        // the running scope's precision (#615).
+        if matches!(&d.kind, ExprKind::SystemCall { name, .. }
+            if name == super::elaborate::ONE_STEP_DELAY)
+        {
+            return 1;
+        }
         let raw = if v.is_real {
             let f = v.to_f64();
             // Diagnose a pathological real delay: non-finite (NaN/inf) or
@@ -2256,7 +2380,9 @@ impl Simulator {
                 &self.module.arrays,
                 &self.widths,
             );
+            compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
             compiler.set_ast_fallback(false);
+            compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
@@ -2276,6 +2402,7 @@ impl Simulator {
             compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
+            Self::set_pattern_type_tables(&self.module, &mut compiler);
             compiler.set_packed_struct_fields(
                 self.bc_packed_fields
                     .as_ref()
@@ -2313,6 +2440,7 @@ impl Simulator {
                 );
             }
             let compiled = ok.then(|| compiler.finish());
+            self.exec_cache_pids.insert(key.0);
             self.process_loop_bytecode.insert(key, compiled);
         }
         let Some(Some(compiled)) = self.process_loop_bytecode.remove(&key) else {
@@ -2482,6 +2610,7 @@ impl Simulator {
         }
         let key = (pid, cond.span.start, cond.span.end);
         if !self.process_cond_bytecode.contains_key(&key) {
+            self.exec_cache_pids.insert(pid);
             // Side effects would DOUBLE-FIRE during the self-audit below —
             // only cache conditions that provably have none.
             if !Self::cond_expr_is_effect_free(cond, true) {
@@ -2496,7 +2625,9 @@ impl Simulator {
                 &self.module.arrays,
                 &self.widths,
             );
+            compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
             compiler.set_ast_fallback(false);
+            compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
@@ -2516,6 +2647,7 @@ impl Simulator {
             compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
+            Self::set_pattern_type_tables(&self.module, &mut compiler);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
             compiler.set_arrays_2d(&self.module.arrays_2d);
             compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
@@ -2607,32 +2739,33 @@ impl Simulator {
         // see None, not a stale scope. The body lives in
         // run_process_stmts_inner because a Drop guard holding
         // &self.activation_scope would block every &mut self call in it.
-        let same_scope = match (
-            self.process_scope_hint.get(&pid),
-            self.activation_scope.borrow().as_deref(),
-        ) {
-            (Some(s), Some(a)) => s.as_str() == a,
-            (None, Some("")) => true,
-            _ => false,
-        };
+        // An active free task (including a root task whose scope is the
+        // empty string) takes precedence over the process's declaration scope.
+        let task_scope = self.task_cleanup.iter().rev().find_map(|t| {
+            t.frame_scope_hint
+                .as_ref()
+                .map(|scope| (scope.clone(), t.caller_body_scope.is_some()))
+        });
+        // The scheduled process's context has been installed by this point.
+        // Looking at task_cleanup before that swap reads another process's
+        // frame and can bind both sibling instances to the first one's scope.
+        if let Some((scope, free_task)) = &task_scope {
+            *self.name_resolve_hint.borrow_mut() = (!scope.is_empty()).then(|| scope.clone());
+            if *free_task {
+                self.current_scope.clone_from(scope);
+            }
+        }
+        let scope = task_scope
+            .as_ref()
+            .map(|(scope, _)| scope.as_str())
+            .or_else(|| self.process_scope_hint.get(&pid).map(String::as_str))
+            .unwrap_or("");
+        let same_scope = self.activation_scope.borrow().as_deref() == Some(scope);
         if same_scope {
             return self.run_process_stmts_inner(pid, pc);
         }
-        // A method task of a class declared inside a module runs in its
-        // object's instance (`TaskCleanup::modclass`).
-        let modclass = if self.modclass_depth.get() > 0 {
-            self.task_cleanup
-                .iter()
-                .rev()
-                .find_map(|t| t.modclass.clone())
-        } else {
-            None
-        };
-        let saved_activation_scope = self.activation_scope.replace(Some(
-            modclass
-                .or_else(|| self.process_scope_hint.get(&pid).cloned())
-                .unwrap_or_default(),
-        ));
+        let scope = scope.to_string();
+        let saved_activation_scope = self.activation_scope.replace(Some(scope));
         self.run_process_stmts_inner(pid, pc);
         *self.activation_scope.borrow_mut() = saved_activation_scope;
     }
@@ -3030,7 +3163,9 @@ impl Simulator {
             // stream, and recurse. The body's waits then suspend the process via
             // the machinery below instead of running synchronously (which spins
             // to a loop cap). Non-blocking task calls keep the synchronous path.
-            if let StatementKind::Expr(expr) = &stmt.kind {
+            if let StatementKind::Expr(expr) = &stmt.kind
+                && (self.module.dpi_imports.is_empty() || self.dpi_task_callee(expr).is_none())
+            {
                 if let ExprKind::Call { func, args } = &expr.kind {
                     if let ExprKind::Ident(h) = &func.kind {
                         if h.path.len() == 1 {
@@ -3080,16 +3215,7 @@ impl Simulator {
                                     // class). Self-guarded: only shields when
                                     // the caller actually has a `this`.
                                     self.push_instance_task_context(&mut cleanup);
-                                    // The instance task's body resolves in its
-                                    // instance across suspends, as Stage 1-hier.
-                                    if let Some((scope, _)) =
-                                        modclass_key.as_deref().and_then(|k| k.rsplit_once('.'))
-                                    {
-                                        cleanup.prev_hint = self.name_resolve_hint.borrow().clone();
-                                        cleanup.frame_scope_hint = Some(scope.to_string());
-                                        *self.name_resolve_hint.borrow_mut() =
-                                            Some(scope.to_string());
-                                    }
+                                    self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
                                     let mut cont: Vec<Statement> = td.items.clone();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -3110,7 +3236,9 @@ impl Simulator {
             // these ran on the synchronous path, whose nested delay loop
             // never hands control back: a forked `pkg::t()` with a `forever`
             // body kept its parent's `#25 $finish` from ever running.
-            if let StatementKind::Expr(expr) = &stmt.kind {
+            if let StatementKind::Expr(expr) = &stmt.kind
+                && (self.module.dpi_imports.is_empty() || self.dpi_task_callee(expr).is_none())
+            {
                 if let ExprKind::Call { func, args } = &expr.kind {
                     if let Some(td) = self.package_task_target(func) {
                         if self.stmts_have_blocking(&td.items) {
@@ -3140,7 +3268,9 @@ impl Simulator {
             // path, then hint-prefixed) and inline when the body blocks; the
             // frame carries the instance scope so the body's bare interface
             // member names resolve across suspends.
-            if let StatementKind::Expr(expr) = &stmt.kind {
+            if let StatementKind::Expr(expr) = &stmt.kind
+                && (self.module.dpi_imports.is_empty() || self.dpi_task_callee(expr).is_none())
+            {
                 if let ExprKind::Call { func, args } = &expr.kind {
                     {
                         {
@@ -3148,15 +3278,9 @@ impl Simulator {
                             if let Some(full) = full {
                                 let td = self.task_decl_rc(&full).unwrap();
                                 if self.stmts_have_blocking(&td.items) {
-                                    let scope = full
-                                        .rsplit_once('.')
-                                        .map(|(sc, _)| sc.to_string())
-                                        .unwrap_or_default();
                                     let mut cleanup = self.bind_task_frame(&td, args, None);
                                     self.push_instance_task_context(&mut cleanup);
-                                    cleanup.prev_hint = self.name_resolve_hint.borrow().clone();
-                                    cleanup.frame_scope_hint = Some(scope.clone());
-                                    *self.name_resolve_hint.borrow_mut() = Some(scope);
+                                    self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
                                     let mut cont: Vec<Statement> = td.items.clone();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -3653,7 +3777,7 @@ impl Simulator {
                                      first `{}`.",
                                     what, method
                                 );
-                                self.finished = true;
+                                self.abort_run();
                                 return;
                             }
                             let mbx_empty = self
@@ -4078,6 +4202,26 @@ impl Simulator {
                         // path further below. Inside a class method the
                         // elaborator rewrites `@field` to a `HierIdentifier`,
                         // so accept both shapes.
+                        // §15.5: `@(h.evs[i])` — an element of a class event
+                        // array, keyed per element.
+                        let elem_expr = match event {
+                            EventControl::HierIdentifier(e) => Some(e),
+                            EventControl::EventExpr(t) if t.len() == 1 && t[0].edge.is_none() => {
+                                Some(&t[0].expr)
+                            }
+                            _ => None,
+                        };
+                        if let Some(e) = elem_expr
+                            && let Some(key) = self.expr_instance_event_elem(e)
+                        {
+                            let cont = pc.pushed_body(body, pc.start + i + 1);
+                            self.instance_event_waiters.push(InstanceEventWaiter {
+                                key: InstanceEventKeys::One(key),
+                                pid,
+                                continuation: cont,
+                            });
+                            return;
+                        }
                         if let Some(fname) = self.event_control_field_name(event) {
                             if let Some(key) = self.resolve_this_event_field(&fname) {
                                 // Chain the caller's tail rather than copying it (ProcCont::pushed_body).
@@ -4207,6 +4351,23 @@ impl Simulator {
                                     let w = self.make_event_waiter_kind(pid, sens, cont, false);
                                     self.event_waiters.push(w);
                                 }
+                                return;
+                            }
+                            // §15.5: an event with no signal — a subroutine's
+                            // local `event e;` — waits for `fire_named_event`
+                            // by name. The signal fallback below resumed it
+                            // after the slot's NBA region, i.e. at once. So
+                            // does a labeled block's local stored under its
+                            // hierarchical name (`a.e`, §6.21).
+                            if (!canon.contains('.') || self.module.events.contains(canon.as_str()))
+                                && canon != Self::EVENT_NULL_KEY
+                            {
+                                let cont = pc.pushed_body(body, pc.start + i + 1);
+                                self.instance_event_waiters.push(InstanceEventWaiter {
+                                    key: InstanceEventKeys::One(self.unbacked_event_key(&canon)),
+                                    pid,
+                                    continuation: cont,
+                                });
                                 return;
                             }
                         }
@@ -4360,7 +4521,13 @@ impl Simulator {
 
             // Check for repeat with event waits inside
             if let StatementKind::Repeat { count, body } = &stmt.kind {
-                let n = self.repeat_count(count);
+                let reentry = pc.loop_tail_at == Some(pc.start + i)
+                    && pc.repeat_remaining.is_some();
+                let n = if reentry {
+                    pc.repeat_remaining.unwrap()
+                } else {
+                    self.repeat_count(count)
+                };
                 // Mirror the While/For arms: unroll not only when the body has
                 // a direct `@event`/`#delay`, but also when it blocks via a
                 // CALL to a task whose own body contains a `wait`/`#delay`/
@@ -4370,7 +4537,7 @@ impl Simulator {
                 // inlined (Stage 1b), and their nested `wait`s fall through
                 // (IEEE 1800-2023 §9.7.4: a false `wait(cond)` must suspend)
                 // instead of parking the process, busy-spinning the loop.
-                if self.stmt_has_event_wait(body) || self.stmt_is_blocking(body) {
+                if reentry || self.stmt_has_event_wait(body) || self.stmt_is_blocking(body) {
                     // n == 0 (initial count zero, or the natural-exhaustion
                     // sentinel re-entering after the final iteration's body):
                     // clear any loop-control flag left by that body — a
@@ -4456,37 +4623,21 @@ impl Simulator {
                             }
                         }
                     }
-                    // Unroll: execute body once, then schedule rest
-                    let remaining_n = n - 1;
-                    let mut cont = Vec::new();
-                    // Expand body (may contain @event)
-                    let body_stmts = Self::spliced_body(body);
-                    cont.extend(body_stmts);
-                    // Always re-schedule a Repeat tail — at remaining 0 it
-                    // becomes the exhaustion sentinel whose n==0 arm above
-                    // clears a trailing continue/break before `after` runs.
-                    cont.push(Statement::new(
-                        StatementKind::Repeat {
-                            count: Expression::new(
-                                ExprKind::Number(NumberLiteral::Integer {
-                                    size: None,
-                                    signed: false,
-                                    base: NumberBase::Decimal,
-                                    value: remaining_n.to_string(),
-                                    cached_val: Cell::new(None),
-                                }),
-                                body.span,
-                            ),
-                            body: body.clone(),
-                        },
-                        stmt.span,
-                    ));
-                    // Chain the caller's tail rather than copying it (ProcCont::pushed).
-                    // The just-appended Repeat IS this frame's genuine re-entry
-                    // tail (see `loop_tail_at`'s doc comment) — it sits at the
-                    // last index of `cont`.
-                    let tail_idx = cont.len() - 1;
-                    let cont = pc.pushed_with_tail(cont, pc.start + i + 1, tail_idx);
+                    // Keep one immutable body/tail frame per loop activation.
+                    // Re-cloning the body on each resume gives its statements
+                    // fresh addresses, so address-keyed execution caches retain
+                    // every iteration's AST. Only the remaining count changes.
+                    let mut cont = if reentry {
+                        pc.resume_at(0)
+                    } else {
+                        let mut frame = Self::spliced_body(body);
+                        frame.push(stmt.clone());
+                        let tail_idx = frame.len() - 1;
+                        pc.pushed_with_tail(frame, pc.start + i + 1, tail_idx)
+                    };
+                    // Zero is an exhaustion sentinel: it still clears a final
+                    // continue/break before the caller's continuation executes.
+                    cont.repeat_remaining = Some(n - 1);
                     self.continue_stmts_or_trampoline(pid, cont);
                     return;
                 }
@@ -5031,7 +5182,7 @@ impl Simulator {
                             keys[*idx].clone()
                         };
                         let kv = if *is_str {
-                            Value::from_string(&key_str)
+                            Self::name_key_value(&key_str)
                         } else if key_type.1 {
                             let mut v = Value::from_u64(
                                 key_str.parse::<i64>().unwrap_or(0) as u64,
@@ -5140,7 +5291,7 @@ impl Simulator {
                             // run the FIRST iteration now
                             if let Some(vn) = &loop_var {
                                 let kv = if is_str {
-                                    Value::from_string(&keys[0])
+                                    Self::name_key_value(&keys[0])
                                 } else if key_type.1 {
                                     let mut v = Value::from_u64(
                                         keys[0].parse::<i64>().unwrap_or(0) as u64,
@@ -5261,7 +5412,7 @@ impl Simulator {
                                  the usual cause. Raise or disable with \
                                  XEZIM_FOREACH_REPLAY_LIMIT=<n> (0 = never check)."
                             );
-                            self.finished = true;
+                            self.abort_run();
                         }
                     } else {
                         // Completed without parking — clear any earlier streak

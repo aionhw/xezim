@@ -9,10 +9,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use xezim_core::hasher::HashMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct EventId(pub(super) usize);
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct NamedEventTarget {
     pub(super) name: Arc<str>,
     pub(super) signal_id: usize,
@@ -22,12 +22,12 @@ pub(super) struct NamedEventTarget {
 /// Ordered candidate spellings, with their exact signal and stamp identities.
 /// Multiple spellings may address the same signal; retaining every entry keeps
 /// the parent's toggle and covergroup-sampling order unchanged.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct NamedEventPlan {
     pub(super) targets: Box<[NamedEventTarget]>,
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct EventStampStore {
     names: HashMap<Arc<str>, EventId>,
     names_by_id: Vec<Arc<str>>,
@@ -62,10 +62,12 @@ impl EventStampStore {
     /// Compatibility with name-based callers, including dynamic event stamps.
     pub(super) fn insert(&mut self, name: String, time: u64) -> Option<u64> {
         let id = self.intern(&name);
+        super::note_event_trigger();
         self.times[id.0].replace(time)
     }
 
     pub(super) fn mark(&mut self, id: EventId, time: u64) {
+        super::note_event_trigger();
         self.times[id.0] = Some(time);
     }
 

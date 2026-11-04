@@ -286,6 +286,7 @@ impl Simulator {
             }
             if !inst.is_sequential
                 && inst.delay == 0
+                && inst.delay_fall.unwrap_or(0) == 0
                 && n <= 3
                 && in_refs.iter().all(|input| input.sig_id != u32::MAX)
             {
@@ -332,6 +333,7 @@ impl Simulator {
                 in_refs,
                 is_sequential: inst.is_sequential,
                 delay: inst.delay,
+                delay_fall: inst.delay_fall.unwrap_or(inst.delay),
                 rows,
                 transition_lut,
                 lut_input_states,
@@ -771,14 +773,21 @@ impl Simulator {
     #[inline(always)]
     pub(super) fn drive_udp_output(&mut self, idx: usize, new_code: u8) {
         let out_ref = self.udp_runtime[idx].out_ref;
-        let delay = self.udp_runtime[idx].delay;
+        let (rise, fall) = (self.udp_runtime[idx].delay, self.udp_runtime[idx].delay_fall);
         let is_seq = self.udp_runtime[idx].is_sequential;
         let id = out_ref.sig_id as usize;
         let bit = out_ref.bit as usize;
         // §29.7 instance delay: applied to every transition, including the
         // initial one at t=0 (a reference simulator leaves the output at x until the delay
         // elapses — unlike SDF back-annotation, which does not act at t=0).
-        if delay > 0 {
+        if rise > 0 || fall > 0 {
+            // §28.16: a change to 1 takes the rise delay, to 0 the fall
+            // delay, and to x the smaller of the two.
+            let delay = match new_code {
+                1 => rise,
+                0 => fall,
+                _ => rise.min(fall),
+            };
             // §29.7 instance delays are INERTIAL, and the compare must run
             // against the PENDING delayed value when one exists: gating on
             // the CURRENT value elided the cancelling transition of a pulse

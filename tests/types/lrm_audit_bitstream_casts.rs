@@ -4,6 +4,10 @@
 //! by row), and a cast FROM an unpacked collection packs its elements the
 //! same way; `%p` lists a descending array in declared order (§21.2.1.7).
 //! Expected values come from the reference simulator.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -39,8 +43,8 @@ endmodule"#;
         [
             "T|r1|'{1, 2, 3, 4}",
             "T|r2|01020304",
-            "T|r3|'{171, 205, 239}",
-            "T|r4|'{5, 10}",
+            "T|r3|'{'hab, 'hcd, 'hef}",
+            "T|r4|'{'h5, 'ha}",
         ],
     );
 }
@@ -87,17 +91,17 @@ endmodule"#;
         [
             "T|r1|'{1, 2, 3, 4}",
             "T|r2|01020304",
-            "T|r3|'{171, 205, 239} 3",
-            "T|r4|'{5, 10}",
-            "T|r5|'{190, 239} 2",
+            "T|r3|'{'hab, 'hcd, 'hef} 3",
+            "T|r4|'{'h5, 'ha}",
+            "T|r5|'{'hbe, 'hef} 2",
             "T|r6|'{-1, 1}",
-            "T|r7|'{4660, 22136}",
-            "T|r8|'{'{1, 2}, '{3, 4}}",
-            "T|r9|'{1, 2, 3} '{1, 2, 3} 1 3",
+            "T|r7|'{'h1234, 'h5678}",
+            "T|r8|'{'{'h1, 'h2}, '{'h3, 'h4}}",
+            "T|r9|'{'h1, 'h2, 'h3} '{'h1, 'h2, 'h3} 1 3",
             "T|r10|abcdef",
             "T|r11|ffff0001",
-            "T|r12|'{10, 11, 12, 13} '{17, 34}",
-            "T|r13|'{1, 2, 3, 4}",
+            "T|r12|'{10, 11, 12, 13} '{'h11, 'h22}",
+            "T|r13|'{'h1, 'h2, 'h3, 'h4}",
             "T|r14|'{1, 2, 3, 4}",
         ],
     );
@@ -158,11 +162,11 @@ endmodule"#;
         t_lines(&sim),
         [
             "T|s1|'{1, 2, 3, 4}",
-            "T|s2|'{171, 205, 239}",
-            "T|s3|'{5, 10}",
-            "T|s4|'{'{1, 2}, '{3, 4}}",
-            "T|s5|'{1, 2, 3} 3",
-            "T|s6|'{190, 239}",
+            "T|s2|'{'hab, 'hcd, 'hef}",
+            "T|s3|'{'h5, 'ha}",
+            "T|s4|'{'{'h1, 'h2}, '{'h3, 'h4}}",
+            "T|s5|'{'h1, 'h2, 'h3} 3",
+            "T|s6|'{'hbe, 'hef}",
         ],
     );
 }
@@ -181,6 +185,6 @@ endmodule"#;
     let sim = simulate(SRC, 1000).expect("sim");
     assert_eq!(
         t_lines(&sim),
-        ["T|p1|'{1, 2, 3} '{10, 20, 30, 40} '{40, 30, 20, 10}",],
+        ["T|p1|'{'h1, 'h2, 'h3} '{10, 20, 30, 40} '{40, 30, 20, 10}",],
     );
 }

@@ -81,7 +81,8 @@ impl Simulator {
             if &magic != PREPARED_COMB_MAGIC {
                 return Err("bad format marker".to_string());
             }
-            bincode::deserialize_from(reader).map_err(|e| e.to_string())
+            bincode::serde::decode_from_std_read(&mut reader, xezim_core::xez_bincode_config())
+                .map_err(|e| e.to_string())
         })();
         let cache = match result {
             Ok(cache) if self.prepared_comb_cache_is_valid(&cache) => cache,
@@ -174,7 +175,12 @@ impl Simulator {
                 time0_deferred: &self.comb_time0_deferred,
                 cont_driven: &self.cont_driven,
             };
-            bincode::serialize_into(&mut writer, &payload).map_err(|e| e.to_string())?;
+            bincode::serde::encode_into_std_write(
+                &payload,
+                &mut writer,
+                xezim_core::xez_bincode_config(),
+            )
+            .map_err(|e| e.to_string())?;
             writer.flush().map_err(|e| e.to_string())?;
             drop(writer);
             std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
@@ -225,6 +231,8 @@ impl Simulator {
         // The array table is snapshotted because the loop below needs `&mut
         // self`; it is names→ranges only, not ASTs.
         let arrays_snapshot = self.module.arrays.clone();
+        let arrays_2d_snapshot = self.module.arrays_2d.clone();
+        let params_snapshot = self.module.parameters.clone();
         let descending_snapshot = self.module.descending_arrays.clone();
         let decl_dims_snapshot = self.module.unpacked_decl_dims.clone();
         // §23.9/§6.10: a HIERARCHICAL continuous assign can target a
@@ -260,24 +268,44 @@ impl Simulator {
         let dump_unresolved = std::env::var_os("XEZIM_DUMP_UNRESOLVED").is_some();
         for mut ca in cas
             .into_iter()
-            .chain({
-                let params_snapshot = self.module.parameters.clone();
+            .chain(
                 pending_ca
                     .into_iter()
-                    .map(move |p| p.materialize(&params_snapshot))
-            })
+                    .map(|p| p.materialize(&params_snapshot)),
+            )
             .flat_map(|ca| {
-                match crate::compiler::elaborate::whole_array_assign_parts_dir(
+                crate::compiler::elaborate::whole_array_assign_parts_dir(
                     &ca.lhs,
                     &ca.rhs,
                     ca.delay,
                     &arrays_snapshot,
                     Some(&descending_snapshot),
                     Some(&decl_dims_snapshot),
-                ) {
-                    Some(parts) => parts,
-                    None => vec![ca],
-                }
+                )
+                .or_else(|| {
+                    crate::compiler::elaborate::whole_array_row_assign_parts(
+                        &ca.lhs,
+                        &ca.rhs,
+                        ca.delay,
+                        &arrays_snapshot,
+                        &arrays_2d_snapshot,
+                        &params_snapshot,
+                        Some(&descending_snapshot),
+                        Some(&decl_dims_snapshot),
+                    )
+                })
+                .or_else(|| {
+                    crate::compiler::elaborate::slice_array_assign_parts(
+                        &ca.lhs,
+                        &ca.rhs,
+                        ca.delay,
+                        &arrays_snapshot,
+                        Some(&descending_snapshot),
+                        Some(&decl_dims_snapshot),
+                        &params_snapshot,
+                    )
+                })
+                .unwrap_or_else(|| vec![ca])
             })
             .flat_map(|ca| {
                 let chain: Option<Vec<String>> = match &ca.lhs.kind {
@@ -339,6 +367,42 @@ impl Simulator {
                 }
             })
         {
+            // §7.2: a member target written as a member access on a plain
+            // name (`n.V`, the form the nettype pass emits for a struct net)
+            // is the member's own leaf signal. Name it so before compiling:
+            // the width inference otherwise took the access for a 32-bit
+            // integral target and converted a `real` member's value.
+            if let ExprKind::MemberAccess { expr: base, member } = &ca.lhs.kind
+                && let ExprKind::Ident(h) = &base.kind
+                && h.root.is_none()
+                && h.path.iter().all(|s| s.selects.is_empty())
+            {
+                let leaf = format!(
+                    "{}.{}",
+                    h.path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                    member.name
+                );
+                if self.signal_name_to_id.contains_key(leaf.as_str()) {
+                    let span = ca.lhs.span;
+                    ca.lhs = Expression::new(
+                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                            root: None,
+                            path: vec![crate::ast::expr::HierPathSegment {
+                                name: crate::ast::Identifier { name: leaf, span },
+                                selects: Vec::new(),
+                            }],
+                            span,
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        span,
+                    );
+                }
+            }
             let explicit_delay = ca.delay;
             // Captured before `ca.lhs` may be moved into the CombItem below.
             let ca_span = ca.lhs.span;
@@ -675,7 +739,9 @@ impl Simulator {
                     &self.module.arrays,
                     &self.widths,
                 );
+                compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
                 compiler.set_scope_hint(scope_hint.clone());
+                compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
@@ -692,6 +758,7 @@ impl Simulator {
                 compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
+                Self::set_pattern_type_tables(&self.module, &mut compiler);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_arrays_2d(&self.module.arrays_2d);
                 compiler
@@ -760,7 +827,9 @@ impl Simulator {
                     &self.module.arrays,
                     &self.widths,
                 );
+                compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
                 compiler.set_scope_hint(scope_hint.clone());
+                compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
@@ -777,6 +846,7 @@ impl Simulator {
                 compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
+                Self::set_pattern_type_tables(&self.module, &mut compiler);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_arrays_2d(&self.module.arrays_2d);
                 compiler
@@ -1287,7 +1357,8 @@ impl Simulator {
                 if !is_always_comb {
                     SKIP_FN_BODY_READS.with(|c| c.set(true));
                 }
-                Self::collect_stmt_reads(&ab.stmt, &self.module, &mut reads, &mut writes);
+                let whole =
+                    Self::collect_stmt_reads_whole(&ab.stmt, &self.module, &mut reads, &mut writes);
                 SKIP_FN_BODY_READS.with(|c| c.set(false));
                 // Top-prefix-strip helper: `<top>.<rest>` → `<rest>`. Used
                 // to resolve hierarchical refs whose path includes the
@@ -1350,22 +1421,13 @@ impl Simulator {
                 // block re-queue itself every settle pass (the pass-through write
                 // then the field write commit two different values per eval), which
                 // churns to the settle limit. Strip a read whose '.'-base prefix is
-                // in the write set.
+                // in the write set — and a bare base that is read only through
+                // members this block writes (`self_written_read`).
+                // Packed regions are excluded before resolving backing ids
+                // by the same origin collector as struct member reads (#844).
                 let sens_reads: HashSet<String> = reads
                     .iter()
-                    .filter(|r| {
-                        if writes.contains(*r) {
-                            return false;
-                        }
-                        let mut base: &str = r.as_str();
-                        while let Some(pos) = base.rfind('.') {
-                            base = &base[..pos];
-                            if writes.contains(base) {
-                                return false;
-                            }
-                        }
-                        true
-                    })
+                    .filter(|r| !Self::self_written_read(r, &reads, &writes, &whole))
                     .cloned()
                     .collect();
                 // A bare read may resolve BOTH to a top-level signal and to
@@ -1492,6 +1554,25 @@ impl Simulator {
                 // — depend on its leaves, or the block fires once at time 0
                 // and never again.
                 self.expand_member_wise_struct_ids(&mut rids);
+                // §9.2.2.2.1 + §7.2: a WHOLE unpacked struct read (`l = t;`)
+                // resolves to the container signal, which never changes, or
+                // inside an instance to no signal at all — the members are
+                // the signals that do. Depend on the member leaves, or
+                // `always_comb l = t;` never re-fired after time zero.
+                for r in sens_reads.iter() {
+                    let scoped = [
+                        scope_hint.as_ref().map(|s| format!("{s}.{r}")),
+                        (!ab.scope.is_empty()).then(|| format!("{}.{}", ab.scope, r)),
+                        Some(r.clone()),
+                    ];
+                    for name in scoped.iter().flatten() {
+                        for &lid in self.unpacked_struct_sens.get(name).into_iter().flatten() {
+                            if !rids.contains(&lid) {
+                                rids.push(lid);
+                            }
+                        }
+                    }
+                }
                 if std::env::var("XEZIM_DUMP_COMB_SENS").is_ok() {
                     let names: Vec<&str> = rids.iter().map(|&id| self.name_for_id(id)).collect();
                     eprintln!(
@@ -1525,7 +1606,9 @@ impl Simulator {
                         &self.module.arrays,
                         &self.widths,
                     );
+                    compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
                     compiler.set_scope_hint(scope_hint.clone());
+                    compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_functions(&self.module.functions);
                     compiler.set_params(&self.module.parameters);
@@ -1544,6 +1627,7 @@ impl Simulator {
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                     compiler.set_packed_full_dims(&self.module.packed_full_dims);
+                    Self::set_pattern_type_tables(&self.module, &mut compiler);
                     compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                     compiler.set_arrays_2d(&self.module.arrays_2d);
                     compiler.set_collection_denies(

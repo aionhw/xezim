@@ -8,8 +8,9 @@ impl Simulator {
     /// §18.4.3 Compute the domain of a randc property: every value the
     /// variable could possibly take, intersected with any `inside` ranges
     /// from constraints. For enum-typed props the domain is the enum
-    /// members; for bit/integer types it's `0 .. 2^width - 1`. Width > 16
-    /// is capped to avoid materialising huge domains.
+    /// members; for bit/integer types it's `0 .. 2^width - 1`. A wider type
+    /// is enumerated only when an `inside` range narrows it; otherwise it
+    /// cycles through `pick_randc_wide` (empty domain here).
     pub(super) fn randc_domain(
         &self,
         _name: &str,
@@ -23,6 +24,22 @@ impl Simulator {
                 .get(et)
                 .map(|m| m.iter().map(|x| x.1).collect())
                 .unwrap_or_default()
+        } else if width > 16
+            && let Some(rs) = ranges
+            && rs.iter().map(|(lo, hi)| (hi - lo + 1).max(0)).sum::<i128>() <= 1 << 16
+        {
+            // A wide randc held to a narrow `inside` range: enumerate the
+            // range itself (the counter walk of `pick_randc_wide` would
+            // skip most of the width per value).
+            let max = (1i128 << width.min(64)) - 1;
+            let mut vs: Vec<u64> = rs
+                .iter()
+                .flat_map(|&(lo, hi)| lo.max(0)..=hi.min(max))
+                .map(|v| v as u64)
+                .collect();
+            vs.sort_unstable();
+            vs.dedup();
+            return vs;
         } else if width > 0 && width <= 16 {
             let max = if width >= 64 {
                 u64::MAX
@@ -81,7 +98,84 @@ impl Simulator {
         pick
     }
 
+    /// §18.4.2: the next value of a 17- to 32-bit randc cycle, by a keyed
+    /// bijection over `[0, 2^width)` and a counter: every value once per
+    /// cycle, a fresh key (from the object's generator) per cycle. Values
+    /// outside `ranges` are skipped (a narrow range is enumerated exactly by
+    /// `randc_domain` instead). Recorded tentatively, like `pick_randc`.
+    /// None when no value of the width lies in the ranges.
+    pub(super) fn pick_randc_wide(
+        &mut self,
+        handle: usize,
+        name: &str,
+        width: u32,
+        ranges: Option<&[(i128, i128)]>,
+    ) -> Option<u64> {
+        use rand::Rng;
+        let key = (handle, name.to_string());
+        self.randc_rollback(&key);
+        let size = 1u64 << width;
+        let state = self.randc_wide.get(&key).copied();
+        let (mut perm_key, mut next) = match state {
+            Some((k, n, w)) if w == width => (k, n),
+            _ => (self.cur_rng().r#gen::<u64>(), 0),
+        };
+        self.randc_wide_pending.insert(key.clone(), state);
+        let mut steps = 0u64;
+        loop {
+            if next >= size {
+                perm_key = self.cur_rng().r#gen::<u64>();
+                next = 0;
+            }
+            let v = Self::randc_permute(next, perm_key, width);
+            next += 1;
+            steps += 1;
+            if ranges.is_none_or(|rs| {
+                rs.iter()
+                    .any(|&(lo, hi)| (v as i128) >= lo && (v as i128) <= hi)
+            }) {
+                self.randc_wide.insert(key, (perm_key, next, width));
+                return Some(v);
+            }
+            if steps > size {
+                self.randc_rollback(&key);
+                return None;
+            }
+        }
+    }
+
+    /// A bijection of `[0, 2^width)` chosen by `key`: xor with the key,
+    /// odd multiplications and xor-shifts, each invertible modulo 2^width.
+    fn randc_permute(x: u64, key: u64, width: u32) -> u64 {
+        let mask = if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
+        let half = width.div_ceil(2).max(1);
+        let third = (width / 3).max(1);
+        let mut v = (x ^ key) & mask;
+        v = v.wrapping_mul(0x9E37_79B9_7F4A_7C15) & mask;
+        v ^= v >> half;
+        v = v.wrapping_mul(0xBF58_476D_1CE4_E5B9) & mask;
+        v ^= (key >> 32) & mask;
+        v ^= v >> third;
+        v = v.wrapping_mul(0x94D0_49BB_1331_11EB) & mask;
+        v ^= v >> half;
+        v
+    }
+
     pub(super) fn randc_rollback(&mut self, key: &(usize, String)) {
+        if let Some(prev) = self.randc_wide_pending.remove(key) {
+            match prev {
+                Some(st) => {
+                    self.randc_wide.insert(key.clone(), st);
+                }
+                None => {
+                    self.randc_wide.remove(key);
+                }
+            }
+        }
         if let Some((pick, prev)) = self.randc_pending.remove(key) {
             if let Some(p) = prev {
                 self.randc_used.insert(key.clone(), p);
@@ -92,7 +186,8 @@ impl Simulator {
     }
 
     pub(super) fn randc_rollback_all(&mut self) {
-        let keys: Vec<(usize, String)> = self.randc_pending.keys().cloned().collect();
+        let mut keys: Vec<(usize, String)> = self.randc_pending.keys().cloned().collect();
+        keys.extend(self.randc_wide_pending.keys().cloned());
         for k in &keys {
             self.randc_rollback(k);
         }
@@ -168,6 +263,24 @@ impl Simulator {
     /// not a random *value* — the object it points at is randomized, and the
     /// enclosing object's constraints may refer to its members.
     pub(super) fn prop_class_type(&self, handle: usize, prop: &str) -> Option<String> {
+        self.prop_class_binding(handle, prop)
+            .filter(|t| self.module.classes.contains_key(t))
+    }
+
+    /// `prop_class_type`, also answering a binding that names a specialized
+    /// class (`P#(7)`), which is no key of the class table.
+    pub(super) fn prop_class_or_spec_type(&self, handle: usize, prop: &str) -> Option<String> {
+        self.prop_class_binding(handle, prop).filter(|t| {
+            self.module.classes.contains_key(t)
+                || self
+                    .extract_spec_from_string(t)
+                    .is_some_and(|(b, _)| self.module.classes.contains_key(&b))
+        })
+    }
+
+    /// The declared type of the class property `prop` of object `handle`,
+    /// with a type parameter bound through the object (§8.25).
+    fn prop_class_binding(&self, handle: usize, prop: &str) -> Option<String> {
         let mut cur = self
             .heap
             .get(handle)
@@ -194,19 +307,80 @@ impl Simulator {
                     // outrank the instance's own chain. `ancestor_type_param_`
                     // binding walks `owner.class_name` up to the declaring class
                     // and is authoritative for a live instance.
+                    // The owner's own specialization (`W #(B) wb`) comes
+                    // before the ambient one: inside a method of `W #(A)`,
+                    // `other.h` of a `W #(B)` is a `B` (#596).
+                    let own_spec = owner.and_then(|i| i.spec.clone()).filter(|(b, _)| *b == cn);
                     let resolved = inst_binding
                         .clone()
                         .or_else(|| self.ancestor_type_param_binding(handle, &cn, raw))
+                        .or_else(|| {
+                            own_spec
+                                .is_some()
+                                .then(|| self.resolve_type_param_with(raw, &own_spec))
+                                .flatten()
+                        })
                         .or_else(|| self.resolve_type_param_binding(raw));
                     if let Some(r) = resolved {
                         tn = Some(r);
                     }
                 }
-                return tn.filter(|t| self.module.classes.contains_key(t));
+                return tn;
             }
             cur = cd.extends.clone();
         }
         None
+    }
+
+    /// The class a member assignment target (`o.h`, `this.h`, or an element
+    /// `o.arr[0]` of a collection of handles) holds, with a type parameter
+    /// bound by the object that owns the member (§8.25).
+    pub(super) fn member_target_class(&self, lvalue: &Expression) -> Option<String> {
+        let mut lvalue = lvalue;
+        let mut indexed = false;
+        while let ExprKind::Index { expr, .. } = &lvalue.kind {
+            lvalue = expr;
+            indexed = true;
+        }
+        let (owner, prop) = match &lvalue.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (self.eval_handle_expr(expr)?, member.name.as_str())
+            }
+            ExprKind::Ident(h)
+                if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                (
+                    self.eval_ident_handle(&h.path[0].name.name)?,
+                    h.path[1].name.name.as_str(),
+                )
+            }
+            _ => return None,
+        };
+        if owner == 0 {
+            return None;
+        }
+        // A collection of handles names a class only through an element
+        // (`o.arr[0] = new()`); the member itself takes `new[n]`.
+        let mut cur = self
+            .heap
+            .get(owner)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if cd.properties.contains_key(prop) {
+                let coll = cd.array_properties.contains_key(prop)
+                    || cd.array_nd_properties.contains_key(prop)
+                    || cd.queue_properties.contains_key(prop)
+                    || cd.assoc_properties.contains_key(prop);
+                if coll != indexed {
+                    return None;
+                }
+                break;
+            }
+            cur = cd.extends.clone();
+        }
+        self.prop_class_or_spec_type(owner, prop)
     }
 
     /// Class-chain member-type lookup without a live instance handle (used
@@ -368,25 +542,86 @@ impl Simulator {
                 // is the class name `obj`, so the elements are object handles
                 // (randomized recursively, never as scalars). For scalar/
                 // packed element types `type_name` is None or a non-class.
-                let is_object_elem = cd
-                    .properties
-                    .get(prop)
-                    .and_then(|s| s.type_name.clone())
-                    .is_some_and(|tn| self.module.classes.contains_key(&tn));
+                // §8.25: an element type that is a class type parameter is a
+                // class when this object binds the parameter to one.
+                let is_object_elem = self.prop_class_type(handle, prop).is_some();
+                // §8.25/§6.20.2: the element width in this object's
+                // specialization. The class tables hold the default's, so a
+                // `rand T beats[]` bound wider than T's default solved its
+                // elements at the default width and a field select of the
+                // bound type fell outside them (#576).
+                let spec_w = self.spec_member_elem_width(cd, handle, prop);
+                // §18.4 (#519): a multi-dimensional member joins as one row
+                // per prefix of its leading dimensions, each keyed like a
+                // 1-D array (`m[0]`, elements `m[0][j]`), with the base's
+                // bounds carried for the `foreach` levels above the row.
+                if cd.array_nd_properties.contains_key(prop) {
+                    let dims: Option<Vec<(i64, i64)>> =
+                        if let Some(&(d0, d1, _)) = self.module.arrays_2d.get(&scoped) {
+                            Some(vec![d0, d1])
+                        } else {
+                            self.module.arrays_nd.get(&scoped).map(|(sh, _)| sh.clone())
+                        };
+                    let w = self
+                        .module
+                        .arrays_2d
+                        .get(&scoped)
+                        .map(|t| t.2)
+                        .or_else(|| self.module.arrays_nd.get(&scoped).map(|t| t.1))
+                        .or(spec_w)
+                        .unwrap_or(32)
+                        .max(1);
+                    if let Some(dims) = dims
+                        && dims.len() >= 2
+                    {
+                        let (lo, hi) = dims[dims.len() - 1];
+                        let (lo, hi) = (lo.min(hi), lo.max(hi));
+                        let mut prefixes: Vec<String> = vec![String::new()];
+                        for &(l, r) in &dims[..dims.len() - 1] {
+                            let mut next = Vec::new();
+                            for p in &prefixes {
+                                for i in l.min(r)..=l.max(r) {
+                                    next.push(format!("{p}[{i}]"));
+                                }
+                            }
+                            prefixes = next;
+                        }
+                        for p in prefixes {
+                            out.push(RandColl {
+                                prop: format!("{prop}{p}"),
+                                scoped: format!("{scoped}{p}"),
+                                kind: CollKind::Fixed,
+                                width: w,
+                                lo,
+                                hi,
+                                nested: false,
+                                is_object_elem,
+                                nd_base: Some((prop.clone(), dims.clone())),
+                                row_tail: None,
+                            });
+                        }
+                    }
+                    continue;
+                }
                 if let Some(&(lo, hi, w)) = cd.array_properties.get(prop) {
                     let (lo, hi) = self.inst_fixed_bounds(cd, handle, prop, (lo, hi));
                     out.push(RandColl {
                         prop: prop.clone(),
                         scoped,
                         kind: CollKind::Fixed,
-                        width: w.max(1),
+                        width: spec_w.unwrap_or(w).max(1),
                         lo,
                         hi,
                         nested: false,
                         is_object_elem,
+                        nd_base: None,
+                        row_tail: None,
                     });
                 } else if cd.assoc_properties.contains_key(prop) {
-                    let w = cd.properties.get(prop).map_or(32, |s| s.width).max(1);
+                    let w = spec_w
+                        .or_else(|| cd.properties.get(prop).map(|s| s.width))
+                        .unwrap_or(32)
+                        .max(1);
                     out.push(RandColl {
                         prop: prop.clone(),
                         scoped,
@@ -396,18 +631,25 @@ impl Simulator {
                         hi: 0,
                         nested: false,
                         is_object_elem,
+                        nd_base: None,
+                        row_tail: None,
                     });
                 } else if let Some(&(w, _cap)) = cd.queue_properties.get(prop) {
-                    let nested = Self::coll_is_nested(prop, constraints);
+                    // §7.4.5: dynamic rows are sized row by row (`nested`).
+                    let row_tail = self.dyn_row_tail(cd, handle, prop);
+                    let nested = matches!(row_tail, Some(RowTail::Dyn))
+                        || Self::coll_is_nested(prop, constraints);
                     out.push(RandColl {
                         prop: prop.clone(),
                         scoped,
                         kind: CollKind::Dyn,
-                        width: w.max(1),
+                        width: spec_w.unwrap_or(w).max(1),
                         lo: 0,
                         hi: 0,
                         nested,
                         is_object_elem,
+                        nd_base: None,
+                        row_tail,
                     });
                 }
             }
@@ -501,11 +743,29 @@ impl Simulator {
             .filter(|k| !k.contains('[') && !k.contains(']'))
             .collect();
         if self.is_string_keyed_array(scoped) {
-            keys.sort();
+            Self::sort_name_keys(&mut keys);
         } else {
             keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
         }
         keys
+    }
+
+    /// §7.8.2/§18.5.8.1: the value a `foreach` loop variable holds for key
+    /// `key` of associative member `scoped`: the string, or an integer at the
+    /// declared index width and signedness, so an `int` key `-3` stays
+    /// negative where a 32-bit unsigned parse made `i < 0` false.
+    pub(super) fn assoc_foreach_key_value(&self, scoped: &str, key: &str) -> Value {
+        if self.is_string_keyed_array(scoped) {
+            return Self::name_key_value(key);
+        }
+        let (kw, signed) = self.assoc_index_width_for(scoped).unwrap_or((32, false));
+        if kw > 64 {
+            // Wide numeric keys are keyed by hex digits.
+            return Value::from_str_radix(key, 16, kw);
+        }
+        let mut v = Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
+        v.is_signed = signed;
+        v
     }
 
     /// Every element storage key of a collection, in index order.
@@ -521,6 +781,18 @@ impl Simulator {
                 .collect(),
             CollKind::Dyn => {
                 let n = self.get_queue_size(&c.scoped);
+                // §7.4.5: every element of every fixed row (`a[i][j]`).
+                if let Some(RowTail::Fixed(inner)) = &c.row_tail {
+                    let mut keys: Vec<String> =
+                        (0..n).map(|i| format!("{}[{}]", c.scoped, i)).collect();
+                    for &(lo, hi) in inner {
+                        keys = keys
+                            .iter()
+                            .flat_map(|k| (lo..=hi).map(move |j| format!("{}[{}]", k, j)))
+                            .collect();
+                    }
+                    return keys;
+                }
                 if !c.nested {
                     return (0..n).map(|i| format!("{}[{}]", c.scoped, i)).collect();
                 }
@@ -662,6 +934,21 @@ impl Simulator {
             {
                 return Some((handle, member, 1, None));
             }
+            // §7.4.5: a dynamic outer dimension over dynamic or queue rows
+            // (`int d[][]`): `d[i]` names one row collection.
+            if !fixed_only
+                && cd.dynamic_tail_properties.get(&member).is_some_and(|t| {
+                    matches!(
+                        t.first(),
+                        Some(
+                            crate::ast::types::UnpackedDimension::Unsized(_)
+                                | crate::ast::types::UnpackedDimension::Queue { .. }
+                        )
+                    )
+                })
+            {
+                return Some((handle, member, 1, None));
+            }
             cur_cls = cd.extends.clone();
         }
         None
@@ -710,6 +997,12 @@ impl Simulator {
                 let i = self.eval_expr(index).to_i64().unwrap_or(0);
                 return Some(format!("{}[{}]", row, i));
             }
+            // §7.8: a row of a multidimensional associative array
+            // (`o.p["k"][3]` of `int p[string][int][$]`) is keyed by value.
+            if self.is_associative_array(&row) {
+                let kv = self.eval_expr(index);
+                return Some(format!("{}[{}]", row, self.assoc_key_str(&row, &kv)));
+            }
             return None;
         }
         let bn = match self.strip_rand_receiver_prefix(base) {
@@ -723,6 +1016,46 @@ impl Simulator {
             idx_val.to_i64().unwrap_or(0).to_string()
         };
         Some(format!("{}[{}]", bn, key))
+    }
+
+    /// The bits (offset, width) of the packed-struct field `e` names in
+    /// collection element `elem_key` (`p[i].mask` with `p[i]` that element),
+    /// for a field of at most 64 bits.
+    pub(super) fn elem_field_of(&mut self, e: &Expression, elem_key: &str) -> Option<(u32, u32)> {
+        let (base, field) = match &e.kind {
+            ExprKind::MemberAccess { expr, member } => ((**expr).clone(), member.name.clone()),
+            // `p[i].mask` as one path: the element is its first segment.
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 2
+                    && h.path[0].selects.len() == 1
+                    && h.path[1].selects.is_empty() =>
+            {
+                let mut head = h.clone();
+                head.path.truncate(1);
+                let index = head.path[0].selects.pop()?;
+                head.cached_signal_id = std::cell::Cell::new(None);
+                head.cached_resolved_name = std::cell::OnceCell::new();
+                let arr = Expression::new(ExprKind::Ident(head), e.span);
+                (
+                    Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(arr),
+                            index: Box::new(index),
+                        },
+                        e.span,
+                    ),
+                    h.path[1].name.name.clone(),
+                )
+            }
+            _ => return None,
+        };
+        if self.coll_elem_expr_key(&base).as_deref() != Some(elem_key) {
+            return None;
+        }
+        let fields = self.coll_packed_elem_fields(&elem_key[..elem_key.rfind('[')?])?;
+        let &(_, off, w) = fields.iter().find(|(n, _, _)| *n == field)?;
+        (w <= 64).then_some((off, w))
     }
 
     /// Write one collection element. The instance-scoped key (`<h>#m[i]`) is
@@ -772,7 +1105,11 @@ impl Simulator {
                 Some(n) => n,
                 None => cur,
             };
-            self.resize_coll(&c.scoped, n);
+            if c.row_tail.is_some() {
+                self.resize_row_owner(c, n);
+            } else {
+                self.resize_coll(&c.scoped, n);
+            }
             self.module.dynamic_arrays.insert(c.scoped.clone());
             if c.nested {
                 for i in 0..n {
@@ -786,6 +1123,63 @@ impl Simulator {
                 }
             }
         }
+    }
+
+    /// The row shape of the dynamic member `prop` of `cd` declared over
+    /// unpacked rows (`T a[][N]`, `T a[][]`); `None` for any other member or
+    /// a deeper nesting the solver does not model.
+    pub(super) fn dyn_row_tail(
+        &self,
+        cd: &crate::compiler::elaborate::ElaboratedClass,
+        handle: usize,
+        prop: &str,
+    ) -> Option<RowTail> {
+        use crate::ast::types::UnpackedDimension as U;
+        let tail = cd.dynamic_tail_properties.get(prop)?;
+        if let [U::Unsized(_) | U::Queue { .. }] = tail.as_slice() {
+            return Some(RowTail::Dyn);
+        }
+        let params = self.instance_param_scope(handle);
+        let dims: Option<Vec<(i64, i64)>> = tail
+            .iter()
+            .map(|d| match d {
+                U::Range { left, right, .. } => {
+                    let l = super::elaborate::const_eval_i64_with_params(left, Some(&params))?;
+                    let r = super::elaborate::const_eval_i64_with_params(right, Some(&params))?;
+                    Some((l.min(r), l.max(r)))
+                }
+                U::Expression { expr, .. } => {
+                    match super::elaborate::const_eval_i64_with_params(expr, Some(&params)) {
+                        Some(n) if n > 0 => Some((0, n - 1)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        dims.map(RowTail::Fixed)
+    }
+
+    /// Resize the dynamic member `c` whose elements are rows: rows past the
+    /// new end lose their storage, and new dynamic rows are registered as
+    /// empty collections of their own.
+    pub(super) fn resize_row_owner(&mut self, c: &RandColl, n: u64) {
+        let old = self.get_queue_size(&c.scoped);
+        for i in n..old {
+            let row = format!("{}[{}]", c.scoped, i);
+            self.clear_dyn_row(&row);
+            self.signals.remove(&row);
+            self.signals.remove(&format!("{}.size", row));
+        }
+        if c.row_tail == Some(RowTail::Dyn) {
+            for i in old.min(n)..n {
+                let row = format!("{}[{}]", c.scoped, i);
+                self.module.dynamic_arrays.insert(row.clone());
+                self.module.arrays.insert(row.clone(), (0, 63, c.width));
+                self.set_queue_size(&row, 0);
+            }
+        }
+        self.set_queue_size(&c.scoped, n);
     }
 
     /// Set a dynamic array's length, dropping any element storage past the
@@ -816,6 +1210,7 @@ impl Simulator {
         let mut lo_b: u64 = 0;
         let mut hi_b: u64 = 64;
         let mut bounded = false;
+        let mut dist: Option<Vec<(u64, u64, u128)>> = None;
         // Every size expression is evaluated WHILE the foreach index of a row
         // constraint is still bound, so `m[i].size() == i + 2` resolves.
         let items = self.size_constraint_items(prop, row, constraints);
@@ -823,6 +1218,7 @@ impl Simulator {
             match kind {
                 SizeCon::Eq(n) => exact = Some(n),
                 SizeCon::In(rs) => ranges.extend(rs),
+                SizeCon::Dist(items) => dist = Some(items),
                 SizeCon::Rel(op, v) => {
                     bounded = true;
                     match op {
@@ -837,6 +1233,34 @@ impl Simulator {
         }
         if let Some(n) = exact {
             return Some(n.min(1 << 16));
+        }
+        // §18.5.4: a dist on the size draws it by weight on every randomize,
+        // within whatever bounds the other size constraints set. Without it
+        // the size was picked only when the array first failed its
+        // constraints, and a re-randomized object kept the length it had.
+        if let Some(items) = dist {
+            let total: u128 = items.iter().map(|&(_, _, m)| m).sum();
+            let admits = |n: u64| {
+                (ranges.is_empty() || ranges.iter().any(|&(l, h)| l <= n && n <= h))
+                    && (!bounded || (lo_b <= n && n <= hi_b))
+            };
+            for _ in 0..64 {
+                if total == 0 {
+                    break;
+                }
+                let mut draw = self.rng.gen_range(0..total);
+                let Some(&(l, h, _)) = items.iter().find(|&&(_, _, m)| {
+                    let hit = draw < m;
+                    draw = draw.saturating_sub(m);
+                    hit
+                }) else {
+                    break;
+                };
+                let n = if h > l { self.rng.gen_range(l..=h) } else { l };
+                if admits(n) {
+                    return Some(n.min(1 << 16));
+                }
+            }
         }
         if !ranges.is_empty() {
             let (l, h) = ranges[self.rng.gen_range(0..ranges.len())];
@@ -965,10 +1389,42 @@ impl Simulator {
                 expr,
                 range,
                 is_dist,
+                dist_weights,
                 ..
-            } if !*is_dist && Self::is_size_call(expr, prop, row, recv) => {
+            } if Self::is_size_call(expr, prop, row, recv) => {
                 let rs = range.clone();
-                out.push(SizeCon::In(self.eval_range_list(&rs)));
+                if !*is_dist {
+                    out.push(SizeCon::In(self.eval_range_list(&rs)));
+                } else {
+                    use crate::ast::decl::DistWeight;
+                    let mut items = Vec::with_capacity(rs.len());
+                    for (i, r) in rs.iter().enumerate() {
+                        let Some(&(l, h)) = self.eval_range_list(std::slice::from_ref(r)).first()
+                        else {
+                            continue;
+                        };
+                        let (w, total) = match dist_weights.get(i).and_then(|w| w.as_ref()) {
+                            Some(DistWeight::Each(e)) => {
+                                (self.eval_expr(e).to_u64().unwrap_or(1), false)
+                            }
+                            Some(DistWeight::Total(e)) => {
+                                (self.eval_expr(e).to_u64().unwrap_or(1), true)
+                            }
+                            None => (1, false),
+                        };
+                        // `:/` spreads the weight over the item, `:=` gives
+                        // it to every value in it.
+                        let m = if total {
+                            w as u128
+                        } else {
+                            w as u128 * (h - l + 1) as u128
+                        };
+                        if m > 0 {
+                            items.push((l, h, m));
+                        }
+                    }
+                    out.push(SizeCon::Dist(items));
+                }
             }
             ConstraintItem::Expr(e) => match &e.kind {
                 // §18.5.6: `guard -> q.size() == N`. The parser's expression
@@ -1130,7 +1586,28 @@ impl Simulator {
                 v = self.rng.r#gen::<u64>() & mask;
             }
         }
-        Value::from_u64(v, width)
+        if width <= 64 {
+            return Value::from_u64(v, width);
+        }
+        // §18.4: an element wider than 64 bits is drawn across its FULL
+        // width. `from_u64` zero-fills every bit above 63, so routing a
+        // wide element through it silently pinned the high half to 0 — the
+        // low word still looked freshly drawn, and only a check of the high
+        // bits (`wda[i][95:64] != 0`) could catch it. Keep the re-rolled
+        // low word above, then draw the remaining bits fresh.
+        let mut acc = Value::from_u64(v, width);
+        let mut bit = 64u32;
+        while bit < width {
+            let chunk: u64 = self.rng.r#gen();
+            let n = (width - bit).min(64);
+            for k in 0..n {
+                if (chunk >> k) & 1 == 1 {
+                    acc.set_bit((bit + k) as usize, LogicBit::One);
+                }
+            }
+            bit += n;
+        }
+        acc
     }
 
     /// The value ranges an element of `prop` is restricted to by
@@ -1242,6 +1719,7 @@ impl Simulator {
             ConstraintItem,
         )> = Vec::new();
         fn walk(
+            sim: &mut Simulator,
             item: &ConstraintItem,
             colls: &[RandColl],
             jobs: &mut Vec<(
@@ -1267,16 +1745,39 @@ impl Simulator {
                 }
                 ConstraintItem::Block(items) => {
                     for i in items {
-                        walk(i, colls, jobs);
+                        walk(sim, i, colls, jobs);
                     }
                 }
-                ConstraintItem::Soft(i) => walk(i, colls, jobs),
+                ConstraintItem::Soft(i) => walk(sim, i, colls, jobs),
+                // §18.5.6/§18.5.7: collect foreach repairs only from the
+                // branch active for the current scalar assignment.
+                ConstraintItem::IfElse {
+                    condition,
+                    then_item,
+                    else_item,
+                    ..
+                } => {
+                    if sim.cons_expr_true(condition) {
+                        walk(sim, then_item, colls, jobs);
+                    } else if let Some(other) = else_item {
+                        walk(sim, other, colls, jobs);
+                    }
+                }
+                ConstraintItem::Implication {
+                    condition,
+                    constraint,
+                    ..
+                } => {
+                    if sim.cons_expr_true(condition) {
+                        walk(sim, constraint, colls, jobs);
+                    }
+                }
                 _ => {}
             }
         }
         for con in constraints {
             for it in &con.items {
-                walk(it, colls, &mut jobs);
+                walk(self, it, colls, &mut jobs);
             }
         }
         for (c, vars, body) in jobs {
@@ -1289,11 +1790,7 @@ impl Simulator {
                     for key in self.assoc_key_strs(&c.scoped) {
                         let mut frame: HashMap<String, Value> = HashMap::default();
                         if let Some(Some(n)) = idx_names.first() {
-                            let kv = if self.is_string_keyed_array(&c.scoped) {
-                                Value::from_string(&key)
-                            } else {
-                                Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, 32)
-                            };
+                            let kv = self.assoc_foreach_key_value(&c.scoped, &key);
                             frame.insert(n.clone(), kv);
                         }
                         self.push_local_frame(frame);
@@ -1384,6 +1881,14 @@ impl Simulator {
         let allowed = self.elem_allowed_ranges(prop, constraints);
         let saved = self.read_coll_elem(elem_key);
         for _ in 0..256 {
+            // +xezim_rand_timeout deadline was armed at randomize() entry but
+            // only checked at trial boundaries — a single element's retry
+            // loop could grind unboundedly past it. Each retry costs a full
+            // interpreted constraint check, so polling the clock here is
+            // negligible and bounds the loop by the budget.
+            if self.rand_past_deadline() {
+                break;
+            }
             let cand = if allowed.is_empty() {
                 self.draw_elem(width, None)
             } else {
@@ -1401,6 +1906,9 @@ impl Simulator {
         // (or proves there is none) rather than leaving a random value.
         if width <= 16 {
             for v in 0..(1u64 << width) {
+                if self.rand_past_deadline() {
+                    break;
+                }
                 self.write_coll_elem(elem_key, Value::from_u64(v, width));
                 if self.item_holds(handle, body) {
                     return pinned;
@@ -1459,9 +1967,39 @@ impl Simulator {
                 expr,
                 range,
                 is_dist,
+                dist_weights,
                 ..
             } => {
-                if *is_dist || self.coll_elem_expr_key(expr).as_deref() != Some(elem_key) {
+                // §18.5.4: a FIELD of this element (`p[i].mask dist …`) is
+                // drawn into the element; it kept its baseline draw.
+                if let Some((off, w)) = self.elem_field_of(expr, elem_key) {
+                    let mut cur = self
+                        .read_coll_elem(elem_key)
+                        .unwrap_or_else(|| Value::zero(width));
+                    let field = cur.range_select((off + w - 1) as usize, off as usize);
+                    let new = if *is_dist {
+                        self.pick_dist_value(None, range, dist_weights)
+                    } else if !self.value_in_ranges(&field, range) {
+                        self.pick_from_ranges(range, w, field.is_signed)
+                    } else {
+                        None
+                    };
+                    if let Some(v) = new.and_then(|v| v.resize(w).to_u64()) {
+                        cur.splice_bits64(off as usize, v, 0, w as usize);
+                        self.write_coll_elem(elem_key, cur);
+                    }
+                    return false;
+                }
+                if self.coll_elem_expr_key(expr).as_deref() != Some(elem_key) {
+                    return false;
+                }
+                // §18.5.4: the dynamic-array baseline was freshly drawn;
+                // a foreach dist item must draw from its weighted support,
+                // not rely on rejection of full-width random element values.
+                if *is_dist {
+                    if let Some(picked) = self.pick_dist_value(None, range, dist_weights) {
+                        self.write_coll_elem(elem_key, picked.resize(width));
+                    }
                     return false;
                 }
                 let cur = self
@@ -1509,6 +2047,26 @@ impl Simulator {
                     false
                 }
                 ExprKind::Binary { op, left, right } => {
+                    // §18.5.7: `p[i].field == E` sets that field of this
+                    // element. Left alone it kept its baseline draw, the
+                    // body failed, and the generate-and-test fallback redrew
+                    // the whole element, discarding its other fields' draws.
+                    if *op == BinaryOp::Eq {
+                        let field = match self.elem_field_of(left, elem_key) {
+                            Some(f) => Some((f, right)),
+                            None => self.elem_field_of(right, elem_key).map(|f| (f, left)),
+                        };
+                        if let Some(((off, w), other)) = field {
+                            if let Some(v) = self.eval_expr(other).resize(w).to_u64() {
+                                let mut cur = self
+                                    .read_coll_elem(elem_key)
+                                    .unwrap_or_else(|| Value::zero(width));
+                                cur.splice_bits64(off as usize, v, 0, w as usize);
+                                self.write_coll_elem(elem_key, cur);
+                            }
+                            return false;
+                        }
+                    }
                     let on_l = self.coll_elem_expr_key(left).as_deref() == Some(elem_key);
                     let on_r = self.coll_elem_expr_key(right).as_deref() == Some(elem_key);
                     if on_l == on_r {
@@ -1596,21 +2154,44 @@ impl Simulator {
         pinned: &mut HashSet<String>,
     ) {
         let mut items: Vec<ConstraintItem> = Vec::new();
-        fn walk(item: &ConstraintItem, out: &mut Vec<ConstraintItem>) {
+        fn walk(sim: &mut Simulator, item: &ConstraintItem, out: &mut Vec<ConstraintItem>) {
             match item {
                 ConstraintItem::Block(is) => {
                     for i in is {
-                        walk(i, out);
+                        walk(sim, i, out);
                     }
                 }
-                ConstraintItem::Soft(i) => walk(i, out),
+                ConstraintItem::Soft(i) => walk(sim, i, out),
+                // §18.5.6/§18.5.7: the post-draw element repair must also
+                // restore equalities in the active conditional branch.
+                ConstraintItem::IfElse {
+                    condition,
+                    then_item,
+                    else_item,
+                    ..
+                } => {
+                    if sim.cons_expr_true(condition) {
+                        walk(sim, then_item, out);
+                    } else if let Some(other) = else_item {
+                        walk(sim, other, out);
+                    }
+                }
+                ConstraintItem::Implication {
+                    condition,
+                    constraint,
+                    ..
+                } => {
+                    if sim.cons_expr_true(condition) {
+                        walk(sim, constraint, out);
+                    }
+                }
                 ConstraintItem::Foreach { .. } | ConstraintItem::Unique { .. } => {}
                 other => out.push(other.clone()),
             }
         }
         for con in constraints {
             for it in &con.items {
-                walk(it, &mut items);
+                walk(self, it, &mut items);
             }
         }
         for item in items {
@@ -1654,16 +2235,23 @@ impl Simulator {
 
     /// The bare array name of a `<arr>.sum()` call (no `with`).
     pub(super) fn plain_sum_array(e: &Expression) -> Option<String> {
+        Self::plain_reduce_array(e, "sum")
+    }
+
+    /// The bare array name of a `<arr>.<method>()` reduction call (no `with`).
+    pub(super) fn plain_reduce_array(e: &Expression, method: &str) -> Option<String> {
         match &e.kind {
-            ExprKind::Call { func, args } if args.is_empty() => Self::plain_sum_array(func),
-            ExprKind::MemberAccess { expr, member } if member.name == "sum" => {
+            ExprKind::Call { func, args } if args.is_empty() => {
+                Self::plain_reduce_array(func, method)
+            }
+            ExprKind::MemberAccess { expr, member } if member.name == method => {
                 if let ExprKind::Ident(h) = &expr.kind {
                     return h.path.last().map(|s| s.name.name.clone());
                 }
                 None
             }
             ExprKind::Ident(h)
-                if h.path.len() >= 2 && h.path.last().is_some_and(|s| s.name.name == "sum") =>
+                if h.path.len() >= 2 && h.path.last().is_some_and(|s| s.name.name == method) =>
             {
                 Some(h.path[h.path.len() - 2].name.name.clone())
             }
@@ -1733,10 +2321,21 @@ impl Simulator {
             {
                 continue;
             }
-            let Some(k) = self.eval_expr(const_side).to_i64() else {
+            // The target may be wider than 64 bits (`ws.sum() == 96'h1_…`):
+            // `to_i64` reads only the low word of a wide Value, which turned
+            // 2^64 into 0 and made the distributor below pin the sum to a
+            // wrong, always-failing target. Read the full 128 bits (the
+            // distributor works in i128); anything wider or unknown is left
+            // to the trial checker.
+            let tv = self.eval_expr(const_side);
+            if tv.width > 128 || tv.has_xz() {
                 continue;
-            };
-            return Some((c, k as i128));
+            }
+            let mut raw = tv.to_u128();
+            if tv.is_signed && tv.width > 0 && (raw >> (tv.width - 1)) & 1 == 1 {
+                raw |= !0u128 << (tv.width - 1);
+            }
+            return Some((c, raw as i128));
         }
         None
     }
@@ -1758,12 +2357,16 @@ impl Simulator {
         let keys = self.coll_elem_keys(c);
         let ranges = self.elem_allowed_ranges(&c.prop, constraints);
         let (lo, hi): (i128, i128) = if ranges.is_empty() {
-            let hi = if c.width >= 64 {
-                u64::MAX
+            // The element's full domain is 2^width - 1, which for a wide
+            // (>64-bit) element exceeds u64::MAX — capping there made every
+            // wide point-target above 2^64 look infeasible, so the distributor
+            // never ran and the trial loop ground through its retries.
+            let hi = if c.width >= 127 {
+                i128::MAX
             } else {
-                (1u64 << c.width) - 1
+                (1i128 << c.width) - 1
             };
-            (0, hi as i128)
+            (0, hi)
         } else {
             (
                 ranges.iter().map(|(l, _)| *l as i128).min().unwrap(),
@@ -1793,7 +2396,11 @@ impl Simulator {
         let mut free: Vec<String> = Vec::new();
         for k in keys {
             if pinned.contains(k) {
-                fixed_sum += self.read_coll_elem(k).and_then(|v| v.to_u64()).unwrap_or(0) as i128;
+                // A pinned wide element contributes its full 128 bits —
+                // `to_u64` would count only the low word and the residual
+                // handed to the free elements would be wrong.
+                let v = self.read_coll_elem(k).map(|v| v.to_u128()).unwrap_or(0);
+                fixed_sum = fixed_sum.saturating_add(v as i128);
             } else {
                 free.push(k.clone());
             }
@@ -1802,12 +2409,15 @@ impl Simulator {
             return;
         }
         let n = free.len() as i128;
-        let want = target - fixed_sum;
-        if want < n * lo || want > n * hi {
+        let want = target.saturating_sub(fixed_sum);
+        // An element of 127 bits or more has the domain cap i128::MAX, so
+        // `n * hi` overflows: the bounds saturate, which only says the true
+        // bound is further out still.
+        if want < n.saturating_mul(lo) || want > n.saturating_mul(hi) {
             return; // infeasible — leave for the trial checker to reject
         }
-        let cap = hi - lo;
-        let mut rem = want - n * lo; // 0 ..= n*cap
+        let cap = hi.saturating_sub(lo);
+        let mut rem = want.saturating_sub(n.saturating_mul(lo)); // 0 ..= n*cap
         let mut order: Vec<usize> = (0..free.len()).collect();
         for i in (1..order.len()).rev() {
             let j = self.cur_rng().gen_range(0..=i);
@@ -1819,7 +2429,9 @@ impl Simulator {
                 rem
             } else {
                 // Keep the residual absorbable by the still-unassigned elements.
-                let lo_b = (rem - remaining_after * cap).max(0);
+                let lo_b = rem
+                    .saturating_sub(remaining_after.saturating_mul(cap))
+                    .max(0);
                 let hi_b = rem.min(cap);
                 if hi_b <= lo_b {
                     lo_b
@@ -1828,7 +2440,17 @@ impl Simulator {
                 }
             };
             rem -= give;
-            self.write_coll_elem(&free[idx], Value::from_u64((lo + give) as u64, width));
+            // A distributed share can exceed u64::MAX for wide elements
+            // (`lo + give` counts up to the 2^width domain); `from_u64`
+            // would truncate it back to the low word and the sum would
+            // silently miss its target.
+            let share = lo + give;
+            let val = if width > 64 {
+                Value::from_u128(share as u128, width)
+            } else {
+                Value::from_u64(share as u64, width)
+            };
+            self.write_coll_elem(&free[idx], val);
             pinned.insert(free[idx].clone());
         }
     }
@@ -1886,7 +2508,257 @@ impl Simulator {
                     .map(|i| format!("{}[{}]", c.scoped, i))
                     .collect();
                 self.distribute_sum_over(&keys, k, lo, hi, c.width, pinned);
+            } else if let Some((c, method, view, k)) = self.reduce_eq_target(it, colls, rand_names)
+            {
+                self.repair_array_reduction(&c, method, view, k, pinned);
             }
+        }
+    }
+
+    /// §7.12.3/§18.5.8.2 — `<arr>.<red>() [with (item[.field])] == K` for a
+    /// reduction `distribute_array_sum` does not solve: `and`, `or`, `xor`,
+    /// `product`, and a `sum` over a struct field. Returns the collection,
+    /// the reduction, the bits of each element it reduces (offset, width) and
+    /// the target, which must fit those bits: the reduction's result has the
+    /// width of its operand.
+    pub(super) fn reduce_eq_target(
+        &mut self,
+        item: &ConstraintItem,
+        colls: &[RandColl],
+        rand_names: &HashSet<String>,
+    ) -> Option<(RandColl, &'static str, (u32, u32), u64)> {
+        let ConstraintItem::Expr(e) = item else {
+            return None;
+        };
+        let ExprKind::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } = &e.kind
+        else {
+            return None;
+        };
+        for (red_side, const_side) in [(left, right), (right, left)] {
+            let mut side = red_side.as_ref();
+            while let ExprKind::Paren(inner) = &side.kind {
+                side = inner;
+            }
+            let (call, filter) = match &side.kind {
+                ExprKind::WithClause { expr, filter } => (expr.as_ref(), Some(filter.as_ref())),
+                _ => (side, None),
+            };
+            let Some((method, name)) = ["and", "or", "xor", "product", "sum"]
+                .into_iter()
+                .find_map(|m| Self::plain_reduce_array(call, m).map(|n| (m, n)))
+            else {
+                continue;
+            };
+            let Some(c) = colls.iter().find(|c| c.prop == name).cloned() else {
+                continue;
+            };
+            if c.is_object_elem || c.nested || c.width > 64 {
+                continue;
+            }
+            let view = match filter {
+                None => (0, c.width),
+                Some(f) if self.filter_is_identity(f) => (0, c.width),
+                Some(f) => {
+                    // `item.field` of a packed-struct element.
+                    let field = match &f.kind {
+                        ExprKind::Ident(h)
+                            if h.path.len() == 2
+                                && h.path[0].name.name == "item"
+                                && h.path.iter().all(|s| s.selects.is_empty()) =>
+                        {
+                            h.path[1].name.name.clone()
+                        }
+                        ExprKind::MemberAccess { expr, member }
+                            if Self::plain_ident_name(expr).as_deref() == Some("item") =>
+                        {
+                            member.name.clone()
+                        }
+                        _ => continue,
+                    };
+                    let fields = self.coll_packed_elem_fields(&c.scoped);
+                    let Some(&(_, off, w)) = fields
+                        .as_ref()
+                        .and_then(|fs| fs.iter().find(|(n, _, _)| *n == field))
+                    else {
+                        continue;
+                    };
+                    (off, w)
+                }
+            };
+            // A plain `sum` is `distribute_array_sum`'s.
+            if method == "sum" && view == (0, c.width) {
+                continue;
+            }
+            let mut ids: HashSet<String> = HashSet::default();
+            self.collect_expr_idents(const_side, &mut ids);
+            if ids
+                .iter()
+                .any(|n| rand_names.contains(n) || colls.iter().any(|c| &c.prop == n))
+            {
+                continue;
+            }
+            let tv = self.eval_expr(const_side);
+            let Some(k) = tv.to_u64().filter(|_| !tv.has_xz()) else {
+                continue;
+            };
+            let mask = if view.1 >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << view.1) - 1
+            };
+            if k & !mask != 0 {
+                continue;
+            }
+            return Some((c, method, view, k));
+        }
+        None
+    }
+
+    /// Construct elements meeting `<red>(view of each element) == k`: draw
+    /// the free elements as they are and correct as few of them as the
+    /// reduction needs (rejection over the element domain almost never meets
+    /// an `and`/`or`/`xor`/`product` target). Elements pinned by another
+    /// constraint keep their value; an infeasible target is left to the trial
+    /// checker, which rejects and retries.
+    pub(super) fn repair_array_reduction(
+        &mut self,
+        c: &RandColl,
+        method: &str,
+        (off, w): (u32, u32),
+        k: u64,
+        pinned: &mut HashSet<String>,
+    ) {
+        use rand::Rng;
+        let keys = self.coll_elem_keys(c);
+        if keys.is_empty() {
+            return;
+        }
+        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let mut vals: Vec<u64> = keys
+            .iter()
+            .map(|key| {
+                self.read_coll_elem(key)
+                    .and_then(|v| v.to_u64())
+                    .map_or(0, |v| (v >> off) & mask)
+            })
+            .collect();
+        let free: Vec<usize> = (0..keys.len())
+            .filter(|&i| !pinned.contains(&keys[i]))
+            .collect();
+        if free.is_empty() {
+            return;
+        }
+        let pick = |sim: &mut Self| free[sim.cur_rng().gen_range(0..free.len())];
+        let mut touched: Vec<usize> = Vec::new();
+        match method {
+            // Every element holds the target's ones, and every other bit is
+            // 0 in at least one element.
+            "and" => {
+                for &i in &free {
+                    vals[i] |= k;
+                }
+                let extra = vals.iter().fold(mask, |a, v| a & v) & !k;
+                for b in (0..w).filter(|b| extra >> b & 1 == 1) {
+                    let i = pick(self);
+                    vals[i] &= !(1u64 << b);
+                }
+                touched.extend(&free);
+            }
+            // No element holds a bit outside the target, and every target
+            // bit is 1 in at least one element.
+            "or" => {
+                for &i in &free {
+                    vals[i] &= k;
+                }
+                let missing = k & !vals.iter().fold(0, |a, v| a | v);
+                for b in (0..w).filter(|b| missing >> b & 1 == 1) {
+                    let i = pick(self);
+                    vals[i] |= 1u64 << b;
+                }
+                touched.extend(&free);
+            }
+            "xor" => {
+                let j = pick(self);
+                let rest = (0..vals.len())
+                    .filter(|&i| i != j)
+                    .fold(0, |a, i| a ^ vals[i]);
+                vals[j] = (rest ^ k) & mask;
+                touched.push(j);
+            }
+            // The result wraps at the operand width.
+            "sum" => {
+                let j = pick(self);
+                let rest = (0..vals.len())
+                    .filter(|&i| i != j)
+                    .fold(0u64, |a, i| a.wrapping_add(vals[i]));
+                vals[j] = k.wrapping_sub(rest) & mask;
+                touched.push(j);
+            }
+            "product" => {
+                let prod = |vals: &[u64], skip: Option<usize>| {
+                    (0..vals.len())
+                        .filter(|&i| Some(i) != skip)
+                        .fold(1u64, |a, i| a.wrapping_mul(vals[i]))
+                        & mask
+                };
+                if prod(&vals, None) == k {
+                    return;
+                }
+                let j = pick(self);
+                if k == 0 {
+                    vals[j] = 0;
+                } else {
+                    // `x * P == k (mod 2^w)` takes `P = 2^t * odd` with
+                    // 2^t dividing k; make the other free elements odd when
+                    // their product has too many factors of 2.
+                    let need = k.trailing_zeros();
+                    if prod(&vals, Some(j)) == 0 || prod(&vals, Some(j)).trailing_zeros() > need {
+                        for &i in free.iter().filter(|&&i| i != j) {
+                            vals[i] |= 1;
+                            touched.push(i);
+                        }
+                    }
+                    let p = prod(&vals, Some(j));
+                    if p == 0 || p.trailing_zeros() > need {
+                        return;
+                    }
+                    let t = p.trailing_zeros();
+                    let odd = p >> t;
+                    // Inverse of an odd number modulo 2^64 (Newton).
+                    let mut inv = odd;
+                    for _ in 0..6 {
+                        inv = inv.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(inv)));
+                    }
+                    // `x` is fixed modulo 2^(w-t); its bits above are free.
+                    let low_mask = if w - t >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << (w - t)) - 1
+                    };
+                    let low = (k >> t).wrapping_mul(inv) & low_mask;
+                    let hi = if t == 0 {
+                        0
+                    } else {
+                        self.cur_rng().r#gen::<u64>() << (w - t)
+                    };
+                    vals[j] = (low | hi) & mask;
+                }
+                touched.push(j);
+            }
+            _ => return,
+        }
+        for i in touched {
+            let old = self
+                .read_coll_elem(&keys[i])
+                .and_then(|v| v.to_u64())
+                .unwrap_or(0);
+            let new = (old & !(mask << off)) | (vals[i] << off);
+            self.write_coll_elem(&keys[i], Value::from_u64(new, c.width));
+            pinned.insert(keys[i].clone());
         }
     }
 
@@ -1992,7 +2864,11 @@ impl Simulator {
     /// §18.5.9 — an lvalue reaching THROUGH a rand class-handle member
     /// (`sub_inst.sub_data`). Returns the sub-object's handle and the member
     /// name, so a cross-object equality can be forced onto it.
-    pub(super) fn cross_obj_lvalue(&mut self, e: &Expression) -> Option<(usize, String)> {
+    pub(super) fn cross_obj_lvalue(
+        &mut self,
+        e: &Expression,
+        rand_set: &HashSet<String>,
+    ) -> Option<(usize, String)> {
         let (obj, field) = match &e.kind {
             ExprKind::Ident(h) if h.path.len() == 2 => {
                 (h.path[0].name.name.clone(), h.path[1].name.name.clone())
@@ -2006,7 +2882,12 @@ impl Simulator {
             _ => return None,
         };
         let this = self.this_stack.last().copied().flatten()?;
-        // `obj` must be a class-handle member of the enclosing object.
+        // §18.4/§18.5.9: a rand field in a non-rand (or disabled) handle
+        // remains state for this solve. Do not repair equalities by mutating
+        // configuration objects reached through such handles.
+        if !rand_set.contains(&obj) {
+            return None;
+        }
         self.prop_class_type(this, &obj)?;
         let sub = self
             .heap
@@ -2216,11 +3097,7 @@ impl Simulator {
                 for key in self.assoc_key_strs(&c.scoped) {
                     let mut frame: HashMap<String, Value> = HashMap::default();
                     if let Some(Some(n)) = idx_names.first() {
-                        let kv = if self.is_string_keyed_array(&c.scoped) {
-                            Value::from_string(&key)
-                        } else {
-                            Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, 32)
-                        };
+                        let kv = self.assoc_foreach_key_value(&c.scoped, &key);
                         frame.insert(n.clone(), kv);
                     }
                     self.push_local_frame(frame);
@@ -2229,6 +3106,45 @@ impl Simulator {
                     if !good {
                         ok = false;
                         break;
+                    }
+                }
+            }
+            // §7.4.5: rows with fixed dimensions (`foreach (a[i, j, k])` on
+            // `T a[][2][3]`): every loop variable walks its dimension.
+            CollKind::Dyn if matches!(c.row_tail, Some(RowTail::Fixed(_))) => {
+                let mut dims = vec![(0, self.coll_outer_size(c) as i64 - 1)];
+                if let Some(RowTail::Fixed(inner)) = &c.row_tail {
+                    dims.extend_from_slice(inner);
+                }
+                dims.truncate(idx_names.len().max(1));
+                if dims.iter().any(|&(lo, hi)| hi < lo) {
+                    return true;
+                }
+                let mut at: Vec<i64> = dims.iter().map(|d| d.0).collect();
+                loop {
+                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    for (d, n) in idx_names.iter().take(dims.len()).enumerate() {
+                        if let Some(n) = n {
+                            frame.insert(n.clone(), Self::signed_loop_val(at[d]));
+                        }
+                    }
+                    self.push_local_frame(frame);
+                    let good = self.item_holds(handle, body);
+                    self.pop_local_frame();
+                    if !good {
+                        return false;
+                    }
+                    let mut d = dims.len();
+                    loop {
+                        if d == 0 {
+                            return true;
+                        }
+                        d -= 1;
+                        if at[d] < dims[d].1 {
+                            at[d] += 1;
+                            break;
+                        }
+                        at[d] = dims[d].0;
                     }
                 }
             }
@@ -2718,6 +3634,15 @@ impl Simulator {
         }
     }
 
+    /// True when the current randomize() call has passed its
+    /// `+xezim_rand_timeout` deadline (no deadline armed → false). Used
+    /// inside long per-element retry/sweep loops so a single trial cannot
+    /// grind unboundedly past the budget.
+    pub(super) fn rand_past_deadline(&self) -> bool {
+        self.randomize_budget_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
+
     pub(super) fn take_randomize_budget(
         &mut self,
         handle: usize,
@@ -2753,5 +3678,24 @@ impl Simulator {
         }
         self.randomize_budget_remaining -= 1;
         true
+    }
+}
+
+#[cfg(test)]
+mod randc_permute_tests {
+    use super::Simulator;
+
+    /// The wide-randc cycle visits every value of its width exactly once.
+    #[test]
+    fn permute_is_a_bijection() {
+        for width in 17..=20u32 {
+            let n = 1usize << width;
+            let mut seen = vec![false; n];
+            for x in 0..n as u64 {
+                let v = Simulator::randc_permute(x, 0x1234_5678_9abc_def1, width) as usize;
+                assert!(v < n && !seen[v], "width {width}: {x} -> {v}");
+                seen[v] = true;
+            }
+        }
     }
 }

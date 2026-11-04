@@ -7,6 +7,9 @@
 //! pass-through write and the field write commit two values per eval) and
 //! churned to the settle limit — on a real design this exhausted the slot
 //! at the exact time a bus request was issued. Reference-verified values.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! `%0p` as `%p`, and no space before an associative array's closing brace.
 
 use std::process::Command;
 
@@ -53,7 +56,7 @@ endmodule
 "#,
     );
     assert!(!text.contains("settle limit"), "{text}");
-    assert!(text.contains("T|t=16 out_req='{vld:1, addr:33}"), "{text}");
+    assert!(text.contains("T|t=16 out_req='{vld:'h1, addr:'h21}"), "{text}");
 }
 
 #[test]
@@ -78,7 +81,7 @@ endmodule
 "#,
     );
     assert!(!text.contains("settle limit"), "{text}");
-    assert!(text.contains("T|t=16 out_req='{vld:1, addr:85}"), "{text}");
+    assert!(text.contains("T|t=16 out_req='{vld:'h1, addr:'h55}"), "{text}");
 }
 
 #[test]
@@ -105,5 +108,5 @@ endmodule
 "#,
     );
     assert!(!text.contains("settle limit"), "{text}");
-    assert!(text.contains("out_req='{vld:1, addr:65}"), "{text}");
+    assert!(text.contains("out_req='{vld:'h1, addr:'h41}"), "{text}");
 }

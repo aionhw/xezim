@@ -51,7 +51,8 @@ Facts worth knowing before the first run:
   default, pass `--timescale 1ns/1ps` (a default, never an override)
   or the named `--module-timescale mod=unit/prec` form; `--dump-timescales`
   prints every module's resolution.
-- **Exit codes**: parse errors, elaboration errors, `$fatal`, and a `-s`
+- **Exit codes**: parse errors, elaboration errors, `$fatal`, a run-time
+  error that stops the run (a null handle, a livelock), and a `-s`
   naming a nonexistent top all exit nonzero; add `--error-exit` to make any
   `$error` fail the run too — essential in scripts and CI. A generated
   corpus with known-stale top names can restore auto-detection with

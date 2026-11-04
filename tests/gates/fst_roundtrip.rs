@@ -843,3 +843,107 @@ endmodule
     }
     assert_eq!(fst.end_time, 4);
 }
+
+/// `--fst-repack`: the finished dump is gzip-wrapped in an FST `ZWRAPPER`
+/// block (GTKWave's repack-on-close). The file starts with the wrapper's
+/// type byte, and a reader inflates it on open to the same hierarchy and
+/// value changes as the plain dump.
+#[test]
+fn fst_repack_wraps_the_dump_and_reads_back() {
+    let src = "module top;\n\
+               \x20 reg clk = 0; reg [7:0] cnt = 0;\n\
+               \x20 always #5 clk = ~clk;\n\
+               \x20 always @(posedge clk) cnt <= cnt + 3;\n\
+               \x20 initial #100 $finish;\n\
+               endmodule\n";
+    let dir = std::env::temp_dir().join(format!("xezim_fst_repack_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let design = dir.join("top.sv");
+    std::fs::write(&design, src).unwrap();
+    let run = |args: &[&str], out: &PathBuf| {
+        let status = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+            .arg(&design)
+            .args(["--simulate", "-s", "top", "--no-cache", "--fst"])
+            .arg(out)
+            .args(args)
+            .output()
+            .expect("run xezim");
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    };
+    let plain = dir.join("plain.fst");
+    let packed = dir.join("packed.fst");
+    run(&[], &plain);
+    run(&["--fst-repack=4"], &packed);
+    let head = std::fs::read(&packed).unwrap();
+    assert_eq!(head[0], 254, "packed dump does not start with a ZWRAPPER block");
+    assert_ne!(std::fs::read(&plain).unwrap()[0], 254);
+    assert!(
+        head.len() < std::fs::metadata(&plain).unwrap().len() as usize + 64,
+        "the wrapper should not grow a tiny dump by more than its headers"
+    );
+    let a = decode(&plain);
+    let b = decode(&packed);
+    assert_eq!(a.paths(), b.paths());
+    assert_eq!(a.timeline("top.cnt"), b.timeline("top.cnt"));
+    // Ten rising edges before `$finish` at 100: 10 * 3 = 30.
+    assert_eq!(b.timeline("top.cnt").last().map(|(_, v)| v.as_str()), Some("00011110"));
+    assert_eq!((a.start_time, a.end_time), (b.start_time, b.end_time));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--fst-repack` on a dump path that is a symbolic link repacks the link's
+/// target and keeps the link: renaming over the path made the link a regular
+/// file and left the target uncompressed (#598, reported by akashlevy). No
+/// temporary file is left beside the target.
+#[cfg(unix)]
+#[test]
+fn fst_repack_through_a_symbolic_link() {
+    let dir = std::env::temp_dir().join(format!("xezim_fst_repack_link_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let design = dir.join("top.sv");
+    std::fs::write(
+        &design,
+        "module top; reg [7:0] c = 0; always #5 c = c + 1; initial #50 $finish; endmodule\n",
+    )
+    .unwrap();
+    let target = dir.join("real.fst");
+    let link = dir.join("link.fst");
+    std::fs::write(&target, b"").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .arg(&design)
+        .args(["--simulate", "-s", "top", "--no-cache", "--fst"])
+        .arg(&link)
+        .arg("--fst-repack=4")
+        .output()
+        .expect("run xezim");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the dump path is no longer a link"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap()[0],
+        254,
+        "the target was not repacked"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".repack."))
+        .collect();
+    assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -727,6 +727,17 @@ impl Simulator {
     }
 
     pub(super) fn resolve_hier_name_uncached(&self, hier: &HierarchicalIdentifier) -> String {
+        // §23.9 / §13.5 (#534): an unpacked-array FORMAL of the running
+        // method is bound under its bare name (with a frame marker); it
+        // shadows a same-named class array constant or module array, so the
+        // class-scope lift below must not take the name.
+        if hier.root.is_none()
+            && hier.path.len() == 1
+            && let Some(frame) = self.local_stack.last()
+            && frame.contains_key(&format!("\u{1}array_formal:{}", hier.path[0].name.name))
+        {
+            return hier.path[0].name.name.clone();
+        }
         // §25.3 / §23.8: a hierarchical reference through an interface port
         // names its connected instance, before ordinary suffix fallbacks.
         if !self.module.interface_port_aliases.is_empty() {

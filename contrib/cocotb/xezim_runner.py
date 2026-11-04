@@ -42,8 +42,8 @@ _Command = List[str]
 XEZIM_BIN = os.environ.get("XEZIM_BIN", "xezim")
 
 #: cocotb ships one shared object per simulator, but the VPI ones are not
-#: simulator-specific — they are plain IEEE 1800 clause 38 clients. The ``vcs``
-#: flavour is the plain-VPI build and is what xezim is verified against.
+#: simulator-specific — they are plain IEEE 1800 clause 38 clients. The flavour
+#: named below is the plain-VPI build and is what xezim is verified against.
 _VPI_LIB_FLAVOUR = os.environ.get("XEZIM_COCOTB_VPI_FLAVOUR", "vcs")
 
 

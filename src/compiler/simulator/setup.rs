@@ -273,7 +273,14 @@ impl Simulator {
         if !self.wake_rank_built {
             self.build_sig_wake_rank();
         }
+        super::checkpoint::audit::start(self);
+        self.checkpoint_start();
+        if self.checkpoint_restored {
+            start = false;
+        }
         self.event_loop(start);
+        super::checkpoint::audit::finish(self);
+        self.checkpoint_unserved();
         if self.ended_waiting_in_c {
             // Stopped, not finished: no `$finish` was called.
             self.finished = false;
@@ -2295,12 +2302,14 @@ impl Simulator {
             &self.module.arrays,
             &self.widths,
         );
+        compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
         compiler.allow_waits = true;
         // System-task statements (`$display`, `$write`, `$finish`, ...)
         // lower to statement fallbacks; the gate below admits only those,
         // and only because the body has no process locals for the
         // interpreter to miss (LoadProcessLocal is rejected there).
         compiler.allow_ast_fallback = true;
+        compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
         compiler.set_scope_hint(scope_hint);
         compiler.set_tasks(&self.module.tasks);
         compiler.set_functions(&self.module.functions);
@@ -2314,6 +2323,7 @@ impl Simulator {
         compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
         compiler.set_assoc_arrays(&self.module.associative_arrays);
         compiler.set_packed_full_dims(&self.module.packed_full_dims);
+        Self::set_pattern_type_tables(&self.module, &mut compiler);
         compiler.set_packed_struct_fields(
             self.bc_packed_fields
                 .as_ref()
@@ -2534,6 +2544,56 @@ impl Simulator {
                     extra_writes.push(format!("{}{}", ctx.prefix, w));
                 }
                 extra_writes.push(w.clone());
+            }
+        }
+        // Instance `initial` blocks travel unmaterialized in `pending_initial`
+        // — bare source names plus a per-instance `RewriteCtx` — and are only
+        // rewritten into `initial_blocks` (instance-prefixed names) at
+        // scheduling, long after this census. The walk below therefore never
+        // saw a driver initial's write to its own output port under the
+        // spelling the buffer pass compares against (`<ctx.prefix>p`, the rhs
+        // of the output-connect CA), so `p0 = d0.p` collapsed onto the
+        // procedurally written `d0.p`: the t=0 write then hit the merged net
+        // directly, firing the receiver's edge before its `always` armed
+        // (tests/scheduling/t0_comb_defer_start_batch) — and dropping the
+        // delta step the waiter_edge_ordering rule keeps at any time. Add the
+        // prefixed spellings here; a name the set only gains never enables a
+        // collapse, it can only inhibit one.
+        for p in &self.module.pending_initial {
+            let (_, writes) = by_source
+                .entry(std::rc::Rc::as_ptr(&p.source) as usize)
+                .or_insert_with(|| super::elaborate::stmt_write_targets(&p.source));
+            for w in writes.iter() {
+                let head = w.split('.').next().unwrap_or(w);
+                if p.ctx.local_names.contains(head) {
+                    extra_writes.push(format!("{}{}", p.ctx.prefix, w));
+                }
+                extra_writes.push(w.clone());
+            }
+        }
+        // `static_init_blocks` (§6.8 variable declaration assignments) are
+        // absent from the core walk as well; their writes are already
+        // instance-qualified, so they go in verbatim. A materialized
+        // instance block that kept bare names carries its instance path in
+        // `scope` (the runtime resolution hint); qualify those too.
+        for ib in &self.module.static_init_blocks {
+            let (_, writes) = super::elaborate::stmt_write_targets(&ib.stmt);
+            extra_writes.extend(writes);
+        }
+        for ib in self
+            .module
+            .initial_blocks
+            .iter()
+            .chain(self.module.final_blocks.iter())
+        {
+            if ib.scope.is_empty() {
+                continue;
+            }
+            let (_, writes) = super::elaborate::stmt_write_targets(&ib.stmt);
+            for w in writes {
+                if !w.contains('.') {
+                    extra_writes.push(format!("{}.{}", ib.scope, w));
+                }
             }
         }
         let deferred = &self.deferred_always;

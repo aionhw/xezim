@@ -4,6 +4,10 @@
 //! layout, so `m.p.a = 7` wrote nothing and `m.p` stayed x.
 //!
 //! The expected lines were cross-checked against the reference simulator.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -48,10 +52,10 @@ fn subroutine_struct_local_defaults_and_packed_members() {
     assert_eq!(
         got,
         vec![
-            "f: m='{p:'{a:7, b:8}, n:0, l:x} n=0",
+            "f: m='{p:'{a:'h7, b:'h8}, n:0, l:'hX} n=0",
             "f=00000078",
-            "t: o='{inner:'{p:'{a:x, b:9}, n:0, l:x}, k:0}",
-            "mk='{p:'{a:3, b:x}, n:0, l:x}",
+            "t: o='{inner:'{p:'{a:'hX, b:'h9}, n:0, l:'hX}, k:'h0}",
+            "mk='{p:'{a:'h3, b:'hX}, n:0, l:'hX}",
         ]
     );
 }

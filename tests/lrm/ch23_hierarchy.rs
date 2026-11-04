@@ -1,4 +1,8 @@
 //! IEEE 1800-2023 clause 23: modules and hierarchy.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use crate::harness::{Order, check};
 
@@ -135,7 +139,7 @@ fn c23_2_2_2_ansi_port_forms() {
         Order::Exact,
         &[
             "T|23.2.2.2a|s=17 sum=-7 r=9 w=6",
-            "T|23.3.3.ref|cnt=105 q='{119}",
+            "T|23.3.3.ref|cnt=105 q='{'h77}",
         ],
         &["T|23.2.2.2b|", "T|23.2.2.3a|", "T|23.2.2.4|"],
     );
@@ -309,7 +313,7 @@ fn c23_3_3_5_instance_arrays() {
             "T|23.3.3.5a|ys=5432 zs=0000",
             "T|23.3.3.5b|ys2=6543 zs2=0000",
             "T|23.3.3.5c|ob=01011001",
-            "T|23.3.3.5d|uy='{2, 3, 4, 5} uz=0000",
+            "T|23.3.3.5d|uy='{'h2, 'h3, 'h4, 'h5} uz=0000",
             "T|23.3.3.5e|ys3=51 id1=5 id0=1",
             "T|23.3.3.5f|oy=44 oz=00 nz5=3 nz4.y=4",
             "T|23.3.3.5h|16",
@@ -444,5 +448,24 @@ fn c23_hierarchy_more() {
             "T|23.6i|16",
         ],
         &["T|23.6e|", "T|23.6h|"],
+    );
+}
+
+// §23.11, §6.10: a bind port actual the target does not declare is an implicit
+// net in the target, not the bind scope's signal of that name
+#[test]
+fn c23_11_bind_connection_implicit_net() {
+    // The bound instances print from their own initial blocks at time 30; IEEE 1800 §4.7 leaves their order open.
+    check(
+        "23.11_bind_connection_implicit_net",
+        include_str!("sv/23.11_bind_connection_implicit_net.sv"),
+        "bcin",
+        Order::Multiset,
+        &[
+            "T|23.11|bcin.bare.mon edges=0",
+            "T|23.11|bcin.own.mon edges=1",
+            "T|23.11|bcin.far.mon edges=0",
+        ],
+        &[],
     );
 }

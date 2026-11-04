@@ -130,7 +130,7 @@ impl Simulator {
                             .map(|v| v.0),
                     );
                 }
-                None
+                self.nested_iface_operand(e)
             }
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 let raw = &h.path[0].name.name;
@@ -255,6 +255,7 @@ impl Simulator {
                     return Some(Some(h.path[1].name.name.clone()));
                 }
                 self.vif_operand_obj_prop(&h.path[0].name.name, &h.path[1].name.name)
+                    .or_else(|| self.nested_iface_operand(e))
             }
             ExprKind::Ident(h) if h.path.len() > 2 => {
                 // `e.d.vif` — a NESTED receiver spelled as one hierarchical
@@ -274,7 +275,7 @@ impl Simulator {
                         return self.vif_operand_handle_prop(oh, &prop);
                     }
                 }
-                None
+                self.nested_iface_operand(e)
             }
             ExprKind::MemberAccess { expr, member } => {
                 // §8.26/§25.10: `C#(T)::svif` — a static virtual interface of a
@@ -303,7 +304,9 @@ impl Simulator {
                         {
                             return Some(Some(member.name.clone()));
                         }
-                        return self.vif_operand_obj_prop(&bh.path[0].name.name, &member.name);
+                        return self
+                            .vif_operand_obj_prop(&bh.path[0].name.name, &member.name)
+                            .or_else(|| self.nested_iface_operand(e));
                     }
                 }
                 // `this.svif` parses as `MemberAccess { expr: This, .. }`, not
@@ -336,10 +339,129 @@ impl Simulator {
                         return self.vif_operand_handle_prop(oh, &member.name);
                     }
                 }
-                None
+                self.nested_iface_operand(e)
             }
             _ => None,
         }
+    }
+
+    /// `vif_operand` for a hierarchical name of a nested interface instance
+    /// (`o.leaf`, `o.arr[1]`, #612): unless its head is a data object other
+    /// than an interface instance, which makes it a member select.
+    fn nested_iface_operand(&self, e: &Expression) -> Option<Option<String>> {
+        let mut cur = e;
+        let head = loop {
+            match &cur.kind {
+                ExprKind::Ident(h) => break h.path.first()?.name.name.as_str(),
+                ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => cur = expr,
+                _ => return None,
+            }
+        };
+        if !self.is_interface_instance(head) && self.names_data_object(head) {
+            return None;
+        }
+        self.nested_iface_instance(e).map(Some)
+    }
+
+    /// §23.8: inside a subroutine of an interface or module instance,
+    /// `parent_if.children[0]` names by its DEFINITION name the instance the
+    /// subroutine runs in. Spell it the way the instance's own `children[0]`
+    /// reaches the resolver (`parent.children`, under the same select); read as
+    /// written it named no interface instance and bound nothing.
+    pub(super) fn strip_own_definition_name(&self, e: &Expression) -> Option<Expression> {
+        fn base(e: &Expression) -> Option<&HierarchicalIdentifier> {
+            match &e.kind {
+                ExprKind::Ident(h) => Some(h),
+                ExprKind::MemberAccess { expr, .. }
+                | ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. } => base(expr),
+                ExprKind::Call { func, .. } => base(func),
+                _ => None,
+            }
+        }
+        let h = base(e)?;
+        // Only `defname.member...` names the instance: a bare `defname` is a
+        // local, port or variable that happens to share the definition's name
+        // (`int sub;` inside `module sub`).
+        if h.root.is_some() || h.path.len() < 2 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let head = h.path[0].name.name.as_str();
+        if self.local_stack.last().is_some_and(|l| l.contains_key(head)) {
+            return None;
+        }
+        let scope_hint = self.name_resolve_hint.borrow();
+        let scope = scope_hint.as_deref()?;
+        if self.is_interface_instance(head)
+            || !self
+                .instance_by_path(scope)
+                .is_some_and(|i| i.def_name == head)
+        {
+            return None;
+        }
+        let mut path = Self::iface_path_segs(scope, e.span);
+        path.extend(h.path[1..].iter().cloned());
+        let replacement = Self::resolved_iface_expr(path, e.span);
+        fn replace_base(e: &mut Expression, replacement: Expression) {
+            match &mut e.kind {
+                ExprKind::MemberAccess { expr, .. }
+                | ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. } => replace_base(expr, replacement),
+                ExprKind::Call { func, .. } => replace_base(func, replacement),
+                _ => *e = replacement,
+            }
+        }
+        let mut rewritten = e.clone();
+        replace_base(&mut rewritten, replacement);
+        Some(rewritten)
+    }
+
+    /// `vif_operand`, then a receiver with an element select
+    /// (`cfg.kids[0].vif`, `arr[i].vif`), which the `&self` chain walk cannot
+    /// index: those classified as nothing, so a bound vif compared equal to
+    /// null by value (§25.9). Evaluate the receiver to its object handle and
+    /// classify the property there. A receiver with a call is left alone so
+    /// it is not evaluated twice.
+    pub(super) fn vif_operand_eval(&mut self, e: &Expression) -> Option<Option<String>> {
+        if let Some(c) = self.vif_operand(e) {
+            return Some(c);
+        }
+        fn has_select(e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::Index { .. } => true,
+                ExprKind::Ident(h) => h.path.iter().any(|s| !s.selects.is_empty()),
+                ExprKind::MemberAccess { expr, .. } => has_select(expr),
+                _ => false,
+            }
+        }
+        let prop = match &e.kind {
+            ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+            ExprKind::Ident(h) if h.path.len() >= 2 && h.path.last()?.selects.is_empty() => {
+                h.path.last()?.name.name.as_str()
+            }
+            _ => return None,
+        };
+        if !self.class_member_names().vif_props.contains(prop) {
+            return None;
+        }
+        let prop = prop.to_string();
+        let recv = match &e.kind {
+            ExprKind::MemberAccess { expr, .. } => (**expr).clone(),
+            ExprKind::Ident(h) => {
+                let mut bh = h.clone();
+                bh.path.pop();
+                Expression::new(ExprKind::Ident(bh), e.span)
+            }
+            _ => return None,
+        };
+        if !has_select(&recv) || Self::expr_contains_call(&recv) {
+            return None;
+        }
+        let oh = self.eval_expr(&recv).to_u64()? as usize;
+        if oh == 0 {
+            return None;
+        }
+        self.vif_operand_handle_prop(oh, &prop)
     }
 
     /// `obj.prop` classification for `vif_operand` — engages only when the
@@ -393,6 +515,15 @@ impl Simulator {
     /// caller falls back to its non-vif path.
     pub(super) fn chain_handle(&self, expr: &Expression) -> Option<usize> {
         match &expr.kind {
+            // §8.11: `this.cfg.vif` roots the chain at the live object; with
+            // no handle the operand was unclassifiable and a bound vif
+            // compared equal to null.
+            ExprKind::This => self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .filter(|&h| h != 0),
             ExprKind::Ident(h) if h.path.len() == 1 => self.eval_ident_handle(&h.path[0].name.name),
             ExprKind::Ident(h) if h.path.len() > 1 => {
                 // A packed multi-segment path (`e.d`): the head names the
@@ -458,10 +589,9 @@ impl Simulator {
         let mut saved = Vec::with_capacity(formals.len());
         for ((name, _), nm) in formals.iter().zip(bound) {
             // No key was ever made for this name and none is made now: the
-            // removal would find nothing (the store generation still moves,
-            // as it did). An empty key marks the slot for the exit.
+            // removal would find nothing, so nothing is written. An empty key
+            // marks the slot for the exit.
             if nm.is_none() && !self.vif_local_names.contains(*name) {
-                bump_store_gen();
                 saved.push((String::new(), None));
                 continue;
             }
@@ -499,7 +629,6 @@ impl Simulator {
             // Untouched on entry: the key exists only if the body made one.
             let key = if key.is_empty() {
                 if !self.vif_local_names.contains(*name) {
-                    bump_store_gen();
                     continue;
                 }
                 format!("__vif_local__{}", name)
@@ -1489,6 +1618,9 @@ impl Simulator {
         {
             return self.resolve_vif_rhs_name(&stripped);
         }
+        if let Some(local) = self.strip_own_definition_name(rvalue) {
+            return self.resolve_vif_rhs_name(&local);
+        }
         if let Some(b) = self.static_vif_binding(rvalue) {
             return Some(b);
         }
@@ -1567,6 +1699,14 @@ impl Simulator {
                 // Without this, `rv = rb.driver;` bound nothing and every
                 // write through `rv` landed on a phantom copy.
                 let head = &h.path[0].name.name;
+                // §23.6 / §25.9 (#570): `outer.leaf` names the interface
+                // instance `leaf` nested in `outer`; an interface cannot
+                // declare a modport and an instance of one name, so the
+                // instance list decides before the modport-view reading.
+                let nested = format!("{}.{}", head, h.path[1].name.name);
+                if self.is_interface_instance(&nested) {
+                    return Some(nested);
+                }
                 if self.is_interface_instance(head) {
                     return Some(head.clone());
                 }
@@ -1595,7 +1735,12 @@ impl Simulator {
                 if let ExprKind::Ident(h) = &expr.kind {
                     if h.path.len() == 1 {
                         let head = &h.path[0].name.name;
-                        // Same §25.9 modport-view case in MemberAccess shape.
+                        // A nested interface instance first (#570), then the
+                        // same §25.9 modport-view case in MemberAccess shape.
+                        let nested = format!("{}.{}", head, member.name);
+                        if self.is_interface_instance(&nested) {
+                            return Some(nested);
+                        }
                         if self.is_interface_instance(head) {
                             return Some(head.clone());
                         }
@@ -1612,7 +1757,10 @@ impl Simulator {
                         }
                     }
                 }
-                if let Some(p) = self.iface_instance_by_path(rvalue) {
+                if let Some(p) = self
+                    .iface_instance_by_path(rvalue)
+                    .or_else(|| self.nested_iface_instance(rvalue))
+                {
                     return Some(p);
                 }
                 let oh = self.eval_handle_expr(expr).unwrap_or(0);
@@ -1621,7 +1769,9 @@ impl Simulator {
                     .map(|(b, _)| b.clone())
             }
             // `a.b.d` / `g[0].a.d` — a nested interface instance.
-            ExprKind::Ident(_) => self.iface_instance_by_path(rvalue),
+            ExprKind::Ident(_) => self
+                .iface_instance_by_path(rvalue)
+                .or_else(|| self.nested_iface_instance(rvalue)),
             // `INT[i]` — an element of an interface-instance array
             // (`interrupt_if INT[N]()`). Bind to the element's name so
             // `vif.member` resolves to `INT[<i>].member` (interrupt examples set
@@ -1633,7 +1783,8 @@ impl Simulator {
                         return Some(format!("{}[{}]", h.path[0].name.name, idx));
                     }
                 }
-                None
+                // `o.arr[1]`: an element of an array nested in an instance.
+                self.nested_iface_instance(rvalue)
             }
             _ => None,
         }
@@ -1646,7 +1797,96 @@ impl Simulator {
     /// modport view), so `px.vif = a.d` bound nothing and every call through
     /// the handle returned at once.
     pub(super) fn iface_instance_by_path(&self, e: &Expression) -> Option<String> {
+        let segs = self.hier_segments(e)?;
+        self.iface_instance_by_segments(segs)
+    }
+
+    /// §23.6/§25.9/§25.5 (#612): the interface instance a hierarchical name
+    /// in a virtual-interface position names: an instance nested in another
+    /// (`o.leaf`, `o.arr[1]`), or a modport view of one (`o.leaf.mp`), which
+    /// binds the instance itself. Asked only when the name's last segment
+    /// (or, for a modport view, the one before it) can end the path of an
+    /// interface instance, so an ordinary hierarchical operand costs a set
+    /// lookup.
+    pub(super) fn nested_iface_instance(&self, e: &Expression) -> Option<String> {
+        let (last_is, view_is) = self.nested_iface_gate(e);
+        if !last_is && !view_is {
+            return None;
+        }
         let mut segs = self.hier_segments(e)?;
+        if segs.len() < 2 {
+            return None;
+        }
+        if last_is && let Some(p) = self.iface_instance_by_segments(segs.clone()) {
+            return Some(p);
+        }
+        let mp = segs.pop()?;
+        let inst = self.iface_instance_by_segments(segs.clone()).or_else(|| {
+            (segs.len() == 1 && self.is_interface_instance(&segs[0])).then(|| segs[0].clone())
+        })?;
+        let def = &self
+            .module
+            .instances
+            .iter()
+            .find(|i| i.path == inst)?
+            .def_name;
+        self.module
+            .modport_member_dirs
+            .contains_key(&(def.clone(), mp))
+            .then_some(inst)
+    }
+
+    /// Whether a multi-segment name's last segment, and the one before it,
+    /// can end the path of an interface instance (`nested_iface_instance`).
+    fn nested_iface_gate(&self, e: &Expression) -> (bool, bool) {
+        let (tails, heads) = self.iface_path_parts();
+        if tails.is_empty() {
+            return (false, false);
+        }
+        // The last two names, without allocating: this runs for every
+        // virtual-interface-capable operand and right-hand side.
+        let mut names: [&str; 2] = [""; 2];
+        let mut n = 0;
+        let mut cur = e;
+        let mut multi = false;
+        while n < 2 {
+            match &cur.kind {
+                ExprKind::Ident(h) => {
+                    multi |= h.path.len() > 1;
+                    for s in h.path.iter().rev().take(2 - n) {
+                        names[n] = s.name.name.as_str();
+                        n += 1;
+                    }
+                    break;
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    multi = true;
+                    names[n] = member.name.as_str();
+                    n += 1;
+                    cur = expr;
+                }
+                ExprKind::Index { expr, .. } => cur = expr,
+                _ => return (false, false),
+            }
+        }
+        if !multi {
+            return (false, false);
+        }
+        let ends = |s: &str| tails.contains(s) || heads.contains(s);
+        let last_is = n > 0 && ends(names[0]);
+        // A modport view (`o.leaf.mp`) only when the last name is a modport,
+        // so `intf.sig` costs no instance search.
+        let view_is = n > 1
+            && ends(names[1])
+            && self
+                .module
+                .modport_member_dirs
+                .keys()
+                .any(|(_, mp)| mp == names[0]);
+        (last_is, view_is)
+    }
+
+    fn iface_instance_by_segments(&self, mut segs: Vec<String>) -> Option<String> {
         if segs.len() < 2 {
             return None;
         }
@@ -2126,6 +2366,18 @@ impl Simulator {
         }
     }
 
+    /// The expression under a chain of bit, part and element selects
+    /// (`bus[3:0]`, `mem[i][7:4]`): the net a select-bound clockvar names.
+    pub(super) fn select_chain_base(expr: &Expression) -> Option<&Expression> {
+        match &expr.kind {
+            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
+                Some(Self::select_chain_base(base).unwrap_or(base))
+            }
+            ExprKind::Ident(h) if h.path.last().is_some_and(|s| !s.selects.is_empty()) => None,
+            _ => None,
+        }
+    }
+
     /// First segment of a `flatten_member_path` chain, without building it.
     pub(super) fn member_path_head(expr: &Expression) -> Option<&str> {
         match &expr.kind {
@@ -2199,6 +2451,51 @@ impl Simulator {
                 .any(|k| k == last || k.strip_suffix(last).is_some_and(|p| p.ends_with('.')))
     }
 
+    /// §14.3: `cb.sig[i]` where `sig` is an unpacked-array clockvar — the
+    /// sample of element `i` taken at the block's last clocking event.
+    /// `None` for any other indexed read, before the index is evaluated.
+    pub(super) fn clocking_array_elem_read(
+        &mut self,
+        base: &Expression,
+        index: &Expression,
+    ) -> Option<Value> {
+        if self.clocking_array_leaves.is_empty() {
+            return None;
+        }
+        let leaf = match &base.kind {
+            ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+            ExprKind::Ident(h) => h.path.last()?.name.name.as_str(),
+            _ => return None,
+        };
+        if !self.clocking_array_leaves.contains(leaf) {
+            return None;
+        }
+        let segs = Self::flatten_member_path(base)?;
+        let (leaf, owner) = segs.split_last()?;
+        let owner: Vec<&str> = owner.iter().map(String::as_str).collect();
+        let cb = self.resolve_clocking_key(&owner)?;
+        // Samples are keyed by the clocking-visible name, which for a block
+        // of an instance is the net's path (`bus.ready[0]`).
+        let prefix = format!("{}[", leaf);
+        let is_elem_of = |k: &str| k.rsplit('.').next().is_some_and(|l| l.starts_with(&prefix));
+        if !self
+            .clocking_snapshots
+            .get(&cb)?
+            .keys()
+            .any(|k| is_elem_of(k))
+        {
+            return None;
+        }
+        let iv = self.eval_expr(index);
+        let i = iv.to_i64().filter(|_| !iv.has_xz())?;
+        let elem = format!("{}{}]", prefix, i);
+        self.clocking_snapshots
+            .get(&cb)?
+            .iter()
+            .find(|(k, _)| k.rsplit('.').next() == Some(elem.as_str()))
+            .map(|(_, v)| v.clone())
+    }
+
     pub(super) fn try_clocking_signal_read(&self, segs: &[&str]) -> Option<Value> {
         if segs.len() < 2 {
             return None;
@@ -2234,7 +2531,14 @@ impl Simulator {
         // has not been sampled yet and holds its type's default (x for a
         // 4-state net), not the live net value.
         let (_, sigs) = self.clocking_meta.get(&cb)?;
-        let (net, _) = sigs.iter().find(|(n, is_in)| *is_in && matches_sig(n))?;
+        let Some((net, _)) = sigs.iter().find(|(n, is_in)| *is_in && matches_sig(n)) else {
+            // §14.3 makes reading an OUTPUT clockvar illegal;
+            // Verilator answers with the driven net's current value
+            // (`$display(mif.cb.addr)` after `mif.cb.addr <= a`), so do the
+            // same instead of reading x.
+            let (net, _) = sigs.iter().find(|(n, _)| matches_sig(n))?;
+            return self.get_signal_value_by_name(net);
+        };
         match self.signal_name_to_id.get(net.as_str()).copied() {
             Some(id) if id < self.signal_widths.len() => {
                 let w = self.signal_widths[id];
@@ -2792,6 +3096,20 @@ impl Simulator {
         )
     }
 
+    /// §25.9: a resolved virtual interface denotes a physical instance, not
+    /// another class property. Root the rewritten path so a matching property
+    /// name cannot rebind it again (e.g. `vif` bound to `vif.child`).
+    fn resolved_iface_expr(
+        path: Vec<crate::ast::expr::HierPathSegment>,
+        span: crate::ast::Span,
+    ) -> Expression {
+        let mut expr = Self::hier_ident_expr(path, span);
+        if let ExprKind::Ident(h) = &mut expr.kind {
+            h.root = Some("$root".to_string());
+        }
+        expr
+    }
+
     /// The path segments of interface instance `bound` (`bus`, `top.u.bus`,
     /// `INT[1]`).
     pub(super) fn iface_path_segs(
@@ -2871,6 +3189,12 @@ impl Simulator {
     /// when no receiver in the chain is a bound vif — the common case, gated
     /// to a few emptiness and name checks.
     pub(super) fn vif_rebase_expr(&self, e: &Expression) -> Option<Expression> {
+        // A definition-qualified self reference is an instance access even
+        // without a virtual handle. Normalize the whole selected chain so
+        // writes, reads and calls use the same instance as vif returns do.
+        if let Some(local) = self.strip_own_definition_name(e) {
+            return Some(local);
+        }
         let alias_possible = self.iface_alias_possible();
         // Returned handles live in the current receiver memo. They must not
         // enable collection-token lookup on every later member expression.
@@ -2938,7 +3262,7 @@ impl Simulator {
             }
             let mut segs = Self::iface_path_segs(&bound, span);
             segs.extend(h.path[i + 1..].iter().cloned());
-            return Some(Self::hier_ident_expr(segs, span));
+            return Some(Self::resolved_iface_expr(segs, span));
         }
         None
     }
@@ -2969,7 +3293,7 @@ impl Simulator {
                         name: member.clone(),
                         selects: Vec::new(),
                     });
-                    return Some(Self::hier_ident_expr(segs, e.span));
+                    return Some(Self::resolved_iface_expr(segs, e.span));
                 }
                 let nb = self.vif_rebase_chain(recv)?;
                 // A plain member of a rebased instance path stays flat too
@@ -2980,7 +3304,7 @@ impl Simulator {
                         name: member.clone(),
                         selects: Vec::new(),
                     });
-                    return Some(Self::hier_ident_expr(path, e.span));
+                    return Some(Self::resolved_iface_expr(path, e.span));
                 }
                 Some(Expression::new(
                     ExprKind::MemberAccess {
@@ -3065,6 +3389,9 @@ impl Simulator {
         {
             return self.vif_rhs_possible(&stripped);
         }
+        if let Some(local) = self.strip_own_definition_name(e) {
+            return self.vif_rhs_possible(&local);
+        }
         if !self.static_vif_names.is_empty() {
             let leaf = match &e.kind {
                 ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
@@ -3074,6 +3401,10 @@ impl Simulator {
             if leaf.is_some_and(|l| self.static_vif_names.contains(l)) {
                 return true;
             }
+        }
+        // `o.leaf.mp`, `o.arr[1]`: a nested interface instance (#612).
+        if !matches!(self.nested_iface_gate(e), (false, false)) {
+            return true;
         }
         match &e.kind {
             ExprKind::Ident(h) if h.path.len() == 1 => self.vif_name_possible(&h.path[0].name.name),
@@ -3138,7 +3469,8 @@ impl Simulator {
     }
 
     /// Every `.`-separated tail of an interface-instance path (the path
-    /// included), and every prefix of one that ends before a `[`.
+    /// included), and every prefix of one that ends before a `[` (with its
+    /// last segment alone).
     pub(super) fn iface_path_parts(&self) -> &(HashSet<String>, HashSet<String>) {
         self.iface_path_parts.get_or_init(|| {
             let mut tails: HashSet<String> = HashSet::default();
@@ -3158,6 +3490,10 @@ impl Simulator {
                         }
                         '[' => {
                             heads.insert(p[..k].to_string());
+                            // The array's own name, for `o.arr[1]` (#612).
+                            if let Some(leaf) = p[..k].rsplit('.').next() {
+                                heads.insert(leaf.to_string());
+                            }
                         }
                         _ => {}
                     }

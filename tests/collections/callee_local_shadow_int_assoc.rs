@@ -6,6 +6,10 @@
 //! `foreach` walk the keys as text. A local `int a[int]` also records its
 //! key's width and signedness, so `foreach` binds a negative key as
 //! negative. Expected lines are the reference simulator's output.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -50,12 +54,12 @@ endmodule
 "#,
     );
     let want = [
-        "T| c1 A='{-5:2, 2:3, 10:1 } num=3",
+        "T| c1 A='{-5:2, 2:3, 10:1} num=3",
         "T| c1 key -5=2",
         "T| c1 key 2=3",
         "T| c1 key 10=1",
         "T| c1 first=-5",
-        "T| c1 tA='{-5:2, 2:3, 10:1 }",
+        "T| c1 tA='{-5:2, 2:3, 10:1}",
         "T| c1 tkey -5=2",
         "T| c1 tkey 2=3",
         "T| c1 tkey 10=1",
@@ -117,7 +121,7 @@ endmodule
         "T| e1 m key 4=40",
         "T| e1 t key -8=8",
         "T| e1 t key 1=9",
-        "T| e1 n A='{-1:5, 3:6 }",
+        "T| e1 n A='{-1:5, 3:6}",
         "T| e1 n2 first=-20 num=3",
     ];
     assert_eq!(out, want, "{out:?}");

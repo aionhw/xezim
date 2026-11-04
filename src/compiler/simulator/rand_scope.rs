@@ -14,11 +14,14 @@ use crate::ast::decl::DistWeight;
 
 /// §18.6: only the active rand state of reachable child objects belongs to
 /// a solve transaction. Unrelated objects and non-rand callback state do not.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct RandChildSnapshot {
     handle: usize,
     properties: Vec<(String, Option<Value>)>,
     collections: Vec<(String, Vec<(String, Value)>)>,
 }
+
+#[derive(serde::Serialize, serde::Deserialize)]
 
 pub(super) struct RandChildTransaction {
     pub(super) owner: usize,
@@ -26,6 +29,181 @@ pub(super) struct RandChildTransaction {
 }
 
 impl Simulator {
+    /// §18.8/§18.9: whole-object mode changes apply to each declared member.
+    /// Store names, so a later per-member enable can override a bulk disable.
+    pub(super) fn set_object_random_mode(
+        &mut self,
+        handle: usize,
+        rand_mode: bool,
+        target: Option<&str>,
+        enable: bool,
+    ) {
+        let mut names = HashSet::default();
+        // §18.5.11: a static block's mode is one class-wide flag, keyed by
+        // its declaring class, so a bulk change reaches it there.
+        let mut static_blocks = Vec::new();
+        if target.is_none() {
+            let mut cls = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|o| o.class_name.as_str());
+            while let Some(name) = cls {
+                let Some(def) = self.module.classes.get(name) else {
+                    break;
+                };
+                if rand_mode {
+                    names.extend(def.random_properties.iter().cloned());
+                } else {
+                    for (con_name, con) in &def.constraints {
+                        if con.is_static {
+                            static_blocks.push((name.to_string(), con_name.clone()));
+                        } else {
+                            names.insert(con_name.clone());
+                        }
+                    }
+                }
+                cls = def.extends.as_deref();
+            }
+        }
+        for key in static_blocks {
+            if enable {
+                self.static_constraint_disabled.remove(&key);
+            } else {
+                self.static_constraint_disabled.insert(key);
+            }
+        }
+        let table = if rand_mode {
+            &mut self.rand_mode_disabled
+        } else {
+            &mut self.constraint_mode_disabled
+        };
+        let disabled = table.entry(handle).or_default();
+        match (target, enable) {
+            (Some(name), true) => {
+                disabled.remove(name);
+                // Enabling a whole array enables each of its elements too.
+                if !name.contains('[') {
+                    let elem = format!("{name}[");
+                    disabled.retain(|k| !k.starts_with(&elem));
+                }
+            }
+            (Some(name), false) => {
+                disabled.insert(name.to_string());
+            }
+            (None, true) => disabled.clear(),
+            (None, false) => {
+                disabled.extend(names);
+            }
+        }
+    }
+    /// §18.8: the object and element key (`arr[2]`, `m[1][0]`) a
+    /// `rand_mode` receiver names when it selects an element of an unpacked
+    /// rand array: `obj.arr[i]`, or `arr[i]` inside the class.
+    pub(super) fn rand_mode_element_target(
+        &mut self,
+        recv: &Expression,
+    ) -> Option<(usize, String)> {
+        let mut idx = Vec::new();
+        let mut base = recv;
+        while let ExprKind::Index { expr, index } = &base.kind {
+            idx.push(self.eval_expr(index).to_i64()?);
+            base = expr;
+        }
+        if idx.is_empty() {
+            return None;
+        }
+        let (handle, name) = match &base.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (self.eval_expr(expr).to_u64()? as usize, member.name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() == 1 => (
+                self.this_stack.last().copied().flatten()?,
+                h.path[0].name.name.clone(),
+            ),
+            // `obj.arr` flattened into one hierarchical name.
+            ExprKind::Ident(h) if h.path.last().is_some_and(|s| s.selects.is_empty()) => {
+                let mut owner = h.clone();
+                let prop = owner.path.pop()?.name.name;
+                owner.cached_signal_id = std::cell::Cell::new(None);
+                owner.cached_resolved_name = std::cell::OnceCell::new();
+                let owner = Expression::new(ExprKind::Ident(owner), base.span);
+                (self.eval_expr(&owner).to_u64()? as usize, prop)
+            }
+            _ => return None,
+        };
+        if handle == 0 || !self.object_declares_property(handle, &name) {
+            return None;
+        }
+        let mut key = name;
+        for i in idx.iter().rev() {
+            key.push_str(&format!("[{i}]"));
+        }
+        Some((handle, key))
+    }
+
+    /// §18.8: an element whose rand_mode is off is a state variable for this
+    /// call, so it keeps its value and the other constraints see that value:
+    /// one `elem == value` constraint per disabled element that exists now.
+    pub(super) fn rand_mode_element_pins(&mut self, handle: usize) -> Vec<ConstraintItem> {
+        let keys: Vec<String> = match self.rand_mode_disabled.get(&handle) {
+            Some(d) => d.iter().filter(|k| k.contains('[')).cloned().collect(),
+            None => return Vec::new(),
+        };
+        let mut pins = Vec::new();
+        for key in keys {
+            if !self.signals.contains_key(&format!("{handle}#{key}")) {
+                continue;
+            }
+            let (name, rest) = key.split_at(key.find('[').unwrap());
+            let mut elem = super::vpi_model::ident_expr(name);
+            for i in rest.trim_matches(|c| c == '[' || c == ']').split("][") {
+                let index = Expression::new(
+                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                        size: None,
+                        signed: true,
+                        base: crate::ast::expr::NumberBase::Decimal,
+                        value: i.to_string(),
+                        cached_val: std::cell::Cell::new(None),
+                    }),
+                    crate::ast::Span::dummy(),
+                );
+                elem = Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(elem),
+                        index: Box::new(index),
+                    },
+                    crate::ast::Span::dummy(),
+                );
+            }
+            self.this_stack.push(Some(handle));
+            let v = self.eval_expr(&elem);
+            self.this_stack.pop();
+            if v.has_xz() {
+                continue;
+            }
+            let value = Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                    size: Some(v.width),
+                    signed: false,
+                    base: crate::ast::expr::NumberBase::Binary,
+                    value: v.to_bin_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }),
+                crate::ast::Span::dummy(),
+            );
+            pins.push(ConstraintItem::Expr(Expression::new(
+                ExprKind::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(elem),
+                    right: Box::new(value),
+                },
+                crate::ast::Span::dummy(),
+            )));
+        }
+        pins
+    }
+
     /// Budget exhaustion can occur in the parent after a child rolled back.
     /// Include active child constraints when identifying the failed solve.
     pub(super) fn failed_child_constraint_names(&mut self, handle: usize) -> Vec<String> {
@@ -802,12 +980,14 @@ impl Simulator {
                 | ExprKind::SystemCall { .. }
         );
         if operand && self.operand_bind(e, cx, bound) == Some(true) {
-            // A whole unpacked collection has no literal form; it is left
-            // as written (only its elements and methods are frozen).
-            if matches!(e.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. })
-                && self.array_operand_name(e).is_some()
-            {
-                return;
+            // A collection stays live while its foreach index changes. Bind
+            // its storage in caller scope rather than leaving a caller handle
+            // to be looked up after the solver switches to object scope.
+            if matches!(e.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. }) {
+                if let Some(name) = self.array_operand_name(e) {
+                    *e = Self::chain_expr(&[name], e.span);
+                    return;
+                }
             }
             let v = self.eval_expr(e);
             *e = Self::literal_of(&v, e.span);
@@ -1175,6 +1355,16 @@ impl Simulator {
                 Self::rebase_expr(expr, t, hit)
                     && ranges.iter_mut().all(|r| Self::rebase_expr(r, t, hit))
             }
+            // A method of a member below `prop` (`prop.r.sum()`): the receiver
+            // is rebased and the call kept, so the sub-object's own solve
+            // reads `r.sum()` of its array.
+            ExprKind::Call { func, args } => {
+                let ExprKind::MemberAccess { expr, .. } = &mut func.kind else {
+                    return false;
+                };
+                Self::rebase_expr(expr, t, hit)
+                    && args.iter_mut().all(|a| Self::rebase_expr(a, t, hit))
+            }
             _ => false,
         }
     }
@@ -1487,7 +1677,7 @@ impl Simulator {
         }
     }
 
-    fn subst_ident_expr(e: &mut Expression, name: &str, lit: &Expression) {
+    pub(super) fn subst_ident_expr(e: &mut Expression, name: &str, lit: &Expression) {
         if let ExprKind::Ident(h) = &e.kind {
             if h.root.is_none()
                 && h.path.len() == 1

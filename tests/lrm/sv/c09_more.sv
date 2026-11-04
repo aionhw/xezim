@@ -30,6 +30,7 @@ module c09x;
   // sensitivity to real
   real rv = 0; int rcnt = 0;
   always @(rv) rcnt++;
+  int lt_done = 0;
   // wait on expression with x
   initial begin
     #1 s = 1'bx; #1 s = 1; #1 s = 1'bz; #1 s = 0; #1 s = 1'bz; #1 s = 1; #1 s = 1'bx; #1 s = 0;
@@ -57,6 +58,5 @@ module c09x;
     // disable of a block from inside nested fork in a loop
     begin int k; for (k = 0; k < 10; k++) begin : body if (k == 3) disable body; if (k == 5) break; end $display("T|9.6.2c|k=%0d", k); end
   end
-  int lt_done = 0;
   task long_task; #5 lt_done = 1; endtask
 endmodule

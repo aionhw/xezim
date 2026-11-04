@@ -9,10 +9,12 @@ of options and environment variables is in the
 
 * [Running a simulation](#running-a-simulation)
 * [Waveforms](#waveforms)
+* [Checkpoints](#checkpoints)
 * [Warm design cache](#warm-design-cache)
 * [Native compilation](#native-compilation)
 * [Reducing a multi-file build](#reducing-a-multi-file-build)
 * [Module-timescale extension](#module-timescale-extension)
+* [Sources written for other simulators](#sources-written-for-other-simulators)
 * [Non-standard extensions](#non-standard-extensions)
 
 ## Running a simulation
@@ -49,7 +51,10 @@ xezim testbench.v synth.v +firmware=firmware/firmware.hex --max-time 50000000
 ```
 
 The exit status is 1 for parse and elaboration errors (among them a
-hierarchical name that does not resolve, §23.8), `$fatal`, a
+hierarchical name that does not resolve, §23.8), `$fatal`, a run-time error
+that ends the run (a read or call through a null handle in a process, a wait
+on a mailbox that was never constructed, a loop or delta cycle that can never
+let time advance, an SDF file `$sdf_annotate` cannot read), a
 `--dpi-lib` library that cannot be loaded, and an `-s` that names no module
 (`--no-strict-top` falls back to finding tops automatically). `$error` exits 0
 unless `--error-exit` is given.
@@ -81,7 +86,8 @@ per-signal trace table. Pass `--wave` to enable `$dumpfile`/`$dumpvars`
 * **VCD** — `$dumpfile`/`$dumpvars` (IEEE 1800-2017 §21.7); it shows the same
   in GTKWave as the output of other open-source simulators.
 * **FST** — `--fst <file>`, GTKWave's binary format, written on a dedicated
-  thread; `--fst-scope <hier>` limits it to a subtree. Fixed-width signals,
+  thread; `--fst-scope <hier>` limits it to a subtree, and `--fst-repack`
+  gzip-wraps the finished file (about 1.5x smaller). Fixed-width signals,
   reals, and events are supported. Variable-length string variables are
   omitted with a warning naming them; their values are never truncated.
 * **XTrace v1.0** — `--xtrace <file>`, optionally zstd-compressed
@@ -99,6 +105,45 @@ signal. A second Ctrl-C ends it at once. An FST dump is also written out every
 starts. Each block reaches the file whole or not at all, so after a `kill -9`,
 an out-of-memory kill or a second Ctrl-C, at any moment, the file is readable
 and holds everything up to the last block written.
+
+## Checkpoints
+
+A run can be saved at the end of a time slot and continued later, from the
+same design and the same xezim build:
+
+```bash
+# save at the end of the last slot at or before 2 ms (repeatable)
+xezim <sources> -s <top> --save-at 2ms,warm.ckpt
+
+# continue from it: the output is what the uninterrupted run prints after
+# that slot
+xezim <sources> -s <top> --restore warm.ckpt +test=second
+```
+
+`$save("file")` and `$incsave("file")` save from the design, and
+`$restart("file")` replaces the running state with a saved one; each is served
+at the end of the slot that calls it (IEEE 1800 Annex D). A bare `--save-at`
+time is nanoseconds, like `--max-time`, and the file defaults to `xezim.ckpt`.
+The run continues after a save.
+
+A checkpoint holds every process, variable, net, class object, queue,
+covergroup and random state, and the open files with their positions; a file
+written to is cut back to the length it had at the save. Plusargs are read
+from the restoring command line, so one saved warm-up can start several tests.
+Waveform dumps start afresh after a restore, and the memory of DPI and VPI
+libraries is not saved; a save waits for a slot in which no DPI task is
+suspended in C. A checkpoint of another design or written by another xezim
+build is refused.
+
+Native compilation (`XEZIM_JIT`, `XEZIM_AOT`) may differ between the saving
+and the restoring run, except that a process state machine saved while running
+natively (`XEZIM_PROC_FSM=1` with `XEZIM_AOT=1`) needs `XEZIM_AOT=1` again.
+
+One state is not saved yet: a process forked to call a task, while it is still
+inside that task. A save that meets one fails with `Error: cannot save
+'<file>': ...`, which counts as an error, and the run goes on.
+`XEZIM_CKPT_AUDIT=<file>` appends to `<file>` the names of the simulator
+fields a run changes after setup, the state a checkpoint has to hold.
 
 ## Warm design cache
 
@@ -276,6 +321,47 @@ mixed-timescale design; give it a source `` `timescale `` or a
 IEEE 1800 §3.14.2.2; xezim uses `1ns/1ns` for both delays and `$realtime`, so
 an untimed module's `#1` is one nanosecond — declare a timescale explicitly when
 you mean something else.)
+
+## Sources written for other simulators
+
+xezim follows IEEE 1800 strictly by default: a construct the standard does not
+allow is an error, even where another simulator accepts it. Sources that cannot
+be edited (vendor IP, generated code, testbenches shared with other teams) can
+turn on the relaxation they need, one construct at a time. Each switch is off
+by default, prints a warning naming the clause wherever it applies, and is part
+of the [design cache](#warm-design-cache) key, so a strict run never reuses a
+relaxed run's design. Every switch also has an environment variable,
+`XEZIM_RELAX_<NAME>=1` (e.g. `XEZIM_RELAX_DUPLICATE_DECLS=1`), except
+`--relax-implicit-static`, whose variable is `XEZIM_ALLOW_IMPLICIT_STATIC=1`.
+
+| Switch | Accepts | Read as |
+|---|---|---|
+| `--relax-duplicate-decls` | a name declared twice in a task, function, method or block (§3.13) | the first declaration; the second is ignored |
+| `--relax-enum-no-base` | `enum [1:0] {...}` (§6.19) | `enum bit [1:0] {...}` |
+| `--relax-static-const` | `static const int k = 3;` in a subroutine or block (§6.20.6) | `const static int k = 3;` |
+| `--relax-event-this` | `@this.ev;` (§9.4.2) | `@(this.ev);` |
+| `--relax-casex-inside` | `casex (e) inside`, `casez (e) inside` (§12.5.4) | `case (e) inside` |
+| `--relax-macro-space` | `` ` NAME `` (§22.5.1) | `` `NAME `` |
+| `--relax-nul-bytes` | a NUL byte in the source (§5.3) | white space |
+| `--relax-cross-hier-item` | `cross vif.mode, cp_a;` (§19.6) | a cross over an implicit coverpoint of `vif.mode` |
+| `--relax-use-before-decl` | a reference to module data before its declaration, including in call arguments (§6.5) | a reference to the later declaration, with a warning |
+| `--relax-implicit-static` | `int x = ...;` in a static subroutine (§6.21) | a static variable with that initializer |
+| `--relax-driver-conflicts` | a variable written by conflicting drivers (§6.5, §9.2.2) | a warning instead of an error |
+
+Code written before IEEE 1364-2001 may use later keywords as names (`instance`,
+`cell`, `use`, `generate`, `signed`, ...). `` `begin_keywords `` regions in the
+source still work; for text outside them, choose the keyword set on the command
+line:
+
+```bash
+# the ten configuration keywords (instance, cell, use, library, ...) are names
+xezim --no-config-keywords tb.sv
+# Verilog-1995 code: every word added since 1364-1995 is a name
+xezim --keywords 1364-1995 old_rtl.v
+```
+
+`--keywords` takes any §22.14 version, `1364-1995` to `1800-2023`, each also with
+`-noconfig` (environment: `XEZIM_KEYWORDS`, `XEZIM_NO_CONFIG_KEYWORDS=1`).
 
 ## Non-standard extensions
 

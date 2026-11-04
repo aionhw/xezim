@@ -73,7 +73,14 @@ fn run_sv2023_positive(category: &str, filename: &str) {
 }
 
 fn run_sv2023_source(name: &str, source: &str) {
-    let dir = std::env::temp_dir().join(format!("xezim_sv2023_{}", std::process::id()));
+    // One directory per call: the tests run in parallel in one process, and
+    // one test's cleanup must not delete another's source (#594).
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "xezim_sv2023_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).expect("create temporary directory");
     let path = dir.join(name);
     std::fs::write(&path, source).expect("write temporary source");

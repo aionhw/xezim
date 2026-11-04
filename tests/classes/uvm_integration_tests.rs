@@ -149,25 +149,21 @@ fn bare_run_completes_on(version: &str) {
     );
 }
 
-#[test]
-fn uvm_1_2_bare_run_phase_completes() {
+pub(super) fn uvm_1_2_bare_run_phase_completes() {
     bare_run_completes_on("1.2");
 }
 
-#[test]
-fn uvm_1800_2_2017_bare_run_phase_completes() {
+pub(super) fn uvm_1800_2_2017_bare_run_phase_completes() {
     bare_run_completes_on("1800.2-2017");
 }
 
-#[test]
-fn uvm_1800_2_2020_bare_run_phase_completes() {
+pub(super) fn uvm_1800_2_2020_bare_run_phase_completes() {
     bare_run_completes_on("1800.2-2020");
 }
 
 /// §13.3: a sequence calling a blocking task through a local queue
 /// cannot return from that call before the task finishes.
-#[test]
-fn uvm_queued_completion_wait_remains_blocked() {
+pub(super) fn uvm_queued_completion_wait_remains_blocked() {
     let source = include_str!("../uvm/queued_completion_wait.sv");
     for version in ["1.2", "1800.2-2017", "1800.2-2020"] {
         let sim = run_uvm_opt(version, &[], source.to_string(), "top", false)
@@ -189,8 +185,7 @@ fn uvm_queued_completion_wait_remains_blocked() {
 
 /// §16.5: concurrent assertions keep sampling during real UVM phases,
 /// including interface assertions and a configured virtual interface.
-#[test]
-fn uvm_2020_concurrent_assertions_sample_with_dpi() {
+pub(super) fn uvm_2020_concurrent_assertions_sample_with_dpi() {
     let source = include_str!("../uvm/assertion_clock_probe.sv").to_string();
     let sim = run_uvm_opt("1800.2-2020", &[], source, "top", false)
         .expect("UVM assertion probe failed to simulate");
@@ -223,8 +218,7 @@ fn uvm_2020_concurrent_assertions_sample_with_dpi() {
 /// hierarchical names (dotted strings), which key enumeration used to drop —
 /// every `connect()` then resolved to 0 connections and BUILDERR aborted
 /// the run at t=0.
-#[test]
-fn uvm_2020_complete_bench_runs_traffic() {
+pub(super) fn uvm_2020_complete_bench_runs_traffic() {
     let test_src = std::fs::read_to_string("tests/uvm/uvm_complete_test.sv")
         .expect("Could not read uvm_complete_test.sv");
     let sim = run_uvm("1800.2-2020", &[], test_src, "top")
@@ -260,8 +254,7 @@ fn uvm_2020_complete_bench_runs_traffic() {
 }
 
 /// Phase completion must not depend on interpreted versus compiled methods.
-#[test]
-fn uvm_2020_traffic_is_independent_of_method_policy() {
+pub(super) fn uvm_2020_traffic_is_independent_of_method_policy() {
     if !super::compiled_method_test_env::policies(&[("0", "0"), ("1", "0"), ("1", "1000")]) {
         return;
     }
@@ -270,8 +263,7 @@ fn uvm_2020_traffic_is_independent_of_method_policy() {
 
 /// UVM 1800.2-2020 `uvm_config_db#(int)`: a value set at the top against
 /// `uvm_test_top` must be visible to the test's build_phase get.
-#[test]
-fn uvm_2020_config_db_reaches_build_phase() {
+pub(super) fn uvm_2020_config_db_reaches_build_phase() {
     let sim = run_uvm("1800.2-2020", &[], CFG_TEST.to_string(), "top")
         .expect("UVM 2020 config_db test failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
@@ -288,8 +280,7 @@ fn uvm_2020_config_db_reaches_build_phase() {
 /// `override.orig` (a struct with a class-handle + string member) into a
 /// local through a ?: — that whole-struct read through a frame-held handle
 /// came back x, so every registered override failed to match.
-#[test]
-fn uvm_2020_factory_type_override() {
+pub(super) fn uvm_2020_factory_type_override() {
     let sim = run_uvm("1800.2-2020", &[], CFG_TEST.to_string(), "top")
         .expect("UVM 2020 factory test failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
@@ -302,8 +293,7 @@ fn uvm_2020_factory_type_override() {
 
 /// §6.18/§8.23: a class alias must reach the same registry and factory as
 /// the class name. In particular, create must still apply type overrides.
-#[test]
-fn uvm_2020_factory_typedef_chain_honors_override() {
+pub(super) fn uvm_2020_factory_typedef_chain_honors_override() {
     let src = CFG_TEST.replace(
         "class cfg_test extends uvm_test;",
         "typedef base_c base_alias;\ntypedef base_alias chained_alias;\nclass cfg_test extends uvm_test;",
@@ -330,8 +320,7 @@ fn uvm_2020_factory_typedef_chain_honors_override() {
 /// (`write_in`/`write_out`). This is the requirement whose lost coverage let
 /// the dotted-key enumeration regression (92abea7) break `connect()`
 /// silently — now pinned against the real 1800.2-2020 library.
-#[test]
-fn uvm_2020_analysis_imp_decl_routes_to_suffixed_write() {
+pub(super) fn uvm_2020_analysis_imp_decl_routes_to_suffixed_write() {
     let sim = run_uvm("1800.2-2020", &[], IMP_DECL_TEST.to_string(), "top")
         .expect("UVM 2020 imp_decl test failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
@@ -429,8 +418,7 @@ endmodule
 // uvm_default_table_printer`) — const-eval stored null and the initial
 // block died at t=0 before run_test(). Now a static init; the example
 // phases through top.run_phase's #1us objection window.
-#[test]
-fn test_uvm_hello_world() {
+pub(super) fn test_uvm_hello_world() {
     let hw_dir = uvm_dir().join("1.2/examples/simple/hello_world");
     let test_src = std::fs::read_to_string(hw_dir.join("hello_world.sv"))
         .expect("Could not read hello_world.sv");
@@ -445,8 +433,7 @@ fn test_uvm_hello_world() {
 /// UVM_NO_DPI this plusarg is dead in every simulator (the no-DPI
 /// fallback returns no args) — the builtin DPI layer is what makes it
 /// live.
-#[test]
-fn uvm_1800_2_2017_config_db_trace_plusarg_with_dpi() {
+pub(super) fn uvm_1800_2_2017_config_db_trace_plusarg_with_dpi() {
     const TEST: &str = r#"
 import uvm_pkg::*;
 `include "uvm_macros.svh"
@@ -684,8 +671,7 @@ endmodule
 
 "#;
 
-#[test]
-fn uvm_tlm1_blocking_ports_fifo_analysis() {
+pub(super) fn uvm_tlm1_blocking_ports_fifo_analysis() {
     let sim = run_uvm("1.2", &[], TLM1_TEST.to_string(), "top")
         .expect("UVM 1.2 TLM1 test failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
@@ -791,8 +777,7 @@ endmodule
 
 "#;
 
-#[test]
-fn uvm_tlm1_nonblocking_family_analysis_fifo() {
+pub(super) fn uvm_tlm1_nonblocking_family_analysis_fifo() {
     let sim = run_uvm("1.2", &[], TLM2_TEST.to_string(), "top")
         .expect("UVM 1.2 TLM2 test failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
@@ -867,8 +852,7 @@ module top; initial run_test("ev_test"); endmodule
 
 "#;
 
-#[test]
-fn uvm_events_barriers_pools() {
+pub(super) fn uvm_events_barriers_pools() {
     let sim = run_uvm(
         "1.2",
         &[],
@@ -949,8 +933,7 @@ module top; initial run_test("rd_test"); endmodule
 
 "#;
 
-#[test]
-fn uvm_resource_db_report_catcher() {
+pub(super) fn uvm_resource_db_report_catcher() {
     let sim = run_uvm(
         "1.2",
         &[],
@@ -1048,8 +1031,7 @@ module top; initial run_test("t2_test"); endmodule
 
 "#;
 
-#[test]
-fn uvm_tlm2_b_transport() {
+pub(super) fn uvm_tlm2_b_transport() {
     let sim = run_uvm("1.2", &[], UVM_TLM2_B_TRANSPORT_TEST.to_string(), "top")
         .expect("UVM 1.2 uvm_tlm2_b_transport failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
@@ -1133,8 +1115,7 @@ module top; initial run_test("fac_test"); endmodule
 
 "#;
 
-#[test]
-fn uvm_factory_overrides_and_by_name() {
+pub(super) fn uvm_factory_overrides_and_by_name() {
     let sim = run_uvm(
         "1.2",
         &[],
@@ -1212,8 +1193,7 @@ module top; initial run_test("fa_test"); endmodule
 
 "#;
 
-#[test]
-fn uvm_field_automation_clone_pack() {
+pub(super) fn uvm_field_automation_clone_pack() {
     let sim = run_uvm(
         "1.2",
         &[],
@@ -1240,8 +1220,7 @@ fn uvm_field_automation_clone_pack() {
 /// resolution (grant_queued_locks' find_first_index returned empty, so a
 /// REQ entry was treated as a leading lock — arbitration was granted with
 /// no driver and the queue drained, starving get_next_item forever).
-#[test]
-fn uvm_1_2_sequencer_driver_handshake() {
+pub(super) fn uvm_1_2_sequencer_driver_handshake() {
     let test_src = std::fs::read_to_string("tests/uvm/uvm_sequencer_handshake.sv")
         .expect("Could not read uvm_sequencer_handshake.sv");
     let sim = run_uvm("1.2", &[], test_src, "top")
@@ -1275,8 +1254,7 @@ fn uvm_1_2_sequencer_driver_handshake() {
 /// the unpacked-struct decl-init member copy (`op_s x = accesses[i]` in the
 /// reg map's bus access loop) and on 2-state typedef locals defaulting to 0
 /// (`uvm_reg_data_t value_adjust` in the field RMW).
-#[test]
-fn uvm_1_2_ral_frontdoor_read_write() {
+pub(super) fn uvm_1_2_ral_frontdoor_read_write() {
     let test_src = std::fs::read_to_string("tests/uvm/uvm_ral_frontdoor.sv")
         .expect("Could not read uvm_ral_frontdoor.sv");
     let sim =
@@ -1318,8 +1296,7 @@ fn uvm_1_2_ral_frontdoor_read_write() {
 /// overloads take `ref ... paths[$]`, and the callee declares its own
 /// `parent_paths`), plus the class-member pool whose element type is a
 /// nested specialization.
-#[test]
-fn uvm_1_2_ral_backdoor_peek_poke() {
+pub(super) fn uvm_1_2_ral_backdoor_peek_poke() {
     let test_src = std::fs::read_to_string("tests/uvm/uvm_ral_backdoor.sv")
         .expect("Could not read uvm_ral_backdoor.sv");
     let sim = run_uvm_opt("1.2", &[], test_src, "top", false)
@@ -1420,8 +1397,7 @@ endmodule
 /// 2020 `uvm_sequence.start()` + `uvm_create`-style `get_type` on a sequence
 /// FIELD (still null) must resolve to the concrete `my_sequence`, not the
 /// abstract `uvm_sequence_base` / `uvm_sequence_item`.
-#[test]
-fn uvm_2020_sequence_field_get_type_resolves_declared_type() {
+pub(super) fn uvm_2020_sequence_field_get_type_resolves_declared_type() {
     let sim = run_uvm("1800.2-2020", &[], SEQ_GET_TYPE_TEST.to_string(), "top")
         .expect("UVM 2020 sequence-field get_type test failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
@@ -1480,8 +1456,7 @@ module top;
 endmodule
 "#;
 
-#[test]
-fn uvm_2020_printer_renders_enum_array_members() {
+pub(super) fn uvm_2020_printer_renders_enum_array_members() {
     let sim = run_uvm("1800.2-2020", &[], ENUM_ARRAY_PRINT_TEST.to_string(), "top")
         .expect("UVM 2020 enum-array printer test failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
@@ -1633,8 +1608,7 @@ module tb;
 endmodule
 "#;
 
-#[test]
-fn stress_bench_items_flow_end_to_end_1_2() {
+pub(super) fn stress_bench_items_flow_end_to_end_1_2() {
     let sim = run_uvm("1.2", &[], STRESS_BENCH.to_string(), "tb").expect("simulate failed");
     let o: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(

@@ -94,8 +94,7 @@ fn assert_summary(version: &str, out: &[String], errors: u32, fatals: u32) {
     );
 }
 
-#[test]
-fn uvm_tlm1_transport_and_channels() {
+pub(super) fn uvm_tlm1_transport_and_channels() {
     let src = include_str!("../uvm/uvm_tlm_transport.sv");
     for v in VERSIONS {
         let out = run(v, src);
@@ -153,8 +152,7 @@ fn uvm_tlm1_transport_and_channels() {
     }
 }
 
-#[test]
-fn uvm_tlm1_connection_topology() {
+pub(super) fn uvm_tlm1_connection_topology() {
     let src = include_str!("../uvm/uvm_tlm_connect.sv");
     for v in VERSIONS {
         let out = run(v, src);
@@ -176,8 +174,7 @@ fn uvm_tlm1_connection_topology() {
     }
 }
 
-#[test]
-fn uvm_tlm1_connection_errors() {
+pub(super) fn uvm_tlm1_connection_errors() {
     let src = include_str!("../uvm/uvm_tlm_connect_errors.sv");
     for v in VERSIONS {
         let out = run(v, src);
@@ -217,8 +214,7 @@ fn uvm_tlm1_connection_errors() {
     }
 }
 
-#[test]
-fn uvm_tlm2_passthrough_and_nonblocking_sockets() {
+pub(super) fn uvm_tlm2_passthrough_and_nonblocking_sockets() {
     let src = include_str!("../uvm/uvm_tlm2_sockets.sv");
     for v in VERSIONS {
         let out = run(v, src);

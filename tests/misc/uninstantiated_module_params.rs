@@ -5,7 +5,7 @@
 //!
 //! Issue #238: `parameter W = 0` feeding `{{(W - 1){1'b0}}}` in a module that
 //! is never instantiated read as a replication count of -1 and failed the
-//! whole run, while Icarus, xsim and xcelium all just run the design.
+//! whole run, while Icarus just runs the design.
 //!
 //! The guard that matters is the second test: the TOP module's own parameters
 //! ARE fixed at their defaults, so the same expression there must still be

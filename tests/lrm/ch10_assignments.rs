@@ -1,4 +1,8 @@
 //! IEEE 1800-2023 clause 10: assignment statements.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use crate::harness::{Order, check};
 
@@ -70,7 +74,7 @@ fn c10_assignments() {
             "T|10.9.1c|'{8, 8, 8, 8}",
             "T|10.9.1d|'{1, 2, 3, 4}",
             "T|10.9.1e|10111111",
-            "T|10.9.1f|'{15, 15}",
+            "T|10.9.1f|'{'hf, 'hf}",
             "T|10.9.2|'{x:1, y:'{2, 3}}",
             "T|10.9.2b|'{x:4, y:'{4, 4}}",
             "T|10.9.1g|'{'{7, 7}, '{7, 7}}",

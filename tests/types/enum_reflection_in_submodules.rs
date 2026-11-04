@@ -68,7 +68,15 @@ module mb (input logic [1:0] i);
   typedef enum logic [1:0] { IDLE = 0, BUSY = 1, HALT = 2 } state_e;   // same name, other members
   state_e st, loc_out;
   task automatic t(); state_e l; l = HALT; loc_out = l; $display("MB task-local name=%s", l.name()); endtask
-  initial begin st = state_e'(i); #1 t(); $display("MB name=%s cast=%s num=%0d", st.name(), loc_out.name(), st.num()); end
+  // The `#1` comes FIRST: a t=0 read of `i` races the output-port-connect
+  // propagation of `a.o` (a t=0 blocking write through an output port is
+  // not visible to a source-later initial until the delta settles — the
+  // reference prints an X-cast there). The old t=0 read only produced
+  // BUSY via the buffer-collapse aliasing that made the write
+  // synchronous; that collapse is now correctly refused for a
+  // process-written port net (see write_target_census), so sample after
+  // the settle like the reference does for a defined value.
+  initial begin #1; st = state_e'(i); t(); $display("MB name=%s cast=%s num=%0d", st.name(), loc_out.name(), st.num()); end
   enum logic [1:0] { AX = 0, AY = 1 } anon;
   initial begin anon = AY; #2 $display("MB anon=%s", anon.name()); end
 endmodule

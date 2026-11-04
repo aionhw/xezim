@@ -207,6 +207,13 @@ fn print_usage() {
     eprintln!(
         "  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100ms)"
     );
+    eprintln!("  --save-at <time>[,<file>]  Save a checkpoint at the end of the last time slot at");
+    eprintln!(
+        "                   or before <time> (<n>[fs|ps|ns|us|ms|s], bare <n> is ns; file default"
+    );
+    eprintln!("                   xezim.ckpt); repeatable. The run continues after saving");
+    eprintln!("  --restore <file> Start from a checkpoint ($save, --save-at) of the same design,");
+    eprintln!("                   built by the same xezim");
     eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug);");
     eprintln!("                   implies the --verbose engine lines");
     eprintln!("  --strict-top     Error out if -s names a module that does not exist (default)");
@@ -227,6 +234,16 @@ fn print_usage() {
                    another process; §6.5, §9.2.2) as a warning instead of an
                    error. Also enabled by XEZIM_RELAX_DRIVER_CONFLICTS=1."
     );
+    for f in sv_parser::relax_flags() {
+        eprintln!("  --relax-{}  Accept, with a warning: {}.", f.name, f.help);
+        eprintln!("                   Also enabled by {}=1.", f.env);
+    }
+    eprintln!("  --keywords <ver> Keyword set outside `begin_keywords` regions (§22.14):");
+    eprintln!("                   1364-1995 ... 1800-2023, each also with -noconfig.");
+    eprintln!("                   Also XEZIM_KEYWORDS=<ver>.");
+    eprintln!("  --no-config-keywords  Read the configuration keywords (`instance`, `cell`,");
+    eprintln!("                   `use`, ...) as names outside `begin_keywords` regions.");
+    eprintln!("                   Also XEZIM_NO_CONFIG_KEYWORDS=1.");
     eprintln!("  --code-coverage[=<kinds>]  Collect code coverage: <kinds> is a comma list of");
     eprintln!("                   stmt, branch, toggle (or all, the default). Counts go to");
     eprintln!("                   xezim_cov.json (XEZIM_COV_DB) with the functional coverage;");
@@ -369,6 +386,9 @@ fn print_usage() {
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
     eprintln!("  -fst_scope_file <file>  (--fst-scope-file) FST scopes from a file: one or");
     eprintln!("                   more per line, '#' or '//' comments. Adds to --fst-scope.");
+    eprintln!("  --fst-repack[=N] gzip-wrap the finished FST on a clean close (GTKWave's");
+    eprintln!("                   repack-on-close; deflate level N, 1..9, default 6). About");
+    eprintln!("                   1.5x smaller; readers inflate it on open.");
     eprintln!("  -xezim_env <file>  (--xezim-env) Set XEZIM_* variables from a file before");
     eprintln!("                   anything reads them: NAME=value, export NAME=value,");
     eprintln!("                   setenv NAME value, unsetenv NAME. Overrides the shell.");
@@ -542,6 +562,33 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     Ok(rounded as u64)
 }
 
+/// Parse a `--save-at` time: like `--max-time`, a bare number is
+/// nanoseconds, but `fs` is accepted and so is zero and anything below 1 ns.
+/// Returns seconds.
+fn parse_save_time(raw: &str) -> Result<f64, String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let units = [
+        ("fs", 1e-15),
+        ("ps", 1e-12),
+        ("ns", 1e-9),
+        ("µs", 1e-6),
+        ("us", 1e-6),
+        ("ms", 1e-3),
+        ("s", 1.0),
+    ];
+    let (num, scale) = units
+        .iter()
+        .find_map(|(u, f)| lower.strip_suffix(u).map(|n| (n, *f)))
+        .unwrap_or((lower.as_str(), 1e-9));
+    match num.trim().parse::<f64>() {
+        Ok(n) if n >= 0.0 => Ok(n * scale),
+        _ => Err(format!(
+            "invalid --save-at time '{}' (expected <n>[fs|ps|ns|us|ms|s])",
+            raw
+        )),
+    }
+}
+
 /// Marks an `-override_timescale` value inside the `--module-timescale`
 /// argument list (a module name cannot start with `+`).
 const OVERRIDE_TIMESCALE_TAG: &str = "+force+";
@@ -627,6 +674,35 @@ fn push_plus_libext(arg: &str, lib_exts: &mut Option<Vec<String>>) {
         if !e.is_empty() {
             list.push(e.to_string());
         }
+    }
+}
+
+/// The opt-in parser relaxations (`--relax-<name>`, one per
+/// `sv_parser::RelaxFlag`), `--no-config-keywords` and `--keywords=<ver>`
+/// (#608, #622-#629). True when `flag` is one of them.
+fn handle_relax_flag(flag: &str) -> bool {
+    if let Some(name) = flag.strip_prefix("--relax-")
+        && let Some(f) = sv_parser::relax_flags().into_iter().find(|f| f.name == name)
+    {
+        f.set(true);
+        return true;
+    }
+    if flag == "--no-config-keywords" {
+        sv_parser::lexer::scanner::set_no_config_keywords(true);
+        return true;
+    }
+    if let Some(v) = flag.strip_prefix("--keywords=") {
+        set_keywords(v);
+        return true;
+    }
+    false
+}
+
+/// `--keywords <version>`: the §22.14 keyword set outside `begin_keywords`.
+fn set_keywords(version: &str) {
+    if let Err(e) = sv_parser::lexer::scanner::set_default_keywords(version) {
+        eprintln!("Error: --keywords: {e}");
+        std::process::exit(1);
     }
 }
 
@@ -1055,6 +1131,14 @@ fn process_command_file(
                     push_plus_define(t, defines);
                 }
                 _ if handle_gls_flag(t) => {}
+                _ if handle_relax_flag(t) => {}
+                "--keywords" => {
+                    i += 1;
+                    let v = toks
+                        .get(i)
+                        .ok_or_else(|| format!("--keywords requires a version (in args file '{}')", path))?;
+                    set_keywords(v);
+                }
                 // `--module-timescale <v>` / `--module-timescale=<v>` inside an
                 // args file (a customer args file used the `=` form; it was
                 // silently ignored and every no-`timescale module fell back to
@@ -1129,8 +1213,16 @@ fn process_command_file(
                         t, path
                     );
                 }
+                // A design-unit name that is not a file (relative to the
+                // args file) names a top, as on the command line (#601).
                 _ => {
-                    source_files.push(resolve_rel(base, t));
+                    let file = resolve_rel(base, t);
+                    match cli_compat::bare_top_name(t, &compat.libs)
+                        .filter(|_| !Path::new(&file).exists())
+                    {
+                        Some(top) => top_modules.push(top),
+                        None => source_files.push(file),
+                    }
                 }
             }
             i += 1;
@@ -2065,6 +2157,7 @@ fn run_main() -> i32 {
     let mut code_cov_kinds: Option<u8> = None;
     let mut code_cov_scopes: Vec<String> = Vec::new();
     let mut fst_file: Option<String> = None;
+    let mut fst_repack: Option<u8> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
     let mut dump_files_list = false;
@@ -2092,6 +2185,7 @@ fn run_main() -> i32 {
 
     let mut compat = cli_compat::CompatArgs::default();
     let mut max_time_explicit = false;
+    let mut save_at: Vec<(f64, String)> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -2349,6 +2443,17 @@ fn run_main() -> i32 {
                 xezim::compiler::simulator::set_no_timing_checks(true);
             }
             _ if handle_gls_flag(arg) => {}
+            _ if handle_relax_flag(arg) => {}
+            "--keywords" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => set_keywords(v),
+                    None => {
+                        eprintln!("Error: --keywords requires a version (IEEE 1800-2023 §22.14)");
+                        std::process::exit(1);
+                    }
+                }
+            }
             _ if arg.starts_with('+') => {
                 // `+X_WARN` is both a plusarg (so `$test$plusargs` can see it)
                 // and the switch itself — this arm runs before the explicit
@@ -2547,6 +2652,31 @@ fn run_main() -> i32 {
                     }
                 }
             }
+            "--save-at" => {
+                i += 1;
+                if i < args.len() {
+                    let (t, file) = match args[i].split_once(',') {
+                        Some((t, f)) => (t, f.to_string()),
+                        None => (args[i].as_str(), "xezim.ckpt".to_string()),
+                    };
+                    match parse_save_time(t) {
+                        Ok(secs) => {
+                            save_at.push((secs, file));
+                            xezim::compiler::simulator::set_checkpoint_save_at(save_at.clone());
+                        }
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            "--restore" => {
+                i += 1;
+                if i < args.len() {
+                    xezim::compiler::simulator::set_checkpoint_restore(Some(args[i].clone()));
+                }
+            }
             "--settle-limit" => {
                 i += 1;
                 if i < args.len() {
@@ -2705,6 +2835,19 @@ fn run_main() -> i32 {
             }
             _ if arg.starts_with("--fst=") => {
                 fst_file = Some(arg["--fst=".len()..].to_string());
+            }
+            "--fst-repack" => {
+                fst_repack = Some(6);
+            }
+            _ if arg.starts_with("--fst-repack=") => {
+                let v = &arg["--fst-repack=".len()..];
+                match v.parse::<u8>() {
+                    Ok(level) if (1..=9).contains(&level) => fst_repack = Some(level),
+                    _ => {
+                        eprintln!("Error: --fst-repack level must be 1..=9, got '{}'", v);
+                        std::process::exit(2);
+                    }
+                }
             }
             "--fst-scope" => {
                 i += 1;
@@ -3382,6 +3525,26 @@ suppressed but the explicit SDF annotation still applies."
         xezim::set_design_cache(None);
     }
 
+    // An artifact is a whole elaborated design: nothing can be added to it,
+    // and it is not source text, so it must be the only file of a run.
+    if source_files.len() > 1 || mode != Mode::Simulate {
+        for sf in &source_files {
+            let mut head = [0u8; 8];
+            let is_artifact = std::fs::File::open(sf)
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+                .is_ok()
+                && head[..7] == xezim::XEZIM_BYTECODE_MAGIC[..7];
+            if is_artifact {
+                eprintln!(
+                    "Error: '{}' is a compiled artifact: it can only be run, as the \
+                     one file on the command line; sources cannot be added to it",
+                    sf
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Fast path: if the only source file is a xezim compiled artifact, load
     // it and jump straight to simulation (skip parse + elaborate).
     if source_files.len() == 1 && mode == Mode::Simulate {
@@ -3396,6 +3559,7 @@ suppressed but the explicit SDF annotation still applies."
             if head.len() == 8 && head[..7] == xezim::XEZIM_BYTECODE_MAGIC[..7] {
                 match xezim::read_compiled(sf) {
                     Ok(Some(elab)) => {
+                        xezim::compiler::fst_sink::set_fst_repack(fst_repack);
                         chatter_out!("Loaded compiled: {}", sf);
                         chatter_out!("Max time: {} ns", max_time);
                         chatter_out!("------------------------------");
@@ -3768,17 +3932,27 @@ suppressed but the explicit SDF annotation still applies."
         }
 
         // §9.4.5 intra-assignment delay canonicalization — keep the compiled
-        // artifact consistent with the simulate path (see xezim::intra_delay).
+        // artifact consistent with the simulate path (see xezim::intra_delay):
+        // rewrite the PREPROCESSED texts too, so a delay spliced in by
+        // `include or a macro is a timing control here as well (#567).
         let sources: Vec<String> = sources
             .iter()
             .map(|s| xezim::intra_delay::rewrite_intra_assignment_delays(s))
             .collect();
-        match xezim::parse_and_elaborate_multi(
+        let mut pre = xezim_core::preprocess_design(&sources, &source_files, &include_dirs, &defines);
+        for t in pre.texts.iter_mut() {
+            let rewritten = xezim::intra_delay::rewrite_intra_assignment_delays(t);
+            if rewritten != *t {
+                *t = rewritten;
+            }
+        }
+        match xezim_core::parse_and_elaborate_multi_preprocessed(
             &sources,
             top_module.as_deref(),
             &include_dirs,
             &source_files,
             &defines,
+            Some(pre),
         ) {
             Ok((_defs, mut elab)) => {
                 // Second-pass `should_fail` lint (additive — does not alter the
@@ -3871,6 +4045,7 @@ suppressed but the explicit SDF annotation still applies."
     // coverage, x-warnings (they name the net that went x), the
     // partition tooling, and XEZIM_KEEP_PORTS=1. Library callers never turn
     // it on: they may look any signal up after the run.
+    xezim::compiler::fst_sink::set_fst_repack(fst_repack);
     xezim_core::elaborate::set_port_elision(
         !xezim::compiler::simulator::wave_enabled()
             && fst_file.is_none()

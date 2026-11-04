@@ -57,3 +57,39 @@ endmodule
         .collect();
     assert_eq!(out, ["T|a=1500 s=base c=18000 e=1500 f=1500"]);
 }
+
+/// §8.14: a base-class method's BARE read and write of a string member a
+/// derived class redeclares use the base's copy. Compiled, the bare
+/// spelling stored to and loaded from the derived class's copy.
+#[test]
+fn compiled_bare_string_member_uses_declaring_class_copy() {
+    let _ = super::compiled_method_test_env::eager();
+    let src = r#"
+class node;
+  string tag;
+  function void set(string t); tag = t; endfunction
+  function string get(); return tag; endfunction
+endclass
+class dnode extends node;
+  string tag;
+  function void dset(string t); tag = t; endfunction
+endclass
+module top;
+  initial begin
+    automatic dnode d = new;
+    automatic node n = d;
+    d.dset("derived");
+    n.set("base");
+    $display("T|base=%s derived=%s get=%s", n.tag, d.tag, n.get());
+  end
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("simulate failed");
+    let out: Vec<&str> = sim
+        .output
+        .iter()
+        .map(|o| o.message.trim())
+        .filter(|l| l.starts_with("T|"))
+        .collect();
+    assert_eq!(out, ["T|base=base derived=derived get=base"]);
+}

@@ -1,4 +1,8 @@
 //! IEEE 1800-2023 clause 6: data types.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use crate::harness::{Order, check};
 
@@ -41,8 +45,8 @@ fn c6_24_3_bitstream_cast_unpacked() {
         &[
             "T|r1|'{1, 2, 3, 4}",
             "T|r2|01020304",
-            "T|r3|'{171, 205, 239}",
-            "T|r4|'{5, 10}",
+            "T|r3|'{'hab, 'hcd, 'hef}",
+            "T|r4|'{'h5, 'ha}",
         ],
         &[],
     );
@@ -252,7 +256,7 @@ fn c6_data_types() {
             "T|6.24.3a|5 a",
             "T|6.24.3b|'{1, 2, 3, 4}",
             "T|6.24.3c|01020304",
-            "T|6.24.3d|'{171, 205, 239}",
+            "T|6.24.3d|'{'hab, 'hcd, 'hef}",
         ],
         &["T|6.21b|12", "T|6.21b|11", "T|6.12b|", "T|6.23|"],
     );

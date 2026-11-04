@@ -1003,10 +1003,24 @@ impl Simulator {
                             let struct_w =
                                 fields.iter().map(|(_, o, fw)| o + fw).max().unwrap_or(0);
                             let dims = self.module.packed_full_dims.get(&arr_name).cloned();
+                            // A package parameter (`p::ENC[f].man_bits` in a
+                            // class method reaches here as `p.ENC`) is no
+                            // signal: read its value from the parameters.
                             if struct_w > 0
                                 && let Some(slot) =
                                     Self::flatten_packed_slot(&indices, dims.as_deref())
-                                && let Some(sig) = self.get_local_or_signal(&arr_name)
+                                && let Some(sig) =
+                                    self.get_local_or_signal(&arr_name).or_else(|| {
+                                        self.module
+                                            .parameters
+                                            .get(&arr_name)
+                                            .or_else(|| {
+                                                self.module
+                                                    .parameters
+                                                    .get(&arr_name.replacen('.', "::", 1))
+                                            })
+                                            .cloned()
+                                    })
                             {
                                 let lo = slot * struct_w + off;
                                 if lo + w <= sig.width {
@@ -1208,8 +1222,15 @@ impl Simulator {
             None
         };
         if let Some(cn) = static_class {
-            if let Some(v) = self.class_static_get(&cn, &member.name) {
-                return v;
+            // Header value parameters are per instance. They also sit in
+            // `param_defaults`, so `class_static_get` answers them from the
+            // elaborated default (`int D = H` is 32) and used to hide the
+            // specialization stored on the object. Localparams and `static`
+            // members are in `static_properties` and stay on the shared cell.
+            if self.member_is_static_prop(&cn, &member.name) {
+                if let Some(v) = self.class_static_get(&cn, &member.name) {
+                    return v;
+                }
             }
         }
         if handle == 0 || handle >= self.heap.len() {
@@ -2079,6 +2100,112 @@ impl Simulator {
         }
     }
 
+    /// §23.6/§23.9, §7.4.6: a declaration-backed module memory does not
+    /// require evaluating its instance prefixes as class or struct values.
+    /// Task bodies keep dotted references as MemberAccess chains; probing
+    /// every prefix that way before recognizing the array repeats that work
+    /// recursively at each hierarchy level.
+    #[inline(never)]
+    fn declared_module_memory_read(
+        &mut self,
+        base: &Expression,
+        index: &Expression,
+    ) -> Option<Value> {
+        let root = Self::member_chain_root(base)?;
+        // A nearer value or interface binding retains ordinary member
+        // dispatch. In particular, an identically named module memory must
+        // not capture a local object's or packed struct's member.
+        if self.frame_scalar_shadows(root)
+            || self.dyn_name_lookup(root).is_some()
+            || self
+                .formal_dyn
+                .last()
+                .is_some_and(|f| f.iter().any(|(name, _)| name == root))
+            || self.class_context_stack.last().is_some_and(Option::is_some)
+            || self.this_prop_hides(root)
+            || self.module.classes.contains_key(root)
+            || self.module.packages.contains(root)
+            || self.lookup_typedef_target(root).is_some()
+            || self
+                .local_iface_aliases
+                .last()
+                .is_some_and(|f| f.contains_key(root))
+            || self.iface_alias_for(root).is_some()
+        {
+            return None;
+        }
+        // Instance prefixes can also have implicit placeholder signal IDs.
+        // Only a declared value shadows the instance, not that lookup entry.
+        let is_value = |name: &str| {
+            self.module.var_decl_types.contains_key(name)
+                || self.module.parameters.contains_key(name)
+        };
+        if is_value(root) || self.hint_scoped(root).is_some_and(|n| is_value(&n)) {
+            return None;
+        }
+
+        // Only pure, unselected names qualify. Calls, indexed receivers,
+        // this/super and other runtime receivers never run during this probe.
+        let mut parts = Vec::new();
+        let mut current = base;
+        loop {
+            match &current.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    parts.push(member.name.as_str());
+                    current = expr;
+                }
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                {
+                    parts.push(h.path[0].name.name.as_str());
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        parts.reverse();
+        let mut name = parts.join(".");
+        // Match the ordinary array reader's absolute-then-instance lookup.
+        if !self.module.arrays.contains_key(&name) {
+            name = self.hint_scoped(&name)?;
+        }
+        let parent = name.rsplit_once('.')?.0;
+        if self.instance_by_path(parent).is_none()
+            || !self.module.var_decl_types.contains_key(&name)
+            || self.module.dynamic_arrays.contains(&name)
+            || self.module.queue_vars.contains(&name)
+            || self.module.associative_arrays.contains_key(&name)
+            || self.module.arrays_2d.contains_key(&name)
+            || self.module.arrays_nd.contains_key(&name)
+        {
+            return None;
+        }
+        let width = self.module.arrays.get(&name)?.2.max(1);
+        let &(first, lo, hi) = self.array_first_id.get(name.as_str())?;
+        // Evaluate the selector only after binding succeeds, exactly once.
+        // Use the same invalid-index and packed-arena handling as the
+        // general fixed-array read below.
+        let value = self.eval_expr(index);
+        let Some(i) = value.to_index().filter(|_| !value.has_xz()) else {
+            return Some(Value::new(width));
+        };
+        if !(lo..=hi).contains(&i) {
+            return Some(
+                self.assoc_missing_elem_value(&name)
+                    .unwrap_or_else(|| Value::new(width)),
+            );
+        }
+        let id = first + (i - lo) as usize;
+        if is_packed_id(id) {
+            return Some(self.packed.read(id));
+        }
+        let mut value = self.signal_table[id].clone();
+        if self.signal_signed[id] {
+            value.is_signed = true;
+        }
+        Some(value)
+    }
+
     pub(super) fn eval_expr_ctx_inner(
         &mut self,
         expr: &Expression,
@@ -2404,7 +2531,8 @@ impl Simulator {
             // class-local typedef args (e.g. `special_comp_type`) through
             // `resolve_typedef_spec`, which reads `self.current_spec`.
             let saved = self.current_spec.clone();
-            let extracted = self.resolve_call_spec_params(Self::extract_call_spec(expr), &saved);
+            let lexical = self.lexical_spec();
+            let extracted = self.resolve_call_spec_params(Self::extract_call_spec(expr), &lexical);
             if let Some((ref base, ref sig)) = extracted {
                 self.ensure_spec_statics(base, sig);
             }
@@ -2459,6 +2587,24 @@ impl Simulator {
                 Value::from_string(s)
             }
             ExprKind::Ident(hier) => {
+                // §14.3: the flat spelling of `cb.sig[i]` (the select on the
+                // last segment) on an unpacked-array clockvar.
+                if !self.clocking_array_leaves.is_empty()
+                    && hier.path.len() >= 2
+                    && let Some((last, owner)) = hier.path.split_last()
+                    && let [sel] = last.selects.as_slice()
+                    && self.clocking_array_leaves.contains(last.name.name.as_str())
+                    && owner.iter().all(|s| s.selects.is_empty())
+                {
+                    let mut base = hier.clone();
+                    base.path.last_mut().unwrap().selects.clear();
+                    base.cached_signal_id = std::cell::Cell::new(None);
+                    base.cached_resolved_name = std::cell::OnceCell::new();
+                    let base = Expression::new(ExprKind::Ident(base), expr.span);
+                    if let Some(v) = self.clocking_array_elem_read(&base, sel) {
+                        return v;
+                    }
+                }
                 // §13.5.2: a selected read through a `ref` formal reads the
                 // caller's actual (see `ref_formal_redirect_hier`).
                 if self.ref_redirect_possible() {
@@ -3754,8 +3900,8 @@ impl Simulator {
                 // never `iface.signal` selects) so ordinary comparisons keep
                 // their value semantics.
                 if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
-                    let lv = self.vif_operand(left);
-                    let rv = self.vif_operand(right);
+                    let lv = self.vif_operand_eval(left);
+                    let rv = self.vif_operand_eval(right);
                     let engaged = lv.is_some() || rv.is_some();
                     if engaged {
                         // A bare `null` on the other side of a vif operand is
@@ -3782,14 +3928,40 @@ impl Simulator {
                     }
                 }
                 // §11.4.5 / §10.9: equality against an ASSIGNMENT PATTERN
-                // (`a == '{9, 5, 5, 5}`) compares element- / member-wise.
+                // (`a == '{9, 5, 5, 5}`) compares element- / member-wise. A
+                // typed pattern of an unpacked type compares the same way;
+                // against another pattern it is a value of its type.
                 if matches!(
                     op,
                     BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
-                ) && (matches!(left.kind, ExprKind::AssignmentPattern(_))
-                    || matches!(right.kind, ExprKind::AssignmentPattern(_)))
-                {
-                    if let Some(v) = self.compare_with_pattern(*op, left, right) {
+                ) {
+                    let (lt, rt) = (
+                        self.unpacked_typed_pattern(left),
+                        self.unpacked_typed_pattern(right),
+                    );
+                    let (l, r) = (lt.unwrap_or(left), rt.unwrap_or(right));
+                    let pat = |e: &Expression| matches!(e.kind, ExprKind::AssignmentPattern(_));
+                    let v = if pat(l) && pat(r) {
+                        // Two patterns: a typed one is the value of its type.
+                        if lt.is_some() {
+                            self.with_typed_pattern_storage(left, |sim, held| {
+                                sim.compare_with_pattern(*op, held, r)
+                            })
+                            .flatten()
+                        } else if rt.is_some() {
+                            self.with_typed_pattern_storage(right, |sim, held| {
+                                sim.compare_with_pattern(*op, l, held)
+                            })
+                            .flatten()
+                        } else {
+                            None
+                        }
+                    } else if pat(l) || pat(r) {
+                        self.compare_with_pattern(*op, l, r)
+                    } else {
+                        None
+                    };
+                    if let Some(v) = v {
                         return v;
                     }
                 }
@@ -4784,6 +4956,60 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                if let Some(selected) = self.selected_aggregate_rhs(None, expr) {
+                    let selected = Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(selected),
+                            index: index.clone(),
+                        },
+                        expr.span,
+                    );
+                    return self.eval_expr_ctx(&selected, ctx_width);
+                }
+
+                // §14.3: `cb.sig[i]` on an unpacked-array clockvar reads the
+                // element's sample (see `tick_clocking_blocks`).
+                if let Some(v) = self.clocking_array_elem_read(expr, index) {
+                    return v;
+                }
+                if matches!(expr.kind, ExprKind::MemberAccess { .. })
+                    && let Some(value) = self.declared_module_memory_read(expr, index)
+                {
+                    return value;
+                }
+                // §13.4/§7.4: an element of a function's or method's returned
+                // collection (`f()[k]`, `o.build()[k]`). Evaluating the call
+                // as a scalar and bit-selecting it read 0 or x.
+                if let ExprKind::Call {
+                    func: cf,
+                    args: cargs,
+                } = &expr.kind
+                    && self.call_returns_collection(cf)
+                {
+                    self.pending_ret_collection = None;
+                    let _ = self.eval_call(cf, cargs);
+                    if let Some(src) = self.take_pending_ret_collection() {
+                        let iv = self.eval_expr(index);
+                        if self.is_associative_array(&src) {
+                            let key = self.assoc_key_str(&src, &iv);
+                            return self
+                                .get_signal_value_by_name(&format!("{}[{}]", src, key))
+                                .or_else(|| self.assoc_missing_elem_value(&src))
+                                .unwrap_or_else(|| Value::new(32));
+                        }
+                        if let Some(i) = iv.to_i64().filter(|_| !iv.has_xz()) {
+                            if i >= 0 && (i as u64) < self.get_queue_size(&src) {
+                                if let Some(v) =
+                                    self.get_signal_value_by_name(&format!("{}[{}]", src, i))
+                                {
+                                    return v;
+                                }
+                            }
+                        }
+                        // §7.4.6: out of range or x/z reads the element default.
+                        return Value::new(32);
+                    }
+                }
                 // §8.25: class constant arrays precede packed-property probes.
                 // The declaration-name cache excludes ordinary indexed reads
                 // before constructing or resolving a class-scope path.
@@ -4959,7 +5185,8 @@ impl Simulator {
                 if let ExprKind::Ident(_h) = &expr.kind {
                     let nm = base_nm.as_deref().unwrap_or("");
                     if !self.module.arrays.contains_key(nm)
-                        && self.signal_name_to_id.contains_key(nm)
+                        && (self.signal_name_to_id.contains_key(nm)
+                            || self.module.packed_signal_elem_widths.contains_key(nm))
                     {
                         if let Some(&ew) = self.module.packed_signal_elem_widths.get(nm) {
                             // `ew == 1` is a real element width when the inner
@@ -5105,12 +5332,15 @@ impl Simulator {
                     if k < 0 || k as usize >= idxs.len() {
                         return Value::new(32); // out-of-range read -> x
                     }
-                    let src_i = idxs[k as usize];
                     if mname.ends_with("_index") {
-                        return Value::from_u64(src_i as u64, 32);
+                        return idxs.index_value(k as usize);
                     }
                     return self
-                        .get_signal_value_by_name(&format!("{}[{}]", arr_name, src_i))
+                        .get_signal_value_by_name(&format!(
+                            "{}[{}]",
+                            arr_name,
+                            idxs.sel(k as usize)
+                        ))
                         .unwrap_or_else(|| Value::new(32));
                 }
                 // §7.4.2: an element of an N-D fixed-array CLASS property —
@@ -5137,9 +5367,13 @@ impl Simulator {
                 // Element of an unpacked array of ASSOCIATIVE arrays:
                 // `a[i][key]` looks the key up in the assoc array `a[i]`.
                 if let Some(elem) = self.indexed_assoc_elem(expr, index) {
-                    return self
-                        .get_signal_value_by_name(&elem)
-                        .unwrap_or_else(|| Value::new(32));
+                    return self.get_signal_value_by_name(&elem).unwrap_or_else(|| {
+                        // §7.8.6: a missing key reads the element type's
+                        // default (0 for a 2-state type), not x.
+                        let base = elem.rfind('[').map_or(elem.as_str(), |p| &elem[..p]);
+                        self.assoc_missing_elem_value(base)
+                            .unwrap_or_else(|| Value::new(32))
+                    });
                 }
                 // Multidimensional associative-array read `m[k1][k2]...[kn]`:
                 // look up the flat compound key `m[K1][K2]...[Kn]`. Mirrors
@@ -5264,8 +5498,24 @@ impl Simulator {
                         let mut base_name = self.resolve_hier_name(hier);
                         // Bare class-member N-D array inside a method:
                         // resolve to its per-instance `<handle>#<member>`.
-                        if !self.module.arrays_nd.contains_key(&*base_name) {
+                        // A member shadows a module array of the same name (§8.10).
+                        if !self.module.arrays_nd.contains_key(&*base_name)
+                            || (hier.path.len() == 1
+                                && hier.path[0].selects.is_empty()
+                                && *base_name == *hier.path[0].name.name)
+                        {
                             if let Some(s) = self.instance_assoc_member(&base_name) {
+                                base_name = std::borrow::Cow::Owned(s);
+                            }
+                        }
+                        // `o.m[i][j][k]` on an object's member: its store is
+                        // `<handle>#m` (§7.4.5).
+                        if !self.module.arrays_nd.contains_key(&*base_name) && hier.path.len() >= 2
+                        {
+                            if let Some(s) = self
+                                .expr_assoc_name(cur)
+                                .filter(|s| self.module.arrays_nd.contains_key(s))
+                            {
                                 base_name = std::borrow::Cow::Owned(s);
                             }
                         }
@@ -5302,8 +5552,23 @@ impl Simulator {
                         let mut name = self.resolve_hier_name(hier);
                         // Bare class-member 2D array inside a method:
                         // resolve to its per-instance `<handle>#<member>`.
-                        if !self.module.arrays_2d.contains_key(&*name) {
+                        // A member shadows a module array of the same name (§8.10).
+                        if !self.module.arrays_2d.contains_key(&*name)
+                            || (hier.path.len() == 1
+                                && hier.path[0].selects.is_empty()
+                                && *name == *hier.path[0].name.name)
+                        {
                             if let Some(s) = self.instance_assoc_member(&name) {
+                                name = std::borrow::Cow::Owned(s);
+                            }
+                        }
+                        // `o.m[i][j]` on an object's member: its store is
+                        // `<handle>#m` (§7.4.5).
+                        if !self.module.arrays_2d.contains_key(&*name) && hier.path.len() >= 2 {
+                            if let Some(s) = self
+                                .expr_assoc_name(inner_expr)
+                                .filter(|s| self.module.arrays_2d.contains_key(s))
+                            {
                                 name = std::borrow::Cow::Owned(s);
                             }
                         }
@@ -5441,10 +5706,14 @@ impl Simulator {
                             }
                         }
                     }
-                    if self.module.arrays.contains_key(&*name)
+                    if (self.module.arrays.contains_key(&*name)
                         || self.module.dynamic_arrays.contains(&*name)
                         || self.is_associative_array(&name)
-                        || self.is_per_spec_dynamic_static(&name)
+                        || self.is_per_spec_dynamic_static(&name))
+                        // §23.9 / §8.10: `str[0]` on a scalar `string str`
+                        // formal or property is its character, not an
+                        // element of a same-named module-level `str[$]`.
+                        && !self.bare_scalar_hides_coll(expr, &name)
                     {
                         // Check if `name` is a queue/dynamic array. This
                         // handles struct-field sub-paths (`info.addr`) and
@@ -5601,7 +5870,9 @@ impl Simulator {
                 // the empty leading bytes and always returned 0.
                 if let ExprKind::Ident(_hier) = &expr.kind {
                     let nm = base_nm.as_deref().unwrap_or("");
-                    if self.string_signals.contains(nm) {
+                    // The running task frame decides for its own formals: a
+                    // string flag another frame left on the name is not it.
+                    if self.frame_name_is_string(nm) {
                         let content = self.eval_expr(expr).sv_string_bytes();
                         let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
                         let byte = content.get(i).copied().unwrap_or(0);
@@ -5613,7 +5884,11 @@ impl Simulator {
                 // against the signal's full packed dims, normalizing indices
                 // for ascending / non-zero-based / negative ranges (§7.4.1).
                 if let Some((base, lo_opt, w)) = self.packed_nested_select(expr, index) {
-                    if let Some(base_v) = self.get_signal_value_by_name(&base) {
+                    // §13.5, §6.21: a formal or local of the running frame
+                    // shadows a design signal of its name (an `initial`
+                    // block's static `a` beside a function's `a`, #650).
+                    let frame_v = self.frame_get(&base).cloned();
+                    if let Some(base_v) = frame_v.or_else(|| self.get_signal_value_by_name(&base)) {
                         return match lo_opt {
                             Some(lo) => base_v.range_select(lo + w as usize - 1, lo),
                             None => {
@@ -6214,12 +6489,9 @@ impl Simulator {
                             // A queue/array operand means set membership: the
                             // value matches any element (e.g. `group inside
                             // {supported_isa}`). Scalars compare directly.
-                            if let Some(nm) = self.array_operand_name(r) {
-                                let sz = self.get_queue_size(&nm);
-                                for i in 0..sz {
-                                    if let Some(ev) =
-                                        self.get_signal_value_by_name(&format!("{}[{}]", nm, i))
-                                    {
+                            if let Some(keys) = self.inside_operand_keys(r) {
+                                for key in keys {
+                                    if let Some(ev) = self.get_signal_value_by_name(&key) {
                                         if val.wildcard_eq(&ev).is_true() {
                                             return Value::from_u64(1, 1);
                                         }
@@ -6482,6 +6754,21 @@ impl Simulator {
                         .or(other)
                     }
                 };
+                // §7.12.3 on a locator call's result queue.
+                if parsed.is_none() {
+                    let call = match &expr.kind {
+                        ExprKind::Call { func, .. } => &**func,
+                        _ => &**expr,
+                    };
+                    if let Some((tmp, method)) = self.locator_result_temp(call)
+                        && matches!(
+                            method,
+                            "sum" | "product" | "min" | "max" | "and" | "or" | "xor"
+                        )
+                    {
+                        return self.reduce_with(&tmp, method, filter, iter_name.as_deref());
+                    }
+                }
                 {
                     if let Some((arr, method)) = parsed {
                         let is_arr = self.is_with_receiver_storage(&arr);
@@ -6520,6 +6807,8 @@ impl Simulator {
                 }
                 r
             }
+            // §10.9: a typed pattern has its type's value.
+            ExprKind::TypedPattern { .. } => self.eval_typed_pattern(expr),
             _ => Value::zero(32),
         }
     }

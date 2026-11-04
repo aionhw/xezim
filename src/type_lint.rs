@@ -1105,12 +1105,25 @@ impl<'a> Ck<'a> {
                 self.index_ty(t, index)
             }
             ExprKind::RangeSelect {
-                expr, left, right, ..
+                expr,
+                kind,
+                left,
+                right,
             } => match self.ty_of(expr) {
                 Ty::Unpacked { mut dims, elem } => {
-                    let n = match (lit_i64(left), lit_i64(right)) {
-                        (Some(l), Some(r)) => Some(l.abs_diff(r) + 1),
-                        _ => None,
+                    // §7.4.5, §11.5.1: `a[l:r]` has |l - r| + 1 elements;
+                    // `a[b +: w]` and `a[b -: w]` have `w`, whatever the base
+                    // (it may vary at run time). Counting the base and the
+                    // width as the bounds of a range rejected `a[0 +: 6] = b`
+                    // (#869).
+                    let n = match kind {
+                        RangeKind::Constant => match (lit_i64(left), lit_i64(right)) {
+                            (Some(l), Some(r)) => Some(l.abs_diff(r) + 1),
+                            _ => None,
+                        },
+                        RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                            lit_i64(right).filter(|&w| w > 0).map(|w| w.unsigned_abs())
+                        }
                     };
                     dims[0] = Dim::Fixed(n);
                     Ty::Unpacked { dims, elem }
@@ -1477,6 +1490,14 @@ impl<'a> Ck<'a> {
     /// `target = rhs` where `target` has type `lt`; `what` names the target
     /// (built only for a report).
     fn check_value(&mut self, lt: &Ty, rhs: &Expression, what: impl FnOnce() -> String) {
+        if is_new_call(rhs)
+            && let Ty::Class(c) = lt
+        {
+            self.check_ctor_call(c, rhs);
+        }
+        if let Some(c) = typed_new_class(rhs) {
+            self.check_ctor_call(c, rhs);
+        }
         if is_new_call(rhs) {
             // `new(args)` and `new[n](init)` share one AST shape; only the
             // bare `new` is certainly a class constructor.
@@ -1658,6 +1679,34 @@ impl<'a> Ck<'a> {
                 ),
             );
         }
+    }
+
+    /// §8.7, §13.5: the actuals of `new`, `new(...)` or `C::new(...)` bound to
+    /// the formals of class `c`'s own constructor. Constructors are not
+    /// inherited: a class that declares none has the implicit `new()` with no
+    /// formals, unless it extends a class, where `extends B(default)` (§8.17)
+    /// would give it the base's.
+    fn check_ctor_call(&mut self, c: &str, rhs: &Expression) {
+        let Some(ci) = self.chain(c).and_then(|ch| ch.first().cloned()) else {
+            return;
+        };
+        if ci.interface {
+            return;
+        }
+        let sig = match ci.methods.get("new") {
+            Some(s) => s.clone(),
+            None if ci.base.is_none() => Rc::new(Sig {
+                ret: Ty::Void,
+                ports: Vec::new(),
+                is_task: false,
+            }),
+            None => return,
+        };
+        let args: &[Expression] = match &rhs.kind {
+            ExprKind::Call { args, .. } => args,
+            _ => &[],
+        };
+        self.check_call(&format!("{c}::new"), &sig, args, rhs.span);
     }
 
     fn walk_expr(&mut self, e: &Expression) {
@@ -3237,7 +3286,8 @@ pub(crate) fn visit_expr<'e>(e: &'e Expression, f: &mut dyn FnMut(&'e Expression
         }
         ExprKind::Paren(x)
         | ExprKind::Specialization { base: x, .. }
-        | ExprKind::ShallowCopy { source: x } => visit_expr(x, f),
+        | ExprKind::ShallowCopy { source: x }
+        | ExprKind::TypedPattern { pattern: x, .. } => visit_expr(x, f),
         ExprKind::WithClause { expr, filter } => {
             visit_expr(expr, f);
             visit_expr(filter, f);

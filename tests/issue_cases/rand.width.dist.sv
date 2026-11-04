@@ -30,7 +30,6 @@
 // Expected:
 //   xezim 0.11.0 (git 4751de22): TEST_FAIL (A: 2, B: 1, C: 1, D: 2 = 6;
 //                                E and F pass)
-//   Xcelium (xrun):              TEST_PASS
 //
 // Run:  xezim mwe_rand_width_dist_all.sv
 //       xrun  -sv -64bit mwe_rand_width_dist_all.sv

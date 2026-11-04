@@ -55,7 +55,7 @@ struct TsCtx<'a> {
 /// `false` that relied on such an assumption is kept only while the
 /// subroutine it assumed is still being analyzed (then dropped). `true`
 /// never depends on an assumption and is always kept.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct CycleMemo {
     cache: std::cell::RefCell<HashMap<String, bool>>,
     /// Assumption-dependent `false`s: key -> (stack index, serial) of the
@@ -115,7 +115,7 @@ impl CycleMemo {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct TsState {
     /// Verdicts keyed `c:<class>::<name>` / `f:<name>`.
     memo: CycleMemo,

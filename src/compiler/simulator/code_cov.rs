@@ -131,6 +131,7 @@ fn block(mut v: Vec<Statement>, span: Span) -> Statement {
 
 /// A reported scope: a module instance, or the package (or `$unit`, or the
 /// declaring module) that holds classes and subroutines outside instances.
+#[derive(serde::Serialize)]
 struct Scope {
     /// Printed name: the hierarchical instance path, or the package name.
     name: String,
@@ -139,6 +140,7 @@ struct Scope {
     src: Option<u32>,
 }
 
+#[derive(serde::Serialize)]
 struct StmtSite {
     scope: u32,
     span: Span,
@@ -146,6 +148,7 @@ struct StmtSite {
     counter: u32,
 }
 
+#[derive(serde::Serialize)]
 struct Arm {
     span: Span,
     label: &'static str,
@@ -154,6 +157,7 @@ struct Arm {
     counter: Option<u32>,
 }
 
+#[derive(serde::Serialize)]
 struct BranchSite {
     scope: u32,
     span: Span,
@@ -163,7 +167,7 @@ struct BranchSite {
 }
 
 /// One 64-bit word of a tracked signal, as toggle coverage last saw it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct Word {
     /// Value at the last sample.
     v: u64,
@@ -177,6 +181,7 @@ struct Word {
 }
 
 /// Per-bit rise/fall counts of the tracked signals.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Toggle {
     /// Signal id -> tracked index, `u32::MAX` when not tracked.
     slot: Vec<u32>,
@@ -265,6 +270,7 @@ impl Toggle {
     }
 }
 
+#[derive(serde::Serialize)]
 pub(crate) struct CodeCov {
     kinds: u8,
     limit: Vec<String>,

@@ -787,6 +787,14 @@ impl Simulator {
         (aval, bval)
     }
 
+    /// Value -> svBitVecVal words for a two-state `bit [N]` formal: the actual
+    /// converts as by assignment (IEEE 1800-2017 §35.6.1, §6.11.2), so X and Z
+    /// bits read as 0. The aval plane alone carries X as 1.
+    pub(super) fn dpi_value_to_bit_words(v: &Value, width: u32) -> Vec<u32> {
+        let (aval, bval) = Self::dpi_value_to_logic_words(v, width);
+        aval.iter().zip(&bval).map(|(a, b)| a & !b).collect()
+    }
+
     /// Value -> the STANDARD svLogicVecVal buffer: an array of `s_vpi_vecval`
     /// {aval, bval} pairs, i.e. INTERLEAVED u32 words [a0, b0, a1, b1, ...]
     /// (§35.5.5 / Annex H.10.2). This is the layout xezim's shipped svdpi.h
@@ -917,7 +925,7 @@ impl Simulator {
         &mut self,
         e: &Expression,
     ) -> Option<(Vec<Value>, Vec<(i64, i64)>)> {
-        let ExprKind::AssignmentPattern(items) = &e.kind else {
+        let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(e).kind else {
             return None;
         };
         if items.is_empty()
@@ -928,9 +936,12 @@ impl Simulator {
             return None;
         }
         let n = items.len() as i64;
-        let nested = items
-            .iter()
-            .all(|it| matches!(it.expr().kind, ExprKind::AssignmentPattern(_)));
+        let nested = items.iter().all(|it| {
+            matches!(
+                self.unpacked_pattern(it.expr()).kind,
+                ExprKind::AssignmentPattern(_)
+            )
+        });
         if nested {
             let mut out = Vec::new();
             let mut inner: Option<Vec<(i64, i64)>> = None;
@@ -1168,6 +1179,56 @@ impl Simulator {
         }
     }
 
+    /// §23.9 / §26.3: ordinary declarations in the calling scope hide a
+    /// wildcard-imported DPI name. A package-qualified call remains explicit.
+    pub(super) fn resolve_dpi_call_name<'a>(
+        &self,
+        sv_name: &'a str,
+        via: Option<&str>,
+    ) -> Option<std::borrow::Cow<'a, str>> {
+        use std::borrow::Cow;
+        if sv_name.contains("::") {
+            return Some(Cow::Borrowed(sv_name));
+        }
+        if via.is_none()
+            && self
+                .class_context_stack
+                .last()
+                .and_then(|c| c.as_deref())
+                .is_some_and(|class| self.class_has_method(class, sv_name))
+        {
+            return None;
+        }
+        if via.is_none() {
+            if let Some(key) = self
+                .m_scope_stack
+                .first()
+                .and_then(|f| f.strip_prefix(M_ROOT_MARK))
+                .filter(|p| self.module.packages.contains(*p))
+                .map(|p| format!("{p}::{sv_name}"))
+                .filter(|key| self.module.dpi_imports.contains_key(key))
+            {
+                return Some(Cow::Owned(key));
+            }
+        }
+        let activation = self.activation_scope.borrow();
+        let scope = via
+            .or(activation.as_deref())
+            .unwrap_or(self.current_scope.as_str());
+        let key = if scope.is_empty() || sv_name.contains('.') {
+            Cow::Borrowed(sv_name)
+        } else {
+            Cow::Owned(format!("{scope}.{sv_name}"))
+        };
+        if !self.module.func_decl_scope.contains_key(key.as_ref())
+            && (self.module.functions.contains_key(key.as_ref())
+                || self.module.tasks.contains_key(key.as_ref()))
+        {
+            return None;
+        }
+        Some(Cow::Borrowed(sv_name))
+    }
+
     /// `exec_dpi_import_call` for a call reached through a hierarchical
     /// prefix (`u_a.c_fn()`): `via` is that instance path (`u_a`).
     pub(super) fn exec_dpi_import_call_in(
@@ -1176,6 +1237,8 @@ impl Simulator {
         args: &[Expression],
         via: Option<&str>,
     ) -> Option<Value> {
+        let resolved_name = self.resolve_dpi_call_name(sv_name, via)?;
+        let sv_name = resolved_name.as_ref();
         // §13.5.3 / §13.5.4: an import call binds its actuals like any
         // subroutine call — `.name(expr)` to the named formal, an omitted
         // one from its default. They were taken by position only, so a
@@ -1479,7 +1542,7 @@ impl Simulator {
                         .get(i)
                         .map(|e| self.dpi_int_actual_w(e, *width))
                         .unwrap_or_else(|| Value::zero(*width));
-                    let (aval, _bval) = Self::dpi_value_to_logic_words(&vv, *width);
+                    let aval = Self::dpi_value_to_bit_words(&vv, *width);
                     // Store in a dedicated Vec<Vec<u32>> to keep storage stable.
                     logic_aval.push(aval);
                     let raw_ptr = logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>();
@@ -1492,7 +1555,7 @@ impl Simulator {
                         .get(i)
                         .map(|e| self.dpi_int_actual_w(e, *width))
                         .unwrap_or_else(|| Value::zero(*width));
-                    let (aval, _bval) = Self::dpi_value_to_logic_words(&init, *width);
+                    let aval = Self::dpi_value_to_bit_words(&init, *width);
                     logic_aval.push(aval);
                     let p = Box::new(logic_aval.last_mut().unwrap().as_mut_ptr().cast::<c_void>());
                     ptr_vals.push(p);

@@ -1,4 +1,8 @@
 //! IEEE 1800-2023 clause 18: constrained random value generation.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use crate::harness::{Order, check};
 
@@ -130,7 +134,7 @@ fn c18_constrained_random_deep() {
             "T|18.5.8|obj array r=1 v=0,2,4,6 n=8",
             "T|18.7|with nested contradiction r=0",
             "T|18.5|bidirectional x=6",
-            "T|18.7|with data='{250, 251, 252, 253} kind<3=1",
+            "T|18.7|with data='{'hfa, 'hfb, 'hfc, 'hfd} kind<3=1",
             "T|18.4|logic rand no x=1 signed s<-100=1",
             "T|18.5.5|queue unique sum r=1 ok=1",
             "T|18.12|std array '{0, 1, 4, 9}",
@@ -203,5 +207,29 @@ fn c18_constraint_inheritance() {
             "T|18.5.8.1|size r=1 size==n 1 d=",
             "T|18.5.8.1|",
         ],
+    );
+}
+
+// IEEE 1800-2017 §18.5.4, §11.4.13, Table 11-21: an `inside` / `dist` item
+// `~k` is sized with the other operands; `!k` and reductions are 1-bit. None
+// of them drops out of the set.
+#[test]
+fn c18_inside_unary_items() {
+    check(
+        "c18_inside_unary",
+        include_str!("sv/c18_inside_unary.sv"),
+        "c18iu",
+        Order::Exact,
+        &[
+            "T|inside_unary|bitnot ok=1 n=a",
+            "T|inside_unary|bitnot widened ok=1 m=fa",
+            "T|inside_unary|bitnot int ok=1 x=-6",
+            "T|inside_unary|lognot ok=1 en=1",
+            "T|inside_unary|xor-reduce ok=1 en=0",
+            "T|inside_unary|or-reduce dist ok=1 en=1",
+            "T|inside_unary|pair only=1 both=1",
+            "T|inside_unary|dist toggles some=1",
+        ],
+        &[],
     );
 }

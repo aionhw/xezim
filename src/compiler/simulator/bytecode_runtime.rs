@@ -2141,6 +2141,14 @@ impl Simulator {
                 // time (§8.15 super / §8.20 non-virtual bare call): run
                 // the body via the hierarchy walk from that class —
                 // non-virtual, ctor chaining included.
+                if let Some(v) =
+                    self.vm_try_direct_call_from(handle, Some(start_class), method, base, n)
+                {
+                    self.vm_regs[*dest as usize] = v;
+                    self.vm_ret_coll = self.pending_ret_collection.clone();
+                    local_count += 1;
+                    return local_count;
+                }
                 let (args, temps) = self.vm_args_with_writeback(start_class, method, base, n);
                 let result = if handle == 0 {
                     // Null receiver (unreachable for instance frames;
@@ -2334,7 +2342,11 @@ impl Simulator {
                 self.class_static_set(class, prop, v);
             }
             Insn::ConstructObject(dest, class, arg_start, n_args) => {
-                let class: &str = &class.0;
+                // `class\0mask`: positions of empty actuals (defaults).
+                let (class, empty_mask): (&str, u64) = match class.0.split_once('\u{0}') {
+                    Some((c, m)) => (c, m.parse().unwrap_or(0)),
+                    None => (&class.0, 0),
+                };
                 // Step 9g: `new(args)` / bare `new` — §8.8 constructor
                 // of the baked DEFINING class. Allocation, property
                 // inits, and the ctor chain all stay in
@@ -2351,7 +2363,14 @@ impl Simulator {
                 }
                 let args: Vec<Expression> = argvals
                     .iter()
-                    .map(|v| self.value_method_arg_expr(v))
+                    .enumerate()
+                    .map(|(i, v)| {
+                        if i < 64 && empty_mask & (1 << i) != 0 {
+                            Expression::new(ExprKind::Empty, crate::ast::Span::dummy())
+                        } else {
+                            self.value_method_arg_expr(v)
+                        }
+                    })
                     .collect();
                 let v = if let Some(cd) = self.module.classes.get(class).cloned() {
                     self.instantiate_class(&cd, &args)
@@ -2736,7 +2755,7 @@ impl Simulator {
                     .iter()
                     .map(|key| {
                         if is_str {
-                            Value::from_string(key)
+                            Self::name_key_value(key)
                         } else {
                             let mut v = Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
                             v.is_signed = ks_sign;
@@ -2949,7 +2968,7 @@ impl Simulator {
                                     "[SOA-SHADOW] LoadSignal mismatch sid={} inline=({:#x},{:#x}) table=({:#x},{:#x}) — aborting",
                                     s, v, x, cv, cx
                                 );
-                                self.finished = true;
+                                self.abort_run();
                             }
                         }
                         let (w, sg) = (self.signal_widths[s], self.signal_signed[s]);
@@ -2986,7 +3005,7 @@ impl Simulator {
                                     "[SOA-SHADOW] LoadSignalSigned mismatch sid={} inline=({:#x},{:#x}) table=({:#x},{:#x}) — aborting",
                                     s, v, x, cv, cx
                                 );
-                                self.finished = true;
+                                self.abort_run();
                             }
                         }
                         self.vm_regs[d] = Value::from_inline(v, x, self.signal_widths[s]);
@@ -4405,7 +4424,7 @@ impl Simulator {
                                         "[SOA-SHADOW] LoadArrayElem mismatch eid={} inline=({:#x},{:#x}) table=({:#x},{:#x}) — aborting",
                                         eid, v, x, cv, cx
                                     );
-                                    self.finished = true;
+                                    self.abort_run();
                                 }
                             }
                             let (w, sg) = (self.signal_widths[eid], self.signal_signed[eid]);

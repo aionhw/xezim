@@ -1270,6 +1270,7 @@ impl Simulator {
             return None;
         }
         let mut sv = BlockScopeSave {
+            scope_gen: self.next_frame_gen(),
             frame_gen: self.local_gen_stack.last().copied().unwrap_or(0),
             pid_mark: self.next_pid,
             ..Default::default()
@@ -1325,6 +1326,7 @@ impl Simulator {
             let plain = Self::type_is_plain_scalar(data_type);
             for d in declarators {
                 let nm = d.name.name.as_str();
+                sv.declared_names.push(nm.to_string());
                 if d.dimensions.is_empty() && self.is_virtual_iface_type(data_type) {
                     // §6.21 / §25.9: hiding a variable also hides its binding.
                     // Values alone cannot restore the enclosing vif after a
@@ -1368,6 +1370,14 @@ impl Simulator {
                             .push((nm.to_string(), self.task_frame_string_flag(nm)));
                     }
                 }
+                // §23.9 (#856): a scalar block local also hides a
+                // same-named enclosing collection. Its rename is restored
+                // with the rest of the block's declarations on exit.
+                if let Some(ld) = self.local_dyn.last_mut() {
+                    if let Some(pos) = ld.iter().rposition(|(k, _)| k == nm) {
+                        sv.dyn_shadowed.push(ld.remove(pos));
+                    }
+                }
                 if plain && d.dimensions.is_empty() {
                     continue;
                 }
@@ -1378,12 +1388,6 @@ impl Simulator {
                         if k.starts_with(&marker) && !sv.shadowed.iter().any(|(n, _)| n == k) {
                             sv.shadowed.push((k.clone(), v.clone()));
                         }
-                    }
-                }
-                // A collection local: move the enclosing rename aside.
-                if let Some(ld) = self.local_dyn.last_mut() {
-                    if let Some(pos) = ld.iter().rposition(|(k, _)| k == nm) {
-                        sv.dyn_shadowed.push(ld.remove(pos));
                     }
                 }
             }
@@ -2114,7 +2118,7 @@ impl Simulator {
             );
             self.record_output(m.clone());
             self.stdout_writeln(&m);
-            self.finished = true;
+            self.abort_run();
             return true;
         }
         true
@@ -2265,6 +2269,7 @@ impl Simulator {
             body.span,
         ));
         let cont: Arc<[Statement]> = Arc::from(cont);
+        self.exec_cache_pids.insert(key.0);
         self.forever_cont_cache.insert(key, cont.clone());
         cont
     }
@@ -2352,6 +2357,7 @@ impl Simulator {
                                 let is_clk_ev = self.is_clocking_event(event);
                                 let resolved = self.resolve_sens_ids(&sens);
                                 if !sens.is_empty() && resolved.len() == sens.len() {
+                                    self.exec_cache_pids.insert(pid);
                                     self.forever_sens_cache
                                         .insert(key, (resolved.clone(), is_clk_ev));
                                 }
@@ -2380,6 +2386,21 @@ impl Simulator {
                             }
                             return;
                         }
+                        // §15.5: an event with no signal-table slot — a class
+                        // event (`@ev` on `this`, `@(h.ev)`, a static class
+                        // event) — parks through `run_process_stmts`, which
+                        // knows those identities. Executed synchronously below
+                        // it never waited, and the loop never saw the trigger.
+                        let cont = self.forever_cont(pid, body, body_stmts, i, 2, s);
+                        let contp = pc.pushed_frame(cont, resume_at);
+                        if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
+                            self.event_queue.schedule(self.time, pid, contp);
+                            return;
+                        }
+                        self.forever_depth += 1;
+                        self.run_process_stmts(pid, &contp);
+                        self.forever_depth -= 1;
+                        return;
                     }
                 }
             }
@@ -2490,7 +2511,7 @@ impl Simulator {
                 "               Simulated time can never advance past this loop. Add a timing control,"
             );
             eprintln!("               or raise/disable the check with XEZIM_STALL_LIMIT=<n>.");
-            self.finished = true;
+            self.abort_run();
         }
     }
 
@@ -2509,6 +2530,14 @@ impl Simulator {
     /// that collection (§11.4.12). None when the base is not an indexable
     /// collection, in which case there is no bound to install.
     pub(super) fn dollar_bound_for_base(&mut self, base: &Expression) -> Option<i64> {
+        // §7.10.1: an object's queue is stored under its handle, not the
+        // source spelling (`list.contents`). Resolve that store before
+        // looking up the last index, including for a class-handle formal.
+        if let Some(n) = self.expr_assoc_name(base) {
+            if self.module.dynamic_arrays.contains(&n) {
+                return Some(self.get_queue_size(&n) as i64 - 1);
+            }
+        }
         let n = match &base.kind {
             ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
             _ => self.flat_member_name(base).map(std::borrow::Cow::Owned),
@@ -2624,6 +2653,21 @@ impl Simulator {
                     e.span,
                 )
             }
+            // §7.10.1/§11.4.12: the queue select may be the receiver of
+            // a property write (`list.contents[$].flags = v`). The scan
+            // above detects it; descend here too so the bound is installed
+            // before the assignment paths evaluate the object handle.
+            ExprKind::MemberAccess { expr, member } => Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.resolve_dollar_in_lvalue(expr)),
+                    member: member.clone(),
+                },
+                e.span,
+            ),
+            ExprKind::Paren(expr) => Expression::new(
+                ExprKind::Paren(Box::new(self.resolve_dollar_in_lvalue(expr))),
+                e.span,
+            ),
             _ => e.clone(),
         }
     }
@@ -2650,6 +2694,56 @@ impl Simulator {
             }
             _ => false,
         }
+    }
+
+    /// §10.4.2 (#569): the root name of a member/element NBA target when it
+    /// holds a live object handle, with the handle value, so the apply site
+    /// writes THAT object. The root may be a frame local or formal, a
+    /// property of `this`, or a module or block variable (#613): any
+    /// class-typed name, read as the statement executes.
+    pub(super) fn nba_root_frame(
+        &self,
+        lvalue: &Expression,
+    ) -> Option<(String, Value, Option<String>)> {
+        if !matches!(
+            lvalue.kind,
+            ExprKind::MemberAccess { .. } | ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+        ) && !matches!(&lvalue.kind, ExprKind::Ident(h) if h.path.len() > 1)
+        {
+            return None;
+        }
+        let mut e = lvalue;
+        loop {
+            match &e.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => e = expr,
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        let root = &h.path[0].name.name;
+        // `this` is carried by `this_handle`.
+        if root == "this" {
+            return None;
+        }
+        // Only a class-typed root holds a handle: an integer local whose value
+        // happens to index a live object is not one.
+        let class = self.class_of_var(root)?;
+        let handle = match self.local_stack.last().and_then(|f| f.get(root)) {
+            Some(v) => v.to_u64()? as usize,
+            None => self.eval_ident_handle(root)?,
+        };
+        if handle == 0 || !self.heap.get(handle).is_some_and(|o| o.is_some()) {
+            return None;
+        }
+        Some((
+            root.clone(),
+            Value::from_u64(handle as u64, 64),
+            Some(class),
+        ))
     }
 
     pub(super) fn freeze_lvalue_indices(&mut self, e: &Expression) -> Expression {
@@ -2859,10 +2953,30 @@ impl Simulator {
                 .is_some_and(|o| o.properties.contains_key(name))
     }
 
+    /// §8.4: in a method, a target rooted at a property of `this` (`s.f <=
+    /// v`, `v[1] <= x`) is the property, not a same-named module variable,
+    /// so it has no signal id; the queued path commits it with `this`
+    /// restored. A virtual-interface property keeps its own redirect.
+    fn nba_root_is_this_prop(&self, h: &HierarchicalIdentifier) -> bool {
+        let name = h.path[0].name.name.as_str();
+        h.root.is_none()
+            && self.this_prop_hides(name)
+            && !self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|th| self.heap.get(th)?.as_ref().map(|i| i.class_name.clone()))
+                .is_some_and(|cn| self.class_vif_decl(&cn, name).is_some())
+    }
+
     pub(super) fn resolve_nba_target(&mut self, lhs: &Expression) -> Option<usize> {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 if self.bare_selected_storage_shadows_signal(hier) {
+                    return None;
+                }
+                if self.nba_root_is_this_prop(hier) {
                     return None;
                 }
                 let is_ambiguous_leaf =
@@ -2899,6 +3013,15 @@ impl Simulator {
                             return self.signal_name_to_id.get(leaf.as_str()).copied();
                         }
                     }
+                }
+                let mut root = expr.as_ref();
+                while let ExprKind::Index { expr, .. } = &root.kind {
+                    root = expr;
+                }
+                if let ExprKind::Ident(h) = &root.kind
+                    && self.nba_root_is_this_prop(h)
+                {
+                    return None;
                 }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
@@ -3012,6 +3135,50 @@ impl Simulator {
                         }
                     }
                 }
+                // A leaf of an unpacked struct (`storage[0].value`,
+                // `field.r1[0].f.value`) is its own signal. Inside an
+                // instance the table key carries the instance prefix
+                // (`u.storage[0].value`); the bare flat name misses, and
+                // the queued-lvalue path commits later with the scope hint
+                // already popped, so the write never landed. Resolve it
+                // now, while this block's hint is still installed.
+                //
+                // Not for an element of a dynamic array, queue or associative
+                // array, whose readers watch the collection (see the Index arm
+                // above), nor in a class method, where a property can hide a
+                // module name.
+                let mut root = expr.as_ref();
+                while let ExprKind::Index { expr: e, .. } | ExprKind::MemberAccess { expr: e, .. } =
+                    &root.kind
+                {
+                    root = e;
+                }
+                let dynamic_root = match &root.kind {
+                    ExprKind::Ident(h) => {
+                        let name = self.resolve_hier_name(h).into_owned();
+                        let scoped = self.hint_scoped(&name);
+                        [Some(name), scoped].into_iter().flatten().any(|n| {
+                            self.module.dynamic_arrays.contains(&n)
+                                || self.module.queue_vars.contains(&n)
+                                || self.module.associative_arrays.contains_key(&n)
+                        })
+                    }
+                    _ => true,
+                };
+                let in_method = matches!(self.this_stack.last(), Some(Some(_)));
+                if !dynamic_root
+                    && !in_method
+                    && let Some(flat) = self.flat_member_name(lhs)
+                {
+                    if let Some(&id) = self.signal_name_to_id.get(flat.as_str()) {
+                        return Some(id);
+                    }
+                    if let Some(scoped) = self.hint_scoped(&flat) {
+                        if let Some(&id) = self.signal_name_to_id.get(scoped.as_str()) {
+                            return Some(id);
+                        }
+                    }
+                }
                 None
             }
             _ => None,
@@ -3072,6 +3239,7 @@ impl Simulator {
         }
         self.enqueue_context_nba(
             NbaEntry {
+                root_frame: None,
                 lhs: key.is_none().then(|| root.into_owned()),
                 value,
                 resolved_id: None,
@@ -3278,10 +3446,33 @@ impl Simulator {
             }
             if let Some(lhs) = entry.lhs {
                 // Re-establish the scheduling context so a class-property
-                // target resolves (see NbaEntry::this_handle).
+                // target resolves (see NbaEntry::this_handle), and the
+                // object the target's root NAMED when it was scheduled
+                // (see NbaEntry::root_frame).
                 if let Some(h) = entry.this_handle {
                     self.this_stack.push(Some(h));
                 }
+                // The frame declares the root's class (its declared one, else
+                // the object's own), so a member write resolves without
+                // whichever call frame the event loop still holds (#613).
+                let pushed_root = if let Some((name, val, declared)) = entry.root_frame {
+                    let class = declared.or_else(|| {
+                        val.to_u64()
+                            .and_then(|h| self.heap.get(h as usize))
+                            .and_then(|o| o.as_ref())
+                            .map(|o| o.class_name.clone())
+                    });
+                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    let mut types = self.take_pooled_types();
+                    if let Some(c) = class {
+                        types.0.insert(name.clone(), c);
+                    }
+                    frame.insert(name, val);
+                    self.push_local_frame_typed(frame, types);
+                    true
+                } else {
+                    false
+                };
                 let value = if let Some((dst, src, len)) = entry.static_slice {
                     let mut stored = self.eval_expr(&lhs);
                     stored.copy_bits_from(dst as usize, &entry.value, src as usize, len as usize);
@@ -3290,6 +3481,9 @@ impl Simulator {
                     entry.value
                 };
                 self.assign_value(&lhs, &value);
+                if pushed_root {
+                    self.pop_local_frame();
+                }
                 if entry.this_handle.is_some() {
                     self.this_stack.pop();
                 }
@@ -3956,7 +4150,7 @@ impl Simulator {
             passes += 1;
             if self.stall_limit > 0 && passes > self.stall_limit {
                 self.report_edge_rescan_stall(passes);
-                self.finished = true;
+                self.abort_run();
                 break;
             }
             self.check_edges_inner(Some(&subset), false);

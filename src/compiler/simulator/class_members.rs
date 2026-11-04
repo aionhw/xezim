@@ -735,6 +735,17 @@ impl Simulator {
         if let Some(k) = self.static_fixed_key_for_name(name) {
             return Some(k);
         }
+        // §23.9 / §13.5 (#534): an unpacked-array FORMAL of the running
+        // method is bound under its bare name (a module-array row plus a
+        // frame marker) and shadows a same-named class member; it must not
+        // be lifted to the object's storage. The array-row test keeps the
+        // marker probe off the common path.
+        if self.module.arrays.contains_key(name)
+            && let Some(frame) = self.local_stack.last()
+            && frame.contains_key(&format!("\u{1}array_formal:{name}"))
+        {
+            return None;
+        }
         // This guard sees every call (22M+ on a UVM run): keep the ORIGINAL
         // vectorizable one-pass `any` for the overwhelmingly common bare
         // names (a manual classify loop here measured +0.5% instructions on
@@ -761,10 +772,11 @@ impl Simulator {
             return None;
         }
         // §8.10 / §13.3: the running subroutine's own formal or automatic
-        // local of this name (an entry in its rename frame) shadows a
-        // same-named property — `uvm_packer::put_bits(ref bit bitstream[])`
+        // local of this name (an entry in its rename frame, or a scalar in
+        // its local frame) shadows a same-named property:
+        // `uvm_packer::put_bits(ref bit bitstream[])`
         // must read its formal, not the class's `static bit bitstream[]`.
-        if self.dyn_name_lookup_innermost(name).is_some() {
+        if self.dyn_name_lookup_innermost(name).is_some() || self.frame_scalar_shadows(name) {
             return None;
         }
         // §8.9: inside a STATIC method there is no `this`; the lexical class
@@ -1155,9 +1167,14 @@ impl Simulator {
         while let Some(cn) = cur {
             match self.module.classes.get(cn) {
                 Some(cd) => {
+                    // §7.4.2: a fixed multi-dimensional member (`int m [2][3]`)
+                    // stores under `<handle>#m` as a 1-D one does; without
+                    // it every whole-member write (`c.m = a`, a pattern, a
+                    // row `c.m[1] = '{..}`) resolved nowhere and was dropped.
                     if cd.assoc_properties.contains_key(member)
                         || cd.queue_properties.contains_key(member)
                         || cd.array_properties.contains_key(member)
+                        || cd.array_nd_properties.contains_key(member)
                     {
                         return true;
                     }
@@ -1555,16 +1572,23 @@ impl Simulator {
             }
             // Flattened nested OBJECT handle: `a.mid.base` (path.len() >= 3).
             // The receiver is an object chain (`a.mid`), not a static handle.
-            // Evaluate the receiver to a handle and scope the leaf member to it.
+            // Evaluate the complete receiver, including intermediate selects
+            // (`sys.targets[i].ports`), and scope the leaf collection to it.
+            // §12.7.3: foreach must use that collection's bounds, not the
+            // bounds of an earlier array in the receiver chain.
             ExprKind::Ident(h)
                 if h.path.len() >= 3
                     && !self.module.classes.contains_key(&h.path[0].name.name)
-                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+                    && h.path.last().is_some_and(|s| s.selects.is_empty()) =>
             {
                 let n = h.path.len();
                 let member = h.path[n - 1].name.name.clone();
                 let recv = hier_prefix(h);
-                let recv_expr = Expression::new(ExprKind::Ident(recv), h.span);
+                let recv_expr = if recv.path.iter().any(|s| !s.selects.is_empty()) {
+                    Self::hier_select_chain(&recv, h.span)
+                } else {
+                    Expression::new(ExprKind::Ident(recv), h.span)
+                };
                 let hh = self.eval_handle_expr(&recv_expr).unwrap_or(0);
                 if hh != 0 {
                     if let Some(cn) = self
@@ -1598,23 +1622,14 @@ impl Simulator {
     pub(super) fn indexed_coll_roots(&self) -> &HashSet<String> {
         self.indexed_coll_roots.get_or_init(|| {
             let mut set: HashSet<String> = HashSet::default();
-            let names = self
-                .module
-                .dynamic_arrays
-                .iter()
-                .chain(self.module.associative_arrays.keys());
-            for n in names {
-                if let Some((root, _)) = n.split_once('[')
-                    && !root.contains('#')
-                    && (self.module.var_decl_types.contains_key(root)
-                        || self.module.arrays.contains_key(root)
-                        || self.module.arrays_2d.contains_key(root)
-                        || self.module.arrays_nd.contains_key(root))
-                {
-                    // §12.7.3 / §23.8: a hierarchical module array is a
-                    // declared root too; leaf names are only probe hints.
-                    set.insert(root.to_string());
-                    if let Some((_, leaf)) = root.rsplit_once('.') {
+            // §7.4.5, §12.7.3, §23.8: every declared collection of
+            // collections whose rows are built row by row: queue or dynamic
+            // rows, or any rows under a fixed, dynamic or queue outer
+            // dimension. Hierarchical names add their leaf as a probe hint.
+            for (n, shape) in &self.module.coll_shapes {
+                if Self::has_queue_rows(shape) || !matches!(shape.dims[0], Dim::Assoc(_)) {
+                    set.insert(n.clone());
+                    if let Some((_, leaf)) = n.rsplit_once('.') {
                         set.insert(leaf.to_string());
                     }
                 }
@@ -1625,6 +1640,11 @@ impl Simulator {
                 // collections (`int q[3][$]`): its elements are stored
                 // per object (see `class_array_of_coll_key`).
                 set.extend(cd.array_of_coll_properties.keys().cloned());
+                set.extend(
+                    (cd.prop_coll_shapes.iter())
+                        .filter(|(_, shape)| Self::has_queue_rows(shape))
+                        .map(|(n, _)| n.clone()),
+                );
                 work.extend(cd.property_types.values().cloned());
             }
             work.extend(self.module.typedef_types.values().cloned());
@@ -1661,7 +1681,9 @@ impl Simulator {
     /// every indexed-collection probe.
     #[inline(always)]
     pub(super) fn indexed_colls_live(&self) -> bool {
-        self.indexed_coll_mask.get() != 0 || self.indexed_coll_roots.get().is_none()
+        self.indexed_coll_mask.get() != 0
+            || self.indexed_coll_roots.get().is_none()
+            || self.local_coll_rows_live
     }
 
     /// Whether `name` may be one of [`indexed_coll_roots`]: the length
@@ -1683,12 +1705,16 @@ impl Simulator {
         let ExprKind::Index { expr: base, .. } = &e.kind else {
             return false;
         };
-        if self.indexed_coll_mask.get() == 0 && self.indexed_coll_roots.get().is_some() {
+        if self.indexed_coll_mask.get() == 0
+            && self.indexed_coll_roots.get().is_some()
+            && !self.local_coll_rows_live
+        {
             return false;
         }
-        let mut cur = base.as_ref();
+        let (mut cur, mut selects) = (base.as_ref(), 1);
         while let ExprKind::Index { expr, .. } = &cur.kind {
             cur = expr;
+            selects += 1;
         }
         let name = match &cur.kind {
             ExprKind::Ident(h) => match h.path.last() {
@@ -1698,7 +1724,29 @@ impl Simulator {
             ExprKind::MemberAccess { member, .. } => member.name.as_str(),
             _ => return false,
         };
+        if self.local_coll_rows_live {
+            return self.indexed_coll_root(name) || self.local_coll_root(name);
+        }
+        // A select as deep as a module-scope declaration's dimensions is an
+        // element (or a bit of one), never a row: `d[i][j] = v` on
+        // `int d[][]` is a plain element write.
         self.indexed_coll_root(name)
+            && !(matches!(&cur.kind, ExprKind::Ident(h) if h.path.len() == 1)
+                && self
+                    .module
+                    .coll_shapes
+                    .get(name)
+                    .is_some_and(|shape| selects >= shape.dims.len()))
+    }
+
+    /// Whether `bare` names a subroutine-local collection of collections,
+    /// stored under its per-call key with a declared shape (§7.4.5).
+    fn local_coll_root(&self, bare: &str) -> bool {
+        let shape = match self.dyn_name_lookup(bare) {
+            Some(key) if key.starts_with('@') => self.local_coll_shapes.get(key),
+            _ => self.module.coll_shapes.get(bare),
+        };
+        shape.is_some_and(Self::has_queue_rows)
     }
 
     /// §7.4.5/§7.6/§7.10: `q3[0] = q3[1]`, `s.sp[3] = '{..}`, `r = q3[1]` —
@@ -1716,6 +1764,10 @@ impl Simulator {
             let Some(name) = self.indexed_coll_name(lvalue) else {
                 return false;
             };
+            // §7.8.7, §7.4.5: create the target row, or ignore the write.
+            if !self.ensure_row(&name) {
+                return true;
+            }
             let dt = self
                 .struct_member_coll_of(&name)
                 .map(|(_, dt, _)| dt)
@@ -1782,16 +1834,119 @@ impl Simulator {
     #[cold]
     #[inline(never)]
     pub(super) fn indexed_coll_name(&mut self, e: &Expression) -> Option<String> {
+        // §13.5.2 (#854): identify a fixed class-row actual before
+        // flattening it. The bare flat name is not the object's store;
+        // trying it and then resolving the class row evaluated every
+        // selector twice (including function calls and increments).
+        let mut indices = Vec::new();
+        let mut root = e;
+        while let ExprKind::Index { expr, index } = &root.kind {
+            indices.push(index.as_ref());
+            root = expr;
+        }
+        // The shape probes below may inspect a member receiver more than
+        // once before finding its collection store. Capture a side-effectful
+        // object receiver once, including for dynamic outer rows that do not
+        // take the fixed-row fast path (§11.4.1 / §13.5.2, #854).
+        if let ExprKind::MemberAccess { expr: recv, member } = &root.kind
+            && !Self::cond_expr_is_effect_free(recv, false)
+        {
+            let value = self.eval_expr(recv);
+            let mut selected = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.value_method_arg_expr(&value)),
+                    member: member.clone(),
+                },
+                root.span,
+            );
+            for index in indices.iter().rev() {
+                selected = Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(selected),
+                        index: Box::new((**index).clone()),
+                    },
+                    e.span,
+                );
+            }
+            return self.indexed_coll_name(&selected);
+        }
+        if let Some((mut key, bounds)) = self.class_fixed_array_of_coll_base(root)
+            && bounds.len() == indices.len()
+        {
+            for (index, &(lo, hi)) in indices.into_iter().rev().zip(&bounds) {
+                let value = self.eval_expr(index).to_i64()?;
+                if !(lo.min(hi)..=lo.max(hi)).contains(&value) {
+                    return None;
+                }
+                key.push('[');
+                Self::push_i64(&mut key, value);
+                key.push(']');
+            }
+            return Some(key);
+        }
         if let Some(n) = self.flat_member_name(e)
             && (self.module.dynamic_arrays.contains(&n)
                 || self.module.associative_arrays.contains_key(&n)
+                || self.is_existing_row(&n)
                 || (self.struct_colls_possible() && self.ensure_struct_member_coll(&n)))
         {
             return Some(n);
         }
         // An element of a class property that is a fixed array of
-        // collections lives under the object-scoped key `<h>#q[i]`.
-        self.class_fixed_array_of_coll_key(e)
+        // collections lives under the object-scoped key `<h>#q[i]`; a row
+        // of any other collection property under `<h>#m[k]`.
+        self.class_fixed_array_of_coll_key(e).or_else(|| {
+            self.coll_elem_expr_key(e)
+                .filter(|k| self.is_existing_row(k))
+        })
+    }
+
+    /// A declared row (see [`is_declared_row`]) that exists — one past the
+    /// size of a queue or dynamic array above it does not (§7.8.6) — or the
+    /// `$+1` slot of a queue, which a write creates (§7.10.1).
+    pub(super) fn is_existing_row(&self, name: &str) -> bool {
+        self.is_declared_row(name)
+            && (self.declared_dim(name).is_some() || self.is_queue_append_slot(name))
+    }
+
+    /// Whether `name` (`q[i]`) selects index `q.size()` of the queue of
+    /// collections `q`.
+    fn is_queue_append_slot(&self, name: &str) -> bool {
+        let Some((shape, depth)) = self.coll_shape_at(name) else {
+            return false;
+        };
+        let Some(p) = name.rfind('[') else {
+            return false;
+        };
+        depth >= 1
+            && shape.dims[depth - 1] == Dim::Queue
+            && name[p + 1..name.len() - 1].parse::<u64>().ok()
+                == Some(self.get_queue_size(&name[..p]))
+    }
+
+    /// §7.4.5: whether `name` is a row of a declared collection of
+    /// collections — selected below its root, above its leaf elements —
+    /// whether or not it exists yet.
+    pub(super) fn is_declared_row(&self, name: &str) -> bool {
+        self.coll_shape_at(name).is_some_and(|(shape, depth)| {
+            depth >= 1
+                && shape
+                    .dims
+                    .get(depth)
+                    .is_some_and(|d| !matches!(d, Dim::Fixed(_)))
+        })
+    }
+
+    /// Whether `shape` has a row that is a queue or dynamic array, which a
+    /// whole assignment (`m[k] = q`) builds element by element. A fixed row
+    /// is laid out by its bounds, and an associative row by the
+    /// multidimensional associative paths.
+    pub(super) fn has_queue_rows(shape: &CollShape) -> bool {
+        shape
+            .dims
+            .iter()
+            .skip(1)
+            .any(|d| matches!(d, Dim::Queue | Dim::Dyn))
     }
 
     /// Evaluate a scalar expression to an i64 in a `&self` context (literals,
@@ -2969,6 +3124,9 @@ impl Simulator {
         let base = strip(base);
         let mut cur = Some(self.typedef_unroll(derived));
         let mut guard = 0;
+        // §8.26: a class is also every interface class it or a base class
+        // implements, and every one those extend.
+        let mut ifaces: Vec<String> = Vec::new();
         while let Some(c) = cur {
             guard += 1;
             if guard > 128 {
@@ -2977,14 +3135,35 @@ impl Simulator {
             if strip(&c) == base || self.class_origin(&c) == base {
                 return true;
             }
-            let nxt = self
+            let cd = self
                 .module
                 .classes
                 .get(&c)
-                .or_else(|| self.module.classes.get(&strip(&c)))
+                .or_else(|| self.module.classes.get(&strip(&c)));
+            if let Some(cd) = cd {
+                ifaces.extend(cd.implements.iter().cloned());
+            }
+            cur = cd
                 .and_then(|cd| cd.extends.clone())
                 .map(|e| self.typedef_unroll(&e));
-            cur = nxt;
+        }
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(i) = ifaces.pop() {
+            if seen.len() > 128 || !seen.insert(i.clone()) {
+                continue;
+            }
+            let i = self.typedef_unroll(&i);
+            if strip(&i) == base {
+                return true;
+            }
+            if let Some(cd) = self
+                .module
+                .classes
+                .get(&i)
+                .or_else(|| self.module.classes.get(&strip(&i)))
+            {
+                ifaces.extend(cd.extends.iter().chain(&cd.implements).cloned());
+            }
         }
         false
     }
@@ -3558,7 +3737,19 @@ impl Simulator {
                 dfrag.to_string()
             };
             let dfrag_resolved = dfrag_resolved.trim().to_string();
-            if canon(&dfrag_resolved) != canon(sval) {
+            // A typedef spelling and the class it stands for are the same
+            // type (§6.18): the dest fragment may come from the
+            // specialization signature's canonical spelling while the
+            // instance binding records the source spelling (`gp_t` vs
+            // `uvm_tlm_generic_payload`), or vice versa. Follow typedefs
+            // on both sides before comparing.
+            let dfrag_resolved = self
+                .typedef_alias_frag(&dfrag_resolved)
+                .unwrap_or(dfrag_resolved);
+            let sval_resolved = self
+                .typedef_alias_frag(sval)
+                .unwrap_or_else(|| sval.to_string());
+            if canon(&dfrag_resolved) != canon(&sval_resolved) {
                 return false;
             }
         }
@@ -3720,6 +3911,46 @@ impl Simulator {
             },
             _ => None,
         }
+    }
+
+    /// §8.25: the `(base, sig)` specialization a variable's DECLARED type
+    /// names — a direct `C#(args)` (with named arguments normalized to
+    /// positional order), or a typedef for a specialization. None for a
+    /// plain class or an unresolvable type. Used to seed `current_spec`
+    /// when a static method is dispatched through a null receiver whose
+    /// declared type is specialized, so the method body's bare
+    /// self-references denote the current specialization.
+    pub(super) fn spec_from_declared_type(&self, decl: &str) -> Option<(String, String)> {
+        let cand = self
+            .positional_spec_text(decl)
+            .unwrap_or_else(|| decl.to_string());
+        if let Some((b, s)) = self.extract_spec_from_string(&cand) {
+            return Some((b, s));
+        }
+        let (b, s) = self.resolve_typedef_spec(decl)?;
+        let full = format!("{}#({})", b, s);
+        let norm = self.positional_spec_text(&full).unwrap_or(full);
+        self.extract_spec_from_string(&norm)
+    }
+
+    /// §8.25: the specialization a NULL receiver's declared type names, for
+    /// seeding `current_spec` around a static-method dispatch. A procedural
+    /// local's `var_class_types` entry holds the BARE class name (its `#(...)`
+    /// arguments live in `var_type_args`), so for a variable receiver
+    /// `declared_class_own_spec` — which spells the declaration's own
+    /// specialization — is authoritative; the declared-type TEXT fallback
+    /// covers `this.member` property types that carry `base#(sig)` spellings.
+    pub(super) fn spec_for_null_receiver(
+        &self,
+        var: Option<&str>,
+        decl: &str,
+    ) -> Option<(String, String)> {
+        if let Some(v) = var {
+            if let Some((_, Some(spec))) = self.declared_class_own_spec(v, None) {
+                return Some(spec);
+            }
+        }
+        self.spec_from_declared_type(decl)
     }
 
     /// `Name.method(args)` where `Name` names a CLASS-scope entity — the

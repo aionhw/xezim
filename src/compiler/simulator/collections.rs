@@ -185,6 +185,20 @@ impl Simulator {
         fitted
     }
 
+    /// The context width of a value stored into an element of associative
+    /// array `name` (§11.6.1): its element width, or none for a `real`
+    /// element, whose integral value is self-determined before conversion.
+    pub(super) fn assoc_store_ctx_width(&self, name: &str) -> Option<u32> {
+        let elem = self
+            .class_member_coll_type(name)
+            .cloned()
+            .or_else(|| self.p_elem_type(name));
+        if elem.is_some_and(|dt| matches!(self.resolve_dt_ref(&dt), DataType::Real { .. })) {
+            return None;
+        }
+        self.assoc_elem_width(name).filter(|&w| w > 0)
+    }
+
     pub(super) fn assoc_elem_width(&self, name: &str) -> Option<u32> {
         if let Some(&w) = self.module.assoc_elem_widths.get(name) {
             return Some(w);
@@ -284,6 +298,46 @@ impl Simulator {
         ))
     }
 
+    /// §7.2.1: the field layout of a packed-struct element of collection
+    /// `arr`, for `item.<field>` in a `with` clause: a module or struct
+    /// member collection's registered layout, or a class member's (`<h>#m`)
+    /// from its declared type on the object's class or an ancestor.
+    pub(super) fn coll_packed_elem_fields(&self, arr: &str) -> Option<Vec<(String, u32, u32)>> {
+        let layout = |dt: &DataType| {
+            super::elaborate::packed_struct_field_layout(
+                dt,
+                &self.module.parameters,
+                &self.module.typedefs,
+                &self.module.typedef_types,
+            )
+        };
+        let fields = if let Some(f) = self.module.packed_struct_fields.get(arr) {
+            Some(f.clone())
+        } else if let Some((h, prop)) = arr.split_once('#')
+            && let Ok(handle) = h.parse::<usize>()
+        {
+            // A class member collection.
+            let mut cls = self.heap.get(handle)?.as_ref()?.class_name.clone();
+            let mut found = None;
+            for _ in 0..64 {
+                let cd = self.module.classes.get(&cls)?;
+                if let Some(dt) = self.class_prop_decl_type(cd, prop) {
+                    found = layout(dt);
+                    break;
+                }
+                cls = cd.extends.clone()?;
+            }
+            found
+        } else if arr.contains('.') && self.struct_colls_possible() {
+            // A struct's dynamic member (`s.sp[2]`): its declared type.
+            self.struct_member_coll_of(arr)
+                .and_then(|(_, dt, _)| layout(&dt))
+        } else {
+            None
+        };
+        fields.filter(|f| !f.is_empty())
+    }
+
     pub(super) fn is_associative_array(&self, name: &str) -> bool {
         if self.module.associative_arrays.contains_key(name) {
             return true;
@@ -347,28 +401,6 @@ impl Simulator {
         false
     }
 
-    /// The associative array a possibly-indexed storage name selects into:
-    /// strip trailing `[key]` segments (`h#m[1][2]` -> `h#m[1]` -> `h#m`) down
-    /// to the DEEPEST prefix registered as an associative array.
-    ///
-    /// §7.4.5: that is the declaration root for a multidimensional
-    /// associative array, and an element (`v[0]` of `int
-    /// v[2][string][string]`) under a non-associative outer dimension.
-    pub(super) fn assoc_registered_prefix<'a>(&self, name: &'a str) -> Option<&'a str> {
-        let mut b = name;
-        loop {
-            match b.rfind('[') {
-                Some(p) if b[p + 1..].ends_with(']') => {
-                    b = &b[..p];
-                    if self.module.associative_arrays.contains_key(b) {
-                        return Some(b);
-                    }
-                }
-                _ => return None,
-            }
-        }
-    }
-
     /// Nested associative-array receiver: `name` is `base[K1]...[Kn]` (n >= 1),
     /// `base` is a registered associative array, and the selected element is
     /// ITSELF an associative array (a multidimensional assoc, IEEE 1800 §7.8.1)
@@ -379,12 +411,283 @@ impl Simulator {
     /// a CYCLIC object graph depends on. An empty nested sub-array can't be
     /// proven from a stored key, but `first`/`num`/`size` on an empty array
     /// return 0 anyway.
+    ///
+    /// §7.4.4: a declared collection answers from its declaration — the
+    /// queue row `m[0]` of `int m[int][$]` is no associative array however
+    /// many `m[0][i]` cells it holds (a pop leaves its vacated cell, #765).
+    /// The stored-key proof remains for undeclared stores.
     pub(super) fn is_nested_assoc_elem(&self, name: &str) -> bool {
-        if self.assoc_registered_prefix(name).is_none() {
-            return false;
+        matches!(self.declared_dim(name), Some(Dim::Assoc(_)))
+    }
+
+    /// §7.4.4: the kind of the collection stored as `name` — its declared
+    /// dimension at the depth `name` selects to (`m[k]` of `int m[int][$]`
+    /// is the queue `dims[1]`). `None` for an undeclared store, or a select
+    /// past the unpacked dimensions (a bit select, §11.5.1).
+    pub(super) fn declared_dim(&self, name: &str) -> Option<&Dim> {
+        let (shape, depth) = self.coll_shape_at(name)?;
+        let dim = shape.dims.get(depth)?;
+        // §7.8.6 Table 7-1: a row past the size of a queue or dynamic array
+        // above it does not exist, so has no kind (`v[1]` of a one-row
+        // `int v[][string]` reads as an empty array).
+        // Nor does one outside a fixed parent's bounds (§7.4.6).
+        let mut row = name;
+        for parent_dim in shape.dims[..depth].iter().rev() {
+            let p = row.rfind('[')?;
+            let idx = &row[p + 1..row.len() - 1];
+            match parent_dim {
+                Dim::Queue | Dim::Dyn => {
+                    if idx.parse::<u64>().ok()? >= self.get_queue_size(&row[..p]) {
+                        return None;
+                    }
+                }
+                Dim::Fixed(Some(bounds)) if !Self::within(idx, *bounds) => return None,
+                _ => {}
+            }
+            row = &row[..p];
         }
-        let nested_prefix = format!("{name}[");
-        self.signal_name_prefix_present(&nested_prefix)
+        Some(dim)
+    }
+
+    /// The declared [`CollShape`] of the collection `name` belongs to, and
+    /// how many selects `name` applies below its root: a root `m`, a row
+    /// `m[k1]..[kn]`, an object's `<h>#m[..]`, a class static `C::m` /
+    /// `C#spec::m`, a package `p::m`, or a local `@m#n`. Borrowed lookups
+    /// only, one per level.
+    pub(super) fn coll_shape_at(&self, name: &str) -> Option<(&CollShape, usize)> {
+        // The common store is `root[k1]..[kn]` with a bracket-free root: one
+        // lookup of the root, not one per prefix (element writes to
+        // `int d[][]` ask on every write).
+        if let Some(p) = name.find('[')
+            && let Some(depth) = Self::select_count(&name[p..])
+            && let Some(shape) = self.root_coll_shape(&name[..p])
+        {
+            return Some((shape, depth));
+        }
+        let mut root = name;
+        let mut depth = 0;
+        loop {
+            if let Some(shape) = self.root_coll_shape(root) {
+                return Some((shape, depth));
+            }
+            if !root.ends_with(']') {
+                return None;
+            }
+            root = &root[..root.rfind('[')?];
+            depth += 1;
+        }
+    }
+
+    /// The number of `[..]` selects `rest` consists of, or `None` when
+    /// anything else follows one (`[1].a[2]`, a member of an element).
+    fn select_count(rest: &str) -> Option<usize> {
+        let (mut open, mut n) = (0usize, 0);
+        for b in rest.bytes() {
+            match b {
+                b'[' => {
+                    n += usize::from(open == 0);
+                    open += 1;
+                }
+                b']' => open = open.checked_sub(1)?,
+                _ if open == 0 => return None,
+                _ => {}
+            }
+        }
+        (open == 0).then_some(n)
+    }
+
+    /// The declared shape stored under the unselected name `root`.
+    fn root_coll_shape(&self, root: &str) -> Option<&CollShape> {
+        if let Some(shape) = self.module.coll_shapes.get(root) {
+            return Some(shape);
+        }
+        if root.starts_with('@') {
+            return self.local_coll_shapes.get(root);
+        }
+        // Most stores are plain names: one byte scan each rules out the
+        // static/package and object-property forms below.
+        let bytes = root.as_bytes();
+        // A class static (`C::m`, `C#spec::m`) or a package item (`p::m`,
+        // recorded under its bare name).
+        if bytes.contains(&b':')
+            && let Some((owner, member)) = root.rsplit_once("::")
+        {
+            let class = owner.split('#').next().unwrap_or(owner);
+            return self
+                .class_prop_shape(class, member)
+                .or_else(|| self.module.coll_shapes.get(member));
+        }
+        // An object's property `<h>#m`.
+        if !bytes.contains(&b'#') {
+            return None;
+        }
+        let (h, member) = root.split_once('#')?;
+        if !self.class_member_names().shaped_props.contains(member) {
+            return None;
+        }
+        let handle = h.parse::<usize>().ok()?;
+        let class = self.heap.get(handle)?.as_ref()?.class_name.as_str();
+        self.class_prop_shape(class, member)
+    }
+
+    /// Make the declared row `name` (`m[k1]..[kn]`) exist for a write — an
+    /// assignment to it or a mutating method on it — creating each absent
+    /// level of its path as its declared kind. The parent's kind decides
+    /// whether an absent row may be created: an associative array allocates
+    /// the entry (§7.8.7), a queue grows only at `$+1` (§7.10.1), and a
+    /// dynamic or fixed array must already hold the index — writing past it
+    /// is ignored (§7.4.6, §7.5.1). The keys come from `name`, so no index
+    /// is evaluated again (§11.4.1). Returns false when the write must be
+    /// ignored; true for an undeclared store, which the legacy paths own.
+    pub(super) fn ensure_row(&mut self, name: &str) -> bool {
+        let Some((shape, depth)) = self.coll_shape_at(name) else {
+            return true;
+        };
+        if depth == 0 || depth > shape.dims.len() {
+            return true;
+        }
+        // Every write to an element of `int d[][]` passes here: a row path
+        // that already exists is checked without allocating.
+        if let Some(ready) = self.row_write_ready(shape, depth, name) {
+            return ready;
+        }
+        let dims = shape.dims.clone();
+        // The path's prefixes, outermost first: `m`, `m[k1]`, ..., `name`.
+        let mut ends = Vec::with_capacity(depth + 1);
+        let mut end = name.len();
+        ends.push(end);
+        for _ in 0..depth {
+            end = match name[..end].rfind('[') {
+                Some(p) => p,
+                None => return true,
+            };
+            ends.push(end);
+        }
+        ends.reverse();
+        let root = &name[..ends[0]];
+        let w = self
+            .module
+            .assoc_elem_widths
+            .get(root)
+            .or_else(|| self.module.arrays.get(root).map(|t| &t.2))
+            .copied()
+            .unwrap_or(32);
+        for level in 1..=depth {
+            let (parent, row) = (&name[..ends[level - 1]], &name[..ends[level]]);
+            let idx = &row[parent.len() + 1..row.len() - 1];
+            let registered = self.module.dynamic_arrays.contains(row)
+                || self.module.associative_arrays.contains_key(row);
+            // A queue or dynamic parent holds the rows below its size, however
+            // many it has registered (elaboration registers placeholders).
+            let mut fresh = false;
+            match &dims[level - 1] {
+                Dim::Queue | Dim::Dyn => {
+                    let size = self.get_queue_size(parent);
+                    match idx.parse::<u64>() {
+                        Ok(i) if i < size => {}
+                        Ok(i) if i == size && dims[level - 1] == Dim::Queue => {
+                            self.set_queue_size(parent, size + 1);
+                            fresh = true;
+                        }
+                        _ => return false,
+                    }
+                }
+                Dim::Fixed(Some(bounds)) if !Self::within(idx, *bounds) => return false,
+                Dim::Assoc(_) | Dim::Fixed(_) => {}
+            }
+            if registered && !fresh {
+                continue;
+            }
+            // A new row starts empty, whatever an earlier row at this index
+            // left behind (`q.delete(); q[0][7] = 2` holds only key 7).
+            if fresh {
+                for key in self.signals.keys_with_elem_prefix(&format!("{row}[")) {
+                    self.signals.remove(&key);
+                    self.widths.remove(&key);
+                }
+            }
+            match dims.get(level) {
+                Some(Dim::Queue | Dim::Dyn) => {
+                    self.module.dynamic_arrays.insert(row.to_string());
+                    self.module
+                        .arrays
+                        .entry(row.to_string())
+                        .or_insert((0, 63, w));
+                    // An unregistered row that already has a size (a copied
+                    // object's) keeps it.
+                    if fresh
+                        || !self
+                            .signals
+                            .contains_key(&Self::name_with_suffix(row, ".size"))
+                    {
+                        self.set_queue_size(row, 0);
+                    }
+                }
+                Some(Dim::Assoc(k)) => {
+                    let is_str = *k == KeyKind::String;
+                    self.module
+                        .associative_arrays
+                        .insert(row.to_string(), is_str);
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// `ensure_row`'s check of a row path that needs nothing created:
+    /// `Some(true)` when every level exists and each index is in range,
+    /// `Some(false)` when the write must be ignored, `None` when a level is
+    /// still to be created (or a queue to grow at `$+1`).
+    pub(super) fn row_write_ready(
+        &self,
+        shape: &CollShape,
+        depth: usize,
+        name: &str,
+    ) -> Option<bool> {
+        let mut row = name;
+        for level in (1..=depth).rev() {
+            let p = row.rfind('[')?;
+            let (parent, idx) = (&row[..p], &row[p + 1..row.len() - 1]);
+            match &shape.dims[level - 1] {
+                parent_dim @ (Dim::Queue | Dim::Dyn) => match idx.parse::<u64>() {
+                    Ok(i) if i < self.get_queue_size(parent) => {}
+                    Ok(_) if *parent_dim == Dim::Queue => return None,
+                    _ => return Some(false),
+                },
+                Dim::Fixed(Some(bounds)) if !Self::within(idx, *bounds) => return Some(false),
+                Dim::Assoc(_) | Dim::Fixed(_) => {}
+            }
+            if matches!(
+                shape.dims.get(level),
+                Some(Dim::Queue | Dim::Dyn | Dim::Assoc(_))
+            ) && !self.module.dynamic_arrays.contains(row)
+                && !self.module.associative_arrays.contains_key(row)
+            {
+                return None;
+            }
+            row = parent;
+        }
+        Some(true)
+    }
+
+    /// Whether the stored index `idx` lies within a fixed dimension's
+    /// inclusive bounds.
+    fn within(idx: &str, (lo, hi): (i64, i64)) -> bool {
+        idx.parse::<i64>().is_ok_and(|i| (lo..=hi).contains(&i))
+    }
+
+    /// The shape of property `member` as declared by `class` or the nearest
+    /// class it extends.
+    fn class_prop_shape(&self, class: &str, member: &str) -> Option<&CollShape> {
+        let mut cd = self.module.classes.get(class)?;
+        for _ in 0..64 {
+            if let Some(shape) = cd.prop_coll_shapes.get(member) {
+                return Some(shape);
+            }
+            cd = self.module.classes.get(cd.extends.as_deref()?)?;
+        }
+        None
     }
 
     /// True if any stored signal name starts with `prefix`. Mirrors the prefix
@@ -464,6 +767,14 @@ impl Simulator {
             None
         };
         let nm = &tref.name.name;
+        // §8.23/§8.25 (#842): a specialized enclosing scope keeps the
+        // full TypeName chain, even when pkg_scope qualified a colliding
+        // nested declaration. Its leaf alone can name another class.
+        if !tref.scopes.is_empty()
+            && let Some(c) = base_class(&tref.qualified())
+        {
+            return Some(c);
+        }
         if let Some(c) = base_class(nm) {
             return Some(c);
         }
@@ -550,6 +861,28 @@ impl Simulator {
             None
         };
         let nm = &tref.name.name;
+        // The nested class carries its enclosing parameters first. Keep
+        // the explicit enclosing specialization when resolving its handle;
+        // otherwise `Outer#(byte)::Inner` silently uses Outer's defaults.
+        if !tref.scopes.is_empty()
+            && let Some(c) = base_class(&tref.qualified())
+        {
+            let mut args: Vec<Expression> = tref
+                .scopes
+                .iter()
+                .flat_map(|s| s.type_args.iter().cloned())
+                .collect();
+            if args.is_empty()
+                && let Some(DataType::TypeReference { type_args, .. }) = self
+                    .module
+                    .typedef_types
+                    .get(&tref.qualified())
+                    .or_else(|| self.module.typedef_types.get(nm))
+            {
+                args.clone_from(type_args);
+            }
+            return Some((c, (!args.is_empty()).then_some(args)));
+        }
         // Direct class match (possibly parameterized) — extract type_args.
         if let Some(c) = base_class(nm) {
             let ta = match self
@@ -593,6 +926,79 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// §8.23/§8.25 (#842): nested declarations receive the enclosing
+    /// parameters first, followed by the nested class's own arguments.
+    /// Keep both lists for declaration initialization and later `new()`.
+    pub(super) fn scoped_class_type_args(
+        &self,
+        data_type: &crate::ast::types::DataType,
+    ) -> Option<Vec<Expression>> {
+        let crate::ast::types::DataType::TypeReference {
+            name, type_args, ..
+        } = data_type
+        else {
+            return None;
+        };
+        if !name.scopes.iter().any(|s| !s.type_args.is_empty()) {
+            return None;
+        }
+        let own_params = |class: &crate::compiler::elaborate::ElaboratedClass| {
+            let inherited = class
+                .enclosing
+                .as_ref()
+                .and_then(|n| self.module.classes.get(n))
+                .map_or(&[][..], |c| c.param_order.as_slice());
+            class
+                .param_order
+                .starts_with(inherited)
+                .then_some(inherited.len())
+        };
+        let mut out = Vec::new();
+        let mut append = |class: &crate::compiler::elaborate::ElaboratedClass,
+                          args: &[Expression]|
+         -> Option<()> {
+            let first = own_params(class)?;
+            let params = &class.param_order[first..];
+            for (i, arg) in args.iter().enumerate() {
+                match &arg.kind {
+                    ExprKind::Empty => {}
+                    ExprKind::NamedArg { .. } => out.push(arg.clone()),
+                    _ => {
+                        let param = params.get(i)?;
+                        out.push(Expression::new(
+                            ExprKind::NamedArg {
+                                name: crate::ast::Identifier {
+                                    name: param.clone(),
+                                    span: arg.span,
+                                },
+                                expr: Some(Box::new(arg.clone())),
+                            },
+                            arg.span,
+                        ));
+                    }
+                }
+            }
+            Some(())
+        };
+        let mut scope = String::new();
+        for link in &name.scopes {
+            if !scope.is_empty() {
+                scope.push_str("::");
+            }
+            scope.push_str(&link.name.name);
+            if !link.type_args.is_empty() {
+                append(self.module.classes.get(&scope)?, &link.type_args)?;
+            }
+        }
+        if !type_args.is_empty() {
+            append(self.module.classes.get(&name.qualified())?, type_args)?;
+        }
+        // Named bindings leave omitted outer parameters at their defaults;
+        // concatenating positional lists would shift inner arguments into
+        // those omitted slots.
+        Some(out)
     }
 
     /// §6.18 compile-time assignment type-check: assigning a non-class value
@@ -895,7 +1301,9 @@ impl Simulator {
                 name.name,
                 self.expr_to_spec_fragment(x)?
             )),
-            ExprKind::AssignmentPattern(_) => self.class_array_arg_fragment(e),
+            ExprKind::AssignmentPattern(_) | ExprKind::TypedPattern { .. } => {
+                self.class_array_arg_fragment(e)
+            }
             ExprKind::Number(NumberLiteral::Integer { value, .. }) => Some(value.clone()),
             ExprKind::Number(NumberLiteral::Real(r)) => Some(format!("{}", r)),
             ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) => Some(c.to_string()),
@@ -922,6 +1330,25 @@ impl Simulator {
                 } else {
                     None
                 }
+            }
+            // §8.25: a value argument matches by value. A constant expression
+            // of literals and package parameters (`pkg::N + pkg::K`) is
+            // keyed by the number it folds to, like the literal itself.
+            ExprKind::Binary { .. }
+            | ExprKind::Unary { .. }
+            | ExprKind::Paren(_)
+            | ExprKind::Conditional { .. }
+            | ExprKind::MemberAccess { .. } => self.fold_package_const_expr(e),
+            ExprKind::Ident(hier)
+                if hier.path.len() == 2
+                    && self
+                        .package_param_key(&format!(
+                            "{}::{}",
+                            hier.path[0].name.name, hier.path[1].name.name
+                        ))
+                        .is_some_and(|k| self.module.parameters.contains_key(k)) =>
+            {
+                self.fold_package_const_expr(e)
             }
             ExprKind::Ident(hier) => {
                 let nm = &hier.path.last()?.name.name;
@@ -1322,6 +1749,28 @@ impl Simulator {
                         }
                     }
                     let frag = self.expr_to_spec_fragment(e)?;
+                    // §8.25: a bare SELF-REFERENCE — the argument names the
+                    // class whose specialization context we are resolving in
+                    // (`uvm_object_registry#(C,"C") type_id`, written by
+                    // `uvm_object_utils(C)`) — denotes the CURRENT
+                    // specialization `C#(sig)`, not the default. Without
+                    // this, a static method entered through a specialization
+                    // (`C#(T2)::get_type()`, or `v.get_type()` on a null `v`
+                    // declared `C#(T2)`) keyed the registry on the default
+                    // `C`, so the factory created default-specialized objects
+                    // and the `$cast` in `uvm_create_on` correctly rejected
+                    // them.
+                    //
+                    // Only inside that class's own declaration (or a derived
+                    // one): elsewhere the bare name IS the default
+                    // specialization — a non-parameterized class whose typedef
+                    // names `C` must not read `C#(sig)` just because its method
+                    // happens to run under an active `C#(sig)` context.
+                    if let Some((b, s)) = &self.current_spec {
+                        if frag == *b && self.inside_class_decl_of(b) {
+                            return Some(format!("{}#({})", b, s));
+                        }
+                    }
                     // Resolve bare type-param names (e.g. `T`, `this_type`)
                     // through the active specialization so the typedef's
                     // specialization carries concrete values.
@@ -1372,11 +1821,16 @@ impl Simulator {
             // the array its compound key starts at (see
             // `multidim_assoc_elem`), so `v[0]["A"].exists("B")` looks up the
             // key the write stored.
-            None if name.ends_with(']') && !name.contains('#') => {
-                if let Some(base) = self.assoc_registered_prefix(name)
-                    && let Some(&is_str) = self.module.associative_arrays.get(base)
-                {
-                    return is_str;
+            None if name.ends_with(']') => {
+                // §7.8.1: a declared level has its own key type, not its
+                // ancestor's (`x["a"]` of `int x[string][int][$]` is keyed
+                // by `int`). A named key type falls through.
+                match self.declared_dim(name) {
+                    Some(Dim::Assoc(KeyKind::String)) => return true,
+                    Some(Dim::Assoc(KeyKind::Integral { .. } | KeyKind::Wildcard)) => {
+                        return false;
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -1552,18 +2006,60 @@ impl Simulator {
         k: usize,
         name: &str,
     ) -> Option<String> {
+        Self::carried_type_binding_rec(bindings, chain, k, name, &[])
+    }
+
+    /// Defaults may name several earlier parameters. Track their declaration
+    /// path to reject a cycle without cutting off a valid long alias chain.
+    fn carried_type_binding_rec(
+        bindings: &HashMap<String, String>,
+        chain: &[&super::elaborate::ElaboratedClass],
+        k: usize,
+        name: &str,
+        path: &[(usize, String)],
+    ) -> Option<String> {
+        if path
+            .iter()
+            .any(|(level, param)| *level == k && param == name)
+        {
+            return None;
+        }
         if k == 0 {
             return bindings.get(name).cloned();
         }
+        let mut path = path.to_vec();
+        path.push((k, name.to_string()));
         let child = chain[k - 1];
-        let i = chain[k].param_order.iter().position(|p| p == name)?;
-        let a = child.extends_type_args.get(i)?.trim();
-        if Self::spec_projection(a).is_some() {
-            return Self::carry_extends_arg(a, &|p| {
-                Self::carried_type_binding(bindings, chain, k - 1, p)
+        let parent = chain[k];
+        let i = parent.param_order.iter().position(|p| p == name)?;
+        // An argument the child's `extends` omits is absent or empty in
+        // `extends_type_args` and takes the parameter's default (§8.25).
+        let written = child
+            .extends_type_args
+            .get(i)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let a = match written {
+            Some(w) => w,
+            None => {
+                let def = parent
+                    .type_param_defaults
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, d)| d.clone())?;
+                if parent.type_param_names.iter().any(|p| p == &def) {
+                    return Self::carried_type_binding_rec(bindings, chain, k, &def, &path);
+                }
+                // A default is written in the parent's scope, not the child's.
+                return Some(def);
+            }
+        };
+        if Self::spec_projection(&a).is_some() {
+            return Self::carry_extends_arg(&a, &|p| {
+                Self::carried_type_binding_rec(bindings, chain, k - 1, p, &path)
             });
         }
-        Some(Self::carried_type_binding(bindings, chain, k - 1, a).unwrap_or_else(|| a.to_string()))
+        Some(Self::carried_type_binding_rec(bindings, chain, k - 1, &a, &path).unwrap_or(a))
     }
 
     /// The per-instance part of `is_string_keyed_array` for `member` of an
@@ -1759,7 +2255,7 @@ impl Simulator {
 
     pub(super) fn assoc_key_str(&self, name: &str, idx_val: &Value) -> String {
         if self.is_string_keyed_array(name) {
-            idx_val.to_sv_string()
+            encode_name_key(&idx_val.to_sv_string()).into_owned()
         } else if idx_val.width > 64 {
             // A wide key that isn't flagged string-keyed: `to_u64()` would
             // truncate to the low 64 bits (the last ~8 chars) and collide.
@@ -1776,14 +2272,22 @@ impl Simulator {
                     return idx_val.resize(kw).to_hex();
                 }
             }
-            idx_val.to_sv_string()
+            encode_name_key(&idx_val.to_sv_string()).into_owned()
         } else {
+            let iw = self.assoc_index_width_for(name);
+            // A wide key type keys by hex digits whatever the index width:
+            // `w[5]` and `w[100'h5]` name one element (§7.8.4).
+            if let Some((kw, _)) = iw
+                && kw > 64
+            {
+                return idx_val.resize(kw).to_hex();
+            }
             // §7.8.2: the index is narrowed to the declared key type before
             // keying. `int k; shortint aa[shortint]; aa[k]` with a 32-bit k
             // must store the 16-bit-truncated value so a later read with the
             // correctly-narrowed key matches. Without this the packed key text
             // diverged from the unpacked one and AA round-trips corrupted.
-            let (mut v, is_signed) = if let Some((kw, ks)) = self.assoc_index_width_for(name) {
+            let (mut v, is_signed) = if let Some((kw, ks)) = iw {
                 let narrowed = idx_val.resize(kw);
                 (narrowed, ks)
             } else {
@@ -1808,8 +2312,8 @@ impl Simulator {
     /// `num()`/`first()` over the wrong set. The top-level assoc key is the
     /// text between `arr[` and the FIRST `]`, uniform across plain assoc
     /// (`arr[KEY]`), assoc-of-queue (`arr[KEY][i]`), and multidim assoc
-    /// (`arr[k1][k2]`). Returned sorted (numeric keys ascending by value,
-    /// else lexicographic) to match the LRM's first/next/last/prev order and
+    /// (`arr[k1][k2]`). Returned sorted (integral keys numerically, string
+    /// keys lexicographically) to match the LRM's first/next/last/prev order and
     /// `num()`'s count of distinct keys.
     /// `signal_name_to_id` keys under `prefix`, memoized.
     ///
@@ -1835,43 +2339,50 @@ impl Simulator {
     }
 
     pub(super) fn assoc_top_level_keys(&self, obj_name: &str) -> Vec<String> {
+        self.assoc_top_level_keys_shared(obj_name).as_ref().clone()
+    }
+
+    /// `assoc_top_level_keys`, shared and cached: `first`/`next`/`num` in a
+    /// loop over an unchanged array no longer rescan and re-sort every key.
+    pub(super) fn assoc_top_level_keys_shared(&self, obj_name: &str) -> Arc<Vec<String>> {
         let prefix = format!("{}[", obj_name);
-        // A STRUCT element stores member-wise leaves (`sa[k].id`), which do
-        // not end in `]` — accept any entry whose key bracket closes, else
-        // struct-element assoc arrays enumerate as empty (num()/foreach).
-        //
-        // The stored entry is `name + rest` where `rest = KEY`, or
-        // `KEY[K2]...[Kn]` for a MULTIDIM assoc (`arr[k1][k2]`) or an
-        // assoc-of-queue (`arr[key][i]`). Decide which by inspection: a
-        // multi-index entry has an inner `[` immediately after its FIRST
-        // `]` (`k1][k2]`), so the level-0 key = up to that `]`. Otherwise
-        // the array is 1-D and KEY is the WHOLE text, which may itself
-        // contain `]`/`[` (UVM component names like
-        // `special-:{ chars{}[0123456789] _` are legal assoc string keys,
-        // §7.11) — take up to the LAST `]` so such brackets are not mistaken
-        // for an index end.
+        let stamp = self.signals.elem_gen_for_prefix(&prefix);
+        if let Some((s, keys)) = self.assoc_keys_cache.borrow().get(obj_name) {
+            if *s == stamp {
+                return Arc::clone(keys);
+            }
+        }
+        let numeric = !self.is_string_keyed_array(obj_name);
+        let keys = Arc::new(self.assoc_top_level_keys_uncached(&prefix, numeric));
+        let mut cache = self.assoc_keys_cache.borrow_mut();
+        // Per-call and per-object array names come and go; bound the cache
+        // rather than track every name's lifetime.
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(obj_name.to_string(), (stamp, Arc::clone(&keys)));
+        keys
+    }
+
+    fn assoc_top_level_keys_uncached(&self, prefix: &str, numeric: bool) -> Vec<String> {
         // The `signal_name_to_id` half of this enumeration is fixed for the
         // run (see `assoc_static_keys_cache`), so scan it once per prefix
         // instead of on every call.
         let static_keys = self.assoc_static_keys(&prefix);
-        let mut struct_elem: Option<bool> = None;
         let mut keys: Vec<String> = self
             .signals
             .elem_keys_with_prefix(&prefix)
             .chain(static_keys.iter().map(|k| &**k))
             .filter_map(|k| {
                 let rest = &k[prefix.len()..];
-                let se = Self::key_has_member_suffix(rest)
-                    && *struct_elem
-                        .get_or_insert_with(|| self.queue_elem_struct(obj_name).is_some());
-                Self::assoc_elem_key_seg(rest, se).map(|s| s.to_string())
+                Self::assoc_first_key_seg(rest).map(|s| s.to_string())
             })
             .collect();
-        keys.sort();
+        Self::sort_name_keys(&mut keys);
         keys.dedup();
-        // i128 covers both signed keys and full-range u64 keys; with i64 a
-        // single 2^63+ key demoted the whole sort to lexicographic.
-        if !keys.is_empty() && keys.iter().all(|k| k.parse::<i128>().is_ok()) {
+        // §7.8.2: string keys stay lexicographic even when they look numeric.
+        // i128 covers both signed keys and full-range u64 keys.
+        if numeric && !keys.is_empty() && keys.iter().all(|k| k.parse::<i128>().is_ok()) {
             keys.sort_by_key(|k| k.parse::<i128>().unwrap_or(0));
         }
         keys
@@ -2891,6 +3402,121 @@ impl Simulator {
             })
     }
 
+    /// §12.7.3: a multi-variable `foreach` over the declared collection of
+    /// collections `name` (`foreach (d[i, k, j])` on `int d[][string][$]`)
+    /// walks each level as its declaration names it: a queue or dynamic
+    /// level by index below its size, an associative level by its keys in
+    /// §7.8.4 order, each loop variable taking that level's index type.
+    /// Returns false — leaving the loop to the other paths — for a store with
+    /// no such shape, one with fixed levels (iterated by their bounds), or a
+    /// level keyed by a named type (an enum or class key).
+    pub(super) fn foreach_shaped(
+        &mut self,
+        name: &str,
+        vars: &[Option<crate::ast::Identifier>],
+        body: &Statement,
+        iterations: &mut u64,
+    ) -> bool {
+        let Some((shape, 0)) = self.coll_shape_at(name) else {
+            return false;
+        };
+        let walkable = |d: &Dim| {
+            matches!(
+                d,
+                Dim::Queue
+                    | Dim::Dyn
+                    | Dim::Assoc(KeyKind::String | KeyKind::Integral { .. } | KeyKind::Wildcard)
+            )
+        };
+        if vars.len() > shape.dims.len() || !shape.dims.iter().all(walkable) {
+            return false;
+        }
+        let dims = shape.dims.clone();
+        self.foreach_shaped_level(name, &dims, vars, 0, body, iterations);
+        true
+    }
+
+    /// One level of [`foreach_shaped`]. Returns false once the loop is broken.
+    fn foreach_shaped_level(
+        &mut self,
+        prefix: &str,
+        dims: &[Dim],
+        vars: &[Option<crate::ast::Identifier>],
+        level: usize,
+        body: &Statement,
+        iterations: &mut u64,
+    ) -> bool {
+        // The keys of this level, and the loop variable's type: `None` for a
+        // string key, else (width, signed).
+        let (keys, ty): (Vec<String>, Option<(u32, bool)>) = match &dims[level] {
+            Dim::Assoc(KeyKind::String) => (self.assoc_top_level_keys(prefix), None),
+            Dim::Assoc(k) => {
+                let ty = match k {
+                    KeyKind::Integral { width, signed } => (*width, *signed),
+                    _ => (32, false),
+                };
+                let mut keys = self.assoc_top_level_keys(prefix);
+                keys.sort_by_key(|k| k.parse::<i128>().unwrap_or(0));
+                (keys, Some(ty))
+            }
+            // §7.8.6: a row past its parent's size does not exist.
+            _ => {
+                let n = match self.declared_dim(prefix) {
+                    Some(_) => self.get_queue_size(prefix),
+                    None => 0,
+                };
+                ((0..n).map(|i| i.to_string()).collect(), Some((32, true)))
+            }
+        };
+        // A string key variable renders as a string (§7.8.1).
+        let str_var = vars[level]
+            .as_ref()
+            .filter(|_| ty.is_none())
+            .map(|v| v.name.clone())
+            .filter(|n| self.string_signals.insert(n.clone()));
+        let mut live = true;
+        for key in keys {
+            if self.finished {
+                live = false;
+                break;
+            }
+            if let Some(v) = vars[level].as_ref() {
+                let kv = match ty {
+                    None => {
+                        self.widths.remove(&v.name);
+                        Self::name_key_value(&key)
+                    }
+                    Some((w, signed)) => {
+                        self.widths.insert(v.name.clone(), w);
+                        let mut kv = Value::from_u64(key.parse::<i128>().unwrap_or(0) as u64, w);
+                        kv.is_signed = signed;
+                        kv
+                    }
+                };
+                self.set_loop_var(&v.name, kv);
+            }
+            if level + 1 < vars.len() {
+                let row = format!("{prefix}[{key}]");
+                if !self.foreach_shaped_level(&row, dims, vars, level + 1, body, iterations) {
+                    live = false;
+                    break;
+                }
+            } else {
+                self.continue_flag = false;
+                *iterations = iterations.saturating_add(1);
+                self.exec_statement(body);
+                if self.break_flag {
+                    live = false;
+                    break;
+                }
+            }
+        }
+        if let Some(n) = str_var {
+            self.string_signals.remove(&n);
+        }
+        live
+    }
+
     /// One level of a multi-variable `foreach` over nested associative
     /// arrays: bind `vars[level]` to each key of `prefix` and descend, or run
     /// the body at the last variable (§12.7.3). The outer level takes the
@@ -2906,17 +3532,13 @@ impl Simulator {
         iterations: &mut u64,
     ) -> bool {
         let keys = self.assoc_top_level_keys(prefix);
-        // An inner level's declared key type, when known: a string key
-        // stored by value is turned back into its text (§7.8.1).
-        let declared_str = (level > 0)
-            .then(|| {
-                let lv = self.module.assoc_inner_string_keys.get(root).or_else(|| {
-                    let leaf = root.rsplit("::").next()?;
-                    self.module.assoc_inner_string_keys.get(leaf)
-                })?;
-                lv.get(level - 1).copied()
-            })
-            .flatten();
+        // An inner level's declared key type: a string key stored by value
+        // is turned back into its text (§7.8.1).
+        let declared_str = match self.declared_dim(prefix).filter(|_| level > 0) {
+            Some(Dim::Assoc(KeyKind::String)) => Some(true),
+            Some(Dim::Assoc(KeyKind::Integral { .. } | KeyKind::Wildcard)) => Some(false),
+            _ => None,
+        };
         let (is_str, kw, ksign) = if level == 0 {
             let is_str = self
                 .module
@@ -2927,7 +3549,14 @@ impl Simulator {
                 || self.is_string_keyed_array(prefix);
             let (kw, ks) = self.assoc_index_width_for(prefix).unwrap_or((32, true));
             (is_str, kw, ks)
+        } else if let Some(&row_str) = self.module.associative_arrays.get(prefix) {
+            // A row registered as an associative array of its own (see
+            // `ensure_assoc_row`) keys its elements by its declared key type.
+            let (kw, ks) = self.assoc_index_width_for(prefix).unwrap_or((32, true));
+            (row_str || declared_str.unwrap_or(false), kw, ks)
         } else {
+            // No declared shape, or a named key type (enum, class, a type
+            // parameter bound per specialization): the stored keys tell.
             (
                 declared_str.unwrap_or_else(|| keys.iter().any(|k| k.parse::<i128>().is_err())),
                 32,
@@ -2973,6 +3602,7 @@ impl Simulator {
                 // (an int key 2 is the character 0x02), else by value (a
                 // string key "ab" is the number 0x6162).
                 let as_text = level > 0
+                    && !self.module.associative_arrays.contains_key(prefix)
                     && (self.is_string_keyed_array(prefix)
                         || self.is_string_keyed_array(root)
                         || (!is_str && key.parse::<i128>().is_err()));
@@ -2983,10 +3613,10 @@ impl Simulator {
                             let first = b.iter().position(|&c| c != 0).unwrap_or(b.len());
                             Value::from_string(&String::from_utf8_lossy(&b[first..]))
                         }
-                        _ => Value::from_string(&key),
+                        _ => Self::name_key_value(&key),
                     }
                 } else if as_text {
-                    let mut v = Value::from_string(&key).resize(kw);
+                    let mut v = Self::name_key_value(&key).resize(kw);
                     v.is_signed = ksign;
                     v
                 } else if kw > 64 {
@@ -3144,51 +3774,35 @@ impl Simulator {
     /// Compute the iteration keys for a named array/collection
     /// (`<name>.size` dense fallback, else raw key-scan of `<name>[…]`).
     /// Returns `(keys, is_str)`. Integer keys are sorted numerically.
-    /// Top-level assoc key for a stored entry whose text after the array
-    /// name is `rest`. A MULTIDIM or collection-valued assoc stores
-    /// `arr[k1][k2]...` (an inner `[` right after the FIRST `]`), so the
-    /// level-0 key runs to that `]`. Otherwise the array is 1-D and the key
-    /// is the WHOLE text to the FINAL `]` — a 1-D string key may itself
-    /// contain `]`/`[` (a UVM component name like
-    /// `special-:{ chars{}[0123456789] _` is a legal assoc key, §7.11).
-    pub(super) fn assoc_first_key_seg(rest: &str) -> Option<&str> {
-        if rest
-            .find(']')
-            .map_or(false, |p| rest[p + 1..].starts_with('['))
-        {
-            rest.find(']').map(|e| &rest[..e])
+    /// Sort stored string keys by the strings they name (§7.8.4).
+    pub(super) fn sort_name_keys(keys: &mut [String]) {
+        if keys.iter().any(|k| k.contains('\\')) {
+            keys.sort_by(|a, b| decode_name_key(a).cmp(&decode_name_key(b)));
         } else {
-            rest.rfind(']').map(|e| &rest[..e])
+            keys.sort();
         }
     }
 
-    /// `assoc_first_key_seg` for an array whose ELEMENT is an unpacked
-    /// struct when `struct_elem`: such an element is stored as its member
-    /// leaves (`sa[KEY].m`, `sa[KEY].arr[1][0]`), so the key ends at the
-    /// first `].` — the last `]` would take the member's own index as part
-    /// of the key and enumerate one phantom key per array-member leaf.
-    /// Whether a stored entry's text after `name[` has a `].` — the shape of
-    /// a struct-element member leaf. A byte scan on `]` (memchr), not a
-    /// substring search: this runs once per stored entry of every
-    /// associative-array enumeration.
-    pub(super) fn key_has_member_suffix(rest: &str) -> bool {
-        let mut s = rest;
-        while let Some(p) = s.find(']') {
-            if s.as_bytes().get(p + 1) == Some(&b'.') {
-                return true;
-            }
-            s = &s[p + 1..];
+    /// Sort stored integral keys by value. A key type wider than 64 bits is
+    /// keyed by fixed-width hex digits (`assoc_key_str`), which already
+    /// order as their values do.
+    pub(super) fn sort_int_keys(keys: &mut [String], wide: bool) {
+        if wide {
+            keys.sort();
+        } else {
+            keys.sort_by_key(|k| k.parse::<i128>().unwrap_or(0));
         }
-        false
     }
 
-    pub(super) fn assoc_elem_key_seg(rest: &str, struct_elem: bool) -> Option<&str> {
-        if struct_elem {
-            if let Some(p) = rest.find("].") {
-                return Self::assoc_first_key_seg(&rest[..=p]);
-            }
-        }
-        Self::assoc_first_key_seg(rest)
+    /// A stored string key as the SV value it names.
+    pub(super) fn name_key_value(key: &str) -> Value {
+        Value::from_string(&decode_name_key(key))
+    }
+
+    /// Top-level key of a stored entry `rest` (`KEY]`, `KEY][K2]..`,
+    /// `KEY].m`); keys hold no raw `]` (`encode_name_key`).
+    pub(super) fn assoc_first_key_seg(rest: &str) -> Option<&str> {
+        rest.find(']').map(|e| &rest[..e])
     }
 
     pub(super) fn array_iter_keys(&self, name: &str) -> (Vec<String>, bool) {
@@ -3205,26 +3819,12 @@ impl Simulator {
             return ((0..sz).map(|i| i.to_string()).collect(), false);
         }
         let prefix = format!("{}[", name);
-        // For an associative array whose VALUES are themselves collections
-        // (e.g. `bq_t all[int]` where `bq_t = Base[$]`), an element at key 5
-        // is stored as `all[5][0]`, `all[5][1]`, etc. The key must be
-        // extracted up to the FIRST `]`, not `k.len()-1` (which would grab
-        // `5][0`). Dedup because multiple sub-elements share one key.
-        //
-        // But a 1-D STRING key may itself contain `]`/`[` (e.g. a UVM
-        // component name `special-:{ chars{}[0123456789] _`), stored
-        // verbatim as `arr[KEY]`. Distinguish by shape: a multi-index entry
-        // has an inner `[` right after its first `]` (`k1][k2]`), so extract
-        // up to that `]`; otherwise take the whole key up to the final `]`.
-        let mut struct_elem: Option<bool> = None;
         let mut ks: Vec<String> = self
             .signals
             .elem_keys_with_prefix(&prefix)
             .filter_map(|k| {
                 let rest = k.strip_prefix(prefix.as_str())?;
-                let se = Self::key_has_member_suffix(rest)
-                    && *struct_elem.get_or_insert_with(|| self.queue_elem_struct(name).is_some());
-                Self::assoc_elem_key_seg(rest, se).map(|s| s.to_string())
+                Self::assoc_first_key_seg(rest).map(|s| s.to_string())
             })
             .collect();
         ks.sort();
@@ -3237,10 +3837,13 @@ impl Simulator {
             .unwrap_or(false)
             || self.is_string_keyed_array(name);
         if is_str {
-            ks.sort();
+            Self::sort_name_keys(&mut ks);
         } else {
             // §7.9: numeric order incl. NEGATIVE int keys.
-            ks.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
+            let wide = self
+                .assoc_index_width_for(name)
+                .is_some_and(|(w, _)| w > 64);
+            Self::sort_int_keys(&mut ks, wide);
         }
         (ks, is_str)
     }
@@ -3370,17 +3973,48 @@ impl Simulator {
     /// The innermost rename-table entry for `bare` (see `dyn_name_lookup`).
     #[inline(always)]
     pub(super) fn dyn_entry(&self, bare: &str) -> Option<&(String, String)> {
-        for frame in self.local_dyn.iter().rev() {
+        for (depth, frame) in self.local_dyn.iter().rev().enumerate() {
             // Frames hold at most a handful of entries — a reverse linear
             // scan (later declaration shadows earlier) beats hashing `bare`
             // once per frame (this probe runs for every bare-name resolve).
             for e in frame.iter().rev() {
                 if e.0 == bare {
+                    if depth > 0 && self.frame_scalar_shadows(bare) {
+                        return None;
+                    }
                     return Some(e);
                 }
             }
         }
         None
+    }
+
+    /// §23.9: a scalar formal or local of the running subroutine hides a
+    /// same-named collection of a caller or of `this`, so a `string str`
+    /// formal reads its own string, not a caller's `str[$]`.
+    #[inline(never)]
+    pub(super) fn frame_scalar_shadows(&self, bare: &str) -> bool {
+        self.local_stack
+            .last()
+            .is_some_and(|f| f.contains_key(bare))
+    }
+
+    /// §23.9 / §8.10: a MODULE-level collection named `bare` is out of scope
+    /// in a subroutine whose own frame, or whose `this`, declares a scalar of
+    /// that name — a `string str` formal or property hides a module-level
+    /// `string str[$]`. Callers test the module registration first; this
+    /// only decides who owns the name.
+    pub(super) fn scalar_hides_module_coll(&self, bare: &str) -> bool {
+        self.frame_scalar_shadows(bare) || self.this_prop_hides(bare)
+    }
+
+    /// `scalar_hides_module_coll` for an indexed base: only a plain
+    /// one-segment name that resolved to itself can be a module collection a
+    /// scalar hides (a rewritten `<handle>#member` or scoped name cannot).
+    pub(super) fn bare_scalar_hides_coll(&self, base: &Expression, name: &str) -> bool {
+        matches!(&base.kind, ExprKind::Ident(h)
+            if h.path.len() == 1 && h.path[0].selects.is_empty() && h.path[0].name.name == name)
+            && self.scalar_hides_module_coll(name)
     }
 
     /// `dyn_name_lookup`'s hit on an identity entry `(name, name)`: in the
@@ -3444,6 +4078,9 @@ impl Simulator {
     /// after the current frame and the class members have both been
     /// consulted.
     pub(super) fn dyn_name_lookup_enclosing(&self, bare: &str) -> Option<&str> {
+        if self.frame_scalar_shadows(bare) {
+            return None;
+        }
         for frame in self.local_dyn.iter().rev().skip(1) {
             for (k, uq) in frame.iter().rev() {
                 if k == bare {
@@ -3452,6 +4089,65 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// §7.4.5: record the pending declared shape of the local just declared
+    /// under the storage name `name` it was given, unless `declare_local_dyn`
+    /// already did (a block local outside any subroutine keeps its bare name).
+    pub(super) fn adopt_local_shape(&mut self, name: &str) {
+        if let Some(shape) = self.pending_local_shape.take() {
+            self.register_local_shape(name, shape);
+        }
+    }
+
+    /// Record a local's declared shape under its storage name: a per-call
+    /// key (`@l#n`) replaces any earlier one; a bare name never overrides a
+    /// same-named module-scope collection's own shape.
+    fn register_local_shape(&mut self, name: &str, shape: CollShape) {
+        // A one-dimensional local (`int q[$]`) has no rows to type.
+        if shape.dims.len() < 2 {
+            return;
+        }
+        self.local_coll_rows_live |= Self::has_queue_rows(&shape);
+        self.has_coll_rows = true;
+        if name.starts_with('@') {
+            self.local_coll_shapes.insert(name.to_string(), shape);
+        } else {
+            self.module
+                .coll_shapes
+                .entry(name.to_string())
+                .or_insert(shape);
+        }
+    }
+
+    /// §7.4.5, §13.5.1: a collection-of-collections formal copied in under
+    /// the per-call key `key` types its rows by the port's declared
+    /// dimensions, as a local does. (A `ref` formal aliases the actual's
+    /// storage, which has its own shape.)
+    pub(super) fn register_formal_shape(
+        &mut self,
+        key: &str,
+        dims: &[crate::ast::types::UnpackedDimension],
+    ) {
+        if dims.len() < 2 {
+            return;
+        }
+        let dims = super::elaborate::normalize_unpacked_dims(
+            dims,
+            &self.module.parameters,
+            &self.module.typedef_types,
+        );
+        let shape = CollShape::of(&dims, None, |kdt| {
+            super::elaborate::coll_key_kind(
+                kdt,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+                Some(&self.module.typedef_types),
+            )
+        });
+        if let Some(shape) = shape {
+            self.register_local_shape(key, shape);
+        }
     }
 
     /// Mint a fresh process-unique storage key for a local dyn array `bare`
@@ -3469,10 +4165,13 @@ impl Simulator {
     pub(super) fn declare_local_dyn(&mut self, bare: &str) -> String {
         // Kill-switch for debugging the per-process local-dyn-array rename.
         static NO_DYN_RENAME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *NO_DYN_RENAME.get_or_init(|| std::env::var_os("XEZIM_NO_DYN_RENAME").is_some()) {
-            return bare.to_string();
-        }
-        if self.local_dyn.is_empty() {
+        let shape = self.pending_local_shape.take();
+        if *NO_DYN_RENAME.get_or_init(|| std::env::var_os("XEZIM_NO_DYN_RENAME").is_some())
+            || self.local_dyn.is_empty()
+        {
+            if let Some(shape) = shape {
+                self.register_local_shape(bare, shape);
+            }
             return bare.to_string();
         }
         // Clean up a prior same-frame declaration so the new one starts fresh.
@@ -3491,6 +4190,9 @@ impl Simulator {
         key.push_str(bare);
         key.push('#');
         Self::push_i64(&mut key, id as i64);
+        if let Some(shape) = shape {
+            self.register_local_shape(&key, shape);
+        }
         let frame = self.local_dyn.last_mut().unwrap();
         if let Some(slot) = frame.iter_mut().find(|(k, _)| k == bare) {
             slot.1 = key.clone();
@@ -3529,6 +4231,34 @@ impl Simulator {
         key
     }
 
+    /// Release a terminating child's captures (cleaning storage once no child
+    /// needs it) and its entries in the activation index `fork_gen_pids`.
+    pub(super) fn release_fork_collections(&mut self, pid: usize) {
+        if let Some(gens) = self.fork_pid_gens.remove(&pid) {
+            for g in gens {
+                if let Some(pids) = self.fork_gen_pids.get_mut(&g) {
+                    pids.remove(&pid);
+                    if pids.is_empty() {
+                        self.fork_gen_pids.remove(&g);
+                    }
+                }
+            }
+        }
+        if let Some(keys) = self.fork_collection_captures.remove(&pid) {
+            for key in keys {
+                if let Some(n) = self.fork_capture_refs.get_mut(&key) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.fork_capture_refs.remove(&key);
+                    }
+                }
+                if self.deferred_collection_cleanup.remove(&key) {
+                    self.cleanup_dyn_storage(&key);
+                }
+            }
+        }
+    }
+
     /// Remove all runtime signal/registration bookkeeping for a renamed
     /// local-dyn-array storage key (its `.size`, its `[i]` elements, and the
     /// `module.*` collection registrations). Used when a declaration is
@@ -3539,6 +4269,10 @@ impl Simulator {
         // removing them here would corrupt a concurrent process's queue.
         // (Identity-mapped formals and module-level arrays are bare.)
         if !key.starts_with('@') {
+            return;
+        }
+        if self.fork_capture_refs.contains_key(key) {
+            self.deferred_collection_cleanup.insert(key.to_string());
             return;
         }
         let mut size_key = std::mem::take(&mut self.dyn_key_scratch);
@@ -3566,6 +4300,9 @@ impl Simulator {
         self.module.arrays_2d.remove(key);
         self.module.arrays_nd.remove(key);
         self.module.associative_arrays.remove(key);
+        if !self.local_coll_shapes.is_empty() {
+            self.local_coll_shapes.remove(key);
+        }
         self.module.assoc_index_widths.remove(key);
         self.module.queue_max_sizes.remove(key);
         self.module.descending_arrays.remove(key);
@@ -3892,6 +4629,19 @@ impl Simulator {
         call: &Expression,
         constraints: &[crate::ast::decl::ConstraintItem],
     ) -> Value {
+        // §18.7: the empty argument parentheses may be omitted. The parser
+        // then retains the method reference rather than a Call node; falling
+        // through to eval_expr executes randomize but discards its with block.
+        if !matches!(call.kind, ExprKind::Call { .. }) {
+            let call = Expression::new(
+                ExprKind::Call {
+                    func: Box::new(call.clone()),
+                    args: Vec::new(),
+                },
+                call.span,
+            );
+            return self.eval_randomize_with(&call, constraints);
+        }
         if let ExprKind::Call { func, args } = &call.kind {
             if let ExprKind::MemberAccess { expr, member } = &func.kind {
                 if member.name == "randomize" {
@@ -4305,7 +5055,14 @@ impl Simulator {
         while let Some(cn) = cur {
             if let Some(cd) = self.module.classes.get(&cn) {
                 for (nm, con) in cd.constraints.iter() {
-                    if all_off || disabled.contains(nm) {
+                    // §18.5.11: a static block's mode is the class-wide flag
+                    // a whole-object `constraint_mode(0)` also clears.
+                    let static_off = con.is_static
+                        && !self.static_constraint_disabled.is_empty()
+                        && self
+                            .static_constraint_disabled
+                            .contains(&(cn.clone(), nm.clone()));
+                    if all_off || static_off || disabled.contains(nm) {
                         seen.insert(nm.clone());
                         continue;
                     }

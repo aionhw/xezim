@@ -3,35 +3,166 @@
 use super::*;
 
 impl Simulator {
-    /// Render an already-extracted `Value` interpreted as `dt` (used for the
-    /// bit-slices of a packed struct, which have no signal of their own).
-    pub(super) fn render_p_value_typed(&mut self, v: &Value, dt: &DataType) -> String {
-        if let DataType::TypeReference { name: tn, .. } = dt {
-            if let Some(members) = self.module.enum_members.get(&tn.name.name).cloned() {
-                // An x/z value matches no label (§6.19): it prints as a number.
-                if let Some(x) = v.to_u64().filter(|_| !v.has_xz()) {
-                    if let Some((label, _)) = members.iter().find(|(_, mv)| *mv == x) {
-                        return label.clone();
-                    }
-                }
-                return v.to_dec_string();
+    /// §21.2.1.7 / §6.19: the label of `v` when `dt` names an enum (declared
+    /// bare, in a package, or through a typedef chain); `None` otherwise or
+    /// for an x/z value, which matches no label.
+    pub(super) fn p_enum_label(&self, v: &Value, dt: &DataType) -> Option<String> {
+        let DataType::TypeReference { name: tn, .. } = dt else {
+            return None;
+        };
+        let members = self
+            .module
+            .enum_members
+            .get(&tn.qualified())
+            .or_else(|| self.enum_members_named(&tn.name.name))?;
+        Self::enum_label(members, v)
+    }
+
+    /// The members of the enum type named `name`, following typedef aliases.
+    pub(super) fn enum_members_named(&self, name: &str) -> Option<&Vec<(String, u64)>> {
+        let mut name = name;
+        for _ in 0..8 {
+            // The name text may carry its package (`pkg::e_t`) while the
+            // table is keyed by the typedef's bare name, or the reverse.
+            let bare = name.rsplit("::").next().unwrap_or(name);
+            if let Some(m) = self
+                .module
+                .enum_members
+                .get(name)
+                .or_else(|| self.module.enum_members.get(bare))
+            {
+                return Some(m);
+            }
+            match self.module.typedef_types.get(bare) {
+                Some(DataType::TypeReference { name: next, .. }) => name = &next.name.name,
+                // A local typedef of another type hides package enums.
+                Some(_) => return None,
+                None => break,
             }
         }
+        // `import pkg::*` leaves the bare name: the one package declaring it.
+        let bare = name.rsplit("::").next().unwrap_or(name);
+        let suffix = format!("::{bare}");
+        let mut hits = self
+            .module
+            .enum_members
+            .iter()
+            .filter(|(k, _)| k.ends_with(&suffix));
+        let first = hits.next();
+        if hits.next().is_some() {
+            None
+        } else {
+            first.map(|(_, m)| m)
+        }
+    }
+
+    /// The label of `v` among `members`; `None` for x/z or an invalid value.
+    pub(super) fn enum_label(members: &[(String, u64)], v: &Value) -> Option<String> {
+        if v.has_xz() {
+            return None;
+        }
+        let x = v.to_u64()?;
+        members
+            .iter()
+            .find(|(_, mv)| *mv == x)
+            .map(|(label, _)| label.clone())
+    }
+
+    /// `%p` of one packed leaf by its declared type, as the majority of the
+    /// reference simulators prints it (#566): a 2/4-state VECTOR type
+    /// (`bit`, `logic`, `reg`, with any packed dimensions) as `'h` hex with
+    /// uppercase X/Z digits, a vector declared `signed` and the integer atoms
+    /// (`byte`, `int`, `shortint`, `longint`, `integer`) as decimal with
+    /// their declared signedness, an enum as its label, a real as a real and
+    /// a string quoted.
+    pub(super) fn p_leaf_value(&self, v: &Value, dt: &DataType) -> String {
+        use crate::ast::types::{IntegerAtomType, Signing, SimpleType};
+        if let Some(label) = self.p_enum_label(v, dt) {
+            return label;
+        }
         match self.resolve_dt(dt) {
-            DataType::Struct(su) if su.packed => self.render_p_packed(v, &su),
-            DataType::Real { .. } => format!("{}", v.to_f64()),
-            // §21.2.1.7: a string prints quoted.
+            DataType::Real { .. } => Self::p_real(v.to_f64()),
             DataType::Simple {
-                kind: crate::ast::types::SimpleType::String,
+                kind: SimpleType::String,
                 ..
             } => format!("\"{}\"", v.to_sv_string()),
+            DataType::IntegerAtom { kind, signing, .. } => {
+                let mut x = v.clone();
+                x.is_signed = match signing {
+                    Some(s) => s == Signing::Signed,
+                    None => kind != IntegerAtomType::Time,
+                };
+                if x.is_real {
+                    Self::p_real(x.to_f64())
+                } else {
+                    x.to_dec_string()
+                }
+            }
+            DataType::IntegerVector {
+                signing: Some(Signing::Signed),
+                ..
+            }
+            | DataType::Implicit {
+                signing: Some(Signing::Signed),
+                ..
+            } => {
+                let mut x = v.clone();
+                x.is_signed = true;
+                x.to_dec_string()
+            }
+            DataType::IntegerVector { .. } | DataType::Implicit { .. } => Self::p_hex(v),
             _ => {
                 if v.is_real {
-                    format!("{}", v.to_f64())
+                    Self::p_real(v.to_f64())
                 } else {
                     v.to_dec_string()
                 }
             }
+        }
+    }
+
+    /// `'h` hex of a vector value: lowercase digits, uppercase X/Z, leading
+    /// zeros dropped (`'h0` for zero).
+    pub(super) fn p_hex(v: &Value) -> String {
+        let digits: String = v
+            .to_hex()
+            .chars()
+            .map(|c| match c {
+                'x' => 'X',
+                'z' => 'Z',
+                c => c,
+            })
+            .collect();
+        let trimmed = digits.trim_start_matches('0');
+        format!("'h{}", if trimmed.is_empty() { "0" } else { trimmed })
+    }
+
+    /// A real inside an aggregate: the shortest round-trip form for ordinary
+    /// magnitudes, `%g`-style exponent form (six significant digits) for
+    /// very small or very large ones, as the reference simulators print a
+    /// reinterpreted union member (`3.21143e-322`).
+    pub(super) fn p_real(x: f64) -> String {
+        let a = x.abs();
+        if x != 0.0 && x.is_finite() && !(1e-4..1e15).contains(&a) {
+            let s = format!("{:.5e}", x);
+            let (m, e) = s.split_once('e').unwrap_or((&s, "0"));
+            let m = if m.contains('.') {
+                m.trim_end_matches('0').trim_end_matches('.')
+            } else {
+                m
+            };
+            let e: i32 = e.parse().unwrap_or(0);
+            return format!("{m}e{}{:02}", if e < 0 { "-" } else { "+" }, e.abs());
+        }
+        format!("{x}")
+    }
+
+    /// Render an already-extracted `Value` interpreted as `dt` (used for the
+    /// bit-slices of a packed struct, which have no signal of their own).
+    pub(super) fn render_p_value_typed(&mut self, v: &Value, dt: &DataType) -> String {
+        match self.resolve_dt(dt) {
+            DataType::Struct(su) if su.packed => self.render_p_packed(v, &su),
+            _ => self.p_leaf_value(v, dt),
         }
     }
 
@@ -112,6 +243,12 @@ impl Simulator {
                 off += items[i].1;
             }
         }
+        // §7.3 / §21.2.1.7 (#566, majority): a PACKED union prints its first
+        // member only; an unpacked union prints every member over the shared
+        // storage, a `real` member as the bits reinterpreted.
+        if is_union && !su.tagged && su.packed {
+            items.truncate(1);
+        }
         let parts: Vec<String> = (0..items.len())
             .map(|i| {
                 let (n, w, mdt) = items[i].clone();
@@ -122,6 +259,14 @@ impl Simulator {
                 // A slice loses the member's signedness: an `int` member holding
                 // 32'hDEADBEEF prints -559038737, not 3735928559.
                 sub.is_signed = super::elaborate::is_type_signed(&mdt);
+                if is_union
+                    && !su.packed
+                    && matches!(self.resolve_dt(&mdt), DataType::Real { .. })
+                    && !v.is_real
+                {
+                    let bits = sub.to_u64().unwrap_or(0);
+                    return format!("{}:{}", n, Self::p_real(f64::from_bits(bits)));
+                }
                 format!("{}:{}", n, self.render_p_value_typed(&sub, &mdt))
             })
             .collect();
@@ -140,6 +285,7 @@ impl Simulator {
         let Some((first, rest)) = lists.split_first() else {
             return self.render_p_typed(name, dt);
         };
+        self.p_top_level = false;
         let parts: Vec<String> = first
             .iter()
             .map(|i| {
@@ -169,17 +315,16 @@ impl Simulator {
     pub(super) fn render_p_typed(&mut self, name: &str, dt: &DataType) -> String {
         use crate::ast::types::SimpleType;
         // Enum member -> its label (LRM prints the name, not the encoding).
-        if let DataType::TypeReference { name: tn, .. } = dt {
-            if let Some(members) = self.module.enum_members.get(&tn.name.name).cloned() {
-                if let Some(v) = self.get_signal_value_by_name(name) {
-                    if let Some(x) = v.to_u64() {
-                        if let Some((label, _)) = members.iter().find(|(_, mv)| *mv == x) {
-                            return label.clone();
-                        }
-                    }
-                    return v.to_dec_string();
-                }
-            }
+        if let DataType::TypeReference { name: tn, .. } = dt
+            && (self.module.enum_members.contains_key(&tn.qualified())
+                || self.module.enum_members.contains_key(&tn.name.name)
+                || self
+                    .module
+                    .enum_members
+                    .contains_key(tn.name.name.rsplit("::").next().unwrap_or("")))
+            && let Some(v) = self.get_signal_value_by_name(name)
+        {
+            return self.p_leaf_value(&v, dt);
         }
         match self.resolve_dt(dt) {
             DataType::Struct(su) => {
@@ -201,6 +346,7 @@ impl Simulator {
                         .unwrap_or_else(|| Value::zero(1));
                     return self.render_p_packed(&v, &su);
                 }
+                self.p_top_level = false;
                 let mut parts = Vec::new();
                 for m in &su.members {
                     for md in &m.declarators {
@@ -237,11 +383,224 @@ impl Simulator {
                 .map(|v| format!("\"{}\"", v.to_sv_string()))
                 .unwrap_or_else(|| "\"\"".into()),
             _ => match self.get_signal_value_by_name(name) {
-                Some(v) if v.is_real => format!("{}", v.to_f64()),
-                Some(v) => v.to_dec_string(),
+                Some(v) if std::mem::take(&mut self.p_top_level) => {
+                    if v.is_real {
+                        format!("{}", v.to_f64())
+                    } else if let Some(label) = self.p_enum_label(&v, dt) {
+                        label
+                    } else {
+                        v.to_dec_string()
+                    }
+                }
+                Some(v) => self.p_leaf_value(&v, dt),
                 None => self.p_unwritten_leaf(name, dt),
             },
         }
+    }
+
+    /// The declared data type of a `%p` operand that no name-based path
+    /// renders: a class property through a handle, `this` or bare (and an
+    /// element of a collection property), a static `Cls::p` /
+    /// `C#(..)::p`, an interface or virtual-interface member, an element
+    /// of any of those, and a function result (§21.2.1.7).
+    pub(super) fn p_decl_type(&mut self, arg: &Expression) -> Option<DataType> {
+        match &arg.kind {
+            ExprKind::Paren(e) => self.p_decl_type(e),
+            ExprKind::Call { func, .. } => self.call_return_type(func),
+            // An element of an unpacked collection keeps the declared
+            // element type (the unpacked dimensions sit on the declarator).
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                self.p_decl_type(expr)
+            }
+            _ => {
+                if !self.no_class_objects()
+                    && let Some((handle, prop)) = self.class_prop_receiver(arg)
+                    && handle != 0
+                    && let Some(tn) = self.class_prop_type_name(handle, &prop)
+                    && let Some(dt) = self.p_type_by_name(&tn)
+                {
+                    return Some(dt);
+                }
+                if let Some((cls, prop)) = self.p_static_prop_parts(arg)
+                    && let Some(tn) = self.p_static_prop_type_name(arg, &cls, &prop)
+                    && let Some(dt) = self.p_type_by_name(&tn)
+                {
+                    return Some(dt);
+                }
+                let flat = self.flat_member_name(arg)?;
+                let base = flat.split('[').next().unwrap_or(&flat).to_string();
+                if let Some(dt) = self.module.var_decl_types.get(&base) {
+                    return Some(dt.clone());
+                }
+                // A subroutine formal or local of the running automatic task.
+                if !base.contains('.')
+                    && let Some(task) = self
+                        .current_auto_task
+                        .clone()
+                        .or_else(|| self.current_static_task.clone())
+                    && let Some(dt) = self.p_task_local_type(&task, &base)
+                {
+                    return Some(dt);
+                }
+                // A member reached through a virtual interface variable.
+                if let Some((head, rest)) = base.split_once('.') {
+                    let head_expr = Expression::new(
+                        ExprKind::Ident(HierarchicalIdentifier {
+                            root: None,
+                            path: vec![HierPathSegment {
+                                name: crate::ast::Identifier {
+                                    name: head.to_string(),
+                                    span: arg.span,
+                                },
+                                selects: Vec::new(),
+                            }],
+                            span: arg.span,
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        arg.span,
+                    );
+                    if let Some(Some(inst)) = self.vif_operand(&head_expr)
+                        && let Some(dt) = self.module.var_decl_types.get(&format!("{inst}.{rest}"))
+                    {
+                        return Some(dt.clone());
+                    }
+                }
+                let ident = HierarchicalIdentifier {
+                    root: None,
+                    path: vec![HierPathSegment {
+                        name: crate::ast::Identifier {
+                            name: base.clone(),
+                            span: arg.span,
+                        },
+                        selects: Vec::new(),
+                    }],
+                    span: arg.span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                };
+                let resolved = self.resolve_hier_name(&ident).to_string();
+                if resolved != base
+                    && let Some(dt) = self.module.var_decl_types.get(&resolved)
+                {
+                    return Some(dt.clone());
+                }
+                None
+            }
+        }
+    }
+
+    /// `Cls::p` (flat two-segment ident) or `C#(args)::p` (specialization
+    /// member access) → the class and property names.
+    fn p_static_prop_parts(&mut self, arg: &Expression) -> Option<(String, String)> {
+        match &arg.kind {
+            ExprKind::Ident(h)
+                if h.path.len() == 2
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && self.module.classes.contains_key(&h.path[0].name.name) =>
+            {
+                Some((h.path[0].name.name.clone(), h.path[1].name.name.clone()))
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let base = match &expr.kind {
+                    ExprKind::Specialization { base, .. } => base.as_ref(),
+                    _ => expr.as_ref(),
+                };
+                let ExprKind::Ident(h) = &base.kind else {
+                    return None;
+                };
+                let cls = h.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join("::");
+                if !self.module.classes.contains_key(&cls) {
+                    return None;
+                }
+                Some((cls, member.name.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The declared type name of static property `prop` of `cls`; a type
+    /// parameter is mapped through the operand's `#(...)` arguments.
+    fn p_static_prop_type_name(&mut self, arg: &Expression, cls: &str, prop: &str) -> Option<String> {
+        let owners = self.prop_owners(cls);
+        let (_, cd) = owners.get(prop)?;
+        let tn = cd.properties.get(prop)?.type_name.clone()?;
+        if !cd.type_param_names.iter().any(|t| *t == tn) {
+            return Some(tn);
+        }
+        let idx = cd.param_order.iter().position(|p| *p == tn)?;
+        let text = match &arg.kind {
+            ExprKind::MemberAccess { expr, .. } => match &expr.kind {
+                ExprKind::Specialization { type_args_text, .. } => type_args_text.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let args = Self::split_spec_args(&text);
+        args.get(idx).map(|a| a.trim().to_string())
+    }
+
+    /// The declared type of formal or local `name` of task `task`.
+    fn p_task_local_type(&self, task: &str, name: &str) -> Option<DataType> {
+        let td = self.module.tasks.get(task)?;
+        if let Some(p) = td.ports.iter().find(|p| p.name.name == name) {
+            return Some(p.data_type.clone());
+        }
+        for st in &td.items {
+            if let StatementKind::VarDecl { data_type, declarators, .. } = &st.kind
+                && declarators.iter().any(|d| d.name.name == name)
+            {
+                return Some(data_type.clone());
+            }
+        }
+        None
+    }
+
+    /// Is the `%p` operand a whole collection (queue, dynamic or
+    /// associative array, unpacked array)? Those render element-wise by
+    /// name; the typed fallback is for single packed values.
+    pub(super) fn p_operand_is_collection(&mut self, arg: &Expression) -> bool {
+        let Some(flat) = self.flat_member_name(arg) else {
+            return false;
+        };
+        self.module.dynamic_arrays.contains(&flat)
+            || self.module.associative_arrays.contains_key(&flat)
+            || self.module.arrays.contains_key(&flat)
+            || self.module.arrays_2d.contains_key(&flat)
+            || self.module.arrays_nd.contains_key(&flat)
+    }
+
+    /// A declared type by its (possibly package-qualified) name.
+    pub(super) fn p_type_by_name(&self, tn: &str) -> Option<DataType> {
+        if let Some(dt) = self.module.typedef_types.get(tn) {
+            return Some(dt.clone());
+        }
+        if self.module.enum_members.contains_key(tn) {
+            return Some(DataType::TypeReference {
+                name: crate::ast::types::TypeName {
+                    scopes: Vec::new(),
+                    name: crate::ast::Identifier {
+                        name: tn.to_string(),
+                        span: crate::ast::Span::dummy(),
+                    },
+                    span: crate::ast::Span::dummy(),
+                },
+                dimensions: Vec::new(),
+                type_args: Vec::new(),
+                span: crate::ast::Span::dummy(),
+            });
+        }
+        let suffix = format!("::{tn}");
+        let mut hits = self
+            .module
+            .typedef_types
+            .iter()
+            .filter(|(k, _)| k.ends_with(&suffix));
+        let first = hits.next();
+        if hits.next().is_some() {
+            return None;
+        }
+        first.map(|(_, dt)| dt.clone())
     }
 
     /// §8.9 / §21.2.1.7: `%p` of a static fixed array reached through its
@@ -377,75 +736,6 @@ impl Simulator {
         }
     }
 
-    /// Render one `%p` member value: strings as quoted text, reals as reals,
-    /// everything else in decimal (LRM §21.2.1.7 assignment-pattern form).
-    /// §21.2.1.7 `%0p`: rewrite a `%p` assignment-pattern rendering into the
-    /// reference simulator's compact form — braces, member names and comma
-    /// separators drop out, values separate with single spaces
-    /// (`'{id:777, active:1}` -> `777 1`). Quoted strings pass through
-    /// verbatim, including any braces or commas inside them.
-    pub(super) fn compact_p(s: &str) -> String {
-        // A lone string prints unquoted (`%0p` of "ab" is `ab`).
-        if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-            return s[1..s.len() - 1].to_string();
-        }
-        let mut out = String::with_capacity(s.len());
-        let mut it = s.chars().peekable();
-        let mut in_str = false;
-        let mut expect_name = false;
-        while let Some(c) = it.next() {
-            if in_str {
-                out.push(c);
-                if c == '"' {
-                    in_str = false;
-                }
-                continue;
-            }
-            match c {
-                '"' => {
-                    in_str = true;
-                    expect_name = false;
-                    out.push(c);
-                }
-                '\'' if it.peek() == Some(&'{') => {
-                    it.next();
-                    expect_name = true;
-                }
-                '}' => {}
-                ',' => {
-                    if it.peek() == Some(&' ') {
-                        it.next();
-                    }
-                    if !out.is_empty() && !out.ends_with(' ') {
-                        out.push(' ');
-                    }
-                    expect_name = true;
-                }
-                _ if expect_name && (c.is_ascii_alphabetic() || c == '_') => {
-                    // Possible `name:` label — drop it only if a ':' follows.
-                    let mut ident = String::new();
-                    ident.push(c);
-                    while it
-                        .peek()
-                        .is_some_and(|&n| n.is_ascii_alphanumeric() || n == '_')
-                    {
-                        ident.push(it.next().unwrap());
-                    }
-                    if it.peek() == Some(&':') {
-                        it.next();
-                    } else {
-                        out.push_str(&ident);
-                    }
-                    expect_name = false;
-                }
-                _ => {
-                    expect_name = false;
-                    out.push(c);
-                }
-            }
-        }
-        out
-    }
 
     /// §21.2.1.7 / §7.2: render a WHOLE unpacked-struct CLASS property
     /// (`c.first` where `first` is a `typedef struct` bound through a class

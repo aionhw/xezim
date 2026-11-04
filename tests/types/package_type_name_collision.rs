@@ -18,6 +18,10 @@
 //! invisible (an error where it is used as a type).
 //!
 //! Expected values come from the reference simulator.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -234,7 +238,7 @@ fn same_named_typedefs_of_every_kind() {
             "T|c.s.a=3 c.s.b=9 d.s.a=1234 d.s.c=77",
             "T|cast 7f 1fff",
             "T|cast2 7 13",
-            "T|va '{a:15, b:1} vb '{a:4660, b:86, c:120}",
+            "T|va '{a:'hf, b:'h1} vb '{a:'h1234, b:'h56, c:'h78}",
             "T|enum 1 2",
             "T|enumname GRN MAG",
         ],

@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use xezim_core::hasher::HashMap;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct NameMap {
     map: HashMap<Arc<str>, usize>,
     /// Registered 1-D arrays whose element names are virtual:
@@ -48,6 +48,7 @@ pub struct NameMap {
 }
 
 /// The elided port nets: `elided_port_hash` of each flat name, sorted.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ElidedPorts {
     hashes: Vec<u64>,
 }
@@ -394,7 +395,7 @@ impl NameMap {
 /// an array whose element names are virtual (see `NameMap`) or were never
 /// registered at all (a bulk memory) — form GAPS: no per-cell entry, so the
 /// stored names stay aligned with their ids at no per-cell cost.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct IdNames {
     names: Vec<Arc<str>>,
     /// (first id, len, names stored before it), ascending.

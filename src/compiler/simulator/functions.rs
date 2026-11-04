@@ -379,7 +379,19 @@ impl Simulator {
                 }
             }
             let mut val = if arg_supplied(i) {
-                let value = self.eval_expr(&args[i]);
+                // §11.6.1/§11.8.2: the ACTUAL is context-determined by this
+                // formal's declared width (see `actual_ctx_shape`), so
+                // `fwide9(x + y)` over 8-bit x, y adds at 9 bits. `fit_scalar_-
+                // formal_seed` below only resizes the value that is handed it,
+                // which cannot restore a carry the self-determined width
+                // already dropped.
+                let value = match self.formal_pattern_value(port, &args[i]) {
+                    Some(v) => v,
+                    None => match self.actual_context_width(port) {
+                        Some(w) => self.eval_expr_ctx(&args[i], w),
+                        None => self.eval_expr(&args[i]),
+                    },
+                };
                 self.vif_argument_value(port, &args[i], value)
             } else if let Some(def) = &port.default {
                 // §13.5.3: a default may reference EARLIER formals (`int b =
@@ -387,7 +399,7 @@ impl Simulator {
                 // evaluated bare, `a` was unknown and the default was x.
                 self.in_subroutine_default_scope(None, None, |sim| {
                     sim.push_local_frame_typed(locals.clone(), frame_types.clone());
-                    let value = sim.eval_expr(def);
+                    let value = sim.eval_formal_default(port, def);
                     let value = sim.vif_argument_value(port, def, value);
                     sim.pop_local_frame();
                     value
@@ -673,6 +685,12 @@ impl Simulator {
         // ordered.
         self.fn_ret_collection_stack
             .push(self.fn_returns_collection(&fd.return_type));
+        let ret_ctx = self
+            .scalar_formal_integral(&fd.return_type)
+            .map_or(0, |(w, _)| w);
+        self.fn_ret_ctx_stack.push(ret_ctx);
+        let frame = self.return_pattern_type(fd);
+        self.fn_ret_frames.push(frame);
         // §13.4.1: a function returning a queue, dynamic or associative
         // array (through a typedef) has a return VARIABLE of that type: the
         // body may fill it in place (`f.push_back(v)`, `f[k] = v`, `f = new[n]`,
@@ -706,6 +724,19 @@ impl Simulator {
             );
             self.exec_statement(&decl);
         }
+        // §3.12.1 / §23.4: actuals bind in the caller above; the body
+        // resolves free names in its own lexical scope. In particular a
+        // root/unit helper must not inherit a child's same-named signals.
+        let body_scope = fd
+            .name
+            .name
+            .name
+            .rsplit_once('.')
+            .map(|(scope, _)| scope.to_string());
+        let saved_body_hint = self.name_resolve_hint.replace(body_scope.clone());
+        let body_scope = body_scope.unwrap_or_default();
+        let saved_body_activation = self.activation_scope.replace(Some(body_scope.clone()));
+        let saved_body_scope = std::mem::replace(&mut self.current_scope, body_scope);
         self.pkg_scope_stack.push(pkg_scope.clone());
         let m_fn_entry = self.subroutine_m_entry(
             &fd.name.name.name,
@@ -777,11 +808,16 @@ impl Simulator {
             }
         }
         self.sync_static_locals();
+        *self.name_resolve_hint.borrow_mut() = saved_body_hint;
+        *self.activation_scope.borrow_mut() = saved_body_activation;
+        self.current_scope = saved_body_scope;
         self.apply_default_formal_outputs(&default_output_bindings);
         let vif_alias_ended = self.local_iface_aliases.pop().unwrap_or_default();
         self.func_call_stack.pop();
         self.fn_ret_collection_stack.pop();
         self.fn_ret_assoc_stack.pop();
+        self.fn_ret_ctx_stack.pop();
+        self.fn_ret_frames.pop();
         self.pkg_scope_stack.pop();
         self.m_scope_stack = saved_m_scope_fn;
         self.this_stack.pop();
@@ -973,6 +1009,7 @@ impl Simulator {
             .take()
             .or_else(|| self.module.func_decl_scope.get(&td.name.name.name).cloned());
         let mut cleanup = self.bind_task_frame(td, args, None);
+        self.enter_free_task_scope(td, &mut cleanup);
         self.open_decl_shadow_frame();
         // §23.8/§13.3.2: an instance or free task body resolves names
         // lexically, without a class-method caller's `this`/class context.
@@ -1007,6 +1044,28 @@ impl Simulator {
         self.unwind_task_frame(cleanup);
     }
 
+    /// §13.3 / §23.4: arguments bind in the caller, then the free task
+    /// body resolves in its declaration's scope, including across suspension.
+    pub(super) fn enter_free_task_scope(
+        &mut self,
+        td: &TaskDeclaration,
+        cleanup: &mut TaskCleanup,
+    ) {
+        let scope = td
+            .name
+            .name
+            .name
+            .rsplit_once('.')
+            .map(|(scope, _)| scope.to_string())
+            .unwrap_or_default();
+        cleanup.prev_hint = self.name_resolve_hint.borrow().clone();
+        cleanup.frame_scope_hint = Some(scope.clone());
+        *self.name_resolve_hint.borrow_mut() = (!scope.is_empty()).then(|| scope.clone());
+        let activation = self.activation_scope.replace(Some(scope.clone()));
+        let current = std::mem::replace(&mut self.current_scope, scope);
+        cleanup.caller_body_scope = Some((activation, current));
+    }
+
     /// Replay the deferred teardown of an inlined (or synchronous) task call:
     /// the work that `exec_task_call` runs after the body. Mirrors the original
     /// inline cleanup exactly.
@@ -1016,6 +1075,10 @@ impl Simulator {
         self.apply_default_formal_outputs(&c.default_output_bindings);
         if c.frame_scope_hint.is_some() {
             *self.name_resolve_hint.borrow_mut() = c.prev_hint.clone();
+        }
+        if let Some((activation, scope)) = c.caller_body_scope.take() {
+            *self.activation_scope.borrow_mut() = activation;
+            self.current_scope = scope;
         }
         if let Some(tn) = &c.task_name {
             if let Some(set) = self.active_task_pids.get_mut(tn) {
@@ -1034,14 +1097,15 @@ impl Simulator {
         }
         if c.modclass.take().is_some() {
             self.modclass_depth.set(self.modclass_depth.get() - 1);
-            *self.activation_scope.borrow_mut() = Some(
-                self.task_cleanup
-                    .iter()
-                    .rev()
-                    .find_map(|t| t.modclass.clone())
-                    .or_else(|| self.process_scope_hint.get(&self.current_pid).cloned())
-                    .unwrap_or_default(),
-            );
+            let scope = self
+                .task_cleanup
+                .iter()
+                .rev()
+                .find_map(|t| t.frame_scope_hint.clone())
+                .or_else(|| self.process_scope_hint.get(&self.current_pid).cloned())
+                .unwrap_or_default();
+            *self.activation_scope.borrow_mut() = Some(scope.clone());
+            self.current_scope = scope;
         }
         // §13.5.2/§25.9: preserve output identities before removing the
         // callee's binding frame, including an explicit null result.
@@ -1243,6 +1307,48 @@ impl Simulator {
     /// Is `func` a call of a module/package function whose return type is
     /// a queue, dynamic or associative array typedef?
     pub(super) fn call_returns_collection(&self, func: &Expression) -> bool {
+        // §13.4: a METHOD returning a collection (`o.build().size()`,
+        // `B::make().size()`): the receiver's class, or the scope class of a
+        // static call, declares it. Only module functions were recognized,
+        // so the collection method ran on nothing and answered 0.
+        let (recv, mname): (Option<Expression>, &str) = match &func.kind {
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let mut r = h.clone();
+                r.path.pop();
+                r.cached_signal_id = std::cell::Cell::new(None);
+                (
+                    Some(Expression::new(ExprKind::Ident(r), func.span)),
+                    h.path[h.path.len() - 1].name.name.as_str(),
+                )
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                (Some((**expr).clone()), member.name.as_str())
+            }
+            _ => (None, ""),
+        };
+        if let Some(recv) = recv {
+            let class = match &recv.kind {
+                ExprKind::Ident(rh)
+                    if rh.path.len() == 1
+                        && self.module.classes.contains_key(&rh.path[0].name.name) =>
+                {
+                    Some(rh.path[0].name.name.clone())
+                }
+                _ => self.get_expr_type_name(&recv),
+            };
+            let mut cur = class;
+            while let Some(cn) = cur {
+                let Some(cd) = self.module.classes.get(&cn) else {
+                    break;
+                };
+                if let Some(m) = cd.methods.get(mname) {
+                    return matches!(&m.kind, crate::ast::decl::ClassMethodKind::Function(f)
+                        if self.fn_ret_coll_dims(&f.return_type).is_some());
+                }
+                cur = cd.extends.clone();
+            }
+            return false;
+        }
         let ExprKind::Ident(h) = &func.kind else {
             return false;
         };
@@ -1491,6 +1597,7 @@ impl Simulator {
                 frame_gen,
                 epoch: self.nested_run_epoch,
                 saves: Vec::new(),
+                fresh_strings: Vec::new(),
             });
         }
     }
@@ -1508,7 +1615,20 @@ impl Simulator {
         }
         match self.module.var_decl_types.get(name) {
             Some(old) if Self::dt_trivially_equal(old, dt) => return,
-            None if !self.widths.contains_key(name) => return,
+            None if !self.widths.contains_key(name) => {
+                // §6.21: a fresh `string` local still adds its name to the
+                // global `string_signals` set, where a later task's same-named
+                // enum formal read as text (`256 >= 16` compared false). Take
+                // just that flag back when the activation ends.
+                if Self::is_string_data_type(dt)
+                    && !self.string_signals.contains(name)
+                    && let Some(top) = self.decl_shadow_log.last_mut()
+                    && !top.fresh_strings.iter().any(|n| n == name)
+                {
+                    top.fresh_strings.push(name.to_string());
+                }
+                return;
+            }
             _ => {}
         }
         if top.saves.iter().any(|d| d.meta.name == name) {
@@ -1644,6 +1764,9 @@ impl Simulator {
         };
         if frame.epoch != self.nested_run_epoch {
             return;
+        }
+        for n in &frame.fresh_strings {
+            self.string_signals.remove(n);
         }
         self.restore_decl_shadows(frame.saves);
     }
@@ -1987,6 +2110,20 @@ impl Simulator {
                 is_vif.then_some(i)
             })
             .collect();
+        // Resolve output handle types in the callee's specialization before
+        // restoring the caller's context. Automatic formals start null.
+        let output_class_indices: Vec<usize> = td
+            .ports
+            .iter()
+            .enumerate()
+            .filter_map(|(i, port)| {
+                (port.direction == PortDirection::Output
+                    && (method_ctx.is_some()
+                        || matches!(td.lifetime, Some(crate::ast::types::Lifetime::Automatic)))
+                    && self.port_class_ref(port).is_some())
+                .then_some(i)
+            })
+            .collect();
         if let Some(saved) = saved_type_context {
             self.current_spec = saved;
         }
@@ -2069,8 +2206,8 @@ impl Simulator {
                     );
                 }
                 // No key was ever made under this name, so the removal
-                // would find nothing (the store generation still moves).
-                None if !self.vif_local_names.contains(&port.name.name) => bump_store_gen(),
+                // would find nothing and nothing is written.
+                None if !self.vif_local_names.contains(&port.name.name) => {}
                 None => {
                     self.signals
                         .remove(&format!("__vif_local__{}", port.name.name));
@@ -2238,7 +2375,7 @@ impl Simulator {
                     // binds the default as its actual, so `output o = a`
                     // copies `o` back to `a` on return.
                     let val = if port.direction == PortDirection::Output
-                        && vif_formal_indices.contains(&i)
+                        && (vif_formal_indices.contains(&i) || output_class_indices.contains(&i))
                     {
                         Value::zero(32)
                     } else {
@@ -2319,7 +2456,10 @@ impl Simulator {
                 }
                 _ => {
                     let mut val = if arg_supplied(i) {
-                        let value = self.eval_expr(&args[i]);
+                        let value = match self.formal_pattern_value(port, &args[i]) {
+                            Some(v) => v,
+                            None => self.eval_expr(&args[i]),
+                        };
                         self.vif_argument_value(port, &args[i], value)
                     } else if let Some(def) = &port.default {
                         // Caller omitted this arg → apply the formal's default
@@ -2331,7 +2471,7 @@ impl Simulator {
                             default_spec.clone(),
                             |sim| {
                                 sim.push_local_frame_typed(locals.clone(), frame_types.clone());
-                                let value = sim.eval_expr(def);
+                                let value = sim.eval_formal_default(port, def);
                                 let value = sim.vif_argument_value(port, def, value);
                                 sim.pop_local_frame();
                                 value
@@ -2527,6 +2667,7 @@ impl Simulator {
         TaskCleanup {
             frame_scope_hint: None,
             prev_hint: None,
+            caller_body_scope: None,
             saved_m_scope,
             task_name: Some(tname),
             array_writebacks,

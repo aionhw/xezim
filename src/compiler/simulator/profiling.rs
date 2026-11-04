@@ -865,6 +865,18 @@ impl Simulator {
         );
     }
 
+    /// Per comb entry: `CombEntry::reads_own_writes`, for the self-dependency
+    /// skips of both settle loops. Called with the levels and by the canonical
+    /// settle whenever the entry table changed length (first settle, cache
+    /// load, checkpoint restore).
+    pub(super) fn build_comb_self_exempt(&mut self) {
+        self.comb_self_exempt = self
+            .comb_entries
+            .iter()
+            .map(CombEntry::reads_own_writes)
+            .collect();
+    }
+
     /// Feasibility probe for levelized / bulk-synchronous parallel settle
     /// (XEZIM_SETTLE_LEVELS=1). Assigns each comb entry a static level =
     /// longest producer chain (entries in stored topo order; cyclic back-edges
@@ -883,6 +895,7 @@ impl Simulator {
         let mut unresolved = 0usize;
         self.comb_level = vec![0u32; n];
         self.comb_has_nba = vec![false; n];
+        self.build_comb_self_exempt();
         self.comb_par_safe = vec![false; n];
         // Writer-count pre-pass: a signal written by >1 comb entry is
         // multi-driven; entries touching such a signal CANNOT run in the
@@ -949,7 +962,8 @@ impl Simulator {
                     // par_safe only if the isolated path fully handles it, it
                     // has no deferred NBA, and all its writes are single-driver
                     // (disjoint-write safety for parallel level eval).
-                    self.comb_par_safe[i] = !has_nba && !unsupported && single_writer;
+                    self.comb_par_safe[i] =
+                        !has_nba && !unsupported && single_writer && !self.comb_self_exempt[i];
                 }
                 // AST entries always need &mut self.
                 CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {}
@@ -2817,7 +2831,14 @@ impl Simulator {
         json.push_str("  \"assertions\": [\n");
         let mut sites: Vec<_> = self.assertion_stats.iter().collect();
         sites.sort_by_key(|(k, _)| **k);
-        for (i, (_, st)) in sites.iter().enumerate() {
+        for (i, (key, st)) in sites.iter().enumerate() {
+            // §16.5 / §16.14: a labelled site carries its label; an
+            // unlabelled one has no `name` key.
+            let name = self
+                .assertion_labels
+                .get(*key)
+                .map(|l| format!("\"name\": \"{}\", ", json_escape(l)))
+                .unwrap_or_default();
             let kind = match st.kind {
                 0 => "assert",
                 1 => "assume",
@@ -2835,7 +2856,8 @@ impl Simulator {
                 None => (0, String::new()),
             };
             json.push_str(&format!(
-                "    {{{}\"span_start\": {}, \"kind\": \"{}\", \"pass\": {}, \"fail\": {}}}{}\n",
+                "    {{{}{}\"span_start\": {}, \"kind\": \"{}\", \"pass\": {}, \"fail\": {}}}{}\n",
+                name,
                 place,
                 off,
                 kind,

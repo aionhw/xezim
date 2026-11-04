@@ -202,6 +202,7 @@ impl Simulator {
             let mut static_methods: HashSet<String> = HashSet::default();
             let mut params: HashSet<String> = HashSet::default();
             let mut assoc_props: HashSet<String> = HashSet::default();
+            let mut shaped_props: HashSet<String> = HashSet::default();
             let mut string_props: HashSet<String> = HashSet::default();
             let mut static_or_param: HashSet<String> = HashSet::default();
             let mut constant_arrays: HashSet<String> = HashSet::default();
@@ -248,6 +249,11 @@ impl Simulator {
                 params.extend(cd.type_param_names.iter().cloned());
                 params.extend(cd.param_order.iter().cloned());
                 assoc_props.extend(cd.assoc_properties.keys().cloned());
+                shaped_props.extend(
+                    (cd.prop_coll_shapes.iter())
+                        .filter(|(_, shape)| shape.dims.len() >= 2)
+                        .map(|(n, _)| n.clone()),
+                );
                 static_or_param.extend(cd.static_properties.iter().cloned());
                 static_or_param.extend(cd.param_defaults.iter().map(|(n, _)| n.clone()));
                 static_or_param.extend(cd.array_properties.keys().filter(|name| {
@@ -359,6 +365,7 @@ impl Simulator {
                 param_first,
                 params,
                 assoc_props,
+                shaped_props,
                 string_props,
                 static_or_param,
                 constant_arrays,
@@ -902,7 +909,7 @@ impl Simulator {
                 let class_ref = self.port_class_ref(port);
                 let dt = &port.data_type;
                 let fixed_width = (matches!(dt, DataType::IntegerAtom { .. })
-                    || Self::packed_dims_are_literal(dt))
+                    || Self::packed_dims_are_constant(dt))
                 .then(|| {
                     super::elaborate::resolve_type_width(
                         dt,
@@ -1027,6 +1034,36 @@ impl Simulator {
     /// `C#(spec)` resolves bare statics to the shared `C::member` cell
     /// while every interpreter route uses `C#spec::member` — storage
     /// silently splits. Returns the saved spec for restore.
+    /// §8.25: the width of `dt`, a packed type sized by a class value
+    /// parameter, or a typedef of the class naming one, in a method of
+    /// `cname` called on `handle`: the receiver's specialization, else the
+    /// class's defaults. `None` for a literal or non-packed type.
+    pub(super) fn method_formal_param_width(
+        &mut self,
+        handle: usize,
+        cname: &str,
+        dt: &DataType,
+    ) -> Option<u32> {
+        if Self::packed_dims_are_literal(dt) {
+            return None;
+        }
+        // Only a typedef of the class itself can be sized by its parameters;
+        // look before seeding the receiver's specialization.
+        if let DataType::TypeReference { name, .. } = dt
+            && (name.has_scope() || self.class_local_typedef(cname, &name.name.name).is_none())
+        {
+            return None;
+        }
+        let saved = self.seed_callee_spec_from_instance(handle, cname);
+        self.this_stack.push(Some(handle));
+        self.class_context_stack.push(Some(cname.to_string()));
+        let w = self.class_param_sized_width(dt);
+        self.class_context_stack.pop();
+        self.this_stack.pop();
+        self.restore_spec_pooled(saved);
+        w
+    }
+
     pub(super) fn seed_callee_spec_from_instance(
         &mut self,
         handle: usize,
@@ -1190,6 +1227,90 @@ impl Simulator {
     }
 
     /// The string properties of `class_name` and its ancestors.
+    /// §6.16/§13.5: the interpreter's string typing for one method
+    /// activation — its string formals, a string result variable and the
+    /// class's string properties join `string_signals` (the non-string
+    /// formals of a function leave it), and the frame's formal types are
+    /// classified under the active specialization. Compiled bytecode never
+    /// reads these, so only interpreted statements need them: the whole body
+    /// on the AST path, or a compiled body's statement fallbacks.
+    pub(super) fn method_string_frame_begin(
+        &mut self,
+        cname: &str,
+        ports: &[crate::ast::decl::FunctionPort],
+        is_function: bool,
+        string_ret: Option<&str>,
+        found_string_props: Option<std::rc::Rc<Vec<String>>>,
+    ) -> MethodStringFrame {
+        // Common frame teardown removes this entry.
+        if let Some(&fgen) = self.local_gen_stack.last() {
+            if let Some(entry) = self.task_frame_strings(fgen, ports) {
+                self.task_string_formals.push(entry);
+            }
+        }
+        let mut signals: Vec<String> = Vec::new();
+        self.string_signals_removed.push(Vec::new());
+        if is_function {
+            for port in ports.iter() {
+                if !Self::is_string_data_type(&port.data_type) {
+                    self.forget_string_flag(&port.name.name);
+                }
+            }
+            if let Some(r) = string_ret {
+                if self.string_signals.insert(r.to_string()) {
+                    signals.push(r.to_string());
+                }
+            }
+        }
+        for port in ports.iter() {
+            if Self::is_string_data_type(&port.data_type) {
+                if self.string_signals.insert(port.name.name.clone()) {
+                    signals.push(port.name.name.clone());
+                }
+            }
+        }
+        let props = found_string_props.unwrap_or_else(|| self.class_string_props_of(cname));
+        let mut prop_mask: u64 = 0;
+        let mut prop_more: Vec<usize> = Vec::new();
+        for (i, sp) in props.iter().enumerate() {
+            if !self.string_signals.contains(sp) {
+                self.string_signals.insert(sp.clone());
+                if i < 64 {
+                    prop_mask |= 1u64 << i;
+                } else {
+                    prop_more.push(i);
+                }
+            }
+        }
+        MethodStringFrame {
+            signals,
+            props,
+            prop_mask,
+            prop_more,
+        }
+    }
+
+    /// Undo `method_string_frame_begin`.
+    pub(super) fn method_string_frame_end(&mut self, f: MethodStringFrame) {
+        for n in &f.signals {
+            self.string_signals.remove(n);
+        }
+        let mut mask = f.prop_mask;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.string_signals.remove(&f.props[i]);
+        }
+        for &i in &f.prop_more {
+            self.string_signals.remove(&f.props[i]);
+        }
+        if let Some(removed) = self.string_signals_removed.pop() {
+            for n in removed {
+                self.string_signals.insert(n);
+            }
+        }
+    }
+
     pub(super) fn class_string_props_of(&self, class_name: &str) -> std::rc::Rc<Vec<String>> {
         if let Some(hit) = self.class_string_props.borrow().get(class_name) {
             return hit.clone();
@@ -1208,6 +1329,38 @@ impl Simulator {
             .borrow_mut()
             .insert(class_name.to_string(), props.clone());
         props
+    }
+
+    /// Whether `class_name` or an ancestor declares a property (of any
+    /// kind: scalar, queue, associative, static, ...) named `prop`.
+    ///
+    /// Scopes the flat, name-global `string_signals` set inside
+    /// `expr_is_string_valued`: a bare property reference in a class
+    /// method shadows same-named module-scope signals (§6.21), and the
+    /// flat set cannot distinguish specializations of a parameterized
+    /// class — a string-typed `T val` formal of `uvm_resource_db#(string)`
+    /// poisons the bare name for `uvm_resource#(<enum>)`'s `val` property,
+    /// which routed an enum `val == t` through the TEXT comparison and
+    /// made `X == 0` compare equal (skipping `uvm_resource#(T)::write`'s
+    /// `if (val == t) return;` early-out, so the stored value stayed X).
+    pub(super) fn class_declares_property(&self, class_name: &str, prop: &str) -> bool {
+        let mut cur: Option<&str> = Some(class_name);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            if cd.properties.contains_key(prop)
+                || cd.queue_properties.contains_key(prop)
+                || cd.assoc_properties.contains_key(prop)
+                || cd.array_properties.contains_key(prop)
+                || cd.array_nd_properties.contains_key(prop)
+                || cd.static_properties.contains(prop)
+            {
+                return true;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
     }
 
     pub(super) fn exec_method_in_class_hierarchy(
@@ -1403,9 +1556,6 @@ impl Simulator {
                         .collect()
                 };
                 let vif_saved = if vif_fast {
-                    if !ports.is_empty() {
-                        bump_store_gen();
-                    }
                     Vec::new()
                 } else {
                     self.vif_formals_enter(&vif_formals)
@@ -1630,8 +1780,43 @@ impl Simulator {
                             continue;
                         }
                     }
-                    let mut val = if arg_supplied(i) {
-                        let value = self.eval_expr(&args[i]);
+                    // §11.6.1/§11.8.2: a call ACTUAL is CONTEXT-DETERMINED by
+                    // the callee's declared formal, exactly like the operand of
+                    // a comparison (see `actual_ctx_shape`). Gated to the shape
+                    // `resize_for_assign` already understands, and the width is
+                    // read from the cached plan rather than recomputed.
+                    // §8.25/§13.5: a packed formal sized by a class value
+                    // parameter (`bit [W-1:0] a`, or a class typedef of one)
+                    // is as wide as the receiver's specialization makes it.
+                    let param_w = if plan.ports[i].fixed_width.is_none()
+                        && !plain_class
+                        && (Self::actual_ctx_shape(port)
+                            || port.dimensions.is_empty()
+                                && port.direction == PortDirection::Input
+                                && matches!(&port.data_type, DataType::TypeReference { .. }))
+                    {
+                        self.method_formal_param_width(handle, cname, &port.data_type)
+                    } else {
+                        None
+                    };
+                    let actual_ctx = if arg_supplied(i) && Self::actual_ctx_shape(port) {
+                        plan.ports[i].fixed_width.filter(|w| *w > 0).or(param_w)
+                    } else {
+                        None
+                    };
+                    // Class methods have automatic lifetime. An output handle
+                    // starts null on every call; it never copies in the caller's
+                    // previous object (including when the actual is a default).
+                    let mut val = if plain_class && port.direction == PortDirection::Output {
+                        Value::zero(32)
+                    } else if arg_supplied(i) {
+                        let value = match self.formal_pattern_value(port, &args[i]) {
+                            Some(v) => v,
+                            None => match actual_ctx {
+                                Some(w) => self.eval_expr_ctx(&args[i], w),
+                                None => self.eval_expr(&args[i]),
+                            },
+                        };
                         self.vif_argument_value(port, &args[i], value)
                     } else if let Some(def) = &port.default {
                         // Caller omitted this arg → apply the formal's
@@ -1653,7 +1838,7 @@ impl Simulator {
                         self.this_stack.push(Some(handle));
                         self.class_context_stack.push(Some(cname.clone()));
                         self.push_local_frame_typed(locals.clone(), frame_types.clone());
-                        let v = self.eval_expr(def);
+                        let v = self.eval_formal_default(port, def);
                         let v = self.vif_argument_value(port, def, v);
                         self.pop_local_frame();
                         self.class_context_stack.pop();
@@ -1677,6 +1862,19 @@ impl Simulator {
                     if matches!(&port.data_type, DataType::TypeReference { .. }) {
                         if plain_class {
                             // A class handle is bound as passed.
+                        } else if let Some(pw) = param_w {
+                            let signed = match &port.data_type {
+                                DataType::TypeReference { name, .. } => self
+                                    .class_local_typedef(cname, &name.name.name)
+                                    .is_some_and(super::elaborate::is_type_signed),
+                                _ => false,
+                            };
+                            if val.is_real {
+                                val = Self::real_to_int(val.to_f64(), pw);
+                            } else if pw != val.width {
+                                val = val.resize_for_assign(pw);
+                            }
+                            val.is_signed = signed;
                         } else if let Some((pw, signed)) =
                             self.scalar_formal_integral(&port.data_type)
                         {
@@ -1730,6 +1928,13 @@ impl Simulator {
                             val = val.resize_for_assign(pw);
                         }
                         val.is_signed = pp.signed;
+                    } else if let Some(pw) = param_w {
+                        if val.is_real {
+                            val = Self::real_to_int(val.to_f64(), pw);
+                        } else if pw != val.width {
+                            val = val.resize_for_assign(pw);
+                        }
+                        val.is_signed = plan.ports[i].signed;
                     } else if plan.ports[i].signed {
                         val.is_signed = true;
                     }
@@ -2147,6 +2352,68 @@ impl Simulator {
                     _ => false,
                 };
                 self.fn_ret_collection_stack.push(method_ret_collection);
+                // §13.4/§7.9.9: and whether it returns an ASSOCIATIVE array,
+                // so `return w;` snapshots the local before the frame is
+                // torn down (as for a free function); the caller read an
+                // empty array.
+                let method_ret_assoc = match &method.kind {
+                    ClassMethodKind::Function(f) => matches!(
+                        self.fn_ret_coll_dims(&f.return_type)
+                            .as_ref()
+                            .and_then(|d| d.first()),
+                        Some(crate::ast::types::UnpackedDimension::Associative { .. })
+                    ),
+                    _ => false,
+                };
+                self.fn_ret_assoc_stack.push(method_ret_assoc);
+                let method_ret_ctx = match &method.kind {
+                    ClassMethodKind::Function(f) => self
+                        .scalar_formal_integral(&f.return_type)
+                        .map_or(0, |(w, _)| w),
+                    _ => 0,
+                };
+                self.fn_ret_ctx_stack.push(method_ret_ctx);
+                let frame = match &method.kind {
+                    ClassMethodKind::Function(f) if Self::ret_may_take_pattern(&f.return_type) => {
+                        ReturnPatternType::Method(method.clone())
+                    }
+                    _ => ReturnPatternType::NotPacked,
+                };
+                self.fn_ret_frames.push(frame);
+                // §13.4.1: a method returning a queue, dynamic or associative
+                // array has a return VARIABLE of that type, which the body may
+                // fill in place (`build[k] = v`); declare it as a collection
+                // local, as for a free function.
+                let method_ret_coll: Option<crate::ast::decl::FunctionDeclaration> =
+                    match &method.kind {
+                        ClassMethodKind::Function(f)
+                            if fn_ret_name.is_some()
+                                && self.fn_ret_coll_dims(&f.return_type).is_some() =>
+                        {
+                            Some(f.clone())
+                        }
+                        _ => None,
+                    };
+                if let (Some(f), Some(rn)) = (&method_ret_coll, fn_ret_name) {
+                    if let Some(frame) = self.local_stack.last_mut() {
+                        frame.remove(rn);
+                    }
+                    self.widths.remove(rn);
+                    let decl = Statement::new(
+                        StatementKind::VarDecl {
+                            data_type: f.return_type.clone(),
+                            lifetime: None,
+                            declarators: vec![crate::ast::stmt::VarDeclarator {
+                                name: f.name.name.clone(),
+                                dimensions: Vec::new(),
+                                init: None,
+                                span: f.span,
+                            }],
+                        },
+                        f.span,
+                    );
+                    self.exec_statement(&decl);
+                }
                 // §6.21: open a static-local sync frame so a `static`
                 // local declared in the method body persists across calls.
                 // (Class methods previously never opened one — only free
@@ -2179,14 +2446,14 @@ impl Simulator {
                 } else {
                     None
                 };
-                // class-perf pilot: a fully-lowered Function body may run as
-                // bytecode instead of the AST interpreter. ALL-OR-NOTHING:
+                // class-perf pilot: a lowered Function body may run as
+                // bytecode instead of the AST interpreter.
                 // `try_run_compiled_method` returns None unless every
-                // statement lowered without a fallback, in which case the
-                // value is byte-identical to the interpreter by construction
-                // (the compiled block reads `this` members and locals from
-                // the same heap / register file the AST path uses). Gated off
-                // by default.
+                // statement lowered, or runs as a statement fallback carrying
+                // the registers it touches, in which case the value is
+                // byte-identical to the interpreter by construction (the
+                // compiled block reads `this` members and locals from the same
+                // heap / register file the AST path uses).
                 // Wait-free tasks compile like functions, after the same
                 // call-count tier: compiling every task on its first call
                 // paid a whole plan + compile for each of the many tasks a
@@ -2209,53 +2476,21 @@ impl Simulator {
                 {
                     self.return_value = Some(cval);
                 } else {
-                    // §6.16/§13.5: classify the callee's formal types under
-                    // its active specialization, independently of global
-                    // string flags. Common frame teardown removes this entry.
-                    if let Some(&fgen) = self.local_gen_stack.last() {
-                        if let Some(entry) = self.task_frame_strings(fgen, ports) {
-                            self.task_string_formals.push(entry);
+                    let string_ret = match &method.kind {
+                        ClassMethodKind::Function(f)
+                            if plan.ret.as_ref().is_some_and(|r| r.decl_string) =>
+                        {
+                            Some(f.name.name.name.as_str())
                         }
-                    }
-                    // Mark string-typed return variable, params, and class
-                    // properties only when the AST interpreter actually runs
-                    // this body (compiled bytecode never reads `string_signals`).
-                    let mut frame_string_signals: Vec<String> = Vec::new();
-                    self.string_signals_removed.push(Vec::new());
-                    if let ClassMethodKind::Function(f) = &method.kind {
-                        for port in ports.iter() {
-                            if !Self::is_string_data_type(&port.data_type) {
-                                self.forget_string_flag(&port.name.name);
-                            }
-                        }
-                        if plan.ret.as_ref().is_some_and(|r| r.decl_string) {
-                            if self.string_signals.insert(f.name.name.name.clone()) {
-                                frame_string_signals.push(f.name.name.name.clone());
-                            }
-                        }
-                    }
-                    for port in ports.iter() {
-                        if Self::is_string_data_type(&port.data_type) {
-                            if self.string_signals.insert(port.name.name.clone()) {
-                                frame_string_signals.push(port.name.name.clone());
-                            }
-                        }
-                    }
-                    let frame_string_props = found_string_props
-                        .clone()
-                        .unwrap_or_else(|| self.class_string_props_of(cname));
-                    let mut frame_string_prop_mask: u64 = 0;
-                    let mut frame_string_prop_more: Vec<usize> = Vec::new();
-                    for (i, sp) in frame_string_props.iter().enumerate() {
-                        if !self.string_signals.contains(sp) {
-                            self.string_signals.insert(sp.clone());
-                            if i < 64 {
-                                frame_string_prop_mask |= 1u64 << i;
-                            } else {
-                                frame_string_prop_more.push(i);
-                            }
-                        }
-                    }
+                        _ => None,
+                    };
+                    let string_frame = self.method_string_frame_begin(
+                        cname,
+                        ports,
+                        matches!(method.kind, ClassMethodKind::Function(_)),
+                        string_ret,
+                        found_string_props.clone(),
+                    );
                     // class-perf loop-heat boost (pass C): while this method
                     // body runs on the AST interpreter, attribute its loop
                     // back-edges to it so the measured-heat gate can admit
@@ -2296,12 +2531,7 @@ impl Simulator {
                     if heat_key.is_some() {
                         self.compiled_method_heat_stack.pop();
                     }
-                    ast_string_cleanup = Some((
-                        frame_string_signals,
-                        frame_string_props,
-                        frame_string_prop_mask,
-                        frame_string_prop_more,
-                    ));
+                    ast_string_cleanup = Some(string_frame);
                 } // end else: AST interpreter path
                 if let Some(prev) = _prev_meth {
                     CUR_METHOD_HASH.store(prev, Ordering::Relaxed);
@@ -2313,35 +2543,16 @@ impl Simulator {
                 // the locals frame is dropped.
                 self.sync_static_locals();
                 self.fn_ret_collection_stack.pop();
+                self.fn_ret_assoc_stack.pop();
+                self.fn_ret_ctx_stack.pop();
+                self.fn_ret_frames.pop();
                 // Declaration snapshots describe this activation's string
                 // flags. Restore them before reinstating the caller's flags
                 // (§6.21/§23.8), or an integral shadow can erase the caller's
                 // string classification after it has already been restored.
                 self.close_decl_shadow_frame();
-                if let Some((
-                    frame_string_signals,
-                    frame_string_props,
-                    frame_string_prop_mask,
-                    frame_string_prop_more,
-                )) = ast_string_cleanup
-                {
-                    for n in &frame_string_signals {
-                        self.string_signals.remove(n);
-                    }
-                    let mut mask = frame_string_prop_mask;
-                    while mask != 0 {
-                        let i = mask.trailing_zeros() as usize;
-                        mask &= mask - 1;
-                        self.string_signals.remove(&frame_string_props[i]);
-                    }
-                    for &i in &frame_string_prop_more {
-                        self.string_signals.remove(&frame_string_props[i]);
-                    }
-                    if let Some(removed) = self.string_signals_removed.pop() {
-                        for n in removed {
-                            self.string_signals.insert(n);
-                        }
-                    }
+                if let Some(string_frame) = ast_string_cleanup {
+                    self.method_string_frame_end(string_frame);
                 }
                 self.restore_spec_pooled(saved_spec);
                 if let Some(prev) = saved_resolve_hint {
@@ -2393,6 +2604,29 @@ impl Simulator {
                         }
                     }
                 }
+                // Falling off the end of a collection-returning method hands
+                // its return variable over as `return f;` does.
+                if let (Some(_), Some(rn)) = (&method_ret_coll, fn_ret_name)
+                    && self.return_value.is_none()
+                {
+                    let n = self
+                        .dyn_name_lookup(rn)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| rn.to_string());
+                    if self.is_associative_array(&n) {
+                        self.snapshot_ret_assoc(&n);
+                        self.return_value = Some(Value::zero(32));
+                    } else if self.module.dynamic_arrays.contains(&n) {
+                        if self.queue_elem_struct(&n).is_none() {
+                            const RET_SNAP: &str = "__xz_ret_coll__";
+                            self.copy_whole_queue(RET_SNAP, &n);
+                            self.pending_ret_collection = Some(RET_SNAP.to_string());
+                        } else {
+                            self.pending_ret_collection = Some(n);
+                        }
+                        self.return_value = Some(Value::zero(32));
+                    }
+                }
                 let implicit = fn_ret_name.and_then(|rn| {
                     let lv = self.local_stack.last().and_then(|m| m.get(rn).cloned());
                     // A `funcname = {a, b, ...}` string-concat assignment is
@@ -2417,6 +2651,24 @@ impl Simulator {
                 {
                     let (w, sg) = self.method_ret_typedef_fit(&f.return_type, &cname);
                     ret = Self::ret_convert(ret, ret_conv, w, sg);
+                }
+                // §8.25: a return typed by a class typedef sized by a class
+                // value parameter (`typedef bit [W-1:0] vec_t;`).
+                if dyn_ret_type.is_none()
+                    && !ret.is_real
+                    && !ret_is_string
+                    && let ClassMethodKind::Function(f) = &method.kind
+                    && matches!(&f.return_type, DataType::TypeReference { .. })
+                    && let Some(w) = self.method_formal_param_width(handle, &cname, &f.return_type)
+                {
+                    if w != ret.width {
+                        ret = ret.resize_for_assign(w);
+                    }
+                    if let DataType::TypeReference { name, .. } = &f.return_type
+                        && let Some(td) = self.class_local_typedef(&cname, &name.name.name)
+                    {
+                        ret.is_signed = super::elaborate::is_type_signed(td);
+                    }
                 }
                 // Per-instance return clamp for a class-parameter-sized
                 // return type: `box#(4)` with `function bit [W-1:0] mk()`
@@ -2581,11 +2833,7 @@ impl Simulator {
                 let vif_ended = if !vif_fast {
                     self.vif_formals_exit(vif_saved, &vif_formals, &outs)
                 } else if self.vif_local_names.len() == vif_len0 {
-                    // Still no formal name keyed: the exit only moves the
-                    // store generation again.
-                    if !ports.is_empty() {
-                        bump_store_gen();
-                    }
+                    // Still no formal name keyed: the exit writes nothing.
                     HashMap::default()
                 } else {
                     // The body keyed some name: replay the general exit from

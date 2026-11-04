@@ -607,6 +607,29 @@ impl Simulator {
                 {
                     return Some(w);
                 }
+                // §11.6.1 (#565): a subroutine formal or local is not a
+                // module-scope signal; its frame value carries the declared
+                // width (`logic [8:0] s` as a formal sizes `s === x + y`).
+                if h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && let Some(v) = self
+                        .local_stack
+                        .last()
+                        .and_then(|f| f.get(&h.path[0].name.name))
+                    && !v.is_real
+                    && v.width > 0
+                {
+                    return Some(v.width);
+                }
+                // §11.6.1 (#564): a dotted path rooted at a class VARIABLE
+                // (`e.st.sa`, `e.arr[0]`) is sized by walking the declared
+                // property types — no object is read.
+                if h.path.len() > 1
+                    && h.root.is_none()
+                    && let Some(w) = self.class_var_path_width(h)
+                {
+                    return Some(w);
+                }
                 // A CLASS-FIELD operand (e.g. a `time` / `longint` member of
                 // a `uvm_transaction`) isn't a module-scope signal, so the
                 // width tables above miss it. Falling back to the live
@@ -614,9 +637,56 @@ impl Simulator {
                 // operand correctly: `begin_time != -1` on a 64-bit `time`
                 // field otherwise sized `-1` as 32-bit and compared
                 // 64-bit-all-ones against 32'hFFFFFFFF as NOT equal.
-                if let Some((handle, prop)) = self.class_prop_receiver(expr) {
-                    if let Some(w) = self.class_prop_width_of(handle, &prop) {
-                        return Some(w);
+                // `class_prop_receiver` resolves the receiver to a heap handle,
+                // which for a call-rooted chain (`w.me().x`) would RUN the
+                // callee. §13.4 lets a call be evaluated once per evaluation and
+                // the owning statement owns that one, so only a call-free
+                // operand may be probed here.
+                if !Self::expr_contains_call(expr) {
+                    if let Some((handle, prop)) = self.class_prop_receiver(expr) {
+                        if let Some(w) = self.class_prop_width_of(handle, &prop) {
+                            return Some(w);
+                        }
+                    }
+                }
+                // §11.6.1: ELABORATION FLATTENS an owner-qualified name. `E::ta`
+                // does not stay a `MemberAccess` node — it arrives as a single
+                // `Ident` whose path is ["E","ta"]. Every probe above keys on a
+                // signal name or a live receiver, so a class-STATIC property read
+                // from module scope matches none of them: the operand fell back to
+                // its self-determined width and `s === E::ta + E::tb` compared the
+                // 9-bit 300 against an 8-bit 44.
+                //
+                // Ask the class declaration table directly. `class_prop_width_impl`
+                // with `handle = None` is the static path — no object, no
+                // evaluation — so the §13.4 rule that a sizing probe must never RUN
+                // a method still holds, and it stays None for every shape it cannot
+                // size, which is what the single-segment cases above rely on.
+                if h.root.is_none()
+                    && h.path.len() > 1
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                {
+                    // The owner is the first segment and the property the last --
+                    // exactly what joining the path with '.' and re-splitting it
+                    // would yield, without the Vec and String allocation on a path
+                    // this hot (`lrm_self_width` runs per operand per evaluation).
+                    let owner = h
+                        .path
+                        .first()
+                        .map(|s| s.name.name.as_str())
+                        .unwrap_or("");
+                    let prop = h
+                        .path
+                        .last()
+                        .map(|s| s.name.name.as_str())
+                        .unwrap_or("");
+                    if !owner.is_empty() && !prop.is_empty() && owner != prop {
+                        if let Some(w) = self
+                            .class_prop_width_impl(owner, None, prop)
+                            .filter(|w| *w > 0)
+                        {
+                            return Some(w);
+                        }
                     }
                 }
                 None
@@ -694,9 +764,49 @@ impl Simulator {
                 if let Some(w) = self.select_width(expr) {
                     return Some(w);
                 }
+                // A CLASS-MEMBER operand (`c.a`, `this.x`, `arg.a`) is not a
+                // module signal, so `select_width` misses it and the comparison
+                // used to fall to None — i.e. never widen. Size it from the
+                // property's DECLARATION through the live receiver, as the
+                // Ident arm above does for a bare class field.
+                // `class_prop_receiver` resolves the receiver to a heap handle,
+                // which for a call-rooted chain (`w.me().x`) would RUN the
+                // callee. §13.4 allows a call ONE evaluation per operand and the
+                // owning statement holds that one, so only a call-free operand
+                // may be probed here.
+                if !Self::expr_contains_call(expr) {
+                    if let Some((handle, prop)) = self.class_prop_receiver(expr) {
+                        if let Some(w) = self.class_prop_width_of(handle, &prop) {
+                            return Some(w);
+                        }
+                    }
+                }
+                // Still unresolved: a packed-struct field, an array element, a
+                // class STATIC, a package variable or a virtual-interface
+                // member. All of those size from a DECLARATION table.
+                if let Some(w) = self.declared_select_width(expr) {
+                    return Some(w);
+                }
+                // §11.6.1 (#564): an element of an array, queue or
+                // associative property reached from a class VARIABLE
+                // (`e.arr[0]`), sized from the declared property.
+                if let ExprKind::Index { expr: base, .. } = &expr.kind
+                    && let ExprKind::Ident(h) = &base.kind
+                    && h.root.is_none()
+                    && h.path.len() > 1
+                    && let Some(w) = self.class_var_path_width_impl(h, true)
+                {
+                    return Some(w);
+                }
                 (self.active_sva_site.is_some() && Self::cond_expr_is_effect_free(expr, false))
                     .then(|| self.eval_expr(expr).width)
             }
+            // A function-call operand: the callee's DECLARED return width,
+            // never by running the call (`call_return_width` is what
+            // `infer_width` uses for exactly this reason). Without it
+            // `f8a() + f8b()` sized as None and the comparison against a
+            // 9-bit RHS stayed 8-bit, so 200+100 wrapped to 44.
+            ExprKind::Call { func, .. } => self.call_return_width(func),
             // §6.24.1: a size cast `N'(x)` is N bits wide.
             ExprKind::SystemCall { name, args }
                 if name == "$__xz_size_cast" || name == "$__xz_named_cast" =>
@@ -716,6 +826,339 @@ impl Simulator {
                     .iter()
                     .try_fold(0u32, |w, p| Some(w + self.lrm_self_width(p)?))?;
                 n.checked_mul(w)
+            }
+            _ => None,
+        }
+    }
+
+    /// Declaration-table width of a class-member / handle-member / select
+    /// operand, without evaluating anything.
+    ///
+    /// `lrm_self_width` already resolves a live class member through
+    /// `class_prop_receiver` + `class_prop_width_of`; what is left are the
+    /// shapes that walk past that: a packed-struct FIELD of a class property
+    /// (`c.st.sa`), an element of a class-owned array (`c.arr[i]`), a package
+    /// variable (`pkg::pa`), a class static (`E::ta`) and a virtual-interface
+    /// member (`vif.data`). All of them are answerable from the elaboration
+    /// tables, so the width path stays side-effect free.
+    /// The declared width of `v.p1.p2...` where `v` is a class-typed
+    /// variable: each segment is a property of the class so far, the
+    /// walk descends through class-typed properties and, for a packed
+    /// struct property, ends at a field; an indexed last segment is an
+    /// element of an array, queue or associative property (§11.6.1).
+    fn class_var_path_width(&mut self, h: &HierarchicalIdentifier) -> Option<u32> {
+        self.class_var_path_width_impl(h, false)
+    }
+
+    /// `class_var_path_width` for a path whose last segment is indexed by
+    /// an enclosing `Index` node (`e.arr[0]` parses that way).
+    fn class_var_path_width_impl(
+        &mut self,
+        h: &HierarchicalIdentifier,
+        indexed_last: bool,
+    ) -> Option<u32> {
+        let decl = self.class_of_var(&h.path[0].name.name)?;
+        let mut cls = decl.split('#').next().unwrap_or(&decl).to_string();
+        let mut i = 1;
+        while i < h.path.len() {
+            let seg = &h.path[i];
+            let name = seg.name.name.clone();
+            let last = i + 1 == h.path.len();
+            let owners = self.prop_owners(&cls);
+            let (_, cd) = owners.get(&name)?;
+            let elem_w = cd
+                .array_properties
+                .get(&name)
+                .map(|&(_, _, w)| w)
+                .or_else(|| cd.queue_properties.get(&name).map(|(w, _)| *w))
+                .or_else(|| cd.assoc_index_props.get(&name).map(|(w, _)| *w));
+            let type_name = cd.properties.get(&name).and_then(|s| s.type_name.clone());
+            let whole_w = cd.properties.get(&name).map(|s| s.value.width);
+            if last {
+                return if seg.selects.is_empty() && !indexed_last {
+                    whole_w.filter(|w| *w > 0)
+                } else {
+                    elem_w.filter(|w| *w > 0)
+                };
+            }
+            if !seg.selects.is_empty() {
+                return None;
+            }
+            let tn = type_name?;
+            if self.module.classes.contains_key(&tn) {
+                cls = tn;
+                i += 1;
+                continue;
+            }
+            // A packed struct property: the rest of the path names a field.
+            let dt = self.p_type_by_name(&tn)?;
+            let fields = xezim_core::elaborate::packed_struct_field_layout(
+                &dt,
+                &self.module.parameters,
+                &self.module.typedefs,
+                &self.module.typedef_types,
+            )?;
+            let rest: Vec<&str> = h.path[i + 1..].iter().map(|s| s.name.name.as_str()).collect();
+            if h.path[i + 1..].iter().any(|s| !s.selects.is_empty()) {
+                return None;
+            }
+            let leaf = *rest.last()?;
+            let joined = rest.join(".");
+            return fields
+                .iter()
+                .find(|(f, _, _)| f.trim_start_matches('.') == joined)
+                .or_else(|| fields.iter().find(|(f, _, _)| f.rsplit('.').next() == Some(leaf)))
+                .map(|(_, _, w)| *w)
+                .filter(|w| *w > 0);
+        }
+        None
+    }
+
+    fn declared_select_width(&mut self, expr: &Expression) -> Option<u32> {
+        use crate::ast::expr::ExprKind;
+        // A chain rooted at a CALL (`w.me().x`, `q.pop_front().addr`) is owned
+        // by the statement that memoized its receiver: probing it here would
+        // run the callee again and break §13.4's "one call per evaluation".
+        // Those shapes stay on the memoized path.
+        if Self::expr_contains_call(expr) {
+            return None;
+        }
+        // (a) `base.member`: the field width comes from the packed layout of
+        //     the property that `base` names.
+        if let ExprKind::MemberAccess { expr: base, member } = &expr.kind {
+            if let Some((_cls, _prop, _h, dt)) = self.declared_prop_chain_type(base) {
+                if let Some(fields) = xezim_core::elaborate::packed_struct_field_layout(
+                    &dt,
+                    &self.module.parameters,
+                    &self.module.typedefs,
+                    &self.module.typedef_types,
+                ) {
+                    if let Some((_, _, w)) = fields.iter().find(|(f, _, _)| {
+                        f.rsplit('.').next() == Some(member.name.as_str())
+                    }) {
+                        if *w > 0 {
+                            return Some(*w);
+                        }
+                    }
+                }
+            }
+        }
+        // (b) `base[i]` / `base[a:b]`: the element width of the collection
+        //     that `base` names.
+        if let ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } =
+            &expr.kind
+        {
+            if let Some((cls, prop, _h, dt)) = self.declared_prop_chain_type(base) {
+                if let Some(cd) = self.module.classes.get(&cls) {
+                    let hit = cd
+                        .array_properties
+                        .get(&prop)
+                        .map(|&(_, _, w)| w)
+                        .or_else(|| cd.queue_properties.get(&prop).map(|(w, _)| *w))
+                        .or_else(|| cd.assoc_index_props.get(&prop).map(|(w, _)| *w))
+                        .or_else(|| {
+                            cd.static_fixed_arrays
+                                .iter()
+                                .find(|(n, _, _, _)| *n == prop)
+                                .map(|&(_, _, _, w)| w)
+                        })
+                        .or_else(|| {
+                            cd.static_collections
+                                .iter()
+                                .find(|(n, _, _)| *n == prop)
+                                .map(|&(_, _, w)| w)
+                        });
+                    if let Some(w) = hit.filter(|w| *w > 0) {
+                        return Some(w);
+                    }
+                }
+                // A declared packed type narrower than the whole property is
+                // the ELEMENT type of an array-like property. A plain vector
+                // select is answered by `select_width` before reaching here.
+                let whole = self.class_prop_width_impl(&cls, None, &prop).unwrap_or(0);
+                let ew = xezim_core::elaborate::resolve_type_width(
+                    &dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                if ew > 0 && ew < whole {
+                    return Some(ew);
+                }
+            }
+        }
+        // (c) Owner-qualified names: `pkg::pa`, `E::ta`, `ifc.q1`.
+        let cands: Vec<String> = match self.declared_dotted_name(expr) {
+            Some(d) => vec![d.clone(), format!("{}.{}", d, d)],
+            None => Vec::new(),
+        };
+        for cand in &cands {
+            let owner = cand.split('.').next().unwrap_or("");
+            let prop = cand.rsplit('.').next().unwrap_or("");
+            if owner.is_empty() || prop.is_empty() || owner == prop {
+                continue;
+            }
+            if let Some(w) = self.class_prop_width_impl(owner, None, prop).filter(|w| *w > 0) {
+                return Some(w);
+            }
+            if let Some(Some(h)) = self.this_stack.last().copied() {
+                if let Some(w) = self.class_prop_width_impl(owner, Some(h), prop).filter(|w| *w > 0) {
+                    return Some(w);
+                }
+            }
+            if self.module.packages.contains(owner) {
+                if let Some(w) = self.lookup_signal_width(prop).filter(|w| *w > 0) {
+                    return Some(w);
+                }
+            }
+            if let Some(w) = self.lookup_signal_width(cand).filter(|w| *w > 0) {
+                return Some(w);
+            }
+        }
+        // (d) Virtual-interface member: `vif.data` sizes from the interface
+        //     instance the handle's `vif` property is bound to.
+        if let ExprKind::MemberAccess { expr: base, member } = &expr.kind {
+            // The receiver of a virtual-interface member is the property that
+            // HOLDS the vif (`vif` in `vif.data`); it is declared in
+            // `virtual_iface_properties`, not `property_types`, so the class is
+            // taken from the live receiver (or the enclosing class) instead of
+            // from a property table lookup.
+            let live_cls = self
+                .heap
+                .get(self.this_stack.last().copied().flatten().unwrap_or(0))
+                .and_then(|o| o.as_ref().map(|i| i.class_name.clone()))
+                .or_else(|| self.class_context_stack.last().and_then(|c| c.clone()));
+            // The vif property is the RECEIVER (`vif` in `vif.data`), not the
+            // member being read.
+            let recv_prop = match &base.kind {
+                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
+                ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
+                _ => None,
+            };
+            if let Some(recv_prop) = recv_prop {
+            if let Some(cls) = self
+                .declared_prop_chain_class(base)
+                .or_else(|| live_cls)
+            {
+                if self.class_vif_decl(&cls, &recv_prop).is_some() {
+                    if let Some(h) = self.this_stack.last().copied().flatten() {
+                        if let Some((bound, _mp)) = self
+                            .virtual_iface_bindings
+                            .get(&(h, recv_prop.clone()))
+                            .cloned()
+                        {
+                            let sig = format!("{}.{}", bound, member.name);
+                            if let Some(w) = self.lookup_signal_width(&sig).filter(|w| *w > 0) {
+                                return Some(w);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(bound) = self.iface_alias_for(&recv_prop) {
+                let sig = format!("{}.{}", bound, member.name);
+                if let Some(w) = self.lookup_signal_width(&sig).filter(|w| *w > 0) {
+                    return Some(w);
+                }
+            }
+            }
+        }
+        None
+    }
+
+    /// The class that owns the property named at the end of a plain property
+    /// chain (`c.st`, `st`, `this.st`), the property name, the receiver handle
+    /// when one is known, and the property's declared `DataType`.
+    fn declared_prop_chain_type(
+        &mut self,
+        expr: &Expression,
+    ) -> Option<(String, String, Option<usize>, crate::ast::types::DataType)> {
+        use crate::ast::expr::ExprKind;
+        let (base, prop) = match &expr.kind {
+            ExprKind::MemberAccess { expr, member } => (Some(&**expr), member.name.as_str()),
+            ExprKind::Ident(name) => (None, name.path.last()?.name.name.as_str()),
+            _ => return None,
+        };
+        fn this_cls(sim: &mut Simulator) -> Option<(usize, String)> {
+            let h = sim.this_stack.last().copied().flatten()?;
+            let cls = sim.heap.get(h)?.as_ref()?.class_name.clone();
+            Some((h, cls))
+        }
+        let (handle, cls) = match base {
+            None => {
+                let (h, cls) = this_cls(self)?;
+                (Some(h), cls)
+            }
+            Some(b) => match &b.kind {
+                ExprKind::This => {
+                    let (h, cls) = this_cls(self)?;
+                    (Some(h), cls)
+                }
+                ExprKind::Ident(name) => {
+                    let n = name.path.last()?.name.name.as_str();
+                    if n == "this" {
+                        let (h, cls) = this_cls(self)?;
+                        (Some(h), cls)
+                    } else {
+                        let v = if let Some(locals) = self.local_stack.last() {
+                            locals.get(n).cloned()
+                        } else {
+                            None
+                        }
+                        .or_else(|| self.get_signal_value_by_name(n))?;
+                        let h = v.to_u64()? as usize;
+                        if h == 0 {
+                            return None;
+                        }
+                        (Some(h), self.heap.get(h)?.as_ref()?.class_name.clone())
+                    }
+                }
+                _ => return None,
+            },
+        };
+        let owners = self.prop_owners(&cls);
+        let (ocn, cd) = owners.get(prop)?;
+        let dt = cd.property_types.get(prop)?.clone();
+        Some((ocn.clone(), prop.to_string(), handle, dt))
+    }
+
+    /// Just the owning class of [`Self::declared_prop_chain_type`], for the
+    /// shapes that only need the class (virtual-interface declarations).
+    fn declared_prop_chain_class(&mut self, expr: &Expression) -> Option<String> {
+        use crate::ast::expr::ExprKind;
+        let inner = match &expr.kind {
+            ExprKind::MemberAccess { expr: base, .. } | ExprKind::Index { expr: base, .. } => {
+                base.clone()
+            }
+            ExprKind::Ident(_) => Box::new(expr.clone()),
+            _ => return None,
+        };
+        self.declared_prop_chain_type(&inner).map(|(c, _, _, _)| c)
+    }
+
+    /// Dotted name of a plain member-access chain (`c.st.sa` -> `"c.st.sa"`,
+    /// `"e.st.sa"`, `arr` -> `"arr"`), built from the AST alone. None for any
+    /// shape that is not a pure chain of bare identifiers — a select, a call,
+    /// a scoped `::` name — so callers never mistake those for a struct field.
+    fn declared_dotted_name(&self, expr: &Expression) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(h) => {
+                if h.root.is_some()
+                    || h.path.is_empty()
+                    || h.path.iter().any(|s| !s.selects.is_empty())
+                {
+                    return None;
+                }
+                Some(
+                    h.path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                )
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let base = self.declared_dotted_name(expr)?;
+                Some(format!("{base}.{}", member.name))
             }
             _ => None,
         }
@@ -837,12 +1280,6 @@ impl Simulator {
         expr: &Expression,
         items: &[Expression],
     ) -> Option<u32> {
-        if !matches!(
-            Self::unparen(expr).kind,
-            ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
-        ) {
-            return None;
-        }
         let mut bounds: Vec<(&Expression, bool)> = Vec::with_capacity(items.len());
         for it in items {
             match &it.kind {
@@ -888,21 +1325,30 @@ impl Simulator {
         expr: &Expression,
         bounds: &[(&Expression, bool)],
     ) -> Option<u32> {
-        // Only an operation's result depends on the width it is computed
-        // at; a variable or literal compares the same either way.
-        if !matches!(
-            Self::unparen(expr).kind,
-            ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
-        ) || self.operand_is_string(expr)
-        {
+        // §11.4.13: EVERY operand is sized to the widest of them all, and the
+        // widening matters for any operand whose RESULT depends on the width
+        // it is computed at — an arithmetic/relational/conditional operation.
+        // Either side can be that operation: `x inside {a+b}` and
+        // `a+b inside {x}` both have to size `a+b` at the joint width, so the
+        // tested expression being a plain variable is no reason to bail.
+        let op_shaped = |e: &Expression| {
+            matches!(
+                Self::unparen(e).kind,
+                ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
+            )
+        };
+        if self.operand_is_string(expr) {
             return None;
         }
         let own = self.lrm_self_width(expr)?;
-        if own == 64 {
-            // possibly real (§11.8.2): leave it to the per-item compare
+        // §11.4.13: 64-bit integers still supply context to narrower
+        // range expressions. Width alone does not make an operand real.
+        if self.expr_is_real_static(expr) || self.call_returns_real(expr) {
             return None;
         }
         let mut w = own;
+        // The narrowest operand that would change value if computed at `w`.
+        let mut narrowest = op_shaped(expr).then_some(own);
         for &(b, item) in bounds {
             if matches!(b.kind, ExprKind::Dollar) {
                 continue;
@@ -917,12 +1363,19 @@ impl Simulator {
                 }
                 continue;
             }
-            if self.operand_is_string(b) {
+            if self.operand_is_string(b)
+                || self.expr_is_real_static(b)
+                || self.call_returns_real(b)
+            {
                 return None;
             }
-            w = w.max(self.lrm_self_width(b)?);
+            let bw = self.lrm_self_width(b)?;
+            w = w.max(bw);
+            if op_shaped(b) {
+                narrowest = Some(narrowest.map_or(bw, |n| n.min(bw)));
+            }
         }
-        (w > own).then_some(w)
+        (w > own || narrowest.is_some_and(|n| w > n)).then_some(w)
     }
 
     /// §12.5: a case expression and its item expressions are sized to the
@@ -1055,6 +1508,13 @@ impl Simulator {
                 // the rvalue at the right bit boundaries.
                 if let Some(w) = self.packed_field_width(&n) {
                     return (w, stable);
+                }
+                // Class properties have no signal entry. In particular a
+                // concatenation lvalue must split its RHS using each declared
+                // property width, not the one-bit unknown-name fallback.
+                // Receiver/parameter-dependent widths cannot be node-cached.
+                if let Some(w) = self.lrm_self_width(expr) {
+                    return (w, false);
                 }
                 (1, false)
             }

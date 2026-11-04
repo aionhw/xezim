@@ -2,6 +2,10 @@
 //! `'{key:value, ...}` over the populated keys, not as a single element.
 //! Integer keys sort numerically, string keys are quoted, and struct elements
 //! recurse.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -40,9 +44,9 @@ fn p_format_assoc_arrays_print_key_value_pairs() {
     let sim = simulate(SRC, 100).expect("simulate failed");
 
     // Integer keys: numeric order, not lexical ("10" < "20" < "3" lexically).
-    assert_eq!(line(&sim, "AI="), "AI='{3:30, 10:100, 20:200 }");
+    assert_eq!(line(&sim, "AI="), "AI='{3:30, 10:100, 20:200}");
     // String keys are quoted.
-    assert_eq!(line(&sim, "AS="), r#"AS='{"a":1, "b":2 }"#);
+    assert_eq!(line(&sim, "AS="), r#"AS='{"a":1, "b":2}"#);
     // Struct elements recurse (enum label + quoted string).
-    assert_eq!(line(&sim, "CS="), r#"CS='{5:'{tgl:OFF, str:"five"} }"#);
+    assert_eq!(line(&sim, "CS="), r#"CS='{5:'{tgl:OFF, str:"five"}}"#);
 }

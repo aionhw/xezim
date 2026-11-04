@@ -24,6 +24,25 @@ fn c19_6_cross_coverage() {
     );
 }
 
+// §11.4.12, §19.5: bin range bounds written as constant concatenations or
+// replications; the bins were dropped and the coverpoints read 0.00.
+#[test]
+fn c19_bins_concat_bound() {
+    check(
+        "c19_bins_concat_bound",
+        include_str!("sv/c19_bins_concat_bound.sv"),
+        "c19_bins_concat_bound",
+        Order::Exact,
+        &[
+            "T|module|66.67",
+            "T|module_all|100.00",
+            "T|class4|100.00",
+            "T|class8|25.00",
+        ],
+        &[],
+    );
+}
+
 // §19.5.3, §19.5.6, §19.6: covergroups, coverpoints, bins, auto bins
 #[test]
 fn c19_coverage_basic() {

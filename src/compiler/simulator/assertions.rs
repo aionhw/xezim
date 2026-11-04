@@ -729,17 +729,31 @@ impl Simulator {
     /// implication is nonvacuous iff some consequent started by a match was
     /// nonvacuous; each compound operator keeps a recursive rule. For a
     /// pending operand the value is how far the attempt has established
-    /// nonvacuity, which is enough because a compound body only resolves an
-    /// operand once it has resolved.
+    /// nonvacuity; an `or` that already holds settles on it without waiting
+    /// for the operand to resolve.
     fn sva_attempt_nonvacuous(node: &SvaNode, st: &SvaState) -> bool {
         match (node, st) {
             // §16.14.8: an evaluation attempt of a sequence expression is
             // always nonvacuous, whether the sequence matched or failed.
             (SvaNode::Seq(..), SvaState::Seq(_)) => true,
+            // A match that started a consequent whose attempt is nonvacuous
+            // (a sequence always is) makes the implication nonvacuous before
+            // that consequent resolves. A nonoverlapped consequent still
+            // waiting for its first clock tick has not started yet.
             (
-                SvaNode::Impl { .. } | SvaNode::Followed { .. },
-                SvaState::Impl { nonvacuous, .. } | SvaState::Followed { nonvacuous, .. },
-            ) => *nonvacuous,
+                SvaNode::Impl { cons: cn, .. } | SvaNode::Followed { cons: cn, .. },
+                SvaState::Impl {
+                    nonvacuous, cons, ..
+                }
+                | SvaState::Followed {
+                    nonvacuous, cons, ..
+                },
+            ) => {
+                *nonvacuous
+                    || cons
+                        .iter()
+                        .any(|(delay, cs)| *delay == 0 && Self::sva_attempt_nonvacuous(cn, cs))
+            }
             (SvaNode::Not(inner), SvaState::Not(ist)) => Self::sva_attempt_nonvacuous(inner, ist),
             (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
                 Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b)
@@ -1474,10 +1488,18 @@ impl Simulator {
                 if rb.is_none() {
                     *rb = self.sva_advance(nb, b);
                 }
-                // §16.14.8: a nonvacuous success of either operand already
-                // decides a nonvacuous success for the `or`, regardless of the
-                // other operand.
-                if *ra == Some(SvaOutcome::Pass) || *rb == Some(SvaOutcome::Pass) {
+                // §16.12.6: `p or q` holds as soon as either operand holds,
+                // whatever the other still owes. §16.14.8: it is nonvacuous if
+                // either operand's attempt is, so once an operand holds and
+                // either attempt has established nonvacuity, the `or` is a
+                // nonvacuous success even while the other operand is pending
+                // (say a strong obligation that may never resolve).
+                let holds = |r: &Option<SvaOutcome>| {
+                    matches!(r, Some(SvaOutcome::Pass | SvaOutcome::Vacuous))
+                };
+                if (holds(ra) || holds(rb))
+                    && (Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b))
+                {
                     return Some(SvaOutcome::Pass);
                 }
                 // Otherwise the `or` succeeds unless both operands fail, and
@@ -1604,6 +1626,7 @@ impl Simulator {
         a: &crate::ast::stmt::AssertionStatement,
         events: Vec<EventExpr>,
         body: Expression,
+        label: Option<&str>,
     ) {
         use crate::ast::stmt::AssertionKind;
         let span_key = a.span.start;
@@ -1779,9 +1802,11 @@ impl Simulator {
             Some(Edge::Negedge) => 1,
             _ => 2,
         };
+        let stat_key = Self::assert_stat_key(span_key, src);
+        self.note_assert_label(stat_key, label);
         self.sva_sites.push(SvaClockedSite {
             span_key,
-            stat_key: Self::assert_stat_key(span_key, src),
+            stat_key,
             stat_loc: (src, span_key),
             dedup_scope: self.current_scope.clone(),
             kind,
@@ -2476,6 +2501,9 @@ impl Simulator {
                     self.sva_collect_action_sampled_expr(item.expr(), out, sels);
                 }
             }
+            ExprKind::TypedPattern { pattern, .. } => {
+                self.sva_collect_action_sampled_expr(pattern, out, sels)
+            }
             ExprKind::NamedArg {
                 expr: Some(expr), ..
             } => self.sva_collect_action_sampled_expr(expr, out, sels),
@@ -2513,6 +2541,16 @@ impl Simulator {
             })
             .collect();
         for n in names {
+            // §14.3: an unpacked-array clockvar has no signal of its own;
+            // its elements are sampled one by one.
+            if let Some(elems) = self.clocking_array_elems(&n) {
+                for (_, e) in elems {
+                    if let Some(v) = self.get_signal_value_by_name(&e) {
+                        self.clocking_preponed.insert(e, v);
+                    }
+                }
+                continue;
+            }
             if let Some(v) = self.get_signal_value_by_name(&n) {
                 self.clocking_preponed.insert(n, v);
             }

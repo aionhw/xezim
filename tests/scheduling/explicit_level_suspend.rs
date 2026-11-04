@@ -107,13 +107,23 @@ fn queued_flow_drains_with_edge_skipping_enabled_and_disabled() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/scheduling/fixtures/queued_flow.sv"
     );
-    for (skip, armed) in [("1", "1"), ("1", "0"), ("0", "1")] {
-        let result = Command::new(env!("CARGO_BIN_EXE_xezim"))
-            .env("XEZIM_EVENT_EDGE", skip)
-            .env("XEZIM_ARMED_EDGE", armed)
-            .args([source, "-s", "flow_tb", "--max-time", "50ns"])
-            .output()
-            .expect("run simulator");
+    // The three configurations are independent runs: start them together.
+    let runs: Vec<_> = [("1", "1"), ("1", "0"), ("0", "1")]
+        .into_iter()
+        .map(|(skip, armed)| {
+            let child = Command::new(env!("CARGO_BIN_EXE_xezim"))
+                .env("XEZIM_EVENT_EDGE", skip)
+                .env("XEZIM_ARMED_EDGE", armed)
+                .args([source, "-s", "flow_tb", "--max-time", "50ns"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("run simulator");
+            (skip, child)
+        })
+        .collect();
+    for (skip, child) in runs {
+        let result = child.wait_with_output().expect("run simulator");
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&result.stdout),

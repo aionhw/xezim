@@ -17,10 +17,10 @@ impl Simulator {
         if self.event_waiters.iter().any(|w| w.pid == pid) {
             return true;
         }
-        if self.condition_waiters.iter().any(|(p, _)| *p == pid) {
+        if self.condition_waiters.contains_pid(pid) {
             return true;
         }
-        if self.ready_condition_waiters.iter().any(|(p, _)| *p == pid) {
+        if self.ready_condition_waiters.contains_pid(pid) {
             return true;
         }
         // A process parked by `#0` in the Inactive-region queue (§4.4.2.3)
@@ -71,7 +71,7 @@ impl Simulator {
         // `InstanceEventWaiter`. Without this a `fork...join_any` whose child
         // is the `@m_event` waiter (e.g. event abort branch) fired
         // the join prematurely, killing the loop branch.
-        if self.instance_event_waiters.iter().any(|w| w.pid == pid) {
+        if self.instance_event_waiters.contains_pid(pid) {
             return true;
         }
         // §15.4.1: a producer parked on a FULL bounded mailbox, and §15.3.3 a
@@ -182,15 +182,13 @@ impl Simulator {
         to_kill.extend(self.collect_fork_descendants(pid));
         for &p in &to_kill {
             self.killed_pids.insert(p);
+            self.release_killed_process_state(p);
             self.vc_cancel_process(p);
             self.finished_pids.remove(&p);
             self.suspended_pids.remove(&p);
             self.suspended_proc_info.remove(&p);
             self.process_parents.remove(&p);
             self.process_contexts.remove(&p);
-            self.fork_baselines.remove(&p);
-            self.fork_signal_captures.remove(&p);
-            self.suspended_loop_frames.remove(&p);
         }
         // Purge from every scheduling structure — every DESCENDANT's
         // future-time #delay too, or the wheel keeps reporting activity
@@ -199,8 +197,7 @@ impl Simulator {
             self.event_queue.remove_pid(p);
         }
         self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
-        self.instance_event_waiters
-            .retain(|w| !to_kill.contains(&w.pid));
+        self.instance_event_waiters.remove_pids(to_kill.iter());
         self.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
         self.ready_condition_waiters
             .retain(|(p, _)| !to_kill.contains(p));
@@ -447,21 +444,97 @@ impl Simulator {
         }
     }
 
+    /// Process ids are never reused. Compiled loops and prepared forever
+    /// continuations belonging to a terminated process cannot run again.
+    /// Per-process state a killed process (`kill()`, `disable fork`,
+    /// `disable <label>`) never releases through `child_finished`.
+    pub(super) fn release_killed_process_state(&mut self, pid: usize) {
+        self.release_process_execution_caches(pid);
+        self.fork_baselines.remove(&pid);
+        self.fork_local_scopes.remove(&pid);
+        self.release_fork_collections(pid);
+        self.fork_signal_captures.remove(&pid);
+        self.suspended_loop_frames.remove(&pid);
+    }
+
+    fn release_process_execution_caches(&mut self, pid: usize) {
+        if !self.exec_cache_pids.remove(&pid) {
+            return;
+        }
+        self.process_loop_bytecode.retain(|&(p, _, _), _| p != pid);
+        self.process_cond_bytecode.retain(|&(p, _, _), _| p != pid);
+        self.forever_cont_cache.retain(|&(p, _, _, _, _), _| p != pid);
+        self.forever_sens_cache.retain(|&(p, _), _| p != pid);
+    }
+
+    /// §24.3: program process `pid` has ended. When it was the last of its
+    /// program's initial procedures, the program's other processes (their
+    /// descendants) end with it; when no thread that originated in a program
+    /// initial procedure is left, the run ends by an implicit `$finish`. The
+    /// run used to go on to the time limit.
+    pub(super) fn program_process_ended(&mut self, pid: usize) {
+        let Some(scope) = self.program_pid_scope.remove(&pid) else {
+            return;
+        };
+        // A process ended by `disable fork` or `kill()` never passes here.
+        let killed: Vec<usize> = (self.program_pid_scope.keys())
+            .copied()
+            .filter(|p| self.killed_pids.contains(p))
+            .collect();
+        for p in killed {
+            if let Some(s) = self.program_pid_scope.remove(&p)
+                && self.program_initial_pids.remove(&p)
+                && let Some(n) = self.program_initials_live.get_mut(&s)
+            {
+                *n = n.saturating_sub(1);
+            }
+        }
+        if self.program_initial_pids.remove(&pid) {
+            let left = self.program_initials_live.get_mut(&scope).map_or(0, |n| {
+                *n = n.saturating_sub(1);
+                *n
+            });
+            if left == 0 {
+                let rest: Vec<usize> = self
+                    .program_pid_scope
+                    .iter()
+                    .filter(|(_, s)| **s == scope)
+                    .map(|(&p, _)| p)
+                    .collect();
+                for p in rest {
+                    self.program_pid_scope.remove(&p);
+                    self.program_pids.remove(&p);
+                    self.proc_kill(p);
+                }
+            }
+        }
+        if self.program_pid_scope.is_empty()
+            && !self.program_initials_live.is_empty()
+            && self.program_initials_live.values().all(|&n| n == 0)
+        {
+            self.flush_file_writes();
+            self.finished = true;
+        }
+    }
+
     pub(super) fn child_finished(&mut self, child_pid: usize) {
         self.finished_pids.insert(child_pid);
+        self.release_process_execution_caches(child_pid);
         // A fork child's inherited `%m` chain (`inherit_fork_m_scope`) is
         // never unwound by its own statements.
         if !self.process_m_scope.is_empty() {
             self.process_m_scope.remove(&child_pid);
         }
-        if !self.program_pids.is_empty() {
-            self.program_pids.remove(&child_pid);
+        if !self.program_pids.is_empty() && self.program_pids.remove(&child_pid) {
+            self.program_process_ended(child_pid);
         }
         if !self.process_m_label.is_empty() && self.process_parents.contains_key(&child_pid) {
             self.process_m_label.remove(&child_pid);
         }
         self.suspended_loop_frames.remove(&child_pid);
         self.fork_baselines.remove(&child_pid);
+        self.fork_local_scopes.remove(&child_pid);
+        self.release_fork_collections(child_pid);
         self.fork_signal_captures.remove(&child_pid);
         self.process_contexts.remove(&child_pid);
         // §9.7: wake any process awaiting this one's termination.

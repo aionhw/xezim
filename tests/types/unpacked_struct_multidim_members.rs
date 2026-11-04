@@ -11,6 +11,10 @@
 //! nonblocking whole-struct assignment, lost it as well.
 //!
 //! Expected values are the reference simulator's.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -64,9 +68,9 @@ fn multidim_member_survives_every_operation() {
             "  obs Cd2  uq[0].mm[1][1] = 33 (want 33)",
             "  obs Cd3  uq[0].mm[1][1] = 88 (want 88)",
             "  obs Cd3b uq[1].mm[1][1] = 33 (want 33)",
-            "  obs Cf   '{sc:161, sd:'{34, 35}, mm:'{'{48, 49}, '{50, 51}}}",
-            "  obs Cg   '{'{48, 49}, '{50, 51}}",
-            "  obs CfS  ['{sc:161, sd:'{34, 35}, mm:'{'{48, 49}, '{50, 51}}}]",
+            "  obs Cf   '{sc:'ha1, sd:'{'h22, 'h23}, mm:'{'{'h30, 'h31}, '{'h32, 'h33}}}",
+            "  obs Cg   '{'{'h30, 'h31}, '{'h32, 'h33}}",
+            "  obs CfS  ['{sc:'ha1, sd:'{'h22, 'h23}, mm:'{'{'h30, 'h31}, '{'h32, 'h33}}}]",
             "  obs Lc   mLc.mm[i][j] = e1 (want e1)",
             "  obs Ld   pLd.pm[1][7:4] = f (want f)",
             "  obs Le   sum = 198 (want 198)",
@@ -526,15 +530,15 @@ endmodule
         o,
         [
             "T|copy a10=3 a02=2 b21=0201 c=-5 d111=15 d010=04",
-            "T|p '{a:'{'{3, 4, 5}, '{0, 1, 2}}, b:'{'{0, 1}, '{256, 257}, '{512, 513}}, c:-5, d:'{'{'{4, 5}, '{0, 1}}, '{'{20, 21}, '{16, 17}}}}",
+            "T|p '{a:'{'{'h3, 'h4, 'h5}, '{'h0, 'h1, 'h2}}, b:'{'{'h0, 'h1}, '{'h100, 'h101}, '{'h200, 'h201}}, c:-5, d:'{'{'{4, 5}, '{0, 1}}, '{'{20, 21}, '{16, 17}}}}",
             "T|pd '{'{'{4, 5}, '{0, 1}}, '{'{20, 21}, '{16, 17}}}",
             "T|eq 1 0",
             "T|eq2 0 1",
             "T|cls a11=4 b20=0200 d101=11",
             "T|pat sd0=22 sd1=11 mm00=33 mm01=34 mm10=31 mm11=32",
-            "T|dp '{sd:'{17, 34}, mm:'{'{49, 50}, '{51, 52}}}",
-            "T|mmpat '{'{9, 8}, '{12, 13}}",
-            "T|dflt '{sd:'{5, 5}, mm:'{'{5, 5}, '{5, 5}}}",
+            "T|dp '{sd:'{'h11, 'h22}, mm:'{'{'h31, 'h32}, '{'h33, 'h34}}}",
+            "T|mmpat '{'{'h9, 'h8}, '{'hc, 'hd}}",
+            "T|dflt '{sd:'{'h5, 'h5}, mm:'{'{'h5, 'h5}, '{'h5, 'h5}}}",
         ],
         "{o:#?}"
     );
@@ -626,16 +630,16 @@ endmodule
         o,
         [
             "T|in mm11=33 mm01=31 sd1=23",
-            "T|inp '{sc:161, sd:'{34, 35}, mm:'{'{48, 49}, '{50, 51}}}",
+            "T|inp '{sc:'ha1, sd:'{'h22, 'h23}, mm:'{'{'h30, 'h31}, '{'h32, 'h33}}}",
             "T|meth mm11=33 mm01=31 sd1=23 sc=a1",
             "T|got 33",
             "T|mout mm01=b1 sd0=b0",
-            "T|ret '{sc:96, sd:'{0, 0}, mm:'{'{96, 97}, '{98, 99}}}",
-            "T|inout '{sc:96, sd:'{0, 189}, mm:'{'{96, 97}, '{190, 99}}}",
-            "T|ref '{sc:172, sd:'{173, 189}, mm:'{'{174, 97}, '{190, 99}}}",
+            "T|ret '{sc:'h60, sd:'{'h0, 'h0}, mm:'{'{'h60, 'h61}, '{'h62, 'h63}}}",
+            "T|inout '{sc:'h60, sd:'{'h0, 'hbd}, mm:'{'{'h60, 'h61}, '{'hbe, 'h63}}}",
+            "T|ref '{sc:'hac, sd:'{'had, 'hbd}, mm:'{'{'hae, 'h61}, '{'hbe, 'h63}}}",
             "T|q bits=32 size=2 size2=2 dims=3 udims=2 bitsS=56",
             "T|q1 size=2 bits=16 left=0 right=1",
-            "T|local e1 e2 size=2 size2=2 '{sc:0, sd:'{0, 0}, mm:'{'{0, 226}, '{225, 0}}}",
+            "T|local e1 e2 size=2 size2=2 '{sc:'h0, sd:'{'h0, 'h0}, mm:'{'{'h0, 'he2}, '{'he1, 'h0}}}",
         ],
         "{o:#?}"
     );
@@ -701,10 +705,10 @@ endmodule
             "T|key 5",
             "T|key 7",
             "T|aa out mm00=ee mm11=33",
-            "T|aa p '{5:'{sc:161, sd:'{0, 0}, mm:'{'{238, 49}, '{50, 51}}}, 7:'{sc:0, sd:'{0, 80}, mm:'{'{0, 0}, '{64, 0}}} }",
+            "T|aa p '{5:'{sc:'ha1, sd:'{'h0, 'h0}, mm:'{'{'hee, 'h31}, '{'h32, 'h33}}}, 7:'{sc:'h0, sd:'{'h0, 'h50}, mm:'{'{'h0, 'h0}, '{'h40, 'h0}}}}",
             "T|da mm11=33",
             "T|q 2 50 31",
-            "T|larr e5 31 '{sc:0, sd:'{0, 0}, mm:'{'{0, 0}, '{0, 229}}}",
+            "T|larr e5 31 '{sc:'h0, sd:'{'h0, 'h0}, mm:'{'{'h0, 'h0}, '{'h0, 'he5}}}",
         ],
         "{o:#?}"
     );
@@ -746,11 +750,11 @@ endmodule
     assert_eq!(
         o,
         [
-            "T|dflt '{sc:0, sd:'{0, 0}, mm:'{'{0, 0}, '{0, 0}}}",
-            "T|before '{sc:0, sd:'{0, 0}, mm:'{'{0, 0}, '{0, 0}}}",
-            "T|nba '{sc:17, sd:'{34, 51}, mm:'{'{48, 49}, '{50, 51}}}",
-            "T|nba0 '{sc:68, k:55}",
-            "T|elem '{sc:0, sd:'{68, 0}, mm:'{'{0, 0}, '{85, 0}}}",
+            "T|dflt '{sc:'h0, sd:'{'h0, 'h0}, mm:'{'{'h0, 'h0}, '{'h0, 'h0}}}",
+            "T|before '{sc:'h0, sd:'{'h0, 'h0}, mm:'{'{'h0, 'h0}, '{'h0, 'h0}}}",
+            "T|nba '{sc:'h11, sd:'{'h22, 'h33}, mm:'{'{'h30, 'h31}, '{'h32, 'h33}}}",
+            "T|nba0 '{sc:'h44, k:55}",
+            "T|elem '{sc:'h0, sd:'{'h44, 'h0}, mm:'{'{'h0, 'h0}, '{'h55, 'h0}}}",
         ],
         "{o:#?}"
     );
@@ -820,7 +824,7 @@ endmodule
         [
             "T|holder mm10=5e sd1=5d",
             "T|nested 9 3 77",
-            "T|nested p '{g:'{'{'{x:0, y:'{0, 0}}, '{x:3, y:'{0, 0}}}, '{'{x:0, y:'{0, 9}}, '{x:0, y:'{0, 0}}}}, k:77}",
+            "T|nested p '{g:'{'{'{x:'h0, y:'{'h0, 'h0}}, '{x:'h3, y:'{'h0, 'h0}}}, '{'{x:'h0, y:'{'h0, 'h9}}, '{x:'h0, y:'{'h0, 'h0}}}}, k:77}",
             "T|suba sc=a1 sd1=23 mm10=32",
             "T|subn sc=a1 sd1=23 mm10=32 loc=32",
             "T|subn upd 99",

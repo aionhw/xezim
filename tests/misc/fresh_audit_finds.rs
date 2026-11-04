@@ -122,11 +122,11 @@ endmodule
     assert_eq!(r, 8, "f2()=5 + x=3");
 }
 
-/// §21.2.1.7 (audit #44, reference-validated): %p of an ASSOCIATIVE array
-/// closes with ` }` — a space before the brace — and an empty assoc prints
-/// `'{ }`. Queues/structs/fixed arrays keep the tight `}`.
+/// §21.2.1.7 (audit #44; #566 majority of the reference simulators): %p of an
+/// ASSOCIATIVE array closes with a tight `}` like every other aggregate, and
+/// an empty assoc prints `'{}`.
 #[test]
-fn assoc_array_percent_p_trailing_space() {
+fn assoc_array_percent_p_closes_tight() {
     let src = r#"
 module tb;
   int aa[string];
@@ -146,9 +146,9 @@ endmodule
     let sim = simulate(src, 10).expect("sim");
     let out = outs(&sim).join("\n");
     for want in [
-        "T|'{\"k1\":5, \"k2\":6 }",
-        "T|'{3:7, 10:8 }",
-        "T|'{ }",
+        "T|'{\"k1\":5, \"k2\":6}",
+        "T|'{3:7, 10:8}",
+        "T|'{}",
         "T|'{1, 2}",
     ] {
         assert!(out.contains(want), "missing `{}` in:\n{}", want, out);

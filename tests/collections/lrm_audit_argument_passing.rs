@@ -12,6 +12,10 @@
 //! - §7.10 / §13.5: a queue slice used directly as an actual (`q[1:$]`)
 //!   bound as a one-element scalar, so a recursive `rsum(q[1:$])` never
 //!   reached its base case and overflowed the stack.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -82,8 +86,8 @@ endmodule
     assert_eq!(
         tagged(src),
         vec![
-            r#"T|f|d='{1, 2} q='{1, 2} a='{"x":3 } s=orig"#,
-            r#"T|t|d='{1, 2} q='{1, 2} a='{"x":3 }"#,
+            r#"T|f|d='{1, 2} q='{1, 2} a='{"x":3} s=orig"#,
+            r#"T|t|d='{1, 2} q='{1, 2} a='{"x":3}"#,
             "T|o|oq='{7} ov='{0, 0, 8} ioq='{3, 9}",
             "T|s|3 q='{1, 2}",
             "T|c|q='{1, 2} d='{1, 2}",
@@ -152,9 +156,9 @@ endmodule
             "T|g|2 66 new",
             "T|h|303",
             "T|i|'{3, 4}",
-            "T|j|'{9:9 }",
-            "T|k|'{1:1, 8:8, 9:9 }",
-            "T|l|'{1:1, 7:7, 8:8, 9:9 }",
+            "T|j|'{9:9}",
+            "T|k|'{1:1, 8:8, 9:9}",
+            "T|l|'{1:1, 7:7, 8:8, 9:9}",
             "T|m|3",
         ]
     );
@@ -247,7 +251,7 @@ endmodule
         vec![
             r#"T|r1|'{"B", "A"}"#,
             "T|r2|'{10, 20, 30}",
-            "T|r3|'{5:50, 6:60 }",
+            "T|r3|'{5:50, 6:60}",
             "T|r4|2",
             "T|r5|'{1, 9, 2}",
         ]
@@ -426,9 +430,9 @@ endmodule
         tagged(src),
         vec![
             "T|ref|3 101",
-            "T|after|5 '{0, 0, 1}",
+            "T|after|5 '{'h0, 'h0, 'h1}",
             "T|val|3 001",
-            "T|after2|'{0, 0, 1} 0",
+            "T|after2|'{'h0, 'h0, 'h1} 0",
         ]
     );
 }

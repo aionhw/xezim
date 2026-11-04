@@ -160,21 +160,46 @@ impl Simulator {
 
     /// The callee of `e` when it calls an imported task: its name and the
     /// instance path it is called through (`u_a.c_task()`).
-    fn dpi_task_callee(&self, e: &Expression) -> Option<(String, Option<String>)> {
+    pub(super) fn dpi_task_callee(&self, e: &Expression) -> Option<(String, Option<String>)> {
+        // Resolve declarations even on the nested-scheduler path: normal SV
+        // task inlining must not capture a package-qualified imported task.
+        let imported = |name: &str| self.module.dpi_imports.get(name).is_some_and(|spec|
+            matches!(spec.proto, crate::ast::decl::DPIProto::Task(_))
+        );
         let func = match &e.kind {
             ExprKind::Call { func, .. } => &**func,
             ExprKind::Ident(_) => e,
             _ => return None,
         };
+        if let ExprKind::MemberAccess { expr, member } = &func.kind
+            && let ExprKind::Ident(h) = &expr.kind
+            && h.path.len() == 1 && h.path[0].selects.is_empty()
+            && self.module.packages.contains(&h.path[0].name.name)
+            && !self.this_prop_hides(&h.path[0].name.name)
+            && !self.local_stack.last().is_some_and(|m| m.contains_key(&h.path[0].name.name))
+            && !self.signal_name_to_id.contains_key(&h.path[0].name.name)
+        {
+            let key = format!("{}::{}", h.path[0].name.name, member.name);
+            return imported(&key).then_some((key, None));
+        }
         let ExprKind::Ident(h) = &func.kind else {
             return None;
         };
         let last = h.path.last()?;
-        if !last.selects.is_empty() || !self.dpi_task_names.contains(last.name.name.as_str()) {
+        if !last.selects.is_empty() {
             return None;
         }
         if h.path.len() == 1 {
-            return Some((last.name.name.clone(), None));
+            let name = self.resolve_dpi_call_name(&last.name.name, None)?.into_owned();
+            return imported(&name).then_some((name, None));
+        }
+        if h.path.len() == 2 && self.module.packages.contains(&h.path[0].name.name)
+            && !self.this_prop_hides(&h.path[0].name.name)
+            && !self.local_stack.last().is_some_and(|m| m.contains_key(&h.path[0].name.name))
+            && !self.signal_name_to_id.contains_key(&h.path[0].name.name)
+        {
+            let key = format!("{}::{}", h.path[0].name.name, last.name.name);
+            return imported(&key).then_some((key, None));
         }
         // As the call path does (`exec_dpi_import_call_in`): a prefix that
         // names an instance is the scope the call runs in.
@@ -183,11 +208,13 @@ impl Simulator {
             .map(|s| s.name.name.as_str())
             .collect::<Vec<_>>()
             .join(".");
-        self.module
-            .instances
-            .iter()
-            .any(|i| i.path == prefix)
-            .then(|| (last.name.name.clone(), Some(prefix)))
+        if !self.module.instances.iter().any(|i| i.path == prefix) {
+            return None;
+        }
+        let name = self
+            .resolve_dpi_call_name(&last.name.name, Some(&prefix))?
+            .into_owned();
+        imported(&name).then_some((name, Some(prefix)))
     }
 
     /// `stmt_is_blocking`: an imported task may consume time (§35.5.2), so

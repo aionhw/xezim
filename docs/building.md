@@ -45,6 +45,14 @@ CoreMark −0.3% to −0.7%, and a loop-heavy DRAM-model stress −12%. Output i
 bit-exact. The bundled trainer covers the executors and the scheduler; what it
 cannot know is *your* design's hot mix, so the SoC gain is modest.
 
+`PGO_TARGET_DIR` selects the build directory (default `pgo-target`). Raw
+profiles, `merged.profdata`, training logs and toolchain/flag metadata stay
+in its `profile` subdirectory; `PGO_PROFILE_DIR` can select another location.
+Each new training run replaces only the generated raw profiles. Caller
+`RUSTFLAGS` or `CARGO_ENCODED_RUSTFLAGS` are retained with Cargo's usual
+precedence, and the PGO flag is appended. The local build wrapper also
+selects this machine's CPU when encoded flags are used.
+
 Run **with a training command** (`./scripts/build-pgo.sh xezim --simulate …`,
 the binary path is substituted) it trains on that run instead. A profile
 trained on the workload itself is worth far more — the C906 memcpy

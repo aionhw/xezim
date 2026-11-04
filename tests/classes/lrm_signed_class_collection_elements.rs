@@ -1,6 +1,10 @@
 //! IEEE 1800-2023 §6.11.1 / §7.5 / §7.10: elements of a class queue / dynamic-array property with a signed element type keep that signedness (`byte dyn[]` element 8'hff reads -1).
 //!
 //! Expected lines come from the reference simulator.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -59,7 +63,7 @@ fn audit_repro() {
 fn signed_element_types() {
     let want = [
         "T|a|dyn='{0, -1} el=-1 sd='{-2} el=-2 id=-5 ld=-7 ls=-128",
-        "T|b|q='{-3} el=-3 sq=-300 aa='{3:-16 } el=-16 ia=-9",
+        "T|b|q='{-3} el=-3 sq=-300 aa='{3:-16} el=-16 ia=-9",
         "T|c|b4=-1 ub=255 lt=1 sum=-1",
         "T|d|x=-1 pop=-3 min='{-1}",
         "T|e|0 0",

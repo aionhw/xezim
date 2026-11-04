@@ -57,7 +57,7 @@ pub(super) const DT_ASSUME: u8 = 4;
 
 /// One assertion's control state; 0 is the default (enabled, unlocked,
 /// pass action on nonvacuous success only, fail action on).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct CtlState(u8);
 
 impl CtlState {
@@ -124,7 +124,7 @@ impl CtlState {
 }
 
 /// What a control call selects an assertion by.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct CtlIdent {
     /// Instance-relative path of the scope the assertion sits in: instance,
     /// generate and named blocks (a labelled procedural assertion's label is
@@ -137,7 +137,7 @@ pub(super) struct CtlIdent {
 }
 
 /// A concurrent site's identity plus its cached state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct CtlSite {
     pub(super) ident: CtlIdent,
     epoch: u64,
@@ -154,7 +154,7 @@ impl CtlSite {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CtlEntry {
     ctl: u8,
     atype: u8,
@@ -184,7 +184,7 @@ fn ctl_writes_default(ctl: u8) -> bool {
     )
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct AssertCtl {
     log: Vec<CtlEntry>,
     /// Bumped on every change of `log`; concurrent sites cache against it.

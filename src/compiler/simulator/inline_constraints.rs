@@ -233,6 +233,26 @@ impl Simulator {
         }
     }
 
+    /// §11.4.13: an unpacked array in an inside set contributes its values,
+    /// including associative arrays with sparse or string keys.
+    pub(super) fn inside_operand_keys(&mut self, expr: &Expression) -> Option<Vec<String>> {
+        if let Some(name) = self.expr_assoc_name(expr)
+            && self.is_associative_array(&name)
+        {
+            return Some(
+                self.assoc_top_level_keys(&name)
+                    .into_iter()
+                    .map(|key| format!("{}[{}]", name, key))
+                    .collect(),
+            );
+        }
+        self.array_operand_name(expr).map(|name| {
+            (0..self.get_queue_size(&name))
+                .map(|i| format!("{}[{}]", name, i))
+                .collect()
+        })
+    }
+
     pub(super) fn array_operand_name(&mut self, expr: &Expression) -> Option<String> {
         if let ExprKind::Ident(h) = &expr.kind
             && !self.ident_shadowed_by_non_collection(h)
@@ -552,6 +572,28 @@ impl Simulator {
         Some(format!("{}[{}]", an, key))
     }
 
+    /// The text of key `kv` selecting into `level` of the nested associative
+    /// array rooted at `root`: a row registered as an associative array of
+    /// its own (`ensure_assoc_row`) uses its declared key type, a queue or
+    /// dynamic row takes an element index, and an unregistered level (a row
+    /// a whole copy made) is keyed like the root. §7.4.4: a declared level
+    /// is keyed as declared, whether or not it is registered yet.
+    fn nested_level_key(&self, level: &str, root: &str, kv: &Value) -> String {
+        match self.declared_dim(level) {
+            Some(Dim::Assoc(_)) => self.assoc_key_str(level, kv),
+            Some(_) => kv.to_i64().unwrap_or(0).to_string(),
+            // No declared shape (a level past a row's size): keyed as
+            // registered, else as the root it hangs from.
+            None if level != root && self.module.dynamic_arrays.contains(level) => {
+                kv.to_i64().unwrap_or(0).to_string()
+            }
+            None if self.module.associative_arrays.contains_key(level) => {
+                self.assoc_key_str(level, kv)
+            }
+            None => self.assoc_key_str(root, kv),
+        }
+    }
+
     pub(super) fn nested_index_name(&mut self, expr: &Expression) -> Option<String> {
         // Peel every Index level: `expr` is `Index(...Index(base, k1),...,kn)`.
         // Collect indices leaf-first, then resolve the root `Ident` to its
@@ -617,14 +659,18 @@ impl Simulator {
                 .inner_assoc_compound_key(start, &rev, 1)
                 .map(|(_, k)| k);
         }
-        let mut name = bn.clone();
-        // Build root→leaf so the string reads `base[K1][K2]...[Kn]`.
+        let mut name = bn.to_string();
+        // Build root→leaf so the string reads `base[K1][K2]...[Kn]`. Each key
+        // takes the key type of the array it selects into: a row registered
+        // as an associative array of its own (`ensure_assoc_row`) has its
+        // declared one; an unregistered level (a row a whole copy made, say)
+        // is keyed like the root.
         for idx in rev.iter().rev() {
             let kv = self.eval_expr(idx);
-            let ks = self.assoc_key_str(&bn, &kv);
-            name = std::borrow::Cow::Owned(format!("{}[{}]", name, ks));
+            let ks = self.nested_level_key(&name, &bn, &kv);
+            name = format!("{}[{}]", name, ks);
         }
-        Some(name.to_string())
+        Some(name)
     }
 
     /// Resolve a base expression to its associative-array STORAGE name if it
@@ -712,11 +758,16 @@ impl Simulator {
         {
             return None;
         }
-        // Build the compound key inner→outer so it reads base[K1][K2]...[Kn].
+        // Build the compound key inner→outer so it reads base[K1][K2]...[Kn],
+        // each key in the key type of the array it selects into (see
+        // `nested_index_name`; an unregistered level is keyed like the
+        // root). Below a queue row (`q["x"][5][0]` of
+        // `int q[string][int][$]`) the last key is the element index, and
+        // the compound key is that row's element name.
         let mut key = base_name.clone();
         for idx in rev.iter().rev() {
             let kv = self.eval_expr(idx);
-            let ks = self.assoc_key_str(&base_name, &kv);
+            let ks = self.nested_level_key(&key, &base_name, &kv);
             key = format!("{}[{}]", key, ks);
         }
         Some((base_name, key))
@@ -2454,7 +2505,12 @@ impl Simulator {
                         }
                     }
                     let saved = self.bind_loop_vars(binds);
-                    let ok = self.check_constraint_item_impl(body);
+                    // The body may itself be a `foreach` over the next
+                    // dimension (`foreach (a[i]) foreach (a[i][j]) …`, #519)
+                    // or a block of them: check it through this function so
+                    // its loop variables are bound too; the member-foreach
+                    // check has no object here and passed it vacuously.
+                    let ok = self.inline_constraint_item_ok(body);
                     self.unbind_loop_vars(saved);
                     if !ok {
                         return false;
@@ -3255,13 +3311,10 @@ impl Simulator {
         }
         let masses: Vec<u128> = items.iter().map(|(_, m)| *m).collect();
         let total: u128 = masses.iter().fold(0u128, |a, m| a.saturating_add(*m));
-        // Every weight is 0 — the constraint admits no value; keep the first
-        // item so the caller still makes progress.
+        // §18.5.4: an item of weight 0 is not in the set, so when every
+        // weight is 0 the dist admits no value and nothing is picked.
         if total == 0 {
-            return Some(match &items[0].0 {
-                DistItem::One(v) => v.clone(),
-                DistItem::Span(l, _, bw) => Value::from_u64(*l as u64, *bw),
-            });
+            return None;
         }
 
         let dealt = match key {
@@ -3304,6 +3357,29 @@ impl Simulator {
         }
     }
 
+    /// §18.5.4: the items of a `dist` whose weight is not 0, the values it
+    /// admits. Weights are read as `pick_dist_value` reads them.
+    pub(super) fn dist_weighted_ranges(
+        &mut self,
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+    ) -> Vec<ConstraintRange> {
+        use crate::ast::decl::DistWeight;
+        let mut kept = Vec::with_capacity(ranges.len());
+        for (i, r) in ranges.iter().enumerate() {
+            let w = match weights.get(i).and_then(|w| w.as_ref()) {
+                Some(DistWeight::Each(e)) | Some(DistWeight::Total(e)) => {
+                    self.eval_expr(e).to_u64().unwrap_or(1)
+                }
+                None => 1,
+            };
+            if w != 0 {
+                kept.push(r.clone());
+            }
+        }
+        kept
+    }
+
     /// §18.5.4/§18.10 — deal the next dist ITEM index for `key` from its
     /// proportional schedule, rebuilding the schedule when it is exhausted.
     /// Each set of resolved weights keeps its own schedule: the weights are
@@ -3330,7 +3406,16 @@ impl Simulator {
             .and_then(|ds| ds.iter().find(|d| d.0 == sig))
             .is_some_and(|(_, deck, pos)| *pos < deck.len());
         if !live {
-            let deck = self.build_dist_deck(masses)?;
+            let mut deck = self.build_dist_deck(masses)?;
+            // The schedule opens on its heaviest item: start it at a random
+            // phase, so each deal has its item's probability, including an
+            // object's first. A testbench that randomizes a fresh object per
+            // call drew a 9:1 dist's light item never.
+            if deck.len() > 1 {
+                use rand::Rng;
+                let phase = self.cur_rng().gen_range(0..deck.len());
+                deck.rotate_left(phase);
+            }
             let decks = self.dist_decks.entry(key.clone()).or_default();
             decks.retain(|d| d.0 != sig);
             if decks.len() >= MAX_DECKS {
@@ -3430,7 +3515,7 @@ impl Simulator {
                     _ => ConstraintRange::Value(r.clone()),
                 })
                 .collect();
-            let (choices, ws) = self.cons_ranges_i128_ws(&cr, target.width);
+            let (choices, ws) = self.cons_ranges_i128_typed(&cr, target.width, target.is_signed);
             if ws.is_some() {
                 let choices =
                     Self::fit_cons_ranges_for_target(choices, ws, target.width, target.is_signed);

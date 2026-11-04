@@ -2073,7 +2073,7 @@ impl Simulator {
                      (write path not hooked) — aborting",
                     self.time, pos, sid
                 );
-                self.finished = true;
+                self.abort_run();
                 self.edge_scan_scanned += scanned_delta;
                 self.edge_scan_changed += changed_delta;
                 self.edge_pass_depth -= 1;
@@ -2259,6 +2259,9 @@ impl Simulator {
                                     "[EVENT-EDGE] ARMED shadow miss at time={} block={} span={:?}",
                                     self.time, bi, blocks[bi].stmt.span
                                 );
+                                // `abort_run`, field by field: `triggered_bitmap` still
+                                // borrows `self` mutably here.
+                                self.saw_fatal = true;
                                 self.finished = true;
                             }
                             snapshot_result = Some(differ);

@@ -25,6 +25,7 @@ use super::*;
 
 /// A constant event select, compact for the common low-word case. Wide
 /// selects use the edge snapshot too, without an interpreted value waiter.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) enum EventMask {
     Low(u64),
     Wide(Vec<u32>),

@@ -319,6 +319,108 @@ endmodule"
     assert_eq!(lines(&src), vec!["T try 7 8 num 0"]);
 }
 
+/// An ASSIGNMENT PATTERN put straight into the box (`mb.put('{a: 1, b: 2})`).
+/// Only an identifier was stashed, so a pattern was queued as a scalar and
+/// `get`/`peek` left the receiver unchanged. The pattern's items are taken at
+/// the `put`, so a later change to a variable it names does not leak in.
+#[test]
+fn a_pattern_message_is_delivered() {
+    let src = format!(
+        "{S}\
+typedef struct {{ int x; bit [3:0] y; }} in_t;\n\
+typedef struct {{ int a; bit b; in_t n; }} nest_t;\n\
+typedef struct packed {{ logic [7:0] a; logic [7:0] b; }} ppair_t;\n\
+module t;\n\
+  initial begin\n\
+    mailbox #(pair_t) mb = new();\n\
+    mailbox #(nest_t) mn = new();\n\
+    mailbox #(ppair_t) mp = new();\n\
+    mailbox #(longint) ml = new();\n\
+    longint lv;\n\
+    pair_t q;\n\
+    nest_t r;\n\
+    ppair_t pp;\n\
+    int v = 5;\n\
+    mb.put('{{a: v, b: v + 1}});\n\
+    mb.put('{{7, 8}});\n\
+    mb.put(pair_t'{{b: 10, a: 9}});\n\
+    ml.put(64'h5a50_0000_0000_0001); ml.get(lv);\n\
+    $display(\"T longint %h\", lv);\n\
+    v = 100;\n\
+    for (int i = 0; i < 3; i++) begin\n\
+      q = '{{99, 99}}; mb.peek(q);\n\
+      $display(\"T peek %0d %0d\", q.a, q.b);\n\
+      q = '{{99, 99}}; mb.get(q);\n\
+      $display(\"T get %0d %0d\", q.a, q.b);\n\
+    end\n\
+    void'(mn.try_put('{{n: '{{x: 3, y: 4'h4}}, default: '1}}));\n\
+    r = '{{default: 0}}; void'(mn.try_get(r));\n\
+    $display(\"T nested %0d %0d %0d %h\", r.a, r.b, r.n.x, r.n.y);\n\
+    mp.put('{{a: 8'h12, b: 8'h34}});\n\
+    mp.get(pp);\n\
+    $display(\"T packed %h %h\", pp.a, pp.b);\n\
+    $display(\"T num %0d %0d %0d\", mb.num(), mn.num(), mp.num());\n\
+  end\n\
+endmodule"
+    );
+    assert_eq!(
+        lines(&src),
+        vec![
+            "T longint 5a50000000000001",
+            "T peek 5 6",
+            "T get 5 6",
+            "T peek 7 8",
+            "T get 7 8",
+            "T peek 9 10",
+            "T get 9 10",
+            "T nested -1 1 3 4",
+            "T packed 12 34",
+            "T num 0 0 0"
+        ]
+    );
+}
+
+/// A pattern message on the blocking paths: handed to a parked `get`, and
+/// queued by a `put` parked on a full bounded box.
+#[test]
+fn a_pattern_message_on_the_blocking_paths() {
+    let src = format!(
+        "{S}module t;\n\
+  mailbox #(pair_t) e = new();\n\
+  mailbox #(pair_t) b = new(1);\n\
+  initial begin\n\
+    pair_t c;\n\
+    c = '{{99, 99}};\n\
+    e.get(c);\n\
+    $display(\"T parked get %0d %0d at %0t\", c.a, c.b, $time);\n\
+  end\n\
+  initial begin #5; e.put('{{b: 22, a: 11}}); end\n\
+  initial begin\n\
+    #10;\n\
+    b.put('{{a: 1, b: 2}});\n\
+    b.put('{{a: 3, b: 4}});\n\
+    $display(\"T parked put done at %0t\", $time);\n\
+  end\n\
+  initial begin\n\
+    pair_t q1, q2;\n\
+    #20;\n\
+    q1 = '{{99, 99}}; b.get(q1);\n\
+    q2 = '{{99, 99}}; b.get(q2);\n\
+    #1;\n\
+    $display(\"T bounded %0d %0d, %0d %0d\", q1.a, q1.b, q2.a, q2.b);\n\
+  end\n\
+endmodule"
+    );
+    assert_eq!(
+        lines(&src),
+        vec![
+            "T parked get 11 22 at 5",
+            "T parked put done at 20",
+            "T bounded 1 2, 3 4"
+        ]
+    );
+}
+
 /// Consuming a message frees a stash id only when that message IS a stashed
 /// struct. A scalar message whose value happened to equal a queued struct's
 /// id freed that id, so the next struct `put` reused the slot and overwrote

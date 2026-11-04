@@ -301,7 +301,7 @@ module m22(,{a[7], a[6:0]});
 endmodule
 
 // 95, two ports; the second has no internal connection; the first is implicit/
-// concatenation. note that both modelsim and ISE set the entire sum, and not
+// concatenation. note that other simulators set the entire sum, and not
 // just the top 8 bits, to all x's for 'test.sum[23] = test.sum[23] + a'
 module m23({a[7], a[6:0]},);
    input a;

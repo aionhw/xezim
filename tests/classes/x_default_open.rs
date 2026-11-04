@@ -4,6 +4,10 @@
 //! returned unpacked structs (§6.8, §13.4.1), mixed 2-/4-state packed structs
 //! (§7.2.1) and program instances (§24.3). Expected values come from the
 //! reference simulator.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -94,7 +98,7 @@ endmodule
 "#;
     assert_eq!(
         t_lines(src),
-        ["T|cls_p '{arr:'{x, x, x}, barr:'{0, 0}, h:null, n:x}"]
+        ["T|cls_p '{arr:'{'hX, 'hX, 'hX}, barr:'{'h0, 'h0}, h:null, n:x}"]
     );
 }
 
@@ -337,7 +341,7 @@ endmodule
             "T|ii xxxx 0000",
             "T|h xxxx 0000",
             "T|w 0011 0000 0011",
-            "T|p '{d:x, f:0, n:x, i:0}",
+            "T|p '{d:'hX, f:'h0, n:x, i:0}",
         ]
     );
 }
@@ -418,7 +422,7 @@ endmodule
             "T|fp 0001 0000",
             "T|m xxxx 0000 xxxx 0000",
             "T|r xxxx 0000 0",
-            "T|p '{d:x, f:0, i:0, n:x}",
+            "T|p '{d:'hX, f:'h0, i:0, n:x}",
         ]
     );
 }

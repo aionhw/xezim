@@ -1,4 +1,8 @@
 //! IEEE 1800-2023 clause 7: aggregate data types.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use crate::harness::{Order, check};
 
@@ -60,6 +64,19 @@ fn c7_2_2_struct_member_default_blocklocal() {
     );
 }
 
+// §7.3.2: Tagged union: reading the active member returns its stored value
+#[test]
+fn c7_3_2_tagged_union_active_member() {
+    check(
+        "7.3.2_tagged_union_active_member",
+        include_str!("sv/7.3.2_tagged_union_active_member.sv"),
+        "tu_active",
+        Order::Exact,
+        &["T|7.3.2|42"],
+        &[],
+    );
+}
+
 // §7.2: Structures: unpacked struct 2-state members default value
 #[test]
 fn c7_2_struct_2state_member_default() {
@@ -93,17 +110,17 @@ fn c7_aggregates() {
         Order::Exact,
         &[
             "T|7.2.1a|a=0 b=5 s=[]",
-            r#"T|7.2.1b|'{a:1, b:2, s:"x"}"#,
+            r#"T|7.2.1b|'{a:1, b:'h2, s:"x"}"#,
             "T|7.2.1c|1 9",
-            r#"T|7.2.2a|'{a:0, b:0, s:"d"}"#,
-            r#"T|7.2.2b|'{a:7, b:1, s:"q"}"#,
+            r#"T|7.2.2a|'{a:0, b:'h0, s:"d"}"#,
+            r#"T|7.2.2b|'{a:7, b:'h1, s:"q"}"#,
             "T|7.2.1d|c 3 8",
             "T|7.2.1e|c9",
             "T|7.2.1f|-16 15",
             "T|7.2.1g|12",
             "T|7.2.1h|1",
-            "T|7.2.1i|'{p:'{hi:3, lo:4}, arr:'{5, 6}}",
-            "T|7.2.1j|'{p:'{hi:10, lo:11}, arr:'{3, 3}}",
+            "T|7.2.1i|'{p:'{hi:'h3, lo:'h4}, arr:'{5, 6}}",
+            "T|7.2.1j|'{p:'{hi:'ha, lo:'hb}, arr:'{3, 3}}",
             "T|7.3.1|a 5",
             "T|7.3.2a|42",
             "T|7.3.2b|valid 42",
@@ -111,12 +128,12 @@ fn c7_aggregates() {
             "T|7.4.1a|44 11 2",
             "T|7.4.1b|1122ff44",
             "T|7.4.1c|22ff",
-            "T|7.4.2a|'{1, 2, 3, 4}",
+            "T|7.4.2a|'{'h1, 'h2, 'h3, 'h4}",
             "T|7.4.2b|xx",
-            "T|7.4.2c|'{1, 2, 3, 4}",
+            "T|7.4.2c|'{'h1, 'h2, 'h3, 'h4}",
             "T|7.4.5a|6 1 '{'{1, 2, 3}, '{4, 5, 6}}",
             "T|7.4.5b|dc 1",
-            "T|7.4.6b|'{238, 238, 238, 238}",
+            "T|7.4.6b|'{'hee, 'hee, 'hee, 'hee}",
             "T|7.4.6c|xx",
             "T|7.4.3|2 3",
             "T|7.5.1a|'{0, 0, 0} size=3",
@@ -129,18 +146,18 @@ fn c7_aggregates() {
             "T|7.6b|'{7, 8, 9}",
             "T|7.6c|'{7, 8, 9}",
             "T|7.8a|3 3 1",
-            r#"T|7.8b|'{"a":1, "b":2, "c":3 }"#,
+            r#"T|7.8b|'{"a":1, "b":2, "c":3}"#,
             "T|7.8c|first=a",
             "T|7.8d|next=b",
             "T|7.8e|last=c",
             "T|7.8f|prev=b",
             "T|7.8g|next-of-last=0",
-            r#"T|7.8i|'{"a":1, "c":3 }"#,
+            r#"T|7.8i|'{"a":1, "c":3}"#,
             "T|7.8j|nonexist=0",
             "T|7.8k|num=2",
-            "T|7.8l|'{-5:1, 3:3, 10:2 }",
+            "T|7.8l|'{-5:1, 3:3, 10:2}",
             "T|7.8m|-5",
-            "T|7.8n|'{1:2, 15:1 }",
+            "T|7.8n|'{1:2, 15:1}",
             "T|7.8p|2",
             "T|7.8q|1 -1",
             "T|7.8r|0",
@@ -230,7 +247,7 @@ fn c7_aggregates_more() {
             "T|7.12.1n|1 10",
             "T|7.4.5c|ab 4 192",
             "T|7.4.6d|'{2, 3}",
-            r#"T|7.8w|'{"a":2, "b":1 }"#,
+            r#"T|7.8w|'{"a":2, "b":1}"#,
             "T|7.10s|'{1, 3, 4}",
             "T|7.10t|'{3}",
             "T|7.10u|'{1, 2}",
@@ -239,7 +256,7 @@ fn c7_aggregates_more() {
             "T|7.12.2i|'{3, 2, 1}",
             "T|7.12.3j|0",
             "T|7.12.3k|32",
-            "T|7.4.6e|'{0, 0, 0, 0}",
+            "T|7.4.6e|'{'h0, 'h0, 'h0, 'h0}",
             "T|7.6d|1 4",
             "T|7.5.2|0",
             "T|7.2.2c|3 4 9",

@@ -74,6 +74,8 @@ mod mailbox_handle_named_like_struct;
 mod member_off_handle_collection_elem;
 #[path = "classes/compiled_method_test_env.rs"]
 mod compiled_method_test_env;
+#[path = "collections/bits_dynamic_operand.rs"]
+mod bits_dynamic_operand;
 #[path = "collections/compiled_ret_coll_by_name.rs"]
 mod compiled_ret_coll_by_name;
 #[path = "collections/compiled_typedef_local_queue.rs"]
@@ -221,3 +223,84 @@ mod array_cond_operands;
 
 #[path = "collections/assoc_dyn_struct_delete.rs"]
 mod assoc_dyn_struct_delete;
+
+#[path = "collections/foreach_omitted_var_before_collection.rs"]
+mod foreach_omitted_var_before_collection;
+#[path = "collections/assoc_select_write_and_return.rs"]
+mod assoc_select_write_and_return;
+#[path = "collections/foreach_subarray.rs"]
+mod foreach_subarray;
+#[path = "collections/assoc_coll_rows.rs"]
+mod assoc_coll_rows;
+#[path = "collections/dyn_rows_copy_595.rs"]
+mod dyn_rows_copy_595;
+#[path = "collections/dyn_row_print_order_597.rs"]
+mod dyn_row_print_order_597;
+
+#[path = "collections/row_of_2d_array_assign.rs"]
+mod row_of_2d_array_assign;
+
+#[path = "collections/conditional_aggregate_659.rs"]
+mod conditional_aggregate_659;
+
+#[path = "collections/assoc_key_enumeration_cache.rs"]
+mod assoc_key_enumeration_cache;
+#[path = "collections/hierarchical_whole_array_assign.rs"]
+mod hierarchical_whole_array_assign;
+#[path = "collections/inside_associative_values.rs"]
+mod inside_associative_values;
+
+#[path = "collections/foreach_indexed_receiver.rs"]
+mod foreach_indexed_receiver;
+
+#[path = "collections/enclosing_value_parameter_specialization.rs"]
+mod enclosing_value_parameter_specialization;
+
+#[path = "collections/lexical_value_parameter_specialization.rs"]
+mod lexical_value_parameter_specialization;
+
+#[path = "collections/coll_rows_typed_by_declaration.rs"]
+mod coll_rows_typed_by_declaration;
+
+#[path = "collections/coll_shape_iteration.rs"]
+mod coll_shape_iteration;
+
+#[path = "collections/review_coll_shape_rows.rs"]
+mod review_coll_shape_rows;
+
+#[path = "collections/string_key_escaping.rs"]
+mod string_key_escaping;
+
+#[path = "collections/assoc_locator_keys.rs"]
+mod assoc_locator_keys;
+
+#[path = "collections/review_wide_assoc_keys.rs"]
+mod review_wide_assoc_keys;
+
+#[path = "collections/numeric_string_keys_781.rs"]
+mod numeric_string_keys_781;
+
+#[path = "collections/locator_result_size_779.rs"]
+mod locator_result_size_779;
+
+#[path = "collections/nested_row_locators_780.rs"]
+mod nested_row_locators_780;
+
+#[path = "collections/enum_locator_p_782.rs"]
+mod enum_locator_p_782;
+#[path = "collections/assoc_store_context_width.rs"]
+mod assoc_store_context_width;
+#[path = "collections/locator_result_methods.rs"]
+mod locator_result_methods;
+
+#[path = "collections/nested_row_locators.rs"]
+mod nested_row_locators;
+
+#[path = "collections/string_key_order.rs"]
+mod string_key_order;
+
+#[path = "collections/review_real_assoc_store.rs"]
+mod review_real_assoc_store;
+
+#[path = "collections/reduction_with_struct_field.rs"]
+mod reduction_with_struct_field;

@@ -8,6 +8,10 @@
 //! and subroutine locals already were.
 //!
 //! The expected lines were cross-checked against the reference simulator.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use xezim::simulate;
 
@@ -67,16 +71,16 @@ fn initial_block_struct_locals() {
     assert_eq!(
         got,
         vec![
-            "fresh a='{level:0, w:x} t='{rows:'{'{level:0, w:x}, '{level:0, w:x}}, k:0, tag:x}",
+            "fresh a='{level:0, w:'hX} t='{rows:'{'{level:0, w:'hX}, '{level:0, w:'hX}}, k:0, tag:'hXX}",
             "b.level=1 b.w=2",
             "c.level=9 c.w=3",
-            "u='{rows:'{'{level:1, w:2}, '{level:7, w:x}}, k:0, tag:165}",
+            "u='{rows:'{'{level:1, w:'h2}, '{level:7, w:'hX}}, k:0, tag:'ha5}",
             "u.rows[0].w=2 u.rows[1].level=7",
-            "m='{p:'{a:5, b:6}, n:3} m.p=56",
+            "m='{p:'{a:'h5, b:'h6}, n:3} m.p=56",
             "loop 10 11",
             "q[0].level=3 q.size=1",
-            "r='{level:4, w:1} s.rows[1].level=3 s.k=5",
-            "s='{rows:'{'{level:1, w:2}, '{level:8, w:4}}, k:5, tag:6}",
+            "r='{level:4, w:'h1} s.rows[1].level=3 s.k=5",
+            "s='{rows:'{'{level:1, w:'h2}, '{level:8, w:'h4}}, k:5, tag:'h6}",
         ]
     );
 }

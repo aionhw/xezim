@@ -481,6 +481,9 @@ impl Simulator {
                             let hi = self.comb_dep_offsets[id + 1] as usize;
                             for k in lo..hi {
                                 let dep = self.comb_dep_entries[k] as usize;
+                                if dep == eidx && self.comb_self_exempt[eidx] {
+                                    continue;
+                                }
                                 if !self.settle_triggered[dep] {
                                     self.settle_triggered[dep] = true;
                                     let dl = self.comb_level[dep] as usize;
@@ -579,7 +582,7 @@ impl Simulator {
                 "[BSP-SHADOW] time={} FIRST divergence: {} signals differ — aborting",
                 self.time, diffs
             );
-            self.finished = true;
+            self.abort_run();
             return;
         }
         self.bsp_shadow_checks += 1;
@@ -663,19 +666,10 @@ impl Simulator {
                 // timeunit, not that of the process whose write woke it.
                 let saved_ts =
                     std::mem::replace(&mut self.timescale_scope_override, entry.cold.ts_scope());
-                // §7.4.2/§10.9: `assign x = '{...}` (or `assign x[i] = '{...}`
-                // on an array of packed vectors) converts each item to the
-                // ELEMENT type. The generic eval concatenates items at their
-                // own widths, which scrambles any item that is not exactly
-                // element-sized.
-                //
-                let val = if let ExprKind::AssignmentPattern(items) = &rhs.kind {
-                    self.packed_pattern_for_lhs(lhs, items)
-                        .or_else(|| self.eval_packed_struct_pattern(lhs, items))
-                        .unwrap_or_else(|| self.eval_expr_ctx(rhs, w))
-                        .resize(w)
-                } else {
-                    self.eval_expr_ctx(rhs, w).resize(w)
+                // §10.8, §10.9: a pattern takes the net's declared type.
+                let val = match self.eval_pattern_for_lvalue(lhs, rhs) {
+                    Some(v) => v.resize(w),
+                    None => self.eval_expr_ctx(rhs, w).resize(w),
                 };
                 self.timescale_scope_override = saved_ts;
                 let delay = if *explicit_delay > 0 {
@@ -1259,6 +1253,35 @@ impl Simulator {
         self.gate_lane_valid = true;
     }
 
+    /// #35/#t0-comb-defer: gate-shaped entries are origin-ambiguous — a gate
+    /// PRIMITIVE (`buf b(y, x);`) and a continuous assignment (`assign y = x;`)
+    /// lower to the same fused op, and the vector/scatter/region/ctl passes
+    /// preserve that ambiguity (see tests/misc/assign_z_passthrough.rs, which
+    /// had to recover the distinction for z-passthrough semantics).
+    /// `signal_gate_driven` records the origin per signal: an entry writing
+    /// any non-gate-driven net is assign-origin and must take the #35
+    /// deferral path like the copy variants in the settle loop below;
+    /// primitive-origin entries stay eager (the reference-measured
+    /// c1b-lazy/dep-eager split). Vector/scatter batches share one dst
+    /// signal so the origin is uniform; a region mixing origins defers as a
+    /// whole (it is one dispatch unit). Write ids the passes could not
+    /// resolve — or an out-of-range id — conservatively count as primitive
+    /// so this never widens the deferral on unknown data.
+    fn gate_entry_is_assign_origin(&self, entry: &CombEntry) -> bool {
+        match &entry.item {
+            CombItem::FusedGate { .. }
+            | CombItem::VectorGate { .. }
+            | CombItem::ScatterGate { .. }
+            | CombItem::GateRegion { .. }
+            | CombItem::CtlGate { .. } => entry
+                .cold
+                .write_signal_ids
+                .iter()
+                .any(|&id| !self.signal_gate_driven.get(id).copied().unwrap_or(true)),
+            _ => false,
+        }
+    }
+
     pub(super) fn settle_combinatorial_inner(&mut self) {
         if !self.ts_sleep.is_empty() {
             self.ts_wake_sleepers();
@@ -1290,6 +1313,9 @@ impl Simulator {
         }
         if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
             self.build_gate_lane();
+        }
+        if self.comb_self_exempt.len() != self.comb_entries.len() {
+            self.build_comb_self_exempt();
         }
         if !self.quiet_valid || self.quiet_bits.len() != self.signal_table.len().div_ceil(64) {
             self.build_quiet_bits();
@@ -1356,7 +1382,13 @@ impl Simulator {
         // #35: a FULL settle first re-dirties the source signals of the
         // entries a deferring (post-proc-write) settle skipped, so they
         // re-trigger through the ordinary dependency walk below.
-        if !self.proc_settle_defer && !self.deferred_proc_entries.is_empty() {
+        // #t0-comb-defer: during the time-0 start batch the deferrals stay
+        // held — a settle triggered by something else (clock generator,
+        // tick top) must not consume them before the last start has run.
+        if !self.proc_settle_defer
+            && (self.time != 0 || self.t0_starts_remaining == 0)
+            && !self.deferred_proc_entries.is_empty()
+        {
             let deferred = std::mem::take(&mut self.deferred_proc_entries);
             self.defer_epoch += 1;
             for sid in deferred {
@@ -1648,7 +1680,47 @@ impl Simulator {
                             continue;
                         }
                         let __dep = __e.entry as usize;
+                        // §9.2.2.2.1(b): an `always_comb` is never re-armed
+                        // by its OWN write. One that writes a member of a
+                        // packed struct and reads ANOTHER member depends on
+                        // the whole signal here (CVA6's decoder exception
+                        // block: `instruction_o.ex = ex_i; … .ex.valid = 1;`
+                        // beside a read of `instruction_o.pc`), so its own
+                        // two-step member write re-queued it every pass to
+                        // the settle limit and the core never left its first
+                        // fetch. Only always_comb/always_latch: an explicit
+                        // `always @(a)` and a continuous assign DO re-fire on
+                        // their own writes (the zero-delay loop the limit is
+                        // there to report).
+                        if __dep == $eidx
+                            && matches!(
+                                entries[__dep].item,
+                                CombItem::AlwaysBlock {
+                                    is_always_comb: true,
+                                    ..
+                                } | CombItem::CompiledAlwaysBlock {
+                                    is_always_comb: true,
+                                    ..
+                                }
+                            )
+                        {
+                            continue;
+                        }
                         if __tree_clk && tree_entry.get(__dep).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        // An `always @*` that reads a packed element it also
+                        // writes after packed-region exclusion, the one
+                        // kind the arm above lets through. Precomputed; only
+                        // a self-dependency gets this far, and only an entry
+                        // added since the table was built misses it.
+                        if __dep == $eidx
+                            && self
+                                .comb_self_exempt
+                                .get(__dep)
+                                .copied()
+                                .unwrap_or_else(|| entries[__dep].reads_own_writes())
+                        {
                             continue;
                         }
                         if lane_on {
@@ -1901,8 +1973,16 @@ impl Simulator {
                 // entries to the next full settle. UDP/gate/always entries
                 // (a synthesized netlist's cells) stay eager, which is the
                 // reference-measured split (c1b lazy vs dep eager).
+                // #t0-comb-defer: the optimizer lowers `assign p = a` (and
+                // port connects) to gate-shaped entries, which the variant
+                // list above missed — they evaluated eagerly during the
+                // writer's own settle, firing the t=0 edge before a
+                // source-later blocking-body `always` armed.
+                // `gate_entry_is_assign_origin` recovers the assign origin
+                // from `signal_gate_driven` so those entries defer too while
+                // true gate primitives stay eager.
                 if self.proc_settle_defer
-                    && matches!(
+                    && (matches!(
                         entries[eidx].item,
                         CombItem::ContAssign { .. }
                             | CombItem::CompiledContAssign { .. }
@@ -1911,7 +1991,7 @@ impl Simulator {
                             | CombItem::FastDirectFanout { .. }
                             | CombItem::FusedBufFanout { .. }
                             | CombItem::FusedAndFanout { .. }
-                    )
+                    ) || self.gate_entry_is_assign_origin(&entries[eidx]))
                 {
                     let cold = &entries[eidx].cold;
                     if cold.deferred_epoch.get() == self.defer_epoch {

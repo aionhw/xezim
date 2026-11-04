@@ -283,3 +283,44 @@ fn typedef_string_collection_scopes() {
     ];
     assert_eq!(t_lines(TYPEDEF_SCOPES), want);
 }
+
+const MEMBER_ELEMENTS: &str = r#"
+typedef string sq_t[$];
+class C;
+  string mq[$];
+  sq_t tq;
+  function int f6(string a, string b); mq.push_back(a); return mq[mq.size()-1] == b; endfunction
+  function int f7(string a, string b); mq.push_back(a); return mq[$] == b; endfunction
+  function int f9(string b); return mq[0] == b; endfunction
+  function int t1(string a, string b); tq.push_back(a); return tq[tq.size()-1] == b; endfunction
+  function int t2(string b); return tq[0] < b; endfunction
+endclass
+module top;
+  initial begin
+    C c; c = new;
+    $display("T|f6 %0d %0d %0d", c.f6("e", "e"), c.f6("ab", "ab"), c.f6("xe", "e"));
+    $display("T|f7 %0d %0d", c.f7("e", "e"), c.f7("xe", "e"));
+    $display("T|f9 %0d %0d", c.f9("e"), c.f9("x"));
+    $display("T|t1 %0d %0d %0d", c.t1("e", "e"), c.t1("ab", "ab"), c.t1("xe", "e"));
+    $display("T|t2 %0d %0d", c.t2("f"), c.t2("a"));
+  end
+endmodule
+"#;
+
+/// An element of an instance-member string queue — declared `string` or
+/// through a typedef — compares as a string in a compiled body: it took the
+/// comparison context's one-bit width, so `mq[i] == b` was always 0.
+#[test]
+fn member_string_queue_element_compares_as_string() {
+    let _ = super::compiled_method_test_env::policies(&[("1", "0"), ("0", "0")]);
+    assert_eq!(
+        t_lines(MEMBER_ELEMENTS),
+        [
+            "T|f6 1 1 0",
+            "T|f7 1 0",
+            "T|f9 1 0",
+            "T|t1 1 1 0",
+            "T|t2 1 0"
+        ]
+    );
+}

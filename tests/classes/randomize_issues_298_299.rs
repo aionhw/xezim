@@ -115,7 +115,8 @@ fn size_phase_edges() {
     );
 }
 
-/// The #298 class's scalars over 100 draws: the reference gives
+/// The #298 class's scalar distribution over 100 draws; its empty beat
+/// arrays remain state with rand_mode off. The reference gives
 /// `allow_cfg_space` = 1 in all of them and 14 counts below 32.
 #[test]
 fn issue_298_distribution() {
