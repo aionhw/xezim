@@ -382,6 +382,41 @@ impl Simulator {
             .then_some(TypeParamKind::Class)
     }
 
+    /// class-perf: does the declared return type name a CLASS type parameter
+    /// (bare `T`) whose concrete binding on this specialization is `real`?
+    /// The width-0 passthrough that serves class handles and generic type-
+    /// parameter returns must ALSO be used for a real-bound parameter —
+    /// otherwise `resolve_type_width` treats the bare `T` as an unknown
+    /// typedef (width 32) and the compiled `return e` truncates a real value
+    /// to int (the `P#(real)::get()` regression: 2.5 -> 3.0). The interpreter
+    /// routes the same case through `concrete_ret_conv` to `RetConv::Real`.
+    pub(super) fn param_result_is_real(&self, cname: &str, dt: &DataType) -> bool {
+        let DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = dt
+        else {
+            return false;
+        };
+        if !dimensions.is_empty() || !type_args.is_empty() || !name.scopes.is_empty() {
+            return false;
+        }
+        let tn = name.name.name.as_str();
+        let base = cname.split('#').next().unwrap_or(cname);
+        let Some(cd) = self.module.classes.get(base) else {
+            return false;
+        };
+        if !cd.type_param_names.iter().any(|t| t == tn) {
+            return false;
+        }
+        matches!(
+            self.resolve_type_param_binding(tn).as_deref(),
+            Some("real") | Some("shortreal")
+        )
+    }
+
     /// class-perf: does `dt` (a TypeReference, possibly through a typedef
     /// chain) name a CLASS in `module.classes`? Unlike `resolve_dt_ref` + a
     /// TypeReference test, this survives FORWARD typedefs (`typedef class
@@ -2094,8 +2129,13 @@ impl Simulator {
             pre
         };
         // Effective result width: instance-resolved for param-bounded packed
-        // returns, else the static width from the plan.
-        let result_width = if pre.param_able_result
+        // returns, else the static width from the plan. A type parameter bound
+        // to a real is a width-0 passthrough (see `param_result_is_real`) —
+        // resolving the bare `T` through module typedefs would otherwise yield
+        // an int width and the compiled return would truncate the real.
+        let result_width = if self.param_result_is_real(cname, &pre.return_type) {
+            0
+        } else if pre.param_able_result
             && matches!(
                 &*pre.return_type,
                 crate::ast::types::DataType::TypeReference { .. }
