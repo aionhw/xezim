@@ -317,6 +317,7 @@ impl Simulator {
                         .collection_elem_struct(handle, &pname)
                         .filter(Self::spreads_member_wise)
                 {
+                    // Calls, including ones nested in a pattern, read the queue before it grows. The resize drops a value stored earlier, so a saved call is written last.
                     let base = prop_ident_expr(&pname);
                     let mut calls = Vec::new();
                     for (i, item) in items.iter().enumerate() {
@@ -327,7 +328,6 @@ impl Simulator {
                             calls.push((i, self.eval_expr(e)));
                         }
                     }
-                    self.set_queue_size(&scoped_q, items.len() as u64);
                     for (i, item) in items.iter().enumerate() {
                         let e = item.expr();
                         if matches!(e.kind, ExprKind::AssignmentPattern(_))
@@ -337,6 +337,7 @@ impl Simulator {
                             self.assign_class_unpacked_elem(&elem, e, &su);
                         }
                     }
+                    self.set_queue_size(&scoped_q, items.len() as u64);
                     for (i, v) in calls {
                         self.set_signal_value_by_name(&format!("{scoped_q}[{i}]"), v);
                     }
