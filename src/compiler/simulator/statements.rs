@@ -3493,7 +3493,9 @@ impl Simulator {
                                         }
                                         _ => None,
                                     };
+                                    let scoped_args = self.scoped_class_type_args(data_type);
                                     let ta: Option<&[Expression]> = match data_type {
+                                        _ if scoped_args.is_some() => scoped_args.as_deref(),
                                         crate::ast::types::DataType::TypeReference {
                                             type_args,
                                             ..
@@ -3837,7 +3839,11 @@ impl Simulator {
                         .and_then(|(_, ta)| ta),
                     _ => None,
                 };
-                if let crate::ast::types::DataType::TypeReference { type_args, .. } = data_type {
+                if let Some(ta) = self.scoped_class_type_args(data_type) {
+                    self.var_type_args.insert(d.name.name.clone(), ta);
+                } else if let crate::ast::types::DataType::TypeReference { type_args, .. } =
+                    data_type
+                {
                     if !type_args.is_empty() {
                         self.var_type_args
                             .insert(d.name.name.clone(), type_args.clone());

@@ -365,3 +365,6 @@ mod generate_region_parameter_override;
 
 #[path = "hierarchy/param_override_lists.rs"]
 mod param_override_lists;
+
+#[path = "hierarchy/static_memory_member_paths.rs"]
+mod static_memory_member_paths;

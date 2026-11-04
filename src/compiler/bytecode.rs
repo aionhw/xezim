@@ -16671,6 +16671,29 @@ impl<'a> BytecodeCompiler<'a> {
                 acc
             }
             ExprKind::Call { func, args } => {
+                // §18.8 (#846): mode builtins address a variable/constraint
+                // through its receiver expression. CallMethod carries only
+                // a handle value, losing `sub` versus `this.sub` and bypassing
+                // the builtin dispatcher. Preserve that expression and the
+                // register-backed locals needed to evaluate it.
+                let mode_builtin = match &func.kind {
+                    ExprKind::MemberAccess { member, .. } => {
+                        matches!(member.name.as_str(), "rand_mode" | "constraint_mode")
+                    }
+                    ExprKind::Ident(h) if h.path.len() > 1 => h.path.last().is_some_and(|s| {
+                        matches!(s.name.name.as_str(), "rand_mode" | "constraint_mode")
+                    }),
+                    _ => false,
+                };
+                if self.method_mode && mode_builtin {
+                    if let Some(r) =
+                        self.emit_expr_fallback(expr, ctx_width, "Expr_Call_random_mode")
+                    {
+                        return Some(r);
+                    }
+                    self.bail("Expr_Call_random_mode");
+                    return None;
+                }
                 // class-perf method-mode: `this.m(a,..)` / `<classhandle>.m(a,..)`
                 // where the receiver is a class handle lowers to a CallMethod
                 // instruction. Runtime re-enters the interpreter's method

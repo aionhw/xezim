@@ -121,7 +121,9 @@ impl Simulator {
             } else {
                 None
             };
-        if let crate::ast::types::DataType::TypeReference { type_args, .. } = data_type {
+        if let Some(ta) = self.scoped_class_type_args(data_type) {
+            self.var_type_args.insert(name.to_string(), ta);
+        } else if let crate::ast::types::DataType::TypeReference { type_args, .. } = data_type {
             if !type_args.is_empty() {
                 self.var_type_args
                     .insert(name.to_string(), type_args.clone());

@@ -96,8 +96,7 @@ fn assert_clean(version: &str, out: &[String]) {
 
 /// build and final are top-down, every other function phase bottom-up, and
 /// siblings run in NAME order (`mon` is created before `drv`).
-#[test]
-fn uvm_phases_run_in_hierarchy_order() {
+pub(super) fn uvm_phases_run_in_hierarchy_order() {
     let src = include_str!("../uvm/uvm_phase_order.sv");
     let td = ["uvm_test_top", "e", "agt", "drv", "mon"];
     let bu = ["drv", "mon", "agt", "e", "uvm_test_top"];
@@ -129,8 +128,7 @@ fn uvm_phases_run_in_hierarchy_order() {
 }
 
 /// run_phase ends at the LAST drop (t=70) plus the drain time (25).
-#[test]
-fn uvm_objection_drain_time_extends_the_phase() {
+pub(super) fn uvm_objection_drain_time_extends_the_phase() {
     let src = include_str!("../uvm/uvm_objection_drain.sv");
     for v in VERSIONS {
         let sim = run(v, src, &[]);
@@ -146,8 +144,7 @@ fn uvm_objection_drain_time_extends_the_phase() {
 }
 
 /// Verbosity filtering, an ID set to UVM_NO_ACTION, and a severity override.
-#[test]
-fn uvm_report_verbosity_actions_and_overrides() {
+pub(super) fn uvm_report_verbosity_actions_and_overrides() {
     let src = include_str!("../uvm/uvm_report_controls.sv");
     for v in VERSIONS {
         let sim = run(v, src, &[]);
@@ -186,8 +183,7 @@ fn uvm_report_verbosity_actions_and_overrides() {
 
 /// `run_test()` with no argument takes +UVM_TESTNAME; +UVM_VERBOSITY sets
 /// the starting level — and without it a HIGH message stays filtered.
-#[test]
-fn uvm_cmdline_testname_and_verbosity() {
+pub(super) fn uvm_cmdline_testname_and_verbosity() {
     let src = include_str!("../uvm/uvm_cmdline_select.sv");
     let vb = |out: &[String]| {
         out.iter()
@@ -227,8 +223,7 @@ fn uvm_cmdline_testname_and_verbosity() {
 
 /// A virtual sequence drives two sequencers in parallel; each driver gets its
 /// own share, in order, and the virtual sequence completes after both.
-#[test]
-fn uvm_virtual_sequence_drives_two_agents() {
+pub(super) fn uvm_virtual_sequence_drives_two_agents() {
     let src = include_str!("../uvm/uvm_virtual_sequence.sv");
     for v in VERSIONS {
         let sim = run(v, src, &[]);
@@ -257,8 +252,7 @@ fn uvm_virtual_sequence_drives_two_agents() {
 
 /// get_response() receives the response the driver tagged with
 /// set_id_info(req) — the one for the request just sent.
-#[test]
-fn uvm_sequence_receives_matching_responses() {
+pub(super) fn uvm_sequence_receives_matching_responses() {
     let src = include_str!("../uvm/uvm_seq_response.sv");
     for v in VERSIONS {
         let out = lines(&run(v, src, &[]));
@@ -282,8 +276,7 @@ fn uvm_sequence_receives_matching_responses() {
 /// fall around the locked block depends on the library's grant logic, and it
 /// does differ: UVM 1.2 delivers `A0 A1 B0 B1 B2 A2`, 1800.2-2020
 /// `A0 B0 B1 B2 A1 A2`. So the exact interleave is deliberately not pinned.
-#[test]
-fn uvm_locked_sequence_items_are_contiguous() {
+pub(super) fn uvm_locked_sequence_items_are_contiguous() {
     let src = include_str!("../uvm/uvm_seq_lock.sv");
     for v in VERSIONS {
         let out = lines(&run(v, src, &[]));
@@ -313,8 +306,7 @@ fn uvm_locked_sequence_items_are_contiguous() {
 
 /// A registered callback runs through `uvm_do_callbacks; deleted, it no
 /// longer does.
-#[test]
-fn uvm_callbacks_add_and_delete() {
+pub(super) fn uvm_callbacks_add_and_delete() {
     let src = include_str!("../uvm/uvm_callbacks.sv");
     for v in VERSIONS {
         let out = lines(&run(v, src, &[]));
@@ -329,8 +321,7 @@ fn uvm_callbacks_add_and_delete() {
 
 /// A run_phase that never drops its objection is ended by set_timeout with a
 /// PH_TIMEOUT fatal at exactly the configured time.
-#[test]
-fn uvm_global_timeout_ends_a_hung_run_phase() {
+pub(super) fn uvm_global_timeout_ends_a_hung_run_phase() {
     let src = include_str!("../uvm/uvm_global_timeout.sv");
     for v in VERSIONS {
         let sim = run(v, src, &[]);

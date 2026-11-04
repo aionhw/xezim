@@ -1330,12 +1330,8 @@ impl Simulator {
                 if !is_always_comb {
                     SKIP_FN_BODY_READS.with(|c| c.set(true));
                 }
-                PACKED_ACCESS.with(|p| *p.borrow_mut() = Some(HashMap::default()));
                 let whole =
                     Self::collect_stmt_reads_whole(&ab.stmt, &self.module, &mut reads, &mut writes);
-                let packed_access: HashMap<String, PackedAccess> = PACKED_ACCESS
-                    .with(|p| p.borrow_mut().take())
-                    .unwrap_or_default();
                 SKIP_FN_BODY_READS.with(|c| c.set(false));
                 // Top-prefix-strip helper: `<top>.<rest>` → `<rest>`. Used
                 // to resolve hierarchical refs whose path includes the
@@ -1400,36 +1396,11 @@ impl Simulator {
                 // churns to the settle limit. Strip a read whose '.'-base prefix is
                 // in the write set — and a bare base that is read only through
                 // members this block writes (`self_written_read`).
-                // A packed vector is the exception (§9.2.2.2.1 longest static
-                // prefix): the block reads one element and writes another
-                // (`ds[1] = f(ds[0])`, `w[7:4] = w[3:0] + 1`, `st[1] = st[i]`),
-                // both named `ds`, and the element it reads is driven from
-                // outside. Dropping `ds` left the block deaf to that driver.
-                // `PackedAccess::keeps_sensitivity` says which blocks qualify;
-                // the settle loop never re-queues such a block on its own write
-                // (`comb_self_exempt`).
-                let is_vector = |k: &str| {
-                    self.signal_name_to_id.get(k).is_some_and(|&id| {
-                        self.signal_widths.get(id).is_some_and(|&w| w > 1)
-                            && !self.module.string_signals.contains(k)
-                    })
-                };
-                let keeps_packed_read = |r: &str| -> bool {
-                    packed_access
-                        .get(r)
-                        .is_some_and(PackedAccess::keeps_sensitivity)
-                        && (is_vector(r)
-                            || (!ab.scope.is_empty() && is_vector(&format!("{}.{}", ab.scope, r)))
-                            || scope_hint
-                                .as_ref()
-                                .is_some_and(|sc| is_vector(&format!("{}.{}", sc, r))))
-                };
+                // Packed regions are excluded before resolving backing ids
+                // by the same origin collector as struct member reads (#844).
                 let sens_reads: HashSet<String> = reads
                     .iter()
-                    .filter(|r| {
-                        keeps_packed_read(r.as_str())
-                            || !Self::self_written_read(r, &reads, &writes, &whole)
-                    })
+                    .filter(|r| !Self::self_written_read(r, &reads, &writes, &whole))
                     .cloned()
                     .collect();
                 // A bare read may resolve BOTH to a top-level signal and to

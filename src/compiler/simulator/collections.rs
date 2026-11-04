@@ -767,6 +767,14 @@ impl Simulator {
             None
         };
         let nm = &tref.name.name;
+        // §8.23/§8.25 (#842): a specialized enclosing scope keeps the
+        // full TypeName chain, even when pkg_scope qualified a colliding
+        // nested declaration. Its leaf alone can name another class.
+        if !tref.scopes.is_empty()
+            && let Some(c) = base_class(&tref.qualified())
+        {
+            return Some(c);
+        }
         if let Some(c) = base_class(nm) {
             return Some(c);
         }
@@ -853,6 +861,28 @@ impl Simulator {
             None
         };
         let nm = &tref.name.name;
+        // The nested class carries its enclosing parameters first. Keep
+        // the explicit enclosing specialization when resolving its handle;
+        // otherwise `Outer#(byte)::Inner` silently uses Outer's defaults.
+        if !tref.scopes.is_empty()
+            && let Some(c) = base_class(&tref.qualified())
+        {
+            let mut args: Vec<Expression> = tref
+                .scopes
+                .iter()
+                .flat_map(|s| s.type_args.iter().cloned())
+                .collect();
+            if args.is_empty()
+                && let Some(DataType::TypeReference { type_args, .. }) = self
+                    .module
+                    .typedef_types
+                    .get(&tref.qualified())
+                    .or_else(|| self.module.typedef_types.get(nm))
+            {
+                args.clone_from(type_args);
+            }
+            return Some((c, (!args.is_empty()).then_some(args)));
+        }
         // Direct class match (possibly parameterized) — extract type_args.
         if let Some(c) = base_class(nm) {
             let ta = match self
@@ -896,6 +926,79 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// §8.23/§8.25 (#842): nested declarations receive the enclosing
+    /// parameters first, followed by the nested class's own arguments.
+    /// Keep both lists for declaration initialization and later `new()`.
+    pub(super) fn scoped_class_type_args(
+        &self,
+        data_type: &crate::ast::types::DataType,
+    ) -> Option<Vec<Expression>> {
+        let crate::ast::types::DataType::TypeReference {
+            name, type_args, ..
+        } = data_type
+        else {
+            return None;
+        };
+        if !name.scopes.iter().any(|s| !s.type_args.is_empty()) {
+            return None;
+        }
+        let own_params = |class: &crate::compiler::elaborate::ElaboratedClass| {
+            let inherited = class
+                .enclosing
+                .as_ref()
+                .and_then(|n| self.module.classes.get(n))
+                .map_or(&[][..], |c| c.param_order.as_slice());
+            class
+                .param_order
+                .starts_with(inherited)
+                .then_some(inherited.len())
+        };
+        let mut out = Vec::new();
+        let mut append = |class: &crate::compiler::elaborate::ElaboratedClass,
+                          args: &[Expression]|
+         -> Option<()> {
+            let first = own_params(class)?;
+            let params = &class.param_order[first..];
+            for (i, arg) in args.iter().enumerate() {
+                match &arg.kind {
+                    ExprKind::Empty => {}
+                    ExprKind::NamedArg { .. } => out.push(arg.clone()),
+                    _ => {
+                        let param = params.get(i)?;
+                        out.push(Expression::new(
+                            ExprKind::NamedArg {
+                                name: crate::ast::Identifier {
+                                    name: param.clone(),
+                                    span: arg.span,
+                                },
+                                expr: Some(Box::new(arg.clone())),
+                            },
+                            arg.span,
+                        ));
+                    }
+                }
+            }
+            Some(())
+        };
+        let mut scope = String::new();
+        for link in &name.scopes {
+            if !scope.is_empty() {
+                scope.push_str("::");
+            }
+            scope.push_str(&link.name.name);
+            if !link.type_args.is_empty() {
+                append(self.module.classes.get(&scope)?, &link.type_args)?;
+            }
+        }
+        if !type_args.is_empty() {
+            append(self.module.classes.get(&name.qualified())?, type_args)?;
+        }
+        // Named bindings leave omitted outer parameters at their defaults;
+        // concatenating positional lists would shift inner arguments into
+        // those omitted slots.
+        Some(out)
     }
 
     /// §6.18 compile-time assignment type-check: assigning a non-class value

@@ -334,8 +334,8 @@ fn method_boost_enabled() -> bool {
 /// lowering, register allocation, block layout. Stale entries with an old
 /// salt hash to different keys and are simply recompiled; the safety net is
 /// the suite-level ON == OFF parity run against a warm cache.
-// §13.5.2: ref / inout copy-backs fit the actual; declined shadowed handles.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3066;
+// §18.8 (#846): mode builtins retain their receiver expressions in compiled code.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3067;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1569,43 +1569,6 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// How an `always_comb` block touches one packed vector through selects.
-/// An element is an index in the vector's outermost dimension (a bit of a
-/// one-dimensional vector); a constant part select records every element
-/// it covers.
-#[derive(Default)]
-struct PackedAccess {
-    reads: HashSet<i64>,
-    writes: HashSet<i64>,
-    /// Read whole or at a non-constant select.
-    read_any: bool,
-    /// Written whole or at a non-constant select.
-    write_any: bool,
-}
-
-impl PackedAccess {
-    /// §9.2.2.2.1: the vector stays in the block's sensitivity when the block
-    /// reads some element it does not write. Its longest static prefix is
-    /// read (`v[0]`, `v[i]`, `v`), and only the written select expressions
-    /// are excluded, so `v[1] = v[0]; v[2] = v[1]` is sensitive to `v` and
-    /// `v[1] = v[i] + 1` too. A block that writes the vector whole or at a
-    /// non-constant element (`v = '0; v[i] = x`), or one that writes every
-    /// element it reads (`v[0] = a; v[0] ^= b`), sees its own transient
-    /// values and keeps the old exclusion, so it cannot re-queue itself.
-    fn keeps_sensitivity(&self) -> bool {
-        !self.write_any
-            && !self.writes.is_empty()
-            && (self.read_any || self.reads.iter().any(|r| !self.writes.contains(r)))
-    }
-}
-
-thread_local! {
-    /// When `Some`, the read/write collectors record, per variable name, which
-    /// constant elements of a packed vector a block reads and writes.
-    static PACKED_ACCESS: std::cell::RefCell<Option<HashMap<String, PackedAccess>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CombEntry {
     item: CombItem,
@@ -1670,7 +1633,9 @@ struct CombEntryCold {
     cov: Option<u32>,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB028";
+// §9.2.2.2.1 (#844): rebuild dependency tables made before packed-region
+// sensitivity exclusion; their layout is readable but their edges are stale.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB029";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -9381,8 +9346,8 @@ pub struct Simulator {
     /// them into the real NBA queue. So the BSP driver must route these through
     /// the full `&mut self` path. Built alongside comb_level.
     comb_has_nba: Vec<bool>,
-    /// Per comb entry: it reads a signal it also writes (a packed vector,
-    /// see `PackedAccess::keeps_sensitivity`), so its own writes must not
+    /// Per comb entry: it reads a signal it also writes (a packed vector
+    /// whose reads survive write exclusion), so its own writes must not
     /// re-queue it. Other drivers of the vector still do. Rebuilt with the
     /// levels and whenever its length differs from `comb_entries`.
     comb_self_exempt: Vec<bool>,

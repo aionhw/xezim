@@ -1834,6 +1834,56 @@ impl Simulator {
     #[cold]
     #[inline(never)]
     pub(super) fn indexed_coll_name(&mut self, e: &Expression) -> Option<String> {
+        // §13.5.2 (#854): identify a fixed class-row actual before
+        // flattening it. The bare flat name is not the object's store;
+        // trying it and then resolving the class row evaluated every
+        // selector twice (including function calls and increments).
+        let mut indices = Vec::new();
+        let mut root = e;
+        while let ExprKind::Index { expr, index } = &root.kind {
+            indices.push(index.as_ref());
+            root = expr;
+        }
+        // The shape probes below may inspect a member receiver more than
+        // once before finding its collection store. Capture a side-effectful
+        // object receiver once, including for dynamic outer rows that do not
+        // take the fixed-row fast path (§11.4.1 / §13.5.2, #854).
+        if let ExprKind::MemberAccess { expr: recv, member } = &root.kind
+            && !Self::cond_expr_is_effect_free(recv, false)
+        {
+            let value = self.eval_expr(recv);
+            let mut selected = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.value_method_arg_expr(&value)),
+                    member: member.clone(),
+                },
+                root.span,
+            );
+            for index in indices.iter().rev() {
+                selected = Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(selected),
+                        index: Box::new((**index).clone()),
+                    },
+                    e.span,
+                );
+            }
+            return self.indexed_coll_name(&selected);
+        }
+        if let Some((mut key, bounds)) = self.class_fixed_array_of_coll_base(root)
+            && bounds.len() == indices.len()
+        {
+            for (index, &(lo, hi)) in indices.into_iter().rev().zip(&bounds) {
+                let value = self.eval_expr(index).to_i64()?;
+                if !(lo.min(hi)..=lo.max(hi)).contains(&value) {
+                    return None;
+                }
+                key.push('[');
+                Self::push_i64(&mut key, value);
+                key.push(']');
+            }
+            return Some(key);
+        }
         if let Some(n) = self.flat_member_name(e)
             && (self.module.dynamic_arrays.contains(&n)
                 || self.module.associative_arrays.contains_key(&n)

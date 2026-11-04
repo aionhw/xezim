@@ -2079,12 +2079,18 @@ impl Simulator {
     /// `@q#7`), or a member chain `obj.q` / `a.b.q` mapped to the owning
     /// object's `<handle>#q` storage. `None` when `arg` names no collection.
     pub(super) fn queue_actual_storage(&mut self, arg: &Expression) -> Option<String> {
+        // §13.5.2 (#854): resolve selected rows through one path, which
+        // captures side-effectful receivers and evaluates selectors once.
+        // Repeated probes would consume an actual's selectors again.
+        if matches!(&arg.kind, ExprKind::Index { .. }) {
+            let name = self.indexed_coll_name_gated(arg)?;
+            let is_collection = self.module.arrays.contains_key(&name)
+                || self.module.dynamic_arrays.contains(&name);
+            return is_collection.then_some(name);
+        }
         // An element of a fixed array of queues / dynamic arrays
         // (`sub_program[hart]`).
         let indexed = match &arg.kind {
-            ExprKind::Index { .. } => self
-                .class_array_of_coll_key(arg)
-                .or_else(|| self.indexed_coll_name_gated(arg)),
             ExprKind::Ident(h) if h.path.last().is_some_and(|s| !s.selects.is_empty()) => {
                 self.selected_ident_coll_name(arg)
             }

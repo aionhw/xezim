@@ -1956,12 +1956,13 @@ impl Simulator {
     /// distinct declaring name and remains a separate specialization.
     /// The class a plain type-argument fragment names. A direct key hit
     /// first; a `pkg::A::B` that is not a key falls back to `A::B`. The
-    /// pkg_scope collision pass renames a nested class whose leaf name is
-    /// declared in several packages to the mangled `A::B` (registered
-    /// under `A::B`, `A::A::B` and `pkg::A::A::B`), so a source spelling
-    /// that kept the unmangled `pkg::A::B` form misses the direct lookup
-    /// although the stripped form is one of its registered aliases.
-    fn class_arc_for_frag(&self, frag: &str) -> Option<std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>> {
+    /// package collision pass can qualify the nested declaration itself.
+    /// Older compiled artifacts also carry duplicated enclosing-name aliases;
+    /// stripping the package keeps their original source spellings resolvable.
+    fn class_arc_for_frag(
+        &self,
+        frag: &str,
+    ) -> Option<std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>> {
         if let Some(arc) = self.module.classes.get(frag) {
             return Some(arc.clone());
         }
@@ -1985,10 +1986,38 @@ impl Simulator {
             return None;
         }
         let arc = self.class_arc_for_frag(frag)?;
-        let declared = match &arc.enclosing {
-            Some(outer) => format!("{}::{}", outer, arc.name),
+        let mut declared = match &arc.enclosing {
+            Some(outer) => {
+                // §8.23 (#842): pkg_scope may already have qualified the
+                // declaration as Outer::Inner. Join only the missing prefix,
+                // exactly as the elaborator registers its class aliases.
+                let includes = |scope: &str| {
+                    arc.name == scope
+                        || arc
+                            .name
+                            .strip_prefix(scope)
+                            .is_some_and(|s| s.starts_with("::"))
+                };
+                if includes(outer) {
+                    arc.name.clone()
+                } else if let Some((at, _)) = outer
+                    .match_indices("::")
+                    .find(|(at, _)| includes(&outer[at + 2..]))
+                {
+                    format!("{}::{}", &outer[..at], arc.name)
+                } else {
+                    format!("{}::{}", outer, arc.name)
+                }
+            }
             None => arc.name.clone(),
         };
+        // Pre-#842 artifacts can retain only the duplicated declaring alias.
+        // Keep those aliases canonical with one another when decoding them.
+        if !self.module.classes.contains_key(&declared)
+            && let Some(outer) = &arc.enclosing
+        {
+            declared = format!("{}::{}", outer, arc.name);
+        }
         if declared == frag {
             return None; // already the declaring spelling
         }

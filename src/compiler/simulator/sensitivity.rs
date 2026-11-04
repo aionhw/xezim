@@ -5,28 +5,191 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 thread_local! {
-    /// While set (`collect_stmt_reads_whole`): the names read as a whole value,
-    /// not only as the base of a member read.
-    static WHOLE_READS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+    /// Origins used to exclude self-written members and packed selections
+    /// before their surviving dependencies resolve to backing signal ids.
+    static WHOLE_READS: RefCell<Option<ImplicitReadOrigins>> = const { RefCell::new(None) };
     /// While a function body's reads are collected: the reads of the
     /// functions it calls, kept apart from its own (`collect_callee_reads`).
     static CALLEE_READS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
-    /// The constant part select being applied to the bare name the collector
-    /// is about to visit (`v[7:4]`): the `Ident` arms hand it to
-    /// `note_packed_access` instead of recording a whole-vector access.
-    static PACKED_SELECT: std::cell::Cell<Option<(i64, i64)>> = const { std::cell::Cell::new(None) };
+}
+
+#[derive(Default)]
+pub(super) struct ImplicitReadOrigins {
+    whole: HashSet<String>,
+    whole_writes: HashSet<String>,
+    packed: HashMap<String, PackedAccesses>,
+}
+
+#[derive(Default)]
+struct PackedAccesses {
+    width: u64,
+    reads: Vec<(u64, u64)>,
+    writes: Vec<(u64, u64)>,
+}
+
+struct PackedSelection {
+    name: String,
+    offset: u64,
+    width: u64,
+    total_width: u64,
+    dims: Vec<(i64, i64)>,
+    dynamic: bool,
 }
 
 /// Record `name` as read whole, when `collect_stmt_reads_whole` is collecting.
 fn note_whole_read(name: &str) {
     WHOLE_READS.with(|c| {
         if let Some(set) = c.borrow_mut().as_mut() {
-            set.insert(name.to_string());
+            set.whole.insert(name.to_string());
+        }
+    });
+}
+
+fn note_packed_access(selection: &PackedSelection, write: bool) {
+    WHOLE_READS.with(|c| {
+        if let Some(origins) = c.borrow_mut().as_mut() {
+            let access = origins.packed.entry(selection.name.clone()).or_default();
+            access.width = selection.total_width;
+            let ranges = if write {
+                &mut access.writes
+            } else {
+                &mut access.reads
+            };
+            ranges.push((selection.offset, selection.offset + selection.width));
         }
     });
 }
 
 impl Simulator {
+    /// §9.2.2.2.1 / §11.5 (#844): keep the longest static packed prefix
+    /// until self-written regions have been excluded. Signal ids alone lose
+    /// the distinction between, for example, `ds[0]` and `ds[1]`.
+    fn packed_sensitivity_selection(
+        expr: &Expression,
+        module: &ElaboratedModule,
+    ) -> Option<PackedSelection> {
+        match &expr.kind {
+            ExprKind::Paren(e) => Self::packed_sensitivity_selection(e, module),
+            ExprKind::Ident(h) => {
+                let name = Self::resolve_hier_name_static(h, module);
+                if module.arrays.contains_key(&name)
+                    || module.arrays_2d.contains_key(&name)
+                    || module.arrays_nd.contains_key(&name)
+                    || module.dynamic_arrays.contains(&name)
+                    || module.queue_vars.contains(&name)
+                    || module.associative_arrays.contains_key(&name)
+                {
+                    return None;
+                }
+                let mut dims = module
+                    .packed_full_dims
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_default();
+                let width = if !dims.is_empty() {
+                    dims.iter().try_fold(1u64, |w, &(l, r)| {
+                        w.checked_mul(l.abs_diff(r).checked_add(1)?)
+                    })?
+                } else {
+                    let w = module.signals.get(&name).map(|s| s.width).or_else(|| {
+                        module.var_decl_types.get(&name).map(|dt| {
+                            super::elaborate::resolve_type_width(
+                                dt,
+                                Some(&module.parameters),
+                                Some(&module.typedefs),
+                            )
+                        })
+                    })?;
+                    dims.push(
+                        module
+                            .ascending_packed
+                            .get(&name)
+                            .copied()
+                            .unwrap_or((i64::from(w).checked_sub(1)?, 0)),
+                    );
+                    u64::from(w)
+                };
+                (width > 0).then_some(PackedSelection {
+                    name,
+                    offset: 0,
+                    width,
+                    total_width: width,
+                    dims,
+                    dynamic: false,
+                })
+            }
+            ExprKind::Index { expr: base, index } => {
+                let mut selection = Self::packed_sensitivity_selection(base, module)?;
+                if selection.dynamic {
+                    return Some(selection);
+                }
+                let Some(index) = Self::constant_array_index(index, module) else {
+                    selection.dynamic = true;
+                    return Some(selection);
+                };
+                let (left, right) = *selection.dims.first()?;
+                if !(left.min(right)..=left.max(right)).contains(&index) {
+                    return None;
+                }
+                let element = selection
+                    .width
+                    .checked_div(left.abs_diff(right).checked_add(1)?)?;
+                let pos = if left < right {
+                    right - index
+                } else {
+                    index - right
+                };
+                selection.offset += u64::try_from(pos).ok()?.checked_mul(element)?;
+                selection.width = element;
+                selection.dims.remove(0);
+                if selection.dims.is_empty() && element > 1 {
+                    selection.dims.push((i64::try_from(element).ok()? - 1, 0));
+                }
+                Some(selection)
+            }
+            ExprKind::RangeSelect {
+                expr: base,
+                kind,
+                left,
+                right,
+            } => {
+                let mut selection = Self::packed_sensitivity_selection(base, module)?;
+                if selection.dynamic {
+                    return Some(selection);
+                }
+                let (Some(a), Some(b)) = (
+                    Self::constant_array_index(left, module),
+                    Self::constant_array_index(right, module),
+                ) else {
+                    selection.dynamic = true;
+                    return Some(selection);
+                };
+                use crate::ast::expr::RangeKind;
+                let (l, r) = *selection.dims.first()?;
+                let (a, b) = match kind {
+                    RangeKind::Constant => (a, b),
+                    RangeKind::IndexedUp if b > 0 && l >= r => (a.checked_add(b - 1)?, a),
+                    RangeKind::IndexedUp if b > 0 => (a, a.checked_add(b - 1)?),
+                    RangeKind::IndexedDown if b > 0 && l >= r => (a, a.checked_sub(b - 1)?),
+                    RangeKind::IndexedDown if b > 0 => (a.checked_sub(b - 1)?, a),
+                    _ => return None,
+                };
+                let lo = a.min(b);
+                let hi = a.max(b);
+                if lo < l.min(r) || hi > l.max(r) || (a != b && (a > b) != (l > r)) {
+                    return None;
+                }
+                let element = selection.width.checked_div(l.abs_diff(r).checked_add(1)?)?;
+                let pos = if l < r { r - hi } else { lo - r };
+                selection.offset += u64::try_from(pos).ok()?.checked_mul(element)?;
+                selection.width = lo.abs_diff(hi).checked_add(1)?.checked_mul(element)?;
+                selection.dims[0] = (a, b);
+                Some(selection)
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn collect_leaf_idents(expr: &Expression, out: &mut HashSet<String>) {
         match &expr.kind {
             ExprKind::Ident(hier) if hier.path.len() == 1 => {
@@ -335,6 +498,11 @@ impl Simulator {
         if !entered {
             return;
         }
+        // Callee frame writes must not classify a caller's same-named
+        // packed signal as wholly written (#844). Collect the function with
+        // ordinary conservative dependencies, then record only its external
+        // reads after removing formals and locals below.
+        let outer_origins = WHOLE_READS.with(|c| c.replace(None));
         let mut scratch_writes: HashSet<String> = HashSet::default();
         let mut body_reads: HashSet<String> = HashSet::default();
         let outer = CALLEE_READS.with(|c| c.replace(Some(HashSet::default())));
@@ -377,6 +545,7 @@ impl Simulator {
         // spelling resolves to a nonexistent top-level signal and drops out of
         // the sensitivity set. Qualify it wherever only the scoped one exists.
         let scope = name.rsplit_once('.').map(|(s, _)| s);
+        WHOLE_READS.with(|c| c.replace(outer_origins));
         for r in body_reads {
             if let Some(scope) = scope {
                 // The body may be unrewritten (bare spellings), and a same-named
@@ -384,9 +553,12 @@ impl Simulator {
                 // a superset sensitivity is always safe, and the sensitivity
                 // builder drops whichever spelling resolves to no signal.
                 if !r.contains('.') {
-                    reads.insert(format!("{}.{}", scope, r));
+                    let scoped = format!("{}.{}", scope, r);
+                    note_whole_read(&scoped);
+                    reads.insert(scoped);
                 }
             }
+            note_whole_read(&r);
             reads.insert(r);
         }
         ACTIVE.with(|a| {
@@ -689,6 +861,17 @@ impl Simulator {
         module: &ElaboratedModule,
         reads: &mut HashSet<String>,
     ) {
+        if matches!(
+            expr.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+        ) && WHOLE_READS.with(|c| c.borrow().is_some())
+            && let Some(selection) = Self::packed_sensitivity_selection(expr, module)
+        {
+            note_packed_access(&selection, false);
+            reads.insert(selection.name);
+            Self::collect_lhs_index_reads(expr, module, reads);
+            return;
+        }
         // §14.13: a clocking-signal read (`cb.sig`, `iface.cb.sig`, either the
         // flat-Ident or MemberAccess shape) depends on the hidden sample mirror,
         // NOT on the underlying net — the sample only moves at the block's clock
@@ -762,7 +945,6 @@ impl Simulator {
                     }
                 }
                 note_whole_read(&name);
-                Self::note_packed_access(&name, PACKED_SELECT.take(), false);
                 reads.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
@@ -816,8 +998,6 @@ impl Simulator {
                         }
                     } else {
                         note_whole_read(&name);
-                        let idx = Self::constant_array_index(index, module);
-                        Self::note_packed_access(&name, idx.map(|i| (i, i)), false);
                         reads.insert(name);
                     }
                 } else if let Some(elems) = Self::multi_dim_elem_names(base, index, module) {
@@ -849,18 +1029,11 @@ impl Simulator {
             }
             ExprKind::RangeSelect {
                 expr: base,
-                kind,
                 left,
                 right,
+                ..
             } => {
-                // A constant part select of a bare vector names its elements
-                // (`w[3:0]`); the `Ident` arm records them in place of a
-                // whole read. Cleared again in case that arm returned early.
-                if matches!(base.kind, ExprKind::Ident(_)) {
-                    PACKED_SELECT.set(Self::constant_select_range(kind, left, right, module));
-                }
                 Self::collect_expr_reads(base, module, reads);
-                PACKED_SELECT.set(None);
                 Self::collect_expr_reads(left, module, reads);
                 Self::collect_expr_reads(right, module, reads);
             }
@@ -1137,10 +1310,24 @@ impl Simulator {
         writes: &mut HashSet<String>,
         mut arrays: Option<&mut HashSet<String>>,
     ) {
+        if matches!(
+            lhs.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+        ) && WHOLE_READS.with(|c| c.borrow().is_some())
+            && let Some(selection) = Self::packed_sensitivity_selection(lhs, module)
+        {
+            note_packed_access(&selection, true);
+            writes.insert(selection.name);
+            return;
+        }
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 let name = Self::resolve_hier_name_static(hier, module);
-                Self::note_packed_access(&name, PACKED_SELECT.take(), true);
+                WHOLE_READS.with(|c| {
+                    if let Some(origins) = c.borrow_mut().as_mut() {
+                        origins.whole_writes.insert(name.clone());
+                    }
+                });
                 writes.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
@@ -1172,8 +1359,6 @@ impl Simulator {
                                 }
                             }
                         } else {
-                            let idx = Self::constant_array_index(index, module);
-                            Self::note_packed_access(&name, idx.map(|i| (i, i)), true);
                             writes.insert(name);
                         }
                     }
@@ -1203,19 +1388,8 @@ impl Simulator {
                     }
                 }
             }
-            ExprKind::RangeSelect {
-                expr: base,
-                kind,
-                left,
-                right,
-            } => {
-                // `w[7:4] = ...` writes those elements, not the whole vector
-                // (see the read collector's arm).
-                if matches!(base.kind, ExprKind::Ident(_)) {
-                    PACKED_SELECT.set(Self::constant_select_range(kind, left, right, module));
-                }
-                Self::collect_lhs_writes_ex(base, module, writes, arrays.as_deref_mut());
-                PACKED_SELECT.set(None);
+            ExprKind::RangeSelect { expr: base, .. } => {
+                Self::collect_lhs_writes_ex(base, module, writes, arrays.as_deref_mut())
             }
             ExprKind::Concatenation(exprs) => {
                 for e in exprs {
@@ -1224,50 +1398,6 @@ impl Simulator {
             }
             _ => {}
         }
-    }
-
-    /// Record one access to `name` for the packed-vector sensitivity rule in
-    /// `comb_compilation`. `elems` is the inclusive range of outermost-dimension
-    /// elements a constant select covers; `None` for a whole-variable access
-    /// or a select whose bounds are not constants.
-    fn note_packed_access(name: &str, elems: Option<(i64, i64)>, is_write: bool) {
-        /// A wider constant part select counts as the whole vector.
-        const MAX_ELEMS: i64 = 4096;
-        PACKED_ACCESS.with(|p| {
-            let mut p = p.borrow_mut();
-            let Some(map) = p.as_mut() else { return };
-            let acc = map.entry(name.to_string()).or_default();
-            match elems {
-                Some((a, b)) if (a - b).abs() < MAX_ELEMS => {
-                    let set = if is_write {
-                        &mut acc.writes
-                    } else {
-                        &mut acc.reads
-                    };
-                    set.extend(a.min(b)..=a.max(b));
-                }
-                _ if is_write => acc.write_any = true,
-                _ => acc.read_any = true,
-            }
-        });
-    }
-
-    /// The outermost-dimension elements a part select of `base` with constant
-    /// bounds covers (`v[7:4]`, `v[4 +: 4]`, `v[7 -: 4]`), for
-    /// `note_packed_access`.
-    fn constant_select_range(
-        kind: &RangeKind,
-        left: &Expression,
-        right: &Expression,
-        module: &ElaboratedModule,
-    ) -> Option<(i64, i64)> {
-        let l = Self::constant_array_index(left, module)?;
-        let r = Self::constant_array_index(right, module)?;
-        Some(match kind {
-            RangeKind::Constant => (l, r),
-            RangeKind::IndexedUp => (l, l + (r - 1).max(0)),
-            RangeKind::IndexedDown => (l - (r - 1).max(0), l),
-        })
     }
 
     /// Collect reads/writes from a statement (for always @* / always_comb blocks).
@@ -1703,7 +1833,11 @@ impl Simulator {
                     .module
                     .packed_full_dims
                     .get(&name)
-                    .or_else(|| scoped.as_ref().and_then(|k| self.module.packed_full_dims.get(k)))
+                    .or_else(|| {
+                        scoped
+                            .as_ref()
+                            .and_then(|k| self.module.packed_full_dims.get(k))
+                    })
                     .or_else(|| {
                         hier.path
                             .last()
@@ -1920,8 +2054,8 @@ impl Simulator {
         module: &ElaboratedModule,
         reads: &mut HashSet<String>,
         writes: &mut HashSet<String>,
-    ) -> HashSet<String> {
-        let outer = WHOLE_READS.with(|c| c.replace(Some(HashSet::default())));
+    ) -> ImplicitReadOrigins {
+        let outer = WHOLE_READS.with(|c| c.replace(Some(ImplicitReadOrigins::default())));
         Self::collect_stmt_reads(stmt, module, reads, writes);
         WHOLE_READS.with(|c| c.replace(outer)).unwrap_or_default()
     }
@@ -1940,7 +2074,7 @@ impl Simulator {
         r: &str,
         reads: &HashSet<String>,
         writes: &HashSet<String>,
-        whole: &HashSet<String>,
+        origins: &ImplicitReadOrigins,
     ) -> bool {
         fn direct(r: &str, writes: &HashSet<String>) -> bool {
             if writes.contains(r) {
@@ -1956,12 +2090,42 @@ impl Simulator {
             false
         }
         if direct(r, writes) {
+            // Packed reads and writes share a signal id, but only overlapping
+            // static regions are excluded. Keep any portion read from outside
+            // this block, including a whole read beside a partial write.
+            if writes.contains(r)
+                && !origins.whole_writes.contains(r)
+                && let Some(access) = origins.packed.get(r)
+                && !access.writes.is_empty()
+            {
+                let covered = |(mut lo, end): (u64, u64)| {
+                    while lo < end {
+                        let next = access
+                            .writes
+                            .iter()
+                            .filter(|&&(a, b)| a <= lo && b > lo)
+                            .map(|&(_, b)| b)
+                            .max()
+                            .unwrap_or(lo);
+                        if next == lo {
+                            return false;
+                        }
+                        lo = next;
+                    }
+                    true
+                };
+                if access.reads.iter().any(|&range| !covered(range))
+                    || (origins.whole.contains(r) && !covered((0, access.width)))
+                {
+                    return false;
+                }
+            }
             return true;
         }
         // A base the block also reads as a whole (`out = s` beside
         // `s.a = ...`) stays: every member it does not write reaches `out`
         // through it.
-        if whole.contains(r) {
+        if origins.whole.contains(r) {
             return false;
         }
         let prefix = format!("{r}.");
