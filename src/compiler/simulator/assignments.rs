@@ -3870,7 +3870,7 @@ impl Simulator {
         // rather than each arm having to remember to push the bound. Gated on
         // a cheap scan, so an lvalue without `$` is untouched.
         let dollar_free;
-        let lhs: &Expression = if Self::lvalue_mentions_dollar(lhs) {
+        let lhs: &Expression = if Self::select_mentions_dollar(lhs) {
             dollar_free = self.resolve_dollar_in_lvalue(lhs);
             &dollar_free
         } else {
