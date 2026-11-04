@@ -1703,8 +1703,7 @@ impl Simulator {
         if let Some(kind) = Self::coll_kind_of(dims)
             && let (Some(dst), Some(src)) = (self.expr_assoc_name(lhs), self.expr_assoc_name(rhs))
         {
-            self.clear_coll(&dst, kind);
-            self.copy_coll(&dst, &src, kind);
+            if dst != src { self.clear_coll(&dst, kind); self.copy_coll(&dst, &src, kind); }
             return;
         }
         let v = self.eval_expr(rhs);
