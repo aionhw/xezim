@@ -1256,8 +1256,8 @@ impl Simulator {
         if self.module.interfaces.is_empty() {
             return None;
         }
-        // A class whose name is `virtual` plus an interface name is that
-        // class, not the interface. `virtualmon_if` must not become `virtual mon_if`.
+        // A class named `virtual` plus an interface is that class, not the interface.
+        // If that class exists, a parameter-free virtual interface keys as `virtual.name`.
         if self.module.classes.contains_key(frag.trim()) {
             return None;
         }
@@ -1347,7 +1347,7 @@ impl Simulator {
                 args.push(d);
             }
         }
-        let mut out = format!("virtual{}", name);
+        let mut out = format!("virtual{}{}", if args.is_empty() && modport.is_none() && self.module.classes.contains_key(&format!("virtual{name}")) { "." } else { "" }, name);
         if !args.is_empty() {
             out.push_str("#(");
             out.push_str(&args.join(","));

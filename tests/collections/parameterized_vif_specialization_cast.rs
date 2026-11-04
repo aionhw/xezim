@@ -46,23 +46,23 @@ endinterface
 interface mon_if #(parameter DATA_WIDTH = 32);
 endinterface
 
-class virtualmon_if;
-endclass
+class virtualmon_if; endclass
+class virtualplain_if; endclass
 
 module top;
-  int str_ok, plain_ok, mon_ok, wide_ok, class_ok;
-  res_base cq[$], pq[$], mq[$], wq[$], vq[$];
+  int str_ok, plain_ok, mon_ok, wide_ok, class_ok, plain_cls;
+  res_base cq[$], pq[$], mq[$], wq[$], vq[$], pq2[$];
   initial begin
     cq.push_back(res#(virtual str_if)::make());
     pq.push_back(res#(virtual plain_if)::make());
     mq.push_back(res#(virtual mon_if)::make());
     wq.push_back(res#(virtual mon_if#(64))::make());
-    vq.push_back(res#(virtualmon_if)::make());
+    vq.push_back(res#(virtualmon_if)::make()); pq2.push_back(res#(virtualplain_if)::make());
     str_ok = res#(virtual str_if)::from_q(cq);
     plain_ok = res#(virtual plain_if)::from_q(pq);
     mon_ok = res#(virtual mon_if)::from_q(mq);
     wide_ok = res#(virtual mon_if)::from_q(wq);
-    class_ok = res#(virtual mon_if)::from_q(vq);
+    class_ok = res#(virtual mon_if)::from_q(vq); plain_cls = res#(virtual plain_if)::from_q(pq2);
   end
 endmodule
 "#;
@@ -73,9 +73,9 @@ endmodule
             u(&sim, "plain_ok"),
             u(&sim, "mon_ok"),
             u(&sim, "wide_ok"),
-            u(&sim, "class_ok")
+            u(&sim, "class_ok"), u(&sim, "plain_cls")
         ),
-        (1, 1, 1, 0, 0),
-        "string-param, plain, integer-param, a different integer parameter, and a class named like the interface"
+        (1, 1, 1, 0, 0, 0),
+        "string-param, plain, integer-param, a different integer parameter, and classes named like the interfaces"
     );
 }
