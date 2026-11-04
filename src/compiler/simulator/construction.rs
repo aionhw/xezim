@@ -1256,6 +1256,11 @@ impl Simulator {
         if self.module.interfaces.is_empty() {
             return None;
         }
+        // A class whose name is `virtual` plus an interface name is that
+        // class, not the interface. `virtualmon_if` must not become `virtual mon_if`.
+        if self.module.classes.contains_key(frag.trim()) {
+            return None;
+        }
         let rest = frag.trim().strip_prefix("virtual")?;
         let head_end = rest.find(['#', '.']).unwrap_or(rest.len());
         let head: String = rest[..head_end]

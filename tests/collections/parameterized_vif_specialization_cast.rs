@@ -46,18 +46,23 @@ endinterface
 interface mon_if #(parameter DATA_WIDTH = 32);
 endinterface
 
+class virtualmon_if;
+endclass
+
 module top;
-  int str_ok, plain_ok, mon_ok, wide_ok;
-  res_base cq[$], pq[$], mq[$], wq[$];
+  int str_ok, plain_ok, mon_ok, wide_ok, class_ok;
+  res_base cq[$], pq[$], mq[$], wq[$], vq[$];
   initial begin
     cq.push_back(res#(virtual str_if)::make());
     pq.push_back(res#(virtual plain_if)::make());
     mq.push_back(res#(virtual mon_if)::make());
     wq.push_back(res#(virtual mon_if#(64))::make());
+    vq.push_back(res#(virtualmon_if)::make());
     str_ok = res#(virtual str_if)::from_q(cq);
     plain_ok = res#(virtual plain_if)::from_q(pq);
     mon_ok = res#(virtual mon_if)::from_q(mq);
     wide_ok = res#(virtual mon_if)::from_q(wq);
+    class_ok = res#(virtual mon_if)::from_q(vq);
   end
 endmodule
 "#;
@@ -67,9 +72,10 @@ endmodule
             u(&sim, "str_ok"),
             u(&sim, "plain_ok"),
             u(&sim, "mon_ok"),
-            u(&sim, "wide_ok")
+            u(&sim, "wide_ok"),
+            u(&sim, "class_ok")
         ),
-        (1, 1, 1, 0),
-        "string-param, plain, integer-param, and a different integer parameter"
+        (1, 1, 1, 0, 0),
+        "string-param, plain, integer-param, a different integer parameter, and a class named like the interface"
     );
 }
