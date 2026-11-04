@@ -392,3 +392,6 @@ mod review_indexed_scope_selects;
 
 #[path = "hierarchy/instance_array_struct_ports.rs"]
 mod instance_array_struct_ports;
+
+#[path = "hierarchy/struct_member_actuals.rs"]
+mod struct_member_actuals;
