@@ -395,6 +395,21 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   bounds of a range, so `a[0 +: 6] = b` was rejected ("the arrays have 7
   and 6 elements"), some real mismatches were accepted and others reported
   with wrong sizes (§7.4.5, §7.6, §11.5.1, #869, reported by git-hevangel).
+* A method of a nested class defined out of block inside the enclosing
+  class body, `task inner::run(...)` written in `outer`, is linked to the
+  nested class, in a package, through a constructor, as a virtual method and
+  with type parameters; the call ran the empty prototype (§8.24, §8.23, #842,
+  reported by git-hevangel). A nested class whose name collides across
+  packages keeps its qualified spellings.
+* Follow-ups to the recent randomization and argument fixes: a constraint on
+  a selected part of a counted vector counts its bits with the rest
+  (§20.9, #852), a fixed class-row actual and a side-effecting receiver are
+  evaluated once (§13.5.2, #854), a rand sub-object's collections join the
+  parent's solve and its `foreach` indexes the elements, not their bits
+  (§18.5.9, #860), and a package struct member keeps its own enum domain
+  when packages share a typedef name (§18.3, §26.3, #862). Packed and
+  unpacked element reads of an `always_comb` share one dependency collector
+  (§9.2.2.2.1, #844).
 
 **Performance**
 
@@ -484,6 +499,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   110.9 G instructions to compile, now 9.9 G, and 8,000 package classes
   41.3 G, now 1.7 G (§11.5.1, §8.18, #872, reported by git-hevangel). The
   verdicts are unchanged.
+* A prepared body's cache key holds only the parameters of its scope that
+  differ from the table, plus a shared bit mask of the ones absent from it,
+  and repeated width bindings of unchanged typedefs are no longer journaled,
+  so a large design keeps one copy of the common scope words instead of one
+  per definition (§23.10, #721). With several uninstantiated modules and no
+  top named, the first in source order carries the compilation-unit
+  subroutine bodies instead of every definition getting a copy (§3.12.1,
+  #834).
+* A read of a declared module memory through a static hierarchical path
+  inside an automatic task binds the memory directly instead of evaluating
+  the instance prefix as a run-time receiver on every access; local, class,
+  struct and typedef names that shadow it keep their meaning.
 
 ### 0.11.4 — class-object reclamation, linear elaboration, class and randomization correctness (October 2026)
 
