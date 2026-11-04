@@ -312,14 +312,7 @@ impl Simulator {
             };
             if is_queue_init {
                 let scoped_q = format!("{}#{}", handle, pname);
-                // An unpacked-struct element is stored member-wise as
-                // `<prop>[i].<m>`. A non-pattern item is read once per member,
-                // so a call stays on the whole-element path.
                 if let ExprKind::AssignmentPattern(items) = &init.kind
-                    && items.iter().all(|it| {
-                        matches!(it.expr().kind, ExprKind::AssignmentPattern(_))
-                            || Self::cond_expr_is_effect_free(it.expr(), false)
-                    })
                     && let Some(su) = self
                         .collection_elem_struct(handle, &pname)
                         .filter(Self::spreads_member_wise)
@@ -327,8 +320,16 @@ impl Simulator {
                     self.set_queue_size(&scoped_q, items.len() as u64);
                     let base = prop_ident_expr(&pname);
                     for (i, item) in items.iter().enumerate() {
-                        let elem = Self::index_expr(&base, i as i64);
-                        self.assign_class_unpacked_elem(&elem, item.expr(), &su);
+                        let e = item.expr();
+                        if matches!(e.kind, ExprKind::AssignmentPattern(_))
+                            || Self::cond_expr_is_effect_free(e, false)
+                        {
+                            let elem = Self::index_expr(&base, i as i64);
+                            self.assign_class_unpacked_elem(&elem, e, &su);
+                        } else {
+                            let v = self.eval_expr(e);
+                            self.set_signal_value_by_name(&format!("{scoped_q}[{i}]"), v);
+                        }
                     }
                     continue;
                 }
