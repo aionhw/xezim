@@ -1362,6 +1362,7 @@ impl Simulator {
             .then(|| obj::csp_obj_enter(obj_arrays.iter().cloned().collect()));
         let mut joint: Vec<ClassConstraint>;
         let joint_check: Vec<ClassConstraint>;
+        let mut sub_dynamic = false;
         let check: &[ClassConstraint];
         let constraints: &[ClassConstraint] = if subs.is_empty() {
             check = constraints;
@@ -1376,9 +1377,11 @@ impl Simulator {
                 }
             };
             for (prop, sub) in subs {
-                let Some(items) = self.csp_add_sub(&mut csp, prop, *sub, constraints) else {
+                let Some((items, dynamic)) = self.csp_add_sub(&mut csp, prop, *sub, constraints)
+                else {
                     return CspOutcome::NotApplicable;
                 };
+                sub_dynamic |= dynamic;
                 joint.push(ClassConstraint {
                     is_static: false,
                     is_extern: false,
@@ -1420,6 +1423,12 @@ impl Simulator {
             return CspOutcome::GaveUp;
         }
         let out = self.csp_run(&csp, check, colls);
+        // The caller sized a sub-object's dynamic arrays in its own trial.
+        // Refuting those particular sizes does not refute another size the
+        // next trial may draw (§18.5.8.1).
+        if sub_dynamic && matches!(out, CspOutcome::Unsat) {
+            return CspOutcome::GaveUp;
+        }
         if !matches!(out, CspOutcome::Unsat) || csp.soft_priority.is_empty() {
             return out;
         }
@@ -1639,7 +1648,10 @@ impl Simulator {
                     .iter()
                     .map(|(n, a)| (n.clone(), a.elems.len(), a.width, a.signed))
                     .collect::<Vec<_>>(),
-                csp.vars.iter().map(|v| format!("{:?}", v.key)).collect::<Vec<_>>(),
+                csp.vars
+                    .iter()
+                    .map(|v| format!("{:?}", v.key))
+                    .collect::<Vec<_>>(),
                 csp.nd_dims
             );
         }
@@ -3716,8 +3728,8 @@ impl Simulator {
     /// own (`csp_wide_split`), or left as drawn when no constraint of the
     /// solve (`parent`'s or the sub-object's) reads it. A `foreach` over a
     /// fixed-shape member of the sub-object is unrolled. None when the
-    /// sub-object holds anything this solver does not model: a nested
-    /// object, a collection, a real, a randc, an unpacked struct, or a
+    /// sub-object holds anything this solver does not model: a real,
+    /// a randc, an unpacked struct, an unsupported collection shape, or a
     /// constraint that calls a method.
     fn csp_add_sub(
         &mut self,
@@ -3725,7 +3737,7 @@ impl Simulator {
         prop: &str,
         sub: usize,
         parent: &[ClassConstraint],
-    ) -> Option<Vec<ConstraintItem>> {
+    ) -> Option<(Vec<ConstraintItem>, bool)> {
         let class_name = self.heap.get(sub)?.as_ref()?.class_name.clone();
         let rand_disabled = self
             .rand_mode_disabled
@@ -3769,14 +3781,23 @@ impl Simulator {
                 {
                     continue;
                 }
-                if is_obj
-                    || sig.is_real
-                    || sig.width == 0
-                    || cd.array_properties.contains_key(&name)
+                let is_coll = cd.array_properties.contains_key(&name)
                     || cd.array_nd_properties.contains_key(&name)
                     || cd.queue_properties.contains_key(&name)
-                    || cd.assoc_properties.contains_key(&name)
-                {
+                    || cd.assoc_properties.contains_key(&name);
+                // §18.5.9 (#860): a child collection joins through its
+                // elements below, rather than aborting the parent's solve.
+                if is_coll && !is_obj {
+                    if sig.is_real
+                        || self
+                            .class_prop_struct(sub, &name)
+                            .is_some_and(|s| !s.packed)
+                    {
+                        return None;
+                    }
+                    continue;
+                }
+                if is_obj || sig.is_real || sig.width == 0 || is_coll {
                     return None;
                 }
                 // §7.2.1: a packed struct is one integral value of its true
@@ -3817,6 +3838,60 @@ impl Simulator {
                 }
             }
             cur = cd.extends.clone();
+        }
+        let child_constraints = [ClassConstraint {
+            is_static: false,
+            is_extern: false,
+            has_body: true,
+            name: crate::ast::Identifier {
+                name: "__child__".to_string(),
+                span: crate::ast::Span::dummy(),
+            },
+            items: items.clone(),
+            span: crate::ast::Span::dummy(),
+        }];
+        let colls = self.collect_rand_colls(sub, &rand_disabled, &child_constraints);
+        let dynamic = colls.iter().any(|c| c.kind == CollKind::Dyn);
+        if !colls.is_empty() {
+            let colls = self.csp_expand_rows(&colls);
+            let enums: HashMap<String, String> = colls
+                .iter()
+                .filter_map(|c| {
+                    let p = c.nd_base.as_ref().map_or(c.prop.as_str(), |(p, _)| p);
+                    let tn = self.class_prop_type_name(sub, p)?;
+                    self.module
+                        .enum_members
+                        .contains_key(&tn)
+                        .then(|| (c.prop.clone(), tn))
+                })
+                .collect();
+            let child = self.csp_vars(
+                sub,
+                &[],
+                &HashSet::default(),
+                &HashMap::default(),
+                &colls,
+                &enums,
+                &HashSet::default(),
+                true,
+                &HashSet::default(),
+            )?;
+            let offset = csp.vars.len();
+            csp.vars.extend(child.vars);
+            csp.dom0.extend(child.dom0);
+            csp.wide.extend(child.wide.into_iter().map(|v| offset + v));
+            for (name, mut array) in child.arrays {
+                for (_, v) in &mut array.elems {
+                    *v += offset;
+                }
+                csp.arrays.insert(format!("{prop}.{name}"), array);
+            }
+            for (name, dims) in child.nd_dims {
+                csp.nd_dims.insert(format!("{prop}.{name}"), dims);
+            }
+            for (name, n) in child.nd_dyn {
+                csp.nd_dyn.insert(format!("{prop}.{name}"), n);
+            }
         }
         // §18.5.8.1: a loop over a fixed-shape member of the sub-object has
         // known indices; it is unrolled so every item reads through `prop`.
@@ -3887,7 +3962,7 @@ impl Simulator {
             }
             out.push(it);
         }
-        Some(out)
+        Some((out, dynamic))
     }
 
     /// Visit `it` and every item nested in it.
@@ -4106,6 +4181,18 @@ impl Simulator {
             ExprKind::SystemCall { args, .. } => args
                 .iter_mut()
                 .all(|a| Self::csp_prefix_expr(a, prop, members)),
+            ExprKind::Call { func, args }
+                if matches!(
+                    &func.kind,
+                    ExprKind::MemberAccess { member, .. }
+                        if matches!(member.name.as_str(), "size" | "num" | "sum")
+                ) =>
+            {
+                Self::csp_prefix_expr(func, prop, members)
+                    && args
+                        .iter_mut()
+                        .all(|a| Self::csp_prefix_expr(a, prop, members))
+            }
             ExprKind::Replication { count, exprs } => {
                 Self::csp_prefix_expr(count, prop, members)
                     && exprs
@@ -4406,7 +4493,11 @@ impl Simulator {
                             .map(|(j, v)| {
                                 let d = consts.len() + j;
                                 let (l, r) = dims[d];
-                                let (lo, hi) = if d < ndyn { (0, r) } else { (l.min(r), l.max(r)) };
+                                let (lo, hi) = if d < ndyn {
+                                    (0, r)
+                                } else {
+                                    (l.min(r), l.max(r))
+                                };
                                 (v.as_ref().map(|v| v.name.clone()), lo, hi)
                             })
                             .collect();
@@ -4683,10 +4774,20 @@ impl Simulator {
         {
             return None;
         }
-        let (lo, hi) = match self
-            .fixed_foreach_dims(handle, name)
-            .or_else(|| self.packed_prop_foreach_dims(handle, name))
+        let fixed = self.fixed_foreach_dims(handle, name);
+        if fixed.is_none()
+            && let Some(keys) = self.rand_child_collection_keys(handle, name)
         {
+            // §7.4/§18.5.9 (#860): foreach indexes the unpacked collection,
+            // not its element's packed dimensions. `bit [7:0] r[]` with
+            // four elements has indices 0..3, never the eight bit indices.
+            let prefix = format!("{handle}#{name}[");
+            return keys
+                .iter()
+                .map(|key| key.strip_prefix(&prefix)?.strip_suffix(']')?.parse().ok())
+                .collect();
+        }
+        let (lo, hi) = match fixed.or_else(|| self.packed_prop_foreach_dims(handle, name)) {
             Some((dims, _)) => *dims.first()?,
             // A state queue or dynamic array: its current size bounds the
             // loop for this solve (an empty one constrains nothing).
@@ -5989,7 +6090,7 @@ impl Simulator {
                 // `a.x`, or `a.b.x` for a sub-object of a sub-object.
                 if path.len() >= 2 {
                     let n = path.join(".");
-                    if csp.scalars.contains_key(&n) {
+                    if known(&n) {
                         return Some(n);
                     }
                 }
@@ -6119,7 +6220,9 @@ impl Simulator {
                 if !csp.nd_dims.is_empty()
                     && h.root.is_none()
                     && h.path.last().is_some_and(|s| !s.selects.is_empty())
-                    && h.path[..h.path.len() - 1].iter().all(|s| s.selects.is_empty())
+                    && h.path[..h.path.len() - 1]
+                        .iter()
+                        .all(|s| s.selects.is_empty())
                 {
                     let mut bh = h.clone();
                     let sels = std::mem::take(&mut bh.path.last_mut().unwrap().selects);
@@ -6136,7 +6239,8 @@ impl Simulator {
                                     row.push_str(&format!("[{c}]"));
                                 }
                                 if let Some(a) = csp.arrays.get(&row)
-                                    && let Some(x) = a.elems.iter().find(|x| x.0 == cs[cs.len() - 1])
+                                    && let Some(x) =
+                                        a.elems.iter().find(|x| x.0 == cs[cs.len() - 1])
                                 {
                                     push_var(x.1, out);
                                     return true;
@@ -7090,6 +7194,18 @@ impl Simulator {
                 uses.insert(v, all.clone());
             }
         }
+        // §20.9 (#852): when another constraint selects part of a counted
+        // scalar, count its bits rather than a separate whole-value pop
+        // variable. Otherwise the selected segment is pinned but the
+        // remaining wide segment is guessed without count propagation.
+        pops.sort_unstable();
+        pops.dedup();
+        for &v in &pops {
+            if let Some(u) = uses.get_mut(&v) {
+                let w = csp.vars[v].width;
+                u.0.extend((0..w).map(|bit| (bit, 1)));
+            }
+        }
         if !csp.wide.is_empty() {
             self.csp_wide_split(csp, &uses, &links);
         }
@@ -7136,8 +7252,6 @@ impl Simulator {
             }
             csp.segs.insert(v, segs);
         }
-        pops.sort_unstable();
-        pops.dedup();
         csp.pop.clear();
         csp.pop_rev.clear();
         for x in pops {
@@ -9006,10 +9120,23 @@ impl Simulator {
     /// the sub-object for a `prop.x` variable (`csp_add_sub`), the object
     /// being solved otherwise.
     fn csp_owner<'a>(csp: &'a Csp, name: &'a str) -> (usize, &'a str) {
-        match csp.scalars.get(name).map(|&v| &csp.vars[v].key) {
-            Some(VarKey::Sub(h, n)) => (*h, n.as_str()),
-            _ => (csp.handle, name),
+        if let Some(VarKey::Sub(h, n)) = csp.scalars.get(name).map(|&v| &csp.vars[v].key) {
+            return (*h, n.as_str());
         }
+        // A sub-object collection keeps its actual `<handle>#member[i]`
+        // storage keys. Packed element fields/dimensions belong to that
+        // declaring object's class, just as a sub-object scalar does.
+        if let Some(VarKey::Elem(key)) = csp
+            .arrays
+            .get(name)
+            .and_then(|a| a.elems.first())
+            .map(|&(_, v)| &csp.vars[v].key)
+            && let Some((h, member)) = key.split_once('#')
+            && let Ok(h) = h.parse()
+        {
+            return (h, member.split_once('[').map_or(member, |(p, _)| p));
+        }
+        (csp.handle, name)
     }
 
     /// §7.4.5: the fields of struct scalar `name` (nested ones included)

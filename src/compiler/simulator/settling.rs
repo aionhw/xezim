@@ -1696,7 +1696,7 @@ impl Simulator {
                             continue;
                         }
                         // An `always @*` that reads a packed element it also
-                        // writes (`PackedAccess::keeps_sensitivity`), the one
+                        // writes after packed-region exclusion, the one
                         // kind the arm above lets through. Precomputed; only
                         // a self-dependency gets this far, and only an entry
                         // added since the table was built misses it.

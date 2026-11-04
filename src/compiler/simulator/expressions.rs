@@ -2100,6 +2100,112 @@ impl Simulator {
         }
     }
 
+    /// §23.6/§23.9, §7.4.6: a declaration-backed module memory does not
+    /// require evaluating its instance prefixes as class or struct values.
+    /// Task bodies keep dotted references as MemberAccess chains; probing
+    /// every prefix that way before recognizing the array repeats that work
+    /// recursively at each hierarchy level.
+    #[inline(never)]
+    fn declared_module_memory_read(
+        &mut self,
+        base: &Expression,
+        index: &Expression,
+    ) -> Option<Value> {
+        let root = Self::member_chain_root(base)?;
+        // A nearer value or interface binding retains ordinary member
+        // dispatch. In particular, an identically named module memory must
+        // not capture a local object's or packed struct's member.
+        if self.frame_scalar_shadows(root)
+            || self.dyn_name_lookup(root).is_some()
+            || self
+                .formal_dyn
+                .last()
+                .is_some_and(|f| f.iter().any(|(name, _)| name == root))
+            || self.class_context_stack.last().is_some_and(Option::is_some)
+            || self.this_prop_hides(root)
+            || self.module.classes.contains_key(root)
+            || self.module.packages.contains(root)
+            || self.lookup_typedef_target(root).is_some()
+            || self
+                .local_iface_aliases
+                .last()
+                .is_some_and(|f| f.contains_key(root))
+            || self.iface_alias_for(root).is_some()
+        {
+            return None;
+        }
+        // Instance prefixes can also have implicit placeholder signal IDs.
+        // Only a declared value shadows the instance, not that lookup entry.
+        let is_value = |name: &str| {
+            self.module.var_decl_types.contains_key(name)
+                || self.module.parameters.contains_key(name)
+        };
+        if is_value(root) || self.hint_scoped(root).is_some_and(|n| is_value(&n)) {
+            return None;
+        }
+
+        // Only pure, unselected names qualify. Calls, indexed receivers,
+        // this/super and other runtime receivers never run during this probe.
+        let mut parts = Vec::new();
+        let mut current = base;
+        loop {
+            match &current.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    parts.push(member.name.as_str());
+                    current = expr;
+                }
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                {
+                    parts.push(h.path[0].name.name.as_str());
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        parts.reverse();
+        let mut name = parts.join(".");
+        // Match the ordinary array reader's absolute-then-instance lookup.
+        if !self.module.arrays.contains_key(&name) {
+            name = self.hint_scoped(&name)?;
+        }
+        let parent = name.rsplit_once('.')?.0;
+        if self.instance_by_path(parent).is_none()
+            || !self.module.var_decl_types.contains_key(&name)
+            || self.module.dynamic_arrays.contains(&name)
+            || self.module.queue_vars.contains(&name)
+            || self.module.associative_arrays.contains_key(&name)
+            || self.module.arrays_2d.contains_key(&name)
+            || self.module.arrays_nd.contains_key(&name)
+        {
+            return None;
+        }
+        let width = self.module.arrays.get(&name)?.2.max(1);
+        let &(first, lo, hi) = self.array_first_id.get(name.as_str())?;
+        // Evaluate the selector only after binding succeeds, exactly once.
+        // Use the same invalid-index and packed-arena handling as the
+        // general fixed-array read below.
+        let value = self.eval_expr(index);
+        let Some(i) = value.to_index().filter(|_| !value.has_xz()) else {
+            return Some(Value::new(width));
+        };
+        if !(lo..=hi).contains(&i) {
+            return Some(
+                self.assoc_missing_elem_value(&name)
+                    .unwrap_or_else(|| Value::new(width)),
+            );
+        }
+        let id = first + (i - lo) as usize;
+        if is_packed_id(id) {
+            return Some(self.packed.read(id));
+        }
+        let mut value = self.signal_table[id].clone();
+        if self.signal_signed[id] {
+            value.is_signed = true;
+        }
+        Some(value)
+    }
+
     pub(super) fn eval_expr_ctx_inner(
         &mut self,
         expr: &Expression,
@@ -4865,6 +4971,11 @@ impl Simulator {
                 // element's sample (see `tick_clocking_blocks`).
                 if let Some(v) = self.clocking_array_elem_read(expr, index) {
                     return v;
+                }
+                if matches!(expr.kind, ExprKind::MemberAccess { .. })
+                    && let Some(value) = self.declared_module_memory_read(expr, index)
+                {
+                    return value;
                 }
                 // §13.4/§7.4: an element of a function's or method's returned
                 // collection (`f()[k]`, `o.build()[k]`). Evaluating the call

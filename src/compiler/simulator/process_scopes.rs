@@ -1370,6 +1370,14 @@ impl Simulator {
                             .push((nm.to_string(), self.task_frame_string_flag(nm)));
                     }
                 }
+                // §23.9 (#856): a scalar block local also hides a
+                // same-named enclosing collection. Its rename is restored
+                // with the rest of the block's declarations on exit.
+                if let Some(ld) = self.local_dyn.last_mut() {
+                    if let Some(pos) = ld.iter().rposition(|(k, _)| k == nm) {
+                        sv.dyn_shadowed.push(ld.remove(pos));
+                    }
+                }
                 if plain && d.dimensions.is_empty() {
                     continue;
                 }
@@ -1380,12 +1388,6 @@ impl Simulator {
                         if k.starts_with(&marker) && !sv.shadowed.iter().any(|(n, _)| n == k) {
                             sv.shadowed.push((k.clone(), v.clone()));
                         }
-                    }
-                }
-                // A collection local: move the enclosing rename aside.
-                if let Some(ld) = self.local_dyn.last_mut() {
-                    if let Some(pos) = ld.iter().rposition(|(k, _)| k == nm) {
-                        sv.dyn_shadowed.push(ld.remove(pos));
                     }
                 }
             }
