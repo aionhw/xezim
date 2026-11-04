@@ -2971,7 +2971,7 @@ impl Simulator {
                 if cd.static_properties.contains(name)
                     && cd.static_collections.iter().any(|(n, _, _)| n == name)
                 {
-                    if let Some(key) = self.static_prop_key(&cn, name) {
+                    if let Some(key) = self.static_prop_key(ctx, name) {
                         // Rewrite storage to the per-DECLARING-class key ONLY
                         // when the bare name collides across classes (§8.9) or
                         // the class is parameterized (`#spec`). A statically
