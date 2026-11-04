@@ -408,3 +408,6 @@ mod generate_rename_scope;
 
 #[path = "hierarchy/generate_array_localparam.rs"]
 mod generate_array_localparam;
+
+#[path = "hierarchy/instance_array_struct_ports.rs"]
+mod instance_array_struct_ports;
