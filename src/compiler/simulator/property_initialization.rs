@@ -312,10 +312,14 @@ impl Simulator {
             };
             if is_queue_init {
                 let scoped_q = format!("{}#{}", handle, pname);
-                // An unpacked-struct element (one with a string member,
-                // say) is stored member-wise as `<prop>[i].<m>`, like the
-                // fixed-array case below.
+                // An unpacked-struct element is stored member-wise as
+                // `<prop>[i].<m>`. A non-pattern item is read once per member,
+                // so a call stays on the whole-element path.
                 if let ExprKind::AssignmentPattern(items) = &init.kind
+                    && items.iter().all(|it| {
+                        matches!(it.expr().kind, ExprKind::AssignmentPattern(_))
+                            || Self::cond_expr_is_effect_free(it.expr(), false)
+                    })
                     && let Some(su) = self
                         .collection_elem_struct(handle, &pname)
                         .filter(Self::spreads_member_wise)
