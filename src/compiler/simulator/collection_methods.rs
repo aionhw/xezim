@@ -3280,7 +3280,22 @@ impl Simulator {
                 {
                     return Some(Value::from_u64(1, 1));
                 }
-                if self.assoc_elem_decl_type(obj_name).is_some() {
+                if self.assoc_elem_decl_type(obj_name).is_some()
+                    // Scalar-integral fast path: a flat-key miss with a scalar
+                    // (non-collection) element can have no compound children, so
+                    // `.exists` is false. But a MULTIDIMENSIONAL row (`v[0]` of
+                    // `int v[2][string][string]`) still stores its entry under a
+                    // compound key `v[0]["A"]["B"]`; the scalar element type is
+                    // only reported via the §7.4.5 dimension collapse, and the
+                    // element below the current select chain is itself a
+                    // collection, so `.exists("A")` must fall through to the
+                    // prefix scan (it is true). Skip the fast path then.
+                    && !self.coll_shape_at(&obj_name).is_some_and(|(shape, depth)| {
+                        shape.dims.get(depth + 1).is_some_and(|d| {
+                            matches!(d, Dim::Assoc(_) | Dim::Queue | Dim::Dyn)
+                        })
+                    })
+                {
                     return Some(Value::from_u64(0, 1));
                 }
                 // A multidimensional associative array (`m[K1][K2]`, IEEE
