@@ -2439,6 +2439,14 @@ impl Simulator {
             while let ExprKind::Paren(inner) = &operand.kind {
                 operand = inner;
             }
+            // §7.4.6, §20.7: a slice of an unpacked array has the size of its
+            // range, not its width in bits (#867).
+            if name == "$size"
+                && args.len() == 1
+                && let Some(n) = self.unpacked_slice_size(operand)
+            {
+                return Value::from_u64(n as u64, 32);
+            }
             if let ExprKind::Conditional {
                 then_expr,
                 else_expr,

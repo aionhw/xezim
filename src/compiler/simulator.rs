@@ -3016,6 +3016,7 @@ mod system_tasks;
 mod two_state;
 mod type_metadata;
 mod udp;
+mod unpacked_slices;
 mod value_display;
 mod virtual_interfaces;
 mod waveforms;
@@ -8664,6 +8665,14 @@ pub struct Simulator {
     /// Names the storage of each typed pattern value held at once.
     #[serde(skip)]
     typed_pattern_seq: u64,
+    /// §13.5: the slice actuals of the `output`, `inout` and `ref` array
+    /// formals of the calls running now, by caller key (`bind_slice_array_arg`):
+    /// each formal index and the slice element it copies back to.
+    #[serde(skip)]
+    slice_arg_targets: HashMap<String, Vec<(i64, Option<String>)>>,
+    /// Numbers the caller keys of `slice_arg_targets`.
+    #[serde(skip)]
+    slice_arg_seq: u64,
     /// PIDs whose first-at-time-0 variable `#(expr)` delay evaluated to 0 and
     /// was deferred once past the time-0 settle (so the period signal — e.g. a
     /// real cont-assign feeding `always #(p/2) clk=~clk` — settles before the

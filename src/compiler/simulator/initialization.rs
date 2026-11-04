@@ -4241,6 +4241,8 @@ impl Simulator {
             warned_delay_spikes: HashSet::default(),
             warned_uncovered_patterns: HashSet::default(),
             typed_pattern_seq: 0,
+            slice_arg_targets: HashMap::default(),
+            slice_arg_seq: 0,
             t0_delay_deferred: HashSet::default(),
             suspended_loop_frames: HashMap::default(),
             process_loop_bytecode: HashMap::default(),

@@ -1364,6 +1364,12 @@ impl Simulator {
             self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
             return;
         }
+        // §7.4.6, §7.6: a slice of an unpacked array on either side pairs
+        // its elements left to right with the other side's (#867).
+        if self.assign_unpacked_slice(lvalue, rvalue) {
+            self.settle_after_proc_write();
+            return;
+        }
         if let Some(selected) = self.selected_aggregate_rhs(Some(lvalue), rvalue) {
             self.exec_stmt_blocking_assign(stmt, lvalue, &selected);
             return;

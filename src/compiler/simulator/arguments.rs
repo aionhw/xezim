@@ -2326,6 +2326,21 @@ impl Simulator {
         // `this.member` / `a.b.member` (handled by `array_actual_storage`;
         // a fixed-array property actual `parity_bytes` previously returned
         // None here, dropping the writeback).
+        // §7.4.6, §13.5: a slice actual of a one-dimensional formal is copied
+        // in, and back for an `output`, `inout` or `ref` formal, element by
+        // element left to right (#867).
+        if dims.len() == 1 {
+            let desc = match dims.first() {
+                Some(UD::Range { left, right, .. }) => {
+                    super::elaborate::const_eval_i64_with_params(left, params)
+                        > super::elaborate::const_eval_i64_with_params(right, params)
+                }
+                _ => false,
+            };
+            if let Some(bound) = self.bind_slice_array_arg(port, arg, lo, hi, desc) {
+                return Some(bound);
+            }
+        }
         let caller = self.array_actual_storage(arg)?;
         // §13.5.2 multi-dimensional formal (`int a[R][C]`, `a[X][Y][Z]`): copy
         // every element of the caller's array in under the formal's name and
@@ -2636,6 +2651,9 @@ impl Simulator {
 
     pub(super) fn writeback_array_args(&mut self, wb: &[(String, String, i64, i64)]) {
         for (param, caller, lo, hi) in wb {
+            if self.writeback_slice_arg(param, caller) {
+                continue;
+            }
             if let Some(sfxs) = self.nd_formal_suffixes(param) {
                 if param != caller {
                     for sfx in sfxs {
