@@ -170,9 +170,10 @@ module top;
   function automatic logic [3:0] b_hi(s_t c); return c.b[6:3]; endfunction
   function automatic logic [1:0] hi_of(pk::s_t c); return c.p.hi; endfunction
   function automatic logic [3:0] mix(pk::s_t c, s_t d); return {c.a, c.b[0], d.a, d.b[0]}; endfunction
+  function automatic logic [1:0] pair_a(s_t c, d); return {c.a, d.a}; endfunction
   s_t m [2];
   pk::s_t k;
-  logic [1:0] a;
+  logic [1:0] a, pa;
   logic [3:0] bh, mx;
   logic [1:0] hi, lo, sv;
   for (genvar g = 0; g < 2; g++) begin : gen
@@ -182,14 +183,15 @@ module top;
   assign hi = hi_of(k);
   assign lo = pk::lo_of(k);
   assign mx = mix(k, m[0]);
+  assign pa = pair_a(m[0], m[1]);
   sub u_sub(.i(k), .o(sv));
   initial begin
     m[0] = 8'h85; m[1] = 8'h3c; k = 8'b1_10_01_011;
-    #1 $display("NOTE: %b %b %b %b %b %b", a, bh, hi, lo, mx, sv);
+    #1 $display("NOTE: %b %b %b %b %b %b %b", a, bh, hi, lo, mx, sv, pa);
     m[0] = 8'h7f; m[1] = 8'hc3; k = 8'b0_01_10_100;
-    #1 $display("NOTE: %b %b %b %b %b %b", a, bh, hi, lo, mx, sv);
+    #1 $display("NOTE: %b %b %b %b %b %b %b", a, bh, hi, lo, mx, sv, pa);
     m[0] = 8'hx0; k = 8'b1_x1_0z_110;
-    #1 $display("NOTE: %b %b %b %b %b %b", a, bh, hi, lo, mx, sv);
+    #1 $display("NOTE: %b %b %b %b %b %b %b", a, bh, hi, lo, mx, sv, pa);
     $finish;
   end
 endmodule
@@ -200,9 +202,9 @@ fn continuous_assigns_read_packed_struct_formal_members() {
     assert_eq!(
         notes(MEMBER_READS),
         vec![
-            "NOTE: 01 0111 10 01 1111 11",
-            "NOTE: 10 1000 01 10 0001 11",
-            "NOTE: 1x 1000 x1 0z 10x0 00",
+            "NOTE: 01 0111 10 01 1111 11 10",
+            "NOTE: 10 1000 01 10 0001 11 01",
+            "NOTE: 1x 1000 x1 0z 10x0 00 x1",
         ]
     );
 }

@@ -3841,7 +3841,9 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit_local_fit(slot);
             }
             binds.push((p.name.name.clone(), (slot, w)));
-            if let Some(fields) = self.packed_formal_layout(&p.data_type, w) {
+            if let Some(fields) =
+                self.packed_formal_layout(Self::port_effective_type(&fd.ports, i), w)
+            {
                 struct_binds.push((p.name.name.clone(), (slot, fields)));
             }
             if let Some(ew) = self.decl_elem_width_in(&p.data_type, Some(&name)) {
