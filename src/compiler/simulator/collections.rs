@@ -1289,7 +1289,7 @@ impl Simulator {
         match &e.kind {
             // A data-declaration type arg that is not a bare name
             // (`P#(bit [7:0]) x;`) arrives as a TypeLiteral.
-            ExprKind::TypeLiteral(dt) => crate::elaborate::data_type_to_spec_fragment(dt),
+            ExprKind::TypeLiteral(dt) => match &**dt { crate::ast::types::DataType::Interface { name, modport, type_args, .. } => Some(self.canonical_vif_frag(&name.name, type_args.iter().filter_map(|e| self.expr_to_spec_fragment(e)).collect(), modport.as_ref().map(|m| m.name.clone()))), _ => crate::elaborate::data_type_to_spec_fragment(dt) },
             ExprKind::StringLiteral(s) => Some(format!("\"{}\"", s)),
             // A named assignment keeps its name (`.W(5)`); the class's
             // `canonicalize_spec_sig` moves it to that parameter's slot.

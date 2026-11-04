@@ -3082,12 +3082,7 @@ impl Simulator {
             .unwrap_or(false)
     }
 
-    /// Base name of a class, dropping one specialization.
-    ///
-    /// Entries made for a virtual-interface type argument are `base<sig>`
-    /// and `sig` may itself contain `#(...)`
-    /// (`uvm_resource<virtualmon_if#(32)>`). A split on `#` stops inside
-    /// that signature and the hierarchy walk no longer sees `base`.
+    /// Class base name; `base<sig>` keeps `sig` when it contains `#(...)` inside.
     fn class_key_base(s: &str) -> &str {
         if let Some(i) = s.find('<') {
             if s.ends_with('>') && i > 0 {

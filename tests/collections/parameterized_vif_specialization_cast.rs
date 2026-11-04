@@ -1,9 +1,4 @@
-//! §8.25, §25.9: a class specialized by a virtual interface type keeps its
-//! class identity when the interface has a parameter. `$cast` back to
-//! `res#(virtual mon_if)` must accept the object `res#(virtual mon_if)::make`
-//! built. With an integer interface parameter the specialization is entered
-//! as `res<virtualmon_if#(32)>`, and a split on `#` stopped inside that
-//! signature, so the object was no longer a `res`.
+//! Parameterized virtual-interface class specialization: `$cast` and homograph classes.
 
 use xezim::simulate;
 
@@ -40,19 +35,19 @@ endclass
 interface str_if #(parameter string IfName = "main");
 endinterface
 
-interface plain_if;
-endinterface
+interface plain_if; int x; endinterface
 
 interface mon_if #(parameter DATA_WIDTH = 32);
 endinterface
 
 class virtualmon_if; endclass
-class virtualplain_if; endclass
+class virtualplain_if; endclass class box #(type T = int); T vif; endclass
 
 module top;
-  int str_ok, plain_ok, mon_ok, wide_ok, class_ok, plain_cls;
-  res_base cq[$], pq[$], mq[$], wq[$], vq[$], pq2[$];
+  int str_ok, plain_ok, mon_ok, wide_ok, class_ok, plain_cls, prop_ok;
+  res_base cq[$], pq[$], mq[$], wq[$], vq[$], pq2[$]; plain_if bus(); box#(virtual plain_if) b;
   initial begin
+    b = new; b.vif = bus; bus.x = 4; prop_ok = b.vif.x;
     cq.push_back(res#(virtual str_if)::make());
     pq.push_back(res#(virtual plain_if)::make());
     mq.push_back(res#(virtual mon_if)::make());
@@ -73,9 +68,8 @@ endmodule
             u(&sim, "plain_ok"),
             u(&sim, "mon_ok"),
             u(&sim, "wide_ok"),
-            u(&sim, "class_ok"), u(&sim, "plain_cls")
+            u(&sim, "class_ok"), u(&sim, "plain_cls"), u(&sim, "prop_ok")
         ),
-        (1, 1, 1, 0, 0, 0),
-        "string-param, plain, integer-param, a different integer parameter, and classes named like the interfaces"
+        (1, 1, 1, 0, 0, 0, 4),
     );
 }

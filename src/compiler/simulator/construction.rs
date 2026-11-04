@@ -1256,8 +1256,7 @@ impl Simulator {
         if self.module.interfaces.is_empty() {
             return None;
         }
-        // A class named `virtual` plus an interface is that class, not the interface.
-        // If that class exists, a parameter-free virtual interface keys as `virtual.name`.
+        // Bare `virtualplain_if` is the class; `virtual plain_if` / `virtualplain_if#()` are the interface.
         if self.module.classes.contains_key(frag.trim()) {
             return None;
         }
@@ -1347,7 +1346,7 @@ impl Simulator {
                 args.push(d);
             }
         }
-        let mut out = format!("virtual{}{}", if args.is_empty() && modport.is_none() && self.module.classes.contains_key(&format!("virtual{name}")) { "." } else { "" }, name);
+        let mut out = format!("virtual{name}{}", if args.is_empty() && modport.is_none() && self.module.classes.contains_key(&format!("virtual{name}")) { "#()" } else { "" });
         if !args.is_empty() {
             out.push_str("#(");
             out.push_str(&args.join(","));
@@ -2882,7 +2881,7 @@ impl Simulator {
         for tp_name in class_def.type_param_names.iter() {
             let mut bound: Option<String> = None;
             if let Some(ta) = arg_map.get(tp_name) {
-                if let Some(concrete) = Self::leaf_ident_name(ta) {
+                if let Some(concrete) = match &ta.kind { ExprKind::TypeLiteral(dt) => match &**dt { crate::ast::types::DataType::Interface { name, modport, type_args, .. } => Some(self.canonical_vif_frag(&name.name, type_args.iter().filter_map(|e| self.expr_to_spec_fragment(e)).collect(), modport.as_ref().map(|m| m.name.clone()))), _ => Self::leaf_ident_name(ta) }, _ => Self::leaf_ident_name(ta) } {
                     // The type arg may itself be a type PARAMETER of the enclosing
                     // parameterized context (`uvm_resource#(T)` where `T` is
                     // config_db's own param) — resolve it to the concrete type so
