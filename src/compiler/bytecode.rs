@@ -5403,7 +5403,7 @@ impl<'a> BytecodeCompiler<'a> {
             // all-or-nothing failure propagates.
             match saved_local {
                 Some(b) => {
-                    self.local_var_regs.insert(var, b);
+                    self.local_var_regs.insert(var.clone(), b);
                 }
                 None => {
                     self.local_var_regs.remove(&var);
