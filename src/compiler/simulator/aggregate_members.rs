@@ -1699,6 +1699,14 @@ impl Simulator {
                 return;
             }
         }
+        // A queue or dynamic member is the collection, not one scalar cell.
+        if let Some(kind) = Self::coll_kind_of(dims)
+            && let (Some(dst), Some(src)) = (self.expr_assoc_name(lhs), self.expr_assoc_name(rhs))
+        {
+            self.clear_coll(&dst, kind);
+            self.copy_coll(&dst, &src, kind);
+            return;
+        }
         let v = self.eval_expr(rhs);
         self.assign_value(lhs, &v);
     }

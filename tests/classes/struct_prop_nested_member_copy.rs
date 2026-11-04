@@ -79,8 +79,11 @@ module t;\n\
     $display(\"T plain %0d %0d %0d %h\", p.last.a, p.last.b, p.last.n.x, p.last.n.y);\n\
   end\n\
 endmodule";
-    assert_eq!(
-        lines(src),
-        vec!["T param 4 1 7 7", "T plain 4 1 7 7"]
-    );
+    assert_eq!(lines(src), vec!["T param 4 1 7 7", "T plain 4 1 7 7"]);
+}
+
+#[test]
+fn a_nested_queue_member_copies_with_the_struct() {
+    let src = "typedef struct { int q[$]; } inner_t; typedef struct { inner_t in; int n; } outer_t; typedef struct { int q[$]; } flat_t; class c; outer_t src, dst; flat_t fs, fd; endclass module t; initial begin c o = new(); o.src.in.q.push_back(3); o.src.in.q.push_back(4); o.src.n = 9; o.dst.in.q.push_back(1); o.dst = o.src; $display(\"T nest %0d %0d %0d %0d\", o.dst.in.q.size(), o.dst.in.q[0], o.dst.in.q[1], o.dst.n); o.fs.q.push_back(8); o.fs.q.push_back(9); o.fd.q.push_back(7); o.fd = o.fs; $display(\"T flat %0d %0d %0d\", o.fd.q.size(), o.fd.q[0], o.fd.q[1]); end endmodule";
+    assert_eq!(lines(src), vec!["T nest 2 3 4 9", "T flat 2 8 9"]);
 }
