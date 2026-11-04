@@ -27008,6 +27008,58 @@ const _: () = assert!(
     "TsInsn grew past 24 bytes"
 );
 
+/// Calls `f` with every register `ins` defines, in place or as a destination.
+fn ts_for_each_reg_def(ins: &Insn, mut f: impl FnMut(RegId)) {
+    if let Some(d) = BytecodeCompiler::dest_reg(ins) {
+        f(d);
+    }
+    if let Some(a) = BytecodeCompiler::in_place_reg(ins) {
+        f(a);
+    }
+    match ins {
+        Insn::CmpBranchConst(_, _, _, tmp, _) => f(*tmp),
+        Insn::BinOpConstAdd2(a) => {
+            f(a.d1);
+            f(a.d2);
+        }
+        Insn::EvalExprFallback(_, d, _) | Insn::Format(d, _) | Insn::StrOp(d, _, _) => f(*d),
+        _ => {}
+    }
+}
+
+/// For each instruction index, the earliest forward branch that targets it.
+fn ts_earliest_forward_branch(insns: &[Insn]) -> Vec<Option<usize>> {
+    let mut earliest: Vec<Option<usize>> = vec![None; insns.len() + 1];
+    for (i, insn) in insns.iter().enumerate() {
+        let mut note = |t: u32| {
+            if let Some(slot) = earliest.get_mut(t as usize)
+                && t as usize > i
+                && slot.is_none()
+            {
+                *slot = Some(i);
+            }
+        };
+        match insn {
+            Insn::BranchIfFalse(_, t)
+            | Insn::BranchUnlessZero(_, t)
+            | Insn::BranchIfSignalFalse(_, t, _)
+            | Insn::CmpBranch(_, _, _, _, t)
+            | Insn::CmpBranchConst(_, _, _, _, t)
+            | Insn::Jump(t) => note(*t),
+            Insn::CaseJump(_, cj) => {
+                cj.table.iter().for_each(|&t| note(t));
+                note(cj.default);
+            }
+            Insn::CaseMaskJump(_, mj) => {
+                mj.table.iter().for_each(|&t| note(t));
+                note(mj.xz_path);
+            }
+            _ => {}
+        }
+    }
+    earliest
+}
+
 pub fn lower_two_state(
     cb: &CompiledBlock,
     signal_widths: &[u32],
@@ -27366,27 +27418,16 @@ pub fn lower_two_state(
     // the lowering handles but this table does not model.
     let mut last_def: Vec<usize> = vec![0; cb.num_regs as usize];
     for (j, ins) in insns.iter().enumerate() {
-        let mut note = |r: RegId| {
+        ts_for_each_reg_def(ins, |r| {
             if let Some(slot) = last_def.get_mut(r as usize) {
                 *slot = j;
             }
-        };
-        if let Some(d) = BytecodeCompiler::dest_reg(ins) {
-            note(d);
-        }
-        if let Some(a) = BytecodeCompiler::in_place_reg(ins) {
-            note(a);
-        }
-        match ins {
-            Insn::CmpBranchConst(_, _, _, tmp, _) => note(*tmp),
-            Insn::BinOpConstAdd2(a) => {
-                note(a.d1);
-                note(a.d2);
-            }
-            Insn::EvalExprFallback(_, d, _) | Insn::Format(d, _) | Insn::StrOp(d, _, _) => note(*d),
-            _ => {}
-        }
+        });
     }
+    let earliest_branch = ts_earliest_forward_branch(insns);
+    // Index of each register's latest definition in the forward walk, for the
+    // forward-join reset below.
+    let mut walk_def: Vec<usize> = vec![0; cb.num_regs as usize];
     for (ins_i, insn) in insns.iter().enumerate() {
         if track {
             TS_BAIL_AT.with(|c| c.set((ins_i, insn_opcode_name(insn))));
@@ -27408,6 +27449,26 @@ pub fn lower_two_state(
         if back_branch && is_tgt[ins_i] {
             for r in 0..rc.len() {
                 if last_def[r] >= ins_i {
+                    rc[r] = None;
+                    wfill[r] = None;
+                }
+            }
+        }
+        // A forward branch can skip a definition between it and its target,
+        // so a value the walk learned there is only one of the values that
+        // reach the target. The out-of-range arm of a 2-D element index
+        // (`flat = count`, see `compile_2d_flat_index`) read as a constant
+        // index here, and the store it guards was dropped as out of range.
+        if ins_i > 0 {
+            ts_for_each_reg_def(&insns[ins_i - 1], |r| {
+                if let Some(slot) = walk_def.get_mut(r as usize) {
+                    *slot = ins_i - 1;
+                }
+            });
+        }
+        if let Some(branch) = earliest_branch[ins_i] {
+            for r in 0..rc.len() {
+                if walk_def[r] > branch {
                     rc[r] = None;
                     wfill[r] = None;
                 }
