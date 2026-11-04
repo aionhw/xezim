@@ -2513,6 +2513,7 @@ impl Simulator {
                 for (cs, scalars) in &unique_colls {
                     self.enforce_unique_coll(handle, cs, scalars, &constraints, &pinned_elems);
                 }
+                self.enforce_conditional_unique_colls(handle, &constraints, &rand_colls, &pinned_elems);
             }
             {
                 fn collect_unique_items<'a>(

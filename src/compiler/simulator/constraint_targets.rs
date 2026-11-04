@@ -2906,11 +2906,7 @@ impl Simulator {
         Some((sub, field))
     }
 
-    /// §18.5.5 / §18.5.9: `unique {c}` over a rand collection, or
-    /// `unique {a, b}` over several: make every element of the group
-    /// pairwise distinct. Scalar members and pinned elements keep their
-    /// value; the rest are re-picked from their own collection's legal
-    /// domain (the `foreach … inside {…}` ranges, when any).
+    /// §18.5.5: re-pick a `unique` group's elements so they stay distinct from its scalars.
     pub(super) fn enforce_unique_coll(
         &mut self,
         handle: usize,
@@ -3001,11 +2997,37 @@ impl Simulator {
         }
     }
 
-    /// §18.5.5: the parser spells `unique {a, b}` as pairwise `a != b`. A
-    /// `!=` with a whole rand fixed, dynamic or queue array on either side
-    /// can only come from there (§18.3 admits only integral operands), so
-    /// turn it back into a `unique` group over both operands: the
-    /// collections' elements and a plain scalar member.
+    /// §18.5.5: repair a `unique` group under `if` or `->` only on this trial's branch.
+    pub(super) fn enforce_conditional_unique_colls(&mut self, handle: usize, constraints: &[ClassConstraint], colls: &[RandColl], pinned: &HashSet<String>) {
+        fn walk(sim: &mut Simulator, handle: usize, item: &ConstraintItem, colls: &[RandColl], constraints: &[ClassConstraint], pinned: &HashSet<String>, live: bool) {
+            match item {
+                ConstraintItem::Block(items) => items.iter().for_each(|i| walk(sim, handle, i, colls, constraints, pinned, live)),
+                ConstraintItem::Soft(i) => walk(sim, handle, i, colls, constraints, pinned, live),
+                ConstraintItem::IfElse { condition, then_item, else_item, .. } => {
+                    let arm = if sim.eval_expr(condition).is_true() { Some(then_item.as_ref()) } else { else_item.as_deref() };
+                    if let Some(a) = arm { walk(sim, handle, a, colls, constraints, pinned, true); }
+                }
+                ConstraintItem::Implication { condition, constraint, .. } if sim.eval_expr(condition).is_true() => {
+                    walk(sim, handle, constraint, colls, constraints, pinned, true);
+                }
+                ConstraintItem::Unique { exprs, .. } if live => {
+                    let mut cs = Vec::new();
+                    let mut scalars = Vec::new();
+                    for e in exprs {
+                        if let ExprKind::Ident(h) = &e.kind && let Some(n) = h.path.last().map(|s| s.name.name.clone()) {
+                            match colls.iter().find(|c| c.prop == n) { Some(c) => cs.push(c.clone()), None => scalars.push(n) }
+                        }
+                    }
+                    if !cs.is_empty() { sim.enforce_unique_coll(handle, &cs, &scalars, constraints, pinned); }
+                }
+                _ => {}
+            }
+        }
+        for con in constraints { for it in &con.items { walk(self, handle, it, colls, constraints, pinned, false); } }
+    }
+
+    /// §18.5.5: turn a whole-array `!=` back into the `unique` group it came from.
+    /// A whole rand array is not a legal `!=` operand except through that parse.
     pub(super) fn regroup_unique_colls(constraints: &mut [ClassConstraint], colls: &[RandColl]) {
         fn plain_name(e: &Expression) -> Option<&str> {
             let ExprKind::Ident(h) = &e.kind else {
