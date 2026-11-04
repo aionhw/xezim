@@ -294,6 +294,17 @@ impl Simulator {
                         Some(&decl_dims_snapshot),
                     )
                 })
+                .or_else(|| {
+                    crate::compiler::elaborate::slice_array_assign_parts(
+                        &ca.lhs,
+                        &ca.rhs,
+                        ca.delay,
+                        &arrays_snapshot,
+                        Some(&descending_snapshot),
+                        Some(&decl_dims_snapshot),
+                        &params_snapshot,
+                    )
+                })
                 .unwrap_or_else(|| vec![ca])
             })
             .flat_map(|ca| {

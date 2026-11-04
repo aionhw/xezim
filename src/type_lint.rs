@@ -1105,12 +1105,25 @@ impl<'a> Ck<'a> {
                 self.index_ty(t, index)
             }
             ExprKind::RangeSelect {
-                expr, left, right, ..
+                expr,
+                kind,
+                left,
+                right,
             } => match self.ty_of(expr) {
                 Ty::Unpacked { mut dims, elem } => {
-                    let n = match (lit_i64(left), lit_i64(right)) {
-                        (Some(l), Some(r)) => Some(l.abs_diff(r) + 1),
-                        _ => None,
+                    // §7.4.5, §11.5.1: `a[l:r]` has |l - r| + 1 elements;
+                    // `a[b +: w]` and `a[b -: w]` have `w`, whatever the base
+                    // (it may vary at run time). Counting the base and the
+                    // width as the bounds of a range rejected `a[0 +: 6] = b`
+                    // (#869).
+                    let n = match kind {
+                        RangeKind::Constant => match (lit_i64(left), lit_i64(right)) {
+                            (Some(l), Some(r)) => Some(l.abs_diff(r) + 1),
+                            _ => None,
+                        },
+                        RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                            lit_i64(right).filter(|&w| w > 0).map(|w| w.unsigned_abs())
+                        }
                     };
                     dims[0] = Dim::Fixed(n);
                     Ty::Unpacked { dims, elem }

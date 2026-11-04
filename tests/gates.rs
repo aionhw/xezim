@@ -86,3 +86,5 @@ mod udp_delay_forms;
 
 #[path = "gates/udp_adjacent_symbols_841.rs"]
 mod udp_adjacent_symbols_841;
+#[path = "gates/udp_output_reg_body_868.rs"]
+mod udp_output_reg_body_868;

@@ -945,6 +945,12 @@ impl Simulator {
                     }
                 }
                 note_whole_read(&name);
+                // §9.2.2.2.1, §7.6: a whole fixed unpacked array, or a slice
+                // of one (the range arm recurses here), has no signal of its
+                // own: its elements are the signals that change, so depend on
+                // them. `always_comb s = b;` never re-fired after time zero
+                // (#867).
+                Self::insert_unpacked_elem_reads(&name, module, reads);
                 reads.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
@@ -1398,6 +1404,41 @@ impl Simulator {
             }
             _ => {}
         }
+    }
+
+    /// The element names of the fixed unpacked array `name` (`a[3]`,
+    /// `m[1][4]`), when it is one with at most 65,536 elements.
+    fn insert_unpacked_elem_reads(
+        name: &str,
+        module: &ElaboratedModule,
+        reads: &mut HashSet<String>,
+    ) {
+        if module.dynamic_arrays.contains(name) || module.associative_arrays.contains_key(name) {
+            return;
+        }
+        let dims: Vec<(i64, i64)> = if let Some(&(lo, hi, _)) = module.arrays.get(name) {
+            vec![(lo, hi)]
+        } else if let Some(&(d0, d1, _)) = module.arrays_2d.get(name) {
+            vec![d0, d1]
+        } else if let Some((d, _)) = module.arrays_nd.get(name) {
+            d.clone()
+        } else {
+            return;
+        };
+        let count = dims
+            .iter()
+            .try_fold(1u64, |n, &(l, r)| n.checked_mul(l.abs_diff(r) + 1));
+        if !count.is_some_and(|n| n <= 1 << 16) {
+            return;
+        }
+        let mut names = vec![name.to_string()];
+        for (l, r) in dims {
+            names = names
+                .iter()
+                .flat_map(|p| (l.min(r)..=l.max(r)).map(move |i| format!("{p}[{i}]")))
+                .collect();
+        }
+        reads.extend(names);
     }
 
     /// Collect reads/writes from a statement (for always @* / always_comb blocks).

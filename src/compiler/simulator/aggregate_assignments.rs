@@ -1464,6 +1464,10 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) -> Option<Vec<(Expression, Value)>> {
+        // §7.4.6, §10.4.2: a slice of an unpacked array on either side (#867).
+        if let Some(leaves) = self.unpacked_slice_nba_leaves(lvalue, rvalue) {
+            return Some(leaves);
+        }
         let dst = self.foreach_check_operand_name(lvalue)?;
         let src = self.foreach_check_operand_name(rvalue)?;
         if self.module.dynamic_arrays.contains(&dst)
