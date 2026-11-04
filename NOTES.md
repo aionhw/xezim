@@ -372,6 +372,29 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   of interpreted pattern assignments runs about 40% more instructions than
   before (compiled blocks and methods are unaffected); caching the plan per
   pattern is the open follow-up.
+* A slice of an unpacked array, `a[l:r]`, `a[b +: w]` or `a[b -: w]`, is
+  read and written as an unpacked array whose elements pair left to right
+  with the other side (§7.4.6, §7.6, #867, reported by git-hevangel): as the
+  source or target of a blocking or nonblocking assignment, slice to slice
+  in opposite directions or overlapping, as a row or part of a row of a
+  two-dimensional array, as an `input` or `output` argument, in `$size`
+  (its element count, not its width in bits), in a continuous assignment
+  (a variable base is followed) and on a port. The target kept its value,
+  took the wrong elements, took them in reverse order or read x, depending
+  on the place. A row of a two-dimensional array (`m[1]`) passed as an
+  argument reads its elements too, and an `always_comb` that reads a whole
+  unpacked array, `s = b`, wakes when an element changes; it never re-ran
+  after time zero (§9.2.2.2.1).
+* A sequential UDP that declares its output `output reg q;` in the body of a
+  non-ANSI header keeps state: it was taken for a combinational UDP and its
+  output stayed x (§29.3.2, A.5.2, #868, reported by git-hevangel). An
+  initial value in the declaration, `output reg q = 1'b1`, gives the start
+  state in either header form, as A.5.2 allows.
+* The array-size check counts an indexed part-select of an unpacked array,
+  `a[b +: w]`, as `w` elements: it took the base and the width for the
+  bounds of a range, so `a[0 +: 6] = b` was rejected ("the arrays have 7
+  and 6 elements"), some real mismatches were accepted and others reported
+  with wrong sizes (§7.4.5, §7.6, §11.5.1, #869, reported by git-hevangel).
 
 **Performance**
 
@@ -437,6 +460,30 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   interpreter once per member, over 99% of a charge-pump regulator model's
   run. A struct with member defaults, or a call whose unused part has a side
   effect, keeps the call.
+* An instance's parameter scope takes only what its own definition, the
+  definitions it names and the scopes above it spell. The words of every
+  package item and file-scope class, covergroup and typedef were added to
+  every scope and to every prepared body's cache key, so a design whose
+  packages spell most of their parameters gave every instance nearly the
+  whole table again: 1,000 instances with 4,000 package parameters, 99 %
+  spelled, compiled in 76.0 G instructions, now 2.0 G (§23.10, §26.3, #870,
+  reported by git-hevangel). Package items are evaluated where they are
+  declared, so they read the same values.
+* The names a class constraint may read are looked up in the elaborated
+  design as the constraint names them. Every class of every inlined
+  instance copied every signal and parameter name of the design inlined so
+  far into a set, also a class without constraints, so elaboration grew
+  with the square of the instances: 2,000 instances of a module declaring a
+  constrained class compiled in 53.7 G instructions, now 1.4 G (1.2 G
+  without the class) (§18.3, #871, reported by git-hevangel). The names
+  accepted are unchanged.
+* The second-pass lint builds the last segments of the parameter keys and
+  the map of global classes once per run. It split every parameter key for
+  every width identifier and rebuilt the class map for every module:
+  8,000 modules naming their own parameters in part-select widths took
+  110.9 G instructions to compile, now 9.9 G, and 8,000 package classes
+  41.3 G, now 1.7 G (§11.5.1, §8.18, #872, reported by git-hevangel). The
+  verdicts are unchanged.
 
 ### 0.11.4 — class-object reclamation, linear elaboration, class and randomization correctness (October 2026)
 
