@@ -1112,3 +1112,6 @@ mod nested_extern_methods_842;
 
 #[path = "classes/recent_constraints_848_850_852_860_862.rs"]
 mod recent_constraints_848_850_852_860_862;
+
+#[path = "classes/module_parameter_specialization_874.rs"]
+mod module_parameter_specialization_874;

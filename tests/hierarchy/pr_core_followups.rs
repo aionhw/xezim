@@ -20,8 +20,10 @@ fn unit_qualified_writes_do_not_target_later_module_declarations() {
         ("$unit::x++;", 1),
         ("for ($unit::x = 0; $unit::x < 3; $unit::x++) ;", 3),
     ] {
+        // §6.5: keep the qualified write ahead of the module declaration, but
+        // observe the module variable only after its declaration.
         let source = format!(
-            "int x=0; module top; initial begin {body} #1; $display(\"T|%0d|%0d\",$unit::x,x); $finish; end int x=19; endmodule"
+            "int x=0; module top; initial begin {body} end int x=19; initial begin #1; $display(\"T|%0d|%0d\",$unit::x,x); $finish; end endmodule"
         );
         assert_eq!(trace(&source), [format!("T|{want}|19")], "{body}");
     }

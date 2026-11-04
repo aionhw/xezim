@@ -833,6 +833,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Parse: read `static const` as `const static` (1 enables)",
     ),
     (
+        "XEZIM_RELAX_USE_BEFORE_DECL",
+        "Elab: accept module data references before their declarations with a warning (§6.5; 1 enables)",
+    ),
+    (
         "XEZIM_REPORT_STATS",
         "Print summary statistics at end of run",
     ),

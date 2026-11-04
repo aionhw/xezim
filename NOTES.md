@@ -23,6 +23,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* Module parameters in class and virtual-interface specialization arguments
+  fold in their calling scope even when an unrelated class declares a
+  parameter with the same name (§8.25, #874). A virtual-interface key such
+  as `data_if#(DATA_WIDTH)` now matches `data_if#(32)` when the module's
+  `DATA_WIDTH` is 32, allowing an inherited agent's `uvm_config_db::get`
+  to retrieve the interface. Compound expressions resolve using the active
+  module or class parameter bindings.
+* A trailing comma in a `#(...)` parameter value list is an error in strict
+  mode (Annex A.4.1.1, #874). An empty list, `#()`, and named default
+  assignments such as `.WIDTH()` are accepted.
+
 * `size()` applies to the queue a locator method returns: `q.find_index
   with (item > 2).size()` read 0 (§7.12.1, §7.10.2, #779). A locator on a
   row of a nested associative array, `m["a"].find_index with (item > 1)`,
@@ -410,6 +421,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   when packages share a typedef name (§18.3, §26.3, #862). Packed and
   unpacked element reads of an `always_comb` share one dependency collector
   (§9.2.2.2.1, #844).
+
+* Module data must be declared before it is read as well as before it is
+  written (§6.5, #819). The check includes call arguments, event controls,
+  assertions, declaration dimensions and module-local class bodies, in child
+  definitions as well as the top, while respecting local scopes and
+  hierarchical references. For sources that
+  require the earlier behavior, `--relax-use-before-decl` (or
+  `XEZIM_RELAX_USE_BEFORE_DECL=1`) accepts these references with a warning.
 
 **Performance**
 

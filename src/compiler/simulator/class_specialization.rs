@@ -2046,6 +2046,168 @@ impl Simulator {
         a.name == b.name && a.enclosing == b.enclosing && a.declaring_module == b.declaring_module
     }
 
+    /// §8.25: only parameters in the lexical class scope can shadow a module
+    /// constant. An unrelated class declaring the same name has no effect.
+    fn class_parameter_owner(&self, name: &str) -> Option<&str> {
+        let Some(Some(context)) = self.class_context_stack.last() else {
+            return None;
+        };
+        // Rule out ordinary type names before walking class scopes. A match
+        // in this global index still requires the lexical lookup below.
+        let names = self.class_member_names();
+        if !names.params.contains(name) && !names.static_or_param.contains(name) {
+            return None;
+        }
+        self.class_parameter_scopes(context)
+            .into_iter()
+            .find(|class| {
+                self.module.classes.get(*class).is_some_and(|definition| {
+                    definition.param_order.iter().any(|n| n == name)
+                        || definition.type_param_names.iter().any(|n| n == name)
+                        || definition.param_defaults.iter().any(|(n, _)| n == name)
+                })
+            })
+    }
+
+    fn class_parameter_scopes<'a>(&'a self, context: &'a str) -> Vec<&'a str> {
+        let mut pending = vec![(context, true)];
+        let mut seen = Vec::new();
+        let mut scopes = Vec::new();
+        while let Some((class, lexical)) = pending.pop() {
+            if seen.contains(&(class, lexical)) {
+                continue;
+            }
+            seen.push((class, lexical));
+            let Some(definition) = self.module.classes.get(class) else {
+                continue;
+            };
+            if !scopes.contains(&class) {
+                scopes.push(class);
+            }
+            // An ancestor's enclosing class is not itself inherited scope.
+            if lexical && let Some(enclosing) = definition.enclosing.as_deref() {
+                pending.push((enclosing, true));
+            }
+            if let Some(parent) = definition.extends.as_deref() {
+                pending.push((parent, false));
+            }
+        }
+        scopes
+    }
+
+    fn class_parameter_value(&self, owner: &str, name: &str) -> Option<Value> {
+        let definition = self.module.classes.get(owner)?;
+        if definition.type_param_names.iter().any(|n| n == name) {
+            return None;
+        }
+        let lexical = self.lexical_value_spec();
+        let signature = |class: &str| match &lexical {
+            Some((base, sig)) if base == class => sig.clone(),
+            Some((base, sig)) => self.ancestor_spec(base, sig, class).unwrap_or_default(),
+            None => String::new(),
+        };
+        let number = |fragment: &str| {
+            let (negative, body) = match fragment.trim().strip_prefix('-') {
+                Some(body) => (true, body),
+                None => (false, fragment.trim()),
+            };
+            let mut value = self.eval_number(&Self::parse_spec_number(body)?);
+            if negative {
+                value.is_signed = true;
+                value = value.negate();
+            }
+            Some(value)
+        };
+        let arguments = Self::split_spec_args(&signature(owner));
+        if let Some(index) = definition.param_order.iter().position(|n| n == name)
+            && let Some(argument) = arguments.get(index).filter(|a| !a.trim().is_empty())
+        {
+            return number(argument);
+        }
+        if let Some((_, Some(initializer))) =
+            definition.param_defaults.iter().find(|(n, _)| n == name)
+            && let ExprKind::Number(number) = &initializer.kind
+        {
+            return Some(self.eval_number(number));
+        }
+
+        // A body localparam uses its declaring class's values, including the
+        // concrete arguments of inherited parameters. Remove shadowed module
+        // names before evaluating defaults, so a missing class binding cannot
+        // silently turn into a module constant.
+        let mut parameters = HashMap::default();
+        let mut module_parameters_seeded = false;
+        let mut scopes = self.class_parameter_scopes(owner);
+        scopes.reverse();
+        for class in scopes {
+            let definition = self.module.classes.get(class)?;
+            let arguments = Self::split_spec_args(&signature(class));
+            for parameter in &definition.type_param_names {
+                parameters.remove(parameter);
+            }
+            for (parameter, _) in &definition.param_defaults {
+                parameters.remove(parameter);
+            }
+            let mut supplied = Vec::new();
+            for (index, parameter) in definition.param_order.iter().enumerate() {
+                if let Some(argument) = arguments.get(index).filter(|a| !a.trim().is_empty()) {
+                    supplied.push(parameter.as_str());
+                    if let Some(value) = number(argument) {
+                        parameters.insert(parameter.clone(), value);
+                    }
+                }
+            }
+            for _ in 0..definition.param_defaults.len() {
+                let mut changed = false;
+                for (parameter, initializer) in &definition.param_defaults {
+                    if supplied.contains(&parameter.as_str()) || parameters.contains_key(parameter)
+                    {
+                        continue;
+                    }
+                    let Some(initializer) = initializer else {
+                        continue;
+                    };
+                    let mut value = super::elaborate::const_eval_i64_with_params(
+                        initializer,
+                        Some(&parameters),
+                    );
+                    if value.is_none() && !module_parameters_seeded {
+                        // Header bindings and ordinary class-local defaults
+                        // need only the small overlay above. Copy the module
+                        // table only when a default actually needs its scope.
+                        let class_values = std::mem::take(&mut parameters);
+                        parameters = self.module.parameters.clone();
+                        for scope in self.class_parameter_scopes(class) {
+                            let definition = self.module.classes.get(scope)?;
+                            for parameter in &definition.type_param_names {
+                                parameters.remove(parameter);
+                            }
+                            for (parameter, _) in &definition.param_defaults {
+                                parameters.remove(parameter);
+                            }
+                        }
+                        parameters.extend(class_values);
+                        module_parameters_seeded = true;
+                        value = super::elaborate::const_eval_i64_with_params(
+                            initializer,
+                            Some(&parameters),
+                        );
+                    }
+                    if let Some(value) = value {
+                        let mut value = Value::from_u64(value as u64, 64);
+                        value.is_signed = true;
+                        parameters.insert(parameter.clone(), value);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        parameters.get(name).cloned()
+    }
+
     /// §8.25: specializations match when their value arguments have the SAME
     /// VALUE, however written: `P#(2+2)`, `P#('h4)` and `P#(4)` are one
     /// specialization with one set of statics. The decimal value of a
@@ -2069,12 +2231,14 @@ impl Simulator {
         // a type, class, or enum name keeps its spelling. Its value depends
         // on the scope, so it is not memoized.
         if ident_start && b.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_') {
+            // An untyped parameter retains its actual's type, including the
+            // literal width and signedness carried by the caller's binding.
+            if !typed && self.class_parameter_owner(frag).is_some() {
+                return self.enclosing_value_param_fragment(frag);
+            }
             // `scoped_param_value` tests the parameter leaf names first: the
             // common type / class name costs one probe.
             let v = self.scoped_param_value(frag)?;
-            if self.class_member_names().params.contains(frag) {
-                return None;
-            }
             return v.to_i64().map(|n| n.to_string());
         }
         // A package parameter named through its package (`P#(pkg::W)`) is
@@ -2127,8 +2291,15 @@ impl Simulator {
                 }
             }
         }
-        // A text naming parameters folds per scope: memoize it under the
-        // scope it was folded in.
+        // Class value parameters must be bound before the signature enters a
+        // different callee's scope. Named class expressions are not memoized:
+        // instances of the same lexical class can have different bindings.
+        // Literal-only expressions remain context-independent and cached.
+        if b.iter().any(|c| c.is_ascii_alphabetic() || *c == b'_')
+            && matches!(self.class_context_stack.last(), Some(Some(_)))
+        {
+            return self.fold_const_spec_text(frag);
+        }
         let key = if b.iter().any(|c| c.is_ascii_alphabetic() || *c == b'_') {
             let scope = self.name_resolve_hint.borrow().clone().unwrap_or_default();
             format!("{}|{}", scope, frag)
@@ -2145,10 +2316,12 @@ impl Simulator {
         folded
     }
 
-    /// The value of design parameter `name` as seen from the executing scope:
-    /// the top's own (bare key), else the nearest enclosing instance's
-    /// (`scope.name`, walking the resolve hint outward).
+    /// The parameter value in the executing lexical scope: a class parameter
+    /// first, otherwise the module constant resolved through its instance.
     pub(super) fn scoped_param_value(&self, name: &str) -> Option<Value> {
+        if let Some(owner) = self.class_parameter_owner(name) {
+            return self.class_parameter_value(owner, name);
+        }
         let leaves = self.param_leaf_names.get_or_init(|| {
             self.module
                 .parameters
@@ -2176,9 +2349,7 @@ impl Simulator {
     #[inline(never)]
     pub(super) fn fold_const_spec_text(&self, text: &str) -> Option<String> {
         use crate::ast::decl::{ModuleItem, ParameterKind};
-        // Literals, operators, and design parameters no class declares (a
-        // class's own parameter of the same name would shadow it).
-        let names = self.class_member_names();
+        // Literals, operators, and parameters in the executing lexical scope.
         let literal_only = |e: &Expression| -> bool {
             fn walk(e: &Expression, ok_name: &dyn Fn(&str) -> bool) -> bool {
                 match &e.kind {
@@ -2205,7 +2376,7 @@ impl Simulator {
             }
             walk(e, &|n: &str| match self.package_param_key(n) {
                 Some(key) => self.module.parameters.contains_key(key),
-                None => !names.params.contains(n) && self.scoped_param_value(n).is_some(),
+                None => self.scoped_param_value(n).is_some(),
             })
         };
         // `W`, or `pkg::W` (an identifier path or, in some contexts, a

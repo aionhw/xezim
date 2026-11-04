@@ -40,8 +40,9 @@
   elaboration stages to manage, and no license server
 - Accepts the compile and run options of existing flows: args files,
   `+define+`/`+incdir+`, `-do` scripts, parameter overrides
-- Opt-in switches for sources written for other simulators: their
-  non-standard constructs, and older keyword sets (`--keywords 1364-1995`)
+- Opt-in [switches](docs/user-guide.md#sources-written-for-other-simulators)
+  for non-standard constructs, including early module data references
+  (`--relax-use-before-decl`), and older keyword sets (`--keywords 1364-1995`)
 
 </td>
 <td width="50%" valign="top">

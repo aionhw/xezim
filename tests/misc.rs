@@ -595,3 +595,6 @@ mod struct_resolver_scalarized;
 mod packed_comb_cache_844;
 #[path = "misc/prepared_scope_memory_721.rs"]
 mod prepared_scope_memory_721;
+
+#[path = "misc/read_before_decl_819.rs"]
+mod read_before_decl_819;
