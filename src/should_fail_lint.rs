@@ -34,6 +34,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     let port_map = build_port_map(defs);
     let pkg_decls = package_decls(defs);
     let pkg_names: HashSet<String> = pkg_decls.values().flatten().cloned().collect();
+    // Built once per run, not per identifier and per module (#872): the last
+    // segments of the parameter keys and the classes every unit sees.
+    let _leaves = ParamLeaves::install(elab);
+    let global = global_classes(defs);
     for def in defs {
         match def {
             SourceDefinition::Class(c) => check_class(c, &mut errs),
@@ -52,7 +56,9 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     ports: &m.ports,
                     items: &m.items,
                 };
-                check_unit(&unit, defs, elab, &pkg_decls, &pkg_names, &mut errs);
+                check_unit(
+                    &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
+                );
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 check_subroutine_port_types(&m.items, &local_types, &pkg_names, elab, &mut errs);
@@ -75,7 +81,9 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     ports: &m.ports,
                     items: &m.items,
                 };
-                check_unit(&unit, defs, elab, &pkg_decls, &pkg_names, &mut errs);
+                check_unit(
+                    &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
+                );
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 check_subroutine_port_types(&m.items, &local_types, &pkg_names, elab, &mut errs);
@@ -96,7 +104,9 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     ports: &m.ports,
                     items: &m.items,
                 };
-                check_unit(&unit, defs, elab, &pkg_decls, &pkg_names, &mut errs);
+                check_unit(
+                    &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
+                );
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 check_subroutine_port_types(&m.items, &local_types, &pkg_names, elab, &mut errs);
@@ -146,10 +156,11 @@ struct Unit<'a> {
 /// The declaration and reference checks shared by modules, interfaces and
 /// programs. Checks that resolve names against the elaborated design run on
 /// the top unit only, whose names the elaboration holds.
-fn check_unit(
-    u: &Unit,
+fn check_unit<'a>(
+    u: &Unit<'a>,
     defs: &[&SourceDefinition],
     elab: &ElaboratedModule,
+    global: &HashMap<&'a str, &'a ClassDeclaration>,
     pkg_decls: &HashMap<String, HashSet<String>>,
     pkg_names: &HashSet<String>,
     errs: &mut Vec<String>,
@@ -164,7 +175,7 @@ fn check_unit(
     check_system_task_values(u.items, errs);
     check_wildcard_import_conflicts(u.ports, u.params, u.items, pkg_decls, errs);
     check_imported_hier_refs(defs, u.items, pkg_decls, errs);
-    let classes = visible_classes(defs, u.items);
+    let classes = visible_classes(global, u.items);
     check_inherited_local_access(&classes, u.items, errs);
     check_unspecialized_class_scope(&classes, u.items, errs);
     check_udp_instance_delays(defs, u.items, errs);
@@ -595,6 +606,54 @@ fn for_each_proc_assign_lhs(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
     }
 }
 
+thread_local! {
+    /// The last segments (after `.` and after `::`) of every parameter key of
+    /// the design being linted, built once per `lint_should_fail` run. An
+    /// instance's parameter is keyed `inst.NAME` and a package one
+    /// `pkg::NAME`, and splitting every key for every width identifier cost
+    /// identifiers x instances (#872).
+    static PARAM_LEAVES: std::cell::RefCell<Option<(usize, HashSet<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs `PARAM_LEAVES` for one lint run and removes it when dropped.
+struct ParamLeaves;
+
+impl ParamLeaves {
+    fn install(elab: &ElaboratedModule) -> Self {
+        let mut leaves = HashSet::default();
+        for k in elab.parameters.keys() {
+            for leaf in [k.rsplit('.').next(), k.rsplit("::").next()]
+                .into_iter()
+                .flatten()
+            {
+                if !leaves.contains(leaf) {
+                    leaves.insert(leaf.to_string());
+                }
+            }
+        }
+        PARAM_LEAVES.with(|c| *c.borrow_mut() = Some((elab as *const _ as usize, leaves)));
+        ParamLeaves
+    }
+
+    /// Whether some parameter key of `elab` ends in `leaf`.
+    fn contains(elab: &ElaboratedModule, leaf: &str) -> bool {
+        PARAM_LEAVES.with(|c| match c.borrow().as_ref() {
+            Some((id, leaves)) if *id == elab as *const _ as usize => leaves.contains(leaf),
+            _ => elab
+                .parameters
+                .keys()
+                .any(|k| k.rsplit('.').next() == Some(leaf) || k.rsplit("::").next() == Some(leaf)),
+        })
+    }
+}
+
+impl Drop for ParamLeaves {
+    fn drop(&mut self) {
+        PARAM_LEAVES.with(|c| *c.borrow_mut() = None);
+    }
+}
+
 /// §11.5.1: the width of an indexed part-select (`[base +: w]` / `[base -: w]`)
 /// must be a positive constant — a width that constant-folds to 0 is illegal.
 /// Is this width expression one we can const-fold with CONFIDENCE?
@@ -637,9 +696,7 @@ fn width_is_confident(e: &Expression, elab: &ElaboratedModule) -> bool {
             let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
             elab.parameters.contains_key(&raw)
                 || elab.parameters.contains_key(leaf)
-                || elab.parameters.keys().any(|k| {
-                    k.rsplit('.').next() == Some(leaf) || k.rsplit("::").next() == Some(leaf)
-                })
+                || ParamLeaves::contains(elab, leaf)
         }
         // A struct/interface member or an index: only trusted when the exact
         // dotted key was seeded (interface-port parameters do this).
@@ -3620,12 +3677,8 @@ fn check_imported_hier_refs(
     }
 }
 
-/// Every class visible to a module: its own, the top-level ones and those in
-/// packages.
-fn visible_classes<'a>(
-    defs: &'a [&'a SourceDefinition],
-    items: &'a [ModuleItem],
-) -> HashMap<&'a str, &'a ClassDeclaration> {
+/// The classes every module sees: the top-level ones and those in packages.
+fn global_classes<'a>(defs: &[&'a SourceDefinition]) -> HashMap<&'a str, &'a ClassDeclaration> {
     let mut map = HashMap::new();
     for d in defs {
         match d {
@@ -3642,12 +3695,27 @@ fn visible_classes<'a>(
             _ => {}
         }
     }
-    for it in items {
-        if let ModuleItem::ClassDeclaration(c) = it {
-            map.insert(c.name.name.as_str(), c);
-        }
-    }
     map
+}
+
+/// Every class visible to a module: its own over the global ones. A module
+/// that declares no class shares the global map.
+fn visible_classes<'g, 'a>(
+    global: &'g HashMap<&'a str, &'a ClassDeclaration>,
+    items: &'a [ModuleItem],
+) -> std::borrow::Cow<'g, HashMap<&'a str, &'a ClassDeclaration>> {
+    let own = items.iter().filter_map(|it| match it {
+        ModuleItem::ClassDeclaration(c) => Some(c),
+        _ => None,
+    });
+    if own.clone().next().is_none() {
+        return std::borrow::Cow::Borrowed(global);
+    }
+    let mut map = global.clone();
+    for c in own {
+        map.insert(c.name.name.as_str(), c);
+    }
+    std::borrow::Cow::Owned(map)
 }
 
 /// §8.18: a `local` member is visible only inside its own class, not in a
