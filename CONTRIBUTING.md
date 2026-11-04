@@ -85,6 +85,42 @@ when no checkout is found (and the tests clone on demand as a fallback). To use
 an existing checkout instead, set `XEZIM_UVM_DIR` to its root or clone it as a
 `../UVM` sibling of this repository.
 
+The `classes` target registers the 67 UVM cases as eight grouped tests. Each
+case runs on a fresh thread, preserving isolation of thread-local simulator state;
+the group continues after a panic and reports every failed case by its
+original module/function name. The case bodies and their assertions remain
+in the original `tests/classes/uvm*.rs` files. The complete case-to-group
+mapping is in [`uvm_groups.rs`](tests/classes/uvm_groups.rs).
+
+| Group selector (`uvm_groups::` prefix) | Cases | Coverage |
+| --- | ---: | --- |
+| `uvm_foundation_config_factory` | 11 | Configuration/resource databases, factory overrides and linkage |
+| `uvm_phasing_versions` | 10 | Library versions, phase completion, objections and timeout |
+| `uvm_sequences_traffic` | 8 | Sequencers, responses, locks, traffic and method policies |
+| `uvm_tlm` | 8 | TLM-1/TLM-2 ports, channels, sockets and connection errors |
+| `uvm_ral` | 10 | Register/memory policies, prediction and frontdoor/backdoor access |
+| `uvm_dpi` | 6 | Regex, command line, HDL backdoor and assertion sampling |
+| `uvm_printing_reporting` | 10 | Printers, strings, package calls and report controls |
+| `uvm_objects_features` | 4 | Object automation, callbacks, events and barriers |
+
+Run all groups or one group with the existing test binary:
+
+```bash
+cargo test --release --test classes uvm_groups::
+cargo test --release --test classes uvm_groups::uvm_tlm
+```
+
+To select one original case, use its full name from the mapping:
+
+```bash
+XEZIM_UVM_CASE=uvm_integration_tests::uvm_2020_traffic_is_independent_of_method_policy \
+  cargo test --release --test classes uvm_groups:: -- --nocapture
+```
+
+Unknown case names fail explicitly. Existing optional-library skips retain
+their original messages. The method-policy case still runs its three
+isolated process policies; its child selects the group and that one case.
+
 ### cocotb runner tests
 
 The cocotb runner (`contrib/cocotb/xezim_runner.py`) has a pytest suite in

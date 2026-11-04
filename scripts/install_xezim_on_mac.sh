@@ -14,7 +14,7 @@
 #    5. Clones xezim-core + xezim + UVM 1.2 side-by-side
 #    6. Builds xezim in release mode
 #    7. Runs a quick smoke test
-#    8. Runs UVM simple test (mock)
+#    8. Runs grouped UVM regression tests
 #    9. Runs UVM complete test (real UVM 1.2 library)
 # =============================================================================
 
@@ -209,14 +209,14 @@ info "Step 7/9: Running smoke test..."
     warn "xezim --help returned non-zero (may still be OK)"
 
 # -------------------------------------------------------
-# Step 8: UVM simple test (uses bundled mock)
+# Step 8: Grouped UVM regression tests
 # -------------------------------------------------------
-info "Step 8/9: Running UVM simple test (mock)..."
+info "Step 8/9: Running grouped UVM regression tests..."
 
 cd "$WORKSPACE/xezim"
-cargo test --release --test uvm_integration_tests 2>&1 && \
-    log "UVM simple test (mock) PASSED!" || \
-    warn "UVM simple test returned non-zero (check output above)"
+cargo test --release --test classes uvm_groups:: 2>&1 && \
+    log "Grouped UVM regression tests PASSED!" || \
+    warn "Grouped UVM regression tests returned non-zero (check output above)"
 
 # -------------------------------------------------------
 # Step 9: UVM complete test (real UVM 1.2 library)
