@@ -2931,7 +2931,7 @@ impl Simulator {
             } else {
                 allowed
             };
-            let total: u64 = domain.iter().map(|(l, h)| h - l + 1).sum();
+            let total = domain.iter().fold(0u64, |n, &(l, h)| n.saturating_add(h.saturating_sub(l).saturating_add(1)));
             if total < ck.len() as u64 {
                 return; // provably impossible: leave for the checker to reject
             }
