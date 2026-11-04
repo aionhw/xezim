@@ -20,8 +20,10 @@ class two_c;
   }
 endclass
 class three_c;
+  rand bit on;
   rand bit [3:0] a[], b[], d[];
-  constraint k { a.size() == 3; b.size() == 2; d.size() == 4; unique {a, b, d}; }
+  constraint k { a.size() == 3; b.size() == 2; d.size() == 4;
+                 if (on) { unique {a, b, d}; } else { a[0] == b[0]; } }
 endclass
 module t;
   initial begin
@@ -39,7 +41,7 @@ module t;
     $display("two %0d %0d", ok, bad);
     ok = 0;
     bad = 0;
-    repeat (4) if (p.randomize()) begin
+    repeat (4) if (p.randomize() with { on == 1; }) begin
       bit [3:0] all[$];
       all = {p.a, p.b, p.d};
       ok++;
@@ -47,6 +49,10 @@ module t;
       foreach (all[i]) foreach (all[j]) if (i < j && all[i] == all[j]) bad++;
     end
     $display("three %0d %0d", ok, bad);
+    ok = 0;
+    bad = 0;
+    repeat (4) if (p.randomize() with { on == 0; }) begin ok++; if (p.a[0] != p.b[0]) bad++; end
+    $display("off %0d %0d", ok, bad);
     $finish;
   end
 endmodule
@@ -59,5 +65,5 @@ endmodule
         .iter()
         .map(|entry| entry.message.as_str())
         .collect();
-    assert_eq!(lines, ["two 4 0", "three 4 0"]);
+    assert_eq!(lines, ["two 4 0", "three 4 0", "off 4 0"]);
 }

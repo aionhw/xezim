@@ -2908,12 +2908,14 @@ impl Simulator {
 
     /// §18.5.5 / §18.5.9: `unique {c}` over a rand collection, or
     /// `unique {a, b}` over several: make every element of the group
-    /// pairwise distinct. Elements pinned by an equality constraint keep
-    /// their value; the rest are re-picked from their own collection's legal
+    /// pairwise distinct. Scalar members and pinned elements keep their
+    /// value; the rest are re-picked from their own collection's legal
     /// domain (the `foreach … inside {…}` ranges, when any).
     pub(super) fn enforce_unique_coll(
         &mut self,
+        handle: usize,
         cs: &[RandColl],
+        scalars: &[String],
         constraints: &[ClassConstraint],
         pinned: &HashSet<String>,
     ) {
@@ -2940,12 +2942,13 @@ impl Simulator {
             keys.extend(ck.into_iter().map(|k| (k, ci)));
             domains.push(domain);
         }
-        if keys.len() < 2 {
+        if keys.len() + scalars.len() < 2 {
             return;
         }
+        // Scalar members of the group and pinned elements claim their value
+        // first, so a free element never steals it and forces them to move.
         let mut used: HashSet<u64> = HashSet::default();
-        // Pinned elements claim their value first, so a free element never
-        // steals it and forces the pinned one to move.
+        used.extend(scalars.iter().filter_map(|s| self.unique_scalar_value(handle, s)));
         for (k, _) in &keys {
             if pinned.contains(k) {
                 if let Some(v) = self.read_coll_elem(k).and_then(|v| v.to_u64()) {
@@ -3023,6 +3026,15 @@ impl Simulator {
         fn walk(item: &mut ConstraintItem, colls: &[RandColl]) {
             match item {
                 ConstraintItem::Block(items) => items.iter_mut().for_each(|i| walk(i, colls)),
+                ConstraintItem::Implication { constraint, .. } => walk(constraint, colls),
+                ConstraintItem::IfElse {
+                    then_item,
+                    else_item,
+                    ..
+                } => {
+                    walk(then_item, colls);
+                    else_item.iter_mut().for_each(|e| walk(e, colls));
+                }
                 ConstraintItem::Expr(e) => {
                     let ExprKind::Binary {
                         op: BinaryOp::Neq,

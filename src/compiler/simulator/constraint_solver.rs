@@ -849,9 +849,9 @@ impl Simulator {
         let rand_colls = self.collect_rand_colls(handle, &rand_disabled, &constraints);
         Self::regroup_unique_colls(&mut constraints, &rand_colls);
         // `unique {c}` / `unique {a, b}` items naming those collections
-        // (§18.5.5), one group per item.
-        let unique_colls: Vec<Vec<RandColl>> = {
-            let mut out: Vec<Vec<RandColl>> = Vec::new();
+        // (§18.5.5), one group per item, with the group's other members.
+        let unique_colls: Vec<(Vec<RandColl>, Vec<String>)> = {
+            let mut out: Vec<(Vec<RandColl>, Vec<String>)> = Vec::new();
             fn walk(item: &ConstraintItem, out: &mut Vec<Vec<String>>) {
                 match item {
                     ConstraintItem::Unique { exprs, .. } => {
@@ -881,12 +881,16 @@ impl Simulator {
                 }
             }
             for g in groups {
-                let cs: Vec<RandColl> = g
-                    .iter()
-                    .filter_map(|n| rand_colls.iter().find(|c| &c.prop == n).cloned())
-                    .collect();
+                let mut cs: Vec<RandColl> = Vec::new();
+                let mut scalars: Vec<String> = Vec::new();
+                for n in g {
+                    match rand_colls.iter().find(|c| c.prop == n) {
+                        Some(c) => cs.push(c.clone()),
+                        None => scalars.push(n),
+                    }
+                }
                 if !cs.is_empty() {
-                    out.push(cs);
+                    out.push((cs, scalars));
                 }
             }
             out
@@ -2506,8 +2510,8 @@ impl Simulator {
                 }
                 self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
                 self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
-                for cs in &unique_colls {
-                    self.enforce_unique_coll(cs, &constraints, &pinned_elems);
+                for (cs, scalars) in &unique_colls {
+                    self.enforce_unique_coll(handle, cs, scalars, &constraints, &pinned_elems);
                 }
             }
             {
