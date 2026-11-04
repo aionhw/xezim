@@ -1597,9 +1597,23 @@ impl Simulator {
                 .map(|s| s.trim_matches(['[', ']']).parse().ok())
                 .collect::<Option<_>>()?;
             let elems = self.pattern_elems(items, &indices);
+            // §11.8.2: a real element lends no integral width. Lending the
+            // 64-bit element width wraps `u - 2` at 64 bits.
+            let mut cur = lvalue;
+            let mut idx = vec![indices[0]];
+            while let ExprKind::Index { expr, index } = &cur.kind {
+                idx.insert(0, self.eval_expr(index).to_i64().unwrap_or(0));
+                cur = expr;
+            }
+            let real_row = matches!(&cur.kind, ExprKind::Ident(h) if self
+                .lookup_signal_real(&Self::elem_name(&self.resolve_hier_name(h), &idx)));
             for (sfx, e) in targets.iter().zip(elems) {
-                let leaf = Self::append_leaf_path(lvalue, sfx);
-                values.push(self.eval_target_rhs(&leaf, e?));
+                let e = e?;
+                values.push(if real_row {
+                    self.eval_expr(e)
+                } else {
+                    self.eval_target_rhs(&Self::append_leaf_path(lvalue, sfx), e)
+                });
             }
         } else {
             // A row or whole multi-dimensional array, or a plain 1-D unpacked
