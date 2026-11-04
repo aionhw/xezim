@@ -527,3 +527,5 @@ mod undefined_macro_recovery;
 
 #[path = "misc/constant_scopes_488.rs"]
 mod constant_scopes_488;
+#[path = "misc/edge_call_module_state.rs"]
+mod edge_call_module_state;

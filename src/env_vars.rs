@@ -324,6 +324,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Print per-edge-block execution statistics",
     ),
     (
+        "XEZIM_EDGE_DELEGATE",
+        "Keep a large call to a function touching module state in an edge block as a call (default 1; =0 inlines it)",
+    ),
+    (
         "XEZIM_EDGE_FIRE_TRACE",
         "Trace every edge-block firing (very verbose)",
     ),

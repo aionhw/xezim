@@ -1603,6 +1603,7 @@ impl Simulator {
                         }
                         Insn::StmtFallback(..)
                         | Insn::EvalExprFallback(..)
+                        | Insn::CallFreeFunction(..)
                         | Insn::NbaAssignArray(..)
                         | Insn::BlockingAssignArray(..)
                         | Insn::NbaAssignArrayRange(..)
@@ -1788,10 +1789,12 @@ impl Simulator {
             let mut opaque = false;
             for insn in &cb.instructions {
                 match insn {
-                    // A counted block must run on every edge.
-                    Insn::StmtFallback(..) | Insn::EvalExprFallback(..) | Insn::CovHit(..) => {
-                        opaque = true
-                    }
+                    // A counted block must run on every edge, and a called
+                    // function's reads and effects are not in the bytecode.
+                    Insn::StmtFallback(..)
+                    | Insn::EvalExprFallback(..)
+                    | Insn::CallFreeFunction(..)
+                    | Insn::CovHit(..) => opaque = true,
                     // Constant bit/part selects record only the SLICE they
                     // read (see `edge_block_reads_meta`); everything else is
                     // a full-signal read.

@@ -13,6 +13,10 @@ use xezim_core::hasher::{HashMap, HashSet};
 
 const MAX_INLINE_DEPTH: usize = 8;
 
+/// The most instructions a call inlined into an edge block may add when its
+/// callee touches module state; a larger one stays a `CallFreeFunction`.
+const EDGE_INLINE_MAX: usize = 1024;
+
 /// Sentinel for a method receiver whose declared class could not be resolved
 /// (a handle local/formal with no carried declared type). `emit_arg_slot_writeback`
 /// treats UNTYPED receivers with the conservative name-global writeback rule.
@@ -2875,6 +2879,20 @@ impl<'a> BytecodeCompiler<'a> {
         self.edge_delegate = allow;
     }
 
+    /// A formal an edge block's `CallFreeFunction` can bind: the call
+    /// passes a sized number, so an integral type (not a struct, union,
+    /// real, string or a typedef it cannot see through).
+    fn edge_call_formal_ok(dt: &crate::ast::types::DataType) -> bool {
+        use crate::ast::types::DataType;
+        matches!(
+            dt,
+            DataType::IntegerVector { .. }
+                | DataType::IntegerAtom { .. }
+                | DataType::Implicit { .. }
+                | DataType::Enum(_)
+        )
+    }
+
     pub fn set_scope_hint(&mut self, scope: Option<String>) {
         self.scope_hint = scope;
     }
@@ -3235,13 +3253,38 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 )
             });
-            // Closed over its arguments: no module-signal read or write.
-            // An edge block inlines those helpers. One that touches module
-            // state is a call, or the VHDL kernel's next-time scan is
-            // pasted into `always @(vh_tick)` and the block is tens of
-            // thousands of instructions.
-            let edge_call = self.edge_delegate
+            // An edge block inlines its helpers. One that touches module
+            // state and whose inlined code would be large stays a call: the
+            // VHDL kernel's next-time scan, pasted into `always @(vh_tick)`,
+            // made the block tens of thousands of instructions. A small one
+            // is inlined as before (cheaper, and compiled further). Only
+            // integral formals: the call passes each actual as a sized
+            // number.
+            let mut edge_call = self.edge_delegate
+                && input_only_scalar
+                && arity_le
+                && fd
+                    .ports
+                    .iter()
+                    .all(|p| Self::edge_call_formal_ok(&p.data_type))
                 && !self.fn_is_pure_in(&fd, name.rsplit_once('.').map(|(p, _)| p));
+            if edge_call {
+                let start = self.insns.len();
+                let next = self.next_reg;
+                let reason = self.bail_reason;
+                self.edge_delegate = false;
+                let inlined = self.compile_pure_call(func, args);
+                self.edge_delegate = true;
+                if let Some(r) = inlined
+                    && self.insns.len() - start <= EDGE_INLINE_MAX
+                {
+                    return Some(r);
+                }
+                self.truncate_insns(start);
+                self.next_reg = next;
+                self.bail_reason = reason;
+                edge_call = true;
+            }
             if input_only_scalar
                 && arity_le
                 && (edge_call || (self.method_mode && (has_string_port || !fn_pure(self))))
@@ -3250,8 +3293,22 @@ impl<'a> BytecodeCompiler<'a> {
                 let call_next = self.next_reg;
                 let mut ok = true;
                 let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
-                for a in args {
-                    match self.compile_expr(a, 0) {
+                for (i, a) in args.iter().enumerate() {
+                    // An edge call evaluates each actual at its formal's
+                    // width, as the inlined call does (§13.5.2): `f(a + b)`
+                    // keeps the carry of 8-bit operands into a 9-bit formal.
+                    let w = if edge_call {
+                        self.port_effective_width(&fd.ports, i, Some(&name))
+                    } else {
+                        0
+                    };
+                    match self.compile_expr(a, w) {
+                        Some(r) if w > 0 => {
+                            let s = self.alloc_reg();
+                            self.emit(Insn::Move(s, r));
+                            self.emit(Insn::Resize(s, w));
+                            arg_values.push(s)
+                        }
                         Some(r) => arg_values.push(r),
                         None => {
                             ok = false;
@@ -13538,7 +13595,8 @@ impl<'a> BytecodeCompiler<'a> {
                 // so `s.f0 != last.f0` in an `always` block was always
                 // false. As for the whole variable, take the interpreter's
                 // statement paths.
-                if hier.root.is_none() && self.is_member_wise_struct_name(&Self::hier_raw_cow(hier)) {
+                if hier.root.is_none() && self.is_member_wise_struct_name(&Self::hier_raw_cow(hier))
+                {
                     self.bail("ident_unpacked_struct_member");
                     return None;
                 }

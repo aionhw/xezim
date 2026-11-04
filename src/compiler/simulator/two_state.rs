@@ -4832,6 +4832,7 @@ impl Simulator {
                 insn,
                 Insn::StmtFallback(..)
                     | Insn::EvalExprFallback(..)
+                    | Insn::CallFreeFunction(..)
                     | Insn::NbaAssignArray(..)
                     | Insn::BlockingAssignArray(..)
                     | Insn::NbaAssignArrayRange(..)
@@ -5007,7 +5008,7 @@ impl Simulator {
             // read hidden inside an interpreted expression can't break wake-up
             // analysis here (unlike comb entries / cont-assigns).
             compiler.set_expr_fallback(true);
-            compiler.set_edge_delegate(true);
+            compiler.set_edge_delegate(edge_delegate_enabled());
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
@@ -6211,4 +6212,11 @@ impl Simulator {
             );
         }
     }
+}
+
+/// Whether an edge block keeps a large call to a function touching module
+/// state as a call (`XEZIM_EDGE_DELEGATE=0` inlines it, as before).
+fn edge_delegate_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XEZIM_EDGE_DELEGATE").map_or(true, |v| v != "0"))
 }
