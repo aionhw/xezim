@@ -164,7 +164,7 @@ impl Simulator {
         };
         if let Some(p) = cx.ports.iter().find(|p| p.name.name == name) {
             return Some(wrap(
-                self.ts_recv_kind(&p.data_type),
+                self.ts_recv_kind(&p.data_type, cx.owner.unwrap_or("")),
                 !p.dimensions.is_empty(),
             ));
         }
@@ -177,7 +177,7 @@ impl Simulator {
             } = &st.kind
                 && let Some(d) = declarators.iter().find(|d| d.name.name == name)
             {
-                return Some(wrap(self.ts_recv_kind(data_type), !d.dimensions.is_empty()));
+                return Some(wrap(self.ts_recv_kind(data_type, ""), !d.dimensions.is_empty()));
             }
             todo.extend(Self::ts_children(st));
         }
@@ -192,7 +192,7 @@ impl Simulator {
                     || cd.queue_properties.contains_key(name)
                     || cd.assoc_properties.contains_key(name)
                     || cd.static_collections.iter().any(|(n, _, _)| n == name);
-                return Some(wrap(self.ts_recv_kind(dt), collection));
+                return Some(wrap(self.ts_recv_kind(dt, &cur), collection));
             }
             match &cd.extends {
                 Some(b) => cur = Self::ts_base(b).to_string(),
@@ -207,8 +207,13 @@ impl Simulator {
     }
 
     /// The receiver kind of a declared type; `None` when it cannot be
-    /// resolved (a type parameter, an unknown name).
-    fn ts_recv_kind(&self, dt: &crate::ast::types::DataType) -> Option<TsRecv> {
+    /// resolved (a type parameter, an unknown name). `ctx_class` is the
+    /// class in whose scope `dt` is spelled, so a class-local typedef leaf
+    /// (every parameterized UVM class declares `this_type`) resolves in that
+    /// class's OWN typedef table rather than the module-level `typedef_types`
+    /// where same-named class-local typedefs clobber each other (the last
+    /// class processed wins arbitrarily).
+    fn ts_recv_kind(&self, dt: &crate::ast::types::DataType, ctx_class: &str) -> Option<TsRecv> {
         use crate::ast::types::DataType as DT;
         let mut cur = dt;
         for _ in 0..16 {
@@ -222,12 +227,23 @@ impl Simulator {
             if Self::ts_base(n) == "process" || n.ends_with("::process") {
                 return Some(TsRecv::Builtin);
             }
+            if !ctx_class.is_empty()
+                && let Some(target_class) = self.ts_class_local_typedef_class(ctx_class, n)
+            {
+                // Class-local typedef (e.g. `this_type` of `ctx_class`):
+                // its target is the concrete class spelled by the declaring
+                // class's own ledger, not the clobbered global table. Use it
+                // unless it is a collection element typedef.
+                if !self.module.typedef_unpacked_dims.contains_key(n) {
+                    return Some(TsRecv::Class(target_class));
+                }
+            }
             if self.module.typedef_unpacked_dims.contains_key(n) {
                 let elem = self
                     .module
                     .typedef_types
                     .get(n)
-                    .and_then(|e| self.ts_recv_kind(e))
+                    .and_then(|e| self.ts_recv_kind(e, ""))
                     .map(Box::new);
                 return Some(TsRecv::Collection(elem));
             }
@@ -245,6 +261,32 @@ impl Simulator {
             }
             match self.module.typedef_types.get(n) {
                 Some(next) => cur = next,
+                None => return None,
+            }
+        }
+        None
+    }
+
+    /// If `leaf` is a class-local typedef spelled in `ctx_class`'s scope
+    /// (declared in `ctx_class` or a base via `typedef_targets`), resolve the
+    /// concrete class its target names. Returns `None` when `leaf` is not a
+    /// class-local typedef of `ctx_class`'s chain or does not resolve to a
+    /// class handle.
+    fn ts_class_local_typedef_class(&self, ctx_class: &str, leaf: &str) -> Option<String> {
+        if ctx_class.is_empty() {
+            return None;
+        }
+        let mut cur = Self::ts_base(ctx_class).to_string();
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                return None;
+            }
+            if let Some(target) = cd.typedef_targets.get(leaf) {
+                return self.typeref_class_name(target);
+            }
+            match &cd.extends {
+                Some(b) => cur = Self::ts_base(b).to_string(),
                 None => return None,
             }
         }
@@ -495,10 +537,10 @@ impl Simulator {
             });
         }
         if let Some(dt) = self.module.typedef_types.get(tn) {
-            return self.ts_recv_kind(dt);
+            return self.ts_recv_kind(dt, "");
         }
         if let Some(dt) = self.module.typedef_types.get(base) {
-            return self.ts_recv_kind(dt);
+            return self.ts_recv_kind(dt, "");
         }
         None
     }
@@ -518,6 +560,9 @@ impl Simulator {
     /// handle kind and whether it is a collection. `None` when the
     /// chain lacks the property or cannot be followed.
     fn ts_prop_kind(&self, class: &str, prop: &str) -> Option<(Option<TsRecv>, bool)> {
+        self.ts_prop_kind_inner(class, prop)
+    }
+    fn ts_prop_kind_inner(&self, class: &str, prop: &str) -> Option<(Option<TsRecv>, bool)> {
         let mut cur = Self::ts_base(class).to_string();
         let mut seen: HashSet<String> = HashSet::default();
         while let Some(cd) = self.module.classes.get(&cur) {
@@ -529,7 +574,7 @@ impl Simulator {
                     || cd.queue_properties.contains_key(prop)
                     || cd.assoc_properties.contains_key(prop)
                     || cd.static_collections.iter().any(|(n, _, _)| n == prop);
-                return Some((self.ts_recv_kind(dt), collection));
+                return Some((self.ts_recv_kind(dt, &cur), collection));
             }
             match &cd.extends {
                 Some(b) => cur = Self::ts_base(b).to_string(),
