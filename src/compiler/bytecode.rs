@@ -6677,6 +6677,44 @@ impl<'a> BytecodeCompiler<'a> {
         Some(dest)
     }
 
+    /// The `module.arrays_2d` entry of `hier`, as named or in the current
+    /// scope, with the key it was found under.
+    fn arrays_2d_entry(
+        &self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<(String, ((i64, i64), (i64, i64), u32))> {
+        let raw = Self::hier_raw_name(hier);
+        let arrays_2d = self.arrays_2d?;
+        arrays_2d
+            .get(raw.as_str())
+            .map(|s| (raw.clone(), *s))
+            .or_else(|| {
+                self.scope_hint.as_ref().and_then(|sc| {
+                    let q = cat_dot(sc, &raw);
+                    arrays_2d.get(q.as_str()).map(|s| (q, *s))
+                })
+            })
+    }
+
+    /// Declared width of a fully indexed element of a multidimensional
+    /// unpacked array (§7.4.5): the materialized cell's width when the indices
+    /// are constant, the `arrays_2d` element width when they are not. Anything
+    /// else (a row, a select inside an element) answers None. A string
+    /// element answers 0: its value is self-determined, like a string signal.
+    fn multi_dim_unpacked_elem_width(&self, lhs: &Expression) -> Option<u32> {
+        if let Some(id) = self.const_multi_dim_array_elem_signal_id(lhs) {
+            return Some(self.signal_widths[id]);
+        }
+        let ExprKind::Index { expr, index } = &lhs.kind else {
+            return None;
+        };
+        let (hier, idxs) = self.flatten_index_chain_exprs(expr, index)?;
+        if idxs.len() != 2 {
+            return None;
+        }
+        self.arrays_2d_entry(hier).map(|(_, (_, _, w))| w)
+    }
+
     /// Shared row-major addressing for a DYNAMIC 2-D unpacked element
     /// (`a[i][j]`): returns the Dense operand and the register holding
     /// `flat = (i-lo1)*ncols + (j-lo2)`, with an out-of-range index in EITHER
@@ -6688,17 +6726,7 @@ impl<'a> BytecodeCompiler<'a> {
         i_expr: &Expression,
         j_expr: &Expression,
     ) -> Option<(Box<ArrayOperand>, RegId)> {
-        let raw = Self::hier_raw_name(hier);
-        let arrays_2d = self.arrays_2d?;
-        let (key, ((lo1, hi1), (lo2, hi2), _w)) = arrays_2d
-            .get(raw.as_str())
-            .map(|s| (raw.clone(), *s))
-            .or_else(|| {
-                self.scope_hint.as_ref().and_then(|sc| {
-                    let q = cat_dot(sc, &raw);
-                    arrays_2d.get(q.as_str()).map(|s| (q, *s))
-                })
-            })?;
+        let (key, ((lo1, hi1), (lo2, hi2), _w)) = self.arrays_2d_entry(hier)?;
         if lo1 < 0 || lo2 < 0 {
             return None;
         }
@@ -19573,6 +19601,11 @@ impl<'a> BytecodeCompiler<'a> {
                     // sub-array (§7.4.1). The 32-bit default below truncated
                     // the RHS of a continuous assign or always_comb write to
                     // a wider element before the store ever saw it.
+                    w
+                } else if let Some(w) = self.multi_dim_unpacked_elem_width(lhs) {
+                    // §7.4.5, §11.6.1: `a[i][j] <= v` on a multidimensional
+                    // unpacked array. The 32-bit default below cut the value
+                    // before the store, whatever the element's type.
                     w
                 } else {
                     32
