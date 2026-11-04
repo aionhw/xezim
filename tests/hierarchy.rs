@@ -155,6 +155,8 @@ mod port_default_child_scope;
 mod port_net_driven_from_inside;
 #[path = "hierarchy/port_net_pull_resolution.rs"]
 mod port_net_pull_resolution;
+#[path = "hierarchy/prepared_body_key.rs"]
+mod prepared_body_key;
 #[path = "hierarchy/repro_import.rs"]
 mod repro_import;
 #[path = "hierarchy/resource_pool_scope_lookup.rs"]
