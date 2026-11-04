@@ -315,6 +315,8 @@ mod union_shared_storage;
 mod unit_scope_user_type_var;
 #[path = "types/unpacked_array_ports_and_vif_arrays.rs"]
 mod unpacked_array_ports_and_vif_arrays;
+#[path = "types/unpacked_array_slices_867.rs"]
+mod unpacked_array_slices_867;
 #[path = "types/unpacked_indexed_slice_size_869.rs"]
 mod unpacked_indexed_slice_size_869;
 #[path = "types/unpacked_struct_array_members.rs"]
