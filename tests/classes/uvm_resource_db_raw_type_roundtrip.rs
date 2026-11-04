@@ -74,8 +74,7 @@ fn run_in_process(src: &str) -> Option<String> {
     )
 }
 
-#[test]
-fn uvm_resource_db_raw_type_roundtrip() {
+pub(super) fn uvm_resource_db_raw_type_roundtrip() {
     const TEST_NAME: &str = "uvm_resource_db_raw_type_roundtrip";
     let src = r#"
 `include "uvm_macros.svh"

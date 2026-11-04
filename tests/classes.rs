@@ -810,6 +810,8 @@ mod uvm_feature_coverage;
 mod uvm_ral_coverage;
 #[path = "classes/uvm_tlm_coverage.rs"]
 mod uvm_tlm_coverage;
+#[path = "classes/uvm_groups.rs"]
+mod uvm_groups;
 #[path = "classes/vif_member_read_nested_receiver.rs"]
 mod vif_member_read_nested_receiver;
 #[path = "classes/vif_null_compare_this_receiver.rs"]
@@ -1101,3 +1103,12 @@ mod property_hides_module_variable;
 
 #[path = "classes/unit_class_out_of_block_members_843.rs"]
 mod unit_class_out_of_block_members_843;
+
+#[path = "classes/recent_846_854_856_858.rs"]
+mod recent_846_854_856_858;
+
+#[path = "classes/nested_extern_methods_842.rs"]
+mod nested_extern_methods_842;
+
+#[path = "classes/recent_constraints_848_850_852_860_862.rs"]
+mod recent_constraints_848_850_852_860_862;

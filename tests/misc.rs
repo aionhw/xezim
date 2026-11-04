@@ -590,3 +590,8 @@ mod array_formal_element_types;
 
 #[path = "misc/struct_resolver_scalarized.rs"]
 mod struct_resolver_scalarized;
+
+#[path = "misc/packed_comb_cache_844.rs"]
+mod packed_comb_cache_844;
+#[path = "misc/prepared_scope_memory_721.rs"]
+mod prepared_scope_memory_721;

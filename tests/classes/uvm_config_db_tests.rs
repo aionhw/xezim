@@ -93,8 +93,7 @@ fn skip_no_uvm(test: &str) {
 
 /// Specific instance name: a `get` whose context/inst_name matches a prior `set`
 /// succeeds; a wildcard `set(null, "*", ...)` matches any getter.
-#[test]
-fn test_config_db_inst_name() {
+pub(super) fn test_config_db_inst_name() {
     const TEST_NAME: &str = "test_config_db_inst_name";
     let src = r#"
 `include "uvm_macros.svh"
@@ -150,8 +149,7 @@ endmodule
 
 /// A wildcard `set(null, "*", field, v)` is visible to any getter, and the
 /// retrieved value is the one that was set.
-#[test]
-fn test_config_db_wildcard() {
+pub(super) fn test_config_db_wildcard() {
     const TEST_NAME: &str = "test_config_db_wildcard";
     let src = r#"
 `include "uvm_macros.svh"
@@ -191,8 +189,7 @@ endmodule
 
 /// A specific-instance set hits its getter; a wildcard set hits any getter; a
 /// field that was never set misses.
-#[test]
-fn test_config_db_hit_wildcard_and_miss() {
+pub(super) fn test_config_db_hit_wildcard_and_miss() {
     const TEST_NAME: &str = "test_config_db_hit_wildcard_and_miss";
     let src = r#"
 `include "uvm_macros.svh"
@@ -254,8 +251,7 @@ endmodule
 /// with the collection `exists` builtin) was routed to the associative-array
 /// query and answered 0 without ever running the class method, so every
 /// `exists` reported false even when the matching resource was present.
-#[test]
-fn test_config_db_exists_after_set() {
+pub(super) fn test_config_db_exists_after_set() {
     const TEST_NAME: &str = "test_config_db_exists_after_set";
     let src = r#"
 `include "uvm_macros.svh"

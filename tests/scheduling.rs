@@ -449,3 +449,6 @@ mod program_implicit_finish;
 
 #[path = "scheduling/delay_always_constant_scaled_delay.rs"]
 mod delay_always_constant_scaled_delay;
+
+#[path = "scheduling/packed_comb_sensitivity_844.rs"]
+mod packed_comb_sensitivity_844;
