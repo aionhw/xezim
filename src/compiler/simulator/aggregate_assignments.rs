@@ -1597,8 +1597,9 @@ impl Simulator {
                 .map(|s| s.trim_matches(['[', ']']).parse().ok())
                 .collect::<Option<_>>()?;
             let elems = self.pattern_elems(items, &indices);
-            for e in elems {
-                values.push(self.eval_expr(e?));
+            for (sfx, e) in targets.iter().zip(elems) {
+                let leaf = Self::append_leaf_path(lvalue, sfx);
+                values.push(self.eval_target_rhs(&leaf, e?));
             }
         } else {
             // A row or whole multi-dimensional array, or a plain 1-D unpacked

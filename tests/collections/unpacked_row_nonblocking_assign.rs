@@ -17,6 +17,7 @@ module top;
   logic clk = 0;
   logic [3:0] in_i [2];
   logic [3:0] a [2][2], b [2][2], c [2][2], e [2][2], f [2][2], k [2][1:0];
+  logic [7:0] w [2][2];
   always #5 clk = ~clk;
   always @(posedge clk) begin
     a[0] <= '{default: 0};
@@ -25,18 +26,19 @@ module top;
     e[1] <= e[0];
     f[0][1] <= 4'h7;
     k[0] <= '{0: 4'h1, 1: 4'h2};
+    w[0] <= '{4'hf + 4'h1, 4'hf + 4'h2};
   end
   initial begin
     in_i[0] = 4'h3; in_i[1] = 4'h5;
     e[0][0] = 4'h3; e[0][1] = 4'h4;
-    #6 $display("a=%h%h b=%h%h c=%h%h e=%h%h f=%h k=%h%h",
+    #6 $display("a=%h%h b=%h%h c=%h%h e=%h%h f=%h k=%h%h w=%h%h",
                 a[0][0], a[0][1], b[1][0], b[1][1], c[0][0], c[0][1],
-                e[1][0], e[1][1], f[0][1], k[0][0], k[0][1]);
+                e[1][0], e[1][1], f[0][1], k[0][0], k[0][1], w[0][0], w[0][1]);
     $finish;
   end
 endmodule
 "#);
-    assert_eq!(msgs, ["a=00 b=35 c=12 e=34 f=7 k=12"]);
+    assert_eq!(msgs, ["a=00 b=35 c=12 e=34 f=7 k=12 w=1011"]);
 }
 
 #[test]
