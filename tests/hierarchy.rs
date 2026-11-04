@@ -389,3 +389,6 @@ mod indexed_scope_edge_sensitivity;
 
 #[path = "hierarchy/review_indexed_scope_selects.rs"]
 mod review_indexed_scope_selects;
+
+#[path = "hierarchy/instance_array_struct_ports.rs"]
+mod instance_array_struct_ports;
