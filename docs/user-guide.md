@@ -9,6 +9,7 @@ of options and environment variables is in the
 
 * [Running a simulation](#running-a-simulation)
 * [Waveforms](#waveforms)
+* [Checkpoints](#checkpoints)
 * [Warm design cache](#warm-design-cache)
 * [Native compilation](#native-compilation)
 * [Reducing a multi-file build](#reducing-a-multi-file-build)
@@ -120,6 +121,12 @@ build is refused.
 Native compilation (`XEZIM_JIT`, `XEZIM_AOT`) may differ between the saving
 and the restoring run, except that a process state machine saved while running
 natively (`XEZIM_PROC_FSM=1` with `XEZIM_AOT=1`) needs `XEZIM_AOT=1` again.
+
+One state is not saved yet: a process forked to call a task, while it is still
+inside that task. A save that meets one fails with `Error: cannot save
+'<file>': ...`, which counts as an error, and the run goes on.
+`XEZIM_CKPT_AUDIT=<file>` appends to `<file>` the names of the simulator
+fields a run changes after setup, the state a checkpoint has to hold.
 
 ## Warm design cache
 

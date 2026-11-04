@@ -82,6 +82,8 @@
 **Fast to iterate**
 - Elaborates large RISC-V SoCs
 - Warm design cache for repeated runs
+- Checkpoints: save a run at a time (`--save-at`, `$save`) and continue it
+  later, for example under another test (`--restore`)
 - Profile-guided builds, optional JIT and ahead-of-time native compilation
 
 </td>
@@ -89,7 +91,7 @@
 
 **Open**
 - Apache 2.0 licensed, developed in the open
-- More than 5,600 regression tests, many checked against a commercial
+- More than 6,000 regression tests, many checked against a commercial
   reference simulator
 - Built with AI assistance as part of the engineering workflow
 
@@ -188,7 +190,7 @@ with few, very hot blocks, so measure it on yours.
 - **UVM:** the mbits-mirafra AVIP base tests for AXI4, APB, I3C, SPI and
   AXI4-Lite print the same UVM messages as a commercial reference simulator,
   and 32 of 35 UVM 1800.2-2017 example testbenches pass.
-- **Regression suite:** 5,934 default tests and two JIT smoke tests run in CI. Many are differential tests whose expected values were measured on a
+- **Regression suite:** 6,047 default tests and two JIT smoke tests run in CI. Many are differential tests whose expected values were measured on a
   commercial reference simulator; see [CONTRIBUTING.md](CONTRIBUTING.md#test-suites).
 
 ## Documentation
@@ -196,7 +198,7 @@ with few, very hot blocks, so measure it on yours.
 | Guide | Contents |
 |---|---|
 | [Supported features](docs/features.md) | Language, UVM, coverage, debug and integration features in detail |
-| [User guide](docs/user-guide.md) | Running simulations, waveforms, design cache, native compilation, timescales, sources written for other simulators |
+| [User guide](docs/user-guide.md) | Running simulations, waveforms, checkpoints, design cache, native compilation, timescales, sources written for other simulators |
 | [Command-line reference](docs/command-line.md) | Every option and environment variable, and the spellings of other simulators that Xezim accepts |
 | [UVM guide](docs/uvm-guide.md) | Running UVM testbenches, supported features, UVM's DPI-C library |
 | [DPI and VPI guide](docs/dpi-guide.md) | Loading C and C++ libraries, the VPI surface |
