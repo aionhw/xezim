@@ -2575,7 +2575,7 @@ impl Simulator {
                 }
                 match cb {
                     None => opaque += 1,
-                    Some(cb) if cb.has_fallback => opaque += 1,
+                    Some(cb) if cb.interprets() => opaque += 1,
                     Some(cb) => {
                         for ins in cb.instructions.iter() {
                             match ins {
@@ -2766,7 +2766,7 @@ impl Simulator {
             for cb in self.compiled_edge_blocks.iter() {
                 match cb {
                     None => opaque_edge += 1,
-                    Some(cb) if cb.has_fallback => opaque_edge += 1,
+                    Some(cb) if cb.interprets() => opaque_edge += 1,
                     Some(cb) => {
                         for ins in cb.instructions.iter() {
                             match ins {

@@ -6069,6 +6069,7 @@ impl Simulator {
                 ("Nba(range/bit-dyn)", 0, 0),
                 ("Nba(array)", 0, 0),
                 ("Nba(whole-sig, multi-writer)", 0, 0),
+                ("CallFreeFunction", 0, 0),
             ];
             let mut nonpure_blocks = 0usize;
             let mut nonpure_insns = 0usize;
@@ -6085,7 +6086,7 @@ impl Simulator {
                 }
                 nonpure_blocks += 1;
                 nonpure_insns += n;
-                let mut seen = [false; 7];
+                let mut seen = [false; 8];
                 for insn in &cb.instructions {
                     let c = match insn {
                         Insn::StmtFallback(..) => 0,
@@ -6106,6 +6107,7 @@ impl Simulator {
                         {
                             6
                         }
+                        Insn::CallFreeFunction(..) => 7,
                         _ => continue,
                     };
                     seen[c] = true;
@@ -6178,6 +6180,7 @@ impl Simulator {
                         Insn::StmtFallback(..)
                             | Insn::CovHit(..)
                             | Insn::EvalExprFallback(..)
+                            | Insn::CallFreeFunction(..)
                             | Insn::BlockingAssign(..)
                             | Insn::BlockingAssignRange(..)
                             | Insn::BlockingAssignRangeDyn(..)

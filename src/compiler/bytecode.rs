@@ -1074,6 +1074,17 @@ impl CompiledBlock {
     pub fn carries_sig_id(&self) -> bool {
         self.instructions.iter().any(|i| i.carries_sig_id())
     }
+
+    /// Whether part of the block runs on the interpreter (a statement or
+    /// expression fallback, a called function), whose reads and writes are
+    /// not in the bytecode.
+    pub fn interprets(&self) -> bool {
+        self.has_fallback
+            || self
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Insn::EvalExprFallback(..) | Insn::CallFreeFunction(..)))
+    }
 }
 
 impl Insn {
@@ -1676,6 +1687,9 @@ pub struct BytecodeCompiler<'a> {
     /// Inlining them (the VHDL kernel's `vh_next`) copies the whole body
     /// into the always, and that bytecode walk is the simulation.
     edge_delegate: bool,
+    /// Edge-block callees being inlined on trial (their size decides
+    /// whether they stay calls); not delegated again meanwhile.
+    edge_trial: Vec<String>,
     /// VM register holding the receiving object's heap handle (`this`).
     /// Seeded by the method-mode prologue before the body runs.
     method_this_reg: Option<RegId>,
@@ -2152,6 +2166,7 @@ impl<'a> BytecodeCompiler<'a> {
             local_var_regs: std::collections::HashMap::default(),
             method_mode: false,
             edge_delegate: false,
+            edge_trial: Vec::new(),
             method_this_reg: None,
             method_handle_names: std::collections::HashSet::default(),
             method_handle_local_types: HashMap::default(),
@@ -3261,6 +3276,7 @@ impl<'a> BytecodeCompiler<'a> {
             // integral formals: the call passes each actual as a sized
             // number.
             let mut edge_call = self.edge_delegate
+                && !self.edge_trial.contains(&name)
                 && input_only_scalar
                 && arity_le
                 && fd
@@ -3272,9 +3288,11 @@ impl<'a> BytecodeCompiler<'a> {
                 let start = self.insns.len();
                 let next = self.next_reg;
                 let reason = self.bail_reason;
-                self.edge_delegate = false;
+                // Inlined, its own calls are still judged one by one: a
+                // small helper keeps a large callee as a call.
+                self.edge_trial.push(name.clone());
                 let inlined = self.compile_pure_call(func, args);
-                self.edge_delegate = true;
+                self.edge_trial.pop();
                 if let Some(r) = inlined
                     && self.insns.len() - start <= EDGE_INLINE_MAX
                 {
@@ -6778,12 +6796,18 @@ impl<'a> BytecodeCompiler<'a> {
                         let scalar_ports = fd2.ports.iter().all(|p| p.dimensions.is_empty());
                         let arity_le = fd2.ports.len() >= args.len();
                         let args_ok = args.iter().all(|a| expr_ok(a, bound, me, ext));
-                        return input_only
-                            && args_ok
-                            // Delegation (CallFreeFunction) exists in method
-                            // mode only; module code keeps inlining pure
-                            // callees alone.
-                            && ((me.method_mode && scalar_ports && arity_le) || me.fn_is_pure(fd2));
+                        // Delegation (CallFreeFunction) exists in method
+                        // mode and in edge blocks (integral formals only,
+                        // as `compile_pure_call` admits); other module code
+                        // keeps inlining pure callees alone.
+                        let delegatable = scalar_ports
+                            && arity_le
+                            && (me.method_mode
+                                || (me.edge_delegate
+                                    && fd2.ports.iter().all(|p| {
+                                        BytecodeCompiler::edge_call_formal_ok(&p.data_type)
+                                    })));
+                        return input_only && args_ok && (delegatable || me.fn_is_pure(fd2));
                     }
                     // Not a declared function — a DPI IMPORT is still a
                     // legitimate callee: the interpreter executes it through
@@ -6877,8 +6901,9 @@ impl<'a> BytecodeCompiler<'a> {
                 // A void call in statement position (`uvm_report_error(...)`)
                 // is as pure as the expression walker says: an inlinable,
                 // delegatable (scalar-input) or DPI-import callee is a leaf.
-                // Method bodies only: module code inlines as before.
-                StatementKind::Expr(e) if me.method_mode => {
+                // Method bodies and edge blocks only: other module code
+                // inlines as before.
+                StatementKind::Expr(e) if me.method_mode || me.edge_delegate => {
                     let mut e = e;
                     while let ExprKind::Paren(inner) = &e.kind {
                         e = inner;
