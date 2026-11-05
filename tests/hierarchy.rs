@@ -375,3 +375,6 @@ mod static_memory_member_paths;
 mod issue721_callable_body_sharing;
 #[path = "hierarchy/issue721_prepared_process_ownership.rs"]
 mod issue721_prepared_process_ownership;
+
+#[path = "hierarchy/module_local_names.rs"]
+mod module_local_names;
