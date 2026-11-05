@@ -380,3 +380,6 @@ mod issue721_prepared_process_ownership;
 
 #[path = "hierarchy/module_local_names.rs"]
 mod module_local_names;
+
+#[path = "hierarchy/indexed_scope_cont_assign.rs"]
+mod indexed_scope_cont_assign;

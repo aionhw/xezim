@@ -5,6 +5,139 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// §23.6: fold a hierarchical reference that walks through an INDEXED
+    /// scope (`tb.gl[0].u.sig`) into the single hierarchical `Ident` spelling
+    /// flat signal names use.
+    ///
+    /// `rewrite_expr_impl` folds `a.b.c` into one `Ident` path, but only when
+    /// the rewritten base is itself an `Ident`: an `Index` base stays an
+    /// `Index` node (a select is not a scope segment for a plain leaf), so
+    /// `gl[0].u.sig` reaches the simulator as
+    /// `MemberAccess{ MemberAccess{ Index{ MemberAccess{ Ident } } } }`.
+    /// Every consumer of a continuous-assign TARGET names it from a single
+    /// `Ident` — `collect_lhs_writes`, the alias fan-out, `cont_driven` — so
+    /// that chain produced no write target at all: `wids` stayed empty and
+    /// the assignment silently drove nothing, with no diagnostic. A testbench
+    /// connecting an instance's INPUT PORT inside a for-generate
+    /// (`assign tb.gen_blk[0].u.port_in = drv.value;`) therefore left the DUT
+    /// input at `z` while the driver side ran normally.
+    ///
+    /// Name-guarded, like the member-access fold above: a packed-array
+    /// element (`a[2].b` of a 2-D vector) or any path with no stored signal
+    /// is left exactly as it was. A non-constant select cannot name a
+    /// generate scope (§27.5), so such a path is left alone too.
+    pub(super) fn fold_indexed_hier_path(&self, e: &Expression) -> Option<Expression> {
+        let flat = self.indexed_hier_flat_name(e)?;
+        Some(Self::flat_name_ident(flat, e.span))
+    }
+
+    /// An `Ident` whose single segment is already the fully-qualified stored
+    /// name (`u.a`, `g[0].u.a`, `s.member`). The shape the member-access fold
+    /// above and `fold_indexed_hier_path` both emit: `resolve_hier_name`
+    /// passes a one-segment, select-free path through unchanged, so a name
+    /// that has already been resolved survives the later resolution passes
+    /// (re-resolving a `[0]`-selecting path truncated it back to the leaf).
+    pub(super) fn flat_name_ident(flat: String, span: crate::ast::Span) -> Expression {
+        Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier { name: flat, span },
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+            }),
+            span,
+        )
+    }
+
+    /// The stored (`signal_name_to_id`) name a hierarchical path stands for
+    /// when that path enters a scope through an INDEX, or `None` for any
+    /// other shape.
+    pub(super) fn indexed_hier_flat_name(&self, e: &Expression) -> Option<String> {
+        // A plain `u.sig` already folds upstream, and a select on the LAST
+        // segment (`u.sig[2]`) is an ordinary leaf select that compiles
+        // today; only a scope ENTERED through a select needs this.
+        if !matches!(e.kind, ExprKind::MemberAccess { .. }) {
+            return None;
+        }
+        let mut path: Vec<crate::ast::expr::HierPathSegment> = Vec::new();
+        if !Self::fold_hier_path_segments(e, &mut path) || path.len() < 2 {
+            return None;
+        }
+        if !path[..path.len() - 1].iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        // The signal table stores top-level instance and signal names WITHOUT
+        // the top module's own name (`top.u.a` is keyed `u.a`); the read side
+        // strips it explicitly (`resolve_read_name`), the write side does not.
+        // Strip it here so the folded path names a stored signal.
+        if path.len() > 1
+            && !self.module.name.is_empty()
+            && path[0].selects.is_empty()
+            && path[0].name.name == self.module.name
+        {
+            path.remove(0);
+        }
+        let hier = crate::ast::expr::HierarchicalIdentifier {
+            root: None,
+            path,
+            span: e.span,
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+        };
+        let flat = Self::resolve_hier_name_static(&hier, &self.module);
+        self.signal_name_to_id.get(flat.as_str())?;
+        Some(flat)
+    }
+
+    /// Flatten `a`, `a.b`, `a[0].b`, `a[0].b[1]` into segments, pushing an
+    /// index onto the segment it selects. `false` for anything that is not a
+    /// pure path, a `$root`-qualified path, or a non-constant index.
+    pub(super) fn fold_hier_path_segments(
+        e: &Expression,
+        path: &mut Vec<crate::ast::expr::HierPathSegment>,
+    ) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.root.is_some() || h.path.is_empty() {
+                    return false;
+                }
+                path.extend(h.path.iter().cloned());
+                true
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                if !Self::fold_hier_path_segments(expr, path) {
+                    return false;
+                }
+                path.push(crate::ast::expr::HierPathSegment {
+                    name: member.clone(),
+                    selects: Vec::new(),
+                });
+                true
+            }
+            ExprKind::Index { expr, index } => {
+                // §27.5: only a constant index names a scope.
+                if !matches!(index.kind, ExprKind::Number(_)) {
+                    return false;
+                }
+                if !Self::fold_hier_path_segments(expr, path) {
+                    return false;
+                }
+                match path.last_mut() {
+                    Some(last) => {
+                        last.selects.push(index.as_ref().clone());
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn prepared_comb_cache_eligible(&self) -> bool {
         self.prepared_comb_cache_path.is_some()
             // Instrumented entries hold per-run counters.
@@ -402,6 +535,11 @@ impl Simulator {
                         span,
                     );
                 }
+            }
+            // §23.6: the same fold for a path that enters a scope through a
+            // SELECT (`tb.gl[0].u.sig`). See `fold_indexed_hier_path`.
+            if let Some(folded) = self.fold_indexed_hier_path(&ca.lhs) {
+                ca.lhs = folded;
             }
             let explicit_delay = ca.delay;
             // Captured before `ca.lhs` may be moved into the CombItem below.
