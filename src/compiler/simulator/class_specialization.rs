@@ -639,17 +639,18 @@ impl Simulator {
     }
 
     /// `(iface, modport)` of a specialization fragment spelling a virtual
-    /// interface type (`virtual bus_if`, `virtual I#(8).mp`, or the
-    /// `normalize_spec_ws` form `virtualbus_if`), else `None`.
+    /// interface type (`virtual bus_if`, `virtual I#(8).mp`), else `None`.
     fn vif_of_spec_frag(&self, frag: &str) -> Option<(String, Option<String>)> {
         let rest = frag.strip_prefix("virtual")?;
-        let spaced = rest.starts_with(char::is_whitespace);
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
         let rest = rest.trim();
         let end = rest
             .find(|c: char| c == '#' || c == '.' || c.is_whitespace())
             .unwrap_or(rest.len());
         let (name, tail) = rest.split_at(end);
-        if name.is_empty() || (!spaced && !self.module.interfaces.contains(name)) {
+        if name.is_empty() {
             return None;
         }
         let tail = match tail.rfind(')') {
@@ -1889,13 +1890,6 @@ impl Simulator {
         if let Some(leaf) = self.package_type_leaf(frag_norm) {
             return self.canonicalize_spec_frag(leaf);
         }
-        if let Some((name, args, modport)) = self.parse_vif_frag(frag_norm) {
-            let args = args
-                .iter()
-                .map(|a| self.canonicalize_spec_frag(a))
-                .collect();
-            return self.canonical_vif_frag(&name, args, modport);
-        }
         if let Some((inner_base, inner_sig)) = self.extract_spec_from_string(frag_norm) {
             let canon_inner_sig = self.canonicalize_spec_sig(&inner_base, &inner_sig);
             if !canon_inner_sig.is_empty() {
@@ -1917,6 +1911,14 @@ impl Simulator {
         } else if let Some(t) = self.typedef_alias_frag(frag_norm) {
             // §6.18: a typedef stands for its target type.
             self.canonicalize_spec_frag(&t)
+        } else if let Some((name, args, modport)) = self.parse_vif_frag(frag_norm) {
+            // §25.9/§6.22.1: one key per virtual-interface type however it is
+            // spelled (`interface` keyword, defaults written out).
+            let args = args
+                .iter()
+                .map(|a| self.canonicalize_spec_frag(a))
+                .collect();
+            self.canonical_vif_frag(&name, args, modport)
         } else if let Some(v) = self.fold_const_spec_frag(frag_norm, false) {
             // §8.25: a value argument matches by VALUE (`P#(2+2)` is `P#(4)`).
             v

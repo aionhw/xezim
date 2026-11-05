@@ -1246,9 +1246,9 @@ impl Simulator {
     }
 
     /// Split a virtual-interface type fragment — `virtual [interface]
-    /// I[#(args)][.modport]` in any spacing, including the whitespace-free
-    /// canonical form — into the interface name, its raw `#(...)` arguments
-    /// and the modport. None for anything else.
+    /// I[#(args)][.modport]` in any spacing, including the canonical form —
+    /// into the interface name, its raw `#(...)` arguments and the modport.
+    /// None for anything else, including a class named `virtualI`.
     pub(super) fn parse_vif_frag(
         &self,
         frag: &str,
@@ -1256,11 +1256,10 @@ impl Simulator {
         if self.module.interfaces.is_empty() {
             return None;
         }
-        // Bare `virtualplain_if` is the class; `virtual plain_if` / `virtualplain_if#()` are the interface.
-        if self.module.classes.contains_key(frag.trim()) {
+        let rest = frag.trim().strip_prefix("virtual")?;
+        if !rest.starts_with(char::is_whitespace) {
             return None;
         }
-        let rest = frag.trim().strip_prefix("virtual")?;
         let head_end = rest.find(['#', '.']).unwrap_or(rest.len());
         let head: String = rest[..head_end]
             .chars()
@@ -1310,7 +1309,7 @@ impl Simulator {
         Some((name, args, modport))
     }
 
-    /// The canonical (whitespace-free) key of `virtual name#(args).modport`
+    /// The canonical (`normalize_spec_ws`) key of `virtual name#(args).modport`
     /// (§6.22.1): named arguments moved to their slots and omitted trailing
     /// parameters filled with the interface's defaults, so `virtual I`,
     /// `virtual interface I#(int)` and `virtual I#(.T(int), .N(4))` key one
@@ -1346,7 +1345,7 @@ impl Simulator {
                 args.push(d);
             }
         }
-        let mut out = format!("virtual{name}{}", if args.is_empty() && modport.is_none() && self.module.classes.contains_key(&format!("virtual{name}")) { "#()" } else { "" });
+        let mut out = format!("virtual {}", name);
         if !args.is_empty() {
             out.push_str("#(");
             out.push_str(&args.join(","));
@@ -1756,7 +1755,11 @@ impl Simulator {
                             .next()
                             .is_none_or(|c| !c.is_alphanumeric() && c != '_')
                     });
-                if integral && signing {
+                // §25.9: `virtual bus_if` is an interface type, while
+                // `virtualbus_if` can name an unrelated class.
+                let vif = word == "virtual"
+                    && tail.starts_with(|c: char| c.is_alphabetic() || c == '_');
+                if (integral && signing) || vif {
                     out.push(' ');
                 }
             } else {
@@ -2881,7 +2884,7 @@ impl Simulator {
         for tp_name in class_def.type_param_names.iter() {
             let mut bound: Option<String> = None;
             if let Some(ta) = arg_map.get(tp_name) {
-                if let Some(concrete) = match &ta.kind { ExprKind::TypeLiteral(dt) => match &**dt { crate::ast::types::DataType::Interface { name, modport, type_args, .. } => Some(self.canonical_vif_frag(&name.name, type_args.iter().filter_map(|e| self.expr_to_spec_fragment(e)).collect(), modport.as_ref().map(|m| m.name.clone()))), _ => Self::leaf_ident_name(ta) }, _ => Self::leaf_ident_name(ta) } {
+                if let Some(concrete) = Self::leaf_ident_name(ta) {
                     // The type arg may itself be a type PARAMETER of the enclosing
                     // parameterized context (`uvm_resource#(T)` where `T` is
                     // config_db's own param) — resolve it to the concrete type so

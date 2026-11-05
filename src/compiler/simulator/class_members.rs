@@ -3082,7 +3082,12 @@ impl Simulator {
             .unwrap_or(false)
     }
 
-    /// Class base name; `base<sig>` keeps `sig` when it contains `#(...)` inside.
+    /// Base name of a class, dropping one specialization.
+    ///
+    /// Entries made for a virtual-interface type argument are `base<sig>`
+    /// and `sig` may itself contain `#(...)`
+    /// (`uvm_resource<virtual mon_if#(32)>`). A split on `#` stops inside
+    /// that signature and the hierarchy walk no longer sees `base`.
     fn class_key_base(s: &str) -> &str {
         if let Some(i) = s.find('<') {
             if s.ends_with('>') && i > 0 {
@@ -3774,7 +3779,7 @@ impl Simulator {
             let sval_resolved = self
                 .typedef_alias_frag(sval)
                 .unwrap_or_else(|| sval.to_string());
-            // `virtual mon_if` and `virtualmon_if#(32)` are one type when
+            // `virtual mon_if` and `virtual mon_if#(32)` are one type when
             // 32 is the interface's default parameter (IEEE 1800-2017
             // §25.9). Compare the canonical spelling the specialization entry
             // records.
