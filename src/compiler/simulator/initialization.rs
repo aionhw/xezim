@@ -4991,26 +4991,34 @@ impl Simulator {
         // Seeding. The default is SvRng::DEFAULT_SEED — a run is reproducible
         // unless it asks not to be, so a failing random test can be re-run
         // bit-for-bit. `+seed=<n>` selects another stream; `+seed=random` draws
-        // one from system entropy and PRINTS it, since a seed you cannot see is
-        // a run you cannot replay.
+        // one from system entropy. The last seed given is the run's, and it is
+        // printed on stdout, so the output and the `-l` log name it: a seed
+        // you cannot see is a run you cannot replay.
+        let mut chosen: Option<(u64, bool)> = None;
         for a in &self.plusargs {
             if let Some(v) = a.strip_prefix("seed=").or_else(|| a.strip_prefix("+seed=")) {
                 let v = v.trim();
                 if v.eq_ignore_ascii_case("random") {
                     use rand::Rng;
                     let seed = rand::rngs::StdRng::from_entropy().r#gen::<u64>();
-                    eprintln!("[xezim] random seed: {} (replay with +seed={})", seed, seed);
-                    self.rng = SvRng::from_seed(seed);
-                    self.run_seed = Some(seed);
+                    chosen = Some((seed, true));
                 } else if let Ok(seed) = v.parse::<u64>() {
-                    self.rng = SvRng::from_seed(seed);
-                    self.run_seed = Some(seed);
+                    chosen = Some((seed, false));
                 } else {
                     eprintln!(
                         "[xezim][warning] ignoring malformed +seed={} (want an integer or 'random')",
                         v
                     );
                 }
+            }
+        }
+        if let Some((seed, random)) = chosen {
+            self.rng = SvRng::from_seed(seed);
+            self.run_seed = Some(seed);
+            if random {
+                println!("[xezim] random seed: {} (replay with +seed={})", seed, seed);
+            } else {
+                println!("[xezim] seed: {}", seed);
             }
         }
     }

@@ -86,6 +86,20 @@ pub(crate) fn resolve_sv_libs(cx: &CompatArgs) -> Vec<String> {
         .collect()
 }
 
+/// `-sv_seed`, `-svseed` or `-seed` at `t`: the flag, and the value glued on
+/// with `=` (None when the value is the next token).
+fn seed_flag(t: &str) -> Option<(&'static str, Option<&str>)> {
+    ["-sv_seed", "-svseed", "-seed"]
+        .into_iter()
+        .find_map(|flag| {
+            let rest = t.strip_prefix(flag)?;
+            match rest.strip_prefix('=') {
+                Some(v) => Some((flag, Some(v))),
+                None => rest.is_empty().then_some((flag, None)),
+            }
+        })
+}
+
 /// One of the spellings above at `toks[i]`: apply it and return how many
 /// tokens it used, or 0 when `toks[i]` is not one of them.
 pub(crate) fn handle_flag(
@@ -100,6 +114,22 @@ pub(crate) fn handle_flag(
             .cloned()
             .ok_or_else(|| format!("{} requires an argument", t))
     };
+    // The seed spellings, `<flag> <n>` or `<flag>=<n>`. Here, ahead of the
+    // glued `-s<top>`, in both parsers.
+    if let Some((flag, glued)) = seed_flag(t) {
+        let (seed, used) = match glued {
+            Some(v) => (v.to_string(), 1),
+            None => (value()?, 2),
+        };
+        if !seed.eq_ignore_ascii_case("random") && seed.parse::<u64>().is_err() {
+            return Err(format!(
+                "{} wants a non-negative integer or 'random', got '{}'",
+                flag, seed
+            ));
+        }
+        plusargs.push(format!("+seed={}", seed));
+        return Ok(used);
+    }
     match t {
         // SystemVerilog is always on, every file already shares one
         // compilation unit (macros and `$unit` declarations carry across
@@ -180,17 +210,6 @@ pub(crate) fn handle_flag(
                  declared in the design",
                 res
             );
-            Ok(2)
-        }
-        "-sv_seed" => {
-            let seed = value()?;
-            if !seed.eq_ignore_ascii_case("random") && seed.parse::<u64>().is_err() {
-                return Err(format!(
-                    "-sv_seed wants a non-negative integer or 'random', got '{}'",
-                    seed
-                ));
-            }
-            plusargs.push(format!("+seed={}", seed));
             Ok(2)
         }
         "-sv_root" => {

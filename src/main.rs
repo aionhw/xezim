@@ -413,7 +413,8 @@ fn print_usage() {
     );
     eprintln!("                   (instance values still win); -g/<top>/NAME=VAL: one module only");
     eprintln!("  -GNAME=VAL       Same, and it also replaces instance and defparam values");
-    eprintln!("  -sv_seed <n|random>  Same as +seed=<n|random>");
+    eprintln!("  -sv_seed <n|random>  Same as +seed=<n|random>; also -svseed, -seed and the");
+    eprintln!("                   =<n> forms (-sv_seed=5), on the command line or in -f files");
     eprintln!("  -sv_lib <name>, -sv_root <dir>  DPI library <dir>/<name>.so (see --dpi-lib)");
     eprintln!("  -logfile <file>  Same as -l (redirects; the terminal gets nothing)");
     eprintln!("  -c               With no file after it: accepted (batch mode is the only mode)");
@@ -1170,21 +1171,6 @@ fn process_command_file(
                         }
                     }
                 },
-                // commercial-simulator-compatible seed aliases: `-svseed <n>` / `-svseed=<n>`
-                // (and `-seed` likewise) lower onto the `+seed=` plusarg the
-                // simulator already consumes.
-                "-svseed" | "-seed" => {
-                    if i + 1 < toks.len() {
-                        i += 1;
-                        plusargs.push(format!("+seed={}", toks[i]));
-                    }
-                }
-                _ if t.starts_with("-svseed=") => {
-                    plusargs.push(format!("+seed={}", &t["-svseed=".len()..]));
-                }
-                _ if t.starts_with("-seed=") => {
-                    plusargs.push(format!("+seed={}", &t["-seed=".len()..]));
-                }
                 _ if t.starts_with("-s") && t.len() > 2 => {
                     top_modules.push(t[2..].to_string());
                 }
@@ -3061,19 +3047,6 @@ fn run_main() -> i32 {
             }
             _ if arg.starts_with("--timescale=") => {
                 module_timescale_args.push(arg["--timescale=".len()..].to_string());
-            }
-            // commercial-simulator-compatible seed aliases (undocumented): lower onto `+seed=`.
-            "-svseed" | "-seed" => {
-                i += 1;
-                if i < args.len() {
-                    plusargs.push(format!("+seed={}", args[i]));
-                }
-            }
-            _ if arg.starts_with("-svseed=") => {
-                plusargs.push(format!("+seed={}", &arg["-svseed=".len()..]));
-            }
-            _ if arg.starts_with("-seed=") => {
-                plusargs.push(format!("+seed={}", &arg["-seed=".len()..]));
             }
             _ if arg.starts_with('-') => {
                 eprintln!("Warning: unknown flag '{}' (ignored)", arg);
