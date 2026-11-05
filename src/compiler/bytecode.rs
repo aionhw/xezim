@@ -22,6 +22,22 @@ const MAX_INLINE_DEPTH: usize = 8;
 /// callee touches module state; a larger one stays a `CallFreeFunction`.
 const EDGE_INLINE_MAX: usize = 1024;
 
+/// VHDL kernel functions the cycle always calls (`vh_update`, `vh_sensN`,
+/// `vh_runN`, `vh_next`). An edge block must not inline these: each one is
+/// its own compiled block, reached by `CallFreeFunction`. Inlining up to
+/// `EDGE_INLINE_MAX` pastes the process bodies back into `always @(vh_tick)`
+/// (aionhw/xezim-core#155).
+pub(crate) fn vhdl_kernel_cycle_fn(name: &str) -> bool {
+    let leaf = name.rsplit('.').next().unwrap_or(name);
+    if leaf == "vh_update" || leaf == "vh_next" {
+        return true;
+    }
+    let rest = leaf
+        .strip_prefix("vh_run")
+        .or_else(|| leaf.strip_prefix("vh_sens"));
+    rest.is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Sentinel for a method receiver whose declared class could not be resolved
 /// (a handle local/formal with no carried declared type). `emit_arg_slot_writeback`
 /// treats UNTYPED receivers with the conservative name-global writeback rule.
@@ -3486,6 +3502,21 @@ impl<'a> BytecodeCompiler<'a> {
                 (fd, false)
             }
         };
+        // VHDL kernel cycle functions are their own blocks. Falling through
+        // here inlines a body under EDGE_INLINE_MAX and rebuilds the
+        // vh_tick block (aionhw/xezim-core#155).
+        if self.edge_delegate && !scalarized && vhdl_kernel_cycle_fn(&name) && fd.ports.is_empty()
+        {
+            let dest = self.alloc_reg();
+            let arg_start = self.alloc_reg();
+            self.emit(Insn::CallFreeFunction(
+                dest,
+                Box::new(Name(name.into_boxed_str())),
+                arg_start,
+                0,
+            ));
+            return Some(dest);
+        }
         // §13.5.4 named actuals (`.re(expr)`) normalize to positional order
         // (with §13.5.3 defaults filled) so every path below — delegation and
         // inline — sees a plain positional actual list.
@@ -3545,20 +3576,24 @@ impl<'a> BytecodeCompiler<'a> {
             // state and whose inlined code would be large stays a call: the
             // VHDL kernel's next-time scan, pasted into `always @(vh_tick)`,
             // made the block tens of thousands of instructions. A small one
-            // is inlined as before (cheaper, and compiled further). Only
-            // integral formals: the call passes each actual as a sized
-            // number.
-            let mut edge_call = self.edge_delegate
-                && !scalarized
-                && !self.edge_trial.contains(&name)
-                && input_only_scalar
-                && arity_le
-                && fd
-                    .ports
-                    .iter()
-                    .all(|p| self.edge_call_formal_ok(&p.data_type, Some(&name)))
-                && !self.fn_is_pure_in(&fd, name.rsplit_once('.').map(|(p, _)| p));
-            if edge_call {
+            // is inlined as before (cheaper, and compiled further). The
+            // kernel cycle functions are the exception: they stay calls at
+            // any size, and the compiled-method tier runs each as its own
+            // block. Only integral formals: the call passes each actual as a
+            // sized number.
+            let kernel_cycle = self.edge_delegate && !scalarized && vhdl_kernel_cycle_fn(&name);
+            let mut edge_call = kernel_cycle
+                || (self.edge_delegate
+                    && !scalarized
+                    && !self.edge_trial.contains(&name)
+                    && input_only_scalar
+                    && arity_le
+                    && fd
+                        .ports
+                        .iter()
+                        .all(|p| self.edge_call_formal_ok(&p.data_type, Some(&name)))
+                    && !self.fn_is_pure_in(&fd, name.rsplit_once('.').map(|(p, _)| p)));
+            if edge_call && !kernel_cycle {
                 let start = self.insns.len();
                 let next = self.next_reg;
                 let reason = self.bail_reason;
@@ -4152,6 +4187,14 @@ impl<'a> BytecodeCompiler<'a> {
             return false;
         }
         if self.inlining_stack.iter().any(|n| n == task_name) {
+            return false;
+        }
+        // A void VHDL kernel function (`vh_update`, `vh_runN`) is a task
+        // enable in statement position, so this runs before
+        // `compile_pure_call`. Inlining it pastes the body back into
+        // `vh_tick`. Leave the call for `CallFreeFunction`
+        // (aionhw/xezim-core#155).
+        if self.edge_delegate && vhdl_kernel_cycle_fn(task_name) {
             return false;
         }
         // §13.4.1: a VOID function called as a statement is a task enable in
@@ -14780,8 +14823,17 @@ impl<'a> BytecodeCompiler<'a> {
                             && !self.method_handle_names.contains(bare)
                             && !self.string_formal_names.contains(bare)
                         {
-                            self.bail("free_fn_pkg_variable");
-                            return None;
+                            // A module-scope function's bare name is a module
+                            // signal (`vh_runN` reading `vh_s14`). Package
+                            // functions stay declined: a package variable can
+                            // share a signal-table name, and reading that
+                            // slot returned garbage (uvm_complete_test).
+                            let module_signal = self.method_class.as_deref() == Some("__free_fn__")
+                                && self.lookup_signal_id(hier).is_some();
+                            if !module_signal {
+                                self.bail("free_fn_pkg_variable");
+                                return None;
+                            }
                         }
                     }
                 }

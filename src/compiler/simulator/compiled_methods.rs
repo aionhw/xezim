@@ -1524,7 +1524,12 @@ impl Simulator {
                 .compiled_method_has_loop
                 .entry((cid, mid, spec_id))
                 .or_insert_with(|| Self::stmts_have_loop(body));
-        if tier > 0 && !loop_hot && !has_loop {
+        // The VHDL kernel cycle functions are called once per simulation
+        // cycle from the edge block. The 1000-call tier would leave every
+        // one of them on the interpreter for a whole short run, which is
+        // the block #155 moved out of `vh_tick`. Compile on the first call.
+        let kernel_cycle = super::bytecode::vhdl_kernel_cycle_fn(method_name);
+        if tier > 0 && !loop_hot && !has_loop && !kernel_cycle {
             let calls = self
                 .compiled_method_call_counts
                 .entry((cid, mid, spec_id))

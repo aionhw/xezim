@@ -150,3 +150,82 @@ endmodule
     );
     assert_eq!(lines(&src), vec!["x=2"]);
 }
+
+/// The VHDL cycle names (`vh_update`, `vh_sensN`, `vh_runN`, `vh_next`) stay
+/// calls in an edge block. The same `vh_run0` body under another name is
+/// inlined (209 instructions here); inlining it back into `always @(vh_tick)`
+/// is aionhw/xezim-core#155.
+#[test]
+fn vhdl_kernel_cycle_calls_stay_out_of_the_edge_block() {
+    let body: String = (0..40)
+        .map(|k| format!("    if (n == 32'd{k}) n = n;\n"))
+        .collect();
+    let src = format!(
+        r#"
+module top;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  int n = 0;
+  int vh_nxt = 0;
+  function automatic void vh_update();
+    n = n;
+  endfunction
+  function automatic bit vh_sens0();
+    return 1'b1;
+  endfunction
+  function automatic void vh_run0();
+{body}    n = n + 1;
+  endfunction
+  function automatic int vh_next();
+    return n;
+  endfunction
+  always @(posedge clk) begin
+    vh_update();
+    if (vh_sens0()) vh_run0();
+    vh_nxt = vh_next();
+  end
+  initial begin
+    repeat (3) @(posedge clk);
+    #1 $display("T|n=%0d nxt=%0d", n, vh_nxt);
+    $finish;
+  end
+endmodule
+"#
+    );
+    let dir = std::env::temp_dir().join(format!("xezim_vh_cycle_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temporary directory");
+    let path = dir.join("design.sv");
+    std::fs::write(&path, src).expect("write design");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args([
+            "--simulate",
+            "-s",
+            "top",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
+        .env("XEZIM_PROFILE_REPORT", "1")
+        .output()
+        .expect("run xezim");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "simulation failed:\n{text}");
+    let shown: Vec<&str> = text.lines().filter(|l| l.starts_with("T|")).collect();
+    assert_eq!(shown, ["T|n=3 nxt=3"]);
+    let len = text.lines().find_map(|l| {
+        let rest = l.strip_prefix("[EDGE_STATS]   block=")?;
+        if !rest.contains("sens=clk") {
+            return None;
+        }
+        rest.split_whitespace()
+            .find_map(|w| w.strip_prefix("len="))
+            .and_then(|n| n.parse::<u64>().ok())
+    });
+    let len = len.unwrap_or_else(|| panic!("missing clk edge block:\n{text}"));
+    assert!(
+        len < 32,
+        "vh_run0 was inlined into the edge block (len={len})"
+    );
+}
