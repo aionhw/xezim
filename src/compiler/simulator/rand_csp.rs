@@ -5158,7 +5158,8 @@ impl Simulator {
                 _ => false,
             },
             ExprKind::Unary {
-                op: UnaryOp::LogNot, ..
+                op: UnaryOp::LogNot,
+                ..
             } => true,
             ExprKind::Inside { .. } => true,
             _ => false,

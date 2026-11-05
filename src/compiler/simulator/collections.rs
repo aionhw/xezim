@@ -4648,6 +4648,14 @@ impl Simulator {
                     // std::randomize(vars) with {...}
                     if let ExprKind::Ident(h) = &expr.kind {
                         if h.path.len() == 1 && h.path[0].name.name == "std" {
+                            // §11.4.5: a one-bit `&` / `|` is the logical form
+                            // here too (see `one_bit_logic_item`).
+                            let mut one_bit = constraints.to_vec();
+                            let changed = one_bit
+                                .iter_mut()
+                                .fold(false, |c, it| self.one_bit_logic_item(None, it) | c);
+                            let constraints: &[crate::ast::decl::ConstraintItem] =
+                                if changed { &one_bit } else { constraints };
                             // §18.12 / §18.11.1: `std::randomize()` with an EMPTY
                             // variable list solves nothing — every name in the
                             // `with` block is a state variable, so the call is a

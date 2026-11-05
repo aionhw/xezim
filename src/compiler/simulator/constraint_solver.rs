@@ -103,6 +103,190 @@ impl Simulator {
         cur
     }
 
+    /// §11.4.5: on one-bit operands `a & b` has the value of `a && b`, and
+    /// `a | b` of `a || b`, X and Z included. Every pass of the solve (the
+    /// forced pass, the domain pass, the CSP and the exact satisfaction check)
+    /// splits the logical forms into their operands, so the bitwise forms are
+    /// rewritten into them, in the item's boolean positions, before any pass
+    /// reads the item. Left bitwise, `s == A & (d ^ 'hf) == 0` reached only
+    /// the CSP, which samples `d`, and `randomize()` returned 0 (#899).
+    pub(super) fn one_bit_logic_item(
+        &mut self,
+        handle: Option<usize>,
+        item: &mut ConstraintItem,
+    ) -> bool {
+        match item {
+            ConstraintItem::Expr(e) => self.one_bit_logic_expr(handle, e),
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } => {
+                let c = self.one_bit_logic_expr(handle, condition);
+                self.one_bit_logic_item(handle, constraint) | c
+            }
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                let mut c = self.one_bit_logic_expr(handle, condition);
+                c |= self.one_bit_logic_item(handle, then_item);
+                if let Some(e) = else_item {
+                    c |= self.one_bit_logic_item(handle, e);
+                }
+                c
+            }
+            ConstraintItem::Foreach { item, .. } | ConstraintItem::Soft(item) => {
+                self.one_bit_logic_item(handle, item)
+            }
+            ConstraintItem::Block(items) => items
+                .iter_mut()
+                .fold(false, |c, i| self.one_bit_logic_item(handle, i) | c),
+            _ => false,
+        }
+    }
+
+    /// `one_bit_logic_item` for an expression in a boolean position; true
+    /// when it rewrote something.
+    fn one_bit_logic_expr(&mut self, handle: Option<usize>, e: &mut Expression) -> bool {
+        let one_bit = match &e.kind {
+            ExprKind::Binary {
+                op: BinaryOp::BitAnd | BinaryOp::BitOr,
+                left,
+                right,
+            } => self.constraint_one_bit(handle, left) && self.constraint_one_bit(handle, right),
+            _ => false,
+        };
+        match &mut e.kind {
+            ExprKind::Paren(inner) => self.one_bit_logic_expr(handle, inner),
+            ExprKind::Unary {
+                op: UnaryOp::LogNot,
+                operand,
+            } => self.one_bit_logic_expr(handle, operand),
+            ExprKind::Binary { op, left, right } => {
+                if one_bit {
+                    *op = if *op == BinaryOp::BitAnd {
+                        BinaryOp::LogAnd
+                    } else {
+                        BinaryOp::LogOr
+                    };
+                }
+                if matches!(
+                    op,
+                    BinaryOp::LogAnd | BinaryOp::LogOr | BinaryOp::LogImplies | BinaryOp::LogEquiv
+                ) {
+                    let l = self.one_bit_logic_expr(handle, left);
+                    self.one_bit_logic_expr(handle, right) | l | one_bit
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// True when the constraint operand `e` of the object `handle` (none for
+    /// `std::randomize`) is one bit wide: a comparison, an `inside`, a
+    /// logical or reduction operator, a bitwise operator over one-bit
+    /// operands, or a name or select whose declared width is one bit
+    /// (`rand bit b`, `data[0]`).
+    pub(super) fn constraint_one_bit(&mut self, handle: Option<usize>, e: &Expression) -> bool {
+        let e = Self::unparen(e);
+        match &e.kind {
+            ExprKind::Binary { op, left, right } => match op {
+                BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::CaseEq
+                | BinaryOp::CaseNeq
+                | BinaryOp::WildcardEq
+                | BinaryOp::WildcardNeq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+                | BinaryOp::LogAnd
+                | BinaryOp::LogOr
+                | BinaryOp::LogImplies
+                | BinaryOp::LogEquiv => true,
+                BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::BitXnor => {
+                    self.constraint_one_bit(handle, left) && self.constraint_one_bit(handle, right)
+                }
+                _ => false,
+            },
+            ExprKind::Unary { op, .. } => matches!(
+                op,
+                UnaryOp::LogNot
+                    | UnaryOp::BitAnd
+                    | UnaryOp::BitNand
+                    | UnaryOp::BitOr
+                    | UnaryOp::BitNor
+                    | UnaryOp::BitXor
+                    | UnaryOp::BitXnor
+            ),
+            ExprKind::Inside { .. } => true,
+            // A one-segment name is the object's property when it has one
+            // (§18.7); a select or member is sized from its declaration.
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                match handle.and_then(|o| self.class_prop_width_of(o, &h.path[0].name.name)) {
+                    Some(w) => w == 1,
+                    None => self.lrm_self_width(e) == Some(1),
+                }
+            }
+            ExprKind::Index { expr: base, .. } => match (handle, Self::bare_name(base)) {
+                (Some(o), Some(p)) if self.class_prop_width_of(o, p).is_some() => {
+                    self.class_prop_bit_select(o, p)
+                }
+                _ => !Self::expr_contains_call(e) && self.lrm_self_width(e) == Some(1),
+            },
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                !Self::expr_contains_call(e) && self.lrm_self_width(e) == Some(1)
+            }
+            _ => false,
+        }
+    }
+
+    /// The name a one-segment, select-free identifier spells.
+    fn bare_name(e: &Expression) -> Option<&str> {
+        match &Self::unparen(e).kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                Some(h.path[0].name.name.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `prop[i]` of the object `handle` is a bit select: `prop` is an
+    /// integral vector with at most one packed dimension, not a collection
+    /// (whose index picks an element), a string (a byte) or a `real`.
+    fn class_prop_bit_select(&self, handle: usize, prop: &str) -> bool {
+        let Some(Some(inst)) = self.heap.get(handle) else {
+            return false;
+        };
+        let mut cur = Some(inst.class_name.as_str());
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                return false;
+            };
+            if let Some(sig) = cd.properties.get(prop) {
+                return !sig.is_real
+                    && !cd.array_properties.contains_key(prop)
+                    && !cd.array_nd_properties.contains_key(prop)
+                    && !cd.queue_properties.contains_key(prop)
+                    && !cd.assoc_properties.contains_key(prop)
+                    && !cd.string_properties.contains(prop)
+                    && self.class_prop_packed_dims(handle, prop).is_none();
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
     pub(super) fn consequent_domains_expr(
         &mut self,
         e: &Expression,
@@ -813,6 +997,21 @@ impl Simulator {
             constraint_src_files.push(None);
             constraint_depth.push(0);
         }
+
+        // §11.4.5: a one-bit `&` / `|` is the logical form (see
+        // `one_bit_logic_item`). The passes below also walk `inline` on its
+        // own, so it is rewritten the same way.
+        let mut inline_one_bit: Option<Vec<ConstraintItem>> = None;
+        for con in &mut constraints {
+            let mut changed = false;
+            for it in &mut con.items {
+                changed |= self.one_bit_logic_item(Some(handle), it);
+            }
+            if changed && con.name.name == "__inline__" {
+                inline_one_bit = Some(con.items.clone());
+            }
+        }
+        let inline: &[ConstraintItem] = inline_one_bit.as_deref().unwrap_or(inline);
 
         // §18.5.5: expand the array SLICE of a `unique {…}` list into the
         // element-wise inequalities it denotes.
