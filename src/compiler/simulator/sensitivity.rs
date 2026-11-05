@@ -2620,6 +2620,31 @@ impl Simulator {
                         }
                         None => ee,
                     };
+                    // §23.6/§27.5: the same normalisation for a path that
+                    // enters a scope through an INDEXED one
+                    // (`always @(posedge gen_blk[0].u.sig)`).
+                    // `rewrite_expr_impl` leaves such a path as
+                    // `MemberAccess{MemberAccess{Index{MemberAccess{Ident}}}}`;
+                    // neither `collect_ident_names` (no `MemberAccess` arm) nor
+                    // `member_chain_as_flat_ident_for_sens` (bails on the
+                    // `Index` base) collects an `Ident` from it, so the block
+                    // armed on an EMPTY sensitivity, woke once at t=0 through
+                    // the no-signal fallback, and never fired again — every
+                    // flop inside a generate-array instance whose clock the
+                    // parent substitutes as a hierarchical name was dead.
+                    let ee_idx;
+                    let ee = match self.indexed_hier_flat_name(&ee.expr) {
+                        Some(flat) => {
+                            ee_idx = crate::ast::stmt::EventExpr {
+                                edge: ee.edge,
+                                expr: Self::flat_name_ident(flat, ee.expr.span),
+                                iff: ee.iff.clone(),
+                                span: ee.span,
+                            };
+                            &ee_idx
+                        }
+                        None => ee,
+                    };
                     let edge = match ee.edge {
                         Some(Edge::Posedge) => EdgeKind::Posedge,
                         Some(Edge::Negedge) => EdgeKind::Negedge,
