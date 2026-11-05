@@ -402,3 +402,6 @@ mod time0_port_edge;
 
 #[path = "hierarchy/child_constant_checks_893.rs"]
 mod child_constant_checks_893;
+
+#[path = "hierarchy/generate_rename_scope.rs"]
+mod generate_rename_scope;
