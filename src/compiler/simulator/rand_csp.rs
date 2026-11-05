@@ -999,13 +999,14 @@ impl Simulator {
                 array_enums,
                 &sized,
             ) {
-                Ok(sizes) => {
+                Ok((sizes, csp, st)) => {
                     let sizes: Vec<(RandColl, u64)> =
                         sizes.into_iter().map(|(c, n)| (c.clone(), n)).collect();
-                    for (c, n) in sizes {
+                    for (c, n) in &sizes {
+                        let n = *n;
                         if c.row_tail.is_some() {
                             // Its elements are rows, not values.
-                            self.resize_row_owner(&c, n);
+                            self.resize_row_owner(c, n);
                             self.module.dynamic_arrays.insert(c.scoped.clone());
                             continue;
                         }
@@ -1024,6 +1025,53 @@ impl Simulator {
                                 self.write_coll_elem(&key, v);
                             }
                         }
+                    }
+
+                    // Factorized solve: the size phase already found a valid
+                    // assignment for all scalar properties and array sizes.
+                    // Write back the scalars and solve the element constraints
+                    // directly per-element.
+                    let nvars = csp.vars.len();
+                    for v in 0..nvars {
+                        if csp.wide.contains(&v) {
+                            continue;
+                        }
+                        let x = st.fixed(v).unwrap_or(0);
+                        self.csp_write(&csp, v, x);
+                    }
+                    if csp.draw_free {
+                        self.csp_draw_free(&csp);
+                    }
+
+                    let mut rand_set = HashSet::default();
+                    for (n, _) in rand_props {
+                        rand_set.insert(n.clone());
+                    }
+                    for c in &cur {
+                        rand_set.insert(c.prop.clone());
+                    }
+                    fn item_has_foreach(item: &ConstraintItem) -> bool {
+                        match item {
+                            ConstraintItem::Foreach { .. } => true,
+                            ConstraintItem::Block(items) => items.iter().any(item_has_foreach),
+                            ConstraintItem::Soft(inner) => item_has_foreach(inner),
+                            _ => false,
+                        }
+                    }
+                    for con in constraints {
+                        for item in &con.items {
+                            if item_has_foreach(item) {
+                                self.solve_forced(handle, item, &rand_set);
+                            }
+                        }
+                    }
+
+                    let mut fe_failed = false;
+                    if csp.soft_priority.is_empty()
+                        && array_enums.is_empty()
+                        && self.rand_items_accept(handle, constraints, &cur, &mut fe_failed)
+                    {
+                        return CspOutcome::Sat;
                     }
                 }
                 // A relaxation of the problem has no solution: neither has
@@ -1270,7 +1318,7 @@ impl Simulator {
         colls: &'c [RandColl],
         array_enums: &HashMap<String, String>,
         sized: &HashSet<String>,
-    ) -> Result<Vec<(&'c RandColl, u64)>, CspOutcome> {
+    ) -> Result<(Vec<(&'c RandColl, u64)>, Csp, St), CspOutcome> {
         let unread = Self::csp_unread(constraints, rand_props, colls);
         let mut csp = self
             .csp_vars(
@@ -1311,7 +1359,7 @@ impl Simulator {
                 out.push((c, n.max(0) as u64));
             }
         }
-        Ok(out)
+        Ok((out, csp, st))
     }
 
     /// §18.4: the rand variables wider than 64 bits that no constraint

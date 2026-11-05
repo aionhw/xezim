@@ -2442,6 +2442,11 @@ impl Simulator {
                     if self.exact_cmp(&BinaryOp::Eq, left, right) == Some(true) {
                         return false;
                     }
+                    for arr in rand_set {
+                        if let Some(changed) = self.solve_forced_array_elem_member(handle, item, arr, "*") {
+                            return changed;
+                        }
+                    }
                     if let Some(v) = self.rand_lvalue_name(left, rand_set) {
                         if self.rand_lvalue_name(right, rand_set).is_none() {
                             // §18.5: do not force a rand scalar from a rand
@@ -2932,6 +2937,7 @@ impl Simulator {
                 let Some((dims, elem_w)) = self
                     .fixed_foreach_dims(handle, &arr_name)
                     .or_else(|| self.packed_prop_foreach_dims(handle, &arr_name))
+                    .or_else(|| self.dynamic_prop_foreach_dims(handle, &arr_name))
                 else {
                     // §18.5.8.1: a loop over a state vector (`bit [0:3]
                     // it;`) only supplies indices: solve the body once per
@@ -3638,12 +3644,26 @@ impl Simulator {
         // member chain, ranges) — or equality bound.
         enum Op {
             Inside(Vec<ConstraintRange>),
+            Dist(Vec<ConstraintRange>, Vec<Option<crate::ast::decl::DistWeight>>),
             Eq(Expression),
         }
         let (target, op) = match item {
             ConstraintItem::Inside {
-                expr: inner, range, ..
-            } => (Box::new((*inner).clone()), Op::Inside(range.clone())),
+                expr: inner,
+                range,
+                is_dist,
+                dist_weights,
+                ..
+            } => {
+                if *is_dist && !dist_weights.is_empty() {
+                    (
+                        Box::new((*inner).clone()),
+                        Op::Dist(range.clone(), dist_weights.clone()),
+                    )
+                } else {
+                    (Box::new((*inner).clone()), Op::Inside(range.clone()))
+                }
+            }
             ConstraintItem::Expr(e) => match &e.kind {
                 ExprKind::Inside {
                     expr: inner,
@@ -3681,26 +3701,46 @@ impl Simulator {
             _ => return None,
         };
         let (idxs, names, elem_expr) = split(self, &target, arr_name)?;
-        if idxs != idx {
+        if !idx.is_empty() && idx != "*" && idxs != idx {
             return None; // not this element's turn — another index handles it
         }
         // Resolve the whole struct element type + member bit layout. Must use
         // the same width source as the member READ path (packed_agg_layout), so
         // the splice lands on the bits that member-selections observe.
-        let su = self.packed_struct_elem_type(&elem_expr)?;
-        if Self::spreads_member_wise(&su) {
-            return None;
-        }
-        let (fields, _total) = self.packed_agg_layout(&su);
         let (off, w) = {
-            let f = fields.iter().find(|(m, _, _)| m == &names[0])?;
-            // Nested struct member-of-member targets (aper.outer.inner) are not
-            // covered by the flat `packed_agg_layout` here — degenerate to the
-            // caller's fallback rather than splice the wrong bits.
-            if names.len() > 1 {
-                return None;
+            let memo_key = if names.len() == 1 {
+                self.heap.get(handle).and_then(|h| h.as_ref()).map(|inst| {
+                    (format!("{}#{}", inst.class_name, arr_name), names[0].clone())
+                })
+            } else {
+                None
+            };
+            if let Some(ref k) = memo_key {
+                if let Some(&ow) = self.struct_member_offset_memo.borrow().get(k) {
+                    ow
+                } else {
+                    let su = self.packed_struct_elem_type(&elem_expr)?;
+                    if Self::spreads_member_wise(&su) {
+                        return None;
+                    }
+                    let (fields, _total) = self.packed_agg_layout(&su);
+                    let f = fields.iter().find(|(m, _, _)| m == &names[0])?;
+                    let ow = (f.1, f.2);
+                    self.struct_member_offset_memo.borrow_mut().insert(k.clone(), ow);
+                    ow
+                }
+            } else {
+                let su = self.packed_struct_elem_type(&elem_expr)?;
+                if Self::spreads_member_wise(&su) {
+                    return None;
+                }
+                let (fields, _total) = self.packed_agg_layout(&su);
+                let f = fields.iter().find(|(m, _, _)| m == &names[0])?;
+                if names.len() > 1 {
+                    return None;
+                }
+                (f.1, f.2)
             }
-            (f.1, f.2)
         };
         let elem = self
             .class_elem_load(handle, arr_name, &idxs)
@@ -3721,6 +3761,15 @@ impl Simulator {
                     }
                     None => return None,
                 }
+            }
+            Op::Dist(cr, dw) => {
+                let key = (handle, format!("{}{}.{}", arr_name, idxs, names[0]));
+                let picked = self
+                    .pick_dist_value(Some(key), &cr, &dw)
+                    .unwrap_or_else(|| Value::zero(w));
+                let same = picked.to_u64() == mcur.to_u64();
+                self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, picked);
+                !same
             }
             Op::Eq(bound) => {
                 let bv = self.eval_expr(&bound).resize(mcur.width.max(1));
@@ -4062,6 +4111,23 @@ impl Simulator {
             }
         }
         Some(true)
+    }
+
+    pub(super) fn dynamic_prop_foreach_dims(
+        &self,
+        handle: usize,
+        arr_name: &str,
+    ) -> Option<(Vec<(i64, i64)>, u32)> {
+        if !self.prop_is_rand(handle, arr_name) {
+            return None;
+        }
+        let key = format!("{}#{}", handle, arr_name);
+        let n = self.get_queue_size(&key) as i64;
+        if n <= 0 {
+            return None;
+        }
+        let w = self.class_prop_width_of(handle, arr_name)?;
+        Some((vec![(0, n - 1)], w))
     }
 
     pub(super) fn fixed_foreach_dims(

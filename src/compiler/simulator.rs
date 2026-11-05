@@ -8924,6 +8924,8 @@ pub struct Simulator {
     /// then property; `None` marks a width the instance's bindings decide.
     #[allow(clippy::type_complexity)]
     prop_width_memo: std::cell::RefCell<HashMap<String, HashMap<String, Option<Option<u32>>>>>,
+    #[serde(skip)]
+    struct_member_offset_memo: std::cell::RefCell<HashMap<(String, String), (u32, u32)>>,
     /// Emptied formal-metadata snapshot vectors of the class-method call path,
     /// reused across calls.
     formal_parts_pool: Vec<Vec<(usize, FormalMetaParts)>>,
