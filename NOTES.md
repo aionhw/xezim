@@ -30,6 +30,25 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A constraint that joins one-bit terms with `&` or `|`, such as
+  `s == S_DATA & data == 32'h1234`, is solved like `&&` and `||` (§11.4.5,
+  §18.5, #899). `randomize()` returned 0 and left the members unchanged,
+  because the 32-bit term was only ever sampled. A `rand bit`, a bit select
+  such as `data[0]` and a relation the solver inverts, such as
+  `(data ^ 'hf) == 0`, count as one-bit terms too; an operand wider than one
+  bit keeps its bitwise meaning (PR #900, contributed by davekeeshan).
+* A continuous assignment to a path that enters a scope through an index,
+  such as `assign tb.g[0].u.a = s;`, drives its target (§23.6, §10.3.2,
+  #901). Written with the top module's name, or with a delay, it drove
+  nothing and printed nothing. A bit or part select on the target,
+  `assign g[0].u.a[3:1] = 3'b011;`, drives those bits, and the generate
+  block no longer becomes a 1-bit implicit net with a warning (PR #902,
+  contributed by davekeeshan).
+* An event control on a path that enters a scope through an index, such as
+  `@(posedge g[0].u.clk)`, `@(posedge g[0].u.c[0])` or `@(g[0].u.c[2:1])`,
+  wakes on every change (§9.4.2, #903). The process woke once at time 0 and
+  never again, so a flop clocked through such a path stood still (PR #904,
+  contributed by davekeeshan).
 * The lint reads a child module's names in the child's own scope (§23.9,
   #891). A variable of one module is no longer taken for a same-named queue
   of another, and a child's part-select widths, enum values, array sizes and
