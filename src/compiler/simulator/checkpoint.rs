@@ -955,6 +955,19 @@ impl Simulator {
         self.method_plans.borrow_mut().clear();
         self.fsm_clobber_cache.clear();
         self.class_task_frame_cache.clear();
+        // Serialized callable bodies restore with scope caches disabled.
+        // Rebuild private runtime bodies on their next call (§13.3/§13.4);
+        // static locals and suspended task state live in separate tables.
+        self.fn_decl_cache.clear();
+        self.task_decl_cache.clear();
+        self.class_method_cache.borrow_mut().clear();
+        self.class_prop_struct_cache.borrow_mut().clear();
+        self.class_packed_layout_cache.borrow_mut().clear();
+        self.class_value_param_names.borrow_mut().clear();
+        self.aggregate_type_generation.set(self.type_tables_gen);
+        for count in &self.aggregate_type_work {
+            count.set(0);
+        }
         super::super::interrupt::publish_sim_time(self.time);
         self.checkpoint_restored = true;
         audit::write_digests(self, &format!("{path}.restore"));

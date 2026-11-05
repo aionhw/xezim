@@ -819,8 +819,8 @@ impl Simulator {
                     selects: Vec::new(),
                 }],
                 span: crate::ast::Span::dummy(),
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
             }),
             crate::ast::Span::dummy(),
         );
@@ -854,7 +854,7 @@ impl Simulator {
                 signed: false,
                 base,
                 value: val_str.trim().to_string(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             });
         }
         // Plain decimal integer (optional leading sign).
@@ -866,7 +866,7 @@ impl Simulator {
                 signed: neg,
                 base: NumberBase::Decimal,
                 value: body.to_string(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             });
         }
         None
@@ -2141,8 +2141,8 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
                         }),
                         span,
                     )
@@ -2163,7 +2163,7 @@ impl Simulator {
                         signed: false,
                         base: crate::ast::expr::NumberBase::Decimal,
                         value: v.to_u64()?.to_string(),
-                        cached_val: std::cell::Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 )
@@ -3106,7 +3106,7 @@ impl Simulator {
                 {
                     let Some(su) = self
                         .class_prop_struct(handle, prop)
-                        .filter(Self::spreads_member_wise)
+                        .filter(|su| Self::spreads_member_wise(su))
                     else {
                         continue;
                     };

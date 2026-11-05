@@ -1565,8 +1565,8 @@ impl Simulator {
                 root: None,
                 path,
                 span: hier.span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
             });
         }
         // Identity-bound aggregate: the formal has no storage of its own.
@@ -1602,8 +1602,8 @@ impl Simulator {
             root: ah.root.clone(),
             path,
             span: hier.span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         })
     }
 
@@ -1643,8 +1643,8 @@ impl Simulator {
                             selects: Vec::new(),
                         }],
                         span: id.span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
                     }),
                     id.span,
                 );
@@ -3623,7 +3623,7 @@ impl Simulator {
                         // wrongly resolves back to the PACKAGE name, and every
                         // element read returns all-x. Reset the cache so the
                         // new name resolves from scratch.
-                        ident.cached_resolved_name = std::cell::OnceCell::new();
+                        ident.cached_resolved_name = crate::ast::cache::NameCache::new();
                         return Some(Expression::new(ExprKind::Ident(ident), lhs.span));
                     }
                 }
@@ -3643,7 +3643,7 @@ impl Simulator {
                 // See the MemberAccess arm above: the cloned node inherits
                 // `cached_resolved_name` from the `<pkg>::<member>` reference;
                 // reset it so the bare `<member>` resolves fresh.
-                ident.cached_resolved_name = std::cell::OnceCell::new();
+                ident.cached_resolved_name = crate::ast::cache::NameCache::new();
                 Some(Expression::new(ExprKind::Ident(ident), lhs.span))
             }
             ExprKind::Index { expr, index } => {
@@ -3743,8 +3743,8 @@ impl Simulator {
                         root: None,
                         path,
                         span: e.span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
                     }),
                     e.span,
                 ))
@@ -3799,8 +3799,8 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span: crate::ast::Span::dummy(),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                 }),
                 crate::ast::Span::dummy(),
             );
@@ -3968,8 +3968,8 @@ impl Simulator {
                                 root: h.root.clone(),
                                 path: vec![h.path[0].clone()],
                                 span: h.span,
-                                cached_signal_id: std::cell::Cell::new(None),
-                                cached_resolved_name: std::cell::OnceCell::new(),
+                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                cached_resolved_name: crate::ast::cache::NameCache::new(),
                             };
                             Some(self.resolve_hier_name(&head_id).into_owned())
                         }

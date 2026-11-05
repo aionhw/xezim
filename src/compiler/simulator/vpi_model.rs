@@ -2771,8 +2771,8 @@ impl<'a> Builder<'a> {
                     selects: Vec::new(),
                 }],
                 span: Span::dummy(),
-                cached_signal_id: Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
             }),
             Span::dummy(),
         );
@@ -4079,8 +4079,8 @@ pub(super) fn ident_expr(name: &str) -> Expression {
                 selects: Vec::new(),
             }],
             span: Span::dummy(),
-            cached_signal_id: Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         }),
         Span::dummy(),
     )
@@ -4328,7 +4328,7 @@ fn flatten_in_place(m: &VpiModel, scope: u32, e: &mut Expression) {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 });
                 e.cached_width.set(None);
                 return;
@@ -4381,7 +4381,7 @@ fn flatten_in_place(m: &VpiModel, scope: u32, e: &mut Expression) {
                 return;
             }
             h.cached_signal_id.set(None);
-            h.cached_resolved_name = std::cell::OnceCell::new();
+            h.cached_resolved_name = crate::ast::cache::NameCache::new();
         }
         ExprKind::Unary { operand, .. } => flatten_in_place(m, scope, operand),
         ExprKind::Binary { left, right, .. } => {

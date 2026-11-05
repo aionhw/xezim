@@ -183,7 +183,18 @@ impl Simulator {
                 )
             })
             .cloned()
-            .map(Arc::new);
+            .map(|mut method| {
+                // §8.3/§13.4: preserve the existing per-origin runtime body
+                // ownership. Uncalled class declarations stay shared in the
+                // elaborated model; this private copy can cache name lookups.
+                let body = match &mut method.kind {
+                    crate::ast::decl::ClassMethodKind::Function(fd) => &mut fd.items,
+                    crate::ast::decl::ClassMethodKind::Task(td) => &mut td.items,
+                    _ => unreachable!("filtered callable method"),
+                };
+                *body = crate::ast::cache::with_fresh_scope_caches(|| body.to_vec()).into();
+                Arc::new(method)
+            });
         self.class_method_cache
             .borrow_mut()
             .entry(class_name.to_string())

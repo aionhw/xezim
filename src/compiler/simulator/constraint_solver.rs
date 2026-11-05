@@ -3141,8 +3141,8 @@ impl Simulator {
                 selects: Vec::new(),
             }],
             span: expr.span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         };
         Some(Expression::new(ExprKind::Ident(fh), expr.span))
     }
@@ -3740,7 +3740,7 @@ impl Simulator {
                     }
                 } else if let Some(su) = self
                     .class_prop_struct(handle, prop)
-                    .filter(Self::spreads_member_wise)
+                    .filter(|su| Self::spreads_member_wise(su))
                 {
                     self.seed_class_struct_cells(handle, prop, &su);
                 }
@@ -3759,7 +3759,7 @@ impl Simulator {
                 let fill = self.class_bound_array_fill(cdef, handle, prop, w);
                 let su = self
                     .class_prop_struct(handle, prop)
-                    .filter(Self::spreads_member_wise);
+                    .filter(|su| Self::spreads_member_wise(su));
                 for i in lo..=hi {
                     let en = format!("{}[{}]", scoped, i);
                     self.signals.insert(en.clone(), fill.clone());
@@ -3788,7 +3788,7 @@ impl Simulator {
                 let fill = self.class_bound_array_fill(cdef, handle, prop, w);
                 let su = self
                     .class_prop_struct(handle, prop)
-                    .filter(Self::spreads_member_wise);
+                    .filter(|su| Self::spreads_member_wise(su));
                 for suffix in Self::nd_index_suffixes(shape) {
                     let en = format!("{}{}", scoped, suffix);
                     if self.widths.contains_key(&en) {

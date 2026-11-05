@@ -2598,8 +2598,8 @@ impl Simulator {
                 {
                     let mut base = hier.clone();
                     base.path.last_mut().unwrap().selects.clear();
-                    base.cached_signal_id = std::cell::Cell::new(None);
-                    base.cached_resolved_name = std::cell::OnceCell::new();
+                    base.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                    base.cached_resolved_name = crate::ast::cache::NameCache::new();
                     let base = Expression::new(ExprKind::Ident(base), expr.span);
                     if let Some(v) = self.clocking_array_elem_read(&base, sel) {
                         return v;
@@ -2667,8 +2667,8 @@ impl Simulator {
                         {
                             stripped.path[0].name.name = q;
                         }
-                        stripped.cached_signal_id = std::cell::Cell::new(None);
-                        stripped.cached_resolved_name = std::cell::OnceCell::new();
+                        stripped.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                        stripped.cached_resolved_name = crate::ast::cache::NameCache::new();
                         let e2 = Expression::new(ExprKind::Ident(stripped), expr.span);
                         return self.eval_expr_ctx(&e2, ctx_width);
                     }
@@ -2794,8 +2794,8 @@ impl Simulator {
                         root: hier.root.clone(),
                         path: vec![head],
                         span: hier.span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
                     };
                     let resolved = self.resolve_hier_name(&head_id).into_owned();
                     let obj = &hier.path[0].name.name;

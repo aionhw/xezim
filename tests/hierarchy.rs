@@ -368,3 +368,8 @@ mod param_override_lists;
 
 #[path = "hierarchy/static_memory_member_paths.rs"]
 mod static_memory_member_paths;
+
+#[path = "hierarchy/issue721_callable_body_sharing.rs"]
+mod issue721_callable_body_sharing;
+#[path = "hierarchy/issue721_prepared_process_ownership.rs"]
+mod issue721_prepared_process_ownership;

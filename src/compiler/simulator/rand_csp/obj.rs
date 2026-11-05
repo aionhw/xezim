@@ -50,8 +50,8 @@ fn ident_expr(path: Vec<crate::ast::expr::HierPathSegment>, span: crate::ast::Sp
             root: None,
             path,
             span,
-            cached_signal_id: Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         }),
         span,
     )
@@ -594,7 +594,7 @@ impl Simulator {
                 }
                 if changed {
                     h.cached_signal_id.set(None);
-                    h.cached_resolved_name = std::cell::OnceCell::new();
+                    h.cached_resolved_name = crate::ast::cache::NameCache::new();
                     e.cached_width.set(None);
                 }
                 true

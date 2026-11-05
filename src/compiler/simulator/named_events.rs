@@ -692,7 +692,7 @@ impl Simulator {
                             signed: false,
                             base: NumberBase::Decimal,
                             value: idx.to_string(),
-                            cached_val: Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         span,
                     ),
@@ -974,8 +974,8 @@ impl Simulator {
             {
                 let mut b = h.clone();
                 b.path.last_mut()?.selects.clear();
-                b.cached_signal_id = std::cell::Cell::new(None);
-                b.cached_resolved_name = std::cell::OnceCell::new();
+                b.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                b.cached_resolved_name = crate::ast::cache::NameCache::new();
                 let base = Expression::new(ExprKind::Ident(b), e.span);
                 (std::borrow::Cow::Owned(base), &h.path.last()?.selects[0])
             }

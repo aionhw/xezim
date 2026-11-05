@@ -608,8 +608,8 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span: lvalue.span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
                         }),
                         lvalue.span,
                     );
@@ -1002,7 +1002,7 @@ impl Simulator {
             module.signals.insert(
                 name.clone(),
                 Signal {
-                    name,
+                    name: name.into(),
                     width: 1,
                     is_signed: false,
                     is_real: false,
@@ -1118,8 +1118,8 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                 }),
                 span,
             )
@@ -1329,7 +1329,7 @@ impl Simulator {
                                     signed: false,
                                     base: NumberBase::Decimal,
                                     value: ix.to_string(),
-                                    cached_val: std::cell::Cell::new(None),
+                                    cached_val: crate::ast::cache::LiteralCache::new(None),
                                 }),
                                 span,
                             )),
@@ -1367,7 +1367,7 @@ impl Simulator {
             module.signals.insert(
                 name.clone(),
                 Signal {
-                    name,
+                    name: name.into(),
                     width: 1,
                     is_signed: false,
                     is_real: false,
@@ -1814,12 +1814,12 @@ impl Simulator {
                         .collect()
                 };
                 for td in module.tasks.values_mut() {
-                    td.items = flat(&td.items);
+                    td.items = flat(&td.items).into();
                 }
                 let fnames: Vec<String> = module.functions.keys().cloned().collect();
                 for n in fnames {
                     if let Some(mut fd) = module.functions.remove(&n) {
-                        fd.items = flat(&fd.items);
+                        fd.items = flat(&fd.items).into();
                         module.functions.insert(n, fd);
                     }
                 }
@@ -1977,7 +1977,7 @@ impl Simulator {
                     if let (Some(td), StatementKind::SeqBlock { stmts, .. }) =
                         (module.tasks.get_mut(&key), st.kind)
                     {
-                        td.items = stmts;
+                        td.items = stmts.into();
                     }
                 }
                 for (key, st) in fdone {
@@ -1985,7 +1985,7 @@ impl Simulator {
                         (module.functions.get(&key), st.kind)
                     {
                         let mut fd = fd.clone();
-                        fd.items = stmts;
+                        fd.items = stmts.into();
                         module.functions.insert(key, fd);
                     }
                 }
@@ -2111,8 +2111,8 @@ impl Simulator {
                             selects: Vec::new(),
                         }],
                         span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
                     }),
                     span,
                 )
@@ -2259,7 +2259,7 @@ impl Simulator {
                     .signals
                     .entry(nm.clone())
                     .or_insert_with(|| super::elaborate::Signal {
-                        name: nm.clone(),
+                        name: nm.clone().into(),
                         width: 1,
                         is_signed: false,
                         is_real: false,
@@ -2365,7 +2365,7 @@ impl Simulator {
                     .signals
                     .entry(sz_name.clone())
                     .or_insert_with(|| super::elaborate::Signal {
-                        name: sz_name,
+                        name: sz_name.into(),
                         width: 32,
                         is_signed: false,
                         is_real: false,
@@ -3566,7 +3566,7 @@ impl Simulator {
         // because `resolve_type_width` still resolves dimension
         // expressions against it at runtime (per step-2's caller fix).
         let phase_drop = std::time::Instant::now();
-        module.signals = HashMap::default();
+        module.signals = Default::default();
         let drop_ms = phase_drop.elapsed().as_secs_f64() * 1000.0;
         crate::rss_trace("sim::new drop");
 
@@ -3729,6 +3729,11 @@ impl Simulator {
             class_non_member_cache: std::cell::RefCell::new(HashMap::default()),
             member_coll_cache: std::cell::RefCell::new(HashMap::default()),
             class_prop_struct_neg: std::cell::RefCell::new(HashMap::default()),
+            class_prop_struct_cache: std::cell::RefCell::new(HashMap::default()),
+            class_packed_layout_cache: std::cell::RefCell::new(HashMap::default()),
+            aggregate_type_work: Default::default(),
+            aggregate_type_generation: Default::default(),
+            class_value_param_names: std::cell::RefCell::new(HashMap::default()),
             name_stats: Default::default(),
             name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
             frame_pool: Vec::new(),

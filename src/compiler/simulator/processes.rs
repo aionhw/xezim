@@ -220,8 +220,8 @@ impl Simulator {
                 k += last.selects.len();
                 let mut hb = h.clone();
                 hb.path.last_mut()?.selects.clear();
-                hb.cached_signal_id = std::cell::Cell::new(None);
-                hb.cached_resolved_name = std::cell::OnceCell::new();
+                hb.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                hb.cached_resolved_name = crate::ast::cache::NameCache::new();
                 return Some((Expression::new(ExprKind::Ident(hb), cur.span), k));
             }
         }
@@ -380,7 +380,7 @@ impl Simulator {
                 signed: false,
                 base: NumberBase::Decimal,
                 value: id.to_string(),
-                cached_val: Cell::new(Some((id, 0u64, 64u32))),
+                cached_val: crate::ast::cache::LiteralCache::new(Some((id, 0u64, 64u32))),
             }),
             span,
         );
@@ -2238,7 +2238,7 @@ impl Simulator {
                         signed: false,
                         base: NumberBase::Decimal,
                         value: idx.to_string(),
-                        cached_val: Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 )],
@@ -3212,7 +3212,7 @@ impl Simulator {
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
-                                    let mut cont: Vec<Statement> = td.items.clone();
+                                    let mut cont: Vec<Statement> = td.items.to_vec();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
                                     // Chain the caller's tail instead of copying it onto the end of
                                     // the spliced body (ProcCont::pushed).
@@ -3242,7 +3242,7 @@ impl Simulator {
                             // bare free-task arm above (Stage 1).
                             self.push_instance_task_context(&mut cleanup);
                             self.task_cleanup.push(cleanup);
-                            let mut cont: Vec<Statement> = td.items.clone();
+                            let mut cont: Vec<Statement> = td.items.to_vec();
                             cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
                             self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                             return;
@@ -3277,7 +3277,7 @@ impl Simulator {
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
-                                    let mut cont: Vec<Statement> = td.items.clone();
+                                    let mut cont: Vec<Statement> = td.items.to_vec();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
                                     self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                                     return;
@@ -4027,8 +4027,8 @@ impl Simulator {
                                             selects: Vec::new(),
                                         }],
                                         span: *span,
-                                        cached_signal_id: std::cell::Cell::new(None),
-                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                        cached_resolved_name: crate::ast::cache::NameCache::new(),
                                     }),
                                     *span,
                                 ),

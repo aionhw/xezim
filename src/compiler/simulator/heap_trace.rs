@@ -503,7 +503,6 @@ mod tests {
         stmt::Pattern,
         Span,
     };
-    use std::cell::Cell;
     fn lit(n: u64) -> Expression {
         Expression::new(
             ExprKind::Number(NumberLiteral::Integer {
@@ -511,7 +510,7 @@ mod tests {
                 signed: false,
                 base: NumberBase::Decimal,
                 value: n.to_string(),
-                cached_val: Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             Span::new(600, 601),
         )

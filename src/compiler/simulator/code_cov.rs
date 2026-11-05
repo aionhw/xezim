@@ -95,7 +95,7 @@ fn number(n: u32, span: Span) -> Expression {
             signed: false,
             base: NumberBase::Decimal,
             value: n.to_string(),
-            cached_val: Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     )
@@ -1235,7 +1235,7 @@ impl Simulator {
                         kinds,
                         scope: sc,
                     }
-                    .stmts(items);
+                    .stmts(items.into_vec()).into();
                 }
             }
             self.module.functions = xezim_core::elaborate::FuncTable::from_map(functions);
@@ -1251,7 +1251,7 @@ impl Simulator {
                         kinds,
                         scope: sc,
                     }
-                    .stmts(items);
+                    .stmts(items.into_vec()).into();
                 }
             }
             self.module.tasks = tasks;
@@ -1547,7 +1547,7 @@ impl Simulator {
                     kinds,
                     scope: sc,
                 }
-                .stmts(body);
+                .stmts(body.into_vec()).into();
             }
             done.insert(ptr, arc.clone());
             classes.insert(key, arc);

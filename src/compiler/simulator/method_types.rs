@@ -25,8 +25,8 @@ impl Simulator {
             ExprKind::Ident(h) if h.path.len() >= 2 => {
                 let mut r = h.clone();
                 r.path.pop();
-                r.cached_signal_id = std::cell::Cell::new(None);
-                r.cached_resolved_name = std::cell::OnceCell::new();
+                r.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                r.cached_resolved_name = crate::ast::cache::NameCache::new();
                 Expression::new(ExprKind::Ident(r), func.span)
             }
             _ => return false,

@@ -19,7 +19,7 @@ impl Simulator {
                     signed: false,
                     base: NumberBase::Decimal,
                     value: skew.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )
@@ -219,8 +219,8 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span: crate::ast::Span::dummy(),
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
                         }),
                         crate::ast::Span::dummy(),
                     );

@@ -1982,8 +1982,8 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span: crate::ast::Span::dummy(),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                 }),
                 crate::ast::Span::dummy(),
             );
@@ -3176,8 +3176,8 @@ impl Simulator {
                             },
                             selects: Vec::new(),
                         });
-                        fh.cached_signal_id = std::cell::Cell::new(None);
-                        fh.cached_resolved_name = std::cell::OnceCell::new();
+                        fh.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                        fh.cached_resolved_name = crate::ast::cache::NameCache::new();
                         return Some(self.resolve_hier_name(&fh).into_owned());
                     }
                 }
@@ -3198,8 +3198,8 @@ impl Simulator {
                             })
                             .collect(),
                         span: e.span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
                     };
                     return Some(self.resolve_hier_name(&fh).into_owned());
                 }

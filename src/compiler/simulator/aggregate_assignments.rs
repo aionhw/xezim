@@ -132,8 +132,8 @@ impl Simulator {
                 .last_mut()
                 .map(|s| std::mem::take(&mut s.selects))
                 .unwrap_or_default();
-            bare.cached_signal_id = std::cell::Cell::new(None);
-            bare.cached_resolved_name = std::cell::OnceCell::new();
+            bare.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+            bare.cached_resolved_name = crate::ast::cache::NameCache::new();
             let mut all = lsel;
             all.extend(sels);
             return (Expression::new(ExprKind::Ident(bare), cur.span), all);

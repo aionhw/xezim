@@ -135,7 +135,7 @@ impl Simulator {
         }
         let (h, p) = self.class_prop_receiver(e)?;
         let su = self.class_prop_struct(h, &p)?;
-        Self::spreads_member_wise(&su).then_some(su)
+        Self::spreads_member_wise(&su).then(|| (*su).clone())
     }
 
     /// Declared ELEMENT width (bits) of the collection named `name`, where
@@ -635,7 +635,7 @@ impl Simulator {
                             signed: true,
                             base: NumberBase::Binary,
                             value: idx.to_bin(),
-                            cached_val: Cell::new(idx.inline_bits().map(|(v, xz)| (v, xz, 64))),
+                            cached_val: crate::ast::cache::LiteralCache::new(idx.inline_bits().map(|(v, xz)| (v, xz, 64))),
                         }),
                         x.span,
                     )),

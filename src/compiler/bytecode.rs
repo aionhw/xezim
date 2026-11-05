@@ -2133,7 +2133,8 @@ pub struct BytecodeCompiler<'a> {
     /// `typedef_types` key: such a type is not packed.
     typedef_unpacked_dims: Option<&'a HashMap<String, Vec<crate::ast::types::UnpackedDimension>>>,
     /// Declared types of explicitly typed value parameters.
-    param_decl_types: Option<&'a HashMap<String, crate::ast::types::DataType>>,
+    param_decl_types:
+        Option<&'a xezim_core::shared_names::SharedNameMap<crate::ast::types::DataType>>,
     /// Ports collapsed onto the nets they connect, formal to actual.
     port_aliases: Option<&'a HashMap<String, String>>,
     /// Stack of pending `break` jump-target patches, one entry per enclosing
@@ -2859,7 +2860,10 @@ impl<'a> BytecodeCompiler<'a> {
         self.port_aliases = Some(a);
     }
 
-    pub fn set_param_decl_types(&mut self, t: &'a HashMap<String, crate::ast::types::DataType>) {
+    pub fn set_param_decl_types(
+        &mut self,
+        t: &'a xezim_core::shared_names::SharedNameMap<crate::ast::types::DataType>,
+    ) {
         self.param_decl_types = Some(t);
     }
 
@@ -3965,7 +3969,7 @@ impl<'a> BytecodeCompiler<'a> {
         // returns would need a result variable; those stay on the AST.)
         let (ports, body, lifetime): (
             Vec<crate::ast::decl::FunctionPort>,
-            Vec<Statement>,
+            crate::ast::shared_vec::SharedVec<Statement>,
             Option<crate::ast::types::Lifetime>,
         ) = if let Some(td) = self.tasks.and_then(|t| t.get(task_name)) {
             (td.ports.clone(), td.items.clone(), td.lifetime)
@@ -9508,8 +9512,8 @@ impl<'a> BytecodeCompiler<'a> {
             root: h.root.clone(),
             path: h.path[..h.path.len() - 1].to_vec(),
             span: h.span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         };
         self.const_param_member_hier(&base, member)
     }
@@ -12258,8 +12262,8 @@ impl<'a> BytecodeCompiler<'a> {
                         selects: Vec::new(),
                     }],
                     span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                 }),
                 span,
             )
@@ -24349,7 +24353,7 @@ mod tests {
                             signed: false,
                             base: NumberBase::Decimal,
                             value: (index * stride).to_string(),
-                            cached_val: std::cell::Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         span,
                     )],
@@ -24448,8 +24452,8 @@ mod tests {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
             }),
             span,
         )
@@ -24572,7 +24576,7 @@ mod tests {
                 signed: true,
                 base: crate::ast::expr::NumberBase::Decimal,
                 value: "1".into(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             sp,
         );
@@ -29816,14 +29820,22 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
         }
         let raw = BytecodeCompiler::hier_raw_name(h);
         let scoped = self.0.scope_hint.as_deref().map(|sc| cat_dot(sc, &raw));
-        let found = [self.0.var_decl_types, self.0.param_decl_types]
-            .into_iter()
-            .flatten()
-            .find_map(|types| {
+        let found = self
+            .0
+            .var_decl_types
+            .and_then(|types| {
                 [scoped.as_deref(), Some(raw.as_str())]
                     .into_iter()
                     .flatten()
                     .find_map(|n| types.get(n).cloned())
+            })
+            .or_else(|| {
+                self.0.param_decl_types.and_then(|types| {
+                    [scoped.as_deref(), Some(raw.as_str())]
+                        .into_iter()
+                        .flatten()
+                        .find_map(|n| types.get(n).cloned())
+                })
             });
         if found.is_some() {
             return found;

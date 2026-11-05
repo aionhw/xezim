@@ -4067,8 +4067,8 @@ impl Simulator {
                         root: None,
                         path: vec![seg(prop, span), seg(name, span)],
                         span,
-                        cached_signal_id: Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
                     }),
                     span,
                 );
@@ -4079,8 +4079,8 @@ impl Simulator {
                     root: None,
                     path: vec![seg(prop.split('.').next().unwrap_or(prop), span)],
                     span,
-                    cached_signal_id: Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                 }),
                 span,
             );
@@ -4143,7 +4143,7 @@ impl Simulator {
                     }
                 }
                 h.cached_signal_id.set(None);
-                h.cached_resolved_name = std::cell::OnceCell::new();
+                h.cached_resolved_name = crate::ast::cache::NameCache::new();
                 e.cached_width.set(None);
                 true
             }
@@ -5238,8 +5238,8 @@ impl Simulator {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
             }),
             span,
         )
@@ -5297,7 +5297,7 @@ impl Simulator {
                 ExprKind::Index { index, .. } => std::mem::replace(&mut **index, ph),
                 ExprKind::Ident(h) => {
                     h.cached_signal_id.set(None);
-                    h.cached_resolved_name = std::cell::OnceCell::new();
+                    h.cached_resolved_name = crate::ast::cache::NameCache::new();
                     std::mem::replace(&mut h.path.last_mut().unwrap().selects[0], ph)
                 }
                 _ => return None,
@@ -7910,8 +7910,8 @@ impl Simulator {
                 if matches!(idx.kind, ExprKind::Range(..)) {
                     return None;
                 }
-                bh.cached_signal_id = Cell::new(None);
-                bh.cached_resolved_name = std::cell::OnceCell::new();
+                bh.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                bh.cached_resolved_name = crate::ast::cache::NameCache::new();
                 peeled = (Expression::new(ExprKind::Ident(bh), e.span), idx);
                 (&peeled.0, Sel::Index(&peeled.1))
             }
@@ -8138,8 +8138,8 @@ impl Simulator {
             {
                 let mut bh = h.clone();
                 let idx = bh.path.last_mut().unwrap().selects.pop().unwrap();
-                bh.cached_signal_id = Cell::new(None);
-                bh.cached_resolved_name = std::cell::OnceCell::new();
+                bh.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                bh.cached_resolved_name = crate::ast::cache::NameCache::new();
                 Some((Expression::new(ExprKind::Ident(bh), e.span), idx))
             }
             _ => None,

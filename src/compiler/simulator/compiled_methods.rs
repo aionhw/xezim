@@ -1587,7 +1587,7 @@ impl Simulator {
                         return_type: crate::ast::types::DataType::Void(crate::ast::Span::dummy()),
                         name: t.name.clone(),
                         ports: t.ports.clone(),
-                        items: Vec::new(),
+                        items: Default::default(),
                         endlabel: t.endlabel.clone(),
                         strict_body_ports: Vec::new(),
                         span: t.span,
@@ -4318,7 +4318,7 @@ impl Simulator {
                 signed: v.is_signed,
                 base: NumberBase::Hex,
                 value: v.to_hex(),
-                cached_val: std::cell::Cell::new(inline),
+                cached_val: crate::ast::cache::LiteralCache::new(inline),
             }),
             crate::ast::Span::dummy(),
         )
@@ -4415,8 +4415,8 @@ impl Simulator {
                             selects: Vec::new(),
                         }],
                         span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
                     }),
                     span,
                 );
@@ -4579,8 +4579,8 @@ impl Simulator {
                     root: h.root.clone(),
                     path: vec![seg],
                     span: h.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                 };
                 let e = Expression::new(ExprKind::Ident(bare), lvalue.span);
                 if let Some(k) = self.lvalue_container_kind(&e) {

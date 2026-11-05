@@ -125,8 +125,8 @@ impl Simulator {
             ExprKind::Ident(h) if h.path.last().is_some_and(|s| s.selects.is_empty()) => {
                 let mut owner = h.clone();
                 let prop = owner.path.pop()?.name.name;
-                owner.cached_signal_id = std::cell::Cell::new(None);
-                owner.cached_resolved_name = std::cell::OnceCell::new();
+                owner.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                owner.cached_resolved_name = crate::ast::cache::NameCache::new();
                 let owner = Expression::new(ExprKind::Ident(owner), base.span);
                 (self.eval_expr(&owner).to_u64()? as usize, prop)
             }
@@ -164,7 +164,7 @@ impl Simulator {
                         signed: true,
                         base: crate::ast::expr::NumberBase::Decimal,
                         value: i.to_string(),
-                        cached_val: std::cell::Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     crate::ast::Span::dummy(),
                 );
@@ -188,7 +188,7 @@ impl Simulator {
                     signed: false,
                     base: crate::ast::expr::NumberBase::Binary,
                     value: v.to_bin_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 crate::ast::Span::dummy(),
             );
@@ -1130,7 +1130,7 @@ impl Simulator {
                 signed: v.is_signed,
                 base: NumberBase::Binary,
                 value: digits,
-                cached_val: Cell::new(cached),
+                cached_val: crate::ast::cache::LiteralCache::new(cached),
             }),
             span,
         )
@@ -1464,8 +1464,8 @@ impl Simulator {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
             }),
             span,
         );

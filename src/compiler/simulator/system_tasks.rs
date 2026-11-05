@@ -2461,7 +2461,7 @@ impl Simulator {
                     .runtime_recv_class(&Expression {
                         kind: ExprKind::Ident(h.clone()),
                         span: h.span,
-                        cached_width: std::cell::Cell::new(None),
+                        cached_width: crate::ast::cache::WidthCache::new(None),
                     })
                     .or_else(|| self.var_class_types.get(first).cloned())
                     .or_else(|| Some(first.clone()));
@@ -3092,8 +3092,8 @@ impl Simulator {
                                                 selects: Vec::new(),
                                             }],
                                             span: arg.span,
-                                            cached_signal_id: std::cell::Cell::new(None),
-                                            cached_resolved_name: std::cell::OnceCell::new(),
+                                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                            cached_resolved_name: crate::ast::cache::NameCache::new(),
                                         };
                                         let resolved = self.resolve_hier_name(&ident);
                                         if resolved != flat {

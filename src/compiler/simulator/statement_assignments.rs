@@ -1988,7 +1988,7 @@ impl Simulator {
                     ExprKind::Ident(ih) if ih.path.len() >= 3 => {
                         let mut p = ih.clone();
                         let member = p.path.pop().unwrap().name.name.clone();
-                        p.cached_signal_id = std::cell::Cell::new(None);
+                        p.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                         Some((Expression::new(ExprKind::Ident(p), lvalue.span), member))
                     }
                     _ => None,

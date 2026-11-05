@@ -320,7 +320,7 @@ impl Simulator {
         }
         self.class_prop_struct(handle, &prop)
             .filter(|su| su.packed)
-            .map(DataType::Struct)
+            .map(|su| DataType::Struct((*su).clone()))
     }
 
     /// The value of `rvalue` assigned to `lvalue` when `rvalue` holds a

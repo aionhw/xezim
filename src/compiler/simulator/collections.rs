@@ -2515,7 +2515,7 @@ impl Simulator {
                 signed: v.is_signed,
                 base: NumberBase::Binary,
                 value: v.to_bin(),
-                cached_val: Cell::new(v.inline_bits().map(|(vbits, xz)| (vbits, xz, v.width))),
+                cached_val: crate::ast::cache::LiteralCache::new(v.inline_bits().map(|(vbits, xz)| (vbits, xz, v.width))),
             })
         };
         Expression::new(kind, expr.span)

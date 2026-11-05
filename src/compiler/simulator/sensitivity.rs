@@ -2264,8 +2264,8 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                 };
                 let saved = self.name_resolve_hint.borrow().clone();
                 *self.name_resolve_hint.borrow_mut() = hint.clone();
@@ -3506,7 +3506,7 @@ impl Simulator {
                         signed: v.is_signed,
                         base: NumberBase::Binary,
                         value: v.to_bin(),
-                        cached_val: Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }
                 };
                 *e = Expression::new(ExprKind::Number(lit), e.span);

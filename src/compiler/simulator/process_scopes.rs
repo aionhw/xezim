@@ -618,8 +618,8 @@ impl Simulator {
                                         selects: vec![],
                                     }],
                                     span: d.span,
-                                    cached_signal_id: std::cell::Cell::new(None),
-                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                                 }),
                                 d.span,
                             );
@@ -752,7 +752,7 @@ impl Simulator {
                             } else {
                                 "x".repeat(w as usize)
                             },
-                            cached_val: std::cell::Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         port.span,
                     )
@@ -776,7 +776,7 @@ impl Simulator {
         let mut ordinal = 0usize;
         let mut functions: Vec<_> = module.functions.keys().cloned().collect();
         functions.sort();
-        let mut rewritten: HashMap<String, Vec<Statement>> = HashMap::default();
+        let mut rewritten: HashMap<String, crate::ast::shared_vec::SharedVec<Statement>> = HashMap::default();
         for key in functions {
             let Some(original) = module.functions.get(&key) else {
                 continue;
@@ -2581,7 +2581,7 @@ impl Simulator {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: Cell::new(Some((v as u64, 0u64, 64u32))),
+                    cached_val: crate::ast::cache::LiteralCache::new(Some((v as u64, 0u64, 64u32))),
                 }),
                 span,
             )
@@ -2754,7 +2754,7 @@ impl Simulator {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: Cell::new(Some((v as u64, 0u64, 64u32))),
+                    cached_val: crate::ast::cache::LiteralCache::new(Some((v as u64, 0u64, 64u32))),
                 }),
                 span,
             )

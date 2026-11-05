@@ -205,7 +205,7 @@ impl Simulator {
             {
                 let mut stripped = hier.clone();
                 stripped.path.remove(0);
-                stripped.cached_signal_id = std::cell::Cell::new(None);
+                stripped.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                 let f = Expression::new(ExprKind::Ident(stripped), func.span);
                 return self.eval_call_inner(&f, args);
             }
@@ -3001,8 +3001,8 @@ impl Simulator {
                             root: None,
                             path: hier.path[..hier.path.len() - 1].to_vec(),
                             span: hier.span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
                         }),
                         func.span,
                     );

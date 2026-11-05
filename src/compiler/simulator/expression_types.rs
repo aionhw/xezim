@@ -1018,8 +1018,8 @@ impl Simulator {
             {
                 let mut nh = h.clone();
                 nh.path[0].name.name = "this".to_string();
-                nh.cached_signal_id = std::cell::Cell::new(None);
-                nh.cached_resolved_name = std::cell::OnceCell::new();
+                nh.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                nh.cached_resolved_name = crate::ast::cache::NameCache::new();
                 Some(Expression::new(ExprKind::Ident(nh), e.span))
             }
             // Inside a method body the same text is a MemberAccess chain.

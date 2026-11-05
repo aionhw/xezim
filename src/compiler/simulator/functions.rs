@@ -39,7 +39,11 @@ impl Simulator {
         if let Some(rc) = self.fn_decl_cache.get(name) {
             return Some(rc.clone());
         }
-        let fd = self.module.functions.get(name)?.clone();
+        let mut fd = self.module.functions.get(name)?.clone();
+        // §13.4/§23.6: only called declarations materialize a private body.
+        // This cache has one lexical name, so memoized widths and resolved
+        // signals can be enabled without contaminating shared elaboration ASTs.
+        fd.items = crate::ast::cache::with_fresh_scope_caches(|| fd.items.to_vec()).into();
         let rc = std::rc::Rc::new(fd);
         self.fn_decl_cache.insert(name.to_string(), rc.clone());
         Some(rc)
@@ -74,7 +78,8 @@ impl Simulator {
         if let Some(rc) = self.task_decl_cache.get(name) {
             return Some(rc.clone());
         }
-        let td = self.module.tasks.get(name)?.clone();
+        let mut td = self.module.tasks.get(name)?.clone();
+        td.items = crate::ast::cache::with_fresh_scope_caches(|| td.items.to_vec()).into();
         let rc = std::rc::Rc::new(td);
         self.task_decl_cache.insert(name.to_string(), rc.clone());
         Some(rc)
@@ -1307,7 +1312,7 @@ impl Simulator {
             ExprKind::Ident(h) if h.path.len() >= 2 => {
                 let mut r = h.clone();
                 r.path.pop();
-                r.cached_signal_id = std::cell::Cell::new(None);
+                r.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                 (
                     Some(Expression::new(ExprKind::Ident(r), func.span)),
                     h.path[h.path.len() - 1].name.name.as_str(),
@@ -2764,3 +2769,7 @@ impl Simulator {
         spec
     }
 }
+
+#[cfg(test)]
+#[path = "callable_runtime_body_tests.rs"]
+mod callable_runtime_body_tests;

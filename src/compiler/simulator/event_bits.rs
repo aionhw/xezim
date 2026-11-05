@@ -395,7 +395,7 @@ fn int_literal(v: i64, span: crate::ast::Span) -> Expression {
             signed: false,
             base: NumberBase::Decimal,
             value: mag.to_string(),
-            cached_val: std::cell::Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     );
@@ -424,8 +424,8 @@ fn rooted_ident(name: &str, span: crate::ast::Span) -> Expression {
                 selects: Vec::new(),
             }],
             span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         }),
         span,
     )

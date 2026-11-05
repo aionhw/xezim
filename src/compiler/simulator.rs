@@ -47,6 +47,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::raw::c_void;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use xezim_core::elaborate::resolve_type_width;
@@ -2732,7 +2733,7 @@ impl ProcCont {
                         signed: false,
                         base: NumberBase::Decimal,
                         value: remaining.to_string(),
-                        cached_val: Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     count.span,
                 );
@@ -3933,6 +3934,15 @@ enum MemberCollKind {
     Plain { raws: Vec<String>, unbound: bool },
 }
 
+type PackedAggregateLayout = (Vec<(String, u32, u32)>, u32);
+
+#[derive(Debug)]
+struct ClassPackedLayouts {
+    // Keep the source alive for the lifetime of the pointer-keyed cache.
+    _declaration: Rc<crate::ast::types::StructUnionType>,
+    variants: Vec<(Vec<(String, Value)>, Rc<PackedAggregateLayout>)>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ClassInstance {
     class_name: String,
@@ -4395,7 +4405,7 @@ impl SvaNfaBuilder {
                 signed: false,
                 base: crate::ast::expr::NumberBase::Decimal,
                 value: "1".to_string(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             span,
         )
@@ -5519,8 +5529,8 @@ fn hier_prefix(
 ) -> crate::ast::expr::HierarchicalIdentifier {
     let mut p = h.clone();
     p.path.pop();
-    p.cached_signal_id = Cell::new(None);
-    p.cached_resolved_name = std::cell::OnceCell::new();
+    p.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+    p.cached_resolved_name = crate::ast::cache::NameCache::new();
     p
 }
 
@@ -6770,6 +6780,30 @@ pub struct Simulator {
     member_coll_cache: std::cell::RefCell<HashMap<String, HashMap<String, MemberCollKind>>>,
     /// Per class: properties that are NOT structs (see `class_prop_struct`).
     class_prop_struct_neg: std::cell::RefCell<HashMap<String, HashSet<String>>>,
+    /// Shared aggregate declarations per class and exact concrete type bindings.
+    /// Widths still use each object's value-parameter scope (§8.25).
+    #[serde(skip)]
+    #[allow(clippy::type_complexity)]
+    class_prop_struct_cache: std::cell::RefCell<
+        HashMap<
+            String,
+            Vec<(
+                HashMap<String, String>,
+                HashMap<String, Rc<crate::ast::types::StructUnionType>>,
+            )>,
+        >,
+    >,
+    /// Root packed layouts retain their declaration, so pointer keys cannot be
+    /// reused. Each value-parameter specialization gets its own dimensions.
+    #[serde(skip)]
+    class_packed_layout_cache: std::cell::RefCell<HashMap<usize, ClassPackedLayouts>>,
+    #[serde(skip)]
+    aggregate_type_work: [std::cell::Cell<u64>; 2],
+    #[serde(skip)]
+    aggregate_type_generation: std::cell::Cell<u64>,
+    /// Immutable class parameter names; values are always read from the object.
+    #[serde(skip)]
+    class_value_param_names: std::cell::RefCell<HashMap<String, Rc<Vec<String>>>>,
     name_stats: [std::cell::Cell<u64>; 5],
     name_stats_on: bool,
     frame_pool: Vec<HashMap<String, Value>>,

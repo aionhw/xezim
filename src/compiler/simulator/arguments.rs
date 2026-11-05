@@ -997,7 +997,7 @@ impl Simulator {
                                                 signed: true,
                                                 base: NumberBase::Decimal,
                                                 value: i.to_string(),
-                                                cached_val: std::cell::Cell::new(None),
+                                                cached_val: crate::ast::cache::LiteralCache::new(None),
                                             }),
                                             base.span,
                                         )),
@@ -1148,8 +1148,8 @@ impl Simulator {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
             }),
             span,
         );
@@ -1893,7 +1893,7 @@ impl Simulator {
                         } else {
                             i.to_string()
                         },
-                        cached_val: std::cell::Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     base.span,
                 )),
@@ -1917,8 +1917,8 @@ impl Simulator {
                     root: hier.root.clone(),
                     path,
                     span: base.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                 }),
                 base.span,
             );
@@ -2839,7 +2839,7 @@ impl Simulator {
                     signed: false,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: "0".to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 crate::ast::Span::dummy(),
             )
@@ -2994,7 +2994,7 @@ impl Simulator {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: n.to_string(),
-                    cached_val: Cell::new(Some((n as u64, 0u64, 64u32))),
+                    cached_val: crate::ast::cache::LiteralCache::new(Some((n as u64, 0u64, 64u32))),
                 }),
                 x.span,
             ))

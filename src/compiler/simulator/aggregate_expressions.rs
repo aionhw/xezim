@@ -481,8 +481,8 @@ impl Simulator {
             let mut identifier = h.clone();
             identifier.path.truncate(1);
             identifier.path[0].selects.clear();
-            identifier.cached_signal_id = Cell::new(None);
-            identifier.cached_resolved_name = std::cell::OnceCell::new();
+            identifier.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+            identifier.cached_resolved_name = crate::ast::cache::NameCache::new();
             std::borrow::Cow::Owned(Expression::new(ExprKind::Ident(identifier), cur.span))
         };
         if steps.is_empty() {

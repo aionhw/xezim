@@ -67,8 +67,8 @@ fn ident(name: &str, span: Span) -> Expression {
                 selects: Vec::new(),
             }],
             span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         }),
         span,
     )
@@ -171,8 +171,8 @@ fn split_value(e: &Expression, members: &Members) -> Option<Vec<Expression>> {
                             root: None,
                             path,
                             span: e.span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
                         }),
                         e.span,
                     );
@@ -263,7 +263,7 @@ impl Ctx<'_> {
                             signed: true,
                             base: NumberBase::Decimal,
                             value: len.to_string(),
-                            cached_val: std::cell::Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         span,
                     ))
@@ -775,6 +775,6 @@ pub(crate) fn scalarize_member_call(
     out.span = Span::new(fd.span.end, fd.span.end);
     out.return_type = sel_ty;
     out.ports = ports;
-    out.items = items;
+    out.items = items.into();
     Some((out, new_args))
 }

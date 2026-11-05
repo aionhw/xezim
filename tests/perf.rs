@@ -56,3 +56,6 @@ mod displaced_local_meta_reapply;
 
 #[path = "perf/const_index_array_arming.rs"]
 mod const_index_array_arming;
+
+#[path = "perf/class_aggregate_resolution.rs"]
+mod class_aggregate_resolution;

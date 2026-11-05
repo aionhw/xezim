@@ -223,8 +223,8 @@ impl Simulator {
             root: hier.root.clone(),
             path: hier.path[..keep].to_vec(),
             span: hier.span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         };
         let e = std::rc::Rc::new(Expression::new(ExprKind::Ident(base), hier.span));
         self.method_receiver_cache.insert(key, e.clone());
@@ -290,8 +290,8 @@ impl Simulator {
                 root: hier.root.clone(),
                 path: vec![hier.path[0].clone()],
                 span: hier.span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
             }),
             hier.span,
         );
@@ -687,8 +687,8 @@ impl Simulator {
             if !self.unit_scope_decl_exists(&hier.path[0].name.name) {
                 let mut stripped = hier.clone();
                 stripped.path[0].name.name = bare.to_string();
-                stripped.cached_signal_id = std::cell::Cell::new(None);
-                stripped.cached_resolved_name = std::cell::OnceCell::new();
+                stripped.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                stripped.cached_resolved_name = crate::ast::cache::NameCache::new();
                 let resolved = self.resolve_hier_name_uncached(&stripped);
                 let _ = hier.cached_resolved_name.set(resolved.clone());
                 return resolved;

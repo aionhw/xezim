@@ -455,8 +455,8 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span: arg.span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
                         }),
                         arg.span,
                     );
@@ -476,8 +476,8 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span: arg.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                 };
                 let resolved = self.resolve_hier_name(&ident).to_string();
                 if resolved != base
@@ -886,7 +886,7 @@ impl Simulator {
                 && self.static_struct_names.contains(prop)
                 && let Some(su) = self
                     .class_prop_struct(handle, prop)
-                    .filter(Self::spreads_member_wise)
+                    .filter(|su| Self::spreads_member_wise(su))
             {
                 return Some(self.render_p_class_prop_struct(handle, prop, &su));
             }
@@ -987,7 +987,7 @@ impl Simulator {
         }
         let su = self
             .class_prop_struct(handle, &prop)
-            .filter(Self::spreads_member_wise)?;
+            .filter(|su| Self::spreads_member_wise(su))?;
         let mut key = prop;
         for e in idx {
             let i = self.eval_expr(e).to_i64()?;
@@ -1185,14 +1185,14 @@ impl Simulator {
                 },
                 selects: Vec::new(),
             });
-            fh.cached_signal_id = std::cell::Cell::new(None);
-            fh.cached_resolved_name = std::cell::OnceCell::new();
+            fh.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+            fh.cached_resolved_name = crate::ast::cache::NameCache::new();
             out.push((
                 fname.clone(),
                 Expression {
                     kind: ExprKind::Ident(fh),
                     span: a.span,
-                    cached_width: std::cell::Cell::new(None),
+                    cached_width: crate::ast::cache::WidthCache::new(None),
                 },
             ));
         }
@@ -1298,13 +1298,13 @@ impl Simulator {
                 },
                 selects: Vec::new(),
             });
-            fh.cached_signal_id = std::cell::Cell::new(None);
-            fh.cached_resolved_name = std::cell::OnceCell::new();
+            fh.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+            fh.cached_resolved_name = crate::ast::cache::NameCache::new();
             let name = self.resolve_hier_name(&fh).into_owned();
             let fexpr = Expression {
                 kind: ExprKind::Ident(fh),
                 span: a.span,
-                cached_width: std::cell::Cell::new(None),
+                cached_width: crate::ast::cache::WidthCache::new(None),
             };
             out.push((name, fexpr));
         }

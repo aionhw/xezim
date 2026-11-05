@@ -3644,7 +3644,7 @@ impl Simulator {
                 return None;
             }
             match self.resolve_dt(&dt) {
-                DataType::Struct(inner) => level = inner,
+                DataType::Struct(inner) => level = Rc::new(inner),
                 _ => return None,
             }
         }
@@ -4415,7 +4415,7 @@ impl Simulator {
                         if self.signal_name_to_id.contains_key(scoped.as_str()) {
                             hier.path[0].name.name = scoped;
                             hier.cached_signal_id.set(None);
-                            hier.cached_resolved_name = std::cell::OnceCell::new();
+                            hier.cached_resolved_name = crate::ast::cache::NameCache::new();
                         }
                     }
                 }
@@ -4524,7 +4524,7 @@ impl Simulator {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: i.to_string(),
-                    cached_val: Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )

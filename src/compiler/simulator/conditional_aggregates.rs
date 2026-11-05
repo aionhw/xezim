@@ -297,7 +297,7 @@ impl Simulator {
                             LogicBit::Z => 'z',
                         })
                         .collect(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )
@@ -306,8 +306,8 @@ impl Simulator {
             ExprKind::Paren(inner) => return self.freeze_conditional_path(inner, evaluate),
             ExprKind::Ident(h) => {
                 let mut h = h.clone();
-                h.cached_signal_id = std::cell::Cell::new(None);
-                h.cached_resolved_name = std::cell::OnceCell::new();
+                h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                h.cached_resolved_name = crate::ast::cache::NameCache::new();
                 for seg in &mut h.path {
                     for sel in &mut seg.selects {
                         let value = if evaluate {

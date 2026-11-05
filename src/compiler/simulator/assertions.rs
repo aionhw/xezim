@@ -2977,7 +2977,7 @@ impl Simulator {
                                 signed: false,
                                 base: NumberBase::Decimal,
                                 value: id.to_string(),
-                                cached_val: Cell::new(None),
+                                cached_val: crate::ast::cache::LiteralCache::new(None),
                             }),
                             span,
                         )],
@@ -3089,7 +3089,7 @@ impl Simulator {
                     signed: false,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )

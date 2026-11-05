@@ -1605,7 +1605,7 @@ impl Simulator {
                 signed: true,
                 base: crate::ast::expr::NumberBase::Decimal,
                 value: v.to_string(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             f.span,
         );
@@ -2033,8 +2033,8 @@ impl Simulator {
                                         })
                                         .collect(),
                                         span: id.span,
-                                        cached_signal_id: std::cell::Cell::new(None),
-                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                        cached_resolved_name: crate::ast::cache::NameCache::new(),
                                     }),
                                     id.span,
                                 );

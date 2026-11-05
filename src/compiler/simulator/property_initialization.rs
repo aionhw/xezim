@@ -355,8 +355,8 @@ impl Simulator {
                                         selects: Vec::new(),
                                     }],
                                     span: crate::ast::Span::dummy(),
-                                    cached_signal_id: std::cell::Cell::new(None),
-                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                                 }),
                                 crate::ast::Span::dummy(),
                             );
@@ -396,7 +396,7 @@ impl Simulator {
             if let ExprKind::AssignmentPattern(items) = &init.kind
                 && let Some(su) = self
                     .class_prop_struct(handle, &pname)
-                    .filter(Self::spreads_member_wise)
+                    .filter(|su| Self::spreads_member_wise(su))
             {
                 let base =
                     Self::hier_ident_expr(Self::iface_path_segs(&pname, init.span), init.span);

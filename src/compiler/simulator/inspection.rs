@@ -21,6 +21,12 @@ impl Simulator {
         (self.active_force_evals, self.active_force_skips)
     }
 
+    /// Deterministic aggregate work: (specialized declarations resolved,
+    /// root packed layouts built). Repeated member accesses reuse both.
+    pub fn aggregate_type_work_counters(&self) -> (u64, u64) {
+        (self.aggregate_type_work[0].get(), self.aggregate_type_work[1].get())
+    }
+
     pub fn get_signal(&self, name: &str) -> Option<&Value> {
         if let Some(&id) = self.signal_name_to_id.get(name) {
             return Some(&self.signal_table[id]);

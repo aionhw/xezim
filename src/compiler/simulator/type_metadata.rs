@@ -2196,13 +2196,13 @@ impl Simulator {
                 }
                 let mut base = h.clone();
                 let last = base.path.pop()?;
-                base.cached_signal_id = std::cell::Cell::new(None);
-                base.cached_resolved_name = std::cell::OnceCell::new();
+                base.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                base.cached_resolved_name = crate::ast::cache::NameCache::new();
                 Some((
                     Expression {
                         kind: ExprKind::Ident(base),
                         span: e.span,
-                        cached_width: std::cell::Cell::new(None),
+                        cached_width: crate::ast::cache::WidthCache::new(None),
                     },
                     last.name.name,
                 ))

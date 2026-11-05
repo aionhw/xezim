@@ -356,8 +356,8 @@ impl Simulator {
                                         selects: Vec::new(),
                                     }],
                                     span: crate::ast::Span::dummy(),
-                                    cached_signal_id: std::cell::Cell::new(None),
-                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                                 }),
                                 ca.lhs.span,
                             );
@@ -396,8 +396,8 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
                         }),
                         span,
                     );
@@ -1103,8 +1103,8 @@ impl Simulator {
                             })
                             .collect(),
                         span: crate::ast::Span::dummy(),
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
                     };
                     let saved_hint = self.name_resolve_hint.borrow().clone();
                     *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
@@ -1473,8 +1473,8 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
                         };
                         let saved = self.name_resolve_hint.borrow().clone();
                         if !ab.scope.is_empty() {

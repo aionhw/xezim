@@ -68,7 +68,7 @@ fn deferred_bound_fold_failure_retains_evaluator_fallback() {
                 signed: false,
                 base: NumberBase::Decimal,
                 value: value.into(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             crate::ast::Span::dummy(),
         )

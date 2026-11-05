@@ -489,7 +489,7 @@ fn int_lit(v: i64) -> Expression {
             signed: true,
             base: NumberBase::Decimal,
             value: v.unsigned_abs().to_string(),
-            cached_val: std::cell::Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     );
@@ -1244,8 +1244,8 @@ fn ident_expr(id: &crate::ast::Identifier) -> Expression {
                 selects: Vec::new(),
             }],
             span: id.span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         }),
         id.span,
     )

@@ -1034,8 +1034,8 @@ impl Simulator {
                 let mut head = h.clone();
                 head.path.truncate(1);
                 let index = head.path[0].selects.pop()?;
-                head.cached_signal_id = std::cell::Cell::new(None);
-                head.cached_resolved_name = std::cell::OnceCell::new();
+                head.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                head.cached_resolved_name = crate::ast::cache::NameCache::new();
                 let arr = Expression::new(ExprKind::Ident(head), e.span);
                 (
                     Expression::new(
