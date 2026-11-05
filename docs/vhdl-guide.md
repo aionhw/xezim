@@ -268,14 +268,16 @@ calls of procedures that wait or assign signals from outside a process,
 forcing part of a signal,
 external variable names and package paths (`@lib.pkg`) in external names,
 ranges in the choices of `case?`, READ of a TEXT file (READLINE is
-supported), WRITE of a REAL with a FORMAT (VHDL-2019), and across the
-language boundary inout ports, records and multi-dimensional arrays. A NUL character in a report message is dropped (GHDL prints
-it).
+supported), WRITE of a REAL with a FORMAT (VHDL-2019), and `inout` ports
+across the language boundary. A NUL character in a report message is
+dropped (GHDL prints it).
 
 ## Verification
 
 Every design under `tests/vhdl/designs/` is checked against GHDL 4.1's
-output and exit status (`*.golden`, `*.exit`, made by `regen.sh`). The
+output and exit status (`*.golden`, `*.exit`, made by `regen.sh`); a
+design's GHDL run options are in `<name>.args`, settings only xezim reads
+(environment lines such as `XEZIM_METHOD_TIER=0`) in `<name>.env`. The
 group is behind a feature, so plain `cargo test` skips it:
 
     cargo test --features vhdl-tests --test vhdl

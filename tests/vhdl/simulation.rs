@@ -1,7 +1,9 @@
 //! VHDL designs simulated end to end: each `designs/<name>.vhd` runs through
 //! `xezim` and its output and exit status must equal `designs/<name>.golden`
 //! and `designs/<name>.exit`, produced by GHDL 4.1 (`designs/regen.sh`). A
-//! difference is a semantic or formatting difference from GHDL.
+//! difference is a semantic or formatting difference from GHDL. GHDL run
+//! options go in `designs/<name>.args`, simulator settings that only xezim
+//! reads (`KEY=VALUE` environment lines) in `designs/<name>.env`.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -20,8 +22,11 @@ fn check(name: &str) {
     std::fs::copy(dir.join(&src), run_dir.join(&src)).expect("copy design");
     // Run options (GHDL's), if the design has any.
     let opts = std::fs::read_to_string(dir.join(format!("{}.args", name))).unwrap_or_default();
+    // Simulator settings (`KEY=VALUE` lines), if the design needs any.
+    let env = std::fs::read_to_string(dir.join(format!("{}.env", name))).unwrap_or_default();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .current_dir(&run_dir)
+        .envs(env.lines().filter_map(|l| l.split_once('=')))
         .arg("--no-cache")
         .args(opts.split_whitespace())
         .arg(&src)
@@ -255,6 +260,15 @@ fn counter_tb() {
 #[test]
 fn numeric_div() {
     check("numeric_div");
+}
+
+/// A non-static slice inside a scalar function (§8.5), with the function
+/// compiled on its first call (`.env`). The slice is an unpacked struct with
+/// a dynamic array; a compiled call passing it as flat bits gave the callee
+/// an empty array and a slice direction mismatch (#884).
+#[test]
+fn slice_in_hot_fn() {
+    check("slice_in_hot_fn");
 }
 
 /// For-, if-/elsif-/else- and case-generate statements (§11.8): one block
