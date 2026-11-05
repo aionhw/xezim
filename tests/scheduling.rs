@@ -435,6 +435,8 @@ mod clocking_select_clockvars;
 
 #[path = "scheduling/always_property.rs"]
 mod always_property;
+#[path = "scheduling/assign_call_operand_wakeup.rs"]
+mod assign_call_operand_wakeup;
 #[path = "scheduling/class_collection_named_wait.rs"]
 mod class_collection_named_wait;
 

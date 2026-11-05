@@ -444,6 +444,33 @@ impl Simulator {
         v
     }
 
+    /// Whether the callee `func` of a call is a plain name of a function the
+    /// design declares (here or, inlined, under an instance prefix).
+    fn names_declared_function(func: &Expression, module: &ElaboratedModule) -> bool {
+        let ExprKind::Ident(hier) = &func.kind else {
+            return false;
+        };
+        let Some(seg) = hier.path.last() else {
+            return false;
+        };
+        if hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return false;
+        }
+        let name = seg.name.name.as_str();
+        if module.functions.contains_key(name)
+            || module
+                .functions
+                .contains_key(&Self::resolve_hier_name_static(hier, module))
+        {
+            return true;
+        }
+        let suffix = format!(".{name}");
+        module
+            .functions
+            .keys()
+            .any(|k| k.ends_with(suffix.as_str()))
+    }
+
     /// The reads of the function `name` a call reaches (`collect_function_reads`).
     /// Inside another function's body they go to that function's
     /// `CALLEE_READS` sink, apart from its own reads, so its frame names
@@ -1093,7 +1120,14 @@ impl Simulator {
                 }
             }
             ExprKind::Call { func, args } => {
-                Self::collect_expr_reads(func, module, reads);
+                // §13.4: the name of a declared function is not a variable
+                // the call reads (its reads are the callee's, collected
+                // below). Collected, it never resolved, and the entry was
+                // re-evaluated on every settle: `assign ca = now(b)` reran
+                // whenever any net changed, its `$time` reading a later time.
+                if !Self::names_declared_function(func, module) {
+                    Self::collect_expr_reads(func, module, reads);
+                }
                 for a in args {
                     Self::collect_expr_reads(a, module, reads);
                 }
