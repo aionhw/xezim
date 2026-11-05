@@ -1686,6 +1686,8 @@ impl<'a> Ck<'a> {
         let rt = match typed_new_class(rhs) {
             Some(c) if self.is_class_name(c) => Ty::Class(c.into()),
             Some(_) => return,
+            // §7.6: `(x + 1)` is as scalar as `x + 1` to an unpacked array.
+            None if matches!(lt, Ty::Unpacked { .. }) => self.ty_of(peel_parens(rhs)),
             None => self.ty_of(rhs),
         };
         if let Some(why) = self.incompatible(lt, &rt) {
@@ -2957,6 +2959,14 @@ fn is_new_call(e: &Expression) -> bool {
     matches!(&id.kind, ExprKind::Ident(h)
         if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty()
             && h.path[0].name.name == "new")
+}
+
+/// `e` without enclosing parentheses.
+fn peel_parens(mut e: &Expression) -> &Expression {
+    while let ExprKind::Paren(inner) = &e.kind {
+        e = inner;
+    }
+    e
 }
 
 /// `C::new` / `C::new(args)`: the class it constructs.
