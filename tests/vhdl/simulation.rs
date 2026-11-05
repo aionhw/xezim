@@ -271,6 +271,31 @@ fn slice_in_hot_fn() {
     check("slice_in_hot_fn");
 }
 
+/// An element of an unconstrained three-dimensional formal and of a record
+/// field constrained by its signal (§5.3.2.2, §8.4); `front_end.rs` checks
+/// that the element's prefix is evaluated once.
+#[test]
+fn multidim_formal_index() {
+    check("multidim_formal_index");
+}
+
+/// A signal of an array of unconstrained arrays constrained by its
+/// declaration (§5.3.2.2): its elements are stored as structs, and the
+/// drivers of its parts and its `'EVENT` tests must use them that way.
+#[test]
+fn elem_constraint_signal() {
+    check("elem_constraint_signal");
+}
+
+/// Sensitivity to one element of a nested array of records: a concurrent
+/// assignment's implicit list, `wait on` and 'STABLE (§11.3, §10.2,
+/// §16.2.4). Reading the element needs a temporary, which belongs to the
+/// kernel's test (xezim-core #147).
+#[test]
+fn sens_nested_record() {
+    check("sens_nested_record");
+}
+
 /// For-, if-/elsif-/else- and case-generate statements (§11.8): one block
 /// per iteration with its own signals, processes and instances, elaborated
 /// depth-first in iteration order (§14.5.3).

@@ -110,3 +110,28 @@ fn guarded_signal_errors_are_located() {
         assert!(text.contains(e), "{}\n{}", e, text);
     }
 }
+
+/// An element of a multi-dimensional array whose bounds are known only at
+/// run time evaluates its prefix once: inline, each dimension past the
+/// first wrote the prefix out for the element and each bound, four times
+/// per dimension (xezim-core #149).
+#[test]
+fn multidim_index_prefix_once() {
+    let (out, text) = xezim(
+        &["designs/multidim_formal_index.vhd"],
+        &[("XEZIM_VHDL_DUMP", "1")],
+    );
+    assert!(out.status.success(), "{}", text);
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.contains("function automatic") && l.contains("_get("))
+        .expect("the lowered get function");
+    let ret = lines[at + 1];
+    assert!(ret.trim_start().starts_with("return "), "{}", ret);
+    let x = ret
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .find(|w| w.ends_with("_x"))
+        .expect("the formal x");
+    assert_eq!(ret.matches(&format!("{}.d[", x)).count(), 1, "{}", ret);
+}

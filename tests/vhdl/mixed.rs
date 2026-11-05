@@ -112,3 +112,12 @@ fn mixed_slice_actual() {
 fn mixed_array_of_arrays() {
     check("mixed_array_of_arrays");
 }
+
+/// A three-dimensional array of records leaving VHDL as one packed vector
+/// (`mixed_nested_record_port.lrm`), copied out of a record field; an
+/// element read by a concurrent assignment, whose sensitivity test needs a
+/// temporary of its own (xezim-core #147).
+#[test]
+fn mixed_nested_record_port() {
+    check("mixed_nested_record_port");
+}

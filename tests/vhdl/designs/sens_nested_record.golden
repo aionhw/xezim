@@ -1,0 +1,3 @@
+sens_nested_record.vhd:33:5:@2ns:(report note): v='1' n=0 stable=true
+sens_nested_record.vhd:39:5:@4ns:(report note): v='1' n=1 stable=false
+sens_nested_record.vhd:44:5:@14ns:(report note): v='0' n=2 stable=true
