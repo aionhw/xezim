@@ -2633,11 +2633,11 @@ impl Simulator {
                     // flop inside a generate-array instance whose clock the
                     // parent substitutes as a hierarchical name was dead.
                     let ee_idx;
-                    let ee = match self.indexed_hier_flat_name(&ee.expr) {
-                        Some(flat) => {
+                    let ee = match self.fold_indexed_hier_path(&ee.expr) {
+                        Some(folded) => {
                             ee_idx = crate::ast::stmt::EventExpr {
                                 edge: ee.edge,
-                                expr: Self::flat_name_ident(flat, ee.expr.span),
+                                expr: folded,
                                 iff: ee.iff.clone(),
                                 span: ee.span,
                             };

@@ -26,9 +26,22 @@ impl Simulator {
     /// element (`a[2].b` of a 2-D vector) or any path with no stored signal
     /// is left exactly as it was. A non-constant select cannot name a
     /// generate scope (§27.5), so such a path is left alone too.
+    ///
+    /// A select on the leaf (`g[0].u.c[0]`, `g[0].u.c[2:1]`) stays a select
+    /// of the folded name, the shape `u.c[0]` already has.
     pub(super) fn fold_indexed_hier_path(&self, e: &Expression) -> Option<Expression> {
-        let flat = self.indexed_hier_flat_name(e)?;
-        Some(Self::flat_name_ident(flat, e.span))
+        if let Some(flat) = self.indexed_hier_flat_name(e) {
+            return Some(Self::flat_name_ident(flat, e.span));
+        }
+        let (ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. }) = &e.kind else {
+            return None;
+        };
+        let base = self.fold_indexed_hier_path(expr)?;
+        let mut out = e.clone();
+        if let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &mut out.kind {
+            **expr = base;
+        }
+        Some(out)
     }
 
     /// An `Ident` whose single segment is already the fully-qualified stored
