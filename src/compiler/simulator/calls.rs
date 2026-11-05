@@ -2696,9 +2696,14 @@ impl Simulator {
                 if matches!(method_name.as_str(), "rand_mode" | "constraint_mode") {
                     let mname = method_name.clone();
                     // Resolve obj_name to a heap handle.
+                    // §18.8/§18.9: the object is the one in the current
+                    // automatic frame, before any same-named design signal.
                     let h_val = self
-                        .get_signal_value_by_name(obj_name)
-                        .map(|v| v.to_u64().unwrap_or(0) as usize)
+                        .eval_ident_handle(obj_name)
+                        .or_else(|| {
+                            self.get_signal_value_by_name(obj_name)
+                                .map(|v| v.to_u64().unwrap_or(0) as usize)
+                        })
                         .unwrap_or(0);
                     if h_val != 0 && self.heap.get(h_val).and_then(|x| x.as_ref()).is_some() {
                         // Middle segments name the targeted prop/constraint;

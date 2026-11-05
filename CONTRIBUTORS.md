@@ -34,7 +34,10 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   part-select actuals, declared index order of instance arrays, packed
   typedef array dimensions, package-scoped typed assignment patterns and
   package arrays of structs indexed at run time, with simulator and core
-  regression tests.
+  regression tests, and wildcard connections to non-ANSI module ports.
+- **[Chuanseng Ng](https://github.com/chuanseng-ng)** — array parameter shapes
+  in generate scopes and compiled stores to multidimensional unpacked array
+  elements, with regressions for packed widths and branch-dependent indices.
 - **Vrajesh Prakhya** — real-number modelling: Verilog-AMS `wreal` nets
   resolved by summing, user-defined nettypes across the hierarchy and in
   packages (§6.6.7, §6.6.8), real-ness of members projected from call results,
@@ -141,7 +144,9 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   collections as locator receivers, string keys ordered as strings, and enum
   labels in `%p` of a locator result (§7.8, §7.12, §21.2.1.6); and time
   literals and `$time` in packages and `$unit` scopes scaled by their own
-  time unit (§3.14.2.3).
+  time unit (§3.14.2.3); shared package import bindings, type-aware prepared
+  body keys and narrower parameter lookups during elaboration; and `$` queue
+  selects evaluated with their own queue bounds in compiled code (§7.10).
 
 ## Bug reports
 

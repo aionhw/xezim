@@ -92,6 +92,9 @@ pub(crate) struct FnFacts {
 /// counter and falls back before an ID would overflow this representation.
 pub type RegId = u16;
 
+/// Unpacked two-dimensional bounds and the width of one element.
+type Array2dShape = ((i64, i64), (i64, i64), u32);
+
 /// A signal-table index inside an instruction. `u32`, not `usize`: the
 /// largest design measured here has 35.1 M signals and `u32` covers 4.29 B,
 /// so the extra four bytes per field were pure footprint. Fourteen `Insn`
@@ -6682,7 +6685,7 @@ impl<'a> BytecodeCompiler<'a> {
     fn arrays_2d_entry(
         &self,
         hier: &crate::ast::expr::HierarchicalIdentifier,
-    ) -> Option<(String, ((i64, i64), (i64, i64), u32))> {
+    ) -> Option<(String, Array2dShape)> {
         let raw = Self::hier_raw_name(hier);
         let arrays_2d = self.arrays_2d?;
         arrays_2d
@@ -12317,7 +12320,33 @@ impl<'a> BytecodeCompiler<'a> {
         Some(true)
     }
 
+    /// An assignment or increment whose target select holds `$`.
+    fn writes_through_dollar(stmt: &Statement) -> bool {
+        use crate::compiler::simulator::Simulator;
+        let target = match &stmt.kind {
+            StatementKind::BlockingAssign { lvalue, .. }
+            | StatementKind::NonblockingAssign { lvalue, .. } => lvalue,
+            StatementKind::Expr(e) => match &e.kind {
+                ExprKind::AssignExpr { lvalue, .. } => lvalue,
+                ExprKind::Unary {
+                    op: UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr,
+                    operand,
+                } => operand,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        Simulator::select_mentions_dollar(target)
+    }
+
     fn compile_stmt_strict(&mut self, stmt: &Statement) -> bool {
+        // §7.10: a target whose select holds `$` goes to the interpreter
+        // whole; `assign_value` binds each `$` to its own base before it
+        // stores.
+        if Self::writes_through_dollar(stmt) {
+            self.bail("dollar_lvalue");
+            return false;
+        }
         if let Some(done) = self.compile_unpacked_struct_copy(stmt) {
             if !done {
                 self.bail("Stmt_unpacked_struct_whole");
@@ -14356,6 +14385,20 @@ impl<'a> BytecodeCompiler<'a> {
         ctx_width: u32,
         unsigned_context: bool,
     ) -> Option<RegId> {
+        // §7.10: `$` is the last index of the queue its select indexes. The
+        // interpreter evaluates a select chain holding one whole, binding each
+        // `$` to its own base.
+        if matches!(
+            expr.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
+        ) && crate::compiler::simulator::Simulator::select_mentions_dollar(expr)
+        {
+            let dest = self.emit_expr_fallback(expr, ctx_width, "dollar_select");
+            if dest.is_none() {
+                self.bail("dollar_select");
+            }
+            return dest;
+        }
         if let Some(id) = self.const_multi_dim_array_elem_signal_id(expr) {
             let dest = self.alloc_reg();
             if self.signal_signed[id] {
@@ -17296,6 +17339,11 @@ impl<'a> BytecodeCompiler<'a> {
                 self.next_reg = first_reg;
                 self.emit_expr_fallback(expr, ctx_width, "Expr_Call_impure")
             }
+            // `$` outside a select has no queue bound here (§7.10).
+            ExprKind::Dollar => {
+                self.bail("dollar_outside_select");
+                None
+            }
             other => {
                 let n: &'static str = match other {
                     ExprKind::StringLiteral(_) => "Expr_StringLiteral",
@@ -19602,13 +19650,11 @@ impl<'a> BytecodeCompiler<'a> {
                     // the RHS of a continuous assign or always_comb write to
                     // a wider element before the store ever saw it.
                     w
-                } else if let Some(w) = self.multi_dim_unpacked_elem_width(lhs) {
+                } else {
                     // §7.4.5, §11.6.1: `a[i][j] <= v` on a multidimensional
                     // unpacked array. The 32-bit default below cut the value
                     // before the store, whatever the element's type.
-                    w
-                } else {
-                    32
+                    self.multi_dim_unpacked_elem_width(lhs).unwrap_or(32)
                 }
             }
             ExprKind::RangeSelect {

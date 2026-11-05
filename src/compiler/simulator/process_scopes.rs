@@ -2549,30 +2549,36 @@ impl Simulator {
         }
     }
 
-    /// Does any INDEX or RANGE bound inside this lvalue mention `$`? Scans the
-    /// whole lvalue tree, unlike `expr_contains_dollar`, which only looks at
+    /// Does any INDEX or RANGE bound of this select chain mention `$`? Scans
+    /// the whole chain, unlike `expr_contains_dollar`, which only looks at
     /// one index expression.
-    pub(super) fn lvalue_mentions_dollar(e: &Expression) -> bool {
+    pub(crate) fn select_mentions_dollar(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Index { expr, index } => {
-                Self::expr_contains_dollar(index) || Self::lvalue_mentions_dollar(expr)
+                Self::expr_contains_dollar(index) || Self::select_mentions_dollar(expr)
             }
             ExprKind::RangeSelect {
                 expr, left, right, ..
             } => {
                 Self::expr_contains_dollar(left)
                     || Self::expr_contains_dollar(right)
-                    || Self::lvalue_mentions_dollar(expr)
+                    || Self::select_mentions_dollar(expr)
             }
-            ExprKind::Paren(i) => Self::lvalue_mentions_dollar(i),
-            ExprKind::MemberAccess { expr, .. } => Self::lvalue_mentions_dollar(expr),
+            ExprKind::Paren(i) => Self::select_mentions_dollar(i),
+            ExprKind::MemberAccess { expr, .. } => Self::select_mentions_dollar(expr),
+            // `$root.top.q[$].f`: a select inside the path.
+            ExprKind::Ident(h) => h
+                .path
+                .iter()
+                .flat_map(|seg| &seg.selects)
+                .any(Self::expr_contains_dollar),
             _ => false,
         }
     }
 
     /// Rewrite every `$`-bearing index/range bound in an lvalue into a literal,
     /// each evaluated against ITS OWN base's bound. Returns a clone; only
-    /// called when `lvalue_mentions_dollar` says there is work to do.
+    /// called when `select_mentions_dollar` says there is work to do.
     pub(super) fn resolve_dollar_in_lvalue(&mut self, e: &Expression) -> Expression {
         let lit = |v: i64, span| {
             Expression::new(
@@ -2672,27 +2678,65 @@ impl Simulator {
         }
     }
 
-    /// Does this expression mention `$` (§11.4.12 — the last index of the
-    /// collection being indexed)? Used to decide whether an lvalue index has to
-    /// be evaluated with a `dollar_bound` installed.
+    /// Does this index expression mention `$` (§7.10), the last index of the
+    /// collection it indexes? The index of a nested select binds its own `$`,
+    /// so the walk takes only that select's base. Every kind is listed, so a
+    /// new one has to decide.
     pub(super) fn expr_contains_dollar(e: &Expression) -> bool {
+        let one = |x: &Expression| Self::expr_contains_dollar(x);
+        let opt = |x: &Option<Box<Expression>>| x.as_deref().is_some_and(one);
+        let any = |xs: &[Expression]| xs.iter().any(one);
         match &e.kind {
             ExprKind::Dollar => true,
-            ExprKind::Paren(i) => Self::expr_contains_dollar(i),
-            ExprKind::Unary { operand, .. } => Self::expr_contains_dollar(operand),
-            ExprKind::Binary { left, right, .. } => {
-                Self::expr_contains_dollar(left) || Self::expr_contains_dollar(right)
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => one(expr),
+            ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. }
+            | ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::Specialization { base: x, .. }
+            | ExprKind::Matches { expr: x, .. }
+            | ExprKind::ShallowCopy { source: x }
+            | ExprKind::TypedPattern { pattern: x, .. }
+            | ExprKind::RandomizeWith { call: x, .. }
+            | ExprKind::SvaClocked { body: x, .. } => one(x),
+            ExprKind::Binary {
+                left: a, right: b, ..
             }
+            | ExprKind::Range(a, b)
+            | ExprKind::WithClause { expr: a, filter: b }
+            | ExprKind::AssignExpr {
+                lvalue: a,
+                rvalue: b,
+            } => one(a) || one(b),
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
-            } => {
-                Self::expr_contains_dollar(condition)
-                    || Self::expr_contains_dollar(then_expr)
-                    || Self::expr_contains_dollar(else_expr)
-            }
-            _ => false,
+            } => one(condition) || one(then_expr) || one(else_expr),
+            // Casts (`int'($)`, `$signed($)`) parse as calls.
+            ExprKind::Call { func, args } => one(func) || any(args),
+            ExprKind::SystemCall { args, .. } | ExprKind::Concatenation(args) => any(args),
+            ExprKind::Replication { count, exprs } => one(count) || any(exprs),
+            ExprKind::Inside { expr, ranges } => one(expr) || any(ranges),
+            ExprKind::StreamOp {
+                slice_size, exprs, ..
+            } => opt(slice_size) || any(exprs),
+            ExprKind::NamedArg { expr, .. } => opt(expr),
+            ExprKind::Tagged { inner, .. } => opt(inner),
+            ExprKind::AssignmentPattern(items) => items.iter().any(|item| match item {
+                AssignmentPatternItem::Ordered(x)
+                | AssignmentPatternItem::Named(_, x)
+                | AssignmentPatternItem::Typed(_, x)
+                | AssignmentPatternItem::Default(x) => one(x),
+                AssignmentPatternItem::Keyed(k, x) => one(k) || one(x),
+            }),
+            // A select in a hierarchical path segment binds its own `$`.
+            ExprKind::Ident(_)
+            | ExprKind::Number(_)
+            | ExprKind::StringLiteral(_)
+            | ExprKind::TypeLiteral(_)
+            | ExprKind::Null
+            | ExprKind::This
+            | ExprKind::Empty => false,
         }
     }
 

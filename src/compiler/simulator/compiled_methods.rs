@@ -4461,6 +4461,14 @@ impl Simulator {
     /// name accessed inside a method — the current `this` instance's property
     /// map. Returns the raw handle value (caller checks mailboxes/semaphores).
     pub(super) fn resolve_container_handle(&self, obj_name: &str) -> Option<usize> {
+        // §6.21/§23.9: an automatic local (including a null handle) hides
+        // a same-named module variable. Use the class/local lookup before
+        // resolving a bare receiver through the design's signal table.
+        if !obj_name.contains('.')
+            && let Some(handle) = self.eval_ident_handle(obj_name)
+        {
+            return Some(handle);
+        }
         if let Some(v) = self.get_signal_value_by_name(obj_name) {
             return Some(v.to_u64().unwrap_or(0) as usize);
         }
