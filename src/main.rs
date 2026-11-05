@@ -199,7 +199,7 @@ fn print_usage() {
     eprintln!("  -D <name>[=val]  Define a macro");
     eprintln!("  -uvm, --uvm      Add the UVM library named by XEZIM_UVM_DIR (its src include");
     eprintln!("                   dir and uvm_pkg.sv); XEZIM_UVM_VERSION picks a release");
-    eprintln!("  -s <topmodule>   Specify the top-level module to elaborate");
+    eprintln!("  -s, -top <top>   Specify the top-level module to elaborate");
     eprintln!("  --no-sim         Alias for --compile (deprecated)");
     eprintln!("  --preprocess     Run the preprocessor only; emit expanded text");
     eprintln!("  --dump-tokens    With --parse, print the token stream");
@@ -961,13 +961,13 @@ fn process_command_file(
                 continue;
             }
             match t {
-                "-s" => {
+                "-s" | "-top" => {
                     i += 1;
                     let top = toks
                         .get(i)
                         .filter(|top| !top.is_empty() && !top.starts_with('-'))
                         .ok_or_else(|| {
-                            format!("-s requires a top module (in args file '{}')", path)
+                            format!("{} requires a top module (in args file '{}')", t, path)
                         })?;
                     top_modules.push(top.clone());
                 }
@@ -2254,7 +2254,7 @@ fn run_main() -> i32 {
             _ if arg.starts_with("-l") && arg.len() > 2 => {
                 log_file = Some(arg[2..].to_string());
             }
-            "-s" => {
+            "-s" | "-top" => {
                 i += 1;
                 if i < args.len() {
                     top_modules.push(args[i].clone());
