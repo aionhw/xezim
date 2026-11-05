@@ -598,3 +598,6 @@ mod prepared_scope_memory_721;
 
 #[path = "misc/read_before_decl_819.rs"]
 mod read_before_decl_819;
+
+#[path = "misc/nonvhdl_issue_regressions.rs"]
+mod nonvhdl_issue_regressions;

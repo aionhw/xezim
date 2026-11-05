@@ -3004,11 +3004,10 @@ impl Simulator {
             // `self.mailboxes` (keyed by handle), not in `obj[i]` signal slots.
             // This expression path (e.g. `m.num()` inside `$display(...)`) must
             // resolve the handle before falling back to the queue/assoc count.
-            if let Some(handle_val) = self.get_signal_value_by_name(obj_name) {
-                let handle = handle_val.to_u64().unwrap_or(0) as usize;
-                if let Some(q) = self.mailboxes.get(&handle) {
-                    return Some(Self::int_count(q.len() as u64));
-                }
+            if let Some(handle) = self.resolve_container_handle(obj_name)
+                && let Some(q) = self.mailboxes.get(&handle)
+            {
+                return Some(Self::int_count(q.len() as u64));
             }
             // Count distinct TOP-LEVEL keys: for `obj[KEY]` storage this is
             // just the element count (== queue/dynamic-array size), but for

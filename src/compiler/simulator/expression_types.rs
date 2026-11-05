@@ -657,9 +657,16 @@ impl Simulator {
                     .get(base)
                     .is_some_and(|cd| cd.declaring_module.is_some()) =>
             {
-                format!("class {}", self.hier_path(base).replace('.', "/"))
+                let (path, leaf) = base.rsplit_once('.').unwrap_or(("", base));
+                let leaf = leaf.rsplit_once("::").map_or(leaf, |(_, name)| name);
+                let visible = if path.is_empty() {
+                    leaf.to_string()
+                } else {
+                    format!("{path}.{leaf}")
+                };
+                format!("class {}", self.hier_path(&visible).replace('.', "/"))
             }
-            None => format!("class {}", base),
+            None => format!("class {}", self.class_source_name(base)),
         }
     }
 
@@ -668,6 +675,15 @@ impl Simulator {
     /// spelling `pkg::C` (§26.3, see `xezim_core::pkg_scope`); this strips
     /// that prefix again for output that names the class.
     pub(super) fn class_source_name<'a>(&self, base: &'a str) -> &'a str {
+        if self
+            .module
+            .classes
+            .get(base)
+            .is_some_and(|cd| cd.declaring_module.is_some())
+            && let Some((_, name)) = base.rsplit_once("::")
+        {
+            return name;
+        }
         self.module
             .class_decl_pkg
             .get(base)

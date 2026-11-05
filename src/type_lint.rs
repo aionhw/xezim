@@ -80,6 +80,7 @@ enum Ty {
         short: bool,
     },
     Str,
+    Event,
     Class(Rc<str>),
     Null,
     Void,
@@ -151,6 +152,7 @@ impl Ty {
             Ty::Real { short: true } => "shortreal".into(),
             Ty::Real { short: false } => "real".into(),
             Ty::Str => "string".into(),
+            Ty::Event => "event".into(),
             Ty::Class(c) => format!("class {c}"),
             Ty::Null => "null".into(),
             Ty::Void => "void".into(),
@@ -285,6 +287,13 @@ struct ClassInfo {
     props: HashMap<String, Ty>,
     types: HashMap<String, Ty>,
     methods: HashMap<String, Rc<Sig>>,
+    params: Vec<ClassParam>,
+}
+
+#[derive(Clone)]
+struct ClassParam {
+    name: String,
+    is_type: bool,
 }
 
 #[derive(Default)]
@@ -495,6 +504,10 @@ impl<'a> Ck<'a> {
                 kind: SimpleType::String,
                 ..
             } => Ty::Str,
+            DataType::Simple {
+                kind: SimpleType::Event,
+                ..
+            } => Ty::Event,
             DataType::Simple { .. } => Ty::Unknown,
             DataType::Void(_) => Ty::Void,
             DataType::Enum(et) => self.resolve_enum(et, None),
@@ -524,6 +537,7 @@ impl<'a> Ck<'a> {
                 type_args,
                 ..
             } => {
+                self.check_class_type_args(&name.name.name, type_args);
                 if !dimensions.is_empty() || !type_args.is_empty() {
                     return Ty::Unknown;
                 }
@@ -993,6 +1007,114 @@ impl<'a> Ck<'a> {
             props,
             types,
             methods,
+            params: c
+                .params
+                .iter()
+                .flat_map(|p| match &p.kind {
+                    ParameterKind::Data { assignments, .. } => assignments
+                        .iter()
+                        .map(|a| ClassParam {
+                            name: a.name.name.clone(),
+                            is_type: false,
+                        })
+                        .collect::<Vec<_>>(),
+                    ParameterKind::Type { assignments } => assignments
+                        .iter()
+                        .map(|a| ClassParam {
+                            name: a.name.name.clone(),
+                            is_type: true,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    /// §6.20.2/§8.25: a type actual must denote a declared type. A default
+    /// type is not a subtype bound, and omitted actuals may use defaults.
+    fn check_class_type_args(&mut self, name: &str, args: &[Expression]) {
+        if args.is_empty() {
+            return;
+        }
+        let Some(params) = self.class(name).map(|c| c.params.clone()) else {
+            return;
+        };
+        for (i, actual) in args.iter().enumerate() {
+            let (param, actual) = match &actual.kind {
+                ExprKind::NamedArg {
+                    name,
+                    expr: Some(value),
+                } => (params.iter().find(|p| p.name == name.name), value.as_ref()),
+                ExprKind::NamedArg { .. } => continue,
+                _ => (params.get(i), actual),
+            };
+            if param.is_some_and(|p| p.is_type) {
+                self.check_type_actual(actual);
+            }
+        }
+    }
+
+    fn check_type_actual(&mut self, actual: &Expression) {
+        let unknown = match &actual.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                Some(h.path[0].name.name.as_str())
+            }
+            ExprKind::TypeLiteral(dt) => {
+                if let DataType::TypeReference { name, .. } = dt.as_ref() {
+                    if name.scopes.is_empty() {
+                        Some(name.name.name.as_str())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(n) = unknown {
+            // Virtual interface types are retained as source text by the
+            // parser; their names and parameters need interface resolution.
+            if !n.starts_with("virtual ")
+                && !matches!(
+                    n,
+                    "bit"
+                        | "logic"
+                        | "reg"
+                        | "byte"
+                        | "shortint"
+                        | "int"
+                        | "longint"
+                        | "integer"
+                        | "time"
+                        | "shortreal"
+                        | "real"
+                        | "realtime"
+                        | "string"
+                        | "chandle"
+                        | "event"
+                        | "void"
+                        | "mailbox"
+                        | "semaphore"
+                        | "process"
+                )
+                && self.lookup_type(n).is_none()
+                && !self.env.class_names.contains_key(n)
+                // SourceDefinition omits compilation-unit imports. A type
+                // provided by a package may be visible through one, so its
+                // visibility is uncertain here; only reject unknown names.
+                && !self.env.packages.values().any(|p| p.types.contains_key(n))
+                && self.seen.insert(actual.span.start)
+            {
+                self.report(
+                    actual.span,
+                    format!(
+                        "type argument '{n}' is not a declared type (IEEE 1800-2017 §6.20.2, §8.25)"
+                    ),
+                );
+            }
         }
     }
 
@@ -1396,6 +1518,9 @@ impl<'a> Ck<'a> {
     fn check_struct_members(&mut self, e: &Expression) {
         let mut missing: Vec<(String, Span)> = Vec::new();
         visit_expr(e, &mut |x| {
+            if self.check_parenthesized_field(x) {
+                return;
+            }
             let (base, members): (Ty, Vec<&xezim_core::ast::Identifier>) = match &x.kind {
                 ExprKind::MemberAccess { expr, member } => (self.ty_of(expr), vec![member]),
                 ExprKind::Ident(h)
@@ -1428,6 +1553,32 @@ impl<'a> Ck<'a> {
                 format!("'{m}' is not a member of the struct or union (IEEE 1800-2017 §7.2)"),
             );
         }
+    }
+
+    /// A.8.2 permits a parenthesized method-call root, even with omitted
+    /// call parentheses; A.8.3's struct field select needs a hierarchical name.
+    fn check_parenthesized_field(&mut self, e: &Expression) -> bool {
+        let ExprKind::MemberAccess { expr, .. } = &e.kind else {
+            return false;
+        };
+        let ExprKind::Paren(inner) = &expr.kind else {
+            return false;
+        };
+        let mut receiver = inner.as_ref();
+        while let ExprKind::Paren(inner) = &receiver.kind {
+            receiver = inner;
+        }
+        if matches!(self.ty_of(receiver), Ty::Struct(_)) {
+            if self.seen.insert(e.span.start) {
+                self.report(
+                    e.span,
+                    "member select cannot follow a parenthesized expression (IEEE 1800-2017 A.8.3)"
+                        .into(),
+                );
+            }
+            return true;
+        }
+        false
     }
 
     /// A parameter, genvar or enum member (not a variable, and not a
@@ -1499,6 +1650,15 @@ impl<'a> Ck<'a> {
             self.check_ctor_call(c, rhs);
         }
         if is_new_call(rhs) {
+            // §6.17: events are created by their declarations or aliased;
+            // `new()` constructs a class, not a synchronization object.
+            if matches!(lt, Ty::Event) {
+                self.report(
+                    rhs.span,
+                    "'new' cannot construct an event (IEEE 1800-2017 §6.17, §8.7)".into(),
+                );
+                return;
+            }
             // `new(args)` and `new[n](init)` share one AST shape; only the
             // bare `new` is certainly a class constructor.
             if matches!(rhs.kind, ExprKind::Ident(_))
@@ -1720,6 +1880,7 @@ impl<'a> Ck<'a> {
     fn walk_value(&mut self, e: &Expression, value: bool) {
         match &e.kind {
             ExprKind::Call { func, args } => {
+                self.check_builtin_call(func, e.span);
                 for a in args {
                     self.walk_value(a, true);
                 }
@@ -1798,14 +1959,71 @@ impl<'a> Ck<'a> {
                 self.walk_value(expr, true);
                 self.walk_value(index, true);
             }
-            ExprKind::MemberAccess { expr, member } => match self.package_of(expr) {
-                Some(pkg) => {
-                    self.check_package_member(pkg, &member.name, member.span);
+            ExprKind::MemberAccess { expr, member } => {
+                self.check_parenthesized_field(e);
+                match self.package_of(expr) {
+                    Some(pkg) => {
+                        self.check_package_member(pkg, &member.name, member.span);
+                    }
+                    None => self.walk_value(expr, true),
                 }
-                None => self.walk_value(expr, true),
-            },
+            }
             ExprKind::SystemCall { args, .. } => args.iter().for_each(|x| self.walk_value(x, true)),
             _ => {}
+        }
+    }
+
+    /// §15.5.3/§7.10.2/§7.12: known built-in receiver types have a closed
+    /// set of methods. Class methods with the same spellings remain legal.
+    fn check_builtin_call(&mut self, func: &Expression, span: Span) {
+        let (receiver, method) = match &func.kind {
+            ExprKind::MemberAccess { expr, member } => (self.ty_of(expr), member.name.as_str()),
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let mut base = h.clone();
+                let method = &h.path.last().unwrap().name.name;
+                base.path.pop();
+                (
+                    self.ty_of(&Expression::new(ExprKind::Ident(base), func.span)),
+                    method.as_str(),
+                )
+            }
+            _ => return,
+        };
+        let invalid = match &receiver {
+            Ty::Event => method != "triggered",
+            Ty::Unpacked { dims, .. } if dims.first() == Some(&Dim::Queue) => !matches!(
+                method,
+                "size"
+                    | "insert"
+                    | "delete"
+                    | "pop_front"
+                    | "pop_back"
+                    | "push_front"
+                    | "push_back"
+                    | "find"
+                    | "find_index"
+                    | "find_first"
+                    | "find_first_index"
+                    | "find_last"
+                    | "find_last_index"
+                    | "min"
+                    | "max"
+                    | "unique"
+                    | "unique_index"
+                    | "reverse"
+                    | "sort"
+                    | "rsort"
+                    | "shuffle"
+                    | "sum"
+                    | "product"
+                    | "and"
+                    | "or"
+                    | "xor"
+            ),
+            _ => false,
+        };
+        if invalid && self.seen.insert(span.start) {
+            self.report(span, format!("method '{method}' is not defined for {} (IEEE 1800-2017 §15.5.3, §7.10.2, §7.12)", receiver.describe()));
         }
     }
 
@@ -2523,6 +2741,24 @@ impl<'a> Ck<'a> {
     }
 
     fn walk_class(&mut self, c: &ClassDeclaration) {
+        self.push();
+        for p in &c.params {
+            self.declare_param(p);
+        }
+        if let Some(base) = &c.extends {
+            let args: Vec<Expression> = base
+                .args
+                .iter()
+                .map(|p| match p {
+                    xezim_core::ast::decl::ParamValue::Expr(e) => e.clone(),
+                    xezim_core::ast::decl::ParamValue::Type(t) => {
+                        Expression::new(ExprKind::TypeLiteral(Box::new(t.clone())), base.span)
+                    }
+                })
+                .collect();
+            self.check_class_type_args(&base.name.name, &args);
+        }
+        self.pop();
         if !c.params.is_empty() {
             return;
         }
