@@ -2882,7 +2882,7 @@ impl Simulator {
             .map(|(k, v)| (k.as_ref(), v.0, v.1))
             .collect();
         reasons.sort_by_key(|(_, _, ns)| std::cmp::Reverse(*ns));
-        for (reason, count, ns) in reasons.iter().take(15) {
+        for (reason, count, ns) in reasons.iter().take(25) {
             chatter!(
                 "[PROF] fallback_reason {:>30}: count={:>8} total={:>8.1}ms avg={:>7.1}µs",
                 reason,

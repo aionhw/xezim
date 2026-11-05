@@ -1,0 +1,7 @@
+element_drivers.vhd:108:7:@20ns:(report note): acc=216 r0=3 r7=206 bus=1011
+element_drivers.vhd:108:7:@40ns:(report note): acc=24 r0=65 r7=202 bus=1010
+element_drivers.vhd:108:7:@60ns:(report note): acc=152 r0=1 r7=34 bus=1010
+element_drivers.vhd:108:7:@80ns:(report note): acc=200 r0=1 r7=114 bus=10Z1
+element_drivers.vhd:108:7:@100ns:(report note): acc=248 r0=153 r7=2 bus=1011
+element_drivers.vhd:108:7:@120ns:(report note): acc=200 r0=249 r7=178 bus=10Z1
+simulation finished @120ns

@@ -5285,7 +5285,18 @@ impl<'a> BytecodeCompiler<'a> {
         } else {
             FbLocals::default()
         };
-        self.trace_fallback_site_carrying(reason, e.span, "expr", &locals);
+        // A call names its callee (`expr:name`, `expr:.method`): on
+        // generated code the byte span alone does not say which call is
+        // interpreted.
+        let what = match &e.kind {
+            ExprKind::Call { func, .. } => match &func.kind {
+                ExprKind::Ident(h) => format!("expr:{}", Self::hier_raw_name(h)),
+                ExprKind::MemberAccess { member, .. } => format!("expr:.{}", member.name),
+                _ => "expr".to_string(),
+            },
+            _ => "expr".to_string(),
+        };
+        self.trace_fallback_site_carrying(reason, e.span, &what, &locals);
         let r = self.alloc_reg();
         self.emit(Insn::EvalExprFallback(
             Box::new((Arc::new(e.clone()), Arc::from(reason), locals)),

@@ -2164,123 +2164,138 @@ impl Simulator {
                 self.vm_ret_coll = self.pending_ret_collection.clone();
                 local_count += 1;
             }
-            Insn::CallFreeFunction(dest, fname, arg_start, n_args) => 'call: {
-                let base = *arg_start as usize;
-                let n = *n_args as usize;
-                // The callee resolves from the SAME table the compiler
-                // admitted it from; a vanishing entry (module swap)
-                // yields a benign zero like every other missing fn.
-                let fd = self.fn_decl_rc(&fname.0);
-                // §26.3: the package the callee's body runs in. A call the
-                // compiler bound to `P::name` names it outright; any other
-                // callee runs in its declaring scope.
-                let pkg = match &fd {
-                    Some(fd) => self.free_call_pkg(&fname.0, &fd.name.name.name),
-                    None => None,
-                };
-                // Fast dispatch when this callee has a compiled block
-                // (compiled→compiled chain): it reads the argument registers
-                // directly, so no AST actuals are synthesized on this route.
-                if let Some(fd) = &fd
-                    && let Some(v) = self.vm_try_direct_free_fn_call(fd, pkg.as_deref(), base, n)
-                {
-                    self.vm_regs[*dest as usize] = v;
-                    self.vm_ret_coll = self.pending_ret_collection.clone();
-                    local_count += 1;
-                    break 'call;
-                }
-                // DPI imports are NOT in the function table. When the callee
-                // resolves to an import, `output` formals must be written
-                // back into the argument registers: the DPI bridge assigns
-                // through `assign_value` on the synthesized actuals, so an
-                // `output` position gets a scratch lvalue whose landing in
-                // `self.signals` is copied back into `vm_regs` after the
-                // call. The compiled caller then moves the register into its
-                // own lvalue (compile-time copyback).
-                let import_ports: Option<Vec<crate::ast::decl::FunctionPort>> = if fd.is_none() {
-                    self.module
-                        .dpi_imports
-                        .get(fname.0.as_ref())
-                        .and_then(|s| match &s.proto {
-                            crate::ast::decl::DPIProto::Function(f) => Some(f.ports.clone()),
-                            _ => None,
-                        })
-                } else {
-                    None
-                };
-                let mut out_slots: Vec<(usize, String)> = Vec::new();
-                let port_types: Option<&Vec<crate::ast::decl::FunctionPort>> =
-                    fd.as_ref().map(|f| &f.ports).or(import_ports.as_ref());
-                let mut args = Vec::with_capacity(n);
-                for i in 0..n {
-                    let v = self
-                        .vm_regs
-                        .get(base + i)
-                        .cloned()
-                        .unwrap_or_else(|| Value::zero(32));
-                    let port_is_string = port_types.and_then(|p| p.get(i)).is_some_and(|p| {
-                        matches!(
-                            &p.data_type,
-                            crate::ast::types::DataType::Simple {
-                                kind: crate::ast::types::SimpleType::String,
-                                ..
-                            }
-                        )
-                    });
-                    let is_output = import_ports
-                        .as_ref()
-                        .and_then(|p| p.get(i))
-                        .is_some_and(|p| p.direction == PortDirection::Output);
-                    if is_output {
-                        let nm = format!("__xz_dpi_out_{i}");
-                        args.push(Expression::new(
-                            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                                root: None,
-                                path: vec![crate::ast::expr::HierPathSegment {
-                                    name: crate::ast::Identifier {
-                                        name: nm.clone(),
-                                        span: crate::ast::Span::dummy(),
-                                    },
-                                    selects: Vec::new(),
-                                }],
-                                span: crate::ast::Span::dummy(),
-                                cached_signal_id: std::cell::Cell::new(None),
-                                cached_resolved_name: std::cell::OnceCell::new(),
-                            }),
-                            crate::ast::Span::dummy(),
-                        ));
-                        out_slots.push((base + i, nm));
-                    } else if port_is_string && !v.is_real {
-                        // A string actual must arrive as a STRING expression:
-                        // the callee's §13.5 binding and the DPI string
-                        // readers consume the text, not the packed bits.
-                        args.push(Expression::new(
-                            ExprKind::StringLiteral(v.to_sv_string()),
-                            crate::ast::Span::dummy(),
-                        ));
+            Insn::CallFreeFunction(dest, fname, arg_start, n_args) => {
+                // Under the profile report: the time of each callee
+                // (`call:<name>` in the fallback table), interpreted or not.
+                let t0 = self.profile_report.then(std::time::Instant::now);
+                'call: {
+                    let base = *arg_start as usize;
+                    let n = *n_args as usize;
+                    // The callee resolves from the SAME table the compiler
+                    // admitted it from; a vanishing entry (module swap)
+                    // yields a benign zero like every other missing fn.
+                    let fd = self.fn_decl_rc(&fname.0);
+                    // §26.3: the package the callee's body runs in. A call the
+                    // compiler bound to `P::name` names it outright; any other
+                    // callee runs in its declaring scope.
+                    let pkg = match &fd {
+                        Some(fd) => self.free_call_pkg(&fname.0, &fd.name.name.name),
+                        None => None,
+                    };
+                    // Fast dispatch when this callee has a compiled block
+                    // (compiled→compiled chain): it reads the argument registers
+                    // directly, so no AST actuals are synthesized on this route.
+                    if let Some(fd) = &fd
+                        && let Some(v) =
+                            self.vm_try_direct_free_fn_call(fd, pkg.as_deref(), base, n)
+                    {
+                        self.vm_regs[*dest as usize] = v;
+                        self.vm_ret_coll = self.pending_ret_collection.clone();
+                        local_count += 1;
+                        break 'call;
+                    }
+                    // DPI imports are NOT in the function table. When the callee
+                    // resolves to an import, `output` formals must be written
+                    // back into the argument registers: the DPI bridge assigns
+                    // through `assign_value` on the synthesized actuals, so an
+                    // `output` position gets a scratch lvalue whose landing in
+                    // `self.signals` is copied back into `vm_regs` after the
+                    // call. The compiled caller then moves the register into its
+                    // own lvalue (compile-time copyback).
+                    let import_ports: Option<Vec<crate::ast::decl::FunctionPort>> = if fd.is_none()
+                    {
+                        self.module
+                            .dpi_imports
+                            .get(fname.0.as_ref())
+                            .and_then(|s| match &s.proto {
+                                crate::ast::decl::DPIProto::Function(f) => Some(f.ports.clone()),
+                                _ => None,
+                            })
                     } else {
-                        args.push(self.value_method_arg_expr(&v));
-                    }
-                }
-                let result = match fd {
-                    Some(fd) => {
-                        self.pending_pkg_scope = pkg.map(|p| p.to_string());
-                        self.exec_function_call(&fd, &args)
-                    }
-                    None => self
-                        .exec_dpi_import_call(&fname.0, &args)
-                        .unwrap_or_else(|| Value::zero(32)),
-                };
-                for (slot, nm) in out_slots {
-                    if let Some(v) = self.signals.remove(&nm) {
-                        if slot < self.vm_regs.len() {
-                            self.vm_regs[slot] = v;
+                        None
+                    };
+                    let mut out_slots: Vec<(usize, String)> = Vec::new();
+                    let port_types: Option<&Vec<crate::ast::decl::FunctionPort>> =
+                        fd.as_ref().map(|f| &f.ports).or(import_ports.as_ref());
+                    let mut args = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let v = self
+                            .vm_regs
+                            .get(base + i)
+                            .cloned()
+                            .unwrap_or_else(|| Value::zero(32));
+                        let port_is_string = port_types.and_then(|p| p.get(i)).is_some_and(|p| {
+                            matches!(
+                                &p.data_type,
+                                crate::ast::types::DataType::Simple {
+                                    kind: crate::ast::types::SimpleType::String,
+                                    ..
+                                }
+                            )
+                        });
+                        let is_output = import_ports
+                            .as_ref()
+                            .and_then(|p| p.get(i))
+                            .is_some_and(|p| p.direction == PortDirection::Output);
+                        if is_output {
+                            let nm = format!("__xz_dpi_out_{i}");
+                            args.push(Expression::new(
+                                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                                    root: None,
+                                    path: vec![crate::ast::expr::HierPathSegment {
+                                        name: crate::ast::Identifier {
+                                            name: nm.clone(),
+                                            span: crate::ast::Span::dummy(),
+                                        },
+                                        selects: Vec::new(),
+                                    }],
+                                    span: crate::ast::Span::dummy(),
+                                    cached_signal_id: std::cell::Cell::new(None),
+                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                }),
+                                crate::ast::Span::dummy(),
+                            ));
+                            out_slots.push((base + i, nm));
+                        } else if port_is_string && !v.is_real {
+                            // A string actual must arrive as a STRING expression:
+                            // the callee's §13.5 binding and the DPI string
+                            // readers consume the text, not the packed bits.
+                            args.push(Expression::new(
+                                ExprKind::StringLiteral(v.to_sv_string()),
+                                crate::ast::Span::dummy(),
+                            ));
+                        } else {
+                            args.push(self.value_method_arg_expr(&v));
                         }
                     }
+                    let result = match fd {
+                        Some(fd) => {
+                            self.pending_pkg_scope = pkg.map(|p| p.to_string());
+                            self.exec_function_call(&fd, &args)
+                        }
+                        None => self
+                            .exec_dpi_import_call(&fname.0, &args)
+                            .unwrap_or_else(|| Value::zero(32)),
+                    };
+                    for (slot, nm) in out_slots {
+                        if let Some(v) = self.signals.remove(&nm) {
+                            if slot < self.vm_regs.len() {
+                                self.vm_regs[slot] = v;
+                            }
+                        }
+                    }
+                    self.vm_regs[*dest as usize] = result;
+                    self.vm_ret_coll = self.pending_ret_collection.clone();
+                    local_count += 1;
                 }
-                self.vm_regs[*dest as usize] = result;
-                self.vm_ret_coll = self.pending_ret_collection.clone();
-                local_count += 1;
+                if let Some(t0) = t0 {
+                    let ent = self
+                        .prof_fallback_by_reason
+                        .entry(std::sync::Arc::from(format!("call:{}", fname.0)))
+                        .or_insert((0u64, 0u64));
+                    ent.0 += 1;
+                    ent.1 += t0.elapsed().as_nanos() as u64;
+                }
             }
             Insn::CallStaticScoped(dest, names, arg_start, n_args) => {
                 let (recv, method) = (names.0.as_ref(), names.1.as_ref());
@@ -4039,6 +4054,9 @@ impl Simulator {
                     let reason = payload.1.clone();
                     self.prof_fallback_insns += 1;
                     let (r, ctxw) = (*r as usize, *ctxw);
+                    // Timed only under the profile report (two clock reads
+                    // per interpreted expression otherwise).
+                    let t0 = self.profile_report.then(std::time::Instant::now);
                     let v = if payload.2.is_empty() {
                         self.eval_expr_ctx(&e, ctxw)
                     } else {
@@ -4050,6 +4068,32 @@ impl Simulator {
                         .entry(reason)
                         .or_insert((0u64, 0u64));
                     ent.0 += 1;
+                    if let Some(t0) = t0 {
+                        let ns = t0.elapsed().as_nanos() as u64;
+                        ent.1 += ns;
+                        // And by callee (`fb:<name>`): the reason alone does
+                        // not say which call is interpreted.
+                        if let ExprKind::Call { func, .. } = &e.kind {
+                            let callee = match &func.kind {
+                                ExprKind::Ident(h) => h
+                                    .path
+                                    .iter()
+                                    .map(|p| p.name.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("."),
+                                ExprKind::MemberAccess { member, .. } => {
+                                    format!(".{}", member.name)
+                                }
+                                _ => "?".to_string(),
+                            };
+                            let ent = self
+                                .prof_fallback_by_reason
+                                .entry(std::sync::Arc::from(format!("fb:{}", callee)))
+                                .or_insert((0u64, 0u64));
+                            ent.0 += 1;
+                            ent.1 += ns;
+                        }
+                    }
                     if self.finished {
                         break;
                     }
@@ -4071,6 +4115,22 @@ impl Simulator {
                         .or_insert((0u64, 0u64));
                     e.0 += 1;
                     e.1 += elapsed;
+                    // And by statement (`sfb:<what>`) under the profile report.
+                    if self.profile_report {
+                        let what = format!("{:?}", s.kind);
+                        let what: String = what
+                            .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '"'))
+                            .filter(|w| w.starts_with('"'))
+                            .take(2)
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let ent = self
+                            .prof_fallback_by_reason
+                            .entry(std::sync::Arc::from(format!("sfb:{}", what)))
+                            .or_insert((0u64, 0u64));
+                        ent.0 += 1;
+                        ent.1 += elapsed;
+                    }
                     // §20.2: an AST system task can terminate this stream.
                     if self.finished {
                         break;

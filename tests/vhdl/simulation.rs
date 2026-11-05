@@ -271,6 +271,23 @@ fn slice_in_hot_fn() {
     check("slice_in_hot_fn");
 }
 
+/// Elements of resolved array signals driven by processes of their own,
+/// one element with two sources, SHIFT_LEFT, XOR and a loop in a clocked
+/// process (§14.7.3.2): the update copies each driver's elements when the
+/// sources share no leaf (xezim-core #155).
+#[test]
+fn element_drivers() {
+    check("element_drivers");
+}
+
+/// SHIFT_LEFT and SHIFT_RIGHT of numeric_std and numeric_bit for UNSIGNED
+/// and SIGNED, counts past the length and metavalues (§16.8.5), computed
+/// natively.
+#[test]
+fn numeric_shift() {
+    check("numeric_shift");
+}
+
 /// An element of an unconstrained three-dimensional formal and of a record
 /// field constrained by its signal (§5.3.2.2, §8.4); `front_end.rs` checks
 /// that the element's prefix is evaluated once.
