@@ -633,10 +633,122 @@ fn sv_seed_matches_plus_seed() {
     assert_ne!(ok_stdout(&d, &["tb.sv", "-sv_seed", "7"]), native);
     let (code, out, err) = run_in(&d, &["tb.sv", "-sv_seed", "random"]);
     assert_eq!(code, 0, "{}{}", out, err);
-    assert!(err.contains("random seed:"), "{}", err);
+    assert!(out.contains("[xezim] random seed:"), "{}", out);
     let (code, _, err) = run_in(&d, &["tb.sv", "-sv_seed", "abc"]);
     assert_eq!(code, 1);
     assert!(err.contains("-sv_seed"), "{}", err);
+}
+
+/// Every seed spelling, on the command line and in an args file, runs as
+/// `+seed=<n>` does, and the run prints the seed it uses on stdout.
+#[test]
+fn seed_spellings_match_plus_seed() {
+    let d = scratch("seed_spellings");
+    std::fs::write(d.join("tb.sv"), RANDOM).unwrap();
+    let native = ok_stdout(&d, &["tb.sv", "+seed=42"]);
+    assert!(native.contains("[xezim] seed: 42\n"), "{}", native);
+    for spelling in [
+        &["-sv_seed", "42"][..],
+        &["-svseed", "42"],
+        &["-seed", "42"],
+        &["-sv_seed=42"],
+        &["-svseed=42"],
+        &["-seed=42"],
+    ] {
+        let mut args = vec!["tb.sv"];
+        args.extend_from_slice(spelling);
+        assert_eq!(ok_stdout(&d, &args), native, "{:?}", spelling);
+        let file = format!("tb.sv\n{}\n", spelling.join(" "));
+        std::fs::write(d.join("seed.f"), file).unwrap();
+        let (code, out, err) = run_in(&d, &["-f", "seed.f"]);
+        assert_eq!(code, 0, "{:?} in an args file: {}", spelling, err);
+        assert!(!err.contains("ignored unrecognized option"), "{}", err);
+        assert_eq!(out, native, "{:?} in an args file", spelling);
+    }
+    // The last seed given is the run's, and only it is printed.
+    assert_eq!(
+        ok_stdout(&d, &["tb.sv", "-svseed", "7", "+seed=42"]),
+        native
+    );
+    for (bad, flag) in [
+        (&["-svseed", "x1"][..], "-svseed"),
+        (&["-seed=-3"], "-seed"),
+    ] {
+        let mut args = vec!["tb.sv"];
+        args.extend_from_slice(bad);
+        let (code, out, err) = run_in(&d, &args);
+        assert_eq!(code, 1, "{:?}: {}{}", bad, out, err);
+        assert!(
+            err.contains(&format!("{} wants a non-negative integer", flag)),
+            "{:?}: {}",
+            bad,
+            err
+        );
+    }
+    // No seed, no seed line.
+    let unseeded = ok_stdout(&d, &["tb.sv"]);
+    assert!(!unseeded.contains("seed"), "{}", unseeded);
+}
+
+/// The seed line is in the `-l` log, and a random seed read from the log
+/// replays the run.
+#[test]
+fn seed_is_printed_to_the_log() {
+    let d = scratch("seed_log");
+    std::fs::write(d.join("tb.sv"), RANDOM).unwrap();
+    let (code, out, err) = run_in(&d, &["tb.sv", "-sv_seed", "5", "-l", "run.log"]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out, "");
+    let log = std::fs::read_to_string(d.join("run.log")).unwrap();
+    assert!(log.contains("[xezim] seed: 5\n"), "{}", log);
+    let (code, _, err) = run_in(&d, &["tb.sv", "-sv_seed", "random", "-l", "random.log"]);
+    assert_eq!(code, 0, "{}", err);
+    let log = std::fs::read_to_string(d.join("random.log")).unwrap();
+    let seed = log
+        .split("[xezim] random seed: ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap_or_else(|| panic!("no random seed line:\n{}", log));
+    let values = |s: &str| -> Vec<String> {
+        s.lines()
+            .filter(|l| l.starts_with("r="))
+            .map(str::to_string)
+            .collect()
+    };
+    let replay = ok_stdout(&d, &["tb.sv", &format!("+seed={}", seed)]);
+    assert_eq!(values(&replay), values(&log), "{}", log);
+    assert_eq!(values(&log).len(), 4, "{}", log);
+}
+
+/// `-top <name>` is `-s <name>`, on the command line and in an args file.
+#[test]
+fn top_flag_is_s() {
+    let d = filelist_top_fixture("top_flag");
+    std::fs::write(d.join("files.f"), "roots.sv\n-top chosen_root\n").unwrap();
+    for (args, tops) in [
+        (&["roots.sv", "-top", "chosen_root"][..], &["chosen"][..]),
+        (
+            &["roots.sv", "-top", "chosen_root", "-s", "extra_root"],
+            &["chosen", "extra"],
+        ),
+        (&["-f", "files.f"], &["chosen"]),
+        (
+            &["-f", "files.f", "-top", "extra_root"],
+            &["chosen", "extra"],
+        ),
+    ] {
+        assert_filelist_tops(&d, args, tops);
+        let (_, _, err) = run_in(&d, args);
+        assert!(!err.contains("unknown flag"), "{:?}: {}", args, err);
+    }
+    std::fs::write(d.join("bad.f"), "roots.sv\n-top\n").unwrap();
+    let (code, out, err) = run_in(&d, &["-f", "bad.f"]);
+    assert_ne!(code, 0, "{}{}", out, err);
+    assert!(
+        err.contains("-top requires a top module") && err.contains("bad.f"),
+        "{}",
+        err
+    );
 }
 
 #[test]
