@@ -422,6 +422,8 @@ mod randomize_shift_mask_wide_peer;
 mod randomize_inside_range;
 #[path = "classes/rand_inline_bitand_bool.rs"]
 mod rand_inline_bitand_bool;
+#[path = "classes/review_one_bit_logic.rs"]
+mod review_one_bit_logic;
 #[path = "classes/randomize_std_failed_restores_arrays.rs"]
 mod randomize_std_failed_restores_arrays;
 #[path = "classes/randomize_object_arrays.rs"]
