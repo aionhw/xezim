@@ -23,6 +23,27 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* The lint reads a child module's names in the child's own scope (§23.9,
+  #891). A variable of one module is no longer taken for a same-named queue
+  of another, and a child's part-select widths, enum values, array sizes and
+  queue bounds are no longer folded with the top module's parameters, which
+  rejected legal children. A child's check still runs when its expression
+  reads only literals and package constants. A parenthesized integral value
+  assigned to a queue, `q = (x + 1)`, is rejected like `q = x + 1` (§7.6)
+  (PR #892, contributed by philipaxer).
+* A reference in a generate block binds only to declarations visible from it
+  (§23.9, §27.5). An outer `W` beside a nested block's own `localparam int W`
+  was taken for the nested one, giving a 1-bit parameter type, a value of x
+  or 0, or an undeclared `g.W`; parameter types, unpacked dimensions,
+  initializers, declarations, assigns and statements now read the outer `W`
+  (core #162, PR core #165, contributed by chuanseng-ng).
+* A function or task declared in a generate-for block can be called by its
+  bare name from inside the block: from an `initial` or `always`, a
+  continuous assign, another subroutine of the block, the function's own
+  result variable or a nested block (§27.4, §23.9). Each iteration's copy is
+  named `g[i].f`, but the call was left bare, so elaboration stopped with
+  "Undeclared identifier 'f'". `g[i].f()` from outside the loop already
+  worked.
 * Module parameters in class and virtual-interface specialization arguments
   fold in their calling scope even when an unrelated class declares a
   parameter with the same name (§8.25, #874). A virtual-interface key such
