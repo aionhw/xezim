@@ -551,6 +551,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   inside an automatic task binds the memory directly instead of evaluating
   the instance prefix as a run-time receiver on every access; local, class,
   struct and typedef names that shadow it keep their meaning.
+* The source line of a span is found by binary search over the line starts
+  of its preprocessed file, taken once. Each lookup counted the newlines
+  before the span, and setup locates every timing check of every cell
+  instance in the cell library's file, so a gate-level netlist took time in
+  the product of its timing checks and the library's size: 20,000 sky130
+  cells against a 19 MB cell library took 55.7 s, now 8.5 s (#898, reported
+  by Blebowski).
 
 ### 0.11.4 — class-object reclamation, linear elaboration, class and randomization correctness (October 2026)
 
