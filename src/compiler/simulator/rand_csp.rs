@@ -1389,9 +1389,10 @@ impl Simulator {
         }
         for c in colls {
             if matches!(c.kind, CollKind::Dyn | CollKind::Assoc) {
-                // The current size / keys of a dynamic or associative array
-                // affect the solve and are not cheaply folded into the key;
-                // exclude to stay airtight.
+                // The current size / keys of a dynamic or associative array are
+                // value-dependent for the translate-time graph and retaining a
+                // large foreach/grow graph across solves costs more in memory
+                // (GC pressure) than it saves; exclude to stay airtight and cheap.
                 return None;
             }
             let _ = write!(
