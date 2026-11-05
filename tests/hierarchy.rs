@@ -386,3 +386,6 @@ mod indexed_scope_cont_assign;
 
 #[path = "hierarchy/indexed_scope_edge_sensitivity.rs"]
 mod indexed_scope_edge_sensitivity;
+
+#[path = "hierarchy/review_indexed_scope_selects.rs"]
+mod review_indexed_scope_selects;
