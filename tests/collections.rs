@@ -304,3 +304,5 @@ mod review_real_assoc_store;
 
 #[path = "collections/reduction_with_struct_field.rs"]
 mod reduction_with_struct_field;
+#[path = "collections/struct_return_staging_types.rs"]
+mod struct_return_staging_types;

@@ -104,3 +104,11 @@ fn mixed_record_subtype() {
 fn mixed_slice_actual() {
     check("mixed_slice_actual");
 }
+
+/// An array of arrays of vectors in both directions: one packed vector,
+/// the left index of each level first (`mixed_array_of_arrays.lrm`); input
+/// elements read one by one.
+#[test]
+fn mixed_array_of_arrays() {
+    check("mixed_array_of_arrays");
+}

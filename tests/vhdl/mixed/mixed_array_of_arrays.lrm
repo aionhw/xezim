@@ -1,0 +1,4 @@
+Questa 2021.2 cannot connect a VHDL array of arrays to Verilog, so this
+golden is the layout xezim defines (docs/vhdl-guide.md, "Mixed with
+SystemVerilog"): one packed logic vector, the left index of each level in
+the most significant bits.

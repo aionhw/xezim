@@ -3450,6 +3450,16 @@ impl Simulator {
             StructCollKind::Assoc => self.module.associative_arrays.contains_key(&name),
         };
         if known {
+            // A reused staging name (`__xz_ret_struct__.d`, the members of
+            // every struct return) takes the element type of its new use:
+            // kept, the first registration's `byte` elements truncated a
+            // later return's `bit [31:0]` ones.
+            if elem_w > 0 && self.module.assoc_elem_widths.get(&name) != Some(&elem_w) {
+                if let Some(e) = self.module.arrays.get_mut(&name) {
+                    e.2 = elem_w;
+                }
+                self.module.assoc_elem_widths.insert(name, elem_w);
+            }
             return;
         }
         match kind {
