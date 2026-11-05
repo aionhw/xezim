@@ -13069,7 +13069,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit(Insn::AssignPendingColl(key.into_boxed_str(), val_reg));
                         return true;
                     }
-                    if width > 0 && !via_new {
+                    if width > 0 && !via_new && !self.expr_is_string_static(rvalue) {
                         self.emit(Insn::Resize(val_reg, width));
                     }
                     // class-perf P2: STRING member store (`m_leaf_name = name`)
@@ -13707,7 +13707,7 @@ impl<'a> BytecodeCompiler<'a> {
                                     return false;
                                 }
                             };
-                            if width > 0 {
+                            if width > 0 && !self.expr_is_string_static(rvalue) {
                                 self.emit(Insn::Resize(val_reg, width));
                             }
                             if !self.compile_blocking_target(lvalue, val_reg, width) {
@@ -14020,7 +14020,7 @@ impl<'a> BytecodeCompiler<'a> {
                             return false;
                         }
                     };
-                    if width > 0 {
+                    if width > 0 && !self.expr_is_string_static(rhs) {
                         self.emit(Insn::Resize(val_reg, width));
                     }
                     if !self.compile_blocking_target(lhs, val_reg, width) {
@@ -14169,6 +14169,15 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::Repeat { count, body } => {
                 // §12.7.5: repeat (count) body
                 // Lowered as an internal countdown loop to 0.
+                // §12.7.2: a real count rounds to an integer (ties away from
+                // zero). compile_expr(count,32) would ceiling the real to an
+                // int (10.4 -> 11), so let the interpreter's `repeat_count`
+                // handle real counts — mirrors the Process-FSM path's
+                // `bail("Repeat_real_count")` above.
+                if self.expr_may_be_real(count) {
+                    self.bail("Repeat_real_count");
+                    return false;
+                }
                 let Some(cnt_reg) = self.compile_expr(count, 32) else {
                     self.bail("Repeat_count");
                     return false;
