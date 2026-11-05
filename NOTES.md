@@ -20,6 +20,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   between the two runs. Not yet restored: a process forked to call a task
   while it is still inside the task, which is refused with an error.
   `XEZIM_CKPT_AUDIT` lists the fields a run changes after setup.
+* On the command line, `-svseed <n>`, `-seed <n>`, `-svseed=<n>` and
+  `-seed=<n>` seed the run, as they did in args files; they were read as a
+  glued `-s<top>`. `-sv_seed=<n>` is accepted in both places. A run given a
+  seed prints `[xezim] seed: <n>` on stdout, so the output and the `-l` log
+  name it, and `+seed=random` prints the seed it drew there too instead of
+  on stderr. `-top <module>` is `-s <module>`, on the command line and in
+  args files.
 
 **Correctness**
 
