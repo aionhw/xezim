@@ -6677,6 +6677,44 @@ impl<'a> BytecodeCompiler<'a> {
         Some(dest)
     }
 
+    /// The `module.arrays_2d` entry of `hier`, as named or in the current
+    /// scope, with the key it was found under.
+    fn arrays_2d_entry(
+        &self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<(String, ((i64, i64), (i64, i64), u32))> {
+        let raw = Self::hier_raw_name(hier);
+        let arrays_2d = self.arrays_2d?;
+        arrays_2d
+            .get(raw.as_str())
+            .map(|s| (raw.clone(), *s))
+            .or_else(|| {
+                self.scope_hint.as_ref().and_then(|sc| {
+                    let q = cat_dot(sc, &raw);
+                    arrays_2d.get(q.as_str()).map(|s| (q, *s))
+                })
+            })
+    }
+
+    /// Declared width of a fully indexed element of a multidimensional
+    /// unpacked array (§7.4.5): the materialized cell's width when the indices
+    /// are constant, the `arrays_2d` element width when they are not. Anything
+    /// else (a row, a select inside an element) answers None. A string
+    /// element answers 0: its value is self-determined, like a string signal.
+    fn multi_dim_unpacked_elem_width(&self, lhs: &Expression) -> Option<u32> {
+        if let Some(id) = self.const_multi_dim_array_elem_signal_id(lhs) {
+            return Some(self.signal_widths[id]);
+        }
+        let ExprKind::Index { expr, index } = &lhs.kind else {
+            return None;
+        };
+        let (hier, idxs) = self.flatten_index_chain_exprs(expr, index)?;
+        if idxs.len() != 2 {
+            return None;
+        }
+        self.arrays_2d_entry(hier).map(|(_, (_, _, w))| w)
+    }
+
     /// Shared row-major addressing for a DYNAMIC 2-D unpacked element
     /// (`a[i][j]`): returns the Dense operand and the register holding
     /// `flat = (i-lo1)*ncols + (j-lo2)`, with an out-of-range index in EITHER
@@ -6688,17 +6726,7 @@ impl<'a> BytecodeCompiler<'a> {
         i_expr: &Expression,
         j_expr: &Expression,
     ) -> Option<(Box<ArrayOperand>, RegId)> {
-        let raw = Self::hier_raw_name(hier);
-        let arrays_2d = self.arrays_2d?;
-        let (key, ((lo1, hi1), (lo2, hi2), _w)) = arrays_2d
-            .get(raw.as_str())
-            .map(|s| (raw.clone(), *s))
-            .or_else(|| {
-                self.scope_hint.as_ref().and_then(|sc| {
-                    let q = cat_dot(sc, &raw);
-                    arrays_2d.get(q.as_str()).map(|s| (q, *s))
-                })
-            })?;
+        let (key, ((lo1, hi1), (lo2, hi2), _w)) = self.arrays_2d_entry(hier)?;
         if lo1 < 0 || lo2 < 0 {
             return None;
         }
@@ -19574,6 +19602,11 @@ impl<'a> BytecodeCompiler<'a> {
                     // the RHS of a continuous assign or always_comb write to
                     // a wider element before the store ever saw it.
                     w
+                } else if let Some(w) = self.multi_dim_unpacked_elem_width(lhs) {
+                    // §7.4.5, §11.6.1: `a[i][j] <= v` on a multidimensional
+                    // unpacked array. The 32-bit default below cut the value
+                    // before the store, whatever the element's type.
+                    w
                 } else {
                     32
                 }
@@ -27008,6 +27041,58 @@ const _: () = assert!(
     "TsInsn grew past 24 bytes"
 );
 
+/// Calls `f` with every register `ins` defines, in place or as a destination.
+fn ts_for_each_reg_def(ins: &Insn, mut f: impl FnMut(RegId)) {
+    if let Some(d) = BytecodeCompiler::dest_reg(ins) {
+        f(d);
+    }
+    if let Some(a) = BytecodeCompiler::in_place_reg(ins) {
+        f(a);
+    }
+    match ins {
+        Insn::CmpBranchConst(_, _, _, tmp, _) => f(*tmp),
+        Insn::BinOpConstAdd2(a) => {
+            f(a.d1);
+            f(a.d2);
+        }
+        Insn::EvalExprFallback(_, d, _) | Insn::Format(d, _) | Insn::StrOp(d, _, _) => f(*d),
+        _ => {}
+    }
+}
+
+/// For each instruction index, the earliest forward branch that targets it.
+fn ts_earliest_forward_branch(insns: &[Insn]) -> Vec<Option<usize>> {
+    let mut earliest: Vec<Option<usize>> = vec![None; insns.len() + 1];
+    for (i, insn) in insns.iter().enumerate() {
+        let mut note = |t: u32| {
+            if let Some(slot) = earliest.get_mut(t as usize)
+                && t as usize > i
+                && slot.is_none()
+            {
+                *slot = Some(i);
+            }
+        };
+        match insn {
+            Insn::BranchIfFalse(_, t)
+            | Insn::BranchUnlessZero(_, t)
+            | Insn::BranchIfSignalFalse(_, t, _)
+            | Insn::CmpBranch(_, _, _, _, t)
+            | Insn::CmpBranchConst(_, _, _, _, t)
+            | Insn::Jump(t) => note(*t),
+            Insn::CaseJump(_, cj) => {
+                cj.table.iter().for_each(|&t| note(t));
+                note(cj.default);
+            }
+            Insn::CaseMaskJump(_, mj) => {
+                mj.table.iter().for_each(|&t| note(t));
+                note(mj.xz_path);
+            }
+            _ => {}
+        }
+    }
+    earliest
+}
+
 pub fn lower_two_state(
     cb: &CompiledBlock,
     signal_widths: &[u32],
@@ -27366,27 +27451,16 @@ pub fn lower_two_state(
     // the lowering handles but this table does not model.
     let mut last_def: Vec<usize> = vec![0; cb.num_regs as usize];
     for (j, ins) in insns.iter().enumerate() {
-        let mut note = |r: RegId| {
+        ts_for_each_reg_def(ins, |r| {
             if let Some(slot) = last_def.get_mut(r as usize) {
                 *slot = j;
             }
-        };
-        if let Some(d) = BytecodeCompiler::dest_reg(ins) {
-            note(d);
-        }
-        if let Some(a) = BytecodeCompiler::in_place_reg(ins) {
-            note(a);
-        }
-        match ins {
-            Insn::CmpBranchConst(_, _, _, tmp, _) => note(*tmp),
-            Insn::BinOpConstAdd2(a) => {
-                note(a.d1);
-                note(a.d2);
-            }
-            Insn::EvalExprFallback(_, d, _) | Insn::Format(d, _) | Insn::StrOp(d, _, _) => note(*d),
-            _ => {}
-        }
+        });
     }
+    let earliest_branch = ts_earliest_forward_branch(insns);
+    // Index of each register's latest definition in the forward walk, for the
+    // forward-join reset below.
+    let mut walk_def: Vec<usize> = vec![0; cb.num_regs as usize];
     for (ins_i, insn) in insns.iter().enumerate() {
         if track {
             TS_BAIL_AT.with(|c| c.set((ins_i, insn_opcode_name(insn))));
@@ -27408,6 +27482,26 @@ pub fn lower_two_state(
         if back_branch && is_tgt[ins_i] {
             for r in 0..rc.len() {
                 if last_def[r] >= ins_i {
+                    rc[r] = None;
+                    wfill[r] = None;
+                }
+            }
+        }
+        // A forward branch can skip a definition between it and its target,
+        // so a value the walk learned there is only one of the values that
+        // reach the target. The out-of-range arm of a 2-D element index
+        // (`flat = count`, see `compile_2d_flat_index`) read as a constant
+        // index here, and the store it guards was dropped as out of range.
+        if ins_i > 0 {
+            ts_for_each_reg_def(&insns[ins_i - 1], |r| {
+                if let Some(slot) = walk_def.get_mut(r as usize) {
+                    *slot = ins_i - 1;
+                }
+            });
+        }
+        if let Some(branch) = earliest_branch[ins_i] {
+            for r in 0..rc.len() {
+                if walk_def[r] > branch {
                     rc[r] = None;
                     wfill[r] = None;
                 }
