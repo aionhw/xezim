@@ -17,7 +17,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `-I<dir>` | Add an include directory |
 | `-uvm`, `--uvm` | Add the UVM library that `XEZIM_UVM_DIR` names: its `src` directory goes on the include path and its `uvm_pkg.sv` becomes the first source file, unless the file list already has a `uvm_pkg.sv`. Works in every mode and inside `-f`/`-F` files. Without `-uvm` nothing is added. See the [UVM guide](uvm-guide.md#adding-the-uvm-library-with--uvm) |
 | `--simulate` | Run the simulation (vs `--parse` / `--compile` / `--preprocess`) |
-| `-s <module>` | Select a top-level module. Repeat for multiple roots (e.g. `-s hdl_top -s hvl_top`); each is a root of its own in `%m`, messages, `$root` paths and waveform scopes, as when several tops are found automatically. A bare module name that is not a file does the same (see [below](#command-lines-from-other-simulators)) |
+| `-s <module>`, `-top <module>` | Select a top-level module. Repeat for multiple roots (e.g. `-s hdl_top -s hvl_top`); each is a root of its own in `%m`, messages, `$root` paths and waveform scopes, as when several tops are found automatically. A bare module name that is not a file does the same (see [below](#command-lines-from-other-simulators)) |
 | `--no-strict-top` | When an `-s` names no module, warn and find the tops automatically instead of exiting 1 |
 | `--sv2017` | Parse with the IEEE 1800-2017 grammar instead of the default 1800-2023 |
 | `--no-strict` (`--lenient`) | Accept some LRM-illegal constructs that are errors by default, among them a hierarchical name that does not resolve (§23.8), which is then left unchecked |
@@ -29,7 +29,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--save-at <time>[,<file>]` | Save a checkpoint at the end of the last time slot at or before `<time>` (`<n>[fs\|ps\|ns\|us\|ms\|s]`, **nanoseconds** when no unit is given) into `<file>` (default `xezim.ckpt`); repeatable, and the run continues. See the [user guide](user-guide.md#checkpoints) |
 | `--restore <file>` | Start from a checkpoint (`--save-at`, `$save`) of the same design written by the same xezim build |
 | `+trace`, `+<plusarg>` | Passed through to `$value$plusargs` / `$test$plusargs` |
-| `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects) |
+| `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects). The run prints `[xezim] seed: <n>` on stdout, so the output and the `-l` log name the seed; `+seed=random` prints `[xezim] random seed: <n> (replay with +seed=<n>)`. With several seeds, the last one counts |
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate SDF delays (IOPATH/INTERCONNECT) and TIMINGCHECK limits |
 | `--upf <file>`, `--upf-top <instance>` | Apply IEEE 1801 power intent. See the [UPF guide](upf-guide.md) |
 | `--sim-debug` | Print `[DEBUG]` / `[OPT]` diagnostics (`--sim_debug` still accepted); implies `--verbose`'s engine lines |
@@ -153,7 +153,7 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 | `-do "<cmds>"`, `-do <file>` | A subset of the command language: `run -all` (until `$finish` or no events remain), `run <n><unit>` (`fs`…`sec`; several `run`s add up; the run ends at that time, which `final` blocks and the closing line report), `quit`/`exit` (`-f`, `-force`), `do <file>`, separated by `;` or newlines, `#` comments. `log`, `add wave`, `coverage save` and `coverage report` are accepted with one warning each and do nothing. Any other command is an error. A script that quits before any `run` only elaborates. `--max-time` stays a hard cap |
 | `-gNAME=VAL` | Sets the default of parameter `NAME` in every module, interface or program that declares it overridable (a `string` parameter takes an unquoted value as text); a value given at an instantiation or by `defparam` still wins. Parameters in generate blocks, and body `parameter`s of a module that has a parameter port list, are local and not reached. `-g/<top>/NAME=VAL` limits it to module `<top>`; deeper paths are ignored with a warning. A name no module declares is warned about and ignored |
 | `-GNAME=VAL` | Like `-g`, and it also replaces values given at instantiations and by `defparam` |
-| `-sv_seed <n>`, `-sv_seed random` | Same as `+seed=<n>` / `+seed=random` |
+| `-sv_seed <n>`, `-sv_seed random` (also `-svseed`, `-seed`, and the `=` forms such as `-sv_seed=<n>`) | Same as `+seed=<n>` / `+seed=random`, on the command line and in args files |
 | `-sv_lib <name>`, `-sv_root <dir>` | Load `<dir>/<name>.so` as a DPI library (`--dpi-lib`) |
 | `-timescale <u>/<p>` | Default timescale for design elements without one (`--module-timescale`) |
 | `-override_timescale <u>/<p>` (also `--override-timescale`, `=` form) | One timescale for every design element, package and compilation unit: every `` `timescale `` directive, `timeunit`/`timeprecision` declaration and `--module-timescale` is ignored. Bare delays count in `<u>`; literals with a unit (`#3ns`) keep their absolute value |
@@ -170,6 +170,6 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 Where a spelling means something else in xezim, xezim's meaning is kept:
 `-l` redirects rather than copies the transcript; `-c <file>` reads an args
 file. The glued forms `-s<top>`, `-l<file>` and `-f<file>` lose to the
-spellings above (`-sv`, `-sv_seed`, `-suppress`, `-lib`, `-logfile`,
-`-file`); use `-s <top>` / `-l <file>` / `-f <file>` with a space for such
+spellings above (`-sv`, `-sv_seed`, `-svseed`, `-seed`, `-suppress`,
+`-lib`, `-logfile`, `-file`); use `-s <top>` / `-l <file>` / `-f <file>` with a space for such
 names.
