@@ -5067,6 +5067,24 @@ impl Simulator {
                         Node::Or(vec![l, r])
                     })
                 }
+                // §11.4.5: on one-bit operands `&` is `&&` and `|` is `||`.
+                // Decomposing them (rather than leaving the whole item to the
+                // evaluator, which only judges a complete assignment) lets a
+                // conjunct over a wide rand variable propagate; evaluated, the
+                // conjunction is hit by sampling once in 2**32, so every trial
+                // was rejected and randomize() reported "no solution" for e.g.
+                // `with { s == A & data == 32'h1234; }`.
+                BinaryOp::BitAnd | BinaryOp::BitOr
+                    if Self::csp_one_bit(left) && Self::csp_one_bit(right) =>
+                {
+                    let l = self.csp_bool(csp, left, env, neg)?;
+                    let r = self.csp_bool(csp, right, env, neg)?;
+                    Some(if (*op == BinaryOp::BitAnd) != neg {
+                        Node::And(vec![l, r])
+                    } else {
+                        Node::Or(vec![l, r])
+                    })
+                }
                 BinaryOp::LogImplies => {
                     if neg {
                         let l = self.csp_bool(csp, left, env, false)?;
@@ -5113,6 +5131,37 @@ impl Simulator {
             _ => self
                 .csp_dyn_expand(csp, e, env, neg)
                 .or_else(|| self.csp_eval_node(csp, SrcItem::Expr(e.clone()), env, neg)),
+        }
+    }
+
+    /// True when `e` is one bit wide by construction: a comparison, an
+    /// `inside`, a logical operator, or a bitwise operator whose operands are
+    /// both one bit. `a & b` over such operands is exactly `a && b` (§11.4.5),
+    /// so `csp_bool` can decompose it instead of leaving it to the evaluator.
+    fn csp_one_bit(e: &Expression) -> bool {
+        match &Self::unparen(e).kind {
+            ExprKind::Binary { op, left, right } => match op {
+                BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::CaseEq
+                | BinaryOp::CaseNeq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+                | BinaryOp::LogAnd
+                | BinaryOp::LogOr
+                | BinaryOp::LogImplies => true,
+                BinaryOp::BitAnd | BinaryOp::BitOr => {
+                    Self::csp_one_bit(left) && Self::csp_one_bit(right)
+                }
+                _ => false,
+            },
+            ExprKind::Unary {
+                op: UnaryOp::LogNot, ..
+            } => true,
+            ExprKind::Inside { .. } => true,
+            _ => false,
         }
     }
 
