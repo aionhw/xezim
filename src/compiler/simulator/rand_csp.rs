@@ -459,8 +459,27 @@ struct CspArr {
     signed: bool,
 }
 
+/// A memoized, post-translate `Csp` for one rand-class solve, with the
+/// fingerprint that produced it. Reused read-only across `randomize()`
+/// calls while the fingerprint is unchanged; rebuilt on any change.
+pub(crate) struct RandCspMemo {
+    /// The built + translated problem. `csp_run` only ever reads the `Csp`
+    /// (solutions are written to the simulator via `csp_write`), so a cached
+    /// one is safe to share across solves. The `handle` is refreshed to the
+    /// current object before each reuse (it is a writeback target, not part
+    /// of the translated graph).
+    pub(crate) csp: Csp,
+    /// Snapshot of the non-rand scalar configuration properties read by the
+    /// constraints (the value-dependent part `csp_translate` folds in). A
+    /// cached graph is reused only while every stored value still equals the
+    /// live object's current value; any change invalidates it. The HashMap
+    /// key (a deterministic structural string) is the structural side of the
+    /// identity; this list is the value side.
+    pub(crate) config: Box<[(String, Value)]>,
+}
+
 /// The translated problem.
-struct Csp {
+pub(crate) struct Csp {
     handle: usize,
     vars: Vec<CspVar>,
     dom0: Vec<Dom>,
@@ -1320,6 +1339,94 @@ impl Simulator {
         }
     }
 
+    /// Structural + configuration fingerprint for the per-class CSP cache.
+    /// Returns `None` when the solve is not safely cacheable: sub-objects
+    /// (joint path re-builds the problem), or a random object with any
+    /// non-rand, non-solver property that is not a plain scalar (an object
+    /// handle / collection / unpacked aggregate stored as configuration —
+    /// comparing its full `Value` each call would be too costly to be worth
+    /// the cache, so we conservatively rebuild).
+    /// The returned key is a deterministic string over the class name,
+    /// rand properties (name/width/signed/enum), collection shapes and the
+    /// constraint items' structural identity (source index + span). The
+    /// value list is the live snapshot of the scalar non-rand configuration
+    /// props the constraints fold in (`csp_const`), which must be
+    /// byte-identical for a cached graph to be re-usable.
+    fn rand_csp_cache_fp(
+        &self,
+        handle: usize,
+        constraints: &[ClassConstraint],
+        constraint_depth: &[usize],
+        rand_props: &[(String, u32)],
+        signed_props: &HashSet<String>,
+        enum_props: &HashMap<String, String>,
+        colls: &[RandColl],
+        _array_enums: &HashMap<String, String>,
+    ) -> Option<(String, Box<[(String, Value)]>)> {
+        use std::fmt::Write;
+        let inst = self.heap.get(handle)?.as_ref()?;
+        let mut solver = std::collections::HashSet::new();
+        for (n, _) in rand_props {
+            solver.insert(n.clone());
+        }
+        for c in colls {
+            solver.insert(c.prop.clone());
+        }
+        // Non-rand, non-solver configuration props must all be plain scalars
+        // for the cache to be engaged; anything else -> never cache.
+        let mut config: Vec<(String, Value)> = Vec::new();
+        for (n, v) in &inst.properties {
+            if solver.contains(n) {
+                continue;
+            }
+            if v.is_real || v.width > 64 {
+                return None;
+            }
+            config.push((n.clone(), v.clone()));
+        }
+        config.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut key = String::new();
+        let _ = write!(key, "cls{}", inst.class_name);
+        for (n, w) in rand_props {
+            let s = signed_props.contains(n) as u8;
+            let e = enum_props.get(n).cloned().unwrap_or_default();
+            let _ = write!(key, "|r:{n}:{w}:{s}:{e}");
+        }
+        for c in colls {
+            if matches!(c.kind, CollKind::Dyn | CollKind::Assoc) {
+                // The current size / keys of a dynamic or associative array are
+                // value-dependent for the translate-time graph and retaining a
+                // large foreach/grow graph across solves costs more in memory
+                // (GC pressure) than it saves; exclude to stay airtight and cheap.
+                return None;
+            }
+            let _ = write!(
+                key,
+                "|c:{}:{:?}:{}:{}:{}:{}",
+                c.prop, c.kind, c.width, c.lo, c.hi, c.nested
+            );
+        }
+        for (i, con) in constraints.iter().enumerate() {
+            // A dummy/zero span marks a SYNTHESIZED block (inline `with {…}`, a
+            // pinned `__dealt__` item, or a sub-object join) whose contents vary
+            // per call and are not captured by the block name+span. Such blocks
+            // are not structurally stable, so the whole class is not cacheable.
+            if con.span.start == 0 && con.span.end == 0 {
+                return None;
+            }
+            let depth = constraint_depth.get(i).copied().unwrap_or(0);
+            let _ = write!(
+                key,
+                "|x{}:{}:{}({})",
+                con.name.name,
+                con.span.start as usize,
+                con.span.end - con.span.start,
+                depth
+            );
+        }
+        Some((key, config.into_boxed_slice()))
+    }
+
     /// The joint solve with every dynamic array at its current size.
     #[allow(clippy::too_many_arguments)]
     fn rand_csp_solve_sized(
@@ -1339,6 +1446,53 @@ impl Simulator {
         // (or reads only through `size()`) takes any value of its width; it
         // stays out of the solve instead of keeping the whole class out.
         let unread = Self::csp_unread(constraints, rand_props, colls);
+        // Per-class memo cache: for a fixed class / constraint set / config
+        // the whole `csp_vars` + `csp_split_slices` + `csp_translate` graph
+        // is value-independent, so a cached `Csp` is reused read-only and
+        // only the search (`csp_run`) re-runs against the current object.
+        // Used only on the no-sub-object path; dynamic/associative arrays
+        // and any non-scalar configuration make the fingerprint builder
+        // return None (conservative fallback to the current full build).
+        let cached: Option<(String, Box<[(String, Value)]>)> = if subs.is_empty() {
+            self.rand_csp_cache_fp(
+                handle,
+                constraints,
+                constraint_depth,
+                rand_props,
+                signed_props,
+                enum_props,
+                colls,
+                array_enums,
+            )
+        } else {
+            None
+        };
+        if let Some((key, live_config)) = &cached {
+            let reuse = self
+                .csp_cache
+                .borrow()
+                .get(key)
+                .map(|m| {
+                    m.config.len() == live_config.len()
+                        && m.config.iter().zip(live_config.iter()).all(
+                            |((a, va), (b, vb))| a == b && va == vb,
+                        )
+                })
+                .unwrap_or(false);
+            if reuse {
+                let mut memo =
+                    self.csp_cache.borrow_mut().remove(key).unwrap();
+                memo.csp.handle = handle;
+                memo.csp.draw_free = strict;
+                let out = self.csp_run(&memo.csp, constraints, colls);
+                let is_soft = !memo.csp.soft_priority.is_empty();
+                self.csp_cache.borrow_mut().insert(key.clone(), memo);
+                if is_soft {
+                    return CspOutcome::GaveUp;
+                }
+                return out;
+            }
+        }
         let Some(mut csp) = self.csp_vars(
             handle,
             rand_props,
@@ -1435,6 +1589,30 @@ impl Simulator {
             return CspOutcome::GaveUp;
         }
         if !matches!(out, CspOutcome::Unsat) || csp.soft_priority.is_empty() {
+            // Freshly built graph: cache it for reuse on identical future
+            // calls (only when cache-eligible, non-soft, and the solve ended
+            // in a state the graph can be shared from). `csp_run` left `csp`
+            // untouched, so the stored graph is the exact translated problem.
+            if let Some((key, live_config)) = &cached {
+                if csp.soft_priority.is_empty() {
+                    let mut m = self.csp_cache.borrow_mut();
+                    // Bound the table: a long run with many distinct rand
+                    // classes must not grow it without limit. Past the cap,
+                    // drop everything (an occasional rebuild is far cheaper
+                    // than unbounded retained graphs).
+                    if m.len() >= 512 {
+                        m.clear();
+                    }
+                    m.insert(
+                        key.clone(),
+                        RandCspMemo {
+                            csp,
+                            config: live_config.clone(),
+                        },
+                    );
+                    return out;
+                }
+            }
             return out;
         }
         // A preference is discarded only after proving a conflict with hard
@@ -3976,6 +4154,7 @@ impl Simulator {
     }
 
     /// Visit `it` and every item nested in it.
+
     pub(super) fn csp_item_walk(it: &ConstraintItem, f: &mut dyn FnMut(&ConstraintItem)) {
         f(it);
         match it {

@@ -6752,6 +6752,18 @@ pub struct Simulator {
     typedef_target_cache:
         std::cell::RefCell<HashMap<String, HashMap<String, Option<crate::ast::types::DataType>>>>,
     collection_dim_cache: std::cell::RefCell<HashMap<String, bool>>,
+    /// Memoized, structurally-fixed CSP for a rand class. `randomize()` on
+    /// the same class / constraint set / config values re-translated the
+    /// whole constraint graph on every call (csp_vars + csp_split_slices +
+    /// csp_translate are a large constant per call); when the structural and
+    /// config fingerprint is unchanged the post-translate `Csp` is reused
+    /// read-only and only the search (`csp_run`) re-runs against current
+    /// values. The fingerprint includes a hash of every non-rand property
+    /// value the constraints read, so any relevant change rebuilds. Bound the
+    /// table so a long-lived run with many distinct classes can't grow it
+    /// without limit.
+    #[serde(skip)]
+    csp_cache: std::cell::RefCell<HashMap<String, rand_csp::RandCspMemo>>,
     /// Sticky: set the first time a `<base>.` frame marker is created (an
     /// unpacked-struct formal binding, or a struct-return variable via
     /// `unpacked_struct_leaf_keys`); gates `frame_leaf_key_of`'s per-eval
