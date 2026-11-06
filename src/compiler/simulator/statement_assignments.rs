@@ -1415,6 +1415,15 @@ impl Simulator {
         {
             return;
         }
+        // §7.4.5/§25.10: `v2[0][1] = bus` — one element of a MULTI-dimensional
+        // vif array binds by name, ahead of the collection-row store below,
+        // which took the write as a value copy and bound nothing (#925).
+        if self.vif_nd_elem_lvalue(lvalue)
+            && !Self::lvalue_has_incdec_index(lvalue)
+            && self.try_bind_virtual_iface(lvalue, rvalue)
+        {
+            return;
+        }
         // (A side-effecting lvalue index is folded first, below, and
         // comes back through here.)
         if self.indexed_colls_live()

@@ -526,6 +526,19 @@ impl Simulator {
                     }
                     return Some(su.clone());
                 }
+                // §7.4.1: `cand_t [0:2] a` — a typedef'd packed struct with
+                // packed dimensions written before the declarator — is a
+                // packed array of structs; the dimensions are part of the
+                // property's type (`packed_member_select` indexes them).
+                // Resolving the typedef NAME alone lost them, so `a[i]` was
+                // taken for a bit-select and `a[i].f` read 0 (#928).
+                if let Some(dt @ DataType::TypeReference { dimensions, .. }) =
+                    cd.property_types.get(prop)
+                    && !dimensions.is_empty()
+                    && let Some(su) = self.packed_struct_with_dims(dt)
+                {
+                    return Some(su.into_owned());
+                }
                 if cd.properties.contains_key(prop) {
                     break;
                 }
@@ -535,10 +548,9 @@ impl Simulator {
         let verdict = (|| {
             let tn = self.class_prop_type_name(handle, prop)?;
             let dt = self.module.typedef_types.get(tn.as_str())?;
-            match Self::resolve_type_ref(dt, &self.module.typedef_types) {
-                DataType::Struct(su) => Some(su),
-                _ => None,
-            }
+            // `typedef cand_t [0:2] carr_t; carr_t a;` keeps the alias's
+            // dimensions too (§6.20.2).
+            self.packed_struct_with_dims(dt).map(|su| su.into_owned())
         })();
         // Don't record a negative for a TYPE-PARAMETER property: the verdict
         // depends on this instance's binding, and caching a `None` under the
@@ -2083,6 +2095,31 @@ impl Simulator {
                 _ => break,
             }
         }
+        // §8.11: a chain rooted at `this` (`this.a[0].valid` in a method
+        // parses as a MemberAccess over `This`): the property is the member
+        // just above `this`, the object is the one executing (#928).
+        if let ExprKind::This = &cur.kind {
+            let Some(PendingSel::Member(prop)) = peeled.last() else {
+                return None;
+            };
+            if peeled.len() < 2 {
+                return None; // a whole property: not this walk's case
+            }
+            let prop = prop.to_string();
+            let handle = self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .filter(|&h| h != 0)?;
+            let su = self.class_prop_struct(handle, &prop)?;
+            let below: Vec<PendingSel> = peeled[..peeled.len() - 1].iter().rev().cloned().collect();
+            let steps = self.pending_select_steps(&below)?;
+            if Self::spreads_member_wise(&su) {
+                return self.unpacked_member_select(handle, &prop, &su, &steps);
+            }
+            return self.packed_member_select(handle, &prop, &su, &steps);
+        }
         let ExprKind::Ident(h) = &cur.kind else {
             return None;
         };
@@ -2153,6 +2190,13 @@ impl Simulator {
         }
         // Phase 3 — evaluate the selects (§11.5.1: an unknown index selects
         // nothing) and walk.
+        let steps = self.pending_select_steps(&pending)?;
+        self.class_member_select_split(h, cur.span, &steps)
+    }
+
+    /// The root-first `pending` steps with every select evaluated (§11.5.1:
+    /// an unknown or real index selects nothing — `None`).
+    fn pending_select_steps(&mut self, pending: &[PendingSel]) -> Option<Vec<MemberSel>> {
         let mut steps: Vec<MemberSel> = Vec::with_capacity(pending.len());
         for p in pending {
             match p {
@@ -2171,14 +2215,14 @@ impl Simulator {
                         return None;
                     }
                     steps.push(MemberSel::Range {
-                        kind,
+                        kind: *kind,
                         l: lv.to_i64()?,
                         r: rv.to_i64()?,
                     });
                 }
             }
         }
-        self.class_member_select_split(h, cur.span, &steps)
+        Some(steps)
     }
 
     /// Split the root-first `steps` built by [`class_member_select_ref`] into
@@ -2385,12 +2429,100 @@ impl Simulator {
             }
             std::borrow::Cow::Owned(params)
         };
-        let mut level = &**su;
-        let mut layout = self.class_packed_layout(su, &value_params);
-        let total = layout.1.max(1);
-        let mut off = 0u32;
-        let mut w = total;
+        let layout = self.class_packed_layout(su, &value_params);
+        let elem_w = layout.1.max(1);
+        // §7.4.1: a struct type with packed dimensions (`cand_t [0:2] a`) is
+        // a packed array of structs; the property holds every element.
+        let total = Self::packed_struct_array_width(su, elem_w, &inst_params)?;
+        self.packed_member_walk(
+            handle,
+            prop,
+            su,
+            su,
+            &layout.0,
+            elem_w,
+            &inst_params,
+            rest,
+            0,
+            total,
+        )
+    }
+
+    /// Width of the packed struct `su` with its packed `dimensions` (§7.4.1):
+    /// `elem_w` — the width of ONE struct — times every dimension's element
+    /// count. `None` when a bound does not const-evaluate under `params`.
+    pub(super) fn packed_struct_array_width(
+        su: &crate::ast::types::StructUnionType,
+        elem_w: u32,
+        params: &HashMap<String, Value>,
+    ) -> Option<u32> {
+        if su.dimensions.is_empty() {
+            return Some(elem_w);
+        }
+        let dims = Self::packed_range_bounds(&su.dimensions, params)?;
+        let count = dims.iter().try_fold(1u64, |n, &(l, r)| {
+            n.checked_mul((l - r).unsigned_abs().checked_add(1)?)
+        })?;
+        u32::try_from(u64::from(elem_w).checked_mul(count)?).ok()
+    }
+
+    /// One level of [`packed_member_select`]'s walk: `level` is the packed
+    /// struct/union whose fields `layout` lays out (`elem_w` bits for one
+    /// struct), `rest` the steps still to resolve, `off` the bit offset of
+    /// this level inside the `total`-bit property. The level's own packed
+    /// dimensions (`cand_t [0:2]`, a `nest_t [1:0] sub` member) are indexed
+    /// first, outermost first, one `Index` step per dimension; an ascending
+    /// range puts its left index at the MS end, as `packed_array_slice` does
+    /// (§7.4.1). Fewer indices than dimensions leave a whole sub-array (the
+    /// run of its elements); a part-select over elements or a member of a
+    /// sub-array is not modelled here. `root` decides the mixed 2-state rule
+    /// for the leaf.
+    #[allow(clippy::too_many_arguments)]
+    fn packed_member_walk(
+        &self,
+        handle: usize,
+        prop: &str,
+        root: &crate::ast::types::StructUnionType,
+        level: &crate::ast::types::StructUnionType,
+        layout: &[(String, u32, u32)],
+        elem_w: u32,
+        params: &HashMap<String, Value>,
+        rest: &[MemberSel],
+        mut off: u32,
+        total: u32,
+    ) -> Option<ClassAggRef> {
+        let packed = |off: u32, w: u32, two_state: bool| {
+            Some(ClassAggRef::Packed {
+                handle,
+                prop: prop.to_string(),
+                off,
+                w,
+                total,
+                two_state,
+            })
+        };
         let mut i = 0usize;
+        let mut w = elem_w;
+        if !level.dimensions.is_empty() {
+            let dims = Self::packed_range_bounds(&level.dimensions, params)?;
+            w = Self::packed_struct_array_width(level, elem_w, params)?;
+            for &(l, r) in &dims {
+                match rest.get(i) {
+                    Some(MemberSel::Index(idx)) => {
+                        if *idx < l.min(r) || *idx > l.max(r) {
+                            return None;
+                        }
+                        let slot = if l >= r { idx - r } else { r - idx };
+                        let n = u32::try_from((l - r).unsigned_abs() + 1).ok()?;
+                        w = w.checked_div(n)?;
+                        off = off.checked_add(u32::try_from(slot).ok()?.checked_mul(w)?)?;
+                        i += 1;
+                    }
+                    None => return packed(off, w, false),
+                    Some(_) => return None,
+                }
+            }
+        }
         while i < rest.len() {
             let MemberSel::Member(mname) = &rest[i] else {
                 return None;
@@ -2399,39 +2531,35 @@ impl Simulator {
             if !dims.is_empty() {
                 return None; // an unpacked dimension: not a packed aggregate
             }
-            let &(_, moff, mw) = layout.0.iter().find(|(n, ..)| n == mname)?;
+            let &(_, moff, mw) = layout.iter().find(|(n, ..)| n == mname)?;
             off += moff;
             w = mw.max(1);
-            match self.resolve_dt_ref(dt) {
-                crate::ast::types::DataType::Struct(inner) if !Self::spreads_member_wise(inner) => {
-                    level = inner;
-                    layout = Rc::new(self.packed_agg_layout_with(level, &inst_params));
-                    i += 1;
+            match self.packed_struct_with_dims(dt) {
+                Some(inner) if !Self::spreads_member_wise(&inner) => {
+                    let (fields, iw) = self.packed_agg_layout_with(&inner, params);
+                    return self.packed_member_walk(
+                        handle,
+                        prop,
+                        root,
+                        &inner,
+                        &fields,
+                        iw.max(1),
+                        params,
+                        &rest[i + 1..],
+                        off,
+                        total,
+                    );
                 }
                 _ => {
                     // Leaf: the remaining selects address packed slots / a
                     // bit range of the member's slice.
-                    let (o, sw) = self.packed_array_slice(dt, &inst_params, w, &rest[i + 1..])?;
-                    let two_state = self.mixed_member_two_state(su, dt);
-                    return Some(ClassAggRef::Packed {
-                        handle,
-                        prop: prop.to_string(),
-                        off: off + o,
-                        w: sw,
-                        total,
-                        two_state,
-                    });
+                    let (o, sw) = self.packed_array_slice(dt, params, w, &rest[i + 1..])?;
+                    let two_state = self.mixed_member_two_state(root, dt);
+                    return packed(off + o, sw, two_state);
                 }
             }
         }
-        Some(ClassAggRef::Packed {
-            handle,
-            prop: prop.to_string(),
-            off,
-            w,
-            total,
-            two_state: false,
-        })
+        packed(off, w, false)
     }
 
     /// Offset and width — within a `total_w`-bit value whose packed
@@ -2448,6 +2576,13 @@ impl Simulator {
         total_w: u32,
         rest: &[MemberSel],
     ) -> Option<(u32, u32)> {
+        // Nothing selected below the leaf: the whole member. A member with
+        // no packed dimension at all (`logic valid;`) has no bounds to
+        // resolve, and used to fail here — so `a[i].valid` (a 1-bit field
+        // below an indexed element) resolved to nothing (#928).
+        if rest.is_empty() {
+            return Some((0, total_w));
+        }
         let dims = Self::packed_dim_bounds(dt, params)?;
         let counts: Vec<u32> = dims
             .iter()
@@ -2512,8 +2647,18 @@ impl Simulator {
         if dims.is_empty() {
             return None;
         }
+        Self::packed_range_bounds(&dims, params)
+    }
+
+    /// Const-resolved `(left, right)` of each of `dims`, in order; `None` for
+    /// an unsized dimension or a bound that does not const-evaluate.
+    pub(super) fn packed_range_bounds(
+        dims: &[crate::ast::types::PackedDimension],
+        params: &HashMap<String, Value>,
+    ) -> Option<Vec<(i64, i64)>> {
+        use crate::ast::types::PackedDimension;
         let mut out = Vec::with_capacity(dims.len());
-        for d in &dims {
+        for d in dims {
             let PackedDimension::Range { left, right, .. } = d else {
                 return None;
             };

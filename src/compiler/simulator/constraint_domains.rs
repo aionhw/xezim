@@ -5190,9 +5190,13 @@ impl Simulator {
         // foreach loops can also name an array on another class object.
         let Some(dims) = (match self.state_foreach_dims(handle, array, &name, vars.len()) {
             Some(d) => Some(d),
-            None if Self::foreach_plain_member(array) => {
-                self.fixed_foreach_dims(handle, &name).map(|d| d.0)
-            }
+            // §7.4.1: a packed array of structs (`cand_t [0:2] c`) loops over
+            // its elements too; unseen, `foreach (c[i]) c[i].f == K` passed
+            // the check whatever the elements held (#928).
+            None if Self::foreach_plain_member(array) => self
+                .fixed_foreach_dims(handle, &name)
+                .map(|d| d.0)
+                .or_else(|| self.packed_prop_foreach_dims(handle, &name).map(|d| d.0)),
             None => Self::foreach_member_chain(array)
                 .and_then(|(root, members)| self.sub_member_foreach_dims(handle, &root, &members)),
         }) else {

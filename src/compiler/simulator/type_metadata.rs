@@ -1586,6 +1586,47 @@ impl Simulator {
         cur
     }
 
+    /// §7.4.1/§6.20.2: the packed struct or union `dt` denotes, with the
+    /// packed dimensions written on the typedef references that lead to it
+    /// folded into its `dimensions`, outermost first — `cand_t [0:2]` is a
+    /// packed array of three `cand_t`, and so is `carr_t` for `typedef cand_t
+    /// [0:2] carr_t`; `carr_t [1:0] x` is `[1:0][0:2]` of `cand_t`. Borrowed
+    /// when no reference adds dimensions, so the common scalar struct costs
+    /// no clone. `None` when the chain does not end in a struct or union.
+    pub(super) fn packed_struct_with_dims<'a>(
+        &'a self,
+        dt: &'a DataType,
+    ) -> Option<std::borrow::Cow<'a, crate::ast::types::StructUnionType>> {
+        use crate::ast::types::PackedDimension;
+        let mut outer: Vec<PackedDimension> = Vec::new();
+        let mut cur = dt;
+        for _ in 0..16 {
+            match cur {
+                DataType::TypeReference {
+                    name, dimensions, ..
+                } => {
+                    outer.extend(dimensions.iter().cloned());
+                    let next = self.module.typedef_types.get(&name.name.name)?;
+                    if matches!(next, DataType::Void(_)) {
+                        return None;
+                    }
+                    cur = next;
+                }
+                DataType::Struct(su) => {
+                    if outer.is_empty() {
+                        return Some(std::borrow::Cow::Borrowed(su));
+                    }
+                    let mut out = su.clone();
+                    outer.append(&mut out.dimensions);
+                    out.dimensions = outer;
+                    return Some(std::borrow::Cow::Owned(out));
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// §20.6.1 `$typename` of a virtual-interface operand: a variable (module
     /// scope or local) or a class property `h.p` whose declared type is
     /// `virtual <iface>` or a typedef chain ending there. None otherwise.

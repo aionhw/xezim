@@ -2484,19 +2484,32 @@ impl Simulator {
         for it in &items {
             if let Some((c, k)) = self.array_sum_eq_target(it, colls, rand_names) {
                 self.distribute_array_sum(&c, k, constraints, pinned);
-            } else if let Some((c, idxs, k)) =
-                self.explicit_elem_sum_eq_target(it, colls, rand_names)
+            } else if let Some((terms, k)) = self.explicit_elem_sum_eq_target(it, colls, rand_names)
             {
+                let c = terms[0].0.clone();
+                let ranges = self.elem_allowed_ranges(&c.prop, constraints);
+                // `a[0] - a[1] == K`, `a[0] + b[0] == K`: a chain with a
+                // subtracted element, or over several arrays, is solved in
+                // the operands' modular arithmetic (#928).
+                if terms.iter().any(|t| t.2 || t.0.prop != c.prop) {
+                    if ranges.is_empty() {
+                        self.solve_signed_elem_chain(&terms, k, pinned);
+                    }
+                    continue;
+                }
+                let idxs: Vec<i64> = terms.iter().map(|t| t.1).collect();
                 // `a[0] + a[1] + a[2] == K`: distribute over just the named
                 // elements, honoring any `foreach … inside {…}` element range.
-                let ranges = self.elem_allowed_ranges(&c.prop, constraints);
                 let (lo, hi): (i128, i128) = if ranges.is_empty() {
-                    let hi = if c.width >= 64 {
-                        u64::MAX
+                    // The full element domain, as `distribute_array_sum`
+                    // sizes it: capping a wide element at u64::MAX made a
+                    // target near 2^(width) look infeasible (#928).
+                    let hi = if c.width >= 127 {
+                        i128::MAX
                     } else {
-                        (1u64 << c.width) - 1
+                        (1i128 << c.width) - 1
                     };
-                    (0, hi as i128)
+                    (0, hi)
                 } else {
                     (
                         ranges.iter().map(|(l, _)| *l as i128).min().unwrap(),
@@ -2526,7 +2539,7 @@ impl Simulator {
         item: &ConstraintItem,
         colls: &[RandColl],
         rand_names: &HashSet<String>,
-    ) -> Option<(RandColl, &'static str, (u32, u32), u64)> {
+    ) -> Option<(RandColl, &'static str, (u32, u32), u128)> {
         let ConstraintItem::Expr(e) = item else {
             return None;
         };
@@ -2556,7 +2569,10 @@ impl Simulator {
             let Some(c) = colls.iter().find(|c| c.prop == name).cloned() else {
                 continue;
             };
-            if c.is_object_elem || c.nested || c.width > 64 {
+            // Elements up to 128 bits are repaired in u128 arithmetic; `sum`
+            // alone had the wide path (#588) and the other reductions
+            // truncated every operand to its low word (#928).
+            if c.is_object_elem || c.nested || c.width > 128 {
                 continue;
             }
             let view = match filter {
@@ -2602,20 +2618,25 @@ impl Simulator {
                 continue;
             }
             let tv = self.eval_expr(const_side);
-            let Some(k) = tv.to_u64().filter(|_| !tv.has_xz()) else {
+            if tv.has_xz() || tv.is_real || tv.width > 128 {
                 continue;
-            };
-            let mask = if view.1 >= 64 {
-                u64::MAX
-            } else {
-                (1u64 << view.1) - 1
-            };
-            if k & !mask != 0 {
+            }
+            let k = tv.to_u128();
+            if k & !Self::low_mask128(view.1) != 0 {
                 continue;
             }
             return Some((c, method, view, k));
         }
         None
+    }
+
+    /// The low `w` bits set, for `w` up to 128.
+    fn low_mask128(w: u32) -> u128 {
+        if w >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << w) - 1
+        }
     }
 
     /// Construct elements meeting `<red>(view of each element) == k`: draw
@@ -2629,21 +2650,20 @@ impl Simulator {
         c: &RandColl,
         method: &str,
         (off, w): (u32, u32),
-        k: u64,
+        k: u128,
         pinned: &mut HashSet<String>,
     ) {
         use rand::Rng;
         let keys = self.coll_elem_keys(c);
-        if keys.is_empty() {
+        if keys.is_empty() || c.width > 128 {
             return;
         }
-        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-        let mut vals: Vec<u64> = keys
+        let mask = Self::low_mask128(w);
+        let mut vals: Vec<u128> = keys
             .iter()
             .map(|key| {
                 self.read_coll_elem(key)
-                    .and_then(|v| v.to_u64())
-                    .map_or(0, |v| (v >> off) & mask)
+                    .map_or(0, |v| (v.to_u128() >> off) & mask)
             })
             .collect();
         let free: Vec<usize> = (0..keys.len())
@@ -2664,7 +2684,7 @@ impl Simulator {
                 let extra = vals.iter().fold(mask, |a, v| a & v) & !k;
                 for b in (0..w).filter(|b| extra >> b & 1 == 1) {
                     let i = pick(self);
-                    vals[i] &= !(1u64 << b);
+                    vals[i] &= !(1u128 << b);
                 }
                 touched.extend(&free);
             }
@@ -2677,7 +2697,7 @@ impl Simulator {
                 let missing = k & !vals.iter().fold(0, |a, v| a | v);
                 for b in (0..w).filter(|b| missing >> b & 1 == 1) {
                     let i = pick(self);
-                    vals[i] |= 1u64 << b;
+                    vals[i] |= 1u128 << b;
                 }
                 touched.extend(&free);
             }
@@ -2694,15 +2714,15 @@ impl Simulator {
                 let j = pick(self);
                 let rest = (0..vals.len())
                     .filter(|&i| i != j)
-                    .fold(0u64, |a, i| a.wrapping_add(vals[i]));
+                    .fold(0u128, |a, i| a.wrapping_add(vals[i]));
                 vals[j] = k.wrapping_sub(rest) & mask;
                 touched.push(j);
             }
             "product" => {
-                let prod = |vals: &[u64], skip: Option<usize>| {
+                let prod = |vals: &[u128], skip: Option<usize>| {
                     (0..vals.len())
                         .filter(|&i| Some(i) != skip)
-                        .fold(1u64, |a, i| a.wrapping_mul(vals[i]))
+                        .fold(1u128, |a, i| a.wrapping_mul(vals[i]))
                         & mask
                 };
                 if prod(&vals, None) == k {
@@ -2728,22 +2748,18 @@ impl Simulator {
                     }
                     let t = p.trailing_zeros();
                     let odd = p >> t;
-                    // Inverse of an odd number modulo 2^64 (Newton).
+                    // Inverse of an odd number modulo 2^128 (Newton; each
+                    // step doubles the correct low bits, 3 -> 192).
                     let mut inv = odd;
-                    for _ in 0..6 {
-                        inv = inv.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(inv)));
+                    for _ in 0..7 {
+                        inv = inv.wrapping_mul(2u128.wrapping_sub(odd.wrapping_mul(inv)));
                     }
                     // `x` is fixed modulo 2^(w-t); its bits above are free.
-                    let low_mask = if w - t >= 64 {
-                        u64::MAX
-                    } else {
-                        (1u64 << (w - t)) - 1
-                    };
-                    let low = (k >> t).wrapping_mul(inv) & low_mask;
+                    let low = (k >> t).wrapping_mul(inv) & Self::low_mask128(w - t);
                     let hi = if t == 0 {
                         0
                     } else {
-                        self.cur_rng().r#gen::<u64>() << (w - t)
+                        self.cur_rng().r#gen::<u128>() << (w - t)
                     };
                     vals[j] = (low | hi) & mask;
                 }
@@ -2752,12 +2768,14 @@ impl Simulator {
             _ => return,
         }
         for i in touched {
-            let old = self
-                .read_coll_elem(&keys[i])
-                .and_then(|v| v.to_u64())
-                .unwrap_or(0);
+            let old = self.read_coll_elem(&keys[i]).map_or(0, |v| v.to_u128());
             let new = (old & !(mask << off)) | (vals[i] << off);
-            self.write_coll_elem(&keys[i], Value::from_u64(new, c.width));
+            let val = if c.width > 64 {
+                Value::from_u128(new, c.width)
+            } else {
+                Value::from_u64(new as u64, c.width)
+            };
+            self.write_coll_elem(&keys[i], val);
             pinned.insert(keys[i].clone());
         }
     }
@@ -2770,7 +2788,7 @@ impl Simulator {
         item: &ConstraintItem,
         colls: &[RandColl],
         rand_names: &HashSet<String>,
-    ) -> Option<(RandColl, Vec<i64>, i128)> {
+    ) -> Option<(Vec<(RandColl, i64, bool)>, i128)> {
         let ConstraintItem::Expr(e) = item else {
             return None;
         };
@@ -2782,69 +2800,60 @@ impl Simulator {
         else {
             return None;
         };
-        // Collect the index selects on a `+`-chain over a single array `name`.
-        // Index expressions are gathered as-is, then const-evaluated below.
+        // Collect the index selects on a `+`/`-` chain over rand arrays —
+        // one array (`a[0]+a[1]`) or several (`a[0]+b[0]`, #928) — each with
+        // its array's name and whether it is subtracted. Index expressions
+        // are gathered as-is, then const-evaluated below.
         fn chain<'a>(
             e: &'a Expression,
-            name: &mut Option<String>,
-            idxs: &mut Vec<&'a Expression>,
+            neg: bool,
+            idxs: &mut Vec<(&'a str, &'a Expression, bool)>,
         ) -> bool {
             match &e.kind {
-                ExprKind::Paren(i) => chain(i, name, idxs),
+                ExprKind::Paren(i) => chain(i, neg, idxs),
                 ExprKind::Binary {
-                    op: BinaryOp::Add,
+                    op: op @ (BinaryOp::Add | BinaryOp::Sub),
                     left,
                     right,
-                } => chain(left, name, idxs) && chain(right, name, idxs),
+                } => {
+                    chain(left, neg, idxs) && chain(right, neg ^ matches!(op, BinaryOp::Sub), idxs)
+                }
                 ExprKind::Index { expr, index } => {
                     let ExprKind::Ident(h) = &expr.kind else {
                         return false;
                     };
-                    let arr = match h.path.last() {
-                        Some(s) => s.name.name.clone(),
-                        None => return false,
+                    let Some(seg) = h.path.last() else {
+                        return false;
                     };
-                    match name {
-                        Some(n) if *n != arr => return false,
-                        _ => *name = Some(arr),
-                    }
-                    idxs.push(index);
+                    idxs.push((seg.name.name.as_str(), index, neg));
                     true
                 }
                 _ => false,
             }
         }
-        for (sum_side, const_side) in [(left, right), (right, left)] {
-            let mut name: Option<String> = None;
-            let mut idx_exprs: Vec<&Expression> = Vec::new();
-            if !chain(sum_side, &mut name, &mut idx_exprs) || idx_exprs.len() < 2 {
+        'sides: for (sum_side, const_side) in [(left, right), (right, left)] {
+            let mut idx_exprs: Vec<(&str, &Expression, bool)> = Vec::new();
+            if !chain(sum_side, false, &mut idx_exprs) || idx_exprs.len() < 2 {
                 continue;
             }
-            let mut idxs: Vec<i64> = Vec::new();
-            let mut all_const = true;
-            for ie in &idx_exprs {
-                match self.eval_expr(ie).to_i64() {
-                    Some(v) => idxs.push(v),
-                    None => {
-                        all_const = false;
-                        break;
-                    }
-                }
+            let mut terms: Vec<(RandColl, i64, bool)> = Vec::with_capacity(idx_exprs.len());
+            for (arr, ie, neg) in &idx_exprs {
+                let Some(c) = colls.iter().find(|c| c.prop == *arr).cloned() else {
+                    continue 'sides;
+                };
+                let Some(v) = self.eval_expr(ie).to_i64() else {
+                    continue 'sides;
+                };
+                terms.push((c, v, *neg));
             }
-            if !all_const {
-                continue;
-            }
-            // Distinct indices only — a repeated element is not a simple sum.
-            let mut sorted = idxs.clone();
+            // Distinct elements only — a repeated element is not a simple sum.
+            let mut sorted: Vec<(&str, i64)> =
+                terms.iter().map(|t| (t.0.prop.as_str(), t.1)).collect();
             sorted.sort_unstable();
             sorted.dedup();
-            if sorted.len() != idxs.len() {
+            if sorted.len() != terms.len() {
                 continue;
             }
-            let Some(nm) = name else { continue };
-            let Some(c) = colls.iter().find(|c| c.prop == nm).cloned() else {
-                continue;
-            };
             let mut ids: HashSet<String> = HashSet::default();
             self.collect_expr_idents(const_side, &mut ids);
             if ids
@@ -2853,12 +2862,84 @@ impl Simulator {
             {
                 continue;
             }
-            let Some(k) = self.eval_expr(const_side).to_i64() else {
+            // The target keeps every bit up to 128 (§18.5.8, #928): `to_i64`
+            // kept the low word, so a wide target was a different number
+            // and the chain was reported unsolvable.
+            let tv = self.eval_expr(const_side);
+            if tv.has_xz() || tv.is_real || tv.width > 127 {
                 continue;
+            }
+            let k = if tv.is_signed {
+                i128::from(tv.to_i64()?)
+            } else {
+                tv.to_u128() as i128
             };
-            return Some((c, idxs, k as i128));
+            return Some((terms, k));
         }
         None
+    }
+
+    /// §18.5.8 — `a[i] - a[j] (± a[k] …) == K`, or a chain over several
+    /// arrays (`a[0] + b[0] == K`), over elements of one width of at most 128
+    /// bits: every free element but one keeps its draw (pinned ones their
+    /// value) and the last takes the residual, in the arithmetic of the
+    /// operands' width, where the `==` is evaluated (§11.6.1, §11.8.2). An
+    /// element the trial checker then rejects is retried as before.
+    pub(super) fn solve_signed_elem_chain(
+        &mut self,
+        terms: &[(RandColl, i64, bool)],
+        k: i128,
+        pinned: &mut HashSet<String>,
+    ) {
+        use rand::Rng;
+        let Some((c, ..)) = terms.first() else {
+            return;
+        };
+        if c.width > 128 || terms.iter().any(|t| t.0.width != c.width) {
+            return;
+        }
+        let c = c.clone();
+        let mask = Self::low_mask128(c.width);
+        let keys: Vec<String> = terms
+            .iter()
+            .map(|(coll, i, _)| format!("{}[{}]", coll.scoped, i))
+            .collect();
+        let Some(last) = (0..keys.len()).rev().find(|&i| !pinned.contains(&keys[i])) else {
+            return;
+        };
+        let store = |sim: &mut Self, key: &str, v: u128| {
+            let val = if c.width > 64 {
+                Value::from_u128(v, c.width)
+            } else {
+                Value::from_u64(v as u64, c.width)
+            };
+            sim.write_coll_elem(key, val);
+        };
+        let mut acc: u128 = 0;
+        for (i, (_, _, neg)) in terms.iter().enumerate() {
+            if i == last {
+                continue;
+            }
+            if !pinned.contains(&keys[i]) {
+                let v = self.cur_rng().r#gen::<u128>() & mask;
+                store(self, &keys[i], v);
+                pinned.insert(keys[i].clone());
+            }
+            let v = self.read_coll_elem(&keys[i]).map_or(0, |v| v.to_u128()) & mask;
+            acc = if *neg {
+                acc.wrapping_sub(v)
+            } else {
+                acc.wrapping_add(v)
+            };
+        }
+        let kk = (k as u128) & mask;
+        let x = if terms[last].2 {
+            acc.wrapping_sub(kk)
+        } else {
+            kk.wrapping_sub(acc)
+        } & mask;
+        store(self, &keys[last], x);
+        pinned.insert(keys[last].clone());
     }
 
     /// §18.5.9 — an lvalue reaching THROUGH a rand class-handle member
@@ -2932,7 +3013,11 @@ impl Simulator {
         } else {
             allowed
         };
-        let total: u64 = domain.iter().map(|(l, h)| h - l + 1).sum();
+        // Saturating: the full 64-bit (or wider) domain has 2^64 values.
+        let total: u64 = domain
+            .iter()
+            .map(|(l, h)| (h - l).saturating_add(1))
+            .fold(0u64, |a, n| a.saturating_add(n));
         if total < keys.len() as u64 {
             return; // provably impossible — leave for the checker to reject
         }

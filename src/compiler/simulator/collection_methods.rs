@@ -1936,6 +1936,33 @@ impl Simulator {
             self.set_queue_size(&key, n);
             return Some((key, String::new()));
         }
+        // §25.9/§25.10: an interface INSTANCE array as the actual of a
+        // virtual-interface collection formal (`new(2, intf)` with
+        // `InputInterface intf[2]`): each element binds to the matching
+        // instance, held as its handle token. No collection variable backs
+        // the actual, so the copy below had nothing to copy and every
+        // element of the formal read null (#925).
+        if let ExprKind::Ident(h) = &arg.kind
+            && h.root.is_none()
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && self.is_virtual_iface_type(queue_data_type)
+            && let Some(insts) = self.iface_instance_array(&h.path[0].name.name)
+        {
+            let key = self.formal_dyn_key(pname, queue_data_type);
+            self.register_formal_shape(&key, dims);
+            self.module.arrays.insert(key.clone(), (0, -1, 32));
+            self.module.dynamic_arrays.insert(key.clone());
+            self.vif_tokens_stored = true;
+            for (j, inst) in insts.iter().enumerate() {
+                self.set_signal_value_by_name(
+                    &format!("{}[{}]", key, j),
+                    Value::from_u64(Self::iface_handle_token(inst), 32),
+                );
+            }
+            self.set_queue_size(&key, insts.len() as u64);
+            return Some((key, String::new()));
+        }
         let cname = self.queue_actual_storage(arg)?;
         if matches!(dir, PortDirection::Ref) {
             // §13.5.2: alias — the formal resolves to the actual's storage.
@@ -3080,20 +3107,30 @@ impl Simulator {
             return Some(out);
         }
         if matches!(bm, BuiltinM::And | BuiltinM::Or | BuiltinM::Xor) {
-            let mut acc: Option<u64> = None;
+            // §7.12.3: the result has the ELEMENT type — its width and
+            // signedness — and is folded over the elements' full values.
+            // `to_u64` kept the low word of a wide element and the result
+            // was built 32 bits wide, so `p.and()` over `bit [95:0]`
+            // elements could never equal a 96-bit target (#928).
+            let (w, signed) = self.array_elem_sign_width(obj_name);
+            let w = w.max(1);
+            let mut acc: Option<Value> = None;
             for elem in self.reduction_elem_names(obj_name) {
                 if let Some(v) = self.get_signal_value_by_name(&elem) {
-                    let x = v.to_u64().unwrap_or(0);
-                    acc = Some(match (acc, mname) {
-                        (None, _) => x,
-                        (Some(a), "and") => a & x,
-                        (Some(a), "or") => a | x,
-                        (Some(a), "xor") => a ^ x,
-                        (Some(a), _) => a,
+                    let x = if v.width == w { v } else { v.resize(w) };
+                    acc = Some(match acc {
+                        None => x,
+                        Some(a) => match bm {
+                            BuiltinM::And => a.bitwise_and(&x),
+                            BuiltinM::Or => a.bitwise_or(&x),
+                            _ => a.bitwise_xor(&x),
+                        },
                     });
                 }
             }
-            return Some(Value::from_u64(acc.unwrap_or(0), 32));
+            let mut out = acc.unwrap_or_else(|| Value::zero(w));
+            out.is_signed = signed;
+            return Some(out);
         }
         if bm == BuiltinM::Min {
             let cur_size = self.get_queue_size(obj_name) as usize;

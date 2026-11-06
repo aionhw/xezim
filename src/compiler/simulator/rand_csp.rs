@@ -514,6 +514,11 @@ struct Csp {
     /// multi-dimensional packed scalar or array element (`bit [8:0][7:0]
     /// w`), outermost first; its selects go through them (`csp_pdim_ref`).
     pdims: HashMap<usize, Vec<(i64, i64)>>,
+    /// §7.4.1/§7.2.1: the field layout (nested fields by dotted path) of
+    /// ONE element of a `pdims` variable that is a packed array of packed
+    /// structs (`cand_t [0:2] c`): `c[i].f` is field `f` of the element
+    /// `csp_pdim_ref` positions (`csp_pdim_field`).
+    elem_fields: HashMap<usize, Vec<(String, u32, u32)>>,
     /// Declared lsb of a base variable's packed range (`[31:8]` -> 8).
     lsb: HashMap<usize, i64>,
     /// Variables whose packed labels increase from most to least significant.
@@ -1532,6 +1537,7 @@ impl Simulator {
             aux_base: HashMap::default(),
             fields: HashMap::default(),
             field_elems: HashMap::default(),
+            elem_fields: HashMap::default(),
             pdims: HashMap::default(),
             lsb: HashMap::default(),
             ascending: HashSet::default(),
@@ -1741,6 +1747,7 @@ impl Simulator {
             aux_base: HashMap::default(),
             fields: HashMap::default(),
             field_elems: HashMap::default(),
+            elem_fields: HashMap::default(),
             pdims: HashMap::default(),
             lsb: HashMap::default(),
             ascending: HashSet::default(),
@@ -3805,7 +3812,10 @@ impl Simulator {
                 let width = match self.class_prop_struct(sub, &name) {
                     Some(su) if su.packed => {
                         let params = self.instance_param_scope(sub);
-                        self.packed_agg_layout_with(&su, &params).1
+                        // §7.4.1: a packed ARRAY of structs holds every
+                        // element; the layout alone is one element (#928).
+                        let elem_w = self.packed_agg_layout_with(&su, &params).1;
+                        Self::packed_struct_array_width(&su, elem_w, &params).unwrap_or(elem_w)
                     }
                     Some(_) => return None,
                     None => sig.width,
@@ -4684,8 +4694,15 @@ impl Simulator {
                         }
                     }
                 }
+                // §18.5.5 over elements wider than 64 bits: distinctness is
+                // not modelled (the bases are segment-held), but the rest of
+                // the set still is — giving the whole translation up here
+                // left `a[0] < 96'h1_0000_0000_0000_0000` to blind draws
+                // (#928). `enforce_unique_coll` separates the elements
+                // before the solve and the trial checker judges the item.
                 if vs.iter().any(|v| csp.wide.contains(v)) {
-                    return None;
+                    csp.opaque = true;
+                    return Some(Node::True);
                 }
                 Some(Node::AllDiff(vs))
             }
@@ -7123,6 +7140,7 @@ impl Simulator {
         csp.fields.clear();
         csp.field_elems.clear();
         csp.pdims.clear();
+        csp.elem_fields.clear();
         csp.lsb.clear();
         csp.ascending.clear();
         let scalars: Vec<(String, usize)> =
@@ -7150,10 +7168,13 @@ impl Simulator {
                         csp.ascending.insert(*v);
                     }
                 }
-            } else if let Some(dims) = self.csp_packed_dims(csp, name, csp.vars[*v].width) {
+            } else if let Some((dims, elem)) = self.csp_packed_dims(csp, name, csp.vars[*v].width) {
                 // §7.4.1: selects of a multi-dimensional packed variable
                 // name elements of its dimensions (`csp_pdim_ref`).
                 csp.pdims.insert(*v, dims);
+                if let Some(f) = elem {
+                    csp.elem_fields.insert(*v, f);
+                }
             } else {
                 // Other shapes are not split here.
                 csp.lsb.insert(*v, i64::MIN);
@@ -7195,8 +7216,11 @@ impl Simulator {
                         }
                     }
                     None => match &dims {
-                        Some(d) => {
+                        Some((d, elem)) => {
                             csp.pdims.insert(v, d.clone());
+                            if let Some(f) = elem {
+                                csp.elem_fields.insert(v, f.clone());
+                            }
                         }
                         None => {
                             csp.lsb.insert(v, i64::MIN);
@@ -7432,7 +7456,16 @@ impl Simulator {
     /// §7.4.1: the packed dimensions (left, right), outermost first, of a
     /// solver scalar or array `name` declared as a multi-dimensional packed
     /// vector (`bit [8:0][7:0] w`) whose dimensions make up `width` bits.
-    fn csp_packed_dims(&self, csp: &Csp, name: &str, width: u32) -> Option<Vec<(i64, i64)>> {
+    /// For a packed array of packed structs (`cand_t [0:2] c`, §7.4.1) the
+    /// dimensions are the array's — the struct supplies the element width —
+    /// and the element's field layout comes along (`Csp::elem_fields`).
+    #[allow(clippy::type_complexity)]
+    fn csp_packed_dims(
+        &self,
+        csp: &Csp,
+        name: &str,
+        width: u32,
+    ) -> Option<(Vec<(i64, i64)>, Option<Vec<(String, u32, u32)>>)> {
         let (dt, params) = if csp.scope.is_some() {
             let name = self.dyn_name_lookup(name).unwrap_or(name);
             (
@@ -7446,6 +7479,20 @@ impl Simulator {
                 self.instance_param_scope(owner),
             )
         };
+        if let Some(su) = self.packed_struct_with_dims(&dt) {
+            if !su.packed || su.dimensions.is_empty() {
+                return None;
+            }
+            let dims = Self::packed_range_bounds(&su.dimensions, &params)?;
+            let (mut fields, elem_w) = self.packed_agg_layout_with(&su, &params);
+            let total = Self::packed_struct_array_width(&su, elem_w.max(1), &params)?;
+            if total != width {
+                return None;
+            }
+            let top = fields.clone();
+            self.csp_nested_walk(&su, &params, "", 0, &top, &mut fields, 0);
+            return Some((dims, Some(fields)));
+        }
         let dims = crate::compiler::elaborate::packed_full_dims_chained(
             &dt,
             &params,
@@ -7454,7 +7501,7 @@ impl Simulator {
         let bits = dims.iter().try_fold(1u64, |acc, &(l, r)| {
             acc.checked_mul((l - r).unsigned_abs().checked_add(1)?)
         })?;
-        (dims.len() >= 2 && bits == u64::from(width)).then_some(dims)
+        (dims.len() >= 2 && bits == u64::from(width)).then_some((dims, None))
     }
 
     #[allow(clippy::type_complexity)]
@@ -7481,7 +7528,9 @@ impl Simulator {
                 _ => name,
             };
             if let Some(su) = self.class_prop_struct(owner, name) {
-                if !su.packed {
+                // §7.4.1: a packed ARRAY of structs is `csp_packed_dims`'
+                // shape — its fields are per element, not of the whole.
+                if !su.packed || !su.dimensions.is_empty() {
                     return None;
                 }
                 let params = self.instance_param_scope(owner);
@@ -7843,6 +7892,11 @@ impl Simulator {
         if let Some(r) = self.csp_field_elem(csp, e, konst) {
             return Some(r);
         }
+        // `c[i].f` of a packed array of structs: a field of an element whose
+        // index may still be a loop variable (then a dynamic select of `c`).
+        if let Some(r) = self.csp_pdim_field(csp, e, konst) {
+            return Some(r);
+        }
         match &e.kind {
             ExprKind::RangeSelect {
                 expr,
@@ -8071,6 +8125,67 @@ impl Simulator {
         }))
     }
 
+    /// §7.4.1/§7.2.1: `e` as a field of one element of a packed array of
+    /// packed structs (`c[0].valid`, `this.c[1].sub.mode`, `m[1][2].f`, in
+    /// either parse shape — segment selects on a flat identifier, or a
+    /// `MemberAccess` chain over an index): (base variable, lsb, width).
+    /// Some((base, None)) when the field exists but an element index is not
+    /// constant (a `foreach` variable while the constraints are scanned): a
+    /// select at a position not known yet, like `csp_select_ref`'s. None
+    /// unless every dimension of the element is indexed and the dotted
+    /// field path is in the element layout (`Csp::elem_fields`).
+    fn csp_pdim_field(
+        &mut self,
+        csp: &Csp,
+        e: &Expression,
+        konst: &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>,
+    ) -> Option<(usize, Option<(u32, u32)>)> {
+        if csp.elem_fields.is_empty() {
+            return None;
+        }
+        // Member names peeled from the outside in; the element below them.
+        let mut outer: Vec<&str> = Vec::new();
+        let mut cur = Self::unparen(e);
+        while let ExprKind::MemberAccess { expr, member } = &cur.kind {
+            outer.push(member.name.as_str());
+            cur = Self::unparen(expr);
+        }
+        let mut path: Vec<&str> = Vec::new();
+        let base: Expression = match &cur.kind {
+            ExprKind::Ident(h) if h.root.is_none() => {
+                // The last segment WITH selects is the element; the segments
+                // after it are member names.
+                let k = h.path.iter().rposition(|s| !s.selects.is_empty())?;
+                if h.path[..k].iter().any(|s| !s.selects.is_empty()) {
+                    return None;
+                }
+                path.extend(h.path[k + 1..].iter().map(|s| s.name.name.as_str()));
+                let mut bh = h.clone();
+                bh.path.truncate(k + 1);
+                bh.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                bh.cached_resolved_name = crate::ast::cache::NameCache::new();
+                Expression::new(ExprKind::Ident(bh), cur.span)
+            }
+            ExprKind::Index { .. } => cur.clone(),
+            _ => return None,
+        };
+        path.extend(outer.iter().rev());
+        if path.is_empty() {
+            return None;
+        }
+        let p = self.csp_pdim_ref(csp, &base, konst)??;
+        let fields = csp.elem_fields.get(&p.v)?;
+        if p.depth != csp.pdims.get(&p.v)?.len() {
+            return None;
+        }
+        let key = path.join(".");
+        let &(_, flo, fw) = fields.iter().find(|(n, ..)| *n == key)?;
+        if !p.known {
+            return Some((p.v, None));
+        }
+        Some((p.v, Some((p.pos[0].0 + flo, fw))))
+    }
+
     /// `e` as (base, lsb, width, whole): a whole scalar, a field, or a select
     /// of either.
     fn csp_slice_base_k(
@@ -8095,6 +8210,11 @@ impl Simulator {
             let p = p.filter(|p| p.known)?;
             let (lo, w) = p.pos[0];
             return Some((p.v, lo, w, p.depth == 0));
+        }
+        // `c[k].f`: a field of one element of a packed array of structs.
+        if let Some((v, pos)) = self.csp_pdim_field(csp, e, konst) {
+            let (lo, w) = pos?;
+            return Some((v, lo, w, false));
         }
         // `x`, `this.x`, `recv.x`: the scalar itself.
         if let Some(n) = self.csp_member(csp, e) {

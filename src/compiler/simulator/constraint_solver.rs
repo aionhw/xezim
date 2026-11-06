@@ -809,6 +809,7 @@ impl Simulator {
         let mut rand_nd_arrays: Vec<(String, String, Vec<(i64, i64)>, u32)> = Vec::new();
         // §18.4 classification input: rand prop -> its declared type name.
         let mut prop_type_names: HashMap<String, String> = HashMap::default();
+        let mut prop_decl_types: HashMap<String, DataType> = HashMap::default();
 
         // §18.4/§18.5.9/§18.6 — rand class-handle members (`rand SubObject
         // sub_inst`). A rand handle is NOT a random value: "the object handle
@@ -918,6 +919,16 @@ impl Simulator {
                         }
                         if let Some(tn) = &sig.type_name {
                             prop_type_names.insert(prop.clone(), tn.clone());
+                            // §7.4.1: the DECLARED type keeps the packed
+                            // dimensions written before the declarator
+                            // (`cand_t [0:2] a`); the type name alone is one
+                            // struct.
+                            if let Some(dt @ DataType::TypeReference { dimensions, .. }) =
+                                class_def.property_types.get(prop)
+                                && !dimensions.is_empty()
+                            {
+                                prop_decl_types.insert(prop.clone(), dt.clone());
+                            }
                         }
                     }
                     if class_def.randc_properties.contains(prop) {
@@ -1105,11 +1116,16 @@ impl Simulator {
         let mut typed_props: Vec<(&String, &String)> = prop_type_names.iter().collect();
         typed_props.sort_by(|a, b| a.0.cmp(b.0));
         for (prop, tn) in typed_props {
-            let Some(dt) = self.module.typedef_types.get(tn.as_str()) else {
-                continue;
+            let dt = match prop_decl_types.get(prop) {
+                Some(dt) => dt,
+                None => match self.module.typedef_types.get(tn.as_str()) {
+                    Some(dt) => dt,
+                    None => continue,
+                },
             };
-            let DataType::Struct(su) = Self::resolve_type_ref(dt, &self.module.typedef_types)
-            else {
+            // §7.4.1: `cand_t [0:2] a` and `typedef cand_t [0:2] carr_t` keep
+            // their dimensions.
+            let Some(su) = self.packed_struct_with_dims(dt).map(|su| su.into_owned()) else {
                 continue;
             };
             if Self::spreads_member_wise(&su) {
@@ -1139,7 +1155,13 @@ impl Simulator {
                 }
                 unpacked_agg_props.push((prop.clone(), members));
             } else {
-                let (_, total) = self.packed_agg_layout(&su);
+                // §7.4.1: a packed ARRAY of structs is drawn at the width of
+                // every element; one struct's layout alone sized the draw and
+                // rewrote a 27-bit `cand_t [0:2]` property as 9 bits (#928).
+                let (_, elem_w) = self.packed_agg_layout(&su);
+                let total =
+                    Self::packed_struct_array_width(&su, elem_w.max(1), &self.module.parameters)
+                        .unwrap_or(elem_w);
                 packed_agg_props.insert(prop.clone(), total);
             }
         }

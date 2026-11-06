@@ -47,12 +47,22 @@ impl Simulator {
                 // of the type this object binds to it; the declared `T`
                 // has none, so `o.w[1] = 7` wrote nothing (#576).
                 let bound = self.bind_type_params_in(dt, &|n| self.obj_type_param(handle, &c, n));
-                let dims = super::elaborate::packed_full_dims_chained(
-                    bound.as_ref().unwrap_or(dt),
+                let bdt = bound.as_ref().unwrap_or(dt);
+                if let Some(dims) = super::elaborate::packed_full_dims_chained(
+                    bdt,
                     &self.module.parameters,
                     &self.module.typedef_types,
-                )?;
-                return if dims.len() >= 2 { Some(dims) } else { None };
+                ) {
+                    return if dims.len() >= 2 { Some(dims) } else { None };
+                }
+                // §7.4.1: a packed ARRAY of packed structs (`cand_t [0:2] a`):
+                // the array dimensions alone — the struct is the element, so
+                // one dimension already selects elements, not bits (#928).
+                let su = self.packed_struct_with_dims(bdt)?;
+                if !su.packed || su.dimensions.is_empty() {
+                    return None;
+                }
+                return Self::packed_range_bounds(&su.dimensions, &self.module.parameters);
             }
             cur = cd.extends.clone();
         }
