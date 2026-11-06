@@ -1223,7 +1223,10 @@ impl Simulator {
         let mut written: Vec<String> = Vec::new();
         if !child_frames.is_empty() {
             if let Some(parent_pid) = self.process_parents.get(&pid).copied() {
-                // (a) subroutine-frame merge
+                // (a) subroutine-frame merge. Track this child's real writes
+                // so a value that returns to the fork baseline (after an
+                // intermediate write already merged) still propagates.
+                let child_written = self.fork_written.entry(pid).or_default();
                 written = if let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) {
                     Self::merge_fork_writes(
                         &mut parent_ctx.local_stack,
@@ -1231,6 +1234,7 @@ impl Simulator {
                         child_frames,
                         child_frames_gen,
                         baseline,
+                        Some(child_written),
                     )
                 } else {
                     // Parent is the active process — its context is `saved`.
@@ -1240,6 +1244,7 @@ impl Simulator {
                         child_frames,
                         child_frames_gen,
                         baseline,
+                        Some(child_written),
                     )
                 };
             }
@@ -1308,7 +1313,7 @@ impl Simulator {
                     }
                     let updates = Self::merge_fork_writes(
                         &mut other.local_stack, &other.local_gen_stack,
-                        &visible, child_frames_gen, None,
+                        &visible, child_frames_gen, None, None,
                     );
                     written.extend(updates);
                 }
@@ -1327,6 +1332,7 @@ impl Simulator {
             self.process_contexts.remove(&pid);
             self.fork_baselines.remove(&pid);
             self.fork_signal_captures.remove(&pid);
+            self.fork_written.remove(&pid);
         }
         self.restore_process_context(saved);
         self.auto_loop_vars.truncate(saved_auto_len);
@@ -2036,14 +2042,24 @@ impl Simulator {
     /// Returns the names of keys actually propagated (child value differs
     /// from both baseline and parent, so a real write landed). The caller
     /// uses this to promote parked condition waiters that read those names.
+    ///
+    /// `written_keys` (optional) records, per frame index, the keys this
+    /// child has already WRITTEN across earlier merges. A key whose current
+    /// value equals the fork baseline is normally skipped as "inherited,
+    /// never written" — but that is unsound when the child wrote an
+    /// intermediate value (merged into the parent) and then wrote a final
+    /// value equal to the baseline again (`req = null; get(req)` with handle
+    /// reuse). Once a key is recorded here it is propagated regardless of
+    /// baseline equality, so the parent catches the final write.
     pub(super) fn merge_fork_writes(
         parent_frames: &mut [HashMap<String, Value>],
         parent_gens: &[u64],
         child_frames: &[HashMap<String, Value>],
         child_gens: &[u64],
         baseline: Option<&Vec<HashMap<String, Value>>>,
+        mut written_keys: Option<&mut Vec<HashSet<String>>>,
     ) -> Vec<String> {
-        let mut written = Vec::new();
+        let mut propagated = Vec::new();
         let n = parent_frames.len().min(child_frames.len());
         for i in 0..n {
             let same_activation = parent_gens.get(i).copied() == child_gens.get(i).copied();
@@ -2068,14 +2084,30 @@ impl Simulator {
                         break;
                     }
                     if v == bv {
-                        continue;
+                        // Equal to the fork baseline, so it looks merely
+                        // inherited. Still propagate if THIS child already
+                        // wrote it (it went null -> baseline and the parent
+                        // holds the intermediate null).
+                        let already_written = written_keys
+                            .as_ref()
+                            .and_then(|w| w.get(i))
+                            .is_some_and(|s| s.contains(k));
+                        if !already_written {
+                            continue;
+                        }
                     }
                     if let Some(slot) = parent_frames[i].get_mut(k) {
                         if slot != v {
                             *slot = v.clone();
                             // A parked `wait` of the parent may read it.
                             note_store_write(name_bit(k));
-                            written.push(k.clone());
+                            propagated.push(k.clone());
+                            if let Some(w) = written_keys.as_mut() {
+                                if w.len() <= i {
+                                    w.resize_with(i + 1, HashSet::default);
+                                }
+                                w[i].insert(k.clone());
+                            }
                         }
                     }
                 }
@@ -2088,7 +2120,13 @@ impl Simulator {
                     .and_then(|f| f.get(k))
                     .is_some_and(|old| old == v);
                 if inherited_unchanged {
-                    continue;
+                    let already_written = written_keys
+                        .as_ref()
+                        .and_then(|w| w.get(i))
+                        .is_some_and(|s| s.contains(k));
+                    if !already_written {
+                        continue;
+                    }
                 }
                 match parent_frames[i].get_mut(k) {
                     Some(slot) => {
@@ -2096,14 +2134,20 @@ impl Simulator {
                             *slot = v.clone();
                             // A parked `wait` of the parent may read it.
                             note_store_write(name_bit(k));
-                            written.push(k.clone());
+                            propagated.push(k.clone());
+                            if let Some(w) = written_keys.as_mut() {
+                                if w.len() <= i {
+                                    w.resize_with(i + 1, HashSet::default);
+                                }
+                                w[i].insert(k.clone());
+                            }
                         }
                     }
                     None => continue,
                 }
             }
         }
-        written
+        propagated
     }
 
     /// Evaluate a `#delay` expression to an integer number of simulator ticks.
