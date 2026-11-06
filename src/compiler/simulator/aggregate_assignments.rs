@@ -260,17 +260,8 @@ impl Simulator {
             .cloned()
             .filter(|dt| matches!(self.resolve_dt_ref(dt), DataType::Struct(_)));
         for item in items {
-            match item {
-                AssignmentPatternItem::Keyed(k, v) => {
-                    let kv = self.eval_expr(k);
-                    let key = self.assoc_key_str(scoped, &kv);
-                    let target = Self::name_with_key(scoped, &key);
-                    match &elem_dt {
-                        Some(dt) => self.assign_pattern_or_leaf(&target, dt, v),
-                        None => self.pattern_leaf_at_elem_width(&target, v, val_w),
-                    }
-                }
-                AssignmentPatternItem::Default(e) if elem_dt.is_none() => {
+            if let AssignmentPatternItem::Default(e) = item {
+                if elem_dt.is_none() {
                     let mut v = if val_w > 0 {
                         self.eval_expr_ctx(e, val_w)
                     } else {
@@ -293,7 +284,17 @@ impl Simulator {
                     }
                     self.class_assoc_defaults.insert(scoped.to_string(), v);
                 }
-                _ => {}
+                continue;
+            }
+            let Some(k) = Self::array_pattern_key(item) else {
+                continue;
+            };
+            let kv = self.eval_expr(&k);
+            let key = self.assoc_key_str(scoped, &kv);
+            let target = Self::name_with_key(scoped, &key);
+            match &elem_dt {
+                Some(dt) => self.assign_pattern_or_leaf(&target, dt, item.expr()),
+                None => self.pattern_leaf_at_elem_width(&target, item.expr(), val_w),
             }
         }
     }
@@ -451,22 +452,22 @@ impl Simulator {
                     self.eval_builtin_method(name, "delete", &[]);
                     self.module.assoc_defaults.remove(name);
                     for item in items {
-                        match item {
-                            AssignmentPatternItem::Keyed(k, v) => {
-                                let kv = self.eval_expr(k);
-                                let key = self.assoc_key_str(name, &kv);
-                                let cell = format!("{}[{}]", name, key);
-                                match elem_dt {
-                                    Some(dt) => self.assign_pattern_or_leaf(&cell, dt, v),
-                                    None => self.pattern_leaf_at_elem_width(&cell, v, elem_w),
-                                }
-                            }
-                            AssignmentPatternItem::Default(d) => {
-                                self.module
-                                    .assoc_defaults
-                                    .insert(name.to_string(), d.clone());
-                            }
-                            _ => {}
+                        if let AssignmentPatternItem::Default(d) = item {
+                            self.module
+                                .assoc_defaults
+                                .insert(name.to_string(), d.clone());
+                            continue;
+                        }
+                        let Some(k) = Self::array_pattern_key(item) else {
+                            continue;
+                        };
+                        let kv = self.eval_expr(&k);
+                        let key = self.assoc_key_str(name, &kv);
+                        let cell = format!("{}[{}]", name, key);
+                        let v = item.expr();
+                        match elem_dt {
+                            Some(dt) => self.assign_pattern_or_leaf(&cell, dt, v),
+                            None => self.pattern_leaf_at_elem_width(&cell, v, elem_w),
                         }
                     }
                     if !items.is_empty() {
@@ -1046,10 +1047,13 @@ impl Simulator {
                     }
                     pos += 1;
                 }
-                AssignmentPatternItem::Keyed(k, v) => {
-                    if let Some(key) = self.eval_expr(k).to_i64() {
+                AssignmentPatternItem::Keyed(_, _) | AssignmentPatternItem::Named(_, _) => {
+                    let Some(k) = Self::array_pattern_key(item) else {
+                        continue;
+                    };
+                    if let Some(key) = self.eval_expr(&k).to_i64() {
                         if let Some(p) = first.iter().position(|&i| i == key) {
-                            per_elem[p] = Some(v);
+                            per_elem[p] = Some(item.expr());
                         }
                     }
                 }
@@ -3307,10 +3311,13 @@ impl Simulator {
         for item in items {
             match item {
                 AssignmentPatternItem::Default(e) => default = Some(e),
-                AssignmentPatternItem::Keyed(k, v) => {
-                    let ki = self.eval_expr(k).to_i64().unwrap_or(0);
+                AssignmentPatternItem::Keyed(_, _) | AssignmentPatternItem::Named(_, _) => {
+                    let Some(k) = Self::array_pattern_key(item) else {
+                        continue;
+                    };
+                    let ki = self.eval_expr(&k).to_i64().unwrap_or(0);
                     if let Some(p) = indices.iter().position(|&i| i == ki) {
-                        out[p] = Some(v);
+                        out[p] = Some(item.expr());
                     }
                 }
                 AssignmentPatternItem::Ordered(e) => {
@@ -3394,6 +3401,25 @@ impl Simulator {
             } else {
                 self.assign_pattern_or_leaf(&target, dt, e);
             }
+        }
+    }
+
+    /// §10.9.1 — the index expression of a keyed array-pattern item.
+    ///
+    /// `'{ K : v }` parses as a struct member designator (`Named`) whenever
+    /// the key is a bare identifier, because a member name and an index are
+    /// spelled the same (§10.9.1, §10.9.2). On an ARRAY target the
+    /// identifier is a constant or variable used as an index, which is how
+    /// `elaborate::array_params` already reads it for parameters. Reading it
+    /// as a member name here dropped the item instead, so
+    /// `'{ PM_PAGE : '{1,1} }` left an associative array empty.
+    fn array_pattern_key(item: &AssignmentPatternItem) -> Option<Expression> {
+        match item {
+            AssignmentPatternItem::Keyed(k, _) => Some(k.clone()),
+            AssignmentPatternItem::Named(id, _) => {
+                Some(crate::compiler::packed_assignment_pattern_plan::ident_expr(id))
+            }
+            _ => None,
         }
     }
 
@@ -3484,15 +3510,15 @@ impl Simulator {
         if self.module.associative_arrays.contains_key(base) {
             let mut wrote = false;
             for item in items {
-                if let AssignmentPatternItem::Keyed(k, v) = item {
-                    let kv = self.eval_expr(k);
-                    let key = self.assoc_key_str(base, &kv);
-                    self.assign_pattern_or_leaf(&format!("{}[{}]", base, key), &dt, v);
-                    wrote = true;
-                } else if let AssignmentPatternItem::Default(e) = item {
+                if let AssignmentPatternItem::Default(e) = item {
                     self.module
                         .assoc_defaults
                         .insert(base.to_string(), e.clone());
+                    wrote = true;
+                } else if let Some(k) = Self::array_pattern_key(item) {
+                    let kv = self.eval_expr(&k);
+                    let key = self.assoc_key_str(base, &kv);
+                    self.assign_pattern_or_leaf(&format!("{}[{}]", base, key), &dt, item.expr());
                     wrote = true;
                 }
             }
