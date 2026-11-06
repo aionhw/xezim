@@ -51,3 +51,35 @@ endmodule
         ["10 11 12 5 1 2 ", "1 2 5 10 11 12 ", "1 2 3 4", "bad 0"]
     );
 }
+
+/// A fixed array operand is flattened over its declared indexes, left to
+/// right, whatever its bounds.
+#[test]
+fn concat_actual_flattens_array_operand_bounds() {
+    let result = xezim::simulate(
+        r#"
+function automatic string show(int r[3]);
+  return $sformatf("%0d %0d %0d", r[0], r[1], r[2]);
+endfunction
+function automatic string show2(int r[2]);
+  return $sformatf("%0d %0d", r[0], r[1]);
+endfunction
+module t;
+  int down[1:0] = '{10, 20};
+  int up[4:5] = '{7, 9};
+  initial begin
+    $display("%s", show({down, 30}));
+    $display("%s", show2({up}));
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result
+        .output
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(lines, ["10 20 30", "7 9"]);
+}
