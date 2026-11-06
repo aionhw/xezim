@@ -158,12 +158,15 @@ impl Simulator {
         Some(out)
     }
 
-    /// Whether the object in `p` stores a handle back to `handle`.
+    /// Whether a constraint of the object in `p` reads a handle member holding `handle`.
     fn csp_points_back(&self, handle: usize, p: &str) -> bool {
-        let sub = self.member_handle(handle, p);
-        let obj = sub.and_then(|s| self.heap.get(s)?.as_ref());
-        let me = Some(handle as u64);
-        obj.is_some_and(|i| i.properties.values().any(|v| v.to_u64() == me))
+        let sub = self.member_handle(handle, p).unwrap_or(0);
+        let cons = self.active_constraints(sub);
+        let back = |q: &String| {
+            self.member_handle(sub, q) == Some(handle) && Self::csp_constraints_read(q, &cons)
+        };
+        let inst = self.heap.get(sub).and_then(|o| o.as_ref());
+        inst.is_some_and(|i| i.properties.keys().any(back))
     }
 
     /// Whether some item of `constraints` may read member `prop`: a name or
