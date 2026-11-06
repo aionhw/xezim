@@ -346,6 +346,9 @@ mod port_fill_literal_width;
 #[path = "hierarchy/upward_module_name_actual_561.rs"]
 mod upward_module_name_actual_561;
 
+#[path = "hierarchy/upward_name_resolution_890.rs"]
+mod upward_name_resolution_890;
+
 #[path = "hierarchy/nested_iface_write_after_sync_568.rs"]
 mod nested_iface_write_after_sync_568;
 
