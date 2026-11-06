@@ -253,3 +253,23 @@ fn c14_16_2_clocking_last_wins_no_glitch() {
         &[],
     );
 }
+
+// §14.4, §14.16: an edge skew applies to a selected output and to an output
+// whose net another clockvar names, and edge-plus-delay drives made a cycle
+// apart each reach the net.
+#[test]
+fn c14_4_clocking_edge_skew_select_alias_and_delay() {
+    check(
+        "c14_edge_select_alias",
+        include_str!("sv/c14_edge_select_alias.sv"),
+        "c14es",
+        Order::Multiset,
+        &[
+            "T|chg|t=20000 q=1",
+            "T|chg|t=20000 sel=01",
+            "T|chg|t=25000 t=1",
+            "T|chg|t=35000 t=0",
+        ],
+        &[],
+    );
+}

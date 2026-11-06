@@ -54,11 +54,21 @@ impl Simulator {
         raw: &str,
         net: &str,
     ) -> Option<(EdgeKind, u64)> {
-        let raw = self
-            .clocking_sig_alias
-            .get(cb)
-            .and_then(|m| m.iter().find(|(_, n)| n.as_str() == net))
-            .map_or(raw, |(v, _)| v.as_str());
+        // A clockvar with its own output skew keeps its name; only a drive
+        // queued by net alone recovers the name from the alias map.
+        let declared = |n: &str| {
+            self.clocking_sig_out_edge
+                .get(cb)
+                .is_some_and(|m| m.contains_key(n))
+        };
+        let raw = if declared(raw) {
+            raw
+        } else {
+            self.clocking_sig_alias
+                .get(cb)
+                .and_then(|m| m.iter().find(|(v, n)| n.as_str() == net && declared(v)))
+                .map_or(raw, |(v, _)| v.as_str())
+        };
         let per_sig = |m: &HashMap<String, u64>| m.get(raw).or_else(|| m.get(net)).copied();
         if let Some(e) = self
             .clocking_sig_out_edge
@@ -113,26 +123,33 @@ impl Simulator {
             return;
         };
         let mut keep = Vec::new();
-        let mut due: Vec<(String, Value, u64)> = Vec::new();
-        for (net, val, edge, delay) in pend {
+        let mut due: Vec<(String, Value, u64, Option<Expression>)> = Vec::new();
+        for (net, val, edge, delay, target) in pend {
             let hit = match edge {
                 EdgeKind::Posedge => rising,
                 EdgeKind::Negedge => !rising,
                 _ => true,
             };
             if !hit {
-                keep.push((net, val, edge, delay));
+                keep.push((net, val, edge, delay, target));
                 continue;
             }
-            due.retain(|(n, _, _)| *n != net);
-            due.push((net, val, delay));
+            // Selects of one net are different bits, so only whole-net drives replace.
+            if target.is_none() {
+                due.retain(|(n, _, _, t)| t.is_some() || *n != net);
+            }
+            due.push((net, val, delay, target));
         }
-        for (net, val, delay) in due {
-            if delay > 0
+        for (net, val, delay, target) in due {
+            if let Some(t) = target {
+                self.drive_clocking_select(&t, val, delay);
+            } else if delay > 0
                 && let Some(&id) = self.signal_name_to_id.get(net.as_str())
             {
+                // Drives maturing at different times each reach the net, so
+                // this does not replace the net's pending update.
                 let v = self.fit_clocking_value(id, &val);
-                self.schedule_delayed_with_delay(id, v, delay);
+                self.delayed_updates.push((self.time + delay, id, v));
             } else {
                 self.drive_clocking_net(&net, &val);
                 self.clocking_edge_drive_dirty = true;
@@ -268,14 +285,12 @@ impl Simulator {
                 for (n, net, val, target) in pend.drain(..) {
                     if n <= 1 {
                         let raw = net.rsplit('.').next().unwrap_or(&net).to_string();
-                        if target.is_none() {
-                            if let Some((edge, d)) = self.clocking_drive_edge(&cb, &raw, &net) {
-                                self.clocking_edge_out_pending
-                                    .entry(cb.clone())
-                                    .or_default()
-                                    .push((net, val, edge, d));
-                                continue;
-                            }
+                        if let Some((edge, d)) = self.clocking_drive_edge(&cb, &raw, &net) {
+                            self.clocking_edge_out_pending
+                                .entry(cb.clone())
+                                .or_default()
+                                .push((net, val, edge, d, target));
+                            continue;
                         }
                         let skew = self.clocking_net_out_skew(&cb, &net).unwrap_or(dskew);
                         if let Some(t) = target {
@@ -303,14 +318,12 @@ impl Simulator {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
                 for (sig, val, target) in pending {
                     let raw = sig.rsplit('.').next().unwrap_or(&sig).to_string();
-                    if target.is_none() {
-                        if let Some((edge, d)) = self.clocking_drive_edge(&cb, &raw, &sig) {
-                            self.clocking_edge_out_pending
-                                .entry(cb.clone())
-                                .or_default()
-                                .push((sig, val, edge, d));
-                            continue;
-                        }
+                    if let Some((edge, d)) = self.clocking_drive_edge(&cb, &raw, &sig) {
+                        self.clocking_edge_out_pending
+                            .entry(cb.clone())
+                            .or_default()
+                            .push((sig, val, edge, d, target));
+                        continue;
                     }
                     // §14.4 output skew for drives maturing at THIS edge. A
                     // `#0` drive on the plain net is scheduled like one made at

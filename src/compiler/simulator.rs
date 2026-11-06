@@ -7318,8 +7318,10 @@ pub struct Simulator {
     /// skew that overrides the block's default edge).
     clocking_sig_out_edge: HashMap<String, HashMap<String, Option<EdgeKind>>>,
     /// Drives through an edge-skew output, waiting for that edge of the
-    /// block's clock: cb → [(net, value, edge, post-edge delay)] in issue order.
-    clocking_edge_out_pending: HashMap<String, Vec<(String, Value, EdgeKind, u64)>>,
+    /// block's clock: cb → [(net, value, edge, post-edge delay, select target)]
+    /// in issue order.
+    clocking_edge_out_pending:
+        HashMap<String, Vec<(String, Value, EdgeKind, u64, Option<Expression>)>>,
     /// §14.4 per-cb default INPUT skew in ticks (absent = #0).
     clocking_in_skew: HashMap<String, u64>,
     /// §14.4 per-signal input-skew overrides: cb → (resolved net → ticks).
