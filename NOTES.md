@@ -30,6 +30,23 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* An equality that reaches its random variable through `^`, `~^`, `~`, `+`
+  or `-`, such as `(data ^ 32'hf0) == 32'h3`, is solved exactly, in class
+  constraints and in `std::randomize() with` (§18.5.12, §11.8.2).
+  `std::randomize` returned 0 even for `(data ^ 'hf) == 0` on a 32-bit
+  variable. A class constraint solved it only when the constant happened to
+  keep the expression linear on the solver's probe points, as `'hf` does and
+  `'hf0` does not. The solution still has to fit the variable once extended
+  to the comparison's width, so an 8-bit `p` gives
+  `(p ^ 32'h100) == 32'h5` no solution.
+* An input port whose actual holds its declaration initializer takes that
+  value as an edge at time 0 (§23.3.3, §9.4.2). With `logic clk = 0`, a
+  child's `always @(negedge clk)` runs at time 0, and with `logic rst_n = 0`,
+  an `always_ff @(posedge clk or negedge rst_n)` resets at time 0. These
+  blocks used to wait for the first later change. The edge starts from x for
+  a 4-state port and from 0 for a 2-state one. The declaring module's own
+  blocks on the variable still see no event (§6.8), and neither do the
+  instance's initial procedures or `iff` terms.
 * A constraint that joins one-bit terms with `&` or `|`, such as
   `s == S_DATA & data == 32'h1234`, is solved like `&&` and `||` (§11.4.5,
   §18.5, #899). `randomize()` returned 0 and left the members unchanged,
