@@ -134,9 +134,9 @@ impl Simulator {
                 keep.push((net, val, edge, delay, target));
                 continue;
             }
-            // A whole-net drive replaces every earlier drive of the net, selected or not.
+            // A whole-net drive replaces the earlier drives of the net that land at the same time.
             if target.is_none() {
-                due.retain(|(n, ..)| *n != net);
+                due.retain(|(n, _, d, _)| *n != net || *d != delay);
             }
             due.push((net, val, delay, target));
         }

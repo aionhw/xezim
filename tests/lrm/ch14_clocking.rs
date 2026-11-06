@@ -268,6 +268,7 @@ fn c14_4_clocking_edge_skew_select_alias_and_delay() {
             "T|chg|t=20000 q=1",
             "T|chg|t=20000 sel=01",
             "T|chg|t=25000 t=1",
+            "T|chg|t=25000 w=01",
             "T|chg|t=35000 t=0",
         ],
         &[],
