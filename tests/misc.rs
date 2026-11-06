@@ -604,5 +604,7 @@ mod nonvhdl_issue_regressions;
 
 #[path = "misc/import_sized_dimension_895.rs"]
 mod import_sized_dimension_895;
+#[path = "misc/macro_actual_count_888.rs"]
+mod macro_actual_count_888;
 #[path = "misc/typed_localparam_dimension_894.rs"]
 mod typed_localparam_dimension_894;
