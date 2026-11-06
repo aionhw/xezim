@@ -389,3 +389,6 @@ mod indexed_scope_edge_sensitivity;
 
 #[path = "hierarchy/review_indexed_scope_selects.rs"]
 mod review_indexed_scope_selects;
+
+#[path = "hierarchy/time0_port_edge.rs"]
+mod time0_port_edge;
