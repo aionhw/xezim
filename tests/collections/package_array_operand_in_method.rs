@@ -37,3 +37,43 @@ endmodule
         .collect();
     assert_eq!(lines, ["101 10 '{3, 7, 9}"]);
 }
+
+/// A method parameter named like the package is the object, so `{p.iq, 9}`
+/// reads the object's queue rather than the package queue.
+#[test]
+fn object_named_like_package_in_method() {
+    let result = xezim::simulate(
+        r#"
+package p;
+  int iq[$] = {3, 7};
+endpackage
+class holder;
+  int iq[$] = {1, 2};
+endclass
+class gen;
+  function string f(holder p);
+    int cat[$];
+    cat = {p.iq, 9};
+    return $sformatf("%p", cat);
+  endfunction
+endclass
+module t;
+  gen g;
+  holder h;
+  initial begin
+    g = new();
+    h = new();
+    $display("%s", g.f(h));
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result
+        .output
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(lines, ["'{1, 2, 9}"]);
+}

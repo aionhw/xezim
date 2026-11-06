@@ -277,7 +277,9 @@ impl Simulator {
         // Inside a subroutine body `pkg::arr` parses as a member access on
         // the package name; the package's collection is stored under its
         // bare name (or its contested `<pkg>::<name>` store).
-        if matches!(expr.kind, ExprKind::MemberAccess { .. })
+        // A local or property sharing the package's name is an object.
+        if let ExprKind::MemberAccess { expr: base, .. } = &expr.kind
+            && matches!(&base.kind, ExprKind::Ident(h) if !self.ident_shadowed_by_non_collection(h))
             && let Some(e) = self.strip_package_lvalue(expr)
             && let ExprKind::Ident(h) = &e.kind
         {
