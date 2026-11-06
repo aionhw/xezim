@@ -4357,6 +4357,7 @@ impl Simulator {
             local_meta_reapplies: 0,
             mailbox_get_waiters: HashMap::default(),
             fork_baselines: HashMap::default(),
+            fork_written: HashMap::default(),
             fork_collection_captures: HashMap::default(),
             fork_capture_refs: HashMap::default(),
             fork_gen_pids: HashMap::default(),

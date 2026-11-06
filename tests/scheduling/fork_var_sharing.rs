@@ -219,3 +219,44 @@ fn multiple_children_multiple_vars() {
     let sim = simulate(MULTIPLE_VARS, 200).expect("simulate failed");
     assert_pass(&sim, "ACC");
 }
+
+/// A child that writes an INTERMEDIATE value and then a FINAL value equal to
+/// its fork-time baseline must still deliver the final write to the parent.
+///
+/// The propagate-back path skips a key whose current value equals the fork
+/// baseline ("the child merely inherited it"). That heuristic is unsound when
+/// the child writes a value (merged into the parent), parks, and then writes
+/// a value that happens to equal the baseline again — the parent now holds the
+/// intermediate value, so the final write must land anyway. This mirrors the
+/// UVM driver idiom `req = null; seq_item_port.get_next_item(req)` where the
+/// delivered handle reuses the stale one still held at fork (and `null` was
+/// already merged into the parent while the child waited on the sequencer).
+const BASELINE_RETURN: &str = r#"
+module top;
+  task automatic drive();
+    int req = 5;                 // fork-time baseline
+    fork
+      begin
+        req = 0;                 // intermediate write, merged while parked
+        #10;
+        req = 5;                 // returns to baseline — must still propagate
+      end
+      begin
+        #100;                    // sibling that never wins
+      end
+    join_any
+    disable fork;
+    if (req == 5) $display("REUSE_PASS req=%0d", req);
+    else          $display("REUSE_FAIL req=%0d", req);
+  endtask
+  initial begin
+    drive();
+  end
+endmodule
+"#;
+
+#[test]
+fn child_write_returns_to_baseline() {
+    let sim = simulate(BASELINE_RETURN, 200).expect("simulate failed");
+    assert_pass(&sim, "REUSE");
+}
