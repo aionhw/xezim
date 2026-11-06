@@ -1822,6 +1822,11 @@ impl Simulator {
         if let Some(h) = owner {
             self.this_stack.push(Some(h));
         }
+        // An instance covergroup is named `<instance path>.cg`, so the text
+        // before the last dot is the scope its operand names resolve in. A
+        // class covergroup is `Class::cg` and resolves through `this_stack`,
+        // so it is skipped. The hint is restored after sampling because the
+        // caller may be sampling from a different scope.
         let scope = self
             .cg_heap
             .get(handle)
