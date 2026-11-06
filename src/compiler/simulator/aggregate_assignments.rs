@@ -488,12 +488,19 @@ impl Simulator {
                 true
             }
             ExprKind::Concatenation(exprs) if !is_assoc => {
-                let vals = self.unpacked_concat_operand_values(exprs.iter().collect());
-                let n = vals.len() as u64;
+                let mut flat: Vec<&Expression> = Vec::new();
+                for x in exprs {
+                    match &x.kind {
+                        ExprKind::Concatenation(c) => flat.extend(c),
+                        _ => flat.push(x),
+                    }
+                }
+                let vals = self.unpacked_concat_operand_values(flat);
+                self.set_queue_size(name, vals.len() as u64);
                 for (i, v) in vals.into_iter().enumerate() {
+                    let v = self.fit_queue_push_elem(name, v);
                     self.set_signal_value_by_name(&format!("{}[{}]", name, i), v);
                 }
-                self.set_queue_size(name, n);
                 true
             }
             ExprKind::Call { .. } => {

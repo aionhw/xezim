@@ -3604,6 +3604,16 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
+        // §10.10: `cfg.r = {…}`, `s[i].q = {s[i].q, x}` write a queue or dynamic-array
+        // member through a handle, before the right side runs as a value (calls run once).
+        if let ExprKind::MemberAccess { .. } = &lvalue.kind
+            && let ExprKind::Concatenation(_) = &rvalue.kind
+            && let Some(n) = self.expr_assoc_name(lvalue).filter(|n| self.class_queue_prop(n))
+            && self.assign_whole_coll(&n, None, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
         let val = if let ExprKind::Call { func, args } = &rvalue.kind {
             if let ExprKind::Ident(hier) = &func.kind {
                 let method_name = hier.path.last().unwrap().name.name.as_str();
@@ -4092,19 +4102,6 @@ impl Simulator {
                 self.settle_after_proc_write();
                 return;
             }
-        }
-        // §10.10: an unpacked-array concatenation written to a queue or
-        // dynamic-array member through a handle (`cfg.r = {…}`,
-        // `s[i].q = {s[i].q, x}`). Inside a subroutine the target is a
-        // member chain, which the flat-name path below does not take.
-        if let ExprKind::MemberAccess { .. } = &lvalue.kind
-            && let ExprKind::Concatenation(_) = &rvalue.kind
-            && let Some(n) = self.expr_assoc_name(lvalue)
-            && self.class_queue_prop(&n)
-            && self.assign_whole_coll(&n, None, rvalue)
-        {
-            self.settle_after_proc_write();
-            return;
         }
         if let ExprKind::Ident(lhier) = &lvalue.kind {
             let mut lname = if self.ident_shadowed_by_non_collection(lhier) {
