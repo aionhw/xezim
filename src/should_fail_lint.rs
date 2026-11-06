@@ -2620,9 +2620,17 @@ fn check_implicit_ports(
                     }
                     xezim_core::ast::decl::PortConnection::Wildcard => {
                         if let Some(tports) = port_map.get(&inst.module_name.name) {
+                            // §23.3.2.4: `.*` connects only ports that have a
+                            // name; a non-ANSI null port or unnamed port
+                            // expression (the parser's placeholder) is not
+                            // connected and so cannot be missing.
                             let mut missing: Vec<&String> = tports
                                 .iter()
-                                .filter(|p| !scope.contains(*p) && !explicit.contains(*p))
+                                .filter(|p| {
+                                    !scope.contains(*p)
+                                        && !explicit.contains(*p)
+                                        && !xezim_core::elaborate::is_unnamed_port_placeholder(p)
+                                })
                                 .collect();
                             missing.sort();
                             for p in missing {
