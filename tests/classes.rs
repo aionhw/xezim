@@ -1119,3 +1119,6 @@ mod recent_constraints_848_850_852_860_862;
 
 #[path = "classes/module_parameter_specialization_874.rs"]
 mod module_parameter_specialization_874;
+
+#[path = "classes/rand_bijective_eq.rs"]
+mod rand_bijective_eq;
