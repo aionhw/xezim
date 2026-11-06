@@ -1048,21 +1048,83 @@ impl Simulator {
         struct Bound<'a> {
             expr: Option<&'a Expression>,
             leaves: Vec<(u64, u32, bool)>,
-            raw: u64,
+            raw: i128,
             width: u32,
             signed: bool,
             dollar: bool,
         }
-        fn bound<'a>(me: &mut Simulator, e: &'a Expression) -> Option<Bound<'a>> {
+        /// Which end of an `inside` set a bound is, for a real-valued one.
+        #[derive(Clone, Copy, PartialEq)]
+        enum End {
+            Lo,
+            Hi,
+            /// A single `inside {v}` element: the value has to land on an
+            /// integer for any integer operand to equal it.
+            Value,
+        }
+        /// §11.4.13 — a bound built only from real/time literals, which
+        /// `exact_leaves` cannot read. Restricting the fallback to these
+        /// keeps `eval_expr` from running a bound expression that has already
+        /// been (partly) evaluated on the exact path a second time, which
+        /// would repeat a side effect in a function-call bound.
+        fn real_constant(e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::Number(NumberLiteral::Real(_) | NumberLiteral::Time(_)) => true,
+                ExprKind::Paren(inner) => real_constant(inner),
+                ExprKind::Unary {
+                    op: UnaryOp::Plus | UnaryOp::Minus,
+                    operand,
+                } => real_constant(operand),
+                ExprKind::Binary {
+                    op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
+                    left,
+                    right,
+                } => real_constant(left) && real_constant(right),
+                _ => false,
+            }
+        }
+        fn bound<'a>(me: &mut Simulator, e: &'a Expression, end: End) -> Option<Bound<'a>> {
             let mut leaves = Vec::new();
-            let (width, signed) = me.exact_leaves(e, &mut leaves)?;
+            if let Some((width, signed)) = me.exact_leaves(e, &mut leaves) {
+                return Some(Bound {
+                    expr: Some(e),
+                    leaves,
+                    raw: 0,
+                    width,
+                    signed,
+                    dollar: matches!(e.kind, ExprKind::Dollar),
+                });
+            }
+            // §11.4.13 — a real-valued bound. A time literal such as `2000ns`
+            // folds to a real in the current time unit, and an integer
+            // operand is promoted to real for the comparison, so the integer
+            // set is ceil(lo)..floor(hi). Dropping the range instead left
+            // `int x; x inside {[0:2000ns]}` an empty domain, and every
+            // randomize() trial was rejected.
+            if !real_constant(e) {
+                return None;
+            }
+            let v = me.eval_expr(e);
+            if !v.is_real {
+                return None;
+            }
+            let f = v.to_f64();
+            if !f.is_finite() {
+                return None;
+            }
+            let r = match end {
+                End::Lo => f.ceil(),
+                End::Hi => f.floor(),
+                End::Value if f.fract() == 0.0 => f,
+                End::Value => return None,
+            };
             Some(Bound {
-                expr: Some(e),
-                leaves,
-                raw: 0,
-                width,
-                signed,
-                dollar: matches!(e.kind, ExprKind::Dollar),
+                expr: None,
+                leaves: Vec::new(),
+                raw: r as i128,
+                width: 64,
+                signed: true,
+                dollar: false,
             })
         }
         let mut bounds: Vec<(Bound<'_>, Option<Bound<'_>>)> = Vec::new();
@@ -1089,7 +1151,7 @@ impl Simulator {
                                 let b = Bound {
                                     expr: None,
                                     leaves: Vec::new(),
-                                    raw,
+                                    raw: raw as i128,
                                     width: ev.width,
                                     signed: ev.is_signed,
                                     dollar: false,
@@ -1100,7 +1162,7 @@ impl Simulator {
                         }
                         continue;
                     }
-                    if let Some(b) = bound(self, e) {
+                    if let Some(b) = bound(self, e, End::Value) {
                         note(&mut ws, &b);
                         bounds.push((b, None));
                     } else {
@@ -1108,7 +1170,8 @@ impl Simulator {
                     }
                 }
                 ConstraintRange::Range { lo, hi } => {
-                    let (Some(l), Some(h)) = (bound(self, lo), bound(self, hi)) else {
+                    let (Some(l), Some(h)) = (bound(self, lo, End::Lo), bound(self, hi, End::Hi))
+                    else {
                         ws = None;
                         continue;
                     };
@@ -1128,7 +1191,7 @@ impl Simulator {
             let v = if let Some(e) = b.expr {
                 me.exact_fold(e, &b.leaves, &mut 0, w, s)?
             } else {
-                Self::as_ctx(b.raw as i128, b.width, s)
+                Self::as_ctx(b.raw, b.width, s)
             };
             Some(if b.dollar || w == 0 || w > 64 {
                 v

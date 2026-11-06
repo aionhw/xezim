@@ -79,5 +79,7 @@ mod ch34_protected_envelopes;
 mod ch35_dpi;
 #[path = "lrm/ch36_vpi.rs"]
 mod ch36_vpi;
+#[path = "lrm/constraint_real_bounds.rs"]
+mod constraint_real_bounds;
 #[path = "lrm/harness.rs"]
 mod harness;
