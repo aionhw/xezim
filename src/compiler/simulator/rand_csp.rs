@@ -6756,6 +6756,9 @@ impl Simulator {
         for m in hops {
             h = self.member_handle(h, m).filter(|&h| h != 0)?;
         }
+        if h == csp.handle && (csp.arrays.contains_key(leaf) || csp.nd_dims.contains_key(leaf)) {
+            return Some(leaf.clone());
+        }
         csp.scalars.iter().find_map(|(n, &v)| {
             let hit = match &csp.vars[v].key {
                 VarKey::Prop(p) => h == csp.handle && p == leaf,

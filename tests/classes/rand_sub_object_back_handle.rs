@@ -42,3 +42,46 @@ endmodule
         .collect();
     assert_eq!(lines, ["ok 20 bad 0"]);
 }
+
+/// The same read of an enclosing object's rand array element (`p.x[0]`) is
+/// solved with the enclosing object.
+#[test]
+fn sub_object_reads_parent_array_through_back_handle() {
+    let result = xezim::simulate(
+        r#"
+typedef class sub_c;
+class cfg_c;
+  rand sub_c sub;
+  rand bit [7:0] x[1];
+  constraint k { x[0] == 1; }
+  function new(); sub = new(); sub.p = this; endfunction
+endclass
+class sub_c;
+  cfg_c p;
+  rand bit [7:0] y;
+  constraint s { y == p.x[0]; y == 8'd1; }
+endclass
+module t;
+  initial begin
+    cfg_c c = new();
+    int ok = 0, bad = 0;
+    c.x[0] = 5;
+    repeat (20) if (c.randomize()) begin
+      ok++;
+      bad += c.x[0] != 1 || c.sub.y != 1;
+    end
+    $display("ok %0d bad %0d", ok, bad);
+    $finish;
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result
+        .output
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(lines, ["ok 20 bad 0"]);
+}
