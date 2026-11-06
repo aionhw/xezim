@@ -392,3 +392,6 @@ mod review_indexed_scope_selects;
 
 #[path = "hierarchy/time0_port_edge.rs"]
 mod time0_port_edge;
+
+#[path = "hierarchy/child_constant_checks_893.rs"]
+mod child_constant_checks_893;
