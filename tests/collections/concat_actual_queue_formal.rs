@@ -44,3 +44,37 @@ endmodule
         .collect();
     assert_eq!(lines, ["3 C D E", "3 C D E", "4 C D E B", "2 A B"]);
 }
+
+/// A fixed array operand contributes its elements over its declared indexes,
+/// left to right, whatever its bounds.
+#[test]
+fn concat_actual_splices_fixed_array_operands_into_queue_formal() {
+    let result = xezim::simulate(
+        r#"
+class lib_c;
+  static function void show(int inc[$]);
+    string s;
+    s = $sformatf("%0d", inc.size());
+    foreach (inc[i]) s = {s, " ", $sformatf("%0d", inc[i])};
+    $display("%s", s);
+  endfunction
+endclass
+module t;
+  int up[2:3] = '{7, 9};
+  int down[1:0] = '{10, 20};
+  initial begin
+    lib_c::show({up});
+    lib_c::show({down, 30});
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result
+        .output
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(lines, ["2 7 9", "3 10 20 30"]);
+}
