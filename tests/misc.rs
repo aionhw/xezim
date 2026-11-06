@@ -121,6 +121,8 @@ mod generate_item_restrictions;
 mod generate_loop_genvar;
 #[path = "misc/generate_region_contents.rs"]
 mod generate_region_contents;
+#[path = "misc/generate_scope_param_sized_array.rs"]
+mod generate_scope_param_sized_array;
 #[path = "misc/iface_functions_and_vif_locals.rs"]
 mod iface_functions_and_vif_locals;
 #[path = "misc/ifu_ibuf_casez_dispatch_c910.rs"]
