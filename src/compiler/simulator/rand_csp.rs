@@ -6744,18 +6744,16 @@ impl Simulator {
         known(&name).then_some(name)
     }
 
-    /// §18.5.9: a member path that reaches an object of this solve through
-    /// handle members (`sub.p.x`, `p` a sub-object's handle back to the
-    /// object being solved) names that object's variable, not a state value.
+    /// §18.5.9: a member path through handle members (`sub.p.x`, `p` a
+    /// sub-object's handle back to the solved object) names that object's variable.
     fn csp_member_through_handles(&self, csp: &Csp, path: &[String]) -> Option<String> {
         if csp.scope.is_some() {
             return None;
         }
         let (leaf, hops) = path.split_last()?;
-        let mut h = csp.handle;
-        for m in hops {
-            h = self.member_handle(h, m).filter(|&h| h != 0)?;
-        }
+        let h = hops.iter().try_fold(csp.handle, |h, m| {
+            self.member_handle(h, m).filter(|&h| h != 0)
+        })?;
         csp.scalars.iter().find_map(|(n, &v)| {
             let hit = match &csp.vars[v].key {
                 VarKey::Prop(p) => h == csp.handle && p == leaf,
