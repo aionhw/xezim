@@ -1122,3 +1122,8 @@ mod module_parameter_specialization_874;
 
 #[path = "classes/rand_bijective_eq.rs"]
 mod rand_bijective_eq;
+
+#[path = "classes/packed_struct_array_property_928.rs"]
+mod packed_struct_array_property_928;
+#[path = "classes/vif_collection_formals_925.rs"]
+mod vif_collection_formals_925;
