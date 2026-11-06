@@ -3173,6 +3173,83 @@ impl Simulator {
         }
     }
 
+    /// True when `sig_id`'s driver cone reaches a live driver — a free-running
+    /// clock generator, or an edge block / continuous assign whose own fan-in
+    /// (transitively) reaches one — or bottoms out in a VARIABLE with no
+    /// continuous driver (a testbench `reg` driven once by an `initial` block,
+    /// e.g. a stable reset or constant). A signal whose cone bottoms out in a
+    /// NET with no driver — an undriven wire, an unresolved/black-boxed cell,
+    /// an ungenerated behavioural PLL VCO output — is the signature of a DEAD
+    /// clock and returns false.
+    ///
+    /// The distinction matters for the dead-clock watchdog: a control signal
+    /// held stable during a long reset/power-up sequence is driven by a flop
+    /// clocked by a live clock (live), and a held reset is a `reg` written by
+    /// an `initial` block (live) — neither has moved its value yet, but neither
+    /// is dead. Only a NET with no driver is unambiguously dead. Cycle-safe via
+    /// `visited`.
+    pub(super) fn has_live_driver(
+        &self,
+        sig_id: usize,
+        visited: &mut std::collections::HashSet<usize>,
+    ) -> bool {
+        if !visited.insert(sig_id) {
+            return false;
+        }
+        // A free-running clock generator always toggles — live.
+        if self.clock_generators.iter().any(|c| c.signal_id == sig_id) {
+            return true;
+        }
+        // An edge block (flop) writing it is live iff any of ITS sensitivities
+        // (clock/reset) is live — the flop fires when that clock toggles.
+        for (bi, cb) in self.compiled_edge_blocks.iter().enumerate() {
+            let Some(cb) = cb else { continue };
+            use super::bytecode::Insn;
+            let writes = cb.instructions.iter().any(|i| {
+                matches!(i,
+                    Insn::NbaAssign(id, ..) | Insn::NbaAssignConst(id, ..)
+                    | Insn::NbaAssignRange(id, ..) | Insn::NbaAssignRangeDyn(id, ..)
+                    | Insn::NbaAssignBitDyn(id, ..) | Insn::NbaAssignArrayRead(id, ..)
+                    | Insn::BlockingAssign(id, ..) | Insn::BlockingAssignRange(id, ..)
+                    | Insn::BlockingAssignRangeDyn(id, ..) | Insn::BlockingAssignBitDyn(id, ..)
+                        if *id as usize == sig_id)
+            });
+            if !writes {
+                continue;
+            }
+            return self
+                .edge_blocks
+                .get(bi)
+                .map(|block| {
+                    block
+                        .resolved_sensitivities
+                        .iter()
+                        .any(|sid| self.has_live_driver(sid.signal_id, visited))
+                })
+                .unwrap_or(false);
+        }
+        // A continuous assign / combinational entry writing it is live iff any
+        // of its read fan-in is live — it recomputes when an input changes.
+        for e in &self.comb_entries {
+            if !e.cold.write_signal_ids.contains(&sig_id) {
+                continue;
+            }
+            return e
+                .cold
+                .read_signal_ids
+                .iter()
+                .any(|&r| self.has_live_driver(r, visited));
+        }
+        // No continuous driver (no clock generator, edge block, or continuous
+        // assign writes it). A NET with no driver is the dead-clock signature —
+        // an undriven wire / unresolved cell / ungenerated PLL VCO output. A
+        // VARIABLE with no continuous driver is normal: a `reg` driven once by
+        // an `initial` block (a stable reset or constant) — treat it as live so
+        // a held reset does not trip the watchdog.
+        let name = self.name_for_id(sig_id);
+        !(self.module.nets.contains(name) || self.module.implicit_nets.contains(name))
+    }
+
     /// Hang diagnosis: print the longest-parked event waiters — who is
     /// stuck, on which signals, since when, and whether those signals have
     /// EVER changed since the waiter parked (`arm_bits` comparison). A

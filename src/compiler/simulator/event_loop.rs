@@ -1992,6 +1992,9 @@ impl Simulator {
         // clock is caught whatever phase the periodic check lands on.
         let mut wd_toggled = false;
         let mut wd_warned = false;
+        // Memoized "every awaited signal has no live driver" (a static property
+        // of the design). `None` until first computed for the current window.
+        let mut wd_all_dead: Option<bool> = None;
         // O1 flop-fire skip is default-ON (correct-by-construction snapshot
         // compare; ~1.1-1.6x on c910). Set XEZIM_EVENT_EDGE=0 to disable.
         let event_skip = std::env::var("XEZIM_EVENT_EDGE").ok().as_deref() != Some("0");
@@ -2094,48 +2097,68 @@ impl Simulator {
                         let d_edges = self.prof_edges_fired.saturating_sub(wd_ref_edges);
                         let d_wall = sim_start.elapsed().saturating_sub(wd_ref_wall);
                         if d_ticks >= sc_ticks && d_edges >= sc_edges && d_wall >= sc_wall {
-                            let sig = self.name_for_id(cur_sigs[0]).to_string();
-                            let pid = w.pid;
-                            eprintln!(
-                                "\n=================== xezim: DEAD-CLOCK WATCHDOG ==================="
-                            );
-                            eprintln!(
-                                "Process pid {} has been parked on '{}' for {} sim tick(s) with NO\n\
+                            // Liveness gate: a genuinely dead clock has NO live
+                            // driver anywhere in its cone (an undriven net /
+                            // unresolved cell / ungenerated behavioural PLL VCO).
+                            // A control signal held stable during a long
+                            // reset/power-up is driven by a flop that is itself
+                            // clocked by a live clock, so it is LIVE even though
+                            // its value has not moved yet — the sim is making
+                            // progress, just slowly. Memoize the (static) answer
+                            // so the cone is walked at most once per window.
+                            if wd_all_dead.unwrap_or_else(|| {
+                                let dead = {
+                                    let mut visited = std::collections::HashSet::new();
+                                    !cur_sigs
+                                        .iter()
+                                        .any(|&id| self.has_live_driver(id, &mut visited))
+                                };
+                                wd_all_dead = Some(dead);
+                                dead
+                            }) {
+                                let sig = self.name_for_id(cur_sigs[0]).to_string();
+                                let pid = w.pid;
+                                eprintln!(
+                                    "\n=================== xezim: DEAD-CLOCK WATCHDOG ==================="
+                                );
+                                eprintln!(
+                                    "Process pid {} has been parked on '{}' for {} sim tick(s) with NO\n\
                                  change to its awaited signal(s), while the design fired {} edges in\n\
                                  {:.0}s of wall time. '{}' looks like a DEAD clock/reset.",
-                                pid,
-                                sig,
-                                d_ticks,
-                                d_edges,
-                                d_wall.as_secs_f64(),
-                                sig
-                            );
-                            eprintln!(
-                                "Likely cause: an undriven net, an unresolved/black-boxed cell, or an\n\
+                                    pid,
+                                    sig,
+                                    d_ticks,
+                                    d_edges,
+                                    d_wall.as_secs_f64(),
+                                    sig
+                                );
+                                eprintln!(
+                                    "Likely cause: an undriven net, an unresolved/black-boxed cell, or an\n\
                                  ungenerated behavioral clock (PLL VCO) upstream — search the log for\n\
                                  '[IMPLICIT NET' and '-v resolution summary' / 'unresolved definition'.\n\
                                  The simulation is making no functional progress (X-churn)."
-                            );
-                            self.report_parked_waiters(8);
-                            if sc_abort {
-                                eprintln!(
-                                    "Aborting (XEZIM_STUCK_CLOCK=abort). Fix the dead clock/reset, or\n\
+                                );
+                                self.report_parked_waiters(8);
+                                if sc_abort {
+                                    eprintln!(
+                                        "Aborting (XEZIM_STUCK_CLOCK=abort). Fix the dead clock/reset, or\n\
                                            set XEZIM_STUCK_CLOCK=warn to continue."
-                                );
-                                eprintln!(
-                                    "=================================================================\n"
-                                );
-                                self.finished = true;
-                                self.stuck_clock_aborted = true;
-                            } else {
-                                eprintln!(
-                                    "Continuing (set XEZIM_STUCK_CLOCK=abort to stop here; =off to silence)."
-                                );
-                                eprintln!(
-                                    "=================================================================\n"
-                                );
+                                    );
+                                    eprintln!(
+                                        "=================================================================\n"
+                                    );
+                                    self.finished = true;
+                                    self.stuck_clock_aborted = true;
+                                } else {
+                                    eprintln!(
+                                        "Continuing (set XEZIM_STUCK_CLOCK=abort to stop here; =off to silence)."
+                                    );
+                                    eprintln!(
+                                        "=================================================================\n"
+                                    );
+                                }
+                                wd_warned = true; // report once
                             }
-                            wd_warned = true; // report once
                         }
                     } else {
                         // Progress (signal changed or a different waiter is
@@ -2147,6 +2170,7 @@ impl Simulator {
                         wd_ref_wall = sim_start.elapsed();
                         wd_ref_phase = self.event_phase;
                         wd_toggled = false;
+                        wd_all_dead = None;
                     }
                 }
             }
