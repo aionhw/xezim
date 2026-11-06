@@ -663,7 +663,8 @@ impl Simulator {
                 let mut name = bn.clone();
                 for idx in rev.iter().rev() {
                     let kv = self.eval_expr(idx);
-                    name = format!("{}[{}]", name, self.assoc_key_str(&bn, &kv));
+                    let ks = self.nested_level_key(&name, &bn, &kv);
+                    name = format!("{}[{}]", name, ks);
                 }
                 return Some(name);
             }

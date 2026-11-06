@@ -44,3 +44,44 @@ endmodule
         .collect();
     assert_eq!(lines, ["5 BLUE CYAN GREEN"]);
 }
+
+/// Each index of `C::q[s][i]` takes the key type of the dimension it selects
+/// into, so a string-then-int row names the queue a `push_back` filled.
+#[test]
+fn class_scoped_assoc_queue_element_mixed_key_types() {
+    let result = xezim::simulate(
+        r#"
+class pool_c;
+  static int rows[string][int][$];
+  static function void build();
+    rows["x"][65].push_back(9);
+    rows["x"][65].push_back(8);
+    rows["x"][66].push_back(7);
+  endfunction
+endclass
+class user_c;
+  int got[$];
+  function void setup();
+    got = {pool_c::rows["x"][65], pool_c::rows["x"][66]};
+  endfunction
+endclass
+module t;
+  initial begin
+    user_c u = new();
+    pool_c::build();
+    u.setup();
+    $display("%0d %0d %0d %0d", u.got.size(), u.got[0], u.got[1], u.got[2]);
+    $finish;
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result
+        .output
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(lines, ["3 9 8 7"]);
+}
