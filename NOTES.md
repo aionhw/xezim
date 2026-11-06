@@ -46,7 +46,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   blocks used to wait for the first later change. The edge starts from x for
   a 4-state port and from 0 for a 2-state one. The declaring module's own
   blocks on the variable still see no event (§6.8), and neither do the
-  instance's initial procedures or `iff` terms.
+  instance's initial procedures or `iff` terms. The same update reaches a
+  parent's block on the port's hierarchical name (`@(negedge v.clk)`, §23.6)
+  and the readers of a whole-net identity assignment from such a variable
+  (`wire w = v`, `assign w = v`, §10.3.3), whose net took the variable's
+  initializer silently. When a process also writes the variable at time 0,
+  the port's edge comes first and a block both wake runs once; a `#0` or
+  nonblocking write wakes it again.
 * A constraint that joins one-bit terms with `&` or `|`, such as
   `s == S_DATA & data == 32'h1234`, is solved like `&&` and `||` (§11.4.5,
   §18.5, #899). `randomize()` returned 0 and left the members unchanged,
