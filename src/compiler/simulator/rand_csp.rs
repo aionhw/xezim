@@ -2419,10 +2419,7 @@ impl Simulator {
                 );
                 continue;
             }
-            let enum_type = match &c.member {
-                Some(m) => m.enum_type.as_ref(),
-                None => array_enums.get(&c.prop),
-            };
+            let enum_type = array_enums.get(&c.prop);
             if wide && enum_type.is_some() {
                 return None;
             }

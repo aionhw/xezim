@@ -65,3 +65,45 @@ endmodule
         .collect();
     assert_eq!(lines, ["ok 4 valid 4 size 4", "varies 1"]);
 }
+
+/// An enum member of a struct element, with no constraint on it, only takes
+/// enumerator values, whether the enum is declared locally or in a package.
+#[test]
+fn enum_members_of_struct_array_elements_stay_in_their_domain() {
+    let result = xezim::simulate(
+        r#"
+package p;
+  typedef enum bit [2:0] { P_A = 1, P_B = 5 } pmode_t;
+endpackage
+typedef enum bit [2:0] { M_A = 1, M_B = 5 } mode_t;
+typedef struct { rand mode_t mode; rand bit [3:0] pad; } loc_t;
+typedef struct { rand p::pmode_t mode; rand bit [3:0] pad; } pkg_t;
+class c;
+  rand loc_t l[];
+  rand pkg_t g[];
+  function new(); l = new[8]; g = new[8]; endfunction
+endclass
+module t;
+  initial begin
+    c o = new();
+    int bad = 0, ok = 0;
+    repeat (20) begin
+      ok += o.randomize();
+      foreach (o.l[i]) bad += !(o.l[i].mode inside {M_A, M_B});
+      foreach (o.g[i]) bad += !(o.g[i].mode inside {p::P_A, p::P_B});
+    end
+    $display("ok %0d bad %0d", ok, bad);
+    $finish;
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result
+        .output
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(lines, ["ok 20 bad 0"]);
+}

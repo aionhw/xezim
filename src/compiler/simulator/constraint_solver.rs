@@ -1426,6 +1426,9 @@ impl Simulator {
         let array_enums: HashMap<String, String> = rand_colls
             .iter()
             .filter_map(|c| {
+                if let Some(m) = &c.member {
+                    return m.enum_type.clone().map(|tn| (c.prop.clone(), tn));
+                }
                 let prop = c.nd_base.as_ref().map_or(c.prop.as_str(), |(p, _)| p);
                 let tn = self.class_prop_type_name(handle, prop)?;
                 self.module
