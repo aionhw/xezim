@@ -12,6 +12,7 @@
 //! and the whole pass is validated to hold the static-suite baseline (1005).
 
 use xezim_core::SourceDefinition;
+use xezim_core::Value;
 use xezim_core::ast::decl::{
     ClassDeclaration, ClassItem, ClassMethodKind, ClassQualifier, ModuleItem, ParameterDeclaration,
     ParameterKind, TypedefDeclaration,
@@ -24,6 +25,9 @@ use xezim_core::ast::types::{
     DataType, EnumType, IntegerAtomType, PackedDimension, PortDirection, Signing, UnpackedDimension,
 };
 use xezim_core::elaborate::ElaboratedModule;
+
+/// The elaboration's parameter table type (`ElaboratedModule::parameters`).
+type ParamMap = xezim_core::hasher::HashMap<String, Value>;
 
 /// Run the second-pass lint over every top-level definition. Returns a list of
 /// error messages (empty == clean).
@@ -38,12 +42,17 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     // segments of the parameter keys and the classes every unit sees.
     let _leaves = ParamLeaves::install(elab);
     let global = global_classes(defs);
+    let views = InstanceViews::build(elab);
     for def in defs {
         match def {
             SourceDefinition::Class(c) => check_class(c, &mut errs),
             SourceDefinition::Typedef(t) => {
                 // §3.12.1: `$unit` folds in the top's table.
-                let unit = ConstScope { elab, top: true };
+                let unit = ConstScope {
+                    elab,
+                    top: true,
+                    inst: None,
+                };
                 check_typedef(t, unit, &Default::default(), &mut errs);
                 // Width-identifier check is restricted to TOP-LEVEL typedefs
                 // (no enclosing module scope), where every value parameter is
@@ -65,9 +74,14 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 check_subroutine_port_types(&m.items, &local_types, &pkg_names, elab, &mut errs);
                 let scope = ConstScope::of(elab, &m.name.name);
-                for it in &m.items {
-                    check_module_item(it, scope, &local_types, true, &mut errs);
-                }
+                check_items_in_scopes(
+                    &m.name.name,
+                    &m.items,
+                    scope,
+                    &views,
+                    &local_types,
+                    &mut errs,
+                );
                 check_proc_net_assign(&m.ports, &m.items, &mut errs);
                 check_monitor_automatic(&m.items, &mut errs);
                 check_unpacked_pattern_counts(&m.items, &mut errs);
@@ -90,9 +104,14 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 check_subroutine_port_types(&m.items, &local_types, &pkg_names, elab, &mut errs);
                 let scope = ConstScope::of(elab, &m.name.name);
-                for it in &m.items {
-                    check_module_item(it, scope, &local_types, true, &mut errs);
-                }
+                check_items_in_scopes(
+                    &m.name.name,
+                    &m.items,
+                    scope,
+                    &views,
+                    &local_types,
+                    &mut errs,
+                );
                 check_stream_widths(&m.items, scope, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_monitor_automatic(&m.items, &mut errs);
@@ -114,9 +133,14 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 check_subroutine_port_types(&m.items, &local_types, &pkg_names, elab, &mut errs);
                 let scope = ConstScope::of(elab, &m.name.name);
-                for it in &m.items {
-                    check_module_item(it, scope, &local_types, true, &mut errs);
-                }
+                check_items_in_scopes(
+                    &m.name.name,
+                    &m.items,
+                    scope,
+                    &views,
+                    &local_types,
+                    &mut errs,
+                );
                 check_stream_widths(&m.items, scope, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_program_items(&m.items, &mut errs);
@@ -128,12 +152,18 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
             SourceDefinition::Package(p) => {
                 use xezim_core::ast::decl::PackageItem;
                 // A package's own bare names are not resolved here.
-                let scope = ConstScope { elab, top: false };
+                let scope = ConstScope {
+                    elab,
+                    top: false,
+                    inst: None,
+                };
                 for it in &p.items {
                     match it {
                         PackageItem::Class(c) => check_class(c, &mut errs),
                         PackageItem::Data(d) => check_enum_type(&d.data_type, scope, &mut errs),
-                        PackageItem::Typedef(td) => check_enum_type(&td.data_type, scope, &mut errs),
+                        PackageItem::Typedef(td) => {
+                            check_enum_type(&td.data_type, scope, &mut errs)
+                        }
                         _ => {}
                     }
                 }
@@ -191,6 +221,42 @@ fn check_unit<'a>(
     check_param_override_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
+}
+
+/// The per-item value checks of a definition, in every scope its constants
+/// fold in: the top's own table, or the table of each instance of any other
+/// definition (#893) — a child's constants are checked for every instance,
+/// since an override may make one instance illegal. The same message from
+/// several instances is reported once. A definition nothing instantiates
+/// keeps the definition-only fold (`ConstScope::of`).
+fn check_items_in_scopes(
+    name: &str,
+    items: &[ModuleItem],
+    scope: ConstScope,
+    views: &InstanceViews,
+    local_types: &std::collections::HashSet<String>,
+    errs: &mut Vec<String>,
+) {
+    let views = if scope.top { &[][..] } else { views.of(name) };
+    if views.is_empty() {
+        for it in items {
+            check_module_item(it, scope, local_types, true, errs);
+        }
+        return;
+    }
+    let mut seen: HashSet<String> = HashSet::default();
+    let mut found = Vec::new();
+    for view in views {
+        let scope = ConstScope::instance(scope.elab, view);
+        for it in items {
+            check_module_item(it, scope, local_types, true, &mut found);
+        }
+        for e in found.drain(..) {
+            if seen.insert(e.clone()) {
+                errs.push(e);
+            }
+        }
+    }
 }
 
 /// Classes can appear nested inside module/interface/program bodies.
@@ -279,7 +345,7 @@ fn check_module_item(
                 let this_live = match c {
                     _ if !decided || taken => false,
                     None => true,
-                    Some(c) => match (width_is_confident(c, scope.elab), scope.value(c)) {
+                    Some(c) => match (width_is_confident(c, scope), scope.value(c)) {
                         (true, Some(v)) => v != 0,
                         _ => {
                             decided = false;
@@ -602,12 +668,79 @@ impl Drop for ParamLeaves {
 
 /// Folds a value check's constants in one definition (§23.9).
 ///
-/// The top folds against `elab.parameters`. Any other definition keeps only a
-/// fold over literals and `pkg::N` (§26.3); a bare name there may be its own.
+/// The top folds against `elab.parameters`. Another definition folds against
+/// the parameters of ONE of its instances (`inst`, see [`InstanceViews`]):
+/// the elaboration registers a child's constants under the instance path
+/// (`u.N`), so a bare name in the definition is read from that table (#893).
+/// Without an instance only literals and `pkg::N` (§26.3) fold; a bare name
+/// there may be its own.
 #[derive(Clone, Copy)]
 struct ConstScope<'a> {
     elab: &'a ElaboratedModule,
     top: bool,
+    inst: Option<&'a ParamMap>,
+}
+
+/// The parameters of every instance of each non-top definition, keyed by the
+/// definition's name, each with the instance path stripped from its keys
+/// (`u.v.N` of instance `u.v` is `N`) and joined by the package and class
+/// constants (`pkg::N`), which every scope reads by that spelling (§26.3).
+/// A bare top-level key is NOT part of a child's view: the child's own `N`
+/// is registered as `u.N`, and a `$unit` or top-module `N` it could see is
+/// told apart from nothing by the flat table.
+struct InstanceViews {
+    by_def: HashMap<String, Vec<ParamMap>>,
+}
+
+impl InstanceViews {
+    fn build(elab: &ElaboratedModule) -> Self {
+        let mut by_def: HashMap<String, Vec<ParamMap>> = HashMap::default();
+        if elab.instances.is_empty() {
+            return InstanceViews { by_def };
+        }
+        // Instance path -> (definition, index of its view in `by_def`).
+        let mut slots: HashMap<&str, (&str, usize)> = HashMap::default();
+        for inst in &elab.instances {
+            let views = by_def.entry(inst.def_name.clone()).or_default();
+            views.push(ParamMap::default());
+            slots.insert(
+                inst.path.as_str(),
+                (inst.def_name.as_str(), views.len() - 1),
+            );
+        }
+        let mut scoped: Vec<(&String, &Value)> = Vec::new();
+        for (key, value) in &elab.parameters {
+            if key.contains("::") {
+                scoped.push((key, value));
+                continue;
+            }
+            // The longest instance path the key starts with owns it.
+            let mut pos = key.len();
+            while let Some(dot) = key[..pos].rfind('.') {
+                if let Some(&(def, idx)) = slots.get(&key[..dot]) {
+                    by_def.get_mut(def).expect("views of a definition")[idx]
+                        .insert(key[dot + 1..].to_string(), value.clone());
+                    break;
+                }
+                pos = dot;
+            }
+        }
+        if !scoped.is_empty() {
+            for views in by_def.values_mut() {
+                for view in views.iter_mut() {
+                    for (key, value) in &scoped {
+                        view.insert((*key).clone(), (*value).clone());
+                    }
+                }
+            }
+        }
+        InstanceViews { by_def }
+    }
+
+    /// The views of the instances of `def`, empty when it is not instantiated.
+    fn of(&self, def: &str) -> &[ParamMap] {
+        self.by_def.get(def).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// A fold in a `ConstScope`.
@@ -625,14 +758,47 @@ impl<'a> ConstScope<'a> {
         ConstScope {
             elab,
             top: name == elab.name,
+            inst: None,
+        }
+    }
+
+    /// The scope of one instance of a non-top definition (#893).
+    fn instance(elab: &'a ElaboratedModule, view: &'a ParamMap) -> Self {
+        ConstScope {
+            elab,
+            top: false,
+            inst: Some(view),
+        }
+    }
+
+    /// The table a constant of this scope folds against.
+    fn params(&self) -> &'a ParamMap {
+        match self.inst {
+            Some(view) if !self.top => view,
+            _ => &self.elab.parameters,
+        }
+    }
+
+    /// The parameter `name` of this scope, when the scope knows it.
+    fn param(&self, name: &str) -> Option<&'a Value> {
+        if self.top || self.inst.is_some() {
+            self.params().get(name)
+        } else {
+            None
         }
     }
 
     fn fold(&self, e: &Expression) -> Folded {
-        if !self.top && !self.reads_only_package_constants(e) {
-            return Folded::Hidden;
+        if !self.top {
+            let known = match self.inst {
+                Some(_) => width_is_confident(e, *self),
+                None => self.reads_only_package_constants(e),
+            };
+            if !known {
+                return Folded::Hidden;
+            }
         }
-        match xezim_core::elaborate::const_eval_i64_with_params(e, Some(&self.elab.parameters)) {
+        match xezim_core::elaborate::const_eval_i64_with_params(e, Some(self.params())) {
             Some(v) => Folded::Value(v),
             None => Folded::NotConstant,
         }
@@ -647,16 +813,18 @@ impl<'a> ConstScope<'a> {
 
     /// The width of `dt`, 0 when it is not known here.
     fn type_width(&self, dt: &DataType) -> u32 {
+        let bound_known = |e: &Expression| match self.inst {
+            Some(_) => width_is_confident(e, *self),
+            None => self.reads_only_package_constants(e),
+        };
         let known = self.top
             || match dt {
                 DataType::IntegerAtom { .. } => true,
-                DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
-                    dimensions.iter().all(|d| {
-                        matches!(d, PackedDimension::Range { left, right, .. }
-                            if self.reads_only_package_constants(left)
-                                && self.reads_only_package_constants(right))
-                    })
-                }
+                DataType::IntegerVector { dimensions, .. }
+                | DataType::Implicit { dimensions, .. } => dimensions.iter().all(|d| {
+                    matches!(d, PackedDimension::Range { left, right, .. }
+                            if bound_known(left) && bound_known(right))
+                }),
                 _ => false,
             };
         if !known {
@@ -664,7 +832,7 @@ impl<'a> ConstScope<'a> {
         }
         xezim_core::elaborate::resolve_type_width(
             dt,
-            Some(&self.elab.parameters),
+            Some(self.params()),
             Some(&self.elab.typedefs),
         )
     }
@@ -683,7 +851,9 @@ impl<'a> ConstScope<'a> {
                 let [pkg] = h.path.as_slice() else {
                     return false;
                 };
-                h.root.is_none() && pkg.selects.is_empty() && self.elab.packages.contains(&pkg.name.name)
+                h.root.is_none()
+                    && pkg.selects.is_empty()
+                    && self.elab.packages.contains(&pkg.name.name)
             }
             ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => only(x),
             ExprKind::Binary { left, right, .. } => only(left) && only(right),
@@ -712,24 +882,28 @@ impl<'a> ConstScope<'a> {
 /// per-instance, e.g. `u.Cfg`). Only literals and references that genuinely
 /// resolve are trusted; anything else leaves the select alone, which is the
 /// right bias for a lint that produces a hard error.
-fn width_is_confident(e: &Expression, elab: &ElaboratedModule) -> bool {
+///
+/// In an instance scope (#893) a name is trusted only when that instance's
+/// own table holds it: the leaf fallbacks of the flat table would read
+/// another instance's parameter of the same name.
+fn width_is_confident(e: &Expression, scope: ConstScope) -> bool {
     match &e.kind {
         ExprKind::Number(_) => true,
-        ExprKind::Paren(i) => width_is_confident(i, elab),
-        ExprKind::Unary { operand, .. } => width_is_confident(operand, elab),
+        ExprKind::Paren(i) => width_is_confident(i, scope),
+        ExprKind::Unary { operand, .. } => width_is_confident(operand, scope),
         ExprKind::Binary { left, right, .. } => {
-            width_is_confident(left, elab) && width_is_confident(right, elab)
+            width_is_confident(left, scope) && width_is_confident(right, scope)
         }
         ExprKind::Conditional {
             condition,
             then_expr,
             else_expr,
         } => {
-            width_is_confident(condition, elab)
-                && width_is_confident(then_expr, elab)
-                && width_is_confident(else_expr, elab)
+            width_is_confident(condition, scope)
+                && width_is_confident(then_expr, scope)
+                && width_is_confident(else_expr, scope)
         }
-        ExprKind::SystemCall { args, .. } => args.iter().all(|a| width_is_confident(a, elab)),
+        ExprKind::SystemCall { args, .. } => args.iter().all(|a| width_is_confident(a, scope)),
         ExprKind::Ident(h) => {
             let raw = h
                 .path
@@ -738,9 +912,10 @@ fn width_is_confident(e: &Expression, elab: &ElaboratedModule) -> bool {
                 .collect::<Vec<_>>()
                 .join(".");
             let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-            elab.parameters.contains_key(&raw)
-                || elab.parameters.contains_key(leaf)
-                || ParamLeaves::contains(elab, leaf)
+            let params = scope.params();
+            params.contains_key(&raw)
+                || params.contains_key(leaf)
+                || (scope.inst.is_none() && ParamLeaves::contains(scope.elab, leaf))
         }
         // A struct/interface member or an index: only trusted when the exact
         // dotted key was seeded (interface-port parameters do this).
@@ -749,11 +924,9 @@ fn width_is_confident(e: &Expression, elab: &ElaboratedModule) -> bool {
                 return false;
             };
             let b = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-            elab.parameters
-                .contains_key(&format!("{b}.{}", member.name))
-                || elab
-                    .parameters
-                    .contains_key(&format!("{b}::{}", member.name))
+            let params = scope.params();
+            params.contains_key(&format!("{b}.{}", member.name))
+                || params.contains_key(&format!("{b}::{}", member.name))
         }
         _ => false,
     }
@@ -762,7 +935,7 @@ fn width_is_confident(e: &Expression, elab: &ElaboratedModule) -> bool {
 fn check_zero_slice(e: &Expression, scope: ConstScope, errs: &mut Vec<String>) {
     if let ExprKind::RangeSelect { kind, right, .. } = &e.kind {
         if matches!(kind, RangeKind::IndexedUp | RangeKind::IndexedDown) {
-            if !width_is_confident(right, scope.elab) {
+            if !width_is_confident(right, scope) {
                 return;
             }
             if let Some(0) = scope.value(right) {
@@ -1109,19 +1282,19 @@ fn stream_width(exprs: &[Expression], vw: &std::collections::HashMap<String, u32
 /// instance-qualified key (`u_fifo.DW`), so `enum logic [DW-1:0] { A = 96'h0 }`
 /// measured 1 bit and §6.19 REJECTED a perfectly legal design. A lint must not
 /// fire on a width it could not determine.
-fn dim_names_resolve(dt: &DataType, elab: &ElaboratedModule) -> bool {
-    fn expr_known(e: &Expression, elab: &ElaboratedModule) -> bool {
+fn dim_names_resolve(dt: &DataType, scope: ConstScope) -> bool {
+    fn expr_known(e: &Expression, params: &ParamMap) -> bool {
         match &e.kind {
             ExprKind::Number(_) => true,
-            ExprKind::Paren(x) => expr_known(x, elab),
-            ExprKind::Unary { operand, .. } => expr_known(operand, elab),
+            ExprKind::Paren(x) => expr_known(x, params),
+            ExprKind::Unary { operand, .. } => expr_known(operand, params),
             ExprKind::Binary { left, right, .. } => {
-                expr_known(left, elab) && expr_known(right, elab)
+                expr_known(left, params) && expr_known(right, params)
             }
             ExprKind::Ident(h) => h
                 .path
                 .last()
-                .is_some_and(|s| elab.parameters.contains_key(&s.name.name)),
+                .is_some_and(|s| params.contains_key(&s.name.name)),
             // Anything else is not something this lint should judge.
             _ => false,
         }
@@ -1131,9 +1304,10 @@ fn dim_names_resolve(dt: &DataType, elab: &ElaboratedModule) -> bool {
         // A non-vector base carries no dimension to be unsure about.
         _ => return true,
     };
+    let params = scope.params();
     dims.iter().all(|d| match d {
         PackedDimension::Range { left, right, .. } => {
-            expr_known(left, elab) && expr_known(right, elab)
+            expr_known(left, params) && expr_known(right, params)
         }
         _ => false,
     })
@@ -1146,7 +1320,7 @@ fn check_enum_type(dt: &DataType, scope: ConstScope, errs: &mut Vec<String>) {
     // Sized-literal-width check requires an explicit base type.
     if let Some(base) = &et.base_type {
         let w = scope.type_width(base);
-        if w != 0 && dim_names_resolve(base, scope.elab) {
+        if w != 0 && dim_names_resolve(base, scope) {
             for m in &et.members {
                 if let Some(init) = &m.init {
                     if let ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) =
@@ -1249,7 +1423,7 @@ fn check_enum_values(et: &EnumType, scope: ConstScope, errs: &mut Vec<String>) {
     // Same trap as the sized-literal check above: a base whose width names a
     // parameter this map cannot resolve measures 1 bit, and every member then
     // looks out of range (and every one of them looks equal to every other).
-    if base.is_some_and(|b| !dim_names_resolve(b, scope.elab)) {
+    if base.is_some_and(|b| !dim_names_resolve(b, scope)) {
         return;
     }
     let width = base.map(|b| scope.type_width(b)).unwrap_or(32);
@@ -2154,10 +2328,42 @@ fn check_unpacked_dims(
                 // (struct-parameter members, per-instance type params), and
                 // cva6's `logic [W-1:0] mem[$clog2(Cfg.MemWords)]`-style
                 // declarations were rejected as size-0 arrays on legal RTL.
-                if !width_is_confident(expr, scope.elab) {
+                if !width_is_confident(expr, scope) {
                     continue;
                 }
                 if let Some(v) = scope.value(expr) {
+                    if v <= 0 {
+                        errs.push(format!(
+                            "array '{}' dimension size must be greater than zero (LRM 1800-2017 §7.4)",
+                            name
+                        ));
+                    }
+                }
+            }
+            // §7.4.2: `[N]` with a bare name parses as an associative
+            // dimension keyed by the type `N`; it is a fixed size when `N`
+            // names a constant of this scope and no type (#893).
+            UnpackedDimension::Associative {
+                data_type: Some(dt),
+                ..
+            } => {
+                let DataType::TypeReference {
+                    name: key,
+                    dimensions,
+                    type_args,
+                    ..
+                } = dt.as_ref()
+                else {
+                    continue;
+                };
+                if key.has_scope() || !dimensions.is_empty() || !type_args.is_empty() {
+                    continue;
+                }
+                let n = key.name.name.as_str();
+                if scope.elab.typedefs.contains_key(n) || scope.elab.classes.contains_key(n) {
+                    continue;
+                }
+                if let Some(v) = scope.param(n).and_then(|v| v.to_i64()) {
                     if v <= 0 {
                         errs.push(format!(
                             "array '{}' dimension size must be greater than zero (LRM 1800-2017 §7.4)",
