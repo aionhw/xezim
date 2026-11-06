@@ -928,6 +928,22 @@ impl Simulator {
                     } else if self.is_select_of_target(right, targets) {
                         let v = self.eval_expr(left);
                         self.assign_value(right, &v);
+                    } else {
+                        // §18.5.12: a target reached through `^`, `~^`, `~`,
+                        // `+` or `-` (`(sd ^ 32'hf0) == 32'h3`) takes the
+                        // equality's one solution. Only interval narrowing
+                        // saw these, and it reads `+`/`-` alone; the joint
+                        // search gave up on a 32-bit `^`.
+                        for (_, lv) in targets {
+                            let is_var = |x: &Expression| {
+                                !matches!(x.kind, ExprKind::Paren(_))
+                                    && Self::expr_same_ignoring_span(x, lv)
+                            };
+                            if let Some(v) = self.solve_bijective_eq(left, right, &is_var) {
+                                self.assign_value(lv, &v);
+                                break;
+                            }
+                        }
                     }
                 }
                 ExprKind::Inside {

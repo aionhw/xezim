@@ -814,7 +814,8 @@ impl Simulator {
                 | BinaryOp::Mod
                 | BinaryOp::BitAnd
                 | BinaryOp::BitOr
-                | BinaryOp::BitXor => {
+                | BinaryOp::BitXor
+                | BinaryOp::BitXnor => {
                     let (lw, ls) = self.exact_leaves(left, out)?;
                     let (rw, rs) = self.exact_leaves(right, out)?;
                     let w = lw.max(rw).max(1);
@@ -932,6 +933,7 @@ impl Simulator {
                     BinaryOp::BitAnd => (Self::bits_at(l, w) & Self::bits_at(r, w)) as i128,
                     BinaryOp::BitOr => (Self::bits_at(l, w) | Self::bits_at(r, w)) as i128,
                     BinaryOp::BitXor => (Self::bits_at(l, w) ^ Self::bits_at(r, w)) as i128,
+                    BinaryOp::BitXnor => Self::bits_at(!(l ^ r), w) as i128,
                     _ => return None,
                 })
             }
@@ -1780,6 +1782,149 @@ impl Simulator {
         false
     }
 
+    /// §18.5.12, §11.8.2: `solve_bijective_eq` for the rand scalar properties
+    /// of `left == right`, in source order; the first one solved is written.
+    pub(super) fn solve_bijective_eq_prop(
+        &mut self,
+        handle: usize,
+        left: &Expression,
+        right: &Expression,
+        rand_set: &HashSet<String>,
+    ) -> bool {
+        if self.is_rand_dyn_size_expr(handle, left) || self.is_rand_dyn_size_expr(handle, right) {
+            return false;
+        }
+        let mut cands = self.affine_candidates(left, rand_set);
+        for c in self.affine_candidates(right, rand_set) {
+            if !cands.contains(&c) {
+                cands.push(c);
+            }
+        }
+        for name in cands {
+            let is_var = |e: &Expression| {
+                matches!(&e.kind, ExprKind::Ident(h)
+                    if h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && h.path[0].name.name == name)
+            };
+            if let Some(val) = self.solve_bijective_eq(left, right, &is_var) {
+                return self.set_prop_if_changed(handle, &name, val);
+            }
+        }
+        false
+    }
+
+    /// §18.5.12: solve `left == right` exactly for the one operand `is_var`
+    /// names when it occurs once, under operators that are bijections at the
+    /// comparison's context width (§11.8.2): `^`, `~^`, `~`, `+`, `-` and
+    /// unary `+`/`-`. Every other operand keeps its current value. The other
+    /// side's value is undone operator by operator down to the variable,
+    /// which then has to give that value again when extended to the context
+    /// width. Returns the variable's value, or None when the shape does not
+    /// apply or the equality has no solution. `solve_affine_eq` probes three
+    /// points, which a `^` only fits by chance (`x ^ 'hf`, not `x ^ 'hf0`).
+    pub(super) fn solve_bijective_eq(
+        &mut self,
+        left: &Expression,
+        right: &Expression,
+        is_var: &dyn Fn(&Expression) -> bool,
+    ) -> Option<Value> {
+        let mut uses = 0usize;
+        let mut on_left = false;
+        let mut fill = false;
+        for (k, side) in [left, right].into_iter().enumerate() {
+            Self::walk_operands(side, &mut |x| {
+                if is_var(x) {
+                    uses += 1;
+                    on_left |= k == 0;
+                }
+                // §5.7.1: `'1` fills its context, which the exact leaves
+                // cannot express (see `exact_cmp`).
+                fill |= matches!(
+                    x.kind,
+                    ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(_))
+                );
+            });
+        }
+        if uses != 1 || fill {
+            return None;
+        }
+        let (var_side, other) = if on_left {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        let (mut vl, mut ol) = (Vec::new(), Vec::new());
+        let (vw, vs) = self.exact_leaves(var_side, &mut vl)?;
+        let (ow, os) = self.exact_leaves(other, &mut ol)?;
+        let w = vw.max(ow).max(1);
+        if w > 64 {
+            return None;
+        }
+        let s = vs && os;
+        let mut want = self.exact_fold(other, &ol, &mut 0, w, s)?;
+        let mut e = var_side;
+        while !is_var(e) {
+            match &e.kind {
+                ExprKind::Paren(inner)
+                | ExprKind::Unary {
+                    op: UnaryOp::Plus,
+                    operand: inner,
+                } => e = inner,
+                ExprKind::Unary {
+                    op: UnaryOp::Minus,
+                    operand,
+                } => {
+                    want = -want;
+                    e = operand;
+                }
+                ExprKind::Unary {
+                    op: UnaryOp::BitNot,
+                    operand,
+                } => {
+                    want = !want;
+                    e = operand;
+                }
+                ExprKind::Binary {
+                    op: op @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::BitXor | BinaryOp::BitXnor),
+                    left: a,
+                    right: b,
+                } => {
+                    let mut in_a = false;
+                    Self::walk_operands(a, &mut |x| in_a |= is_var(x));
+                    let (inner, known) = if in_a { (a, b) } else { (b, a) };
+                    let mut kl = Vec::new();
+                    self.exact_leaves(known, &mut kl)?;
+                    let c = self.exact_fold(known, &kl, &mut 0, w, s)?;
+                    // Each operator is undone mod 2^w, so the values stay in
+                    // w bits and never overflow.
+                    let (want_w, c) = (Self::bits_at(want, w) as i128, Self::bits_at(c, w) as i128);
+                    want = match op {
+                        BinaryOp::Add => want_w - c,
+                        BinaryOp::Sub if in_a => want_w + c,
+                        BinaryOp::Sub => c - want_w,
+                        BinaryOp::BitXor => want_w ^ c,
+                        _ => !(want_w ^ c),
+                    };
+                    e = inner;
+                }
+                _ => return None,
+            }
+            want = Self::bits_at(want, w) as i128;
+        }
+        let cur = self.eval_expr(e);
+        if cur.is_real || cur.width == 0 || cur.width > w {
+            return None;
+        }
+        let bits = Self::bits_at(want, cur.width);
+        if Self::bits_at(Self::as_ctx(bits as i128, cur.width, s), w) != Self::bits_at(want, w) {
+            return None;
+        }
+        let mut val = Value::from_u64(bits as u64, cur.width);
+        val.is_signed = cur.is_signed;
+        Some(val)
+    }
+
     /// §18.5 — force a relational constraint (`x > K`, `K <= x`) whose rand
     /// side currently violates it. The target is re-picked uniformly from the
     /// interval the relation implies, intersected with its declared `inside`
@@ -2338,8 +2483,10 @@ impl Simulator {
                     // §18.5.12 — neither side is a bare rand target: the
                     // equality is ALGEBRAIC (`int_val + $signed({1'b0, l_val})
                     // == 32'd50`, `(r_val - 8'd10) * (l_val + 8'd5) == 16'd0`).
-                    // Solve it as an affine equation in one rand variable.
+                    // Solve it as an affine equation in one rand variable,
+                    // else exactly through `^`, `~^` and `~` as well.
                     self.solve_affine_eq(handle, left, right, rand_set)
+                        || self.solve_bijective_eq_prop(handle, left, right, rand_set)
                 }
                 // `a != b` (the desugared form of `unique {…}`, §18.5.5, and
                 // plain inequality constraints): when the two sides are
