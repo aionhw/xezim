@@ -4,6 +4,26 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// One item of an evaluated `dist` (a resolved `Value` or a `lo..=hi` span),
+/// paired with its mass. Built by `resolve_dist_geometry` and cached in hot
+/// foreach loops so the scalar bounds/weights are not re-evaluated per element.
+#[derive(Clone)]
+pub(super) enum DistItem {
+    One(Value),
+    /// lo, hi, width
+    Span(i64, i64, u32),
+}
+
+/// A fully resolved `dist`: its items with masses, the mass vector, and the
+/// total mass. Cheap to clone (the per-solve memo holds one per distinct
+/// `dist`); the deal + value draw keep using `deal_dist_item`/the RNG per call.
+#[derive(Clone)]
+pub(super) struct ResolvedDist {
+    pub(super) items: Vec<(DistItem, u128)>,
+    pub(super) masses: Vec<u128>,
+    pub(super) total: u128,
+}
+
 impl Simulator {
     pub(super) fn randomize_check_items(
         &mut self,
@@ -3274,17 +3294,100 @@ impl Simulator {
         ranges: &[ConstraintRange],
         weights: &[Option<crate::ast::decl::DistWeight>],
     ) -> Option<Value> {
-        use crate::ast::decl::DistWeight;
+        let g = self.resolve_dist_geometry(ranges, weights)?;
+        self.pick_dist_draw(key, &g)
+    }
+
+    /// Memoized twin of `pick_dist_value` for hot foreach fast paths where
+    /// the scalar bounds/weights are loop-invariant. `item_ptr` identifies the
+    /// constraint site; the resolved geometry is cached per solve (cleared at
+    /// the fast-path entry) so re-evaluation + Vec building happen once per
+    /// array rather than once per element. The per-element deal + value draw
+    /// still consume the RNG stream identically to `pick_dist_value`.
+    pub(super) fn pick_dist_value_memoized(
+        &mut self,
+        item_ptr: usize,
+        key: Option<(usize, String)>,
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+    ) -> Option<Value> {
+        let g = {
+            let memo = self.dist_geometry_memo.borrow();
+            memo.get(&item_ptr).map(Clone::clone)
+        };
+        let g = match g {
+            Some(g) => g,
+            None => {
+                let resolved = self.resolve_dist_geometry(ranges, weights);
+                if let Some(r) = resolved {
+                    self.dist_geometry_memo.borrow_mut().insert(item_ptr, r.clone());
+                    r
+                } else {
+                    return None;
+                }
+            }
+        };
+        self.pick_dist_draw(key, &g)
+    }
+
+    /// Deal and draw one value from a resolved `dist` geometry.
+    fn pick_dist_draw(
+        &mut self,
+        key: Option<(usize, String)>,
+        g: &ResolvedDist,
+    ) -> Option<Value> {
         use rand::Rng;
+        let dealt = match key {
+            Some(k) => self.deal_dist_item(k, &g.masses),
+            None => None,
+        };
+        let idx = match dealt {
+            Some(i) => i,
+            None => {
+                // No stable identity for the target (a foreach element, say)
+                // or weights too fine to schedule: an independent draw.
+                let mut draw = match u64::try_from(g.total) {
+                    Ok(t) => (self.cur_rng().r#gen::<u64>() % t) as u128,
+                    Err(_) => self.cur_rng().gen_range(0..g.total),
+                };
+                let mut pick = g.masses.len() - 1;
+                for (i, m) in g.masses.iter().enumerate() {
+                    if draw < *m {
+                        pick = i;
+                        break;
+                    }
+                    draw -= *m;
+                }
+                pick
+            }
+        };
+        match g.items[idx].0.clone() {
+            DistItem::One(v) => Some(v),
+            DistItem::Span(l, h, bw) => {
+                // §18.5.4: the values inside one item are equiprobable under
+                // both `:=` and `:/`.
+                let v = if h > l {
+                    self.cur_rng().gen_range(l..=h)
+                } else {
+                    l
+                };
+                Some(Value::from_u64(v as u64, bw))
+            }
+        }
+    }
+
+    /// Resolve a `dist`'s items + masses once (the scalar bounds/weights are
+    /// re-evaluated by `pick_dist_value` on every call); callers in hot
+    /// foreach loops memoize the `ResolvedDist` so the re-evaluation and Vec
+    /// building happen once per solve rather than once per element.
+    pub(super) fn resolve_dist_geometry(
+        &mut self,
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+    ) -> Option<ResolvedDist> {
+        use crate::ast::decl::DistWeight;
         // Fixed-point scaler: keeps `Total(w)` masses exact for small w.
         const SCALER: u128 = 1024;
-
-        #[derive(Clone)]
-        enum DistItem {
-            One(Value),
-            /// lo, hi, width
-            Span(i64, i64, u32),
-        }
         let mut items: Vec<(DistItem, u128)> = Vec::new();
         for (i, r) in ranges.iter().enumerate() {
             let w_kind = weights.get(i).and_then(|w| w.as_ref());
@@ -3332,45 +3435,7 @@ impl Simulator {
         if total == 0 {
             return None;
         }
-
-        let dealt = match key {
-            Some(k) => self.deal_dist_item(k, &masses),
-            None => None,
-        };
-        let idx = match dealt {
-            Some(i) => i,
-            None => {
-                // No stable identity for the target (a foreach element, say)
-                // or weights too fine to schedule: an independent draw.
-                let mut draw = match u64::try_from(total) {
-                    Ok(t) => (self.cur_rng().r#gen::<u64>() % t) as u128,
-                    Err(_) => self.cur_rng().gen_range(0..total),
-                };
-                let mut pick = masses.len() - 1;
-                for (i, m) in masses.iter().enumerate() {
-                    if draw < *m {
-                        pick = i;
-                        break;
-                    }
-                    draw -= *m;
-                }
-                pick
-            }
-        };
-
-        match items[idx].0.clone() {
-            DistItem::One(v) => Some(v),
-            DistItem::Span(l, h, bw) => {
-                // §18.5.4: the values inside one item are equiprobable under
-                // both `:=` and `:/`.
-                let v = if h > l {
-                    self.cur_rng().gen_range(l..=h)
-                } else {
-                    l
-                };
-                Some(Value::from_u64(v as u64, bw))
-            }
-        }
+        Some(ResolvedDist { items, masses, total })
     }
 
     /// §18.5.4: the items of a `dist` whose weight is not 0, the values it
