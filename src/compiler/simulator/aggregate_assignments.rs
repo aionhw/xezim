@@ -488,11 +488,13 @@ impl Simulator {
                 true
             }
             ExprKind::Concatenation(exprs) if !is_assoc => {
-                let mut flat: Vec<&Expression> = Vec::new();
-                for x in exprs {
-                    match &x.kind {
-                        ExprKind::Concatenation(c) => flat.extend(c),
-                        _ => flat.push(x),
+                let mut flat: Vec<&Expression> = exprs.iter().collect();
+                while let Some(i) = flat
+                    .iter()
+                    .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
+                {
+                    if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
+                        flat.splice(i..i, c);
                     }
                 }
                 let vals = self.unpacked_concat_operand_values(flat);

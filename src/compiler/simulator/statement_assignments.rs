@@ -3604,8 +3604,7 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
-        // §10.10: `cfg.r = {…}`, `s[i].q = {s[i].q, x}` write a queue or dynamic-array
-        // member through a handle, before the right side runs as a value (calls run once).
+        // §10.10: `cfg.r = {…}` writes a queue member before the right side runs as a value.
         if let ExprKind::MemberAccess { .. } = &lvalue.kind
             && let ExprKind::Concatenation(_) = &rvalue.kind
             && let Some(n) = self.expr_assoc_name(lvalue).filter(|n| self.class_queue_prop(n))

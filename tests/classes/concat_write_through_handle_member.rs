@@ -80,7 +80,7 @@ class top_c;
     $display("A %p", cfg.r);
     cfg.q = {next_value()};
     $display("B %0d %p", calls, cfg.q);
-    cfg.q = {1, {2, 3}};
+    cfg.q = {1, {2, {3}}};
     $display("C %p", cfg.q);
   endfunction
 endclass
