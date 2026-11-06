@@ -3686,9 +3686,12 @@ impl Simulator {
                 let width = mcur.width.max(1);
                 match self.pick_from_ranges(&cr, width, mcur.is_signed) {
                     Some(picked) => {
-                        let same = picked.to_u64() == mcur.to_u64();
-                        self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, picked);
-                        !same
+                        if picked.to_u64() != mcur.to_u64() {
+                            self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, picked);
+                            true
+                        } else {
+                            false
+                        }
                     }
                     None => return None,
                 }
@@ -3698,17 +3701,23 @@ impl Simulator {
                 let picked = self
                     .pick_dist_value(Some(key), &cr, &dw)
                     .unwrap_or_else(|| Value::zero(w));
-                let same = picked.to_u64() == mcur.to_u64();
-                self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, picked);
-                !same
+                if picked.to_u64() != mcur.to_u64() {
+                    self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, picked);
+                    true
+                } else {
+                    false
+                }
             }
             Op::Eq(bound) => {
                 let bv = self.eval_expr(&bound).resize(mcur.width.max(1));
-                let same = bv.to_u64() == mcur.to_u64();
-                let mut p = bv;
-                p.is_signed = signed;
-                self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, p);
-                !same
+                if bv.to_u64() != mcur.to_u64() {
+                    let mut p = bv;
+                    p.is_signed = signed;
+                    self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, p);
+                    true
+                } else {
+                    false
+                }
             }
         };
         Some(changed)
