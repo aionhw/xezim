@@ -1234,7 +1234,7 @@ fn atom_shape(kind: IntegerAtomType) -> (u32, bool) {
     }
 }
 
-fn ident_expr(id: &crate::ast::Identifier) -> Expression {
+pub(crate) fn ident_expr(id: &crate::ast::Identifier) -> Expression {
     use crate::ast::expr::{HierPathSegment, HierarchicalIdentifier};
     Expression::new(
         ExprKind::Ident(HierarchicalIdentifier {

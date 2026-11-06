@@ -295,3 +295,5 @@ mod reduction_with_struct_field;
 mod compiled_queue_last_index;
 #[path = "collections/unpacked_2d_element_width.rs"]
 mod unpacked_2d_element_width;
+#[path = "collections/assoc_pattern_ident_key.rs"]
+mod assoc_pattern_ident_key;
