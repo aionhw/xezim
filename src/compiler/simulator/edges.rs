@@ -2187,6 +2187,14 @@ impl Simulator {
                 self.sensitivity_trigger_count[sid] += 1;
             }
         }
+        // Blocks a time-0 input-port update wakes (`deliver_time0_port_edges`):
+        // the actual they watch did not itself change.
+        for bi in std::mem::take(&mut self.edge_forced_fire) {
+            if bi < triggered_bitmap.len() && !triggered_bitmap[bi] {
+                triggered_bitmap[bi] = true;
+                triggered.push(bi);
+            }
+        }
         if let Some(t) = t0 {
             self.prof_edge_detect += t.elapsed().as_nanos() as u64;
         }

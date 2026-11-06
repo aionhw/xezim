@@ -2053,8 +2053,8 @@ impl Simulator {
             .module
             .input_port_actuals
             .iter()
-            .filter(|(inst, _)| scopes.contains(inst.as_str()))
-            .cloned()
+            .filter(|(inst, ..)| scopes.contains(inst.as_str()))
+            .map(|(inst, actual, _)| (inst.clone(), actual.clone()))
             .collect();
         let mut port_ids: HashMap<String, Vec<usize>> = HashMap::default();
         for (inst, actual) in &actuals {
@@ -2104,6 +2104,126 @@ impl Simulator {
         if self.dirty_any {
             self.settle_combinatorial();
         }
+    }
+
+    /// §23.3.3, §9.4.2: note the time-0 update of each input port whose
+    /// reads were renamed to a whole actual signal, for
+    /// `deliver_time0_port_edges`. The port takes the actual's value at time
+    /// 0, from x for a 4-state formal and from 0 for a 2-state one, so the
+    /// `0` of `logic clk = 0` is a negedge at a child's `@(negedge clk)`
+    /// although the parent's `clk` itself never changed: an initializer is
+    /// no event (§6.8). An actual the settle changed already delivers its
+    /// own edge to every reader.
+    pub(super) fn record_time0_port_edges(&mut self) {
+        if self.module.input_port_actuals.is_empty() {
+            return;
+        }
+        let top = format!("{}.", self.module.name);
+        let mut out = Vec::new();
+        for (inst, actual, two_state) in &self.module.input_port_actuals {
+            let ExprKind::Ident(h) = &actual.kind else {
+                continue;
+            };
+            if h.path.iter().any(|s| !s.selects.is_empty()) {
+                continue;
+            }
+            let mut reads: HashSet<String> = HashSet::default();
+            Self::collect_expr_reads(actual, &self.module, &mut reads);
+            let [read] = reads.iter().collect::<Vec<_>>()[..] else {
+                continue;
+            };
+            let Some(id) = self.resolve_read_name(read, &top) else {
+                continue;
+            };
+            let w = self.signal_widths.get(id).copied().unwrap_or(0);
+            if w == 0 || w > 64 {
+                continue;
+            }
+            let cur = self.term_raw_bits(id);
+            if (self.prev_val.get(id), self.prev_xz.get(id)) != (Some(&cur.0), Some(&cur.1)) {
+                continue;
+            }
+            let inst = inst.strip_prefix(top.as_str()).unwrap_or(inst);
+            let prev = if *two_state {
+                (0, 0)
+            } else {
+                (0, if w == 64 { u64::MAX } else { (1u64 << w) - 1 })
+            };
+            if prev != cur {
+                out.push((inst.to_string(), id, prev, cur));
+            }
+        }
+        self.time0_port_edges = out;
+    }
+
+    /// §23.3.3, §9.4.2: deliver the time-0 port updates
+    /// `record_time0_port_edges` noted, once every process has started and
+    /// parked. In that instance, the edge blocks and the waiters of always
+    /// procedures that watch the port see the edge from the port's value
+    /// before the update; the parent's readers of the actual keep their own
+    /// baseline. As in the reference simulator, a term with an `iff` guard
+    /// and an initial procedure's waiter take no update, and neither does
+    /// any reader once the actual was written at time 0.
+    pub(super) fn deliver_time0_port_edges(&mut self) {
+        let edges = std::mem::take(&mut self.time0_port_edges);
+        if edges.is_empty() {
+            return;
+        }
+        let mut ports: HashMap<&str, Vec<(usize, (u64, u64))>> = HashMap::default();
+        for (inst, id, prev, cur) in &edges {
+            if self.term_raw_bits(*id) == *cur {
+                ports.entry(inst.as_str()).or_default().push((*id, *prev));
+            }
+        }
+        if ports.is_empty() {
+            return;
+        }
+        let top = format!("{}.", self.module.name);
+        let in_scope = |scope: &str| ports.get(scope.strip_prefix(top.as_str()).unwrap_or(scope));
+        let plain = |s: &SensitivityId| s.iff.is_none() && s.value_of.is_none();
+        let blocks = Arc::clone(&self.edge_blocks);
+        let mut fire = Vec::new();
+        for (bi, b) in blocks.iter().enumerate() {
+            let Some(p) = in_scope(&b.scope) else {
+                continue;
+            };
+            if b.resolved_sensitivities.iter().any(|s| {
+                plain(s)
+                    && p.iter().any(|&(id, (pv, px))| {
+                        s.signal_id == id && self.term_fires(s, pv, px, None)
+                    })
+            }) {
+                fire.push(bi);
+            }
+        }
+        let mut rearm: Vec<(usize, usize, (u64, u64))> = Vec::new();
+        for (wi, w) in self.event_waiters.iter().enumerate() {
+            if w.is_clocking || self.process_origin.get(&w.pid).map(|o| o.1) != Some("always block")
+            {
+                continue;
+            }
+            let Some(p) = self
+                .process_scope_hint
+                .get(&w.pid)
+                .and_then(|s| in_scope(s))
+            else {
+                continue;
+            };
+            for (k, s) in w.resolved_sensitivities.iter().enumerate() {
+                if let Some(&(_, prev)) = p.iter().find(|(id, _)| plain(s) && *id == s.signal_id) {
+                    rearm.push((wi, k, prev));
+                }
+            }
+        }
+        if fire.is_empty() && rearm.is_empty() {
+            return;
+        }
+        for (wi, k, prev) in rearm {
+            self.event_waiters[wi].captured_prev[k] = prev;
+        }
+        self.edge_forced_fire = fire;
+        self.check_edges();
+        self.edge_forced_fire.clear();
     }
 
     /// Lift a force on cell `id` so a replacing force's own write lands.

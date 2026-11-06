@@ -10262,6 +10262,14 @@ pub struct Simulator {
     /// registered its waiter — the trigger would be lost. Queue them and
     /// re-fire at the end of the time-0 active region.
     pending_t0_triggers: Vec<String>,
+    /// §23.3.3: the time-0 update of each input port renamed to a whole
+    /// actual signal (see `record_time0_port_edges`): the instance, the
+    /// actual's id, the port's value before the update and the actual's
+    /// value after the pre-process settle (raw v, x).
+    time0_port_edges: Vec<(String, usize, (u64, u64), (u64, u64))>,
+    /// Edge blocks the next edge pass runs although no signal they watch
+    /// changed: those a time-0 port update wakes.
+    edge_forced_fire: Vec<usize>,
     /// True while the compile-time (pre-process) time-0 settle runs.
     in_pre_process_settle: bool,
     /// Call-site (expression span start) → per activation scope (see

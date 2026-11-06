@@ -1604,6 +1604,11 @@ impl Simulator {
                 self.fire_named_event(&ev);
             }
         }
+        // §23.3.3: the time-0 update of an input port whose actual holds an
+        // initializer value reaches the instance's waiters only now.
+        if self.time == 0 && !self.time0_port_edges.is_empty() {
+            self.deliver_time0_port_edges();
+        }
 
         let _t = profile_timing.then(std::time::Instant::now);
         // §4.5: inactive (`#0`) continuations run before this slot's NBAs.

@@ -1424,6 +1424,7 @@ impl Simulator {
         self.in_pre_process_settle = true;
         self.settle_combinatorial();
         self.fire_time0_input_port_blocks();
+        self.record_time0_port_edges();
         self.in_pre_process_settle = false;
         self.time0_settled = true;
         mark_compile_phase("time-0 settle", &mut compile_phase_start);

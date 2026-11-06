@@ -4761,6 +4761,8 @@ impl Simulator {
             proc_sampled_blocks: Vec::new(),
             sampled_registering: false,
             pending_t0_triggers: Vec::new(),
+            time0_port_edges: Vec::new(),
+            edge_forced_fire: Vec::new(),
             in_pre_process_settle: false,
         };
         sim.unpacked_struct_leaves = sim.build_unpacked_struct_leaves();
