@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// Whether the env-gated `class_elem_load` fast-path self-check is active.
+/// Computed once (lazily) so the hot element read path does not re-read the
+/// environment per element.
+static XZ_VERIFY: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("XZVERIFY").is_some());
+
 impl Simulator {
     /// `v` sized and signed for the static cell `key` (an initializer or a
     /// store is an assignment to it, §10.7; an unsized fill takes the
@@ -3783,7 +3789,20 @@ impl Simulator {
             let (lsb, w) = Self::packed_chain_slice(base.width as u64, &dims, &iv)?;
             return Some(base.range_select((lsb + w - 1) as usize, lsb as usize));
         }
-        self.get_signal_value_by_name(&format!("{}#{}{}", handle, arr_name, idx))
+        // Phase-1 fast path: a class unpacked-array element's scoped key
+        // (`5#p08[0]`) is never a dotted name, module signal, array_first_id,
+        // frame, or packed-struct leaf — the entire `get_signal_value_by_name`
+        // walk misses on every one of those and only reaches the `signals`
+        // HashMap at the end. Read the map directly.
+        let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
+        if let Some(v) = self.signals.get(&scoped_key).cloned() {
+            if *XZ_VERIFY {
+                let slow = self.get_signal_value_by_name(&scoped_key);
+                debug_assert_eq!(Some(v.clone()), slow, "class_elem_load fast-path diverge");
+            }
+            return Some(v);
+        }
+        self.get_signal_value_by_name(&scoped_key)
     }
 
     pub(super) fn class_elem_store(
