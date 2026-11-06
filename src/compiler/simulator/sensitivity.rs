@@ -3323,6 +3323,7 @@ impl Simulator {
                         value_of: s.value_of.clone(),
                         wake_rank: self.wake_rank_of(name, id),
                         cell: false,
+                        alias_t0: self.alias_t0_kind(name, id),
                     });
                 }
                 self.resolve_sens_cell(s)
@@ -3356,6 +3357,7 @@ impl Simulator {
             value_of: s.value_of.clone(),
             wake_rank: 0,
             cell,
+            alias_t0: 0,
         })
     }
 
@@ -3811,6 +3813,7 @@ impl Simulator {
                     value_of: Some(e.clone()),
                     wake_rank: src.wake_rank,
                     cell: true,
+                    alias_t0: src.alias_t0,
                 });
             }
         }

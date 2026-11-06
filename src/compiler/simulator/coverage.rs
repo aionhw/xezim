@@ -188,6 +188,7 @@ impl Simulator {
                     value_of: None,
                     wake_rank: 0,
                     cell: false,
+                    alias_t0: 0,
                 });
             }
             if !resolved.is_empty() {

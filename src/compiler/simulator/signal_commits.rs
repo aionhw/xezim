@@ -2053,8 +2053,8 @@ impl Simulator {
             .module
             .input_port_actuals
             .iter()
-            .filter(|(inst, ..)| scopes.contains(inst.as_str()))
-            .map(|(inst, actual, _)| (inst.clone(), actual.clone()))
+            .filter(|(formal, ..)| scopes.contains(Self::port_formal_inst(formal)))
+            .map(|(formal, actual, _)| (Self::port_formal_inst(formal).to_string(), actual.clone()))
             .collect();
         let mut port_ids: HashMap<String, Vec<usize>> = HashMap::default();
         for (inst, actual) in &actuals {
@@ -2106,21 +2106,64 @@ impl Simulator {
         }
     }
 
-    /// §23.3.3, §9.4.2: note the time-0 update of each input port whose
-    /// reads were renamed to a whole actual signal, for
-    /// `deliver_time0_port_edges`. The port takes the actual's value at time
-    /// 0, from x for a 4-state formal and from 0 for a 2-state one, so the
-    /// `0` of `logic clk = 0` is a negedge at a child's `@(negedge clk)`
-    /// although the parent's `clk` itself never changed: an initializer is
-    /// no event (§6.8). An actual the settle changed already delivers its
-    /// own edge to every reader.
-    pub(super) fn record_time0_port_edges(&mut self) {
-        if self.module.input_port_actuals.is_empty() {
-            return;
+    /// The instance an `input_port_actuals` formal path belongs to.
+    pub(super) fn port_formal_inst(formal: &str) -> &str {
+        formal.rsplit_once('.').map_or("", |(inst, _)| inst)
+    }
+
+    /// §23.3.3, §10.3.3: how a term written with `name`, resolved to `id`,
+    /// starts at time 0 (see `SensitivityId::alias_t0`): 0 unless the name
+    /// is a port formal or an identity net (`assign y = x`) collapsed onto
+    /// its source's id, 1 for such a 4-state alias (from x), 2 for a 2-state
+    /// one (from 0). A formal's state comes from the elaborator (its own net
+    /// is gone); an identity net shares its source's, the collapse requires
+    /// that. `name` is spelled as the key that resolved it.
+    pub(super) fn alias_t0_kind(&self, name: &str, id: usize) -> u8 {
+        if self.collapsed_port_children.is_empty() || !self.collapsed_port_children.contains(name) {
+            return 0;
         }
+        let two_state = match self.port_formal_two_state.get(name) {
+            Some(&ts) => ts,
+            None => self.signal_two_state.get(id).copied().unwrap_or(false),
+        };
+        if two_state { 2 } else { 1 }
+    }
+
+    /// The value an alias of kind `kind` (see `alias_t0_kind`) holds before
+    /// its time-0 update, for a `w`-bit signal (raw v, x).
+    fn alias_t0_prev(kind: u8, w: u32) -> (u64, u64) {
+        if kind == 2 {
+            (0, 0)
+        } else {
+            (0, if w == 64 { u64::MAX } else { (1u64 << w) - 1 })
+        }
+    }
+
+    /// §23.3.3, §10.3.3, §9.4.2: note the time-0 update of each input port
+    /// whose reads were renamed to a whole actual signal, and of each name
+    /// collapsed onto another signal's id, and wake the edge blocks that
+    /// watch one, for `deliver_time0_port_edges`. The port or alias takes
+    /// the source's value at time 0, from x for a 4-state one and from 0
+    /// for a 2-state one, so the `0` of `logic clk = 0` is a negedge at a
+    /// child's `@(negedge clk)` or at `@(negedge w)` after `assign w = clk`
+    /// although `clk` itself never changed: an initializer is no event
+    /// (§6.8). A source the settle changed already delivers its own edge
+    /// to every reader.
+    pub(super) fn record_time0_port_edges(&mut self) {
         let top = format!("{}.", self.module.name);
-        let mut out = Vec::new();
-        for (inst, actual, two_state) in &self.module.input_port_actuals {
+        // A source whose value the settle left alone, 1..=64 bits wide, as
+        // (id, that value).
+        let settled = |sim: &Self, id: usize| -> Option<(u64, u64)> {
+            let w = sim.signal_widths.get(id).copied().unwrap_or(0);
+            if w == 0 || w > 64 {
+                return None;
+            }
+            let cur = sim.term_raw_bits(id);
+            ((sim.prev_val.get(id), sim.prev_xz.get(id)) == (Some(&cur.0), Some(&cur.1)))
+                .then_some(cur)
+        };
+        let mut ports = Vec::new();
+        for (formal, actual, two_state) in &self.module.input_port_actuals {
             let ExprKind::Ident(h) = &actual.kind else {
                 continue;
             };
@@ -2135,82 +2178,122 @@ impl Simulator {
             let Some(id) = self.resolve_read_name(read, &top) else {
                 continue;
             };
-            let w = self.signal_widths.get(id).copied().unwrap_or(0);
-            if w == 0 || w > 64 {
+            let Some(cur) = settled(self, id) else {
                 continue;
-            }
-            let cur = self.term_raw_bits(id);
-            if (self.prev_val.get(id), self.prev_xz.get(id)) != (Some(&cur.0), Some(&cur.1)) {
-                continue;
-            }
-            let inst = inst.strip_prefix(top.as_str()).unwrap_or(inst);
-            let prev = if *two_state {
-                (0, 0)
-            } else {
-                (0, if w == 64 { u64::MAX } else { (1u64 << w) - 1 })
             };
+            let inst = Self::port_formal_inst(formal);
+            let inst = inst.strip_prefix(top.as_str()).unwrap_or(inst);
+            let prev = Self::alias_t0_prev(if *two_state { 2 } else { 1 }, self.signal_widths[id]);
             if prev != cur {
-                out.push((inst.to_string(), id, prev, cur));
+                ports.push((inst.to_string(), id, prev, cur));
             }
         }
-        self.time0_port_edges = out;
+        let mut aliases: Vec<(usize, (u64, u64))> = Vec::new();
+        for name in &self.collapsed_port_children {
+            let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
+                continue;
+            };
+            if aliases.iter().any(|&(i, _)| i == id) {
+                continue;
+            }
+            if let Some(cur) = settled(self, id) {
+                aliases.push((id, cur));
+            }
+        }
+        if ports.is_empty() && aliases.is_empty() {
+            return;
+        }
+        // The edge blocks the updates wake, found now against the settled
+        // values: a process that writes the source at time 0 moves them
+        // before `deliver_time0_port_edges` runs.
+        let blocks = Arc::clone(&self.edge_blocks);
+        let mut pending = Vec::new();
+        for (bi, b) in blocks.iter().enumerate() {
+            let scope = b.scope.strip_prefix(top.as_str()).unwrap_or(&b.scope);
+            if b.resolved_sensitivities.iter().any(|s| {
+                self.alias_t0_term_prev(s, scope, &ports, &aliases)
+                    .is_some_and(|(pv, px)| self.term_fires(s, pv, px, None))
+            }) {
+                pending.push(bi);
+            }
+        }
+        if std::env::var("XEZIM_DEBUG").is_ok() {
+            eprintln!(
+                "[T0-ALIAS] ports={:?} aliases={:?} pending={:?}",
+                ports, aliases, pending
+            );
+        }
+        self.time0_port_edges = ports;
+        self.time0_alias_edges = aliases;
+        self.edge_t0_pending = pending;
     }
 
-    /// §23.3.3, §9.4.2: deliver the time-0 port updates
+    /// The value term `s`, in instance `scope`, held before the time-0
+    /// update `record_time0_port_edges` noted for its signal: through the
+    /// alias name the term was written with, or through the renamed input
+    /// port of its own instance. `None` when the term takes no update: one
+    /// on a source nothing renamed, or guarded by `iff` or a value
+    /// expression (the reference simulator delivers neither).
+    fn alias_t0_term_prev(
+        &self,
+        s: &SensitivityId,
+        scope: &str,
+        ports: &[(String, usize, (u64, u64), (u64, u64))],
+        aliases: &[(usize, (u64, u64))],
+    ) -> Option<(u64, u64)> {
+        if s.iff.is_some() || s.value_of.is_some() {
+            return None;
+        }
+        if s.alias_t0 != 0 && aliases.iter().any(|&(id, _)| id == s.signal_id) {
+            let w = self.signal_widths.get(s.signal_id).copied().unwrap_or(0);
+            return Some(Self::alias_t0_prev(s.alias_t0, w));
+        }
+        ports
+            .iter()
+            .find(|(inst, id, ..)| *id == s.signal_id && inst == scope)
+            .map(|&(_, _, prev, _)| prev)
+    }
+
+    /// §23.3.3, §10.3.3, §9.4.2: deliver the time-0 updates
     /// `record_time0_port_edges` noted, once every process has started and
-    /// parked. In that instance, the edge blocks and the waiters of always
-    /// procedures that watch the port see the edge from the port's value
-    /// before the update; the parent's readers of the actual keep their own
-    /// baseline. As in the reference simulator, a term with an `iff` guard
-    /// and an initial procedure's waiter take no update, and neither does
-    /// any reader once the actual was written at time 0.
+    /// parked. The edge blocks the updates woke that have not run since
+    /// run now; the waiters of always procedures that watch an updated
+    /// port or alias see the edge from the value before the update, as
+    /// long as the source still holds its settled value. The source's own
+    /// readers keep their baseline, and, as in the reference simulator, a
+    /// term with an `iff` guard and an initial procedure's waiter take no
+    /// update.
     pub(super) fn deliver_time0_port_edges(&mut self) {
-        let edges = std::mem::take(&mut self.time0_port_edges);
-        if edges.is_empty() {
-            return;
-        }
-        let mut ports: HashMap<&str, Vec<(usize, (u64, u64))>> = HashMap::default();
-        for (inst, id, prev, cur) in &edges {
-            if self.term_raw_bits(*id) == *cur {
-                ports.entry(inst.as_str()).or_default().push((*id, *prev));
-            }
-        }
-        if ports.is_empty() {
-            return;
-        }
+        let fire = std::mem::take(&mut self.edge_t0_pending);
+        let ports = std::mem::take(&mut self.time0_port_edges);
+        let aliases = std::mem::take(&mut self.time0_alias_edges);
         let top = format!("{}.", self.module.name);
-        let in_scope = |scope: &str| ports.get(scope.strip_prefix(top.as_str()).unwrap_or(scope));
-        let plain = |s: &SensitivityId| s.iff.is_none() && s.value_of.is_none();
-        let blocks = Arc::clone(&self.edge_blocks);
-        let mut fire = Vec::new();
-        for (bi, b) in blocks.iter().enumerate() {
-            let Some(p) = in_scope(&b.scope) else {
-                continue;
-            };
-            if b.resolved_sensitivities.iter().any(|s| {
-                plain(s)
-                    && p.iter().any(|&(id, (pv, px))| {
-                        s.signal_id == id && self.term_fires(s, pv, px, None)
-                    })
-            }) {
-                fire.push(bi);
-            }
-        }
         let mut rearm: Vec<(usize, usize, (u64, u64))> = Vec::new();
         for (wi, w) in self.event_waiters.iter().enumerate() {
             if w.is_clocking || self.process_origin.get(&w.pid).map(|o| o.1) != Some("always block")
             {
                 continue;
             }
-            let Some(p) = self
+            let scope = self
                 .process_scope_hint
                 .get(&w.pid)
-                .and_then(|s| in_scope(s))
-            else {
-                continue;
-            };
+                .map(|s| s.strip_prefix(top.as_str()).unwrap_or(s))
+                .unwrap_or("");
             for (k, s) in w.resolved_sensitivities.iter().enumerate() {
-                if let Some(&(_, prev)) = p.iter().find(|(id, _)| plain(s) && *id == s.signal_id) {
+                let Some(prev) = self.alias_t0_term_prev(s, scope, &ports, &aliases) else {
+                    continue;
+                };
+                let cur = aliases
+                    .iter()
+                    .find(|&&(id, _)| id == s.signal_id)
+                    .map(|&(_, c)| c)
+                    .or_else(|| {
+                        ports
+                            .iter()
+                            .find(|(_, id, ..)| *id == s.signal_id)
+                            .map(|&(_, _, _, c)| c)
+                    });
+                if cur == Some(self.term_raw_bits(s.signal_id)) {
                     rearm.push((wi, k, prev));
                 }
             }

@@ -3693,6 +3693,14 @@ impl Simulator {
         };
         let (hoisted_sub_static_names, hoisted_static_subroutines) =
             Self::hoist_subroutine_statics(&mut module);
+        let port_formal_two_state: HashMap<String, bool> = {
+            let top = format!("{}.", module.name);
+            module
+                .input_port_actuals
+                .iter()
+                .map(|(f, _, ts)| (f.strip_prefix(top.as_str()).unwrap_or(f).to_string(), *ts))
+                .collect()
+        };
         let mut sim = Self {
             prev_val,
             prev_xz,
@@ -3779,6 +3787,7 @@ impl Simulator {
             warn_x_drivers: None,
             cont_driven: HashSet::default(),
             collapsed_port_children: HashSet::default(),
+            port_formal_two_state,
             collapse_settled: None,
             deferred_always,
             signal_type_names,
@@ -4762,6 +4771,8 @@ impl Simulator {
             sampled_registering: false,
             pending_t0_triggers: Vec::new(),
             time0_port_edges: Vec::new(),
+            time0_alias_edges: Vec::new(),
+            edge_t0_pending: Vec::new(),
             edge_forced_fire: Vec::new(),
             in_pre_process_settle: false,
         };

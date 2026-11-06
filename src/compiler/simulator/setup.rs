@@ -1920,6 +1920,7 @@ impl Simulator {
                                 value_of: None,
                                 wake_rank: 0,
                                 cell: false,
+                                alias_t0: self.alias_t0_kind(&s.signal_name, id),
                             });
                         }
                         if let Some(stripped) = s.signal_name.strip_prefix(&top_prefix) {
@@ -1931,6 +1932,7 @@ impl Simulator {
                                     value_of: None,
                                     wake_rank: 0,
                                     cell: false,
+                                    alias_t0: self.alias_t0_kind(stripped, id),
                                 });
                             }
                         }
@@ -1947,6 +1949,7 @@ impl Simulator {
                                     value_of: None,
                                     wake_rank: 0,
                                     cell: false,
+                                    alias_t0: self.alias_t0_kind(&scoped, id),
                                 });
                             }
                         }

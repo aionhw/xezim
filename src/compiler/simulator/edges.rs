@@ -2195,6 +2195,12 @@ impl Simulator {
                 triggered.push(bi);
             }
         }
+        // A block a time-0 alias update woke that fires on its own in this
+        // pass (the actual was written at time 0 too) runs once.
+        if !self.edge_t0_pending.is_empty() {
+            self.edge_t0_pending
+                .retain(|&bi| bi >= triggered_bitmap.len() || !triggered_bitmap[bi]);
+        }
         if let Some(t) = t0 {
             self.prof_edge_detect += t.elapsed().as_nanos() as u64;
         }

@@ -1923,6 +1923,14 @@ struct SensitivityId {
     /// waiter armed. Re-resolved whenever an operand moves without firing,
     /// so the wait follows the index to the element it selects now.
     cell: bool,
+    /// §23.3.3, §10.3.3: how the NAME this term was written with starts at
+    /// time 0 when it is a port formal or an identity net (`assign y = x`)
+    /// collapsed onto its source's id: 0 for a name that is no such alias,
+    /// 1 for a 4-state alias (from x), 2 for a 2-state one (from 0). The
+    /// alias takes the source's time-0 value as an update from that start,
+    /// one the source's own readers never see (§6.8: an initializer is no
+    /// event). See `Simulator::alias_t0_kind`.
+    alias_t0: u8,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -7016,6 +7024,10 @@ pub struct Simulator {
     /// collapsed into a shared id. The dropped connect made them wire-typed
     /// for a dump, and the shared id can't carry per-name typing.
     collapsed_port_children: HashSet<String>,
+    /// §23.3.3, §6.8: whether each renamed input port's formal is 2-state,
+    /// by the formal's path without the top module's prefix (from
+    /// `ElaboratedModule::input_port_actuals`); see `alias_t0_kind`.
+    port_formal_two_state: HashMap<String, bool>,
     /// Set by a `collapse_identity_port_nets` run that reached its fixed
     /// point: the name-map generation it left, the continuous-assign list
     /// (length, buffer) and port-alias count it read, and whether its buffer
@@ -10267,6 +10279,15 @@ pub struct Simulator {
     /// actual's id, the port's value before the update and the actual's
     /// value after the pre-process settle (raw v, x).
     time0_port_edges: Vec<(String, usize, (u64, u64), (u64, u64))>,
+    /// §10.3.3: the ids a collapsed alias name (see `SensitivityId::alias_t0`)
+    /// maps to whose value the pre-process settle left alone, with that
+    /// value (raw v, x): the alias's time-0 update ends there.
+    time0_alias_edges: Vec<(usize, (u64, u64))>,
+    /// Edge blocks a time-0 alias or port update woke before any process
+    /// ran. One that fires on its own at time 0 leaves the list (it runs
+    /// once, as in the reference simulator); the rest run from
+    /// `deliver_time0_port_edges`.
+    edge_t0_pending: Vec<usize>,
     /// Edge blocks the next edge pass runs although no signal they watch
     /// changed: those a time-0 port update wakes.
     edge_forced_fire: Vec<usize>,

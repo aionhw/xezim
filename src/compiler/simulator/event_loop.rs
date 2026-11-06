@@ -1539,6 +1539,21 @@ impl Simulator {
                 // Pending same-time activations remain in the timing wheel.
                 break;
             }
+            // §23.3.3, §10.3.3: the time-0 update of an input port or an
+            // identity net reaches its readers once every process has
+            // started and parked, and before the inactive region: a `#0`
+            // write of the source then moves them a second time, as in the
+            // reference simulator.
+            if self.time == 0
+                && (!self.edge_t0_pending.is_empty()
+                    || !self.time0_port_edges.is_empty()
+                    || !self.time0_alias_edges.is_empty())
+            {
+                self.deliver_time0_port_edges();
+                if self.event_queue.next_time() == Some(self.time) {
+                    continue;
+                }
+            }
             // IEEE 1800-2017 §4.5: once the ACTIVE region empties, the
             // INACTIVE region (`#0` continuations) activates and runs BEFORE
             // the NBA region — a `#0`-resumed read must see pre-NBA values
@@ -1604,9 +1619,13 @@ impl Simulator {
                 self.fire_named_event(&ev);
             }
         }
-        // §23.3.3: the time-0 update of an input port whose actual holds an
-        // initializer value reaches the instance's waiters only now.
-        if self.time == 0 && !self.time0_port_edges.is_empty() {
+        // §23.3.3: a time-0 port or alias update the active loop above did
+        // not reach (it left early) is delivered no later than here.
+        if self.time == 0
+            && (!self.edge_t0_pending.is_empty()
+                || !self.time0_port_edges.is_empty()
+                || !self.time0_alias_edges.is_empty())
+        {
             self.deliver_time0_port_edges();
         }
 
