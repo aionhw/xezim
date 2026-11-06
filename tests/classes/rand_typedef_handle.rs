@@ -79,3 +79,35 @@ fn rand_typedef_handle_keeps_its_object() {
         assert!((4..=6).contains(&n), "{line}");
     }
 }
+
+#[test]
+fn rand_type_parameter_named_like_a_class_stays_an_integer() {
+    let out: Vec<String> = simulate(
+        r#"
+class item;
+  int tag = 3;
+endclass
+class box #(type item = int);
+  rand item x;
+  constraint c { x inside {[10:12]}; }
+endclass
+module t;
+  initial begin
+    box b = new;
+    int ok;
+    ok = b.randomize();
+    $display("ok=%0d x=%0d", ok, b.x);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate failed")
+    .output
+    .iter()
+    .map(|o| o.message.clone())
+    .collect();
+    assert_eq!(out.len(), 1, "{out:?}");
+    let x: i32 = out[0].split("x=").nth(1).and_then(|v| v.parse().ok()).unwrap_or(-1);
+    assert!(out[0].starts_with("ok=1 ") && (10..=12).contains(&x), "{out:?}");
+}

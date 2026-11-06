@@ -844,14 +844,7 @@ impl Simulator {
                     // handles) holds object references, not random values.
                     // §8.25: so does one typed by a class type parameter
                     // this object binds to a class (`rand T h;`, T = leaf).
-                    // The type may also be a typedef of a class
-                    // (`typedef inner#(.W(194)) inner_t`).
-                    let is_handle = self.prop_class_type(handle, prop).is_some()
-                        || class_def
-                            .properties
-                            .get(prop)
-                            .and_then(|s| s.type_name.clone())
-                            .is_some_and(|tn| self.resolved_class_key(&tn).is_some());
+                    let is_handle = self.prop_class_type(handle, prop).is_some();
                     // §18.4: the elements of a fixed `rand obj arr[N]` are
                     // randomized recursively like any rand handle; drawing
                     // them as integers overwrote every handle with a random
