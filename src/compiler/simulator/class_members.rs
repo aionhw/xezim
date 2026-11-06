@@ -2858,6 +2858,41 @@ impl Simulator {
 
     /// Resolve a handle-valued expression (`h`, `arr[i]`) to its heap handle in
     /// a `&self` context, applying instance scoping for member-array bases.
+    /// The object handle held by the variable a dotted name denotes, when
+    /// the name is one of the simulator's flat keys: as written (absolute),
+    /// under the current resolve or process scope hint, or with the top
+    /// module's name stripped (§23.6). A name the heuristics would have to
+    /// guess at is not a handle here.
+    fn hier_var_handle(&self, name: &str) -> Option<usize> {
+        let read = |key: &str| -> Option<usize> {
+            if let Some(&id) = self.signal_name_to_id.get(key) {
+                return self.signal_table[id].to_u64().map(|h| h as usize);
+            }
+            self.signals
+                .get(key)
+                .and_then(|v| v.to_u64())
+                .map(|h| h as usize)
+        };
+        if let Some(h) = read(name) {
+            return Some(h);
+        }
+        if let Some(scoped) = self.hint_scoped(name) {
+            if let Some(h) = read(&scoped) {
+                return Some(h);
+            }
+        }
+        if let Some(scope) = self.process_scope_hint.get(&self.current_pid) {
+            if !scope.is_empty() {
+                if let Some(h) = read(&format!("{scope}.{name}")) {
+                    return Some(h);
+                }
+            }
+        }
+        name.strip_prefix(self.module.name.as_str())
+            .and_then(|rest| rest.strip_prefix('.'))
+            .and_then(read)
+    }
+
     pub(super) fn eval_handle_expr(&self, expr: &Expression) -> Option<usize> {
         match &expr.kind {
             // `this` resolves to the current object handle. Needed so
@@ -2868,14 +2903,39 @@ impl Simulator {
             // Flattened multi-segment handle path (`a.b.c`): resolve the head
             // handle, then walk the remaining segments as property reads.
             ExprKind::Ident(h) if h.path.len() >= 2 => {
-                let mut handle = self.eval_ident_handle(&h.path[0].name.name)?;
-                for seg in &h.path[1..] {
-                    if handle == 0 {
-                        return None;
+                let walk = |mut handle: usize, rest: &[HierPathSegment]| -> Option<usize> {
+                    for seg in rest {
+                        if handle == 0 {
+                            return None;
+                        }
+                        handle = self.member_handle(handle, &seg.name.name)?;
                     }
-                    handle = self.member_handle(handle, &seg.name.name)?;
+                    Some(handle)
+                };
+                if let Some(found) = self
+                    .eval_ident_handle(&h.path[0].name.name)
+                    .and_then(|handle| walk(handle, &h.path[1..]))
+                {
+                    return Some(found);
                 }
-                Some(handle)
+                // §23.6 / §23.8: the head is an INSTANCE, not a variable — a
+                // hierarchical handle (`u_n.obj`, or an upward name the
+                // elaborator rewrote to its absolute path). An instance name
+                // has a placeholder signal, so the head-first walk above
+                // starts from a null handle and finds nothing. The longest
+                // prefix that names a declared variable is the handle, the
+                // remaining segments are property reads. Without this every
+                // collection reached through such a handle (`u_n.obj.arr[k]`)
+                // read x and dropped its stores (#890).
+                (2..=h.path.len()).rev().find_map(|k| {
+                    let name = h.path[..k]
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    let handle = self.hier_var_handle(&name)?;
+                    walk(handle, &h.path[k..])
+                })
             }
             // `<expr>.member` — resolve the base to a handle, then read the
             // member property (also a handle). Enables deep object chains
