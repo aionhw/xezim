@@ -1486,10 +1486,12 @@ impl Simulator {
             if self.expr_is_string_valued(a) {
                 result.push_str(&v.to_sv_string());
             } else {
+                // A real argument prints as a real under every default
+                // radix (`$displayh(r)`), as the reference simulator does.
                 result.push_str(&match r {
-                    'b' => v.to_bin_string(),
-                    'h' => v.to_hex_string(),
-                    'o' => Self::bin_to_oct_string(&v.to_bin_string()),
+                    'b' if !v.is_real => v.to_bin_string(),
+                    'h' if !v.is_real => v.to_hex_string(),
+                    'o' if !v.is_real => Self::bin_to_oct_string(&v.to_bin_string()),
                     // §21.2.1.2: an unconsumed argument prints in the task's
                     // default DECIMAL format — which has the type's default
                     // field width, space-padded (`$display("x=", v)` of a
@@ -3319,6 +3321,27 @@ impl Simulator {
                             } else if ai < args.len() {
                                 let v = self.eval_expr(&args[ai]);
                                 ai += 1;
+                                // §6.12.2: an integral letter prints a real as
+                                // an integer (see `real_fmt_int`).
+                                let v = if v.is_real
+                                    && matches!(
+                                        spec,
+                                        'd' | 'D'
+                                            | 'b'
+                                            | 'B'
+                                            | 'o'
+                                            | 'O'
+                                            | 'h'
+                                            | 'H'
+                                            | 'x'
+                                            | 'X'
+                                            | 'c'
+                                            | 'C'
+                                    ) {
+                                    Self::real_fmt_int(&v)
+                                } else {
+                                    v
+                                };
                                 match spec {
                                     'd' | 'D' => {
                                         // §21.2.1.2: default field width is

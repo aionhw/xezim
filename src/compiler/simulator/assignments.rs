@@ -2252,6 +2252,8 @@ impl Simulator {
                 let prev = self.get_signal_value_by_name(&nm);
                 let fitted = match prev.as_ref() {
                     Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
+                    // §6.12.2: a real into an integral element rounds.
+                    Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                     _ => val.clone(),
                 };
                 let changed = prev.as_ref() != Some(&fitted);
@@ -2310,6 +2312,15 @@ impl Simulator {
                 self.set_queue_size(&qn, k as u64 + 1);
             }
             let elem = format!("{}[{}]", qn, k);
+            // §6.12.2: a real rounds to the element type.
+            let conv;
+            let val = match self.fit_real_nested_elem(expr, val) {
+                Some(v) => {
+                    conv = v;
+                    &conv
+                }
+                None => val,
+            };
             let prev = self.get_signal_value_by_name(&elem);
             let changed = prev.as_ref() != Some(val);
             self.set_signal_value_by_name(&elem, val.clone());
@@ -2317,6 +2328,14 @@ impl Simulator {
         }
         // `a[i][key] = v` on an array of associative arrays.
         if let Some(elem) = self.indexed_assoc_elem(expr, index) {
+            let conv;
+            let val = match self.fit_real_nested_elem(expr, val) {
+                Some(v) => {
+                    conv = v;
+                    &conv
+                }
+                None => val,
+            };
             let prev = self.get_signal_value_by_name(&elem);
             let changed = prev.as_ref() != Some(val);
             self.set_signal_value_by_name(&elem, val.clone());
@@ -2328,6 +2347,14 @@ impl Simulator {
         // the write is silently lost and later reads / `.exists()` /
         // recursion guards see nothing (IEEE 1800-2023 §7.8.1).
         if let Some((_, key)) = self.multidim_assoc_elem(expr, index) {
+            let conv;
+            let val = match self.fit_real_nested_elem(expr, val) {
+                Some(v) => {
+                    conv = v;
+                    &conv
+                }
+                None => val,
+            };
             let changed = self.signals.get(&key).is_none_or(|p| *p != *val);
             if changed {
                 self.signals.insert(key, val.clone());
@@ -2594,6 +2621,13 @@ impl Simulator {
             // which case the value is stored as-is (unchanged).
             let mut fitted = match self.assoc_elem_width(&an) {
                 Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
+                // §6.12.2: a real into an INTEGRAL element rounds to the
+                // declared width (`assoc_store_ctx_width` is None for a real
+                // element, which keeps the value).
+                Some(_) if val.is_real => match self.assoc_store_ctx_width(&an) {
+                    Some(w) => Self::real_to_int(val.to_f64(), w),
+                    None => val.clone(),
+                },
                 _ => self.fit_block_local_array_elem(&an, &elem_name, val.clone()),
             };
             // The element takes its declared signedness, not the RHS's
@@ -2953,11 +2987,7 @@ impl Simulator {
             }
             let fitted = match self.signals.get(&leaf) {
                 Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
-                Some(p) if !p.is_real && val.is_real => {
-                    let mut f = Self::real_to_int(val.to_f64(), p.width.max(1));
-                    f.is_signed = p.is_signed;
-                    f
-                }
+                Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                 Some(p) if !p.is_real && p.width > 0 => {
                     let mut f = val.resize(p.width);
                     f.is_signed = p.is_signed;
@@ -3286,6 +3316,14 @@ impl Simulator {
                 let mut fitted = match self.assoc_elem_width(&name) {
                     Some(w) if w != val.width && !val.is_real && !elem_is_string => {
                         val.resize_for_assign(w)
+                    }
+                    // §6.12.2: a real into an INTEGRAL element rounds to the
+                    // declared width (see the fast path above).
+                    Some(_) if val.is_real && !elem_is_string => {
+                        match self.assoc_store_ctx_width(&name) {
+                            Some(w) => Self::real_to_int(val.to_f64(), w),
+                            None => val.clone(),
+                        }
                     }
                     _ => val.clone(),
                 };
@@ -4198,6 +4236,9 @@ impl Simulator {
                             if let Some(slot) = frame.get_mut(&fname) {
                                 let fitted = if !slot.is_real && !val.is_real && slot.width > 0 {
                                     val.resize(slot.width)
+                                } else if !slot.is_real && val.is_real {
+                                    // §6.12.2: a real into an integral slot rounds.
+                                    Self::real_into_slot(slot, val.to_f64())
                                 } else {
                                     val.clone()
                                 };
@@ -4233,11 +4274,7 @@ impl Simulator {
                 let fitted = match prev.as_ref() {
                     Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
                     Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
-                    Some(p) if !p.is_real && val.is_real => {
-                        let mut f = Self::real_to_int(val.to_f64(), p.width.max(1));
-                        f.is_signed = p.is_signed;
-                        f
-                    }
+                    Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                     _ => val.clone(),
                 };
                 let changed = prev.as_ref() != Some(&fitted);
@@ -4349,6 +4386,13 @@ impl Simulator {
                                 } else {
                                     val.clone()
                                 }
+                            } else if val.is_real
+                                && !is_str
+                                && let Some(p) = self.local_stack[last_idx].get(&joined)
+                                && !p.is_real
+                            {
+                                // §6.12.2: a real into an integral leaf rounds.
+                                Self::real_into_slot(p, val.to_f64())
                             } else {
                                 val.clone()
                             };
@@ -4765,12 +4809,11 @@ impl Simulator {
                             } else {
                                 Value::from_f64(val.to_f64())
                             }
+                        } else if val.is_real {
+                            // §6.12.2: round to the nearest, not truncate.
+                            Self::real_to_int(val.to_f64(), w.max(1))
                         } else {
-                            if val.is_real {
-                                Value::from_u64(val.to_f64() as u64, w)
-                            } else {
-                                val.resize(w)
-                            }
+                            val.resize(w)
                         };
                         resized.is_signed = self.signed_signals.contains(&dotted_name);
                         let changed = existing_val != resized;
@@ -6089,6 +6132,10 @@ impl Simulator {
                                         Value::from_f64(val.to_f64())
                                     }
                                     Some(p) if !p.is_real && !val.is_real => val.resize(p.width),
+                                    // §6.12.2: a real into an integral leaf rounds.
+                                    Some(p) if !p.is_real && val.is_real => {
+                                        Self::real_into_slot(p, val.to_f64())
+                                    }
                                     _ => val.clone(),
                                 };
                                 let changed = prev.as_ref() != Some(&fitted);
@@ -6120,6 +6167,11 @@ impl Simulator {
                                 } else {
                                     val.clone()
                                 }
+                            } else if let Some(p) = self.local_stack[last_idx].get(flat.as_str())
+                                && !p.is_real
+                            {
+                                // §6.12.2: a real into an integral leaf rounds.
+                                Self::real_into_slot(p, val.to_f64())
                             } else {
                                 val.clone()
                             };
@@ -6371,6 +6423,10 @@ impl Simulator {
                         let fitted = match prev.as_ref() {
                             Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
                             Some(p) if !p.is_real && !val.is_real => val.resize(p.width),
+                            // §6.12.2: a real into an integral leaf rounds.
+                            Some(p) if !p.is_real && val.is_real => {
+                                Self::real_into_slot(p, val.to_f64())
+                            }
                             _ => val.clone(),
                         };
                         let changed = prev.as_ref() != Some(&fitted);

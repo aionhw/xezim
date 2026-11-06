@@ -185,6 +185,47 @@ impl Simulator {
         fitted
     }
 
+    /// §6.12.2: a REAL stored into an element of the nested collection whose
+    /// chain of selects `expr` roots at a plain name (`m[k1][k2]`, `a[i][k]`,
+    /// `q[i][k]`), rounded to the element type's width and stamped with its
+    /// signedness. `None` for an integral value, a real element type, or a
+    /// root whose element type is unknown (the caller stores `val` as is).
+    /// Only a real value pays the lookups.
+    pub(super) fn fit_real_nested_elem(&self, expr: &Expression, val: &Value) -> Option<Value> {
+        if !val.is_real {
+            return None;
+        }
+        let mut cur = expr;
+        while let ExprKind::Index { expr: inner, .. } = &cur.kind {
+            cur = inner;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        let root = self.resolve_hier_name(h);
+        let dt = self.p_elem_type_ref(&root)?;
+        let dt = self.resolve_dt_ref(&dt);
+        if !matches!(
+            dt,
+            DataType::IntegerVector { .. } | DataType::IntegerAtom { .. } | DataType::Enum(_)
+        ) {
+            return None;
+        }
+        let w = self
+            .assoc_elem_width(&root)
+            .filter(|&w| w > 0)
+            .unwrap_or_else(|| {
+                super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+            });
+        let mut v = Self::real_to_int(val.to_f64(), w.max(1));
+        v.is_signed = super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types);
+        Some(v)
+    }
+
     /// The context width of a value stored into an element of associative
     /// array `name` (§11.6.1): its element width, or none for a `real`
     /// element, whose integral value is self-determined before conversion.
@@ -2845,6 +2886,8 @@ impl Simulator {
                 let fitted = match self.frame_get(name) {
                     Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
                     Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
+                    // §6.12.2: a real into an integral leaf rounds.
+                    Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                     _ => val,
                 };
                 if let Some(frame) = self.local_stack.last_mut() {

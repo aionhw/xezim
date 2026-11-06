@@ -533,10 +533,14 @@ impl Simulator {
     /// interpreted declaration makes and a compiled one never did; they are
     /// set for the statement's duration and restored after it. Returns the
     /// frame depth and the mark of the saved registrations.
-    pub(super) fn fb_frame_push(&mut self, locals: &[super::bytecode::FbLocal]) -> (usize, usize) {
+    pub(super) fn fb_frame_push(
+        &mut self,
+        locals: &[super::bytecode::FbLocal],
+    ) -> (usize, usize, usize) {
         use super::bytecode::LocalKind;
         let depth = self.local_stack.len();
         let mark = self.fb_meta_saves.len();
+        let geom_mark = self.fb_geom_saves.len();
 
         // A compiled method's output / ref formal lives in its register; the
         // carried frame is its only copy for the statement's duration, so the
@@ -578,6 +582,18 @@ impl Simulator {
                     .push((name.to_string(), cur.0, cur.1, cur.2, cur.3));
                 self.fb_meta_apply(name, want);
             }
+            // §23.9/#916: a register-bound local is a plain vector, real or
+            // string (`local_kind_of` binds nothing else), so any geometry
+            // registered under its bare name — `packed_full_dims` and the
+            // element width of an interpreted subroutine's packed-of-packed
+            // `v`, a struct layout, a typedef'd declared type — belongs to
+            // ANOTHER declaration of the name (that subroutine may be the
+            // caller, still live). The interpreter would slice this local by
+            // it (`v[col*8 +: 8] = …` on a `logic [63:0] v` became a one-byte
+            // element write), so it is set aside for the statement's duration.
+            if !matches!(l.kind, LocalKind::Handle) {
+                self.fb_strip_geometry(name);
+            }
         }
         self.fb_frame_depths.push(depth);
         self.push_local_frame(f);
@@ -586,7 +602,27 @@ impl Simulator {
                 self.record_local_class_type(&l.name, class);
             }
         }
-        (depth, mark)
+        (depth, mark, geom_mark)
+    }
+
+    /// Take the bare-name geometry of carried local `name` out of the type
+    /// tables for a fallback's duration (see `fb_frame_push`); the common
+    /// case — nothing registered — costs the lookups only.
+    fn fb_strip_geometry(&mut self, name: &str) {
+        let m = &self.module;
+        let non_plain = m
+            .var_decl_types
+            .get(name)
+            .is_some_and(|dt| !Self::decl_type_is_plain(dt));
+        if !non_plain
+            && !m.packed_full_dims.contains_key(name)
+            && !m.packed_signal_elem_widths.contains_key(name)
+            && !m.packed_struct_fields.contains_key(name)
+        {
+            return;
+        }
+        let meta = self.take_formal_metadata(name);
+        self.fb_geom_saves.push(meta);
     }
 
     pub(super) fn fb_meta_apply(&mut self, name: &str, m: (Option<u32>, bool, bool, bool)) {
@@ -617,9 +653,18 @@ impl Simulator {
 
     /// Pop the frame `fb_frame_push` made and copy each local back to its
     /// register, fitted to its declaration as a compiled assignment would.
-    pub(super) fn fb_frame_pop(&mut self, locals: &[super::bytecode::FbLocal], at: (usize, usize)) {
-        let (depth, mark) = at;
+    pub(super) fn fb_frame_pop(
+        &mut self,
+        locals: &[super::bytecode::FbLocal],
+        at: (usize, usize, usize),
+    ) {
+        let (depth, mark, geom_mark) = at;
         self.fb_frame_depths.pop();
+        while self.fb_geom_saves.len() > geom_mark {
+            if let Some(meta) = self.fb_geom_saves.pop() {
+                self.restore_formal_metadata(meta);
+            }
+        }
         while self.fb_meta_saves.len() > mark {
             if let Some((name, w, sg, re, st)) = self.fb_meta_saves.pop() {
                 self.fb_meta_apply(&name, (w, sg, re, st));

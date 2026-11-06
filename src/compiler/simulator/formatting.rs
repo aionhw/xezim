@@ -115,6 +115,14 @@ impl Simulator {
                 } => {
                     let v = &regs[f.args[ai] as usize];
                     ai += 1;
+                    // §6.12.2: an integral letter prints a real as an integer.
+                    let conv;
+                    let v = if v.is_real && matches!(spec, 'd' | 'b' | 'h' | 'x' | 'o' | 'c') {
+                        conv = Self::real_fmt_int(v);
+                        &conv
+                    } else {
+                        v
+                    };
                     let pad = |out: &mut String, core: String, w: usize, left: bool| {
                         if core.len() >= w {
                             out.push_str(&core);
@@ -1062,7 +1070,17 @@ impl Simulator {
         // §10.7: every integral store takes the destination's signedness,
         // including stores whose width already matches the declaration.
         if val.is_real {
-            return val.clone();
+            // §6.12.2: a real into an INTEGRAL property rounds to its declared
+            // width (`heap_prop_width` is None for a real, string or handle
+            // property, which keep the value).
+            return match self.heap_prop_width(handle, prop) {
+                Some(w) => {
+                    let mut f = Self::real_to_int(val.to_f64(), w);
+                    f.is_signed = self.class_prop_signed_of(handle, prop);
+                    f
+                }
+                None => val.clone(),
+            };
         }
         let fitted = match self.heap_prop_width(handle, prop) {
             Some(w) => {

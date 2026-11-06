@@ -1556,6 +1556,7 @@ impl Simulator {
                 epoch: self.nested_run_epoch,
                 saves: Vec::new(),
                 fresh_strings: Vec::new(),
+                fresh_names: Vec::new(),
             });
         }
     }
@@ -1584,6 +1585,13 @@ impl Simulator {
                     && !top.fresh_strings.iter().any(|n| n == name)
                 {
                     top.fresh_strings.push(name.to_string());
+                }
+                // What the declaration registers under the bare name goes when
+                // the activation ends (`drop_fresh_local_geometry`).
+                if let Some(top) = self.decl_shadow_log.last_mut()
+                    && !top.fresh_names.iter().any(|n| n == name)
+                {
+                    top.fresh_names.push(name.to_string());
                 }
                 return;
             }
@@ -1725,7 +1733,56 @@ impl Simulator {
         for n in &frame.fresh_strings {
             self.string_signals.remove(n);
         }
+        for n in &frame.fresh_names {
+            self.drop_fresh_local_geometry(n);
+        }
         self.restore_decl_shadows(frame.saves);
+    }
+
+    /// §23.9/#916: a FRESH local (no earlier metadata under its name) of a
+    /// non-plain type — a packed-of-packed `u8_t [0:7] v`, a vector with an
+    /// offset range, a struct, a typedef — registered its geometry under the
+    /// bare name; nothing was saved for it, so nothing put it back when the
+    /// activation ended. Another subroutine's plain local `v` running
+    /// compiled (its declaration never reaches the interpreter) then read the
+    /// stale geometry on a fallback statement: `v[col*8 +: 8] = …` on a
+    /// `logic [63:0] v` landed as a one-byte element write. The name's
+    /// metadata goes back to absent, as before the call. A plain name whose
+    /// declaration registered nothing but its width keeps the cheap path.
+    fn drop_fresh_local_geometry(&mut self, name: &str) {
+        let m = &self.module;
+        let non_plain = m
+            .var_decl_types
+            .get(name)
+            .is_some_and(|dt| !Self::decl_type_is_plain(dt));
+        if !non_plain
+            && !m.packed_full_dims.contains_key(name)
+            && !m.packed_signal_elem_widths.contains_key(name)
+            && !m.packed_struct_fields.contains_key(name)
+        {
+            return;
+        }
+        drop(self.take_formal_metadata(name));
+        self.widths.remove(name);
+        self.signed_signals.remove(name);
+        self.real_signals.remove(name);
+        self.string_signals.remove(name);
+    }
+
+    /// A declared type whose registration is only its width and signedness:
+    /// an integer atom, a real, a string or class handle, or a vector with at
+    /// most one packed dimension (an offset range still registers
+    /// `packed_full_dims`, which the callers check separately). Anything else
+    /// (a typedef, a struct, an enum, a packed-of-packed vector) registers
+    /// geometry under the bare name.
+    pub(super) fn decl_type_is_plain(dt: &DataType) -> bool {
+        match dt {
+            DataType::IntegerAtom { .. } | DataType::Real { .. } | DataType::Simple { .. } => true,
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                dimensions.len() <= 1
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn restore_decl_shadows(&mut self, saves: Vec<DeclShadow>) {

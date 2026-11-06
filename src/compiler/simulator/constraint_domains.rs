@@ -7,10 +7,16 @@ impl Simulator {
     /// store is an assignment to it, §10.7; an unsized fill takes the
     /// cell's width, §5.7.1).
     pub(super) fn fit_static_cell(&self, key: &str, prop: &str, v: Value) -> Value {
-        if v.is_real {
-            return v;
-        }
         match self.static_cell_width(key, prop) {
+            // §6.12.2: a real into an integral static rounds to its width; a
+            // real (or string, handle, collection) cell has no width here
+            // and keeps the value.
+            Some((w, signed)) if v.is_real => {
+                let mut out = Self::real_to_int(v.to_f64(), w);
+                out.is_signed = signed;
+                out
+            }
+            _ if v.is_real => v,
             Some((w, signed)) => {
                 let mut out = if w != v.width {
                     v.resize_for_assign(w)

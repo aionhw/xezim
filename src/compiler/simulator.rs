@@ -5103,6 +5103,11 @@ struct DeclShadowFrame {
     /// §6.21: fresh names a `string` declaration of this activation added
     /// to `string_signals`, taken back out when it ends.
     fresh_strings: Vec<String>,
+    /// Every FRESH name this activation declared (no metadata to put back):
+    /// the geometry such a declaration registers under the bare name is
+    /// removed when it ends (see `drop_fresh_local_geometry`, #916).
+    #[serde(default)]
+    fresh_names: Vec<String>,
 }
 
 /// §6.21: the scope of a `begin…end` block that declares variables, opened
@@ -6820,6 +6825,11 @@ pub struct Simulator {
     /// replaced for its duration: (name, width, signed, real, string) as they
     /// were before. See `fb_frame_push`.
     fb_meta_saves: Vec<(String, Option<u32>, bool, bool, bool)>,
+    /// Bare-name geometry (`packed_full_dims`, `packed_signal_elem_widths`,
+    /// `packed_struct_fields`, a non-plain `var_decl_types` entry) another
+    /// declaration of a carried local's name registered, set aside for the
+    /// fallback's duration and put back after it. See `fb_frame_push`.
+    fb_geom_saves: Vec<FormalMetadataSnapshot>,
     /// Per carried fallback frame, the `ref` redirections of the compiled
     /// method's formals it set aside (`fb_frame_push`), restored on pop.
     fb_unbound_refs: Vec<Vec<(String, Option<Expression>, Option<String>)>>,

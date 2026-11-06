@@ -194,6 +194,31 @@ impl Simulator {
         Value::from_real_wrapped(f, width)
     }
 
+    /// §6.12.2: a real written into the integral slot whose current value is
+    /// `p` — rounded to the slot's width, stamped with its signedness. The
+    /// by-name stores (frame locals, struct leaves, collection elements) all
+    /// keep the slot's own type this way.
+    #[inline]
+    pub(super) fn real_into_slot(p: &Value, f: f64) -> Value {
+        let mut v = Self::real_to_int(f, p.width.max(1));
+        v.is_signed = p.is_signed;
+        v
+    }
+
+    /// §21.2.1.2 / §6.12.2: an integral format letter (`%d`, `%h`, `%o`,
+    /// `%b`, `%c`) applied to a REAL argument prints the real converted to an
+    /// integer: rounded to the nearest (ties away from zero) 32-bit signed
+    /// integer, the width and signedness of `integer`, so `%0d` of 15151.51
+    /// is `15152`, `%0h` of -15151.51 is `ffffc4d0` and `%d` pads to 11.
+    /// (Simulators agree on the 32-bit two's complement; most print the
+    /// decimal signed, one prints it unsigned.)
+    #[inline(never)]
+    pub(super) fn real_fmt_int(v: &Value) -> Value {
+        let mut i = Value::from_real_wrapped(v.to_f64(), 32);
+        i.is_signed = true;
+        i
+    }
+
     /// §13.4.1: how a function's value converts to its declared return type,
     /// for `ty` already resolved through its typedefs. Anything that is not a
     /// numeric scalar (a handle, string, void, unpacked aggregate or an
