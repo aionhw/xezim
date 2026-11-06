@@ -602,5 +602,7 @@ mod read_before_decl_819;
 #[path = "misc/nonvhdl_issue_regressions.rs"]
 mod nonvhdl_issue_regressions;
 
+#[path = "misc/import_sized_dimension_895.rs"]
+mod import_sized_dimension_895;
 #[path = "misc/typed_localparam_dimension_894.rs"]
 mod typed_localparam_dimension_894;
