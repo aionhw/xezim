@@ -30,6 +30,87 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A function or task declared in a generate block belongs to that block
+  (§23.9, §27.6, #897, reported by philipaxer). A bare call from the block's
+  processes, continuous assigns, other subroutines or nested blocks, and a
+  `disable` of its task, bind to the innermost enclosing block that declares
+  the name, then to the module; a formal shadows same-named block data; a
+  block's task no longer collides with a same-named module task. Two blocks
+  that each declared `look()` both ran the one inserted last, and a
+  generate-for in an instance left its calls on the module's table.
+* A `[N]` array declared in a generate block and sized by a module-level or
+  package parameter is a fixed array (§7.4.2, core #162). It was registered
+  as associative as well, so `foreach` ran zero times and reads gave x.
+* `.*` connects no null port or unnamed port expression of a non-ANSI child,
+  and the missing-connection check no longer reports their placeholders
+  (§23.3.2.4, core #163).
+* An upward hierarchical name is resolved at elaboration to the nearest
+  enclosing scope it names (§23.8, #890, reported by Ganesh-TNL): the module
+  name of an enclosing instance (`node1.req1` in a module bound into an
+  instance of `node1`), a child instance of an enclosing scope, or an
+  enclosing scope's generate label, in continuous assigns, procedural blocks,
+  function bodies, event controls, generate blocks and on the left-hand side
+  of a store. Such a name used to fall back to a same-named signal of the
+  top module. A class collection reached through a handle named by an
+  instance path (`u_n.obj.arr[k]`) reads and stores the object's collection
+  instead of x (§23.6).
+* A real stored into an integral target rounds to the nearest integer, ties
+  away from zero, at the target's declared width on every store path
+  (§6.12.2, #889, reported by Ganesh-TNL): associative-array elements of any
+  key type and nesting, class instance and static properties, including
+  inherited ones and those reached through handle chains or copied from task
+  and constructor formals, struct members of collection elements and package
+  structs, and `ref` formals. `%d`, `%h`, `%o`, `%b` and `%c` of a real
+  argument print the value converted to a 32-bit integer; they printed the
+  real's digits or its IEEE-754 bits.
+* A subroutine local's packed geometry no longer leaks into another
+  subroutine's same-named local (§23.9, #916, reported by Ganesh-TNL). After
+  a function declaring `u8_t [0:7] v` had run, a compiled function with a
+  plain `logic [63:0] v` wrote single bytes through the stale geometry when a
+  statement fell back to the interpreter. A fresh local's registration is
+  removed when its call ends, and compiled code's fallbacks shadow stale
+  bare-name geometry.
+* A class property whose type is a packed struct with packed dimensions
+  written before the declarator, `rand cand_t [0:2] a;`, a
+  `typedef cand_t [0:2] carr_t` or an inline `struct packed {…} [0:2] a`, is
+  a packed array of structs (§7.4.1, §6.20.2, §18.5, #928, reported by
+  Ganesh-TNL): `a[i]`, `a[i].f`, `this.a[i].f`, nested and 2-D selects read
+  and write the element's bits, and constraints on `a[i]` and `a[i].f`
+  (equality, `inside`, `dist`, implication, `soft`, cross-element,
+  part-selects) are solved at the property's full width. The dimensions were
+  lost with the typedef name, so `a[i]` read 0 and such constraints were
+  dropped. Still open: a field named through a `foreach` loop variable,
+  `foreach (c[i]) c[i].valid == 1'b1`, and an unpacked array of struct
+  arrays, `cand_t [0:1] g[2]`.
+* The array reductions `and()`, `or()`, `xor()` and `product()` keep every
+  bit of elements wider than 64 bits in the evaluator and the solver, element
+  chains such as `a[0] + a[1]`, `a[0] - a[1]` and `a[0] + b[0]` accept
+  targets above 2^64 - 1, and `unique {a}` over wide elements no longer
+  disables the rest of the constraint set (§7.12.3, §18.5.8, #928, reported
+  by Ganesh-TNL). Only `sum()` had the wide path.
+* A collection of virtual interfaces keeps its element handles when passed
+  as a subroutine or constructor argument (dynamic, queue, fixed, 2-D,
+  typedef'd, `ref` or `output`, or an interface instance array as the
+  actual), declared as a task local, returned from a function, or held in a
+  2-D class property (§13.5.1, §23.9, §25.9, §25.10, #925, reported by
+  Ganesh-TNL): `f[i] != null`, `f[i].sig`, `@(posedge f[i].clk)` and
+  `wait (f[i].sig)` resolve through it; the elements read null or x. Still
+  open: `f[i][j] != null` and `.sig` reads of a fixed-size 2-D formal, and a
+  module-scope 2-D array variable of virtual interfaces.
+* A module's own package imports are searched before the compilation unit's
+  wildcard import when a contested name sizes an unpacked array `a[N]`
+  (§26.3, §7.4.2, #895, reported by philipaxer). The value was right and the
+  dimension used the unit's candidate.
+* A parameter with a declared type is folded at that type's width wherever
+  it sizes a declaration, not only in its value (§10.8, §11.6.1, #894,
+  reported by philipaxer): `localparam int A = (8'd128 + 8'd128) >> 8` gives
+  `logic [A:0]` two bits; it gave one. An untyped parameter keeps the
+  self-determined width.
+* The constant checks of the elaboration lint, a zero-width indexed
+  part-select (§11.5.1), a zero-size unpacked dimension (§7.4.2) and
+  duplicate enum values (§6.19), run on every instance of a child module,
+  and `int m [N]` with a zero `N` is rejected at the top too (#893, reported
+  by philipaxer). A child with any of them elaborated silently.
 * An equality that reaches its random variable through `^`, `~^`, `~`, `+`
   or `-`, such as `(data ^ 32'hf0) == 32'h3`, is solved exactly, in class
   constraints and in `std::randomize() with` (§18.5.12, §11.8.2).
