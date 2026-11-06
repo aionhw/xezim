@@ -3,7 +3,8 @@
 // (sel), and an output whose net another clockvar also names (q, seen as
 // `observed`). A drive with an edge plus delay skew (t) reaches the net at its
 // own time, so drives made one clock cycle apart both appear.
-// q, sel: driven at the event at 15, change on the negedge at 20.
+// q, sel: driven at the event at 15, change on the negedge at 20. A whole-output
+// drive of sel drops the earlier select of its bit 1; the later select of bit 0 stays.
 // t: driven at 5 and at 15, change at 10 + 15 and 20 + 15.
 `timescale 1ns/1ps
 module c14es;
@@ -23,6 +24,8 @@ module c14es;
     @(cb);                       // t=15
     cb.t <= 1'b0;
     cb.q <= 1'b1;
+    cb.sel[1] <= 1'b1;           // replaced by the whole-output drive below
+    cb.sel <= 2'b00;
     cb.sel[0] <= 1'b1;
   end
   always @(q) $display("T|chg|t=%0t q=%b", $time, q);
