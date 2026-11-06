@@ -405,3 +405,6 @@ mod child_constant_checks_893;
 
 #[path = "hierarchy/generate_rename_scope.rs"]
 mod generate_rename_scope;
+
+#[path = "hierarchy/generate_array_localparam.rs"]
+mod generate_array_localparam;
