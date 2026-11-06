@@ -3767,8 +3767,9 @@ impl Simulator {
             }
             Op::Dist(cr, dw) => {
                 let key = (handle, format!("{}{}.{}", arr_name, idxs, names[0]));
+                let item_ptr = item as *const ConstraintItem as usize;
                 let picked = self
-                    .pick_dist_value(Some(key), &cr, &dw)
+                    .pick_dist_value_memoized(item_ptr, Some(key), &cr, &dw)
                     .unwrap_or_else(|| Value::zero(w));
                 if picked.to_u64() != mcur.to_u64() {
                     self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, picked);

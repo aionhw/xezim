@@ -729,6 +729,9 @@ impl Simulator {
         inline: &[ConstraintItem],
         inline_src_file: Option<u32>,
     ) -> Value {
+        // A fresh scalar snapshot for this object's solve invalidates any
+        // `dist` geometry memoized under a stable constraint-item pointer.
+        self.dist_geometry_memo.borrow_mut().clear();
         self.push_local_frame(HashMap::default());
         self.method_local_base.push(self.local_stack.len() - 1);
         let r = self.exec_randomize_solve(handle, inline, inline_src_file);
@@ -3687,6 +3690,19 @@ impl Simulator {
     /// §18.3: whether property `prop` of the object `handle` points at is
     /// declared SIGNED (`rand integer`, `rand int`, `rand byte`, …).
     pub(super) fn class_prop_signed_of(&self, handle: usize, prop: &str) -> bool {
+        let key = (handle, prop.to_string());
+        if let Some(&c) = self.class_prop_signed_memo.borrow().get(&key) {
+            return c;
+        }
+        let r = self.class_prop_signed_of_uncached(handle, prop);
+        self.class_prop_signed_memo
+            .borrow_mut()
+            .insert(key, r);
+        r
+    }
+
+    /// Uncached walk — see `class_prop_signed_of`.
+    fn class_prop_signed_of_uncached(&self, handle: usize, prop: &str) -> bool {
         let Some(Some(inst)) = self.heap.get(handle) else {
             return false;
         };

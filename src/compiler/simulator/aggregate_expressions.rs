@@ -28,6 +28,22 @@ impl Simulator {
         handle: usize,
         prop: &str,
     ) -> Option<Vec<(i64, i64)>> {
+        let key = (handle, prop.to_string());
+        if let Some(cached) = self.class_prop_dims_memo.borrow().get(&key) {
+            return cached.clone();
+        }
+        let r = self.class_prop_packed_dims_uncached(handle, prop);
+        self.class_prop_dims_memo
+            .borrow_mut()
+            .insert(key, r.clone());
+        r
+    }
+
+    fn class_prop_packed_dims_uncached(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Option<Vec<(i64, i64)>> {
         let cn = self
             .heap
             .get(handle)

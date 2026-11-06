@@ -8926,6 +8926,19 @@ pub struct Simulator {
     prop_width_memo: std::cell::RefCell<HashMap<String, HashMap<String, Option<Option<u32>>>>>,
     #[serde(skip)]
     struct_member_offset_memo: std::cell::RefCell<HashMap<(String, String), (u32, u32)>>,
+    /// Per-(handle, prop) cache of `class_prop_packed_dims` and
+    /// `class_prop_signed_of`: a class property's packed-dimension / signed
+    /// status is a per-object invariant, but the helpers walk the class
+    /// hierarchy per call (per foreach element) with identical arguments.
+    #[serde(skip)]
+    class_prop_dims_memo: std::cell::RefCell<HashMap<(usize, String), Option<Vec<(i64, i64)>>>>,
+    #[serde(skip)]
+    class_prop_signed_memo: std::cell::RefCell<HashMap<(usize, String), bool>>,
+    /// Per-solve cache of resolved `dist` geometries in foreach fast paths,
+    /// keyed by the constraint `item` pointer. Cleared at the top of each
+    /// `solve_forced` pass (scalar bounds/weights are constant within a solve).
+    #[serde(skip)]
+    dist_geometry_memo: std::cell::RefCell<HashMap<usize, crate::compiler::simulator::inline_constraints::ResolvedDist>>,
     /// Emptied formal-metadata snapshot vectors of the class-method call path,
     /// reused across calls.
     formal_parts_pool: Vec<Vec<(usize, FormalMetaParts)>>,
