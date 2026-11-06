@@ -41,6 +41,8 @@ mod dpi_unit_scope;
 mod fixed_string_array_dims;
 #[path = "strings/format_lrm_compliance.rs"]
 mod format_lrm_compliance;
+#[path = "strings/format_real_integral_889.rs"]
+mod format_real_integral_889;
 #[path = "strings/format_sibling_fixes.rs"]
 mod format_sibling_fixes;
 #[path = "strings/fwrite_buffered_flush_points.rs"]

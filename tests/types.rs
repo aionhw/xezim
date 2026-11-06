@@ -450,6 +450,8 @@ mod real_to_int_wraps;
 mod real_to_int_wide;
 #[path = "types/real_to_integral_local.rs"]
 mod real_to_integral_local;
+#[path = "types/real_to_integral_stores_889.rs"]
+mod real_to_integral_stores_889;
 #[path = "types/rtoi_out_of_range.rs"]
 mod rtoi_out_of_range;
 #[path = "types/ref_formal_element_write.rs"]
