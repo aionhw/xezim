@@ -107,3 +107,47 @@ endmodule
         .collect();
     assert_eq!(lines, ["ok 20 bad 0"]);
 }
+
+/// The same holds for a sub-object solved together with its owner.
+#[test]
+fn enum_members_of_sub_object_struct_elements_stay_in_their_domain() {
+    let result = xezim::simulate(
+        r#"
+typedef enum bit [2:0] { M_A = 1, M_B = 5 } mode_t;
+typedef struct { rand mode_t mode; rand bit [3:0] pad; } loc_t;
+typedef class owner_c;
+class sub_c;
+  owner_c p;
+  rand loc_t l[];
+  rand bit [3:0] v;
+  constraint k { v == p.x; }
+  function new(); l = new[8]; endfunction
+endclass
+class owner_c;
+  rand sub_c sub;
+  rand bit [3:0] x;
+  function new(); sub = new(); sub.p = this; endfunction
+endclass
+module t;
+  initial begin
+    owner_c o = new();
+    int bad = 0, ok = 0;
+    repeat (20) begin
+      ok += o.randomize();
+      foreach (o.sub.l[i]) bad += !(o.sub.l[i].mode inside {M_A, M_B});
+    end
+    $display("ok %0d bad %0d", ok, bad);
+    $finish;
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result
+        .output
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(lines, ["ok 20 bad 0"]);
+}

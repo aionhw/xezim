@@ -4430,6 +4430,9 @@ impl Simulator {
             let enums: HashMap<String, String> = colls
                 .iter()
                 .filter_map(|c| {
+                    if let Some(m) = &c.member {
+                        return m.enum_type.clone().map(|tn| (c.prop.clone(), tn));
+                    }
                     let p = c.nd_base.as_ref().map_or(c.prop.as_str(), |(p, _)| p);
                     let tn = self.class_prop_type_name(sub, p)?;
                     self.module
