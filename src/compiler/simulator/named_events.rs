@@ -676,6 +676,137 @@ impl Simulator {
         Some(expr)
     }
 
+    /// `@(posedge prop)` / `@(negedge prop)` / `@(edge prop)` where the term is
+    /// a NON-signal operand — a class property, a static, or a procedural
+    /// local. §9.4.2 makes the wait edge-sensitive on the operand's value, but
+    /// such an operand has no signal id to arm, so `event_to_sens` produced a
+    /// sensitivity that resolved to nothing and the wait degenerated to a
+    /// same-time yield: it returned in the current time step (or after the NBA
+    /// region) instead of blocking, so a handshake task waiting on its own
+    /// flag-class-property spun for the whole run. Arm the value instead: a
+    /// snapshot plus an edge-aware condition, parked on the ordinary
+    /// value-change wake path. `None` when the control has no edge, more than
+    /// one term, an `iff`, an `event` operand, or still names a real signal
+    /// (those keep the signal-sensitivity path).
+    pub(super) fn class_prop_edge_cond(&mut self, event: &EventControl) -> Option<Expression> {
+        let EventControl::EventExpr(terms) = event else {
+            return None;
+        };
+        if terms.len() != 1 || terms[0].iff.is_some() {
+            return None;
+        }
+        let term = &terms[0];
+        let edge = term.edge?;
+        if !self.edge_wait_operand(&term.expr) {
+            return None;
+        }
+        let expr = term.expr.clone();
+        let code = match edge {
+            Edge::Posedge => 1,
+            Edge::Negedge => 2,
+            Edge::Edge => 3,
+        };
+        Some(self.edge_value_change_cond(expr, code))
+    }
+
+    /// A term usable as an edge-sensitive value-change wait: something with no
+    /// backing signal that the condition-waiter machinery can re-evaluate — a
+    /// property of `this` or of a class handle, a static member, or a local of
+    /// the running method.
+    fn edge_wait_operand(&mut self, e: &Expression) -> bool {
+        if let Some((h, f)) = self.expr_handle_prop_any(e) {
+            return !self.class_prop_is_event(h, &f);
+        }
+        // `h.STATIC` — the receiver is a class handle, but a static property
+        // lives in the class's shared cell, not in the instance's property
+        // map, so the instance branch above misses it.
+        let dotted = match &e.kind {
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    Some((h.path[0].name.name.clone(), member.name.clone()))
+                }
+                _ => None,
+            },
+            ExprKind::Ident(h)
+                if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                Some((h.path[0].name.name.clone(), h.path[1].name.name.clone()))
+            }
+            _ => None,
+        };
+        if let Some((recv, field)) = dotted
+            && self.eval_ident_handle(&recv).is_some()
+            && self.class_member_names().static_or_param.contains(&field)
+        {
+            return true;
+        }
+        let name = match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                h.path[0].name.name.clone()
+            }
+            _ => return false,
+        };
+        // Only a name with no signal id behind it: a real signal keeps the
+        // edge-triggered waiter (which also honours `iff`, clocking and the
+        // NBA-region handoff that `uvm_wait_for_nba_region` relies on). A
+        // procedural variable lives in `signals` without an id — that is the
+        // shape this fallback is for.
+        if self.signal_name_to_id.contains_key(name.as_str())
+            || self.resolve_sens_name_via_handles(name.as_str()).is_some()
+        {
+            return false;
+        }
+        // A procedural local of the running subroutine or block. The frame
+        // stack is scanned as a whole: a `fork ... join_none` body carries its
+        // own frames, and `method_local_base` only marks METHOD frames.
+        if self
+            .local_stack
+            .iter()
+            .any(|f| f.contains_key(name.as_str()))
+        {
+            return true;
+        }
+        // A bare name of a property of `this`, a static member, or a plain
+        // block-scope variable held in the value store with no signal id.
+        self.this_stack
+            .last()
+            .copied()
+            .flatten()
+            .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+            .is_some_and(|inst| inst.properties.contains_key(name.as_str()))
+            || self.class_member_names().static_or_param.contains(&name)
+            || self.signals.contains_key(name.as_str())
+    }
+
+    /// Arm `expr` and return the condition that becomes true on the `code`
+    /// transition (1 = posedge, 2 = negedge, 3 = any edge).
+    fn edge_value_change_cond(&mut self, expr: Expression, code: u64) -> Expression {
+        let val = self.eval_expr(&expr);
+        let idx = self.intra_saved_next;
+        self.intra_saved_next += 1;
+        self.vc_saved.insert(idx, (self.current_pid, val));
+        let span = expr.span;
+        let num = |v: u64| {
+            Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                }),
+                span,
+            )
+        };
+        Expression::new(
+            ExprKind::SystemCall {
+                name: VC_EDGE_MARKER.to_string(),
+                args: vec![num(idx), expr, num(code)],
+            },
+            span,
+        )
+    }
+
     pub(super) fn value_change_cond(&mut self, expr: Expression) -> Expression {
         let val = self.eval_expr(&expr);
         let idx = self.intra_saved_next;
@@ -716,7 +847,7 @@ impl Simulator {
             self.vc_release(right);
         }
         if let ExprKind::SystemCall { name, args } = &cond.kind {
-            if name == VC_CHANGED_MARKER {
+            if name == VC_CHANGED_MARKER || name == VC_EDGE_MARKER {
                 if let Some(ExprKind::Number(NumberLiteral::Integer { value, .. })) =
                     args.first().map(|a| &a.kind)
                 {

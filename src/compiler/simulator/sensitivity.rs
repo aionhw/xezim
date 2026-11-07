@@ -4066,6 +4066,11 @@ impl Simulator {
                     Self::collect_condition_read_names(a, out);
                 }
             }
+            ExprKind::SystemCall { name, args } if name == VC_EDGE_MARKER => {
+                if let Some(a) = args.get(1) {
+                    Self::collect_condition_read_names(a, out);
+                }
+            }
             _ => {}
         }
     }
@@ -4346,6 +4351,9 @@ impl Simulator {
                     && self.cond_operand_gated(else_expr, this_h, this_cls)
             }
             ExprKind::SystemCall { name, args } if name == VC_CHANGED_MARKER => args
+                .get(1)
+                .is_some_and(|a| self.cond_operand_gated(a, this_h, this_cls)),
+            ExprKind::SystemCall { name, args } if name == VC_EDGE_MARKER => args
                 .get(1)
                 .is_some_and(|a| self.cond_operand_gated(a, this_h, this_cls)),
             _ => false,

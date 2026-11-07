@@ -4571,6 +4571,15 @@ impl Simulator {
                             self.park_condition_waiter(pid, cont, &cond);
                             return;
                         }
+                        // `@(posedge prop)` / `@(negedge prop)` on a non-signal
+                        // operand (class property or procedural local): an
+                        // edge-sensitive value change, not a signal edge.
+                        if let Some(cond) = self.class_prop_edge_cond(event) {
+                            let wait = Self::vc_wait_stmt(cond.clone(), body, stmt.span);
+                            let cont = pc.pushed(vec![wait], pc.start + i + 1);
+                            self.park_condition_waiter(pid, cont, &cond);
+                            return;
+                        }
                         // §15.5 a DECLARED named event — including an array
                         // element (`@ev[1]`) and one reached through an alias
                         // (`e1 = e2; @e1`). Both need the resolved key rather
