@@ -14303,14 +14303,15 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 true
             }
-            StatementKind::Disable(id) => {
+            StatementKind::Disable(target) => {
                 // LRM §9.6.2: disable <named_block> terminates execution of that block.
                 // If the block is an active enclosing named block in this compiled unit,
                 // emit a forward Jump(0) and record the patch.
-                if self.named_block_patches.contains_key(&id.name) {
+                let name = crate::ast::stmt::disable_name(target);
+                if self.named_block_patches.contains_key(name) {
                     let idx = self.insns.len();
                     self.emit(Insn::Jump(0));
-                    self.named_block_patches.get_mut(&id.name).unwrap().push(idx);
+                    self.named_block_patches.get_mut(name).unwrap().push(idx);
                     true
                 } else {
                     self.bail("Disable");

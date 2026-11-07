@@ -628,8 +628,9 @@ impl FbScan<'_> {
             // inside it; anything else (an enclosing block, the task being
             // inlined, another task) is a transfer the compiled code around
             // the fallback would never see.
-            StatementKind::Disable(id) => {
-                if !self.blocks.iter().any(|b| *b == id.name) {
+            StatementKind::Disable(target) => {
+                let name = crate::ast::stmt::disable_name(target);
+                if !self.blocks.iter().any(|b| b == name) {
                     self.refuse("fb_disable_outer");
                 }
             }

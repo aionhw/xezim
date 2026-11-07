@@ -5661,10 +5661,11 @@ impl Simulator {
                 self.break_flag = true;
                 self.return_flag = true;
             }
-            StatementKind::Disable(name) => {
+            StatementKind::Disable(target) => {
+                let name = crate::ast::stmt::disable_name(target);
                 // §38.36.1 cbDisable, reported once the disable took effect.
                 if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_DISABLE) != 0 {
-                    self.vpi_note_disable(&name.name);
+                    self.vpi_note_disable(name);
                 }
                 // IEEE 1800-2017 §9.6.2. `disable_target` was set but never
                 // read: the only effect was `break_flag`, a GLOBAL flag. So a
@@ -5677,7 +5678,7 @@ impl Simulator {
                 // fork block has already returned, so trying to unwind to it
                 // below would run off the end of the disabling process and drop
                 // its continuation — which is exactly what used to happen.
-                if let Some(children) = self.fork_block_children.get(&name.name).cloned() {
+                if let Some(children) = self.fork_block_children.get(name).cloned() {
                     let mut to_kill: HashSet<usize> = HashSet::default();
                     for &c in &children {
                         to_kill.insert(c);
@@ -5713,7 +5714,7 @@ impl Simulator {
                         self.release_killed_from_join_waiters(&to_kill);
                         self.wake_await_waiters(&to_kill);
                         if self_doomed {
-                            self.disable_target = Some(name.name.clone());
+                            self.disable_target = Some(name.to_string());
                             self.break_flag = true;
                         }
                         return;
@@ -5721,7 +5722,7 @@ impl Simulator {
                 }
                 // A label naming ANOTHER process's top-level block terminates
                 // that process; the disabling process carries on.
-                if let Some(&pid) = self.disable_labels.get(&name.name) {
+                if let Some(&pid) = self.disable_labels.get(name) {
                     if pid != self.current_pid {
                         self.killed_pids.insert(pid);
                         self.release_killed_process_state(pid);
@@ -5752,7 +5753,7 @@ impl Simulator {
                 // those invocations. (Approximation: the whole executing
                 // process is terminated — exact for the common `fork
                 // task_a; task_b; join` + `disable task_b` shape.)
-                if let Some(pids) = self.active_task_pids.get(&name.name).cloned() {
+                if let Some(pids) = self.active_task_pids.get(name).cloned() {
                     // An ANCESTOR executing the task (the disabling process was
                     // forked inside it) is unwound out of the call instead —
                     // see `disable_remote_block`.
@@ -5767,7 +5768,7 @@ impl Simulator {
                     // §35.9: an EXPORTED task that is the target returns 0 to
                     // its C caller, and the process carries on in the C code.
                     let handled = !self.dpi_tasks.is_empty()
-                        && self.dpi_disable_exported_task(&name.name, &mut to_kill);
+                        && self.dpi_disable_exported_task(name, &mut to_kill);
                     if to_kill.is_empty() && handled {
                         return;
                     }
@@ -5806,7 +5807,7 @@ impl Simulator {
                 // flags when it sees its own name, so execution resumes after
                 // it. For a loop-body block that is `continue`; for a block
                 // enclosing the loop it is `break`.
-                self.disable_target = Some(name.name.clone());
+                self.disable_target = Some(name.to_string());
                 self.break_flag = true;
                 // Not yet known to be this process's own block: the process
                 // loop checks, and hands it to `disable_remote_block` if not.
