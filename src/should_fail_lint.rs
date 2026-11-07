@@ -172,7 +172,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
             SourceDefinition::Udp(_) => {}
         }
     }
-    check_class_and_package_undeclared(defs, elab, &pkg_names, &mut errs);    
+    check_class_and_package_undeclared(defs, elab, &pkg_names, &mut errs);
     check_named_block_refs(defs, &mut errs);
     if xezim_core::sv_parser::strict_checks() {
         errs.extend(crate::type_lint::check(defs, elab));
@@ -3714,6 +3714,44 @@ fn idents_in_type_arg_text(text: &str) -> Vec<String> {
             }
             continue;
         }
+        let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+        // §5.7: a number is never a name. A digit starts a decimal, real or
+        // time literal (`16`, `1.5e3`, `10ns`); `'` plus an optional `s` and
+        // a base starts the digits of a based literal (`8'hFF`, `'b0`).
+        if cs[i].is_ascii_digit() {
+            while i < cs.len() && (word(cs[i]) || cs[i] == '.') {
+                i += 1;
+            }
+            continue;
+        }
+        if cs[i] == '\'' {
+            let mut j = i + 1;
+            if j < cs.len() && matches!(cs[j], 's' | 'S') {
+                j += 1;
+            }
+            if j < cs.len() && matches!(cs[j], 'b' | 'B' | 'o' | 'O' | 'd' | 'D' | 'h' | 'H') {
+                j += 1;
+                // §5.7.1: white space may separate the base from the digits.
+                while j < cs.len() && cs[j].is_whitespace() {
+                    j += 1;
+                }
+                while j < cs.len() && (word(cs[j]) || cs[j] == '?') {
+                    j += 1;
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // §20: a system function (`$clog2`, `$bits`) names nothing in the design.
+        if cs[i] == '$' {
+            i += 1;
+            while i < cs.len() && word(cs[i]) {
+                i += 1;
+            }
+            continue;
+        }
         if !(cs[i].is_alphabetic() || cs[i] == '_') {
             i += 1;
             continue;
@@ -3745,7 +3783,8 @@ fn is_plain_ident(n: &str) -> bool {
         Some(c) if c.is_alphabetic() || c == '_' => {}
         _ => return false,
     }
-    n.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    n.chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
 /// Every name the design declares, harvested from the AST. Whole-design on
@@ -3996,9 +4035,8 @@ impl<'a> UndeclaredFinder<'a> {
         if self.known(n) {
             return;
         }
-        let msg = format!(
-            "{what} refers to undeclared identifier '{n}' (LRM 1800-2017 §6.20.2, §8.25)"
-        );
+        let msg =
+            format!("{what} refers to undeclared identifier '{n}' (LRM 1800-2017 §6.20.2, §8.25)");
         if self.seen.insert(msg.clone()) {
             self.errs.push(msg);
         }
@@ -4035,9 +4073,7 @@ impl<'a> UndeclaredFinder<'a> {
                 }
             }
             ExprKind::TypeLiteral(dt) => self.data_type(dt, what_owner),
-            ExprKind::NamedArg {
-                expr: Some(x), ..
-            } => self.actual(x, what_owner),
+            ExprKind::NamedArg { expr: Some(x), .. } => self.actual(x, what_owner),
             ExprKind::Paren(x) => self.actual(x, what_owner),
             ExprKind::Unary { operand, .. } => self.actual(operand, what_owner),
             ExprKind::Binary { left, right, .. } => {
