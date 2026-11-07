@@ -297,3 +297,5 @@ mod compiled_queue_last_index;
 mod unpacked_2d_element_width;
 #[path = "collections/assoc_pattern_ident_key.rs"]
 mod assoc_pattern_ident_key;
+#[path = "collections/review_940_exists_rows.rs"]
+mod review_940_exists_rows;
