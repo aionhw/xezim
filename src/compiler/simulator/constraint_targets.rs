@@ -1810,6 +1810,7 @@ impl Simulator {
                 walk(self, it, colls, &mut jobs);
             }
         }
+        self.this_stack.push(Some(handle));
         for (c, vars, body) in jobs {
             let idx_names: Vec<Option<String>> = vars
                 .iter()
@@ -1886,6 +1887,7 @@ impl Simulator {
                 }
             }
         }
+        self.this_stack.pop();
     }
 
     /// Solve one element against a `foreach` body. Returns true when the body
@@ -3322,6 +3324,16 @@ impl Simulator {
             ExprKind::Inside { expr, ranges } => {
                 Self::expr_reads_var(expr, var) || ranges.iter().any(|r| Self::expr_reads_var(r, var))
             }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_reads_var(condition, var)
+                    || Self::expr_reads_var(then_expr, var)
+                    || Self::expr_reads_var(else_expr, var)
+            }
+            ExprKind::Concatenation(exprs) => exprs.iter().any(|e| Self::expr_reads_var(e, var)),
             _ => false,
         }
     }
