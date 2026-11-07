@@ -286,7 +286,7 @@ impl Simulator {
                 }
                 continue;
             }
-            let Some(k) = Self::array_pattern_key(item) else {
+            let Some(k) = self.array_pattern_key(item) else {
                 continue;
             };
             let kv = self.eval_expr(&k);
@@ -458,7 +458,7 @@ impl Simulator {
                                 .insert(name.to_string(), d.clone());
                             continue;
                         }
-                        let Some(k) = Self::array_pattern_key(item) else {
+                        let Some(k) = self.array_pattern_key(item) else {
                             continue;
                         };
                         let kv = self.eval_expr(&k);
@@ -1048,7 +1048,7 @@ impl Simulator {
                     pos += 1;
                 }
                 AssignmentPatternItem::Keyed(_, _) | AssignmentPatternItem::Named(_, _) => {
-                    let Some(k) = Self::array_pattern_key(item) else {
+                    let Some(k) = self.array_pattern_key(item) else {
                         continue;
                     };
                     if let Some(key) = self.eval_expr(&k).to_i64() {
@@ -3461,7 +3461,7 @@ impl Simulator {
             match item {
                 AssignmentPatternItem::Default(e) => default = Some(e),
                 AssignmentPatternItem::Keyed(_, _) | AssignmentPatternItem::Named(_, _) => {
-                    let Some(k) = Self::array_pattern_key(item) else {
+                    let Some(k) = self.array_pattern_key(item) else {
                         continue;
                     };
                     let ki = self.eval_expr(&k).to_i64().unwrap_or(0);
@@ -3561,12 +3561,19 @@ impl Simulator {
     /// identifier is a constant or variable used as an index, which is how
     /// `elaborate::array_params` already reads it for parameters. Reading it
     /// as a member name here dropped the item instead, so
-    /// `'{ PM_PAGE : '{1,1} }` left an associative array empty.
-    fn array_pattern_key(item: &AssignmentPatternItem) -> Option<Expression> {
+    /// `'{ PM_PAGE : '{1,1} }` left an associative array empty. A name that
+    /// denotes a type is a type key (`'{ byte_t : 3 }`), not an index, and is
+    /// not read here.
+    fn array_pattern_key(&self, item: &AssignmentPatternItem) -> Option<Expression> {
         match item {
             AssignmentPatternItem::Keyed(k, _) => Some(k.clone()),
             AssignmentPatternItem::Named(id, _) => {
-                Some(crate::compiler::packed_assignment_pattern_plan::ident_expr(id))
+                let n = id.name.as_str();
+                let is_type = !self.module.parameters.contains_key(n)
+                    && !self.signals.contains_key(n)
+                    && self.lookup_typedef_target(n).is_some();
+                (!is_type)
+                    .then(|| crate::compiler::packed_assignment_pattern_plan::ident_expr(id))
             }
             _ => None,
         }
@@ -3664,7 +3671,7 @@ impl Simulator {
                         .assoc_defaults
                         .insert(base.to_string(), e.clone());
                     wrote = true;
-                } else if let Some(k) = Self::array_pattern_key(item) {
+                } else if let Some(k) = self.array_pattern_key(item) {
                     let kv = self.eval_expr(&k);
                     let key = self.assoc_key_str(base, &kv);
                     self.assign_pattern_or_leaf(&format!("{}[{}]", base, key), &dt, item.expr());
