@@ -30,6 +30,56 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A whole-struct write through a port reaches an instance-array element
+  actual and a nested struct member actual member by member (§23.3.3.5,
+  §7.2, core #166 and #917, contributed by ds54e); the parent read every
+  member as 0.
+* A nonblocking assignment to a row of a multi-dimensional unpacked array,
+  `q[1] <= x`, updates every element of the row (§10.4.2, §7.6, #906,
+  contributed by auty1395).
+* A class specialized by a parameterized virtual interface, `res#(virtual
+  mon_if)`, is the same type under each spelling, and `$cast` to it succeeds
+  (§8.25, §25.9, #908, contributed by auty1395).
+* A class-typedef formal of a 2-state type is 2-state, and a function-name
+  return variable has the declared width before the method compiles
+  (§6.11.2, §13.4.1, §8.25, #910, contributed by auty1395).
+* `C::q` and `D::q` of a static queue copy the queue in a whole-array
+  assignment, also through a subclass (§8.23, §8.9, §7.6, #912, contributed
+  by auty1395).
+* Assigning a struct class property copies its nested struct and queue
+  members (§7.2.2, #914, contributed by auty1395).
+* `unique {a, b}` over rand dynamic arrays, fixed-size arrays and scalars
+  makes every element distinct; `randomize()` failed, or allowed duplicates
+  with a scalar in the list (§18.5.5, #918, contributed by auty1395).
+* A continuous assign that calls a function reading a member of a
+  packed-struct formal is compiled instead of interpreted (§7.2, §13.4,
+  #923, contributed by auty1395).
+* A class queue of unpacked structs keeps its declaration initializer,
+  element by element (§7.10, §10.9, #926, contributed by auty1395).
+* Shift, `/`, `%` and `**` on a property sized by a class parameter give
+  the right result once the method runs compiled (§11.4.10, §11.4.3, #929,
+  contributed by auty1395).
+* A bare identifier used as the key of an array assignment pattern,
+  `'{ CMD_VOUT : v }`, is an index (§10.9.1, #931, contributed by
+  davekeeshan); the item was dropped. A type name as the key is still not
+  supported.
+* A time or real bound of an `inside` range keeps the integers it covers,
+  `x inside {[0:2000ns]}` (§11.4.13, #933, contributed by davekeeshan);
+  `randomize()` failed every trial.
+* A fork child's write of the value a shared automatic held at the fork
+  reaches the parent, whether the child or a sibling changed it before;
+  and a child that only received a sibling's write no longer sends it back
+  over the parent's own later write (§6.21, §9.3.2, #935, contributed by
+  davekeeshan).
+* The dead-clock watchdog fires only when the awaited signal has no live
+  driver, so a control signal held during a slow power-up is not reported
+  (#938, contributed by davekeeshan).
+* `$cast` takes a scoped and a bare spelling of one class or
+  specialization for the same type, a bare `new()` inside a parameterized
+  class keeps the active specialization, a program `initial` process that
+  calls a class task across a delay keeps its context, and a compiled
+  method keeps a real type-parameter return real (§8.16, §8.25, §24.3,
+  #940, contributed by Thomasb81).
 * An instantiated module's `import` of a package the design does not
   declare is an error at that import (§26.3, #937, reported by Ganesh-TNL).
   The import was skipped, so a name used from the package was reported as
@@ -592,6 +642,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
+* A package function call no longer copies the parameter table (#920,
+  contributed by auty1395); 33 s to 2.6 s on the reported design.
+* More code runs compiled (#940, contributed by Thomasb81): `repeat`,
+  `forever`, `while` and `do-while` loops in processes, `disable` of an
+  enclosing named block, process status reads, static class properties
+  and methods through handle chains, and methods with type-parameter
+  formals, locals and returns. `randomize()` reuses the translated
+  constraint graph of a class while every value its constraints read is
+  unchanged, solves element-independent members of a rand dynamic array
+  element by element, and reuses the geometry of a constant `foreach`
+  `dist`. Method dispatch and child-process cleanup allocate less.
 * Instances whose parameters differ only in the instances above them share
   one prepared body. The body cache was keyed on every parameter in the
   scope, the ancestors' included, so a deep hierarchy formatted a long key
