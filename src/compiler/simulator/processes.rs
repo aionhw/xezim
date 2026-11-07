@@ -1223,10 +1223,7 @@ impl Simulator {
         let mut written: Vec<String> = Vec::new();
         if !child_frames.is_empty() {
             if let Some(parent_pid) = self.process_parents.get(&pid).copied() {
-                // (a) subroutine-frame merge. Track this child's real writes
-                // so a value that returns to the fork baseline (after an
-                // intermediate write already merged) still propagates.
-                let child_written = self.fork_written.entry(pid).or_default();
+                // (a) subroutine-frame merge
                 written = if let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) {
                     Self::merge_fork_writes(
                         &mut parent_ctx.local_stack,
@@ -1234,7 +1231,6 @@ impl Simulator {
                         child_frames,
                         child_frames_gen,
                         baseline,
-                        Some(child_written),
                     )
                 } else {
                     // Parent is the active process — its context is `saved`.
@@ -1244,7 +1240,6 @@ impl Simulator {
                         child_frames,
                         child_frames_gen,
                         baseline,
-                        Some(child_written),
                     )
                 };
             }
@@ -1253,6 +1248,7 @@ impl Simulator {
         // `self.signals`. Write only keys the child CHANGED (relative to the
         // fork-time baseline) so an inherited-unchanged value doesn't
         // clobber a sibling's or the parent's concurrent write.
+        let mut stored: Vec<(String, Value)> = Vec::new();
         if let Some(caps) = signal_caps {
             let top = child_frames.last();
             for nm in caps {
@@ -1265,6 +1261,36 @@ impl Simulator {
                     .is_some_and(|old| old == v);
                 if !inherited_unchanged {
                     self.signals.insert(nm.clone(), v.clone());
+                    stored.push((nm.clone(), v.clone()));
+                }
+            }
+        }
+        // The other children of a fork share these block-locals too, but each
+        // holds a copy in its own capture frame, under its own activation, so
+        // the frame broadcast below never reaches them: hand them the value
+        // and make it their baseline, so a later write of the fork-time value
+        // by one of them is still a write.
+        if !stored.is_empty() {
+            let others: Vec<usize> = self
+                .fork_signal_captures
+                .iter()
+                .filter(|(p, caps)| **p != pid && stored.iter().any(|(n, _)| caps.contains(n)))
+                .map(|(p, _)| *p)
+                .collect();
+            for other_pid in others {
+                let Some(other) = self.process_contexts.get_mut(&other_pid) else {
+                    continue;
+                };
+                let Some(top) = other.local_stack.last_mut() else {
+                    continue;
+                };
+                for (n, v) in &stored {
+                    if let Some(slot) = top.get_mut(n) {
+                        *slot = v.clone();
+                    }
+                }
+                if let Some(base) = self.fork_baselines.get_mut(&other_pid) {
+                    Self::sync_fork_baseline(base, &other.local_stack);
                 }
             }
         }
@@ -1313,11 +1339,25 @@ impl Simulator {
                     }
                     let updates = Self::merge_fork_writes(
                         &mut other.local_stack, &other.local_gen_stack,
-                        &visible, child_frames_gen, None, None,
+                        &visible, child_frames_gen, None,
                     );
+                    // The sibling now holds these values: a later write of
+                    // the value it held at the fork is a write too.
+                    if let Some(base) = self.fork_baselines.get_mut(other_pid) {
+                        Self::sync_fork_baseline(base, &other.local_stack);
+                    }
                     written.extend(updates);
                 }
             }
+        }
+        // §9.3.2: this child's writes are published (to the parent and its
+        // siblings), so they become its baseline. A later write is then
+        // compared with what the child last published, not with the value at
+        // the fork: `x = 0; #10; x = 5;` with 5 the fork-time value used to
+        // read as "unchanged" and be dropped, the parent keeping 0.
+        drop(sibling_baseline);
+        if let Some(base) = self.fork_baselines.get_mut(&pid) {
+            Self::sync_fork_baseline(base, child_frames);
         }
         if !written.is_empty() {
             // A child wrote a key a parked `wait` of the parent reads —
@@ -1332,7 +1372,6 @@ impl Simulator {
             self.process_contexts.remove(&pid);
             self.fork_baselines.remove(&pid);
             self.fork_signal_captures.remove(&pid);
-            self.fork_written.remove(&pid);
         }
         self.restore_process_context(saved);
         self.auto_loop_vars.truncate(saved_auto_len);
@@ -2042,22 +2081,14 @@ impl Simulator {
     /// Returns the names of keys actually propagated (child value differs
     /// from both baseline and parent, so a real write landed). The caller
     /// uses this to promote parked condition waiters that read those names.
-    ///
-    /// `written_keys` (optional) records, per frame index, the keys this
-    /// child has already WRITTEN across earlier merges. A key whose current
-    /// value equals the fork baseline is normally skipped as "inherited,
-    /// never written" — but that is unsound when the child wrote an
-    /// intermediate value (merged into the parent) and then wrote a final
-    /// value equal to the baseline again (`req = null; get(req)` with handle
-    /// reuse). Once a key is recorded here it is propagated regardless of
-    /// baseline equality, so the parent catches the final write.
+    /// `baseline` is what the child last published or was given (see
+    /// `sync_fork_baseline`), so a write back to the fork-time value counts.
     pub(super) fn merge_fork_writes(
         parent_frames: &mut [HashMap<String, Value>],
         parent_gens: &[u64],
         child_frames: &[HashMap<String, Value>],
         child_gens: &[u64],
         baseline: Option<&Vec<HashMap<String, Value>>>,
-        mut written_keys: Option<&mut Vec<HashSet<String>>>,
     ) -> Vec<String> {
         let mut propagated = Vec::new();
         let n = parent_frames.len().min(child_frames.len());
@@ -2084,17 +2115,7 @@ impl Simulator {
                         break;
                     }
                     if v == bv {
-                        // Equal to the fork baseline, so it looks merely
-                        // inherited. Still propagate if THIS child already
-                        // wrote it (it went null -> baseline and the parent
-                        // holds the intermediate null).
-                        let already_written = written_keys
-                            .as_ref()
-                            .and_then(|w| w.get(i))
-                            .is_some_and(|s| s.contains(k));
-                        if !already_written {
-                            continue;
-                        }
+                        continue;
                     }
                     if let Some(slot) = parent_frames[i].get_mut(k) {
                         if slot != v {
@@ -2102,12 +2123,6 @@ impl Simulator {
                             // A parked `wait` of the parent may read it.
                             note_store_write(name_bit(k));
                             propagated.push(k.clone());
-                            if let Some(w) = written_keys.as_mut() {
-                                if w.len() <= i {
-                                    w.resize_with(i + 1, HashSet::default);
-                                }
-                                w[i].insert(k.clone());
-                            }
                         }
                     }
                 }
@@ -2120,13 +2135,7 @@ impl Simulator {
                     .and_then(|f| f.get(k))
                     .is_some_and(|old| old == v);
                 if inherited_unchanged {
-                    let already_written = written_keys
-                        .as_ref()
-                        .and_then(|w| w.get(i))
-                        .is_some_and(|s| s.contains(k));
-                    if !already_written {
-                        continue;
-                    }
+                    continue;
                 }
                 match parent_frames[i].get_mut(k) {
                     Some(slot) => {
@@ -2135,12 +2144,6 @@ impl Simulator {
                             // A parked `wait` of the parent may read it.
                             note_store_write(name_bit(k));
                             propagated.push(k.clone());
-                            if let Some(w) = written_keys.as_mut() {
-                                if w.len() <= i {
-                                    w.resize_with(i + 1, HashSet::default);
-                                }
-                                w[i].insert(k.clone());
-                            }
                         }
                     }
                     None => continue,
@@ -2148,6 +2151,32 @@ impl Simulator {
             }
         }
         propagated
+    }
+
+    /// Move a fork child's baseline to the values its frames now hold, for
+    /// every key it inherited. Copied on write: the snapshot is shared until
+    /// a value actually differs.
+    pub(super) fn sync_fork_baseline(
+        base: &mut Arc<Vec<HashMap<String, Value>>>,
+        frames: &[HashMap<String, Value>],
+    ) {
+        let differs = |b: &[HashMap<String, Value>]| {
+            b.iter().zip(frames).any(|(bf, cf)| {
+                bf.iter().any(|(k, bv)| cf.get(k).is_some_and(|v| v != bv))
+            })
+        };
+        if !differs(base) {
+            return;
+        }
+        for (bf, cf) in Arc::make_mut(base).iter_mut().zip(frames) {
+            for (k, bv) in bf.iter_mut() {
+                if let Some(v) = cf.get(k) {
+                    if v != bv {
+                        *bv = v.clone();
+                    }
+                }
+            }
+        }
     }
 
     /// Evaluate a `#delay` expression to an integer number of simulator ticks.

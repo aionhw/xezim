@@ -9098,17 +9098,6 @@ pub struct Simulator {
     /// child CHANGED relative to this baseline.
     /// Immutable fork-time snapshots are shared across process resumptions.
     fork_baselines: HashMap<usize, Arc<Vec<HashMap<String, Value>>>>,
-    /// Keys a fork child has actually WRITTEN (changed from its fork-time
-    /// inherited value), per frame index. `merge_fork_writes` skips a key
-    /// whose value still equals the fork baseline — but that is unsound when
-    /// the child wrote an intermediate value (already merged into the parent)
-    /// and then wrote a final value equal to the baseline again, e.g.
-    /// `req = null; seq_item_port.get_next_item(req)` where the delivered
-    /// object handle reuses the stale one still held at fork. The parent has
-    /// already diverged (it holds the intermediate `null`), so the final
-    /// write must still land. Recording the keys a child really wrote lets the
-    /// merge propagate those regardless of baseline equality.
-    fork_written: HashMap<usize, Vec<HashSet<String>>>,
     /// Automatic collection storage retained by surviving fork children.
     fork_collection_captures: HashMap<usize, HashSet<String>>,
     /// Number of live children capturing each key in
