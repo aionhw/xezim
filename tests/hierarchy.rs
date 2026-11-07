@@ -39,6 +39,8 @@ mod class_method_hier_subroutine_calls;
 mod colliding_actual_child_body;
 #[path = "hierarchy/defparam_upward_paths.rs"]
 mod defparam_upward_paths;
+#[path = "hierarchy/disable_targets.rs"]
+mod disable_targets;
 #[path = "hierarchy/downward_hier_refs_in_siblings.rs"]
 mod downward_hier_refs_in_siblings;
 #[path = "hierarchy/downward_write_with_live_objects.rs"]
