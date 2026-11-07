@@ -1113,3 +1113,49 @@ void (*vlog_startup_routines[])(void) = {reg, 0};
         ]
     );
 }
+
+/// §27.5, §27.6: the object model names generate scopes as elaboration does:
+/// a direct nest adds no scope, an implicit name avoids an explicit one.
+const SCOPE_TREE_C: &str = r###"#include "common.h"
+static void tree(vpiHandle s) {
+    vpi_printf("OM|scope %s\n", fname(s));
+    vpiHandle it = vpi_iterate(vpiInternalScope, s), c;
+    while (it && (c = vpi_scan(it))) tree(c);
+}
+static PLI_INT32 walk(PLI_BYTE8 *u) {
+    (void)u;
+    tree(H("top"));
+    return 0;
+}
+static void reg(void) { reg_task("$walk", walk); }
+void (*vlog_startup_routines[])(void) = {reg, 0};
+"###;
+
+#[test]
+fn design_walk_direct_nest_and_padded_scope_names() {
+    let got = walk(
+        "vpi_om_scope_tree",
+        SCOPE_TREE_C,
+        r#"module top;
+  parameter genblk3 = 0;
+  if (1) if (1) begin : d int x; end
+  if (0) ; else case (1) 1: begin int y; end endcase
+  if (1) begin int z; end
+  if (1) begin if (1) begin : n int w; end end
+  initial $walk;
+endmodule
+"#,
+        Some("top"),
+    );
+    check(
+        &got,
+        &[
+            "OM|scope top",
+            "OM|scope top.d",
+            "OM|scope top.genblk2",
+            "OM|scope top.genblk03",
+            "OM|scope top.genblk4",
+            "OM|scope top.genblk4.n",
+        ],
+    );
+}

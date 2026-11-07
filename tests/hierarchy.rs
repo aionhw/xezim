@@ -69,6 +69,8 @@ mod generate_block_subroutines;
 mod generate_label_hier_roots;
 #[path = "hierarchy/generate_scope_names.rs"]
 mod generate_scope_names;
+#[path = "hierarchy/generate_scope_tree.rs"]
+mod generate_scope_tree;
 #[path = "hierarchy/generate_scope_subroutine_calls.rs"]
 mod generate_scope_subroutine_calls;
 #[path = "hierarchy/generic_interface_ports.rs"]
