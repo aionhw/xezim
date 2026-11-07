@@ -145,3 +145,40 @@ fn static_method_through_live_handle_binds_the_declared_class() {
         );
     }
 }
+
+const THIS_MEMBER: &str = r#"
+module top;
+  class helper_c;
+    static function int twice(int v);
+      return 2 * v;
+    endfunction
+  endclass
+  class holder_c;
+    helper_c aux;   // never constructed
+    int v;
+    function void run();
+      v = this.aux.twice(21);
+    endfunction
+  endclass
+  holder_c h;
+  initial begin
+    h = new();
+    h.run();
+    $display("RESULT this.member=%0d expect=42", h.v);
+    $finish;
+  end
+endmodule
+"#;
+
+/// `this.aux.m()` parses the keyword receiver as its own node, so the
+/// declared-class resolution has to accept that spelling too.
+#[test]
+fn static_method_through_null_this_member_returns_its_result() {
+    for tier in ["0", "1000000"] {
+        let out = run(THIS_MEMBER, "this_member", tier);
+        assert!(
+            out.contains("RESULT this.member=42"),
+            "tier {tier}: unexpected output:\n{out}"
+        );
+    }
+}
