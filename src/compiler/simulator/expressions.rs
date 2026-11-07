@@ -5368,9 +5368,20 @@ impl Simulator {
                     self.dollar_bound.push(self.get_queue_size(&qn) as i64 - 1);
                     let k = self.eval_expr(index).to_i64().unwrap_or(0);
                     self.dollar_bound.pop();
+                    // §7.10.1, §7.8.6: past the queue's size the element does
+                    // not exist (a shrink leaves the old cells in the store)
+                    // and reads the element type's default.
+                    let default =
+                        |s: &Self| s.coll_missing_elem_value(&qn).unwrap_or(Value::new(32));
+                    if self
+                        .live_coll_size(&qn)
+                        .is_some_and(|n| k < 0 || k as u64 >= n)
+                    {
+                        return default(self);
+                    }
                     return self
                         .get_signal_value_by_name(&format!("{}[{}]", qn, k))
-                        .unwrap_or_else(|| Value::new(32));
+                        .unwrap_or_else(|| default(self));
                 }
                 // Element of an unpacked array of ASSOCIATIVE arrays:
                 // `a[i][key]` looks the key up in the assoc array `a[i]`.
@@ -5404,6 +5415,16 @@ impl Simulator {
                 if let Some(row) = self.coll_elem_expr_key(expr) {
                     if self.module.dynamic_arrays.contains(&row) {
                         let j = self.eval_expr(index).to_i64().unwrap_or(0);
+                        // §7.10.1: past the row's size the element does not
+                        // exist; a shrink leaves the old cells in the store.
+                        if self
+                            .live_coll_size(&row)
+                            .is_some_and(|n| j < 0 || j as u64 >= n)
+                        {
+                            return self
+                                .coll_missing_elem_value(&row)
+                                .unwrap_or_else(|| Value::zero(32));
+                        }
                         return self
                             .get_signal_value_by_name(&format!("{}[{}]", row, j))
                             .unwrap_or_else(|| Value::zero(32));
@@ -5891,7 +5912,7 @@ impl Simulator {
                             // gives a subroutine-local array its default (it
                             // read a 1-bit x) and the element's signedness,
                             // so `aa[k] -= 5` on a new `int` key is -5.
-                            if let Some(v) = self.assoc_missing_elem_value(&name) {
+                            if let Some(v) = self.coll_missing_elem_value(&name) {
                                 v
                             } else {
                                 let ew = self.assoc_elem_width(&name).unwrap_or(1).max(1);

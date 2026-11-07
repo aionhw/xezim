@@ -2553,7 +2553,7 @@ impl Simulator {
                         if !self.is_associative_array(&an)
                             && (idx < 0 || idx as u64 >= self.get_queue_size(&an))
                         {
-                            self.assoc_missing_elem_value(&an)
+                            self.coll_missing_elem_value(&an)
                                 .unwrap_or_else(|| Value::zero(32))
                         } else {
                             self.signals
