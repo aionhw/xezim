@@ -3200,6 +3200,9 @@ impl Simulator {
         if self.clock_generators.iter().any(|c| c.signal_id == sig_id) {
             return true;
         }
+        // Any one live driver makes it live; the first one found does not
+        // decide alone.
+        let mut driven = false;
         // An edge block (flop) writing it is live iff any of ITS sensitivities
         // (clock/reset) is live — the flop fires when that clock toggles.
         for (bi, cb) in self.compiled_edge_blocks.iter().enumerate() {
@@ -3217,16 +3220,16 @@ impl Simulator {
             if !writes {
                 continue;
             }
-            return self
-                .edge_blocks
-                .get(bi)
-                .map(|block| {
-                    block
-                        .resolved_sensitivities
-                        .iter()
-                        .any(|sid| self.has_live_driver(sid.signal_id, visited))
-                })
-                .unwrap_or(false);
+            driven = true;
+            let live = self.edge_blocks.get(bi).is_some_and(|block| {
+                block
+                    .resolved_sensitivities
+                    .iter()
+                    .any(|sid| self.has_live_driver(sid.signal_id, visited))
+            });
+            if live {
+                return true;
+            }
         }
         // A continuous assign / combinational entry writing it is live iff any
         // of its read fan-in is live — it recomputes when an input changes.
@@ -3234,11 +3237,18 @@ impl Simulator {
             if !e.cold.write_signal_ids.contains(&sig_id) {
                 continue;
             }
-            return e
-                .cold
+            driven = true;
+            if e.cold
                 .read_signal_ids
                 .iter()
-                .any(|&r| self.has_live_driver(r, visited));
+                .any(|&r| self.has_live_driver(r, visited))
+            {
+                return true;
+            }
+        }
+        // Every driver found is dead.
+        if driven {
+            return false;
         }
         // No continuous driver (no clock generator, edge block, or continuous
         // assign writes it). A NET with no driver is the dead-clock signature —
