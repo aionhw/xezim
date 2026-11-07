@@ -3800,10 +3800,16 @@ impl Simulator {
                     .strip_prefix(self.module.name.as_str())
                     .and_then(|rest| rest.strip_prefix('.'))
                     .unwrap_or(s);
-                self.module
-                    .instances
-                    .iter()
-                    .find(|i| i.path == rel || i.path == *s)
+                // §3.2, §3.14.2.1: time units belong to design elements; a
+                // generate block is not one. An instance may share the top
+                // module's name, so the unstripped path is tried as well.
+                let instance = |scope| {
+                    self.scopes_to_instance(scope)
+                        .last()
+                        .and_then(|p| self.instance_by_path(p))
+                };
+                instance(rel)
+                    .or_else(|| instance(s))
                     .map(|i| i.def_name.as_str())
                     .unwrap_or(self.module.name.as_str())
             }
