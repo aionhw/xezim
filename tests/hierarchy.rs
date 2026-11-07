@@ -15,6 +15,8 @@
 mod absolute_path_writes_in_subroutines;
 #[path = "hierarchy/array_of_module_instances.rs"]
 mod array_of_module_instances;
+#[path = "hierarchy/bind_audit.rs"]
+mod bind_audit;
 #[path = "hierarchy/bind_directive_basic.rs"]
 mod bind_directive_basic;
 #[path = "hierarchy/bind_static_init_syscall_scope.rs"]
