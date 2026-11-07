@@ -30,6 +30,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* An instantiated module's `import` of a package the design does not
+  declare is an error at that import (§26.3, #937, reported by Ganesh-TNL).
+  The import was skipped, so a name used from the package was reported as
+  undeclared, or nothing was reported. A package declared in a `-v`/`-y`
+  library file is still not compiled, since a library file supplies only
+  modules, interfaces, programs and primitives; the error now notes where the
+  library file declared it. An error inside a module adopted from a library
+  file names a line of that file instead of a line of a primary file, and
+  `import std::*;` no longer fails with "Package 'std' not found".
 * A function or task declared in a generate block belongs to that block
   (§23.9, §27.6, #897, reported by philipaxer). A bare call from the block's
   processes, continuous assigns, other subroutines or nested blocks, and a
