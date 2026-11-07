@@ -65,6 +65,8 @@ mod genblk_dotted_ref_nettype_none;
 mod genblk_cont_assign;
 #[path = "hierarchy/generate_block_hiding.rs"]
 mod generate_block_hiding;
+#[path = "hierarchy/generate_block_positions.rs"]
+mod generate_block_positions;
 #[path = "hierarchy/generate_block_subroutine_scopes.rs"]
 mod generate_block_subroutine_scopes;
 #[path = "hierarchy/generate_block_subroutines.rs"]

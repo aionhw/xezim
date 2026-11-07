@@ -44,7 +44,7 @@ fn the_audit_prints_each_binding_and_changes_no_artifact_byte() {
         [
             "t.sv:4 f -> Decl(top.g, Function) rename: yes(g.f) pos=process target=Function",
             "t.sv:5 f -> none rename: no pos=process target=Function why=Local",
-            "t.sv:6 f -> Decl(top.g, Function) rename: no pos=final target=Function disagree=B",
+            "t.sv:6 f -> Decl(top.g, Function) rename: yes(g.f) pos=final target=Function",
         ]
     );
     assert!(none.is_empty(), "{none:?}");
