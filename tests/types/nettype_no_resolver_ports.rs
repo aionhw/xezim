@@ -103,22 +103,6 @@ fn inout_struct_variable() {
 }
 
 #[test]
-fn output_member_drivers() {
-    check_struct_port(
-        "output",
-        "assign p.V = v; assign p.R = 1.0; assign p.code = k; assign p.tag = 8'ha5;",
-    );
-}
-
-#[test]
-fn inout_member_drivers() {
-    check_struct_port(
-        "inout",
-        "assign p.V = v; assign p.R = 1.0; assign p.code = k; assign p.tag = 8'ha5;",
-    );
-}
-
-#[test]
 fn direct_top_level_struct_control() {
     assert_eq!(
         lines(

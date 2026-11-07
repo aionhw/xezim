@@ -666,3 +666,5 @@ mod function_result_member_defaults;
 
 #[path = "types/nettype_no_resolver_ports.rs"]
 mod nettype_no_resolver_ports;
+#[path = "types/review_nettype_partial_driver.rs"]
+mod review_nettype_partial_driver;
