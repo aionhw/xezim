@@ -4,6 +4,36 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+#[derive(Clone, Debug)]
+pub(super) enum CompiledForeachCheck {
+    MemberEq {
+        off: u32,
+        width: u32,
+        expected: u64,
+    },
+    MemberInside {
+        off: u32,
+        width: u32,
+        ranges: Vec<(i64, i64)>,
+    },
+    StaticIf {
+        then_checks: Vec<CompiledForeachCheck>,
+        else_checks: Vec<CompiledForeachCheck>,
+    },
+    IndexEq {
+        target: i64,
+        then_checks: Vec<CompiledForeachCheck>,
+        else_checks: Vec<CompiledForeachCheck>,
+    },
+    ElemInside {
+        ranges: Vec<(i64, i64)>,
+    },
+    ElemRel {
+        op: BinaryOp,
+        bound: i64,
+    },
+}
+
 impl Simulator {
     /// §18.4.3 Compute the domain of a randc property: every value the
     /// variable could possibly take, intersected with any `inside` ranges
@@ -3271,6 +3301,371 @@ impl Simulator {
         }
     }
 
+    pub(super) fn expr_reads_var(e: &Expression, var: &str) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => h.path.iter().any(|s| s.name.name == var),
+            ExprKind::Index { expr, index } => {
+                Self::expr_reads_var(expr, var) || Self::expr_reads_var(index, var)
+            }
+            ExprKind::MemberAccess { expr, .. } => Self::expr_reads_var(expr, var),
+            ExprKind::RangeSelect { expr, left, right, .. } => {
+                Self::expr_reads_var(expr, var) || Self::expr_reads_var(left, var) || Self::expr_reads_var(right, var)
+            }
+            ExprKind::Unary { operand, .. } => Self::expr_reads_var(operand, var),
+            ExprKind::Binary { left, right, .. } => {
+                Self::expr_reads_var(left, var) || Self::expr_reads_var(right, var)
+            }
+            ExprKind::Paren(inner) => Self::expr_reads_var(inner, var),
+            ExprKind::Call { func, args } => {
+                Self::expr_reads_var(func, var) || args.iter().any(|a| Self::expr_reads_var(a, var))
+            }
+            ExprKind::Inside { expr, ranges } => {
+                Self::expr_reads_var(expr, var) || ranges.iter().any(|r| Self::expr_reads_var(r, var))
+            }
+            _ => false,
+        }
+    }
+
+    /// A pre-compiled fast check for an element-independent foreach body.
+    pub(super) fn try_fast_check_coll_foreach(
+        &mut self,
+        handle: usize,
+        c: &RandColl,
+        idx_names: &[Option<String>],
+        body: &ConstraintItem,
+    ) -> Option<bool> {
+        if c.nested || c.row_tail.is_some() || idx_names.len() != 1 || c.width > 64 {
+            return None;
+        }
+        let idx_var = idx_names[0].as_deref()?;
+        let inst = self.heap.get(handle)?.as_ref()?;
+        let class_name = inst.class_name.clone();
+        let mut checks = Vec::new();
+        self.try_compile_foreach_item(handle, &class_name, &c.prop, idx_var, body, &mut checks)?;
+        let outer = self.coll_outer_size(c) as i64;
+        let mut idx_str = String::with_capacity(16);
+        for i in 0..outer {
+            idx_str.clear();
+            idx_str.push('[');
+            Self::push_i64(&mut idx_str, i);
+            idx_str.push(']');
+            let elem = self.class_elem_load(handle, &c.prop, &idx_str)?;
+            let raw = elem.to_u64()?;
+            let elem_i64 = elem.to_i64()?;
+            for chk in &checks {
+                if !Self::check_compiled_foreach_item(chk, raw, elem_i64, i) {
+                    return Some(false);
+                }
+            }
+        }
+        Some(true)
+    }
+
+    fn check_compiled_foreach_item(
+        item: &CompiledForeachCheck,
+        elem_raw: u64,
+        elem_i64: i64,
+        idx: i64,
+    ) -> bool {
+        match item {
+            CompiledForeachCheck::MemberEq { off, width, expected } => {
+                let mask = if *width >= 64 { u64::MAX } else { (1u64 << *width) - 1 };
+                let val = (elem_raw >> *off) & mask;
+                val == *expected
+            }
+            CompiledForeachCheck::MemberInside { off, width, ranges } => {
+                let mask = if *width >= 64 { u64::MAX } else { (1u64 << *width) - 1 };
+                let val = ((elem_raw >> *off) & mask) as i64;
+                ranges.iter().any(|&(lo, hi)| val >= lo && val <= hi)
+            }
+            CompiledForeachCheck::StaticIf { then_checks, else_checks } => {
+                then_checks.iter().all(|c| Self::check_compiled_foreach_item(c, elem_raw, elem_i64, idx))
+                    && else_checks.iter().all(|c| Self::check_compiled_foreach_item(c, elem_raw, elem_i64, idx))
+            }
+            CompiledForeachCheck::IndexEq { target, then_checks, else_checks } => {
+                if idx == *target {
+                    then_checks.iter().all(|c| Self::check_compiled_foreach_item(c, elem_raw, elem_i64, idx))
+                } else {
+                    else_checks.iter().all(|c| Self::check_compiled_foreach_item(c, elem_raw, elem_i64, idx))
+                }
+            }
+            CompiledForeachCheck::ElemInside { ranges } => {
+                ranges.iter().any(|&(lo, hi)| elem_i64 >= lo && elem_i64 <= hi)
+            }
+            CompiledForeachCheck::ElemRel { op, bound } => match op {
+                BinaryOp::Lt => elem_i64 < *bound,
+                BinaryOp::Leq => elem_i64 <= *bound,
+                BinaryOp::Gt => elem_i64 > *bound,
+                BinaryOp::Geq => elem_i64 >= *bound,
+                _ => true,
+            },
+        }
+    }
+
+    pub(super) fn is_bare_var(e: &Expression, name: &str) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].name.name == name,
+            _ => false,
+        }
+    }
+
+    pub(super) fn is_arr_elem_bare(e: &Expression, arr_name: &str, idx_var: &str) -> bool {
+        let e = match &e.kind {
+            ExprKind::Paren(inner) => inner.as_ref(),
+            _ => e,
+        };
+        let ExprKind::Index { expr: arr_e, index } = &e.kind else { return false; };
+        let ExprKind::Ident(h) = &arr_e.kind else { return false; };
+        if h.path.len() != 1 || h.path[0].name.name != arr_name { return false; }
+        Self::is_bare_var(index, idx_var)
+    }
+
+    pub(super) fn is_arr_elem_member<'a>(e: &'a Expression, arr_name: &str, idx_var: &str) -> Option<&'a str> {
+        let ExprKind::MemberAccess { expr: base, member } = &e.kind else { return None; };
+        let ExprKind::Index { expr: arr_e, index } = &base.kind else { return None; };
+        let ExprKind::Ident(h) = &arr_e.kind else { return None; };
+        if h.path.len() != 1 || h.path[0].name.name != arr_name { return None; }
+        if !Self::is_bare_var(index, idx_var) { return None; }
+        Some(&member.name)
+    }
+
+    pub(super) fn get_array_elem_member_layout(
+        &self,
+        _handle: usize,
+        class_name: &str,
+        arr_name: &str,
+        member: &str,
+        expr: &Expression,
+    ) -> Option<(u32, u32)> {
+        let memo_key = (format!("{class_name}#{arr_name}"), member.to_string());
+        if let Some(&ow) = self.struct_member_offset_memo.borrow().get(&memo_key) {
+            return Some(ow);
+        }
+        let su = self.packed_struct_elem_type(expr)?;
+        if Self::spreads_member_wise(&su) { return None; }
+        let (fields, _) = self.packed_agg_layout(&su);
+        let f = fields.iter().find(|(m, _, _)| m == member)?;
+        let ow = (f.1, f.2);
+        self.struct_member_offset_memo.borrow_mut().insert(memo_key, ow);
+        Some(ow)
+    }
+
+    fn try_compile_foreach_item(
+        &mut self,
+        handle: usize,
+        class_name: &str,
+        arr_name: &str,
+        idx_var: &str,
+        item: &ConstraintItem,
+        out: &mut Vec<CompiledForeachCheck>,
+    ) -> Option<()> {
+        match item {
+            ConstraintItem::Block(items) => {
+                for it in items {
+                    self.try_compile_foreach_item(handle, class_name, arr_name, idx_var, it, out)?;
+                }
+                Some(())
+            }
+            ConstraintItem::Soft(inner) => {
+                self.try_compile_foreach_item(handle, class_name, arr_name, idx_var, inner, out)
+            }
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                if !Self::expr_reads_var(condition, idx_var) {
+                    self.this_stack.push(Some(handle));
+                    let cond = self.eval_expr(condition).is_true();
+                    self.this_stack.pop();
+                    let mut then_checks = Vec::new();
+                    let mut else_checks = Vec::new();
+                    if cond {
+                        self.try_compile_foreach_item(
+                            handle, class_name, arr_name, idx_var, then_item, &mut then_checks,
+                        )?;
+                    } else if let Some(ei) = else_item {
+                        self.try_compile_foreach_item(
+                            handle, class_name, arr_name, idx_var, ei, &mut else_checks,
+                        )?;
+                    }
+                    out.push(CompiledForeachCheck::StaticIf {
+                        then_checks,
+                        else_checks,
+                    });
+                    return Some(());
+                }
+                if let ExprKind::Binary { op: BinaryOp::Eq, left, right } = &condition.kind {
+                    let target_expr = if Self::is_bare_var(left, idx_var) && !Self::expr_reads_var(right, idx_var) {
+                        Some(right.as_ref())
+                    } else if Self::is_bare_var(right, idx_var) && !Self::expr_reads_var(left, idx_var) {
+                        Some(left.as_ref())
+                    } else {
+                        None
+                    };
+                    if let Some(texpr) = target_expr {
+                        self.this_stack.push(Some(handle));
+                        let target = self.eval_expr(texpr).to_i64()?;
+                        self.this_stack.pop();
+                        let mut then_checks = Vec::new();
+                        let mut else_checks = Vec::new();
+                        self.try_compile_foreach_item(
+                            handle, class_name, arr_name, idx_var, then_item, &mut then_checks,
+                        )?;
+                        if let Some(ei) = else_item {
+                            self.try_compile_foreach_item(
+                                handle, class_name, arr_name, idx_var, ei, &mut else_checks,
+                            )?;
+                        }
+                        out.push(CompiledForeachCheck::IndexEq {
+                            target,
+                            then_checks,
+                            else_checks,
+                        });
+                        return Some(());
+                    }
+                }
+                None
+            }
+            ConstraintItem::Expr(e) => {
+                match &e.kind {
+                    ExprKind::Binary { op: BinaryOp::Eq, left, right } => {
+                        if let Some(member) = Self::is_arr_elem_member(left, arr_name, idx_var) {
+                            if Self::expr_reads_var(right, idx_var) { return None; }
+                            self.this_stack.push(Some(handle));
+                            let expected = self.eval_expr(right).to_u64()?;
+                            self.this_stack.pop();
+                            let (off, width) = self.get_array_elem_member_layout(handle, class_name, arr_name, member, left)?;
+                            out.push(CompiledForeachCheck::MemberEq { off, width, expected });
+                            return Some(());
+                        } else if let Some(member) = Self::is_arr_elem_member(right, arr_name, idx_var) {
+                            if Self::expr_reads_var(left, idx_var) { return None; }
+                            self.this_stack.push(Some(handle));
+                            let expected = self.eval_expr(left).to_u64()?;
+                            self.this_stack.pop();
+                            let (off, width) = self.get_array_elem_member_layout(handle, class_name, arr_name, member, right)?;
+                            out.push(CompiledForeachCheck::MemberEq { off, width, expected });
+                            return Some(());
+                        } else if Self::is_arr_elem_bare(left, arr_name, idx_var) && !Self::expr_reads_var(right, idx_var) {
+                            self.this_stack.push(Some(handle));
+                            let expected = self.eval_expr(right).to_i64()?;
+                            self.this_stack.pop();
+                            out.push(CompiledForeachCheck::ElemInside { ranges: vec![(expected, expected)] });
+                            return Some(());
+                        } else if Self::is_arr_elem_bare(right, arr_name, idx_var) && !Self::expr_reads_var(left, idx_var) {
+                            self.this_stack.push(Some(handle));
+                            let expected = self.eval_expr(left).to_i64()?;
+                            self.this_stack.pop();
+                            out.push(CompiledForeachCheck::ElemInside { ranges: vec![(expected, expected)] });
+                            return Some(());
+                        }
+                        None
+                    }
+                    ExprKind::Binary { op: op @ (BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq), left, right } => {
+                        if Self::is_arr_elem_bare(left, arr_name, idx_var) && !Self::expr_reads_var(right, idx_var) {
+                            self.this_stack.push(Some(handle));
+                            let bound = self.eval_expr(right).to_i64()?;
+                            self.this_stack.pop();
+                            out.push(CompiledForeachCheck::ElemRel { op: *op, bound });
+                            Some(())
+                        } else {
+                            None
+                        }
+                    }
+                    ExprKind::Inside { expr: inner, ranges: in_ranges } => {
+                        if Self::is_arr_elem_bare(inner, arr_name, idx_var) {
+                            let mut rs = Vec::new();
+                            for r in in_ranges {
+                                match &r.kind {
+                                    ExprKind::Range(lo, hi) => {
+                                        if Self::expr_reads_var(lo, idx_var) || Self::expr_reads_var(hi, idx_var) { return None; }
+                                        self.this_stack.push(Some(handle));
+                                        let l = self.eval_expr(lo).to_i64()?;
+                                        let h = self.eval_expr(hi).to_i64()?;
+                                        self.this_stack.pop();
+                                        rs.push((l, h));
+                                    }
+                                    _ => {
+                                        if Self::expr_reads_var(r, idx_var) { return None; }
+                                        self.this_stack.push(Some(handle));
+                                        let v = self.eval_expr(r).to_i64()?;
+                                        self.this_stack.pop();
+                                        rs.push((v, v));
+                                    }
+                                }
+                            }
+                            out.push(CompiledForeachCheck::ElemInside { ranges: rs });
+                            Some(())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            ConstraintItem::Inside {
+                expr,
+                range,
+                is_dist,
+                dist_weights,
+                ..
+            } => {
+                let member_opt = Self::is_arr_elem_member(expr, arr_name, idx_var);
+                let bare = Self::is_arr_elem_bare(expr, arr_name, idx_var);
+                if member_opt.is_none() && !bare {
+                    return None;
+                }
+                let off_w = if let Some(member) = member_opt {
+                    Some(self.get_array_elem_member_layout(handle, class_name, arr_name, member, expr)?)
+                } else {
+                    None
+                };
+                let mut ranges = Vec::new();
+                for (i, r) in range.iter().enumerate() {
+                    if *is_dist && let Some(Some(w)) = dist_weights.get(i) {
+                        let wexpr = match w {
+                            crate::ast::decl::DistWeight::Each(e) | crate::ast::decl::DistWeight::Total(e) => e,
+                        };
+                        if Self::expr_reads_var(wexpr, idx_var) {
+                            return None;
+                        }
+                        self.this_stack.push(Some(handle));
+                        let wval = self.eval_expr(wexpr).to_i64().unwrap_or(1);
+                        self.this_stack.pop();
+                        if wval == 0 {
+                            continue;
+                        }
+                    }
+                    match r {
+                        ConstraintRange::Value(e) => {
+                            if Self::expr_reads_var(e, idx_var) { return None; }
+                            self.this_stack.push(Some(handle));
+                            let v = self.eval_expr(e).to_i64()?;
+                            self.this_stack.pop();
+                            ranges.push((v, v));
+                        }
+                        ConstraintRange::Range { lo, hi } => {
+                            if Self::expr_reads_var(lo, idx_var) || Self::expr_reads_var(hi, idx_var) { return None; }
+                            self.this_stack.push(Some(handle));
+                            let l = self.eval_expr(lo).to_i64()?;
+                            let h = self.eval_expr(hi).to_i64()?;
+                            self.this_stack.pop();
+                            ranges.push((l, h));
+                        }
+                    }
+                }
+                if let Some((off, width)) = off_w {
+                    out.push(CompiledForeachCheck::MemberInside { off, width, ranges });
+                } else {
+                    out.push(CompiledForeachCheck::ElemInside { ranges });
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
     /// Evaluate a `foreach` body against every element of a collection.
     pub(super) fn check_coll_foreach(
         &mut self,
@@ -3337,16 +3732,10 @@ impl Simulator {
                 }
             }
             _ => {
-                let outer = self.coll_outer_size(c) as i64;
-                let single_var = !c.nested && idx_names.len() == 1;
-                let n_opt = idx_names.first().and_then(|x| x.as_ref());
-                if single_var {
-                    let mut frame: HashMap<String, Value> = HashMap::default();
-                    if let Some(n) = n_opt {
-                        frame.insert(n.clone(), Self::signed_loop_val(0));
-                    }
-                    self.push_local_frame(frame);
+                if let Some(ok) = self.try_fast_check_coll_foreach(handle, c, idx_names, body) {
+                    return ok;
                 }
+                let outer = self.coll_outer_size(c) as i64;
                 'outer: for i in 0..outer {
                     let inner_n = if c.nested && idx_names.len() >= 2 {
                         self.get_queue_size(&format!("{}[{}]", c.scoped, i)) as i64
@@ -3354,38 +3743,23 @@ impl Simulator {
                         1
                     };
                     for j in 0..inner_n {
-                        if single_var {
-                            if let Some(n) = n_opt {
-                                if let Some(top) = self.local_stack.last_mut() {
-                                    if let Some(slot) = top.get_mut(n) {
-                                    *slot = Self::signed_loop_val(i);
-                                    }
-                                }
-                            }
-                        } else {
-                            let mut frame: HashMap<String, Value> = HashMap::default();
-                            if let Some(Some(n)) = idx_names.first() {
-                                frame.insert(n.clone(), Self::signed_loop_val(i));
-                            }
-                            if c.nested && idx_names.len() >= 2 {
-                                if let Some(Some(n)) = idx_names.get(1) {
-                                    frame.insert(n.clone(), Self::signed_loop_val(j));
-                                }
-                            }
-                            self.push_local_frame(frame);
+                        let mut frame: HashMap<String, Value> = HashMap::default();
+                        if let Some(Some(n)) = idx_names.first() {
+                            frame.insert(n.clone(), Self::signed_loop_val(i));
                         }
+                        if c.nested && idx_names.len() >= 2 {
+                            if let Some(Some(n)) = idx_names.get(1) {
+                                frame.insert(n.clone(), Self::signed_loop_val(j));
+                            }
+                        }
+                        self.push_local_frame(frame);
                         let good = self.item_holds(handle, body);
-                        if !single_var {
-                            self.pop_local_frame();
-                        }
+                        self.pop_local_frame();
                         if !good {
                             ok = false;
                             break 'outer;
                         }
                     }
-                }
-                if single_var {
-                    self.pop_local_frame();
                 }
             }
         }
