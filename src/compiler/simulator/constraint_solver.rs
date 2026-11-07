@@ -3695,9 +3695,11 @@ impl Simulator {
             return c;
         }
         let r = self.class_prop_signed_of_uncached(handle, prop);
-        self.class_prop_signed_memo
-            .borrow_mut()
-            .insert(key, r);
+        let mut memo = self.class_prop_signed_memo.borrow_mut();
+        if memo.len() >= super::aggregate_expressions::CLASS_PROP_MEMO_CAP {
+            memo.clear();
+        }
+        memo.insert(key, r);
         r
     }
 

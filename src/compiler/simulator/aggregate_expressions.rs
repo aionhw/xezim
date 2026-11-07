@@ -4,6 +4,10 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// Entries kept by the per-(object, property) shape memos before they are
+/// dropped and rebuilt.
+pub(super) const CLASS_PROP_MEMO_CAP: usize = 1 << 16;
+
 impl Simulator {
     /// §7.4.1: bit offset of ELEMENT `idx` of the packed multi-D signal
     /// `name`, normalized against the declared outer dimension — a descending
@@ -33,9 +37,12 @@ impl Simulator {
             return cached.clone();
         }
         let r = self.class_prop_packed_dims_uncached(handle, prop);
-        self.class_prop_dims_memo
-            .borrow_mut()
-            .insert(key, r.clone());
+        let mut memo = self.class_prop_dims_memo.borrow_mut();
+        // Keyed per object: a long run allocates objects without bound.
+        if memo.len() >= CLASS_PROP_MEMO_CAP {
+            memo.clear();
+        }
+        memo.insert(key, r.clone());
         r
     }
 
