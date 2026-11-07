@@ -3697,6 +3697,23 @@ fn idents_in_type_arg_text(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < cs.len() {
+        // A string actual (`holder #(int, "base_test")`) is a value, not a
+        // name; its contents are never an identifier.
+        if cs[i] == '"' {
+            i += 1;
+            while i < cs.len() {
+                if cs[i] == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if cs[i] == '"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
         if !(cs[i].is_alphabetic() || cs[i] == '_') {
             i += 1;
             continue;
@@ -3717,6 +3734,20 @@ fn idents_in_type_arg_text(text: &str) -> Vec<String> {
     }
     out
 }
+/// The parser retains some type actuals as source text rather than a parsed
+/// name — virtual interface types above all (`virtual I`, `virtual my_if #(T)`),
+/// whose interface and parameters need interface resolution to judge. Anything
+/// that is not a plain identifier is such a retention and is left alone, the
+/// same guard `type_lint::check_type_actual` applies.
+fn is_plain_ident(n: &str) -> bool {
+    let mut ch = n.chars();
+    match ch.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    n.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
 /// Every name the design declares, harvested from the AST. Whole-design on
 /// purpose — see the note above. Names the elaboration already indexes
 /// (`top_declares`) and package members (`pkg_names`) are tested separately.
@@ -3952,7 +3983,7 @@ impl<'a> UndeclaredFinder<'a> {
     /// spelling, a package member, something the elaboration indexes, or
     /// something the design declares anywhere.
     fn known(&self, n: &str) -> bool {
-        n.is_empty()
+        !is_plain_ident(n)
             || n.starts_with('$')
             || is_builtin_type(n)
             || reserved_type_arg_name(n)
