@@ -2449,7 +2449,9 @@ impl Simulator {
                         return false;
                     }
                     for arr in rand_set {
-                        if let Some(changed) = self.solve_forced_array_elem_member(handle, item, arr, "*") {
+                        if let Some(changed) =
+                            self.solve_forced_array_elem_member(handle, item, rand_set, arr, "*")
+                        {
                             return changed;
                         }
                     }
@@ -3287,7 +3289,9 @@ impl Simulator {
         // `arr[i]`, so these fell through to the generate-and-test fallback,
         // which draws the WHOLE element uniformly and can never hit a narrow
         // member range — randomize() failed. Repair the member slice directly.
-        if let Some(changed) = self.solve_forced_array_elem_member(handle, item, arr_name, idx) {
+        if let Some(changed) =
+            self.solve_forced_array_elem_member(handle, item, rand_set, arr_name, idx)
+        {
             return changed;
         }
         // Handle `arr[i] inside { lo:hi }` directly so the range is
@@ -3597,10 +3601,75 @@ impl Simulator {
     /// is not a member-of-element Inside/equality constraint (caller falls
     /// through), otherwise `Some(changed)` — the member slice is re-picked
     /// within the constraint range and spliced back into the element.
+    /// The bounds and weights of a `dist` read nothing that changes during
+    /// one `randomize()`: no bound local (a `foreach` index), no rand
+    /// variable or element of the array being solved, and no call.
+    fn dist_memo_eligible(
+        &self,
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+        rand_set: &HashSet<String>,
+        arr_name: &str,
+    ) -> bool {
+        use crate::ast::decl::DistWeight;
+        let mut ok = true;
+        let mut check = |e: &Expression| {
+            crate::type_lint::visit_expr(e, &mut |x| match &x.kind {
+                ExprKind::Number(_)
+                | ExprKind::Unary { .. }
+                | ExprKind::Binary { .. }
+                | ExprKind::Conditional { .. }
+                | ExprKind::Paren(_)
+                | ExprKind::Range(..)
+                | ExprKind::Index { .. }
+                | ExprKind::RangeSelect { .. }
+                | ExprKind::MemberAccess { .. }
+                | ExprKind::This => {}
+                ExprKind::SystemCall { name, .. }
+                    if matches!(name.as_str(), "$clog2" | "$bits" | "$signed" | "$unsigned") => {}
+                ExprKind::Ident(h) => {
+                    let segs = &h.path;
+                    let first = match segs.first() {
+                        Some(f) if f.name.name == "this" && segs.len() > 1 => &segs[1],
+                        Some(f) => f,
+                        None => return,
+                    };
+                    let n = first.name.name.as_str();
+                    if n == arr_name
+                        || rand_set.contains(n)
+                        || rand_set.iter().any(|r| {
+                            r.strip_prefix(n)
+                                .is_some_and(|t| t.starts_with('[') || t.starts_with('.'))
+                        })
+                        || self.local_stack.iter().any(|f| f.contains_key(n))
+                    {
+                        ok = false;
+                    }
+                }
+                _ => ok = false,
+            })
+        };
+        for r in ranges {
+            match r {
+                ConstraintRange::Value(v) => check(v),
+                ConstraintRange::Range { lo, hi } => {
+                    check(lo);
+                    check(hi);
+                }
+            }
+        }
+        for w in weights.iter().flatten() {
+            let (DistWeight::Each(e) | DistWeight::Total(e)) = w;
+            check(e);
+        }
+        ok
+    }
+
     pub(super) fn solve_forced_array_elem_member(
         &mut self,
         handle: usize,
         item: &ConstraintItem,
+        rand_set: &HashSet<String>,
         arr_name: &str,
         idx: &str,
     ) -> Option<bool> {
@@ -3773,10 +3842,28 @@ impl Simulator {
             }
             Op::Dist(cr, dw) => {
                 let key = (handle, format!("{}{}.{}", arr_name, idxs, names[0]));
-                let item_ptr = item as *const ConstraintItem as usize;
-                let picked = self
-                    .pick_dist_value_memoized(item_ptr, Some(key), &cr, &dw)
-                    .unwrap_or_else(|| Value::zero(w));
+                // §18.5.4: bounds and weights may read the `foreach` index,
+                // the element's own members or other rand variables; such a
+                // `dist` is evaluated again for every element.
+                let span = match item {
+                    ConstraintItem::Inside { span, .. } => *span,
+                    _ => crate::ast::Span::dummy(),
+                };
+                let memo = (span.start != 0 || span.end != 0)
+                    && self.dist_memo_eligible(&cr, &dw, rand_set, arr_name);
+                let picked = if memo {
+                    let item_key = (
+                        handle,
+                        item as *const ConstraintItem as usize,
+                        span.start,
+                        span.end,
+                        cr.len(),
+                    );
+                    self.pick_dist_value_memoized(item_key, Some(key), &cr, &dw)
+                } else {
+                    self.pick_dist_value(Some(key), &cr, &dw)
+                }
+                .unwrap_or_else(|| Value::zero(w));
                 if picked.to_u64() != mcur.to_u64() {
                     self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, picked);
                     true

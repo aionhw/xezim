@@ -3306,7 +3306,7 @@ impl Simulator {
     /// still consume the RNG stream identically to `pick_dist_value`.
     pub(super) fn pick_dist_value_memoized(
         &mut self,
-        item_ptr: usize,
+        item_ptr: (usize, usize, usize, usize, usize),
         key: Option<(usize, String)>,
         ranges: &[ConstraintRange],
         weights: &[Option<crate::ast::decl::DistWeight>],

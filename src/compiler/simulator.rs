@@ -8934,11 +8934,19 @@ pub struct Simulator {
     class_prop_dims_memo: std::cell::RefCell<HashMap<(usize, String), Option<Vec<(i64, i64)>>>>,
     #[serde(skip)]
     class_prop_signed_memo: std::cell::RefCell<HashMap<(usize, String), bool>>,
-    /// Per-solve cache of resolved `dist` geometries in foreach fast paths,
-    /// keyed by the constraint `item` pointer. Cleared at the top of each
-    /// `solve_forced` pass (scalar bounds/weights are constant within a solve).
+    /// Per-randomize cache of resolved `dist` geometries in foreach fast
+    /// paths, keyed by the object, the constraint item (address and source
+    /// span) and its item count. Cleared by each `randomize()`; only a `dist`
+    /// whose bounds and weights read no `foreach` index, no rand variable and
+    /// call nothing is memoized (`dist_memo_eligible`), as only those stay
+    /// constant through one solve.
     #[serde(skip)]
-    dist_geometry_memo: std::cell::RefCell<HashMap<usize, crate::compiler::simulator::inline_constraints::ResolvedDist>>,
+    dist_geometry_memo: std::cell::RefCell<
+        HashMap<
+            (usize, usize, usize, usize, usize),
+            crate::compiler::simulator::inline_constraints::ResolvedDist,
+        >,
+    >,
     /// Emptied formal-metadata snapshot vectors of the class-method call path,
     /// reused across calls.
     formal_parts_pool: Vec<Vec<(usize, FormalMetaParts)>>,
