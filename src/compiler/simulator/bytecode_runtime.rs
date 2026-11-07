@@ -3024,11 +3024,11 @@ impl Simulator {
                 Insn::LoadProcessStatus(dest, handle) => {
                     let hreg = *handle as usize;
                     let h = self.vm_regs[hreg].to_u64().unwrap_or(0);
-                    let st = if let Some(pid) = Self::proc_handle_to_pid(h) {
-                        self.proc_status(pid) as u64
-                    } else {
-                        1 // RUNNING default
-                    };
+                    // A null (or non-process) handle reads like the
+                    // interpreter's `p.status` on it: the 32-bit zero of a
+                    // member read through a null handle, not RUNNING.
+                    let st =
+                        Self::proc_handle_to_pid(h).map_or(0, |pid| self.proc_status(pid) as u64);
                     self.vm_regs[*dest as usize] = Value::from_u64(st, 32);
                 }
                 // class-perf tier-1 opcodes: read/write an object member off
