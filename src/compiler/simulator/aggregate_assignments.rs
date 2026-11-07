@@ -1583,7 +1583,11 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) -> Option<Vec<(Expression, Value)>> {
-        if !matches!(lvalue.kind, ExprKind::Index { .. }) {
+        // Only a 2-D or N-D unpacked array has rows (`fixed_unpacked_dims`);
+        // most designs have none, and every indexed NBA comes through here.
+        if !matches!(lvalue.kind, ExprKind::Index { .. })
+            || (self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty())
+        {
             return None;
         }
         let targets = self.unpacked_row_suffixes(lvalue)?;
