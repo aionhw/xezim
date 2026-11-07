@@ -726,6 +726,20 @@ impl Simulator {
             .map(|pos| &self.module.instances[self.instance_path_order[pos]])
     }
 
+    /// §23.9: `scope` and its enclosing generate blocks, ending at the nearest
+    /// enclosing instance, or at the outermost block of the top module.
+    pub(super) fn scopes_to_instance<'s>(&self, scope: &'s str) -> impl Iterator<Item = &'s str> {
+        let mut next = Some(scope);
+        std::iter::from_fn(move || {
+            let s = next?;
+            next = match self.instance_by_path(s) {
+                Some(_) => None,
+                None => s.rsplit_once('.').map(|(outer, _)| outer),
+            };
+            Some(s)
+        })
+    }
+
     pub(super) fn resolve_hier_name_uncached(&self, hier: &HierarchicalIdentifier) -> String {
         // §23.9 / §13.5 (#534): an unpacked-array FORMAL of the running
         // method is bound under its bare name (with a frame marker); it

@@ -2385,9 +2385,13 @@ impl Simulator {
                     .map(String::as_str),
             ];
             for sc in scopes.into_iter().flatten().filter(|s| !s.is_empty()) {
-                let scoped = format!("{}.{}", sc, raw);
-                if self.clocking_meta.contains_key(&scoped) {
-                    return Some(scoped);
+                // §14.3: found in the block itself, or in an enclosing scope
+                // of the same instance.
+                for outer in self.scopes_to_instance(sc) {
+                    let scoped = format!("{}.{}", outer, raw);
+                    if self.clocking_meta.contains_key(&scoped) {
+                        return Some(scoped);
+                    }
                 }
             }
         }
