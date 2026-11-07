@@ -470,6 +470,8 @@ mod randomize_with_this_and_subset;
 mod null_receiver_static_spec;
 #[path = "classes/randomize_work_budget.rs"]
 mod randomize_work_budget;
+#[path = "classes/edge_event_on_non_signal_operand.rs"]
+mod edge_event_on_non_signal_operand;
 #[path = "classes/enum_string_valued_scope_546.rs"]
 mod enum_string_valued_scope;
 #[path = "classes/scope_randomize_dist_and_foreach.rs"]
