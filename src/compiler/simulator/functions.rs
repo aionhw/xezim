@@ -381,9 +381,6 @@ impl Simulator {
             // Unpacked ARRAY formal: functions never bound one, so the body read
             // X and a `ref` write never reached the caller (§13.5.2).
             if let Some(actual) = actual {
-                let prior = self.module.arrays.contains_key(&port.name.name)
-                    || self.module.arrays_2d.contains_key(&port.name.name)
-                    || self.module.arrays_nd.contains_key(&port.name.name);
                 if let Some(info) = self.bind_array_arg(port, actual) {
                     // Keep fixed-array formals visible to class-scope lookup (§13.5).
                     locals.insert(
@@ -397,7 +394,7 @@ impl Simulator {
                         if !info.1.is_empty() {
                             array_writebacks.push(info);
                         }
-                    } else if !prior {
+                    } else {
                         // An INPUT array formal is dropped on return too: left
                         // registered, a later call whose same-named formal
                         // took the scalar path found it and behaved
@@ -926,6 +923,7 @@ impl Simulator {
         // actual would otherwise let the restore wipe the output writeback.
         let assoc_params = std::mem::take(&mut assoc_params);
         let array_writebacks = std::mem::take(&mut array_writebacks);
+        let staged_arrays = self.stage_array_writebacks(&array_writebacks);
         // Capture the callee's queue formals now; the caller's shadowed
         // storage is restored below, and only then is the writeback
         // applied — see `stage_queue_param`.
@@ -1022,7 +1020,8 @@ impl Simulator {
             }
             self.purge_assoc_param(&param, prior);
         }
-        self.writeback_array_args(&array_writebacks);
+        self.writeback_array_args(&staged_arrays);
+        self.purge_array_formals(&staged_arrays);
         self.purge_array_formals(&array_writebacks);
         self.purge_array_formals(&array_inputs);
         for (tmp, caller) in staged_wb {
@@ -1206,22 +1205,17 @@ impl Simulator {
         // caller's actual, the restore (`pop_and_restore_queue_frame`) wipes
         // the caller's bare-name elements — destroying an output/inout/ref
         // writeback done now. Mirror the function path (and the queue staging
-        // above). An assoc formal's per-call key is torn down by the restore,
-        // so its element data is staged onto a temp key; fixed-array formals
-        // keep bare keys that survive.
+        // above). An assoc or fixed-array formal's per-call key is torn down
+        // by the restore, so its element data is staged onto a temp key.
         let assoc_params = std::mem::take(&mut c.assoc_params);
         let wb = c.array_writebacks.clone();
+        let staged_arrays = self.stage_array_writebacks(&wb);
         let array_params = std::mem::take(&mut c.array_params);
         let assoc_wb = self.stage_assoc_writebacks(
             assoc_params
                 .iter()
                 .map(|(p, c, out)| (p.as_str(), c.as_str(), *out)),
         );
-        let identity_params: std::collections::HashSet<&String> = wb
-            .iter()
-            .filter(|(p, c2, ..)| p == c2)
-            .map(|(p, ..)| p)
-            .collect();
         self.break_flag = c.saved_break || self.dpi_unwinding;
         self.return_flag = c.saved_return || self.dpi_unwinding;
         self.pop_and_restore_queue_frame();
@@ -1247,13 +1241,9 @@ impl Simulator {
                 self.module.assoc_defaults.remove(&param_name);
             }
         }
-        self.writeback_array_args(&wb);
+        self.writeback_array_args(&staged_arrays);
+        self.purge_array_formals(&staged_arrays);
         for param_name in &array_params {
-            // Identity-bound formals share the caller's storage — see the
-            // function-path twin above (audit46 a10).
-            if identity_params.contains(param_name) {
-                continue;
-            }
             let prefix = format!("{}[", param_name);
             let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
             for k in keys {

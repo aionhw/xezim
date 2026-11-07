@@ -1767,9 +1767,6 @@ impl Simulator {
                         // one; a class method bound it as a scalar, so the
                         // body read X and a user function taking an array —
                         // legal in a constraint — always returned 0.
-                        let prior = self.module.arrays.contains_key(&port.name.name)
-                            || self.module.arrays_2d.contains_key(&port.name.name)
-                            || self.module.arrays_nd.contains_key(&port.name.name);
                         if let Some(info) = self.bind_array_arg(port, actual) {
                             // Keep fixed-array formals visible to class-scope lookup (§13.5).
                             locals.insert(
@@ -1783,7 +1780,7 @@ impl Simulator {
                                 if !info.1.is_empty() {
                                     array_writebacks.push(info);
                                 }
-                            } else if !prior {
+                            } else {
                                 // An input array formal is dropped on return
                                 // too (#327's "warming"; see the function path).
                                 array_inputs.push(info);
@@ -2816,6 +2813,7 @@ impl Simulator {
                         .iter()
                         .map(|(p, c, out, _)| (p.as_str(), c.as_str(), *out)),
                 );
+                let staged_arrays = self.stage_array_writebacks(&array_writebacks);
                 self.pop_and_restore_queue_frame();
                 for (tmp, caller) in staged_wb {
                     self.writeback_queue_param(&tmp, &caller);
@@ -2852,7 +2850,8 @@ impl Simulator {
                 // by value and must NOT write back — §18.5.12 relies on
                 // that for array args to constraint functions).
                 if !array_writebacks.is_empty() {
-                    self.writeback_array_args(&array_writebacks);
+                    self.writeback_array_args(&staged_arrays);
+                    self.purge_array_formals(&staged_arrays);
                     self.purge_array_formals(&array_writebacks);
                 }
                 if !array_inputs.is_empty() {

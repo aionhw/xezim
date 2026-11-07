@@ -2260,6 +2260,31 @@ impl Simulator {
         }
     }
 
+    /// §13.5.1: the per-call storage key of a fixed unpacked array formal (see
+    /// `formal_dyn_key`). The element type and its packed geometry are
+    /// recorded under it as a block local array's declaration does, so an
+    /// element write fits, signs and selects like the declared type.
+    pub(super) fn array_formal_key(&mut self, port: &crate::ast::decl::FunctionPort) -> String {
+        let dt = &port.data_type;
+        let key = self.formal_dyn_key(&port.name.name, dt);
+        self.module.var_decl_types.insert(key.clone(), dt.clone());
+        if let Some(dims) = super::elaborate::packed_full_dims_chained(
+            dt,
+            &self.module.parameters,
+            &self.module.typedef_types,
+        )
+        .filter(|dims| dims.len() > 1)
+        {
+            self.module.packed_full_dims.insert(key.clone(), dims);
+            if let Some(width) = self.ast_decl_elem_width(dt) {
+                self.module
+                    .packed_signal_elem_widths
+                    .insert(key.clone(), width);
+            }
+        }
+        key
+    }
+
     /// Copy a fixed unpacked ARRAY actual into the formal's element signals and
     /// register the formal as an array so `a[i]` resolves inside the body.
     /// Returns `(formal, actual, lo, hi)` so an `output`/`inout`/`ref` formal
@@ -2319,7 +2344,6 @@ impl Simulator {
             if dims.len() != 1 {
                 return None;
             }
-            let param = port.name.name.clone();
             let w = super::elaborate::resolve_type_width(
                 &port.data_type,
                 Some(&self.module.parameters),
@@ -2327,9 +2351,14 @@ impl Simulator {
             )
             .max(1);
             let vals = self.unpacked_concat_operand_values(parts.iter().collect());
+            let param = self.array_formal_key(port);
             self.module.arrays.insert(param.clone(), (lo, hi, w));
             for (j, v) in vals.into_iter().take((hi - lo + 1) as usize).enumerate() {
-                let idx = if descending { hi - j as i64 } else { lo + j as i64 };
+                let idx = if descending {
+                    hi - j as i64
+                } else {
+                    lo + j as i64
+                };
                 self.set_signal_value_by_name(&format!("{}[{}]", param, idx), v.resize(w));
             }
             return Some((param, String::new(), lo, hi));
@@ -2343,7 +2372,6 @@ impl Simulator {
             if dims.len() != 1 {
                 return None;
             }
-            let param = port.name.name.clone();
             let dt = &port.data_type;
             let w = super::elaborate::resolve_type_width(
                 dt,
@@ -2351,6 +2379,7 @@ impl Simulator {
                 Some(&self.module.typedefs),
             )
             .max(1);
+            let param = self.array_formal_key(port);
             self.module.arrays.insert(param.clone(), (lo, hi, w));
             let ordered: Vec<Expression> =
                 self.pattern_ordered(items).into_iter().cloned().collect();
@@ -2397,20 +2426,24 @@ impl Simulator {
         // copy back through `writeback_array_args`. Only the first dimension
         // was handled before: a 2-D formal read x and never wrote back.
         if dims.len() >= 2 {
-            let param = port.name.name.clone();
+            if !self.module.arrays_2d.contains_key(&*caller)
+                && !self.module.arrays_nd.contains_key(&*caller)
+            {
+                return None;
+            }
+            let param = self.array_formal_key(port);
             let suffixes =
                 if let Some(&((a0, a1), (b0, b1), w)) = self.module.arrays_2d.get(&*caller) {
                     self.module
                         .arrays_2d
                         .insert(param.clone(), ((a0, a1), (b0, b1), w));
                     Self::nd_elem_suffixes(&[(a0, a1), (b0, b1)])
-                } else if let Some((shape, w)) = self.module.arrays_nd.get(&*caller).cloned() {
+                } else {
+                    let (shape, w) = self.module.arrays_nd.get(&*caller).cloned()?;
                     self.module
                         .arrays_nd
                         .insert(param.clone(), (shape.clone(), w));
                     Self::nd_elem_suffixes(&shape)
-                } else {
-                    return None;
                 };
             self.multi_dim_array_names.insert(param.clone());
             if param != caller {
@@ -2434,7 +2467,7 @@ impl Simulator {
         if !self.module.arrays.contains_key(&*caller) {
             return None;
         }
-        let param = port.name.name.clone();
+        let param = self.array_formal_key(port);
         // §7.2: an element of an UNPACKED-struct array is a set of member
         // leaves. Copying `a[i]` alone brought nothing across, so a
         // `pkt_t arr[3]` formal read zero from every member.
@@ -2695,6 +2728,53 @@ impl Simulator {
             self.set_signal_value_by_name(&format!("{}{}", lbase, ls), v);
         }
         true
+    }
+
+    /// Copy each `output`/`inout`/`ref` array formal's per-call storage onto
+    /// a fresh key while the call's frame is still live (popping it tears
+    /// the formal's key down), and retarget the writeback at that copy. The
+    /// copy is applied after the caller's shadowed storage is restored, so a
+    /// same-named callee local cannot wipe it (see `stage_queue_param`).
+    pub(super) fn stage_array_writebacks(
+        &mut self,
+        wb: &[(String, String, i64, i64)],
+    ) -> Vec<(String, String, i64, i64)> {
+        let mut staged = Vec::with_capacity(wb.len());
+        for (param, caller, lo, hi) in wb {
+            let bare = param
+                .strip_prefix('@')
+                .and_then(|s| s.rsplit_once('#'))
+                .map_or(param.as_str(), |(b, _)| b);
+            let id = self.next_dyn_id;
+            self.next_dyn_id += 1;
+            let tmp = format!("@{}#{}", bare, id);
+            let moved: Vec<(String, Value)> = self
+                .signals
+                .keys_with_elem_prefix(&format!("{}[", param))
+                .into_iter()
+                .filter_map(|k| {
+                    let v = self.signals.get(&k)?.clone();
+                    Some((format!("{}{}", tmp, &k[param.len()..]), v))
+                })
+                .collect();
+            for (k, v) in moved {
+                self.signals.insert(k, v);
+            }
+            if let Some(shape) = self.module.arrays.get(param).copied() {
+                self.module.arrays.insert(tmp.clone(), shape);
+            }
+            if let Some(shape) = self.module.arrays_2d.get(param).copied() {
+                self.module.arrays_2d.insert(tmp.clone(), shape);
+            }
+            if let Some(shape) = self.module.arrays_nd.get(param).cloned() {
+                self.module.arrays_nd.insert(tmp.clone(), shape);
+            }
+            if self.multi_dim_array_names.contains(param) {
+                self.multi_dim_array_names.insert(tmp.clone());
+            }
+            staged.push((tmp, caller.clone(), *lo, *hi));
+        }
+        staged
     }
 
     pub(super) fn writeback_array_args(&mut self, wb: &[(String, String, i64, i64)]) {
