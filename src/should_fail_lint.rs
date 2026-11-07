@@ -173,6 +173,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
         }
     }
     check_class_and_package_undeclared(defs, elab, &pkg_names, &mut errs);
+    check_nettype_partial_drivers(defs, elab, &mut errs);
     check_named_block_refs(defs, &mut errs);
     if xezim_core::sv_parser::strict_checks() {
         errs.extend(crate::type_lint::check(defs, elab));
@@ -4327,6 +4328,127 @@ pub fn check_class_and_package_undeclared(
         }
     }
     errs.extend(f.errs);
+}
+
+/// §10.3: a continuous assignment to a net of a user-defined nettype drives
+/// the whole net, so its left-hand side shall not index or select into the
+/// nettype's data type (`assign p.V = v;`, `assign p[0] = b;`). Such an
+/// assignment elaborated, and each member then had a driver of its own.
+fn check_nettype_partial_drivers(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
+    if elab.nettype_resolvers.is_empty() {
+        return;
+    }
+    let is_nettype = |dt: &DataType| {
+        matches!(dt, DataType::TypeReference { name, .. }
+            if elab.nettype_resolvers.contains_key(&name.name.name))
+    };
+    fn nets_in(
+        items: &[ModuleItem],
+        is_nettype: &dyn Fn(&DataType) -> bool,
+        out: &mut HashSet<String>,
+    ) {
+        for it in items {
+            match it {
+                ModuleItem::DataDeclaration(d) if is_nettype(&d.data_type) => {
+                    out.extend(d.declarators.iter().map(|x| x.name.name.clone()))
+                }
+                ModuleItem::NetDeclaration(d) if is_nettype(&d.data_type) => {
+                    out.extend(d.declarators.iter().map(|x| x.name.name.clone()))
+                }
+                ModuleItem::PortDeclaration(d) if is_nettype(&d.data_type) => {
+                    out.extend(d.declarators.iter().map(|x| x.name.name.clone()))
+                }
+                ModuleItem::GenerateRegion(g) => nets_in(&g.items, is_nettype, out),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, its) in &g.branches {
+                        nets_in(its, is_nettype, out);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => nets_in(&g.items, is_nettype, out),
+                _ => {}
+            }
+        }
+    }
+    /// The nettype net a target selects into, if it does.
+    fn partial_target(e: &Expression, nets: &HashSet<String>) -> Option<String> {
+        let root_net = |x: &Expression| match &x.kind {
+            ExprKind::Ident(h) if h.root.is_none() && nets.contains(&h.path[0].name.name) => {
+                Some(h.path[0].name.name.clone())
+            }
+            _ => None,
+        };
+        match &e.kind {
+            ExprKind::Ident(h) if h.root.is_none() && !h.path.is_empty() => {
+                let n = &h.path[0].name.name;
+                (nets.contains(n) && (h.path.len() > 1 || !h.path[0].selects.is_empty()))
+                    .then(|| n.clone())
+            }
+            ExprKind::MemberAccess { expr, .. }
+            | ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. } => {
+                root_net(expr).or_else(|| partial_target(expr, nets))
+            }
+            ExprKind::Concatenation(xs) => xs.iter().find_map(|x| partial_target(x, nets)),
+            _ => None,
+        }
+    }
+    fn walk(
+        items: &[ModuleItem],
+        nets: &HashSet<String>,
+        elab: &ElaboratedModule,
+        errs: &mut Vec<String>,
+    ) {
+        for it in items {
+            match it {
+                ModuleItem::ContinuousAssign(ca) => {
+                    for (l, _) in &ca.assignments {
+                        if let Some(n) = partial_target(l, nets) {
+                            let at = xezim_core::elaborate::span_location(elab, l.span)
+                                .map(|a| format!(" (at {a})"))
+                                .unwrap_or_default();
+                            errs.push(format!(
+                                "continuous assignment to net '{n}' of a user-defined nettype \
+                                 selects part of it; it shall drive the whole net (IEEE \
+                                 1800-2017 §10.3){at}"
+                            ));
+                        }
+                    }
+                }
+                ModuleItem::GenerateRegion(g) => walk(&g.items, nets, elab, errs),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, its) in &g.branches {
+                        walk(its, nets, elab, errs);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => walk(&g.items, nets, elab, errs),
+                _ => {}
+            }
+        }
+    }
+    for d in defs {
+        let (ports, items) = match d {
+            SourceDefinition::Module(m) => (&m.ports, &m.items),
+            SourceDefinition::Interface(m) => (&m.ports, &m.items),
+            SourceDefinition::Program(m) => (&m.ports, &m.items),
+            _ => continue,
+        };
+        let mut nets = HashSet::new();
+        if let PortList::Ansi(ps) = ports {
+            for p in ps {
+                if p.data_type.as_ref().is_some_and(|dt| is_nettype(dt)) {
+                    nets.insert(p.name.name.clone());
+                }
+            }
+        }
+        nets_in(items, &is_nettype, &mut nets);
+        if !nets.is_empty() {
+            walk(items, &nets, elab, errs);
+        }
+    }
 }
 
 /// Packages a module imports: (wildcard imports, explicitly imported names).
