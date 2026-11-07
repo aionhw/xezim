@@ -29,12 +29,17 @@ fn xezim() -> String {
 }
 
 fn run(src: &str, top: &str) -> String {
-    let path = format!("/tmp/prog_class_task_{top}.sv");
+    let path = std::env::temp_dir().join(format!(
+        "xezim_prog_class_task_{top}_{}.sv",
+        std::process::id()
+    ));
     std::fs::write(&path, src).unwrap();
     let out = Command::new(xezim())
-        .args(["--simulate", "-s", top, &path])
+        .args(["--simulate", "-s", top])
+        .arg(&path)
         .output()
         .expect("run xezim");
+    let _ = std::fs::remove_file(&path);
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 

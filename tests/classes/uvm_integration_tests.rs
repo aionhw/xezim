@@ -1709,8 +1709,11 @@ endprogram
 fn reg_agent_param_create_keeps_specialization_two_top() {
     let src_dir = uvm_dir().join("1.2/src");
     let uvm_pkg = src_dir.join("uvm_pkg.sv");
-    let test_sv = "/tmp/two_top_param_agent.sv";
-    std::fs::write(test_sv, TWO_TOP_PARAM_AGENT).unwrap();
+    let test_sv = std::env::temp_dir().join(format!(
+        "xezim_two_top_param_agent_{}.sv",
+        std::process::id()
+    ));
+    std::fs::write(&test_sv, TWO_TOP_PARAM_AGENT).unwrap();
     let out = Command::new(xezim_bin())
         .args([
             "--simulate",
@@ -1720,9 +1723,10 @@ fn reg_agent_param_create_keeps_specialization_two_top() {
             "-I", src_dir.to_str().unwrap(),
         ])
         .arg(uvm_pkg)
-        .arg(test_sv)
+        .arg(&test_sv)
         .output()
         .expect("run xezim binary with two tops");
+    let _ = std::fs::remove_file(&test_sv);
     let out = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         out.contains("TEST_PASS"),
