@@ -50,3 +50,30 @@ fn the_audit_prints_each_binding_and_changes_no_artifact_byte() {
     assert!(none.is_empty(), "{none:?}");
     assert!(with == without, "the audit changed the artifact");
 }
+
+#[test]
+fn the_audit_prints_where_an_upward_call_resolves_in_each_instance() {
+    // §23.8.1: from the instantiation's scope, then each enclosing instance.
+    const UP: &str = "module c; initial $display(f()); endmodule
+module top;
+  function automatic int f(); return 1; endfunction
+  if (1) begin : g function automatic int f(); return 5; endfunction c x(); end
+  c y();
+endmodule
+";
+    let dir = std::env::temp_dir().join(format!("xezim_bind_audit_up_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a temp dir");
+    std::fs::write(dir.join("t.sv"), UP).expect("the source");
+    let (with, lines) = compile(&dir, "a.bin", true);
+    let (without, _) = compile(&dir, "b.bin", false);
+    std::fs::remove_dir_all(&dir).expect("removing the temp dir");
+    let mut up: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("upward "))
+        .collect();
+    up.sort();
+    // A deferred body is rewritten after the source maps are released, so
+    // the call is located by definition and byte offset.
+    assert_eq!(up, ["c@27 f in g.x -> g.f", "c@27 f in y -> f"]);
+    assert!(with == without, "the audit changed the artifact");
+}

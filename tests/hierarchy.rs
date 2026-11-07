@@ -205,6 +205,8 @@ mod undriven_implicit_output_is_z;
 mod unpacked_struct_port;
 #[path = "hierarchy/unresolved_hier_refs.rs"]
 mod unresolved_hier_refs;
+#[path = "hierarchy/upward_subroutine_calls.rs"]
+mod upward_subroutine_calls;
 #[path = "hierarchy/vif_arrays_and_null_default.rs"]
 mod vif_arrays_and_null_default;
 #[path = "hierarchy/vif_clocking_in_methods.rs"]
