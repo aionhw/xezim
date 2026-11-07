@@ -1050,27 +1050,17 @@ impl Simulator {
                     for c in &cur {
                         rand_set.insert(c.prop.clone());
                     }
-                    fn item_has_foreach(item: &ConstraintItem) -> bool {
-                        match item {
-                            ConstraintItem::Foreach { .. } => true,
-                            ConstraintItem::Block(items) => items.iter().any(item_has_foreach),
-                            ConstraintItem::Soft(inner) => item_has_foreach(inner),
-                            _ => false,
-                        }
-                    }
                     for con in constraints {
                         for item in &con.items {
-                            if item_has_foreach(item) {
-                                self.solve_forced(handle, item, &rand_set);
-                            }
+                            self.solve_forced(handle, item, &rand_set);
                         }
                     }
 
                     let mut fe_failed = false;
-                    if csp.soft_priority.is_empty()
+                    let accepted = csp.soft_priority.is_empty()
                         && array_enums.is_empty()
-                        && self.rand_items_accept(handle, constraints, &cur, &mut fe_failed)
-                    {
+                        && self.rand_items_accept(handle, constraints, &cur, &mut fe_failed);
+                    if accepted {
                         return CspOutcome::Sat;
                     }
                 }

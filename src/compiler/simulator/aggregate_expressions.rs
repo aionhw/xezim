@@ -1430,6 +1430,21 @@ impl Simulator {
                 let DataType::Struct(su) = &access.element_type else {
                     return None;
                 };
+                if access.params.is_none() {
+                    let memo_key = (su.span.start as usize, member.name.clone());
+                    if let Some(cached) = self.packed_struct_member_memo.borrow().get(&memo_key) {
+                        if let Some((offset, width, is_signed, element, dimensions)) = cached {
+                            access.offset = access.offset.checked_add(*offset)?;
+                            access.width = *width;
+                            access.is_signed = *is_signed;
+                            access.dimensions = dimensions.clone();
+                            access.element_type = element.clone();
+                            return Some(access);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
                 let mut remaining = access.width;
                 for m in &su.members {
                     // A member sized by the instance's parameters too.
@@ -1448,17 +1463,37 @@ impl Simulator {
                             remaining
                         };
                         if d.name.name == member.name {
-                            access.offset = access.offset.checked_add(offset)?;
-                            access.width = width;
-                            access.is_signed = super::elaborate::is_type_signed_resolved(
+                            let is_signed = super::elaborate::is_type_signed_resolved(
                                 &m.data_type,
                                 &self.module.typedef_types,
                             );
+                            if access.params.is_none() {
+                                let memo_key = (su.span.start as usize, member.name.clone());
+                                self.packed_struct_member_memo.borrow_mut().insert(
+                                    memo_key,
+                                    Some((
+                                        offset,
+                                        width,
+                                        is_signed,
+                                        element.clone(),
+                                        dimensions.clone(),
+                                    )),
+                                );
+                            }
+                            access.offset = access.offset.checked_add(offset)?;
+                            access.width = width;
+                            access.is_signed = is_signed;
                             access.dimensions = dimensions;
                             access.element_type = element;
                             return Some(access);
                         }
                     }
+                }
+                if access.params.is_none() {
+                    let memo_key = (su.span.start as usize, member.name.clone());
+                    self.packed_struct_member_memo
+                        .borrow_mut()
+                        .insert(memo_key, None);
                 }
                 None
             }

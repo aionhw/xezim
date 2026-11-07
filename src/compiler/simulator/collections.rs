@@ -5100,7 +5100,8 @@ impl Simulator {
                                 // the per-element repair can dead-end (e.g. an
                                 // ascending cross-element chain that exhausts
                                 // its headroom); a fresh seed usually escapes.
-                                if self.inline_constraints_satisfied(constraints) {
+                                let sat = self.inline_constraints_satisfied(constraints);
+                                if sat {
                                     satisfied = true;
                                     break;
                                 }
