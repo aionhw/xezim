@@ -2542,10 +2542,25 @@ impl Simulator {
                         // of `format!` — this runs once per element access on
                         // associative-array procedural loops.
                         let elem = Self::name_with_key(&an, &key);
-                        self.signals
-                            .get(&elem)
-                            .cloned()
-                            .unwrap_or_else(|| Value::zero(32))
+                        // §7.9 / §7.10.4: an element at or past a queue's or
+                        // dynamic array's current SIZE does not exist and
+                        // reads the element type's default. The store keeps
+                        // the cells a shrink (`delete()`, `delete(i)`,
+                        // `pop_*`) orphaned, so the map hit below returned
+                        // the retired element. Same default as this arm's
+                        // own miss path.
+                        let idx = idx_val.to_i64().unwrap_or(-1);
+                        if !self.is_associative_array(&an)
+                            && (idx < 0 || idx as u64 >= self.get_queue_size(&an))
+                        {
+                            self.assoc_missing_elem_value(&an)
+                                .unwrap_or_else(|| Value::zero(32))
+                        } else {
+                            self.signals
+                                .get(&elem)
+                                .cloned()
+                                .unwrap_or_else(|| Value::zero(32))
+                        }
                     }
                     None => Value::zero(32),
                 };

@@ -5469,12 +5469,29 @@ impl Simulator {
                     }
                     let idx_str = self.assoc_key_str(&an, &idx_val);
                     let elem_name = Self::name_with_key(&an, &idx_str);
-                    if let Some(ev) = self.signals.get(&elem_name) {
-                        return ev.clone();
+                    // §7.9 / §7.10.4: an element at or past a queue's or
+                    // dynamic array's current SIZE does not exist. Shrinking
+                    // (`delete()`, `delete(i)`, `pop_front`/`pop_back`) only
+                    // moves `.size` and leaves the orphaned cells in the
+                    // store, so the lookups below returned the retired
+                    // element instead of falling through to the element
+                    // type's default (x / 0 / null / "" as its type dictates).
+                    let in_range = !is_dyn
+                        || self.is_associative_array(&an)
+                        || idx_val
+                            .to_i64()
+                            .is_some_and(|i| i >= 0 && (i as u64) < self.get_queue_size(&an));
+                    if in_range {
+                        if let Some(ev) = self.signals.get(&elem_name) {
+                            return ev.clone();
+                        }
                     }
                     // A struct member queue of a FIXED array element
                     // (`fa[1].q[0]`) can have its cells in the signal table.
-                    if is_dyn && let Some(ev) = self.table_elem_value(&elem_name) {
+                    if in_range
+                        && is_dyn
+                        && let Some(ev) = self.table_elem_value(&elem_name)
+                    {
                         return ev;
                     }
                     // §7.9.11: a `default:` the array was assigned.
@@ -5759,6 +5776,25 @@ impl Simulator {
                                 return Value::new(ew.max(1));
                             }
                         }
+                        // §7.9 / §7.10.4: an element of a queue or dynamic
+                        // array at or past its current SIZE does not exist, so
+                        // reading it yields the element type's default. Every
+                        // storage lookup below addresses cells that a shrink
+                        // left behind — `delete()`, `delete(i)` and
+                        // `pop_front`/`pop_back` only move `.size` — so a
+                        // size-4 queue that had held 8 returned its old byte
+                        // at `q[5]` instead of x. A queue is registered in
+                        // `array_first_id` over a placeholder range (0..63),
+                        // NOT its live length, so the bound comes from
+                        // `.size`. Only the cell lookups are skipped; the
+                        // element-default logic is the one a miss already
+                        // takes, so the element type still decides the default
+                        // (x / 0 / null / "").
+                        let out_of_range = !self.is_associative_array(&name)
+                            && self.module.dynamic_arrays.contains(&*name)
+                            && idx_val.to_i64().is_none_or(|i| {
+                                i < 0 || i as u64 >= self.get_queue_size(&store_name)
+                            });
                         // Fast path for 1-D arrays: compute signal_id directly
                         // via `array_first_id`. Critical for LARGE arrays
                         // (e.g. xezim_mem[0:4M]) where per-element names are
@@ -5780,7 +5816,7 @@ impl Simulator {
                                         .unwrap_or(ctx_width.max(1));
                                     return Value::new(ew.max(1));
                                 };
-                                if idx >= lo && idx <= hi {
+                                if !out_of_range && idx >= lo && idx <= hi {
                                     let eid = first_id + (idx - lo) as usize;
                                     // Packed-arena cell: no signal_table slot
                                     // (found by the #147 race test's AST-path
@@ -5821,15 +5857,22 @@ impl Simulator {
                             idx_val.to_i64().unwrap_or(0).to_string()
                         };
                         let elem_name = Self::name_with_key(&store_name, &idx_str);
-                        if let Some(&eid) = self.signal_name_to_id.get(elem_name.as_str()) {
+                        if !out_of_range
+                            && let Some(&eid) = self.signal_name_to_id.get(elem_name.as_str())
+                        {
                             let mut v = self.signal_table[eid].clone();
                             if self.signal_signed[eid] {
                                 v.is_signed = true;
                             }
                             return v;
                         }
-                        let mut v = if let Some(sv) = self.signals.get(&elem_name) {
-                            sv.clone()
+                        let cell = if out_of_range {
+                            None
+                        } else {
+                            self.signals.get(&elem_name).cloned()
+                        };
+                        let mut v = if let Some(sv) = cell {
+                            sv
                         } else if let Some(def_expr) =
                             self.module.assoc_defaults.get(&*name).cloned()
                         {
