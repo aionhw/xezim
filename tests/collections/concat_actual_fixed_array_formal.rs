@@ -334,3 +334,118 @@ endmodule
         ]
     );
 }
+
+/// §13.5.2: a `ref` array formal aliases the actual, so a write in the body
+/// is visible through the actual's own name while the call runs, whether or
+/// not the formal shares that name.
+#[test]
+fn array_ref_formal_aliases_the_actual() {
+    let result = xezim::simulate(
+        r#"
+module t;
+  int r[2] = '{9, 8};
+  int o[2] = '{5, 6};
+  int m2[2][2] = '{'{1, 2}, '{3, 4}};
+  function automatic void w(ref int r[2]);
+    r[0] = 7;
+    $display("ref mid t.r=%0d o=%0d", t.r[0], o[0]);
+  endfunction
+  task automatic wo(ref int a[2]);
+    a[1] = 70;
+    $display("ref other mid o=%0d r=%0d", o[1], r[1]);
+  endtask
+  task automatic w2(ref int a[2][2]);
+    a[1][0] = 33;
+    $display("ref 2d mid %0d", m2[1][0]);
+  endtask
+  initial begin
+    w(r);
+    $display("after r=%0d %0d", r[0], r[1]);
+    wo(o);
+    $display("after o=%0d %0d", o[0], o[1]);
+    w2(m2);
+    $display("after m2=%0d %0d", m2[1][0], m2[1][1]);
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result
+        .output
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "ref mid t.r=7 o=5",
+            "after r=7 8",
+            "ref other mid o=70 r=8",
+            "after o=5 70",
+            "ref 2d mid 33",
+            "after m2=33 4",
+        ]
+    );
+}
+
+/// §13.5.3: a default may read an earlier array formal, whichever kind of
+/// actual or subroutine bound it, and whether the formal is fixed-size or a
+/// queue.
+#[test]
+fn array_formal_default_reads_earlier_array_formal() {
+    let result = xezim::simulate(
+        r#"
+class C;
+  function int m(input int a[2], input int b = a[1]);
+    return b;
+  endfunction
+endclass
+module t;
+  int o[2] = '{5, 6};
+  function automatic int f(input int a[2], input int b = a[0]);
+    return b;
+  endfunction
+  function automatic int g(input int a[2], input int b = a[1], input int c = b + a[0]);
+    return c;
+  endfunction
+  function automatic int fq(input int a[$], input int b = a[0]);
+    return b;
+  endfunction
+  task automatic tk(input int a[2], input int b = a[1]);
+    $display("task b=%0d", b);
+  endtask
+  initial begin
+    C c = new();
+    int q[$] = '{4, 5};
+    $display("pattern %0d", f('{7, 8}));
+    $display("whole %0d", f(o));
+    $display("chain %0d", g('{3, 4}));
+    $display("queue %0d", fq(q));
+    tk(o);
+    tk('{7, 8});
+    $display("method %0d", c.m(o));
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result
+        .output
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "pattern 7",
+            "whole 5",
+            "chain 7",
+            "queue 4",
+            "task b=6",
+            "task b=8",
+            "method 6",
+        ]
+    );
+}

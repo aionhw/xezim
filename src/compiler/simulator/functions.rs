@@ -438,8 +438,10 @@ impl Simulator {
                 // evaluated bare, `a` was unknown and the default was x.
                 self.in_subroutine_default_scope(None, None, |sim| {
                     sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                    sim.push_pending_formal_dyn(&formal_dyn);
                     let value = sim.eval_formal_default(port, def);
                     let value = sim.vif_argument_value(port, def, value);
+                    sim.pop_pending_formal_dyn();
                     sim.pop_local_frame();
                     value
                 })
@@ -2367,7 +2369,10 @@ impl Simulator {
                     {
                         array_writebacks.push(info.clone());
                     }
-                    array_params.push(info.0);
+                    // A `ref` alias names the caller's own storage.
+                    if !(matches!(port.direction, PortDirection::Ref) && info.1.is_empty()) {
+                        array_params.push(info.0);
+                    }
                     continue;
                 }
             }
@@ -2454,8 +2459,10 @@ impl Simulator {
                                 default_spec.clone(),
                                 |sim| {
                                     sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                                    sim.push_pending_formal_dyn(&formal_dyn);
                                     let value = sim.eval_expr(default);
                                     let value = sim.vif_argument_value(port, default, value);
+                                    sim.pop_pending_formal_dyn();
                                     sim.pop_local_frame();
                                     value
                                 },
@@ -2537,8 +2544,10 @@ impl Simulator {
                             default_spec.clone(),
                             |sim| {
                                 sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                                sim.push_pending_formal_dyn(&formal_dyn);
                                 let value = sim.eval_formal_default(port, def);
                                 let value = sim.vif_argument_value(port, def, value);
+                                sim.pop_pending_formal_dyn();
                                 sim.pop_local_frame();
                                 value
                             },

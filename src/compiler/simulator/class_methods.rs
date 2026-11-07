@@ -1846,8 +1846,10 @@ impl Simulator {
                         self.this_stack.push(Some(handle));
                         self.class_context_stack.push(Some(cname.clone()));
                         self.push_local_frame_typed(locals.clone(), frame_types.clone());
+                        self.push_pending_formal_dyn(&formal_dyn);
                         let v = self.eval_formal_default(port, def);
                         let v = self.vif_argument_value(port, def, v);
+                        self.pop_pending_formal_dyn();
                         self.pop_local_frame();
                         self.class_context_stack.pop();
                         self.this_stack.pop();

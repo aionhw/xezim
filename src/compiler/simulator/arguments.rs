@@ -2419,6 +2419,18 @@ impl Simulator {
             }
         }
         let caller = self.array_actual_storage(arg)?;
+        // §13.5.2: a `ref` formal is an ALIAS of the actual's storage: the
+        // formal's name maps to the actual's key, so every read and write
+        // goes to the caller's array while the call runs and nothing is
+        // copied back.
+        if matches!(port.direction, PortDirection::Ref)
+            && (self.module.arrays.contains_key(&*caller)
+                || self.module.arrays_2d.contains_key(&*caller)
+                || self.module.arrays_nd.contains_key(&*caller))
+        {
+            self.map_formal_dyn(&port.name.name, &caller);
+            return Some((caller, String::new(), lo, hi));
+        }
         // §13.5.2 multi-dimensional formal (`int a[R][C]`, `a[X][Y][Z]`): copy
         // every element of the caller's array in under the formal's name and
         // register the same shape, so element, `foreach`, `%p`, `$size` and
