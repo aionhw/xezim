@@ -419,3 +419,6 @@ mod struct_member_actuals;
 
 #[path = "hierarchy/bind_audit.rs"]
 mod bind_audit;
+
+#[path = "hierarchy/generate_block_hiding.rs"]
+mod generate_block_hiding;
