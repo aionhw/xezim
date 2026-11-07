@@ -422,3 +422,6 @@ mod bind_audit;
 
 #[path = "hierarchy/generate_block_hiding.rs"]
 mod generate_block_hiding;
+
+#[path = "hierarchy/generate_block_positions.rs"]
+mod generate_block_positions;
