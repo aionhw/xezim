@@ -29,6 +29,8 @@ mod bind_path_through_library_module;
 mod bind_through_nested_part_select;
 #[path = "hierarchy/bind_upward_refs.rs"]
 mod bind_upward_refs;
+#[path = "hierarchy/block_subroutines_take_time_and_clocking_from_their_instance.rs"]
+mod block_subroutines_take_time_and_clocking_from_their_instance;
 #[path = "hierarchy/c910_scoped_cont_assign.rs"]
 mod c910_scoped_cont_assign;
 #[path = "hierarchy/class_method_hier_subroutine_calls.rs"]
