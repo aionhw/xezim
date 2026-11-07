@@ -960,6 +960,9 @@ mod compiled_call_actual_width;
 #[path = "classes/null_handle_method_call_532.rs"]
 mod null_handle_method_call_532;
 
+#[path = "classes/null_handle_static_method_call.rs"]
+mod null_handle_static_method_call;
+
 #[path = "classes/alias_spec_array_const_535.rs"]
 mod alias_spec_array_const_535;
 
