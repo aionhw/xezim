@@ -2524,6 +2524,58 @@ impl Simulator {
                 let changed = self.vc_saved.get(&idx).is_none_or(|(_, prev)| *prev != cur);
                 Value::from_u64(changed as u64, 1)
             }
+            // `@(posedge prop)` / `@(negedge prop)` on a non-signal operand:
+            // true once the operand made the requested transition away from
+            // the value captured when the wait was armed. Bit 0 is the edge
+            // operand (§9.4.2 an edge on a multi-bit value is the LSB), and
+            // an unknown bit counts as 0 for posedge / as 1 for negedge so the
+            // LRM's x→1 / 1→x / x→0 / 1→z transitions still fire.
+            VC_EDGE_MARKER => {
+                let idx = args
+                    .first()
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(0))
+                    .unwrap_or(0);
+                // Latch by removal: a fired wait must stay true when the
+                // resumed `wait` re-evaluates this condition before the body
+                // runs. `vc_release` clears the entry (already gone).
+                let Some((owner, prev)) = self.vc_saved.get(&idx).cloned() else {
+                    return Value::from_u64(1, 1);
+                };
+                let cur = args
+                    .get(1)
+                    .map(|a| self.eval_expr(a))
+                    .unwrap_or_else(|| Value::zero(1));
+                let kind = args
+                    .get(2)
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(3))
+                    .unwrap_or(3);
+                // LSB state: 0, 1, or 2 for "unknown" (§9.4.2 an edge on a
+                // multi-bit operand is the LSB; an unknown bit behaves as an
+                // in-between level so x→1 / 1→x / x→0 fire).
+                let state = |v: &Value| -> u8 {
+                    if v.has_xz() {
+                        2
+                    } else {
+                        v.to_u64().unwrap_or(0) as u8 & 1
+                    }
+                };
+                let (p, c) = (state(&prev), state(&cur));
+                let hit = match kind {
+                    1 => (0 == p || 2 == p) && 1 == c,
+                    2 => 1 == p && c != 1,
+                    _ => p != c,
+                };
+                if hit {
+                    self.vc_saved.remove(&idx);
+                    Value::from_u64(1, 1)
+                } else {
+                    // Re-baseline: the operand may move through several values
+                    // between two re-evaluations, and the edge is relative to
+                    // the value LAST SEEN, not to the arming value.
+                    self.vc_saved.insert(idx, (owner, cur));
+                    Value::from_u64(0, 1)
+                }
+            }
             // §9.4.5 marker reached from a context that cannot suspend
             // (always-block settle, function body, bytecode fallback):
             // degrade to the RHS value with the delay ignored.

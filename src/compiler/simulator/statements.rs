@@ -5371,6 +5371,15 @@ impl Simulator {
                             self.break_flag = true;
                             return;
                         }
+                        // `@(posedge prop)` on a non-signal operand — see
+                        // `class_prop_edge_cond`.
+                        if let Some(cond) = self.class_prop_edge_cond(e) {
+                            let pid = self.current_pid;
+                            let wait = Self::vc_wait_stmt(cond.clone(), stmt, stmt.span);
+                            self.park_condition_waiter(pid, vec![wait].into(), &cond);
+                            self.break_flag = true;
+                            return;
+                        }
                         let sens = self.event_to_sens(e);
                         let is_clk_ev = self.is_clocking_event(e);
                         sim_dbg_eprintln!(

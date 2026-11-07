@@ -547,6 +547,14 @@ const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
 /// control (`@prop` on a non-event class property) was armed. Never
 /// user-visible.
 const VC_CHANGED_MARKER: &str = "$__xz_vc_changed";
+/// Internal `$__xz_vc_edge(idx, expr, edge)`: true once `expr` has made the
+/// requested TRANSITION relative to `Simulator::vc_saved[idx]`. Used by
+/// `@(posedge prop)` / `@(negedge prop)` / `@(edge prop)` when `prop` is a
+/// class property or a procedural local — an edge-qualified event term has no
+/// backing signal, so it is armed as an edge-sensitive value-change wait
+/// (§9.4.2). `edge` is 1 = posedge, 2 = negedge, 3 = any edge. Never
+/// user-visible.
+const VC_EDGE_MARKER: &str = "$__xz_vc_edge";
 /// Ends a deferred declaration initializer: `(<target>, ...)` records the
 /// values it gave as their default sampled values (see `sampled_defaults`).
 const SAMPLED_DEFAULT_MARKER: &str = "$__xz_sampled_default";

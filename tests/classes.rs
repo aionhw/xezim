@@ -222,6 +222,8 @@ mod compiled_method_void;
 
 #[path = "classes/class_local_typedef_aa.rs"]
 mod class_local_typedef_aa;
+#[path = "classes/edge_event_on_non_signal_operand.rs"]
+mod edge_event_on_non_signal_operand;
 #[path = "classes/class_local_typedef_resolution.rs"]
 mod class_local_typedef_resolution;
 #[path = "classes/class_method_dispatch.rs"]
