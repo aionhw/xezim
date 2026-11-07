@@ -30,6 +30,25 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A read of a queue or dynamic-array element at or past `size()` gives the
+  element type's default (x, 0, null or "") instead of the element a
+  `delete`, `pop_front` or `pop_back` left behind (§7.10.1, §7.8.6, #949 and
+  #948, contributed by davekeeshan). This includes a row of a fixed array of
+  queues, `fq[1][3]`, and a queue of class handles, which reads null.
+* A package array whose first dimension is sized by a parameter,
+  `logic [31:0] d [N][2]`, keeps all its dimensions (§7.4.2, §26.2, core #169
+  and #168, contributed by chuanseng-ng); `p::d[3][1]` read 0.
+* A user-defined nettype without a resolution function takes an
+  assignment-pattern driver through an output or inout port (§6.6.7, core
+  #170, #945 and #946, contributed by ds54e); the parent net read 0 in every
+  member. A continuous assignment that selects into such a net,
+  `assign p.V = v;`, is now an error (§10.3).
+* A name declared nowhere in the design is an error in a class parameter
+  override, nested ones included (`R #(A #(bad))`), in a class
+  value-parameter default and in a class property or package variable
+  initializer (§6.20.2, §8.25, #947 and #888, contributed by Ganesh-TNL).
+  Literals and system calls in a nested override, such as `8'hFF`,
+  `$clog2(16)` and `10ns`, are not taken for names.
 * A whole-struct write through a port reaches an instance-array element
   actual and a nested struct member actual member by member (§23.3.3.5,
   §7.2, core #166 and #917, contributed by ds54e); the parent read every
