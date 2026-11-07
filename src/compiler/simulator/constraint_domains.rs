@@ -2,11 +2,12 @@
 
 use super::*;
 
-/// Whether the env-gated `class_elem_load` fast-path self-check is active.
-/// Computed once (lazily) so the hot element read path does not re-read the
-/// environment per element.
-static XZ_VERIFY: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var_os("XZVERIFY").is_some());
+/// Whether the env-gated `class_elem_load` fast-path self-check is active
+/// (`XEZIM_VERIFY_CLASS_ELEM_READS=1`). Computed once (lazily) so the hot
+/// element read path does not re-read the environment per element.
+static XZ_VERIFY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("XEZIM_VERIFY_CLASS_ELEM_READS").as_deref() == Ok("1")
+});
 
 impl Simulator {
     /// `v` sized and signed for the static cell `key` (an initializer or a
@@ -3954,7 +3955,8 @@ impl Simulator {
         if let Some(v) = self.signals.get(&scoped_key).cloned() {
             if *XZ_VERIFY {
                 let slow = self.get_signal_value_by_name(&scoped_key);
-                debug_assert_eq!(Some(v.clone()), slow, "class_elem_load fast-path diverge");
+                // A real check: the switch is meant for release builds too.
+                assert_eq!(Some(v.clone()), slow, "class_elem_load fast-path diverge");
             }
             return Some(v);
         }

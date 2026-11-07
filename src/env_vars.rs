@@ -1007,6 +1007,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Same as --verbose: version banner, [PHASE] timings, end-of-run engine counters (1)",
     ),
     (
+        "XEZIM_VERIFY_CLASS_ELEM_READS",
+        "Debug: check every fast class unpacked-array element read against the full name lookup (1)",
+    ),
+    (
         "XEZIM_VERIFY_INLINE_BITS",
         "JIT: shadow-verify the inline-bits mirror against Values",
     ),
