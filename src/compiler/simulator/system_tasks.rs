@@ -3096,6 +3096,7 @@ impl Simulator {
                                             span: arg.span,
                                             cached_signal_id: crate::ast::cache::SignalCache::new(None),
                                             cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                            bound: crate::ast::binding::Bound::UNSET,
                                         };
                                         let resolved = self.resolve_hier_name(&ident);
                                         if resolved != flat {

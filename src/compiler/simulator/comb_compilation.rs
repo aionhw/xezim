@@ -61,6 +61,7 @@ impl Simulator {
                 span,
                 cached_signal_id: crate::ast::cache::SignalCache::new(None),
                 cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         )
@@ -100,6 +101,7 @@ impl Simulator {
             span: e.span,
             cached_signal_id: crate::ast::cache::SignalCache::new(None),
             cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         let flat = Self::resolve_hier_name_static(&hier, &self.module);
         self.signal_name_to_id.get(flat.as_str())?;
@@ -504,6 +506,7 @@ impl Simulator {
                                     span: crate::ast::Span::dummy(),
                                     cached_signal_id: crate::ast::cache::SignalCache::new(None),
                                     cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                    bound: crate::ast::binding::Bound::UNSET,
                                 }),
                                 ca.lhs.span,
                             );
@@ -544,6 +547,7 @@ impl Simulator {
                             span,
                             cached_signal_id: crate::ast::cache::SignalCache::new(None),
                             cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         span,
                     );
@@ -1256,6 +1260,7 @@ impl Simulator {
                         span: crate::ast::Span::dummy(),
                         cached_signal_id: crate::ast::cache::SignalCache::new(None),
                         cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
                     };
                     let saved_hint = self.name_resolve_hint.borrow().clone();
                     *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
@@ -1626,6 +1631,7 @@ impl Simulator {
                             span,
                             cached_signal_id: crate::ast::cache::SignalCache::new(None),
                             cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         };
                         let saved = self.name_resolve_hint.borrow().clone();
                         if !ab.scope.is_empty() {

@@ -64,6 +64,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Debug: trace block-local declaration binding",
     ),
     (
+        "XEZIM_BIND_AUDIT",
+        "Elab: print each name's binding (§23.9) beside what the generate rename made of it",
+    ),
+    (
         "XEZIM_BIT_SENS",
         "Scheduling: bit-granular comb sensitivity (a write re-runs only readers of the changed bits); 0 disables",
     ),

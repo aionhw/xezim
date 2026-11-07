@@ -2766,6 +2766,7 @@ impl<'a> Builder<'a> {
                 span: Span::dummy(),
                 cached_signal_id: crate::ast::cache::SignalCache::new(None),
                 cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             Span::dummy(),
         );
@@ -4116,6 +4117,7 @@ pub(super) fn ident_expr(name: &str) -> Expression {
             span: Span::dummy(),
             cached_signal_id: crate::ast::cache::SignalCache::new(None),
             cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         }),
         Span::dummy(),
     )

@@ -69,6 +69,7 @@ fn ident(name: &str, span: Span) -> Expression {
             span,
             cached_signal_id: crate::ast::cache::SignalCache::new(None),
             cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         }),
         span,
     )
@@ -173,6 +174,7 @@ fn split_value(e: &Expression, members: &Members) -> Option<Vec<Expression>> {
                             span: e.span,
                             cached_signal_id: crate::ast::cache::SignalCache::new(None),
                             cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         e.span,
                     );
