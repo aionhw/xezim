@@ -2844,6 +2844,20 @@ impl Simulator {
                             cur = cd.extends.clone();
                         }
                         facts.instance_colls.insert(class.clone(), colls);
+                        // §8.23 static methods of this class, for the
+                        // null-handle dispatch at the call site. Keyed by the
+                        // elaborated name AND its specialization-stripped base
+                        // (a receiver's declared class may name either).
+                        if !declaration.static_methods.is_empty() {
+                            let base = class.split('#').next().unwrap_or(class).to_string();
+                            for key in [class.clone(), base] {
+                                facts
+                                    .static_methods
+                                    .entry(key)
+                                    .or_default()
+                                    .extend(declaration.static_methods.iter().cloned());
+                            }
+                        }
                         // Direct superclass (spec args stripped): the
                         // writeback-hierarchy walk in
                         // `emit_arg_slot_writeback` climbs this chain.

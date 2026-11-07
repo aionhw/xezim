@@ -2149,9 +2149,13 @@ impl Simulator {
                 }
                 let (args, temps) = self.vm_args_with_writeback(start_class, method, base, n);
                 let result = if handle == 0 {
-                    // Null receiver (unreachable for instance frames;
-                    // a static frame never lowers a scoped call).
-                    Value::zero(32)
+                    // §8.23: a null receiver still has a legally callable
+                    // STATIC target — a static method neither needs nor
+                    // references `this` (§8.7), so it resolves on the
+                    // declared class. Anything else through a null handle
+                    // stays a silent zero.
+                    self.exec_static_method_via_object(start_class, method, &args, 0)
+                        .unwrap_or_else(|| Value::zero(32))
                 } else {
                     self.exec_method_in_class_hierarchy(handle, start_class, method, &args)
                 };
