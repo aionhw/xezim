@@ -1969,6 +1969,48 @@ impl Simulator {
         false
     }
 
+    /// Match an element reference with an optional constant offset:
+    /// `arr[idx]` -> Some(0), `arr[idx] + C` / `C + arr[idx]` -> Some(C),
+    /// `arr[idx] - C` -> Some(-C).
+    pub(super) fn inline_foreach_affine_ref(
+        &mut self,
+        e: &Expression,
+        arr: &str,
+        idx: i64,
+    ) -> Option<i64> {
+        let e = match &e.kind {
+            ExprKind::Paren(inner) => inner.as_ref(),
+            _ => e,
+        };
+        if self.inline_foreach_elem_ref(e, arr, idx) {
+            return Some(0);
+        }
+        if let ExprKind::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } = &e.kind
+        {
+            if self.inline_foreach_elem_ref(left, arr, idx) {
+                return self.eval_expr(right).to_i64();
+            }
+            if self.inline_foreach_elem_ref(right, arr, idx) {
+                return self.eval_expr(left).to_i64();
+            }
+        }
+        if let ExprKind::Binary {
+            op: BinaryOp::Sub,
+            left,
+            right,
+        } = &e.kind
+        {
+            if self.inline_foreach_elem_ref(left, arr, idx) {
+                return self.eval_expr(right).to_i64().map(|c| -c);
+            }
+        }
+        None
+    }
+
     /// §18.5.7: solve one inline-`foreach` body item for element `arr[idx]`.
     /// The loop index variable is already bound in the top local_stack frame,
     /// so index expressions (`i`, `i+1`) and value expressions (`i + 5`)
@@ -2202,9 +2244,9 @@ impl Simulator {
             &mut excl,
         );
         // Phase 2: equality / inside / dist pins.
-        let pinned = self.apply_inline_foreach_pins(item, arr, idx, w);
+        let _ = self.apply_inline_foreach_pins(item, arr, idx, w);
         // Phase 3: repair against the accumulated interval / exclusions.
-        if pinned || !(any_rel || !excl.is_empty()) || lo > hi {
+        if lo > hi {
             return;
         }
         let cur = self
@@ -2247,51 +2289,124 @@ impl Simulator {
         match item {
             CI::Expr(e) => {
                 if let ExprKind::Binary { op, left, right } = &e.kind {
-                    if !matches!(
+                    if matches!(
                         op,
                         BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq | BinaryOp::Neq
                     ) {
-                        return;
+                        let off_l = self.inline_foreach_affine_ref(left, arr, idx);
+                        let off_r = self.inline_foreach_affine_ref(right, arr, idx);
+                        if off_l.is_some() && off_r.is_none() {
+                            let off = off_l.unwrap();
+                            let b = self.eval_expr(right).to_i64().unwrap_or(0).saturating_sub(off);
+                            match op {
+                                BinaryOp::Lt => {
+                                    *hi = (*hi).min(b.saturating_sub(1));
+                                    *any = true;
+                                }
+                                BinaryOp::Leq => {
+                                    *hi = (*hi).min(b);
+                                    *any = true;
+                                }
+                                BinaryOp::Gt => {
+                                    *lo = (*lo).max(b.saturating_add(1));
+                                    *any = true;
+                                }
+                                BinaryOp::Geq => {
+                                    *lo = (*lo).max(b);
+                                    *any = true;
+                                }
+                                BinaryOp::Neq => excl.push(b),
+                                _ => {}
+                            }
+                        } else if off_r.is_some() && off_l.is_none() {
+                            let off = off_r.unwrap();
+                            let b = self.eval_expr(left).to_i64().unwrap_or(0).saturating_sub(off);
+                            match op {
+                                BinaryOp::Lt => {
+                                    *lo = (*lo).max(b.saturating_add(1));
+                                    *any = true;
+                                }
+                                BinaryOp::Leq => {
+                                    *lo = (*lo).max(b);
+                                    *any = true;
+                                }
+                                BinaryOp::Gt => {
+                                    *hi = (*hi).min(b.saturating_sub(1));
+                                    *any = true;
+                                }
+                                BinaryOp::Geq => {
+                                    *hi = (*hi).min(b);
+                                    *any = true;
+                                }
+                                BinaryOp::Neq => excl.push(b),
+                                _ => {}
+                            }
+                        }
                     }
-                    let on_l = self.inline_foreach_elem_ref(left, arr, idx);
-                    let on_r = self.inline_foreach_elem_ref(right, arr, idx);
-                    if on_l == on_r {
-                        return;
+                }
+                if let ExprKind::Inside { expr: inner, ranges } = &e.kind {
+                    if let Some(off) = self.inline_foreach_affine_ref(inner, arr, idx) {
+                        let mut in_lo = i64::MAX;
+                        let mut in_hi = i64::MIN;
+                        for r in ranges {
+                            match &r.kind {
+                                ExprKind::Range(lo_e, hi_e) => {
+                                    if let (Some(l), Some(h)) = (
+                                        self.eval_expr(lo_e).to_i64(),
+                                        self.eval_expr(hi_e).to_i64(),
+                                    ) {
+                                        in_lo = in_lo.min(l.saturating_sub(off));
+                                        in_hi = in_hi.max(h.saturating_sub(off));
+                                    }
+                                }
+                                _ => {
+                                    if let Some(v) = self.eval_expr(r).to_i64() {
+                                        in_lo = in_lo.min(v.saturating_sub(off));
+                                        in_hi = in_hi.max(v.saturating_sub(off));
+                                    }
+                                }
+                            }
+                        }
+                        if in_lo <= in_hi {
+                            *lo = (*lo).max(in_lo);
+                            *hi = (*hi).min(in_hi);
+                            *any = true;
+                        }
                     }
-                    // Normalize to `arr[i] OP bound` (mirror the op when the
-                    // element sits on the right: `5 < arr[i]` ≡ `arr[i] > 5`).
-                    let (bound_side, eff) = if on_l {
-                        (right, *op)
-                    } else {
-                        let m = match op {
-                            BinaryOp::Lt => BinaryOp::Gt,
-                            BinaryOp::Gt => BinaryOp::Lt,
-                            BinaryOp::Leq => BinaryOp::Geq,
-                            BinaryOp::Geq => BinaryOp::Leq,
-                            other => *other,
-                        };
-                        (left, m)
-                    };
-                    let b = self.eval_expr(bound_side).to_i64().unwrap_or(0);
-                    match eff {
-                        BinaryOp::Lt => {
-                            *hi = (*hi).min(b.saturating_sub(1));
-                            *any = true;
+                }
+            }
+            CI::Inside {
+                expr,
+                range,
+                is_dist: false,
+                ..
+            } => {
+                if let Some(off) = self.inline_foreach_affine_ref(expr, arr, idx) {
+                    let mut in_lo = i64::MAX;
+                    let mut in_hi = i64::MIN;
+                    for r in range {
+                        match r {
+                            ConstraintRange::Range { lo: lo_e, hi: hi_e } => {
+                                if let (Some(l), Some(h)) = (
+                                    self.eval_expr(lo_e).to_i64(),
+                                    self.eval_expr(hi_e).to_i64(),
+                                ) {
+                                    in_lo = in_lo.min(l.saturating_sub(off));
+                                    in_hi = in_hi.max(h.saturating_sub(off));
+                                }
+                            }
+                            ConstraintRange::Value(v_e) => {
+                                if let Some(v) = self.eval_expr(v_e).to_i64() {
+                                    in_lo = in_lo.min(v.saturating_sub(off));
+                                    in_hi = in_hi.max(v.saturating_sub(off));
+                                }
+                            }
                         }
-                        BinaryOp::Leq => {
-                            *hi = (*hi).min(b);
-                            *any = true;
-                        }
-                        BinaryOp::Gt => {
-                            *lo = (*lo).max(b.saturating_add(1));
-                            *any = true;
-                        }
-                        BinaryOp::Geq => {
-                            *lo = (*lo).max(b);
-                            *any = true;
-                        }
-                        BinaryOp::Neq => excl.push(b),
-                        _ => {}
+                    }
+                    if in_lo <= in_hi {
+                        *lo = (*lo).max(in_lo);
+                        *hi = (*hi).min(in_hi);
+                        *any = true;
                     }
                 }
             }
@@ -2364,6 +2479,19 @@ impl Simulator {
                         let target = self
                             .get_signal_value_by_name(&elem_name)
                             .unwrap_or_else(|| Value::zero(w));
+                        let cr: Vec<_> = ranges
+                            .iter()
+                            .map(|r| match &r.kind {
+                                ExprKind::Range(lo, hi) => ConstraintRange::Range {
+                                    lo: (**lo).clone(),
+                                    hi: (**hi).clone(),
+                                },
+                                _ => ConstraintRange::Value(r.clone()),
+                            })
+                            .collect();
+                        if !target.has_xz() && self.value_in_ranges(&target, &cr) {
+                            return false;
+                        }
                         if let Some(v) = self.pick_inside_value(ranges, &target) {
                             self.set_signal_value_by_name(&elem_name, v);
                             return true;
@@ -2381,6 +2509,13 @@ impl Simulator {
                 ..
             } => {
                 if self.inline_foreach_elem_ref(expr, arr, idx) {
+                    if !*is_dist {
+                        if let Some(cv) = self.get_signal_value_by_name(&elem_name) {
+                            if !cv.has_xz() && self.value_in_ranges(&cv, range) {
+                                return false;
+                            }
+                        }
+                    }
                     let picked = if *is_dist && !dist_weights.is_empty() {
                         // Per-element target: no stable key, draw independently.
                         self.pick_dist_value(None, range, dist_weights)

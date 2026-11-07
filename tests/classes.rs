@@ -1147,3 +1147,5 @@ mod vif_collection_formals_925;
 mod review_940_constraint_memos;
 #[path = "classes/review_940_process_status.rs"]
 mod review_940_process_status;
+#[path = "classes/randomize_scope_chunked_dist_bounds.rs"]
+mod randomize_scope_chunked_dist_bounds;

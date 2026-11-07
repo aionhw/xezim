@@ -2348,6 +2348,65 @@ impl Simulator {
         None
     }
 
+    pub(super) fn body_has_bare_inside(item: &ConstraintItem, arr_name: &str) -> bool {
+        match item {
+            ConstraintItem::Block(items) => {
+                items.iter().any(|i| Self::body_has_bare_inside(i, arr_name))
+            }
+            ConstraintItem::Soft(inner) => Self::body_has_bare_inside(inner, arr_name),
+            ConstraintItem::IfElse {
+                then_item,
+                else_item,
+                ..
+            } => {
+                Self::body_has_bare_inside(then_item, arr_name)
+                    || else_item
+                        .as_ref()
+                        .is_some_and(|i| Self::body_has_bare_inside(i, arr_name))
+            }
+            ConstraintItem::Implication { constraint, .. } => {
+                Self::body_has_bare_inside(constraint, arr_name)
+            }
+            ConstraintItem::Inside { expr, is_dist, .. } => {
+                !*is_dist && Self::index_chain_root_is(expr, arr_name)
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn body_needs_generate_and_test(item: &ConstraintItem) -> bool {
+        match item {
+            ConstraintItem::Block(items) => items.iter().any(Self::body_needs_generate_and_test),
+            ConstraintItem::IfElse {
+                then_item,
+                else_item,
+                ..
+            } => {
+                Self::body_needs_generate_and_test(then_item)
+                    || else_item
+                        .as_ref()
+                        .is_some_and(|i| Self::body_needs_generate_and_test(i))
+            }
+            ConstraintItem::Implication { constraint, .. } => {
+                Self::body_needs_generate_and_test(constraint)
+            }
+            ConstraintItem::Soft(inner) => Self::body_needs_generate_and_test(inner),
+            ConstraintItem::Inside { .. } => false,
+            ConstraintItem::Expr(e) => match &e.kind {
+                ExprKind::Inside { .. } => false,
+                ExprKind::Binary {
+                    op: BinaryOp::Eq, ..
+                } => false,
+                ExprKind::Paren(inner) => {
+                    let it = ConstraintItem::Expr((**inner).clone());
+                    Self::body_needs_generate_and_test(&it)
+                }
+                _ => true,
+            },
+            _ => true,
+        }
+    }
+
     pub(super) fn solve_forced(
         &mut self,
         handle: usize,
@@ -3018,44 +3077,57 @@ impl Simulator {
                         }
                     }
                 }
-                loop {
-                    // Bind every index and address the element by its full
-                    // index path — `arr[i][j]`, not just the first dimension.
+                let single_var = idx_names.len() == 1;
+                let var0 = &idx_names[0];
+                if single_var {
                     let mut frame: HashMap<String, Value> = HashMap::default();
-                    let mut suffix = String::new();
-                    for (k, nm) in idx_names.iter().enumerate() {
-                        frame.insert(nm.clone(), Self::signed_loop_val(idx[k]));
-                        suffix.push_str(&format!("[{}]", idx[k]));
-                    }
+                    frame.insert(var0.clone(), Self::signed_loop_val(idx[0]));
                     self.push_local_frame(frame);
-                    let mut elem_rand_set = rand_set.clone();
-                    elem_rand_set.insert(format!("{}{}", arr_name, suffix));
-                    let mut hint: Vec<(i64, i64)> = Vec::new();
-                    self.body_inside_ranges(body, &arr_name, &mut hint);
-                    self.elem_inside_hint = hint;
+                }
+                let has_bare_inside = Self::body_has_bare_inside(body, &arr_name);
+                loop {
+                    let mut suffix = String::new();
+                    if single_var {
+                        if let Some(top) = self.local_stack.last_mut() {
+                            if let Some(slot) = top.get_mut(var0) {
+                                *slot = Self::signed_loop_val(idx[0]);
+                            }
+                        }
+                        suffix.push('[');
+                        Self::push_i64(&mut suffix, idx[0]);
+                        suffix.push(']');
+                    } else {
+                        let mut frame: HashMap<String, Value> = HashMap::default();
+                        for (k, nm) in idx_names.iter().enumerate() {
+                            frame.insert(nm.clone(), Self::signed_loop_val(idx[k]));
+                            suffix.push_str(&format!("[{}]", idx[k]));
+                        }
+                        self.push_local_frame(frame);
+                    }
+
+                    if has_bare_inside {
+                        let mut hint: Vec<(i64, i64)> = Vec::new();
+                        self.body_inside_ranges(body, &arr_name, &mut hint);
+                        self.elem_inside_hint = hint;
+                    }
+
                     if self.solve_forced_array_elem(
                         handle,
                         body.as_ref(),
-                        &elem_rand_set,
+                        rand_set,
                         &arr_name,
                         &suffix,
                     ) {
                         changed = true;
                     }
-                    // Structural repair covers equality/relational/inside
-                    // shapes. Anything else the body demands of THIS element
-                    // (`% 2 == 0`, bit tests, …) falls to generate-and-test —
-                    // drawn from the body's own `inside` ranges, since a
-                    // full-width draw would virtually never land in a narrow
-                    // one. Cross-element couplings that no local draw can fix
-                    // are left to the trial checker, which retries or fails
-                    // the randomize() (§18.6.2).
-                    if idx_names.len() == dims.len()
+
+                    let needs_fallback = idx_names.len() == dims.len()
                         && elem_w >= 1
                         && elem_w <= 64
                         && !Self::constraint_unmodeled(body)
-                        && !self.item_holds(handle, body)
-                    {
+                        && Self::body_needs_generate_and_test(body)
+                        && !self.item_holds(handle, body);
+                    if needs_fallback {
                         use rand::Rng;
                         let mut ranges: Vec<(i64, i64)> = Vec::new();
                         self.body_inside_ranges(body, &arr_name, &mut ranges);
@@ -3113,10 +3185,15 @@ impl Simulator {
                         }
                     }
                     self.elem_inside_hint.clear();
-                    self.pop_local_frame();
+                    if !single_var {
+                        self.pop_local_frame();
+                    }
                     let mut k = used.len();
                     loop {
                         if k == 0 {
+                            if single_var {
+                                self.pop_local_frame();
+                            }
                             return changed;
                         }
                         k -= 1;

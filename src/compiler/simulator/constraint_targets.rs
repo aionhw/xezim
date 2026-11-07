@@ -3338,6 +3338,15 @@ impl Simulator {
             }
             _ => {
                 let outer = self.coll_outer_size(c) as i64;
+                let single_var = !c.nested && idx_names.len() == 1;
+                let n_opt = idx_names.first().and_then(|x| x.as_ref());
+                if single_var {
+                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    if let Some(n) = n_opt {
+                        frame.insert(n.clone(), Self::signed_loop_val(0));
+                    }
+                    self.push_local_frame(frame);
+                }
                 'outer: for i in 0..outer {
                     let inner_n = if c.nested && idx_names.len() >= 2 {
                         self.get_queue_size(&format!("{}[{}]", c.scoped, i)) as i64
@@ -3345,23 +3354,38 @@ impl Simulator {
                         1
                     };
                     for j in 0..inner_n {
-                        let mut frame: HashMap<String, Value> = HashMap::default();
-                        if let Some(Some(n)) = idx_names.first() {
-                            frame.insert(n.clone(), Self::signed_loop_val(i));
-                        }
-                        if c.nested && idx_names.len() >= 2 {
-                            if let Some(Some(n)) = idx_names.get(1) {
-                                frame.insert(n.clone(), Self::signed_loop_val(j));
+                        if single_var {
+                            if let Some(n) = n_opt {
+                                if let Some(top) = self.local_stack.last_mut() {
+                                    if let Some(slot) = top.get_mut(n) {
+                                    *slot = Self::signed_loop_val(i);
+                                    }
+                                }
                             }
+                        } else {
+                            let mut frame: HashMap<String, Value> = HashMap::default();
+                            if let Some(Some(n)) = idx_names.first() {
+                                frame.insert(n.clone(), Self::signed_loop_val(i));
+                            }
+                            if c.nested && idx_names.len() >= 2 {
+                                if let Some(Some(n)) = idx_names.get(1) {
+                                    frame.insert(n.clone(), Self::signed_loop_val(j));
+                                }
+                            }
+                            self.push_local_frame(frame);
                         }
-                        self.push_local_frame(frame);
                         let good = self.item_holds(handle, body);
-                        self.pop_local_frame();
+                        if !single_var {
+                            self.pop_local_frame();
+                        }
                         if !good {
                             ok = false;
                             break 'outer;
                         }
                     }
+                }
+                if single_var {
+                    self.pop_local_frame();
                 }
             }
         }
