@@ -4224,8 +4224,10 @@ impl<'a> BytecodeCompiler<'a> {
         // §13.3.1: a STATIC subroutine's variables — its locals and output
         // formals — keep their values between calls; an inline gives each
         // call fresh registers. Only an input-only static body with no
-        // declarations behaves the same either way.
-        if matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+        // declarations behaves the same either way. No written lifetime is
+        // static; elaboration marks a subroutine of an `automatic` module
+        // automatic (§13.3.1).
+        if !matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic))
             && (ports
                 .iter()
                 .any(|p| !matches!(p.direction, PortDirection::Input))
