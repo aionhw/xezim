@@ -663,3 +663,6 @@ mod unpacked_struct_output_port_whole_write;
 
 #[path = "types/function_result_member_defaults.rs"]
 mod function_result_member_defaults;
+
+#[path = "types/nettype_no_resolver_ports.rs"]
+mod nettype_no_resolver_ports;
