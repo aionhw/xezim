@@ -8927,6 +8927,13 @@ pub struct Simulator {
     prop_width_memo: std::cell::RefCell<HashMap<String, HashMap<String, Option<Option<u32>>>>>,
     #[serde(skip)]
     struct_member_offset_memo: std::cell::RefCell<HashMap<(String, String), (u32, u32)>>,
+    #[serde(skip)]
+    packed_struct_member_memo: std::cell::RefCell<
+        HashMap<
+            (usize, String),
+            Option<(u32, u32, bool, crate::ast::types::DataType, Vec<(i64, i64)>)>,
+        >,
+    >,
     /// Per-(handle, prop) cache of `class_prop_packed_dims` and
     /// `class_prop_signed_of`: a class property's packed-dimension / signed
     /// status is a per-object invariant, but the helpers walk the class

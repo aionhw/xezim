@@ -4324,6 +4324,7 @@ impl Simulator {
             prop_owner_index: std::cell::RefCell::new(HashMap::default()),
             prop_width_memo: std::cell::RefCell::new(HashMap::default()),
             struct_member_offset_memo: std::cell::RefCell::new(HashMap::default()),
+            packed_struct_member_memo: std::cell::RefCell::new(HashMap::default()),
             formal_parts_pool: Vec::new(),
             queue_save_pool: Vec::new(),
             local_dyn_pool: Vec::new(),

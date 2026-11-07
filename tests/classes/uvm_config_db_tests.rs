@@ -105,7 +105,7 @@ module top;
     #1;
     uvm_config_db#(int)::set(null, "tc", "my_int", 42);
     #1;
-    comp1 = new("tc");
+    comp1 = new("tc", null);
     #1;
     if (uvm_config_db#(int)::get(comp1, "tc", "my_int", val))
       $display("GET1_OK: %0d", val);
@@ -161,7 +161,7 @@ module top;
     #1;
     uvm_config_db#(int)::set(null, "*", "my_int", 99);
     #1;
-    comp = new("comp");
+    comp = new("comp", null);
     #1;
     if (uvm_config_db#(int)::get(comp, "any_path", "my_int", val)) begin
       if (val == 99)
@@ -201,7 +201,7 @@ module top;
     #1;
     uvm_config_db#(int)::set(null, "tc", "my_int", 42);
     #1;
-    comp = new("comp");
+    comp = new("comp", null);
     #1;
     if (uvm_config_db#(int)::get(comp, "tc", "my_int", val))
       $display("T1_GET: %0d", val);

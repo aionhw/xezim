@@ -2374,6 +2374,21 @@ impl Simulator {
         }
     }
 
+    pub(super) fn all_dist_weights_positive(
+        weights: &[Option<crate::ast::decl::DistWeight>],
+    ) -> bool {
+        weights.iter().all(|w| match w {
+            Some(crate::ast::decl::DistWeight::Each(e))
+            | Some(crate::ast::decl::DistWeight::Total(e)) => match &e.kind {
+                ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+                    value.parse::<i64>().map(|v| v > 0).unwrap_or(false)
+                }
+                _ => false,
+            },
+            None => true,
+        })
+    }
+
     pub(super) fn body_needs_generate_and_test(item: &ConstraintItem) -> bool {
         match item {
             ConstraintItem::Block(items) => items.iter().any(Self::body_needs_generate_and_test),
@@ -5415,11 +5430,15 @@ impl Simulator {
                 // whose weights are all 0 admits no value.
                 let kept;
                 let range: &[ConstraintRange] = if *is_dist && !dist_weights.is_empty() {
-                    kept = self.dist_weighted_ranges(range, dist_weights);
-                    if kept.is_empty() {
-                        return false;
+                    if Self::all_dist_weights_positive(dist_weights) {
+                        range
+                    } else {
+                        kept = self.dist_weighted_ranges(range, dist_weights);
+                        if kept.is_empty() {
+                            return false;
+                        }
+                        &kept
                     }
-                    &kept
                 } else {
                     range
                 };
