@@ -2370,6 +2370,13 @@ impl Simulator {
             ConstraintItem::Inside { expr, is_dist, .. } => {
                 !*is_dist && Self::index_chain_root_is(expr, arr_name)
             }
+            ConstraintItem::Expr(e) => {
+                if let ExprKind::Inside { expr, .. } = &e.kind {
+                    Self::index_chain_root_is(expr, arr_name)
+                } else {
+                    false
+                }
+            }
             _ => false,
         }
     }
