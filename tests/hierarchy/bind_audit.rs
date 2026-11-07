@@ -42,9 +42,9 @@ fn the_audit_prints_each_binding_and_changes_no_artifact_byte() {
     assert_eq!(
         lines,
         [
-            "t.sv:4 f -> Decl(top.g, Function) rename: yes(g.f) pos=process",
-            "t.sv:5 f -> none rename: yes(g.f) pos=process why=Local disagree=A",
-            "t.sv:6 f -> Decl(top.g, Function) rename: no pos=final disagree=B",
+            "t.sv:4 f -> Decl(top.g, Function) rename: yes(g.f) pos=process target=Function",
+            "t.sv:5 f -> none rename: no pos=process target=Function why=Local",
+            "t.sv:6 f -> Decl(top.g, Function) rename: no pos=final target=Function disagree=B",
         ]
     );
     assert!(none.is_empty(), "{none:?}");

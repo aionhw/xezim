@@ -63,6 +63,8 @@ mod foreach_over_submodule_array;
 mod genblk_dotted_ref_nettype_none;
 #[path = "hierarchy/genblk_cont_assign.rs"]
 mod genblk_cont_assign;
+#[path = "hierarchy/generate_block_hiding.rs"]
+mod generate_block_hiding;
 #[path = "hierarchy/generate_block_subroutine_scopes.rs"]
 mod generate_block_subroutine_scopes;
 #[path = "hierarchy/generate_block_subroutines.rs"]
