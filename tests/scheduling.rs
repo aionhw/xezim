@@ -455,3 +455,6 @@ mod packed_comb_sensitivity_844;
 
 #[path = "scheduling/review_fork_baseline_935.rs"]
 mod review_fork_baseline_935;
+
+#[path = "scheduling/review_watchdog_drivers_938.rs"]
+mod review_watchdog_drivers_938;
