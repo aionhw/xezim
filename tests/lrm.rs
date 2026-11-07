@@ -83,3 +83,5 @@ mod ch36_vpi;
 mod constraint_real_bounds;
 #[path = "lrm/harness.rs"]
 mod harness;
+#[path = "lrm/implicit_static_subroutines_keep_their_variables_when_compiled.rs"]
+mod implicit_static_subroutines_keep_their_variables_when_compiled;
