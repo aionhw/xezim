@@ -1143,3 +1143,7 @@ mod rand_bijective_eq;
 mod packed_struct_array_property_928;
 #[path = "classes/vif_collection_formals_925.rs"]
 mod vif_collection_formals_925;
+#[path = "classes/review_940_constraint_memos.rs"]
+mod review_940_constraint_memos;
+#[path = "classes/review_940_process_status.rs"]
+mod review_940_process_status;
