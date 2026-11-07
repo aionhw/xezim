@@ -33,6 +33,25 @@ impl Simulator {
             || self.string_signals.contains(base)
     }
 
+    /// §7.8, §6.18: the element type `dt` of associative array `name` is a
+    /// typedef that carries unpacked dimensions (`typedef int a2_t[2];
+    /// a2_t f[string]`), so each element is itself an array whose entries
+    /// are stored under `f["b"][1]`, never under `f["b"]`.
+    pub(super) fn assoc_elem_typedef_is_array(&self, name: &str, dt: &DataType) -> bool {
+        let DataType::TypeReference { name: tn, .. } = dt else {
+            return false;
+        };
+        let (bare, qual) = (tn.name.name.as_str(), tn.qualified());
+        if let Some((h, _)) = name.split_once('#')
+            && let Ok(h) = h.parse::<usize>()
+        {
+            return self.class_chain_typedef_dims(h, bare).is_some()
+                || self.class_chain_typedef_dims(h, &qual).is_some();
+        }
+        self.typedef_unpacked_dims_of(bare).is_some()
+            || self.module.typedef_unpacked_dims.contains_key(&qual)
+    }
+
     /// The declared INTEGRAL element type of an associative array, from its
     /// declaration: a module / subroutine-local array's `var_decl_types`
     /// entry, or the class property for `<handle>#<member>`. `None` for an
