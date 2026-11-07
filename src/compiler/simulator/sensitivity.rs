@@ -2266,6 +2266,7 @@ impl Simulator {
                     span,
                     cached_signal_id: crate::ast::cache::SignalCache::new(None),
                     cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 let saved = self.name_resolve_hint.borrow().clone();
                 *self.name_resolve_hint.borrow_mut() = hint.clone();

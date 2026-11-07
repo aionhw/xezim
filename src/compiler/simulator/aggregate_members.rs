@@ -2848,6 +2848,7 @@ impl Simulator {
                 span: e.span,
                 cached_signal_id: crate::ast::cache::SignalCache::new(None),
                 cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             };
             let base = Expression::new(ExprKind::Ident(bh), e.span);
             let Some((handle, prop)) = self.class_prop_receiver(&base) else {
@@ -3765,6 +3766,7 @@ impl Simulator {
                         span: h.span,
                         cached_signal_id: crate::ast::cache::SignalCache::new(None),
                         cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
                     };
                     let e = Expression::new(ExprKind::Ident(bare), lvalue.span);
                     self.class_prop_receiver(&e)

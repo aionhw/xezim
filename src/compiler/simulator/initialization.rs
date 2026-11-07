@@ -610,6 +610,7 @@ impl Simulator {
                             span: lvalue.span,
                             cached_signal_id: crate::ast::cache::SignalCache::new(None),
                             cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         lvalue.span,
                     );
@@ -1120,6 +1121,7 @@ impl Simulator {
                     span,
                     cached_signal_id: crate::ast::cache::SignalCache::new(None),
                     cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 }),
                 span,
             )
@@ -2113,6 +2115,7 @@ impl Simulator {
                         span,
                         cached_signal_id: crate::ast::cache::SignalCache::new(None),
                         cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
                     }),
                     span,
                 )

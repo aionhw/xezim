@@ -52,6 +52,7 @@ fn ident_expr(path: Vec<crate::ast::expr::HierPathSegment>, span: crate::ast::Sp
             span,
             cached_signal_id: crate::ast::cache::SignalCache::new(None),
             cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         }),
         span,
     )

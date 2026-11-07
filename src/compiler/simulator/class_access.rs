@@ -225,6 +225,7 @@ impl Simulator {
             span: hier.span,
             cached_signal_id: crate::ast::cache::SignalCache::new(None),
             cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         let e = std::rc::Rc::new(Expression::new(ExprKind::Ident(base), hier.span));
         self.method_receiver_cache.insert(key, e.clone());
@@ -292,6 +293,7 @@ impl Simulator {
                 span: hier.span,
                 cached_signal_id: crate::ast::cache::SignalCache::new(None),
                 cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             hier.span,
         );

@@ -2246,6 +2246,7 @@ impl Simulator {
                                 span: crate::ast::Span::dummy(),
                                 cached_signal_id: crate::ast::cache::SignalCache::new(None),
                                 cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                bound: crate::ast::binding::Bound::UNSET,
                             }),
                             crate::ast::Span::dummy(),
                         ));
@@ -2638,6 +2639,7 @@ impl Simulator {
                                     span: crate::ast::Span::dummy(),
                                     cached_signal_id: crate::ast::cache::SignalCache::new(None),
                                     cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                    bound: crate::ast::binding::Bound::UNSET,
                                 }),
                                 crate::ast::Span::dummy(),
                             );
