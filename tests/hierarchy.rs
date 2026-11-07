@@ -428,3 +428,6 @@ mod generate_block_positions;
 
 #[path = "hierarchy/upward_subroutine_calls.rs"]
 mod upward_subroutine_calls;
+
+#[path = "hierarchy/disable_targets.rs"]
+mod disable_targets;
