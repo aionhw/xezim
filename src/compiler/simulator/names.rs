@@ -45,7 +45,8 @@ pub struct NameMap {
     generation: u64,
     /// Interface port prefixes share the actual instance's signal IDs.
     interface_aliases: Option<Arc<(String, HashMap<String, String>)>>,
-    /// Memoized `interface_id` answers: input name -> canonical resolved name (or None).
+    /// Memoized `interface_id` answers: input name -> canonical resolved name,
+    /// or None when no interface alias rewrites the name.
     interface_cache: Arc<std::sync::RwLock<HashMap<String, Option<String>>>>,
 }
 
@@ -237,12 +238,20 @@ impl NameMap {
                 .get(canonical.as_ref())
                 .or_else(|| self.virtual_id(&canonical).map(|id| &self.identity[id]))
         };
+        // Only alias-determined answers are kept: the canonical spelling (its
+        // id is looked up again on every hit) or "no alias applies". A miss of
+        // an aliased name is not, since a later `insert` /
+        // `add_virtual_array` can add the canonical name.
         let stored = if ans.is_some() {
-            Some(canonical.into_owned())
+            Some(Some(canonical.into_owned()))
+        } else if canonical == name {
+            Some(None)
         } else {
             None
         };
-        if let Ok(mut g) = self.interface_cache.write() {
+        if let Some(stored) = stored
+            && let Ok(mut g) = self.interface_cache.write()
+        {
             g.insert(name.to_string(), stored);
         }
         ans
