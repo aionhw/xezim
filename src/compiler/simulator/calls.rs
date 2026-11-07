@@ -3087,6 +3087,45 @@ impl Simulator {
                             .and_then(|v| v.to_u64())
                             .unwrap_or(0) as usize;
                     }
+                    // §8.23: the walk ended at a NULL handle — an
+                    // unallocated intermediate object (`h.null_h.m()`). A
+                    // STATIC method needs no object, so dispatch it on the
+                    // receiver prefix's DECLARED class. Without this the
+                    // call fell through to path[0], which does not define
+                    // the method, and silently returned integer zero.
+                    if handle == 0 {
+                        let prefix: Vec<String> = hier.path[..last_seg]
+                            .iter()
+                            .map(|s| s.name.name.clone())
+                            .collect();
+                        let prefix_refs: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+                        if let Some(decl_full) = self.dotted_name_declared_class(&prefix_refs) {
+                            let base_cls = decl_full
+                                .split('#')
+                                .next()
+                                .unwrap_or(&decl_full)
+                                .to_string();
+                            if self.is_static_method(&base_cls, method_name) {
+                                // §8.25: seed the specialization context from
+                                // the declared type, as the 2-segment arm does.
+                                let saved = self
+                                    .spec_for_null_receiver(None, &decl_full)
+                                    .map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+                                let res = self.exec_static_method_via_object(
+                                    &base_cls,
+                                    method_name,
+                                    args,
+                                    0,
+                                );
+                                if let Some(prev) = saved {
+                                    self.current_spec = prev;
+                                }
+                                if let Some(res) = res {
+                                    return res;
+                                }
+                            }
+                        }
+                    }
                     // The walked-to property may be a covergroup instance
                     // (`e.cg.sample()`, `e.cg.get_inst_coverage()`).
                     if let Some(idx) = self.cg_index(handle) {

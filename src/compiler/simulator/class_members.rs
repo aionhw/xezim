@@ -4285,6 +4285,15 @@ impl Simulator {
             // `this.req.get_type()` (receiver = `this.req`) — resolve the
             // declared member type through the current `this` class.
             ExprKind::MemberAccess { expr: base, member } => match &base.kind {
+                // The parser spells the keyword receiver as `ExprKind::This`,
+                // not as a one-segment `Ident("this")`; both spellings reach
+                // here, so accept either.
+                ExprKind::This => self
+                    .this_stack
+                    .last()
+                    .copied()
+                    .flatten()
+                    .and_then(|th| self.prop_class_type(th, &member.name)),
                 ExprKind::Ident(b) if b.path.len() == 1 && b.path[0].selects.is_empty() => {
                     let bname = &b.path[0].name.name;
                     if bname == "this" || bname == "super" {

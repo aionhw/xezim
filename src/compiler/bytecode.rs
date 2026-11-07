@@ -52,6 +52,11 @@ pub(crate) struct MethodAdmission {
     /// NON-virtual method that some subclass redeclares (the only case where
     /// the object's dynamic class would pick a different body).
     pub nonvirtual_targets: HashMap<String, HashMap<String, String>>,
+    /// §8.23: class -> the STATIC methods it declares. A static method needs
+    /// no object (§8.7/§8.25), so a call through a NULL handle of a known
+    /// declared class is legal and must dispatch on that class; `CallMethod`
+    /// dispatches on the live object's class, which does not exist there.
+    pub static_methods: HashMap<String, HashSet<String>>,
     /// Instance collection members per declared class, for element access
     /// through a handle of that class (`p.contents[i]`). Only members whose
     /// elements load as one plain value join: string and multi-dimensional
@@ -6002,6 +6007,27 @@ impl<'a> BytecodeCompiler<'a> {
     /// refuse — a conservative decline to the AST interpreter, never a
     /// wrong dispatch. The bare-member ROOT additionally keeps the
     /// bare-key-stability requirement (`bare_member_names`).
+    /// §8.23: the class whose body a call to `method` binds to when the
+    /// receiver's DECLARED class is `rc` and `method` is STATIC. A static
+    /// method needs no object, so this is the legal dispatch for a call
+    /// through a null handle (which has no dynamic class to dispatch on).
+    /// `None` when no class on the declared chain declares `method` static.
+    fn declared_static_target(&self, rc: &str, method: &str) -> Option<String> {
+        let adm = self.method_admission.as_ref()?;
+        let mut cur = rc.split('#').next().unwrap_or(rc).to_string();
+        for _ in 0..64 {
+            if adm
+                .static_methods
+                .get(&cur)
+                .is_some_and(|m| m.contains(method))
+            {
+                return Some(cur);
+            }
+            cur = adm.class_parents.get(&cur)?.clone();
+        }
+        None
+    }
+
     fn method_handle_chain_class(&self, expr: &crate::ast::expr::Expression) -> Option<String> {
         if !self.method_mode {
             return None;
@@ -17495,6 +17521,16 @@ impl<'a> BytecodeCompiler<'a> {
                         // a subclass redeclares the method. Those calls start
                         // the hierarchy walk at the statically bound class.
                         let rc_decl = self.method_handle_chain_class(base);
+                        // §8.23: a STATIC method never dereferences the
+                        // receiver, so `h.m(...)` with `h == null` is legal and
+                        // resolves on the DECLARED class. CallMethod has only
+                        // the handle, so it dispatched on a live object's
+                        // class; with a null handle the runtime returned a
+                        // silent zero. Bake the declared class the same way a
+                        // class-scope static call does.
+                        let static_decl = rc_decl
+                            .as_deref()
+                            .and_then(|rc| self.declared_static_target(rc, member.name.as_str()));
                         let static_target = rc_decl.as_deref().and_then(|rc| {
                             self.method_admission.as_ref().and_then(|a| {
                                 a.nonvirtual_targets
@@ -17503,7 +17539,28 @@ impl<'a> BytecodeCompiler<'a> {
                                     .cloned()
                             })
                         });
-                        if let Some(target) = static_target {
+                        if let Some(target) = static_decl {
+                            // The receiver register rides along so a LIVE
+                            // handle still dispatches through the object (its
+                            // runtime class carries the specialization); a
+                            // NULL one falls back to the baked declared class.
+                            self.emit(Insn::CallScopedMethod(
+                                dest,
+                                handle_reg,
+                                Box::new(NamePair(
+                                    target.clone().into_boxed_str(),
+                                    member.name.clone().into_boxed_str(),
+                                )),
+                                arg_start,
+                                n,
+                            ));
+                            let wb_target = rc_decl.as_deref().unwrap_or(target.as_str());
+                            self.emit_arg_slot_writeback(
+                                args,
+                                arg_start,
+                                Some((wb_target, member.name.as_str())),
+                            )?;
+                        } else if let Some(target) = static_target {
                             self.emit(Insn::CallScopedMethod(
                                 dest,
                                 handle_reg,
