@@ -1387,6 +1387,302 @@ impl Simulator {
         }
     }
 
+    /// Root member name of a solver/property reference: `x`, `this.x`,
+    /// `s.f`, `a[i]`, `a[i].f`.
+    fn csp_cache_root(e: &Expression) -> Option<&str> {
+        match &Self::unparen(e).kind {
+            ExprKind::Ident(h) if h.root.is_none() => {
+                let segs = &h.path;
+                let first = if segs.len() > 1 && segs[0].name.name == "this" {
+                    &segs[1]
+                } else {
+                    segs.first()?
+                };
+                Some(first.name.name.as_str())
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                if matches!(Self::unparen(expr).kind, ExprKind::This) {
+                    Some(member.name.as_str())
+                } else {
+                    Self::csp_cache_root(expr)
+                }
+            }
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                Self::csp_cache_root(expr)
+            }
+            _ => None,
+        }
+    }
+
+    /// System functions whose value depends only on their arguments.
+    fn csp_cache_pure_sys(name: &str) -> bool {
+        matches!(
+            name,
+            "$clog2"
+                | "$bits"
+                | "$signed"
+                | "$unsigned"
+                | "$countones"
+                | "$countbits"
+                | "$onehot"
+                | "$onehot0"
+                | "$isunknown"
+                | "$size"
+                | "$high"
+                | "$low"
+                | "$left"
+                | "$right"
+                | "$increment"
+                | "$dimensions"
+                | "$unpacked_dimensions"
+                | "$__xz_type_cast"
+        )
+    }
+
+    /// `e` reads no solver variable and no `foreach` index, and calls
+    /// nothing whose value could depend on more than its arguments: its
+    /// value can be evaluated on its own, before the translation.
+    fn csp_cache_closed(e: &Expression, solver: &HashSet<String>, locals: &[String]) -> bool {
+        let mut ok = true;
+        crate::type_lint::visit_expr(e, &mut |x| match &x.kind {
+            ExprKind::Call { .. }
+            | ExprKind::WithClause { .. }
+            | ExprKind::RandomizeWith { .. }
+            | ExprKind::AssignExpr { .. }
+            | ExprKind::Matches { .. }
+            | ExprKind::StreamOp { .. }
+            | ExprKind::AssignmentPattern(_)
+            | ExprKind::TypedPattern { .. }
+            | ExprKind::Tagged { .. }
+            | ExprKind::ShallowCopy { .. }
+            | ExprKind::SvaClocked { .. } => ok = false,
+            ExprKind::SystemCall { name, .. } if !Self::csp_cache_pure_sys(name) => ok = false,
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                if let Some(r) = Self::csp_cache_root(x)
+                    && (solver.contains(r) || locals.iter().any(|l| l == r))
+                {
+                    ok = false;
+                }
+            }
+            _ => {}
+        });
+        ok
+    }
+
+    /// Classify every value `it` reads for the CSP cache: solver variables
+    /// and `foreach` indices are the search's own; a bare own property is
+    /// in the configuration snapshot; any other variable-free operand is
+    /// pushed to `ext`, to be evaluated and compared on every call. False
+    /// when `it` reads something neither covers.
+    fn csp_cache_reads<'e>(
+        it: &'e ConstraintItem,
+        solver: &HashSet<String>,
+        own: &HashSet<String>,
+        consts: &dyn Fn(&str) -> bool,
+        locals: &mut Vec<String>,
+        ext: &mut Vec<&'e Expression>,
+    ) -> bool {
+        use crate::ast::decl::ConstraintRange;
+        match it {
+            ConstraintItem::Expr(e) => {
+                Self::csp_cache_expr(e, false, solver, own, consts, locals, ext)
+            }
+            ConstraintItem::Inside {
+                expr,
+                range,
+                dist_weights,
+                ..
+            } => {
+                Self::csp_cache_expr(expr, false, solver, own, consts, locals, ext)
+                    && range.iter().all(|r| match r {
+                        ConstraintRange::Value(v) => {
+                            Self::csp_cache_expr(v, true, solver, own, consts, locals, ext)
+                        }
+                        ConstraintRange::Range { lo, hi } => {
+                            Self::csp_cache_expr(lo, false, solver, own, consts, locals, ext)
+                                && Self::csp_cache_expr(hi, false, solver, own, consts, locals, ext)
+                        }
+                    })
+                    && dist_weights.iter().flatten().all(|w| {
+                        let (DistWeight::Each(w) | DistWeight::Total(w)) = w;
+                        Self::csp_cache_expr(w, false, solver, own, consts, locals, ext)
+                    })
+            }
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } => {
+                Self::csp_cache_expr(condition, false, solver, own, consts, locals, ext)
+                    && Self::csp_cache_reads(constraint, solver, own, consts, locals, ext)
+            }
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                Self::csp_cache_expr(condition, false, solver, own, consts, locals, ext)
+                    && Self::csp_cache_reads(then_item, solver, own, consts, locals, ext)
+                    && else_item
+                        .as_ref()
+                        .is_none_or(|e| Self::csp_cache_reads(e, solver, own, consts, locals, ext))
+            }
+            ConstraintItem::Foreach {
+                array, vars, item, ..
+            } => {
+                // Only a solver collection's shape is in the key.
+                if !Self::csp_cache_root(array).is_some_and(|r| solver.contains(r)) {
+                    return false;
+                }
+                let n = locals.len();
+                locals.extend(vars.iter().flatten().map(|v| v.name.clone()));
+                let ok = Self::csp_cache_reads(item, solver, own, consts, locals, ext);
+                locals.truncate(n);
+                ok
+            }
+            ConstraintItem::Solve { .. } => true,
+            ConstraintItem::Soft(i) => Self::csp_cache_reads(i, solver, own, consts, locals, ext),
+            ConstraintItem::Block(items) => items
+                .iter()
+                .all(|i| Self::csp_cache_reads(i, solver, own, consts, locals, ext)),
+            ConstraintItem::Unique { exprs, .. } => exprs
+                .iter()
+                .all(|e| Self::csp_cache_expr(e, true, solver, own, consts, locals, ext)),
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
+    /// `csp_cache_reads` for one expression. `set` marks a member of an
+    /// `inside` / `unique` list, where a bare name may be a whole unpacked
+    /// array (whose value is no single `Value`).
+    fn csp_cache_expr<'e>(
+        e: &'e Expression,
+        set: bool,
+        solver: &HashSet<String>,
+        own: &HashSet<String>,
+        consts: &dyn Fn(&str) -> bool,
+        locals: &mut Vec<String>,
+        ext: &mut Vec<&'e Expression>,
+    ) -> bool {
+        let e = Self::unparen(e);
+        if matches!(
+            e.kind,
+            ExprKind::Number(_)
+                | ExprKind::StringLiteral(_)
+                | ExprKind::TypeLiteral(_)
+                | ExprKind::Dollar
+                | ExprKind::Null
+                | ExprKind::Empty
+        ) {
+            return true;
+        }
+        let bare_own = match &e.kind {
+            ExprKind::Ident(h) => {
+                h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && own.contains(&h.path[0].name.name)
+            }
+            _ => false,
+        };
+        if Self::csp_cache_closed(e, solver, locals) {
+            // A parameter or enum label is one constant value; any other
+            // bare name in a set may be a whole unpacked array.
+            let constant = matches!(&e.kind, ExprKind::Ident(h)
+                if h.path.len() == 1 && h.path[0].selects.is_empty() && consts(&h.path[0].name.name));
+            if set
+                && !constant
+                && matches!(e.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. })
+            {
+                return false;
+            }
+            if bare_own {
+                return true;
+            }
+            ext.push(e);
+            return true;
+        }
+        let mut sub = |x: &'e Expression, set: bool, locals: &mut Vec<String>| {
+            Self::csp_cache_expr(x, set, solver, own, consts, locals, ext)
+        };
+        let root = Self::csp_cache_root(e);
+        let in_solver = root.is_some_and(|r| solver.contains(r));
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if in_solver {
+                    h.path
+                        .iter()
+                        .flat_map(|s| s.selects.iter())
+                        .all(|x| sub(x, false, locals))
+                } else {
+                    // A bare `foreach` index.
+                    h.root.is_none()
+                        && h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && locals.iter().any(|l| *l == h.path[0].name.name)
+                }
+            }
+            ExprKind::MemberAccess { expr, .. } => {
+                in_solver
+                    && (matches!(Self::unparen(expr).kind, ExprKind::This)
+                        || sub(expr, false, locals))
+            }
+            // A select picked by a `foreach` index is only followed into a
+            // solver variable: the element of any other array is no value
+            // the snapshot holds.
+            ExprKind::Index { expr, index } => {
+                in_solver && sub(expr, false, locals) && sub(index, false, locals)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                in_solver
+                    && sub(expr, false, locals)
+                    && sub(left, false, locals)
+                    && sub(right, false, locals)
+            }
+            ExprKind::Unary { operand, .. } => sub(operand, false, locals),
+            ExprKind::Binary { left, right, .. } => {
+                sub(left, false, locals) && sub(right, false, locals)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                sub(condition, false, locals)
+                    && sub(then_expr, false, locals)
+                    && sub(else_expr, false, locals)
+            }
+            ExprKind::Concatenation(xs) => xs.iter().all(|x| sub(x, false, locals)),
+            ExprKind::Replication { count, exprs } => {
+                sub(count, false, locals) && exprs.iter().all(|x| sub(x, false, locals))
+            }
+            ExprKind::Range(a, b) => sub(a, false, locals) && sub(b, false, locals),
+            ExprKind::Inside { expr, ranges } => {
+                sub(expr, false, locals) && ranges.iter().all(|x| sub(x, true, locals))
+            }
+            ExprKind::SystemCall { name, args } if Self::csp_cache_pure_sys(name) => {
+                args.iter().all(|x| sub(x, false, locals))
+            }
+            // A reduction or `size()` of a solver collection.
+            ExprKind::Call { func, args } => match &Self::unparen(func).kind {
+                ExprKind::MemberAccess { expr, member }
+                    if matches!(
+                        member.name.as_str(),
+                        "size" | "sum" | "product" | "and" | "or" | "xor"
+                    ) && Self::csp_cache_root(expr).is_some_and(|r| solver.contains(r)) =>
+                {
+                    sub(expr, false, locals) && args.iter().all(|x| sub(x, false, locals))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Structural + configuration fingerprint for the per-class CSP cache.
     /// Returns `None` when the solve is not safely cacheable: sub-objects
     /// (joint path re-builds the problem), or a random object with any
@@ -1399,9 +1695,16 @@ impl Simulator {
     /// constraint items' structural identity (source index + span). The
     /// value list is the live snapshot of the scalar non-rand configuration
     /// props the constraints fold in (`csp_const`), which must be
-    /// byte-identical for a cached graph to be re-usable.
+    /// byte-identical for a cached graph to be re-usable. Every other value
+    /// the translation folds in (a module or package variable, a static
+    /// property, another object's member, a parameter or an enum label) is
+    /// evaluated now and appended to the snapshot (`csp_cache_reads`); a
+    /// constraint that reads anything that cannot be captured so (a
+    /// function call, a non-solver array element picked by a `foreach`
+    /// index, a whole unpacked array) is not cached.
+    #[allow(clippy::too_many_arguments)]
     fn rand_csp_cache_fp(
-        &self,
+        &mut self,
         handle: usize,
         constraints: &[ClassConstraint],
         constraint_depth: &[usize],
@@ -1413,7 +1716,7 @@ impl Simulator {
     ) -> Option<(String, Box<[(String, Value)]>)> {
         use std::fmt::Write;
         let inst = self.heap.get(handle)?.as_ref()?;
-        let mut solver = std::collections::HashSet::new();
+        let mut solver: HashSet<String> = HashSet::default();
         for (n, _) in rand_props {
             solver.insert(n.clone());
         }
@@ -1435,6 +1738,32 @@ impl Simulator {
         config.sort_by(|a, b| a.0.cmp(&b.0));
         let mut key = String::new();
         let _ = write!(key, "cls{}", inst.class_name);
+        // The specialization, type bindings and creation scope an object
+        // carries all steer how its constraint names and types resolve.
+        let mut binds: Vec<_> = inst.type_bindings.iter().collect();
+        binds.sort();
+        let _ = write!(
+            key,
+            "|s:{:?}|t:{:?}|cs:{}",
+            inst.spec, binds, inst.creation_scope
+        );
+        let own: HashSet<String> = inst.properties.keys().cloned().collect();
+        let mut ext: Vec<&Expression> = Vec::new();
+        let mut locals: Vec<String> = Vec::new();
+        let params = &self.module.parameters;
+        let consts = |n: &str| params.contains_key(n);
+        for con in constraints {
+            for it in &con.items {
+                if !Self::csp_cache_reads(it, &solver, &own, &consts, &mut locals, &mut ext) {
+                    return None;
+                }
+            }
+        }
+        let env = Env::default();
+        for (i, e) in ext.iter().enumerate() {
+            let v = self.csp_const_any(e, &env);
+            config.push((format!("@{i}"), v));
+        }
         for (n, w) in rand_props {
             let s = signed_props.contains(n) as u8;
             let e = enum_props.get(n).cloned().unwrap_or_default();
