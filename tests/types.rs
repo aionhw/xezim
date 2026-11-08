@@ -672,5 +672,7 @@ mod review_nettype_partial_driver;
 mod review_nettype_multi_top;
 
 
+#[path = "types/function_local_ascending_packed.rs"]
+mod function_local_ascending_packed;
 #[path = "types/two_state_local_in_fallback.rs"]
 mod two_state_local_in_fallback;
