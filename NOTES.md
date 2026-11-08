@@ -703,6 +703,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   hierarchical references. For sources that
   require the earlier behavior, `--relax-use-before-decl` (or
   `XEZIM_RELAX_USE_BEFORE_DECL=1`) accepts these references with a warning.
+* A select past the dimensions of an associative array reads from the
+  element: `a[7][3]` on `logic [31:0] a [int]` is bit 3 of `a[7]`, and a
+  select into a multi-dimensional packed element reads that slice. It read
+  an absent element instead, x for 4-state and 0 for 2-state (§7.8,
+  §11.5.1, #956).
 
 **Performance**
 
