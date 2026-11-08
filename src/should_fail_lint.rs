@@ -4018,6 +4018,25 @@ struct UndeclaredFinder<'a> {
     errs: Vec<String>,
 }
 
+/// §6.10: an undeclared identifier used as a primitive/instance port actual, a
+/// continuous-assign target, or (transitively) read from one creates an implicit
+/// 1-bit net, so a later reference to it is not an undeclared name.
+///
+/// Names created in the TOP module are already in `elab.signals` and so answer
+/// true from `top_declares`. Names created inside a SUB-MODULE are registered
+/// under their elaborated path (`u.bBIST`, `g_top[0].rom.bBIST`), which is why
+/// the bare identifier is matched as a trailing path component here. Without
+/// this, a legal vendor ROM model (`buf sBIST (bBIST, BIST);` followed by
+/// `wire iCEB = bBIST ? ... : ...;`) was rejected at elaboration.
+fn implicit_net_declares(n: &str, elab: &ElaboratedModule) -> bool {
+    elab.implicit_nets.contains(n)
+        || elab.implicit_nets.iter().any(|scoped| {
+            scoped.len() > n.len()
+                && scoped.ends_with(n)
+                && scoped.as_bytes()[scoped.len() - n.len() - 1] == b'.'
+        })
+}
+
 impl<'a> UndeclaredFinder<'a> {
     /// A name needs no declaration here if it is a keyword, a built-in
     /// spelling, a package member, something the elaboration indexes, or
@@ -4030,6 +4049,7 @@ impl<'a> UndeclaredFinder<'a> {
             || self.pkg_names.contains(n)
             || top_declares(n, self.elab)
             || self.declared.contains(n)
+            || implicit_net_declares(n, self.elab)
     }
 
     fn name(&mut self, n: &str, what: &str) {
