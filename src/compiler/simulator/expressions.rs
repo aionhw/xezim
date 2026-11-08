@@ -5389,6 +5389,13 @@ impl Simulator {
                         .get_signal_value_by_name(&format!("{}[{}]", qn, k))
                         .unwrap_or_else(|| default(self));
                 }
+                // §11.5.1: a select past an associative array's unpacked
+                // dimensions selects into the element (`a[k][3]`).
+                if !self.module.associative_arrays.is_empty()
+                    && let Some(v) = self.assoc_elem_select_read(expr, index)
+                {
+                    return v;
+                }
                 // Element of an unpacked array of ASSOCIATIVE arrays:
                 // `a[i][key]` looks the key up in the assoc array `a[i]`.
                 if let Some(elem) = self.indexed_assoc_elem(expr, index) {
