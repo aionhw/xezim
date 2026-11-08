@@ -158,15 +158,40 @@ impl Simulator {
         Some(out)
     }
 
-    /// Whether a constraint of the object in `p` reads a handle member holding `handle`.
+    /// Whether a constraint of the object in `p`, or of a rand sub-object under
+    /// it at any depth, reads through handle members back to `handle`.
     fn csp_points_back(&self, handle: usize, p: &str) -> bool {
         let sub = self.member_handle(handle, p).unwrap_or(0);
-        let cons = self.active_constraints(sub);
-        let back = |q: &String| {
-            self.member_handle(sub, q) == Some(handle) && Self::csp_constraints_read(q, &cons)
+        let (mut seen, mut subtree) = (HashSet::default(), vec![("".to_string(), sub)]);
+        let _ = self.rand_csp_nested_subs(p, sub, handle, &mut seen, &mut subtree, 0);
+        subtree.iter().any(|&(_, o)| {
+            let cons = self.active_constraints(o);
+            let mut visited = HashSet::default();
+            self.csp_reads_back_to(handle, o, &cons, &mut visited)
+        })
+    }
+
+    /// Whether `cons` reads a handle member of `from` that is `target` or
+    /// leads on to it through handle members `cons` also reads.
+    fn csp_reads_back_to(
+        &self,
+        target: usize,
+        from: usize,
+        cons: &[ClassConstraint],
+        visited: &mut HashSet<usize>,
+    ) -> bool {
+        if from == 0 || !visited.insert(from) {
+            return false;
+        }
+        let Some(inst) = self.heap.get(from).and_then(|o| o.as_ref()) else {
+            return false;
         };
-        let inst = self.heap.get(sub).and_then(|o| o.as_ref());
-        inst.is_some_and(|i| i.properties.keys().any(back))
+        inst.properties.keys().any(|q| {
+            let h = self.member_handle(from, q).unwrap_or(0);
+            h != 0
+                && Self::csp_constraints_read(q, cons)
+                && (h == target || self.csp_reads_back_to(target, h, cons, visited))
+        })
     }
 
     /// Whether some item of `constraints` may read member `prop`: a name or
