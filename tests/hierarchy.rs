@@ -437,3 +437,6 @@ mod generate_block_data_scopes;
 
 #[path = "hierarchy/generate_block_data_hiding.rs"]
 mod generate_block_data_hiding;
+
+#[path = "hierarchy/generate_block_type_scopes.rs"]
+mod generate_block_type_scopes;
