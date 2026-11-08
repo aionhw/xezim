@@ -77,6 +77,8 @@ mod generate_block_positions;
 mod generate_block_subroutine_scopes;
 #[path = "hierarchy/generate_block_subroutines.rs"]
 mod generate_block_subroutines;
+#[path = "hierarchy/generate_block_type_scopes.rs"]
+mod generate_block_type_scopes;
 #[path = "hierarchy/generate_label_hier_roots.rs"]
 mod generate_label_hier_roots;
 #[path = "hierarchy/generate_scope_names.rs"]
