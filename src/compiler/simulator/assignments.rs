@@ -2012,12 +2012,36 @@ impl Simulator {
             Some((dl, dr)) => b - dl.min(dr),
             None => b,
         };
-        if phys < 0 || phys as u32 >= cur.width {
+        // §7.4.1: with a multi-dimensional packed element (`logic [3:0][7:0]
+        // p [int]`), `p[k][j]` selects a whole slice of the leading packed
+        // dimension, so write `stride` bits at slot `phys`.
+        let stride = self
+            .module
+            .packed_full_dims
+            .get(&name)
+            .filter(|d| d.len() > 1)
+            .map_or(1, |d| {
+                d[1..]
+                    .iter()
+                    .map(|&(l, r)| (l - r).unsigned_abs() as usize + 1)
+                    .product()
+            });
+        let Some(lsb) = usize::try_from(phys)
+            .ok()
+            .and_then(|p| p.checked_mul(stride))
+            .filter(|l| {
+                l.checked_add(stride)
+                    .is_some_and(|e| e <= cur.width as usize)
+            })
+        else {
             return Some(false);
+        };
+        let mut changed = false;
+        for i in 0..stride {
+            let nb = val.get_bit(i);
+            changed |= cur.get_bit(lsb + i) != nb;
+            cur.set_bit(lsb + i, nb);
         }
-        let nb = val.get_bit(0);
-        let changed = cur.get_bit(phys as usize) != nb;
-        cur.set_bit(phys as usize, nb);
         if changed || fresh {
             self.set_signal_value_by_name(&elem, cur);
             self.mark_dirty(&elem);
