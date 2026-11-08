@@ -755,6 +755,7 @@ impl Simulator {
                     data_type: fd.return_type.clone(),
                     lifetime: None,
                     declarators: vec![crate::ast::stmt::VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name: fd.name.name.clone(),
                         dimensions: Vec::new(),
                         init: None,
