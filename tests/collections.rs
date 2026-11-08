@@ -312,3 +312,5 @@ mod dyn_collection_compiled_read_live;
 mod dyn_row_array_queries;
 #[path = "collections/dyn_row_sized_new_copy.rs"]
 mod dyn_row_sized_new_copy;
+#[path = "collections/assoc_elem_select_read.rs"]
+mod assoc_elem_select_read;
