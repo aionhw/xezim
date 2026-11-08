@@ -4229,11 +4229,13 @@ impl Simulator {
             }
         } else {
             match &var.key {
-                VarKey::Prop(n) => self
-                    .heap
-                    .get(csp.handle)
-                    .and_then(|o| o.as_ref())
-                    .and_then(|i| i.properties.get(n).cloned()),
+                VarKey::Prop(n) => {
+                    let key = self.rand_var_key(csp.handle, n);
+                    self.heap
+                        .get(csp.handle)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|i| i.properties.get(key.as_ref()).cloned())
+                }
                 VarKey::Elem(k) => self.read_coll_elem(k),
                 VarKey::Sub(h, n) => self
                     .heap
@@ -4268,8 +4270,9 @@ impl Simulator {
         }
         match &var.key {
             VarKey::Prop(n) => {
+                let key = self.rand_var_key(csp.handle, n).into_owned();
                 if let Some(Some(inst)) = self.heap.get_mut(csp.handle) {
-                    inst.properties.insert(n.clone(), val);
+                    inst.properties.insert(key, val);
                 }
             }
             VarKey::Elem(k) => self.write_coll_elem(k, val),

@@ -5122,6 +5122,25 @@ impl Simulator {
         // (sizing, element solving, acceptance).
         self.begin_randomize_budget();
         self.obj_rng_stack.push(handle);
+        // §18.7/§8.14: the object's scope is that of the receiver's declared
+        // class, which a derived class's redeclaration can change.
+        let scope = if self.shadowed_prop_names.is_empty() || items.is_empty() {
+            None
+        } else {
+            let dynamic = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.class_name.clone());
+            receiver
+                .as_deref()
+                .and_then(|r| self.var_view_class(r))
+                .filter(|c| {
+                    dynamic
+                        .as_deref()
+                        .is_some_and(|d| d != c && self.class_is_a(d, c))
+                })
+        };
         // §18.7: names in the inline block resolve in the object's scope
         // first, so a property named like the receiver hides it there.
         let receiver = receiver.filter(|r| {
@@ -5139,7 +5158,9 @@ impl Simulator {
         let inline_src_file = (!items.is_empty())
             .then(|| self.current_src_file())
             .flatten();
+        let prev_scope = std::mem::replace(&mut self.inline_constraint_scope, scope);
         let r = self.exec_randomize_inner(handle, items, inline_src_file);
+        self.inline_constraint_scope = prev_scope;
         self.randomize_subset = prev_subset;
         self.rand_receiver_base = prev_base;
         self.rand_receiver = prev_receiver;

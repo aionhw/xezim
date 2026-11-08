@@ -1357,9 +1357,27 @@ impl Simulator {
                 if !matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() == 1))
             || matches!(&lhs.kind, ExprKind::Ident(h) if h.path.len() >= 3)
         {
+            // §8.14/§8.23: a shadowed member names what the reference's
+            // declared class sees (`this.x` in a base method is the base's
+            // `x`), so resolve that before a static of the OBJECT's class can
+            // claim the write (#944).
+            if !self.shadowed_prop_names.is_empty()
+                && let Some(rewritten) = self.super_rewrite(lhs)
+            {
+                return self.assign_value(&rewritten, val);
+            }
             if let Some(ok) = self.assign_static_through_chain(lhs, val) {
                 return ok;
             }
+        }
+        // §8.14: the same for a select of a shadowed member (`this.v[3:0]`).
+        if matches!(
+            lhs.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+        ) && !self.shadowed_prop_names.is_empty()
+            && let Some(rewritten) = self.shadowed_select_rewrite(lhs)
+        {
+            return self.assign_value(&rewritten, val);
         }
         if let ExprKind::MemberAccess { expr: b, .. }
         | ExprKind::Index { expr: b, .. }
@@ -4514,6 +4532,17 @@ impl Simulator {
                             }
                             return true;
                         }
+                    }
+                    // §8.9/§8.14: a shadowed name whose nearest declaration
+                    // from the executing method's class is a STATIC is that
+                    // class's shared cell, though a derived class of the
+                    // object redeclares it as an instance property.
+                    if self.prop_maybe_shadowed(name)
+                        && let Some(ctx) = self.lexical_class()
+                        && self.member_is_static_prop(&ctx, name)
+                        && self.class_static_set(&ctx, name, val.clone())
+                    {
+                        return true;
                     }
                     // Check 'this' properties
                     if let Some(Some(handle)) = self.this_stack.last() {

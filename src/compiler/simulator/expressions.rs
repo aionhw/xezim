@@ -1187,6 +1187,7 @@ impl Simulator {
                     Some(h.path[0].name.name.clone()),
                     Some(self.resolve_hier_name(h).into_owned()),
                 ),
+                ExprKind::This => (Some("this".to_string()), None),
                 ExprKind::MemberAccess { .. } | ExprKind::Ident(_) if handle == 0 => {
                     // §8.9: a static through a null property.
                     if let Some((o, p)) = self.handle_chain_owner(expr) {
@@ -3121,6 +3122,11 @@ impl Simulator {
                                 };
                                 if cd.static_properties.contains(name) {
                                     found = true;
+                                    break;
+                                }
+                                // §8.14: the nearest declaration wins; an
+                                // instance property hides an ancestor's static.
+                                if cd.properties.contains_key(name) {
                                     break;
                                 }
                                 cur = cd.extends.as_deref();

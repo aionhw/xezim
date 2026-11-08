@@ -4139,6 +4139,8 @@ impl Simulator {
             randomize_subset: None,
             shadowed_prop_names: HashSet::default(),
             shadowed_prop_mask: 0,
+            constraint_scopes: HashMap::default(),
+            inline_constraint_scope: None,
             signed_class_colls: HashSet::default(),
             dep_base: HashMap::default(),
             dep_default: HashMap::default(),

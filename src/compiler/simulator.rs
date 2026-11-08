@@ -8322,6 +8322,17 @@ pub struct Simulator {
     /// `meta_key_bits` of every name in `shadowed_prop_names`: a prefilter that
     /// spares the hot member-access paths a hash per access.
     shadowed_prop_mask: u64,
+    /// §18.5/§8.14: the class that declares each constraint block of the
+    /// randomize() call in progress, keyed by the address of the block's item
+    /// list, for the blocks of a base class of the object when some property
+    /// name is shadowed. Their names resolve in that class, not the object's.
+    /// Empty outside a solve and whenever no name is shadowed.
+    constraint_scopes: HashMap<usize, String>,
+    /// §18.7/§8.14: the declared class of the receiver of the
+    /// `obj.randomize() with {…}` call about to solve, when it is a base of
+    /// the object's class and some name is shadowed: the inline block's names
+    /// resolve in it. Taken by the solve that gathers the block.
+    inline_constraint_scope: Option<String>,
     /// §6.11.1 / §7.5: instance-scoped storage names (`<handle>#<member>`) of
     /// queue / dynamic-array class properties whose element type is a SIGNED
     /// integral type (`byte`, `shortint`, `logic signed [7:0]`, ...). Their
