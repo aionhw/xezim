@@ -278,15 +278,29 @@ endmodule
 }
 
 #[test]
-fn unlabelled_data_keeps_its_bare_name_through_a_direct_nest() {
+fn unlabelled_data_of_a_direct_nest_is_named_by_the_outer_constructs_implicit_name() {
     let got = lines(
         r#"module top;
   if (1) if (1) begin int x = 3; end
-  initial #1 $display("%0d", x);
+  initial #1 $display("%0d", genblk1.x);
 endmodule
 "#,
     );
     assert_eq!(got, ["3"]);
+}
+
+#[test]
+fn unlabelled_data_of_a_direct_nest_is_not_visible_from_the_module() {
+    // §23.9: the block is a scope, so a bare `x` outside it is undeclared.
+    let src = r#"module top;
+  if (1) if (1) begin int x = 3; end
+  initial #1 $display("%0d", x);
+endmodule
+"#;
+    let err = simulate(src, 1000)
+        .err()
+        .expect("a bare read of block data is undeclared");
+    assert!(err.contains("Undeclared identifier 'x'"), "{err}");
 }
 
 #[test]
