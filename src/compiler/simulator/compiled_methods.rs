@@ -1372,6 +1372,71 @@ impl Simulator {
         out
     }
 
+    /// Declared ELEMENT widths of `cname`'s element-access plan members
+    /// (`class_coll_elem_member_names` set), walked over the extends
+    /// chain: fixed arrays record the element width in
+    /// `array_properties`, queues in `queue_properties`; associative
+    /// members take the property's declared width. Mirrored into the
+    /// bytecode compiler as a plan fact — its width inference has no
+    /// other table for a member element select, and sized one at 1 bit
+    /// when every table missed (a `(base[i] < base[j])` condition in a
+    /// compiled method then compared the elements' LSBs).
+    pub(super) fn class_coll_elem_widths(&self, cname: &str) -> HashMap<String, u32> {
+        let mut out = HashMap::default();
+        if cname.starts_with("__free_fn__") {
+            return out;
+        }
+        let mut seen = HashSet::default();
+        let mut cur = cname.to_string();
+        // §8.14: a property a derived class redeclares is a separate
+        // variable — the LEAF-MOST declarer on the chain owns the name.
+        // Record widths only for names no more-derived class declares
+        // (as ANY kind of property: a scalar redeclaration must also
+        // mask an ancestor's collection width for the same name).
+        let mut declared = HashSet::default();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            // String collections have no integral element width (their
+            // reads lower outside the element path entirely).
+            let strings = self.class_string_coll_member_names(&cur);
+            for (p, &(_, _, w)) in cd.array_properties.iter() {
+                if w > 0 && !declared.contains(p) && !strings.contains(p) {
+                    out.insert(p.clone(), w);
+                }
+            }
+            for (p, &(w, _)) in cd.queue_properties.iter() {
+                if w > 0 && !declared.contains(p) && !strings.contains(p) {
+                    out.insert(p.clone(), w);
+                }
+            }
+            for p in cd.assoc_properties.keys() {
+                if !declared.contains(p)
+                    && !strings.contains(p)
+                    && let Some(Some(w)) = self.class_prop_width_fixed(&cur, p)
+                    && w > 0
+                {
+                    out.insert(p.clone(), w);
+                }
+            }
+            // Mask by every table's keys, not only `properties`: the
+            // leaf-most-wins invariant must hold even for a name the
+            // class records solely as a collection (and a leaf
+            // collection skipped for `w == 0` must still mask an
+            // ancestor's width for the same name).
+            declared.extend(cd.properties.keys().cloned());
+            declared.extend(cd.array_properties.keys().cloned());
+            declared.extend(cd.queue_properties.keys().cloned());
+            declared.extend(cd.assoc_properties.keys().cloned());
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        out
+    }
+
     /// Persistent method keys include the complete elaborated design context,
     /// the compiler version salt, and the method's resolved width signature.
     /// The shared context digest is lazy: disk caching pays once per simulator,
@@ -2119,6 +2184,7 @@ impl Simulator {
                 static_coll_members: std::rc::Rc::new(self.class_static_coll_member_names(cname)),
                 coll_elem_members: std::rc::Rc::new(self.class_coll_elem_member_names(cname)),
                 coll_elem_packed_dims: std::rc::Rc::new(self.class_coll_elem_packed_dims(cname)),
+                coll_elem_widths: std::rc::Rc::new(self.class_coll_elem_widths(cname)),
                 writeback_formals: std::rc::Rc::new(writeback_formals),
                 static_result_width,
                 result_signed,
@@ -3086,6 +3152,7 @@ impl Simulator {
                     compiler.method_admission = Some(admission);
                     // issue-301 plan fact: multi-dim packed coll elements.
                     compiler.coll_elem_packed_dims = (*pre.coll_elem_packed_dims).clone();
+                    compiler.coll_elem_widths = (*pre.coll_elem_widths).clone();
                     compiler.member_coll_strings = self.class_string_coll_member_names(cname);
                     compiler.typedef_coll_dims = self.local_typedef_coll_dims(
                         cname,
