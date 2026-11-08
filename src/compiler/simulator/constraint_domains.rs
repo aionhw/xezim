@@ -3435,6 +3435,22 @@ impl Simulator {
                 // caller's local frame, so index and bound expressions
                 // evaluate with the concrete `i`.
                 ExprKind::Binary { op, left, right } => {
+                    // §18.5.7 modulo equality over THIS element —
+                    // `(arr[i] % k) == r` (or the mirrored `r == (arr[i] %
+                    // k)`): a structural shape of its own, repaired by
+                    // drawing the element from the congruence class the
+                    // body admits (see `solve_forced_array_elem_modulo`).
+                    // Any other binary shape falls through to the
+                    // equality/relational repair below.
+                    if matches!(op, BinaryOp::Eq) {
+                        for (mod_side, rem_side) in [(left, right), (right, left)] {
+                            if let Some(changed) = self.solve_forced_array_elem_modulo(
+                                handle, mod_side, rem_side, arr_name, idx,
+                            ) {
+                                return changed;
+                            }
+                        }
+                    }
                     // Element ref: `arr[<index-expr that evals to idx>]`.
                     // The full index PATH of an element ref rooted at `arr`,
                     // matching the `[i]`/`[i][j]` suffix the caller iterates.
@@ -3619,6 +3635,360 @@ impl Simulator {
             }
             _ => false,
         }
+    }
+
+    /// The full index PATH (`[i]`, `[i][j]`, …) of an element reference
+    /// rooted at the bare name `arr`, with each index expression evaluated
+    /// in the current frame — the same suffix computation the equality /
+    /// relational arm of `solve_forced_array_elem` performs inline.
+    pub(super) fn elem_index_suffix(&mut self, e: &Expression, arr_name: &str) -> Option<String> {
+        let ExprKind::Index { expr: b, index } = &e.kind else {
+            return None;
+        };
+        let here = format!("[{}]", self.eval_expr(index).to_i64()?);
+        match &b.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == arr_name => {
+                Some(here)
+            }
+            _ => self
+                .elem_index_suffix(b, arr_name)
+                .map(|outer| outer + &here),
+        }
+    }
+
+    /// True when any index chain inside `e` addresses element `idx` of
+    /// `arr_name` (index expressions evaluated in the current frame).
+    pub(super) fn expr_mentions_elem(&mut self, e: &Expression, arr_name: &str, idx: &str) -> bool {
+        let mut index_nodes: Vec<Expression> = Vec::new();
+        crate::type_lint::visit_expr(e, &mut |x| {
+            if matches!(x.kind, ExprKind::Index { .. }) {
+                index_nodes.push(x.clone());
+            }
+        });
+        index_nodes
+            .iter()
+            .any(|n| self.elem_index_suffix(n, arr_name).as_deref() == Some(idx))
+    }
+
+    /// §18.5.7 structural repair for a modulo equality over ONE fixed-array
+    /// element inside a foreach body: `(arr[i] % k) == r`, in either
+    /// operand order (the caller tries both). `mod_side` is the candidate
+    /// `%` expression, `rem_side` the candidate remainder expression.
+    ///
+    /// Returns `Some(changed)` only when the repair is CONFIRMED by the
+    /// ordinary evaluator: either the body already holds for the current
+    /// element, or a drawn candidate was written and re-evaluated equal.
+    /// Every other outcome — the shape does not match, or the arithmetic
+    /// model below cannot produce a confirmed candidate — returns `None`
+    /// (or restores the saved value and returns `None`), so the caller
+    /// falls through to the pre-existing shapes and the generate-and-test
+    /// backstop exactly as if this repair did not exist. The strict final
+    /// check (`check_fixed_foreach_item`) is never weakened or bypassed.
+    ///
+    /// The draw models the `%` in one of two regimes (§11.8.1: the
+    /// operation is unsigned when ANY of its operands is unsigned):
+    /// * signed regime (element, modulus and remainder all signed):
+    ///   truncated-remainder classes in i128 — for `r == 0` the multiples
+    ///   of `|k|`; for `r != 0` the class `v ≡ r (mod |k|)` restricted to
+    ///   `sign(v) == sign(r)`, since the truncated remainder takes the
+    ///   dividend's sign (§11.4.4).
+    /// * unsigned regime: the admitted BIT PATTERNS `u` in the element's
+    ///   domain with `u % k_u == r_u`, where `k_u` / `r_u` are the
+    ///   operands' bit patterns at the operation width.
+    /// In both regimes the candidate set is intersected with the body's
+    /// `inside` hint ranges when present, and a candidate is kept only
+    /// when the evaluator confirms it — so any width/signedness corner
+    /// the model still misses degrades to the old behaviour, never to a
+    /// wrong value. Elements wider than 64 bits are served only in as
+    /// much as their low-word candidates verify; the model works in
+    /// i128 over the i64-representable part of the domain (the same
+    /// reach as the relational repair arm). An element with no stored
+    /// value yet steps aside entirely: its declared width is not
+    /// guessed.
+    pub(super) fn solve_forced_array_elem_modulo(
+        &mut self,
+        handle: usize,
+        mod_side: &Expression,
+        rem_side: &Expression,
+        arr_name: &str,
+        idx: &str,
+    ) -> Option<bool> {
+        // The source spelling parenthesises the modulo sub-expression
+        // (`(arr[i] % k) == r`), and the parser keeps the `Paren` node —
+        // unwrap it (and a parenthesised element ref) before matching.
+        let mut mod_side = mod_side;
+        while let ExprKind::Paren(inner) = &mod_side.kind {
+            mod_side = inner;
+        }
+        let ExprKind::Binary {
+            op: BinaryOp::Mod,
+            left: elem_expr,
+            right: k_expr,
+        } = &mod_side.kind
+        else {
+            return None;
+        };
+        let mut elem_expr = elem_expr.as_ref();
+        while let ExprKind::Paren(inner) = &elem_expr.kind {
+            elem_expr = inner;
+        }
+        if self.elem_index_suffix(elem_expr, arr_name).as_deref() != Some(idx) {
+            return None;
+        }
+        // The modulus and the remainder must not read this same element:
+        // its value is what is being drawn, so a self-referential shape
+        // is not a per-element draw at all (leave it to the trial loop).
+        if self.expr_mentions_elem(k_expr, arr_name, idx)
+            || self.expr_mentions_elem(rem_side, arr_name, idx)
+        {
+            return None;
+        }
+        // Already satisfied? Ask the evaluator, not an arithmetic model:
+        // it is the same judgment the final check will make, at the
+        // operation's own width and signedness.
+        if self.exact_cmp(&BinaryOp::Eq, mod_side, rem_side) == Some(true) {
+            return Some(false);
+        }
+        let k_val = self.eval_expr(k_expr);
+        let r_val = self.eval_expr(rem_side);
+        let elem_name = format!("{}{}", arr_name, idx);
+        // Without a stored element value this repair cannot know the
+        // element's declared width/signedness for sure (the sibling
+        // arms guess 32 bits) — step aside to them and to
+        // generate-and-test instead of drawing at a guessed width.
+        // (In practice elements are populated before repairs run.)
+        let Some(cur) = self
+            .get_signal_value_by_name(&elem_name)
+            .or_else(|| self.class_elem_load(handle, arr_name, idx))
+        else {
+            return None;
+        };
+        let w = cur.width.max(1);
+        // The element's declared signedness: the class table, or the
+        // stored value's own flag (the only source for module-scope
+        // arrays, which the class table does not describe).
+        let elem_signed = self.class_prop_signed_of(handle, arr_name) || cur.is_signed;
+        // §11.8.1: the `%` (and the comparison around it) is unsigned
+        // when any operand is unsigned.
+        let op_unsigned = !elem_signed || !k_val.is_signed || !r_val.is_signed;
+        // Ceiling division on possibly-negative values (p > 0).
+        let ceil_div = |a: i128, p: i128| -> i128 { if a >= 0 { (a + p - 1) / p } else { a / p } };
+        // Per segment: (first admitted value, count of admitted values),
+        // plus the step between admitted values.
+        let (classes, step): (Vec<(i128, i128)>, i128) = if op_unsigned {
+            // Operands as bit patterns at the operation width: in an
+            // unsigned operation SV zero-extends every operand from its
+            // stored bits (§11.8.2), whatever its declared signedness.
+            let opw = w.max(k_val.width).max(r_val.width);
+            if opw > 64 {
+                return None;
+            }
+            let bits = |v: &Value| -> Option<i128> {
+                // The operand's stored bits at its own width,
+                // zero-extended (mask first: a wider internal
+                // representation must not leak bits above the width).
+                let own: i128 = if v.width >= 64 {
+                    u64::MAX as i128
+                } else {
+                    (1i128 << v.width) - 1
+                };
+                Some(v.to_u64()? as i128 & own)
+            };
+            let k_u = bits(&k_val)?;
+            let r_u = bits(&r_val)?;
+            // `% 0` has no admitted class; a remainder no `%` result can
+            // take is likewise unmodelled here — step aside.
+            if k_u == 0 || r_u >= k_u {
+                return None;
+            }
+            // Segments: the element's bit-pattern domain, intersected
+            // with the body's `inside` ranges. The hint ranges name
+            // element VALUES, so clamp them to the element's own value
+            // domain first (a signed element's values stop at
+            // 2^(w-1)-1 — patterns above that are negative values, not
+            // large positive ones), then map the negative part across
+            // the sign boundary by +full.
+            let top: i128 = if w >= 64 {
+                u64::MAX as i128
+            } else {
+                (1i128 << w) - 1
+            };
+            let full: i128 = top + 1;
+            let (vlo, vhi): (i128, i128) = if elem_signed {
+                if w >= 64 {
+                    (i64::MIN as i128, i64::MAX as i128)
+                } else {
+                    (-(1i128 << (w - 1)), (1i128 << (w - 1)) - 1)
+                }
+            } else {
+                (0, top)
+            };
+            let mut segments: Vec<(i128, i128)> = Vec::new();
+            if self.elem_inside_hint.is_empty() {
+                segments.push((0, top));
+            } else {
+                for &(rl, rh) in &self.elem_inside_hint {
+                    // A 64-bit unsigned element's bounds at or above
+                    // 2^63 reach the hint as negative i64 bit patterns;
+                    // reinterpret them as the u64 values they name (a
+                    // genuinely negative bound is meaningless for an
+                    // unsigned element, and reinterprets to a range
+                    // that is empty after clamping).
+                    let (rl, rh) = if !elem_signed && w == 64 {
+                        (rl as u64 as i128, rh as u64 as i128)
+                    } else {
+                        (rl as i128, rh as i128)
+                    };
+                    let (a, b) = (vlo.max(rl), vhi.min(rh));
+                    if a > b {
+                        continue;
+                    }
+                    if a >= 0 {
+                        segments.push((a, b));
+                    } else if b < 0 {
+                        segments.push((a + full, b + full));
+                    } else {
+                        segments.push((0, b));
+                        segments.push((a + full, top));
+                    }
+                }
+            }
+            let mut classes: Vec<(i128, i128)> = Vec::new();
+            for &(a, b) in &segments {
+                // Admitted: v = r_u + m·k_u, m >= 0.
+                let m0 = if a <= r_u { 0 } else { ceil_div(a - r_u, k_u) };
+                let f = r_u + m0 * k_u;
+                if f <= b {
+                    classes.push((f, (b - f) / k_u + 1));
+                }
+            }
+            (classes, k_u)
+        } else {
+            let k = k_val.to_i64()?;
+            let r = r_val.to_i64()?;
+            if k == 0 {
+                // `% 0` has no admitted class to draw from (§11.4.4
+                // leaves the result implementation-defined).
+                return None;
+            }
+            // The element type's domain (§6.11), as in the relational
+            // arm.
+            let (lo, hi) = if w >= 64 {
+                (i64::MIN as i128, i64::MAX as i128)
+            } else {
+                (
+                    -((1i128 << (w - 1)) as i128),
+                    ((1i128 << (w - 1)) - 1) as i128,
+                )
+            };
+            // Segments: the domain, intersected with the body's own
+            // `inside` ranges for this element when the caller supplied
+            // them.
+            let mut segments: Vec<(i128, i128)> = Vec::new();
+            if self.elem_inside_hint.is_empty() {
+                segments.push((lo, hi));
+            } else {
+                for &(rl, rh) in &self.elem_inside_hint {
+                    let (a, b) = (lo.max(rl as i128), hi.min(rh as i128));
+                    if a <= b {
+                        segments.push((a, b));
+                    }
+                }
+            }
+            if segments.is_empty() {
+                return None;
+            }
+            let p: i128 = (k as i128).abs();
+            let r128 = r as i128;
+            // |remainder| must be < |divisor| for a nonzero remainder
+            // (§11.4.4); anything else is not this model's shape.
+            if r != 0 && (r128 >= p || r128 <= -p) {
+                return None;
+            }
+            let mut classes: Vec<(i128, i128)> = Vec::new();
+            for &(a, b) in &segments {
+                let (first, count) = if r == 0 {
+                    // Multiples of p, either sign.
+                    let f = ceil_div(a, p) * p;
+                    if f > b { (f, 0) } else { (f, (b - f) / p + 1) }
+                } else if r > 0 {
+                    // v = r + m·p, m >= 0 (a non-positive v has
+                    // remainder <= 0).
+                    let m0 = if a <= r128 { 0 } else { ceil_div(a - r128, p) };
+                    let f = r128 + m0 * p;
+                    if f > b { (f, 0) } else { (f, (b - f) / p + 1) }
+                } else {
+                    // v = r - m·p, m >= 0 (a non-negative v has
+                    // remainder >= 0): values DECREASE in m, so count
+                    // from the segment top.
+                    let m_min = if r128 <= b { 0 } else { ceil_div(r128 - b, p) };
+                    let top = r128 - m_min * p;
+                    if top < a {
+                        (top, 0)
+                    } else {
+                        // Admitted values step DOWN from `top` by p
+                        // while >= a.
+                        let cnt = (top - a) / p + 1;
+                        (top - (cnt - 1) * p, cnt)
+                    }
+                };
+                if count > 0 {
+                    classes.push((first, count));
+                }
+            }
+            (classes, p)
+        };
+        let total: i128 = classes.iter().map(|&(_, c)| c).sum();
+        if total <= 0 {
+            return None;
+        }
+        use rand::Rng;
+        // Draw an ordinal over all admitted values; for domains too wide
+        // to count in a u64, draw within the widest class instead (any
+        // admitted value is a correct repair; only uniformity degrades).
+        let pick = if total <= u64::MAX as i128 {
+            let mut n = self.cur_rng().gen_range(0..total as u64) as i128;
+            let mut chosen = classes[0].0;
+            for &(first, count) in &classes {
+                if n < count {
+                    chosen = first + n * step;
+                    break;
+                }
+                n -= count;
+            }
+            chosen
+        } else {
+            let &(first, count) = classes
+                .iter()
+                .max_by_key(|&&(_, c)| c)
+                .expect("a positive total implies a nonempty class");
+            let steps = (count - 1).min(u64::MAX as i128) as u64;
+            first + (self.cur_rng().gen_range(0..=steps) as i128) * step
+        };
+        let mut v = Value::from_u64(pick as u64, w);
+        v.is_signed = elem_signed;
+        // Keep the current value on any surprise: write the candidate,
+        // judge the body through the ordinary evaluator, restore on a
+        // mismatch (same save/restore discipline as generate-and-test).
+        let saved = cur;
+        self.class_elem_store(handle, arr_name, idx, v.clone());
+        if self.module.arrays.contains_key(arr_name)
+            || self.signal_name_to_id.contains_key(elem_name.as_str())
+        {
+            self.set_signal_value_by_name(&elem_name, v.clone());
+        }
+        if self.exact_cmp(&BinaryOp::Eq, mod_side, rem_side) == Some(true) {
+            return Some(saved.to_u64() != v.to_u64());
+        }
+        // The model and the evaluator disagree for this element: put
+        // the saved value back and step aside entirely.
+        self.class_elem_store(handle, arr_name, idx, saved.clone());
+        if self.module.arrays.contains_key(arr_name)
+            || self.signal_name_to_id.contains_key(elem_name.as_str())
+        {
+            self.set_signal_value_by_name(&elem_name, saved);
+        }
+        None
     }
 
     /// Repair a packed-struct MEMBER of a fixed-array element inside a foreach
