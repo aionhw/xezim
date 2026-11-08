@@ -3750,6 +3750,8 @@ impl Simulator {
             fb_geom_saves: Vec::new(),
             fb_unbound_refs: Vec::new(),
             fb_frame_depths: Vec::new(),
+            fb_two_state_names: Vec::new(),
+            fb_two_state_marks: Vec::new(),
             param_leaf_index_cell: std::cell::OnceCell::new(),
             var_decl_leaf_index_cell: std::cell::OnceCell::new(),
             forced_names: HashSet::default(),

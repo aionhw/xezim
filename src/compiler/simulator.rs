@@ -6858,10 +6858,13 @@ pub struct Simulator {
     /// method's formals it set aside (`fb_frame_push`), restored on pop.
     fb_unbound_refs: Vec<Vec<(String, Option<Expression>, Option<String>)>>,
     /// `local_stack` depth below each active fallback frame (see
-    /// `fb_frame_push`): a write inside one leaves 2-state fitting to the
-    /// copy-back, since the carried locals' types are not in
-    /// `var_decl_types`.
+    /// `fb_frame_push`). The carried locals' types are not in
+    /// `var_decl_types`, so a write inside one asks `fb_two_state_names`.
     fb_frame_depths: Vec<usize>,
+    /// The carried locals of 2-state type of every active fallback frame,
+    /// innermost last; `fb_two_state_marks` holds where each frame's start.
+    fb_two_state_names: Vec<Arc<str>>,
+    fb_two_state_marks: Vec<usize>,
     /// Lazily-built leaf index over `module.parameters` for the bytecode
     /// compiler's suffix-match fallback (see `lookup_param_value`). Built
     /// once — parameters are final before any bytecode compilation runs.

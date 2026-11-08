@@ -1500,7 +1500,12 @@ impl Simulator {
             .is_some_and(|f| f.contains_key(name));
         if in_frame {
             if self.fb_frame_depths.last().copied() == Some(self.local_stack.len() - 1) {
-                return false;
+                // A fallback's carried local: its declared kind travelled
+                // with it (`fb_frame_push`).
+                let start = self.fb_two_state_marks.last().copied().unwrap_or(0);
+                return self.fb_two_state_names[start..]
+                    .iter()
+                    .any(|n| n.as_ref() == name);
             }
         } else if !self.in_process_block_scope()
             || self.signal_name_to_id.contains_key(name)

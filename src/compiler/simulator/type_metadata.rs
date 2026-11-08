@@ -654,6 +654,19 @@ impl Simulator {
             }
         }
         self.fb_frame_depths.push(depth);
+        // §6.11.1: each write to a 2-state carried local drops X/Z then and
+        // there (`lvalue_is_two_state_local`), not only at the copy-back: a
+        // loop run as one fallback (`foreach (m[i]) s += m[i];`) otherwise
+        // carried `s = x` into every later trip.
+        self.fb_two_state_marks.push(self.fb_two_state_names.len());
+        for l in locals {
+            if let LocalKind::Int {
+                two_state: true, ..
+            } = l.kind
+            {
+                self.fb_two_state_names.push(l.name.clone());
+            }
+        }
         self.push_local_frame(f);
         for l in locals {
             if let Some(class) = &l.class {
@@ -718,6 +731,9 @@ impl Simulator {
     ) {
         let (depth, mark, geom_mark) = at;
         self.fb_frame_depths.pop();
+        if let Some(m) = self.fb_two_state_marks.pop() {
+            self.fb_two_state_names.truncate(m);
+        }
         while self.fb_geom_saves.len() > geom_mark {
             if let Some(meta) = self.fb_geom_saves.pop() {
                 self.restore_formal_metadata(meta);
