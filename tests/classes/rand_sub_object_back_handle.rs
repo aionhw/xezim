@@ -187,3 +187,50 @@ endmodule
         .collect();
     assert_eq!(lines, ["ok 4 bad 0 seen 15"]);
 }
+
+/// The back handle may be declared through a class type parameter
+/// (`Holder #(cfg_c)` declares `T p`).
+#[test]
+fn sub_object_reads_parent_through_type_parameter_back_handle() {
+    let result = xezim::simulate(
+        r#"
+typedef class sub_c;
+class cfg_c;
+  rand sub_c sub;
+  rand bit [7:0] x;
+  constraint k { x inside {[1:200]}; }
+  function new(); sub = new(); sub.p = this; endfunction
+endclass
+class holder_c #(type T = int);
+  T p;
+endclass
+class sub_c extends holder_c #(cfg_c);
+  rand bit [7:0] y;
+  constraint s { y == p.x + 8'd1; }
+endclass
+module t;
+  initial begin
+    cfg_c c = new();
+    int ok = 0, bad = 0;
+    repeat (20) begin
+      c.x = 255;
+      if (c.randomize()) begin
+        ok++;
+        bad += !(c.x inside {[1:200]}) || c.sub.y != c.x + 8'd1;
+      end
+    end
+    $display("ok %0d bad %0d", ok, bad);
+    $finish;
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result
+        .output
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(lines, ["ok 20 bad 0"]);
+}

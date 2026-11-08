@@ -191,29 +191,14 @@ impl Simulator {
         })
     }
 
-    /// The object held by class-typed member `m` of `obj`, 0 for null or for
-    /// a member that is not a class handle.
+    /// The object held by class-typed member `m` of `obj` (a class type
+    /// parameter counts as its binding), 0 for null or for a member that is
+    /// not a class handle.
     fn csp_class_handle(&self, obj: usize, m: &str) -> usize {
-        let inst = self.heap.get(obj).and_then(|o| o.as_ref());
-        let mut cn = inst.map(|i| i.class_name.clone());
-        for _ in 0..64 {
-            let Some(cd) = cn.and_then(|n| self.module.classes.get(&n)) else {
-                break;
-            };
-            if let Some(sig) = cd.properties.get(m) {
-                let is_obj = sig
-                    .type_name
-                    .as_ref()
-                    .is_some_and(|tn| self.module.classes.contains_key(tn));
-                return if is_obj {
-                    self.member_handle(obj, m).unwrap_or(0)
-                } else {
-                    0
-                };
-            }
-            cn = cd.extends.clone();
+        match self.prop_class_or_spec_type(obj, m) {
+            Some(_) => self.member_handle(obj, m).unwrap_or(0),
+            None => 0,
         }
-        0
     }
 
     /// Whether some item of `constraints` may read member `prop`: a name or
