@@ -33,6 +33,7 @@ impl Simulator {
             current_static_task: self.current_static_task.clone(),
             current_auto_task: self.current_auto_task.clone(),
             task_string_formals: self.task_string_formals.clone(),
+            local_meta_claims: self.local_meta_claims.clone(),
         }
     }
 
@@ -94,6 +95,7 @@ impl Simulator {
             && self.current_static_task.is_none()
             && self.current_auto_task.is_none()
             && self.task_string_formals.is_empty()
+            && self.local_meta_claims.is_empty()
             && !self.ref_redirect_hot
     }
 
@@ -128,6 +130,7 @@ impl Simulator {
             current_static_task: self.current_static_task.take(),
             current_auto_task: self.current_auto_task.take(),
             task_string_formals: std::mem::take(&mut self.task_string_formals),
+            local_meta_claims: std::mem::take(&mut self.local_meta_claims),
         }
     }
 
@@ -159,7 +162,8 @@ impl Simulator {
         self.current_static_task = ctx.current_static_task;
         self.current_auto_task = ctx.current_auto_task;
         self.task_string_formals = ctx.task_string_formals;
-        if !self.local_meta_saved.is_empty() {
+        self.local_meta_claims = ctx.local_meta_claims;
+        if !self.local_meta_cache.is_empty() && !self.local_meta_claims.is_empty() {
             self.reapply_local_meta();
         }
     }

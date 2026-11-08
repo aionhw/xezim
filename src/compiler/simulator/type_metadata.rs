@@ -241,44 +241,80 @@ impl Simulator {
     }
 
     /// The name-keyed metadata registered for local `name` now. Only a
-    /// struct-typed local has `name.member` entries; the scan for them is
-    /// skipped for every other local.
-    fn capture_local_meta(&self, name: &str, origin: MetaOrigin) -> LocalMeta {
+    /// struct-typed local has `name.member` entries. The first capture of a
+    /// declaration scans the tables for them; a later one (`known`, the same
+    /// declaration's last capture) reads just the keys that one found, so a
+    /// swap costs the local's own entries, not the size of the tables (#943).
+    fn capture_local_meta(&self, name: &str, known: Option<&LocalMeta>) -> LocalMeta {
         let m = &self.module;
         let members =
             m.struct_members.contains_key(name) || m.packed_struct_fields.contains_key(name);
+        let known = known.filter(|k| k.members == members);
         let pfx = format!("{name}.");
-        let keyed = |k: &str| k == name || (members && k.starts_with(&pfx));
-        fn pick<V: Clone>(
+        fn pick<V: Clone, W>(
             map: &HashMap<String, V>,
             name: &str,
+            pfx: &str,
             members: bool,
-            keyed: &dyn Fn(&str) -> bool,
+            known: Option<&[(String, W)]>,
         ) -> Vec<(String, V)> {
-            if members {
-                (map.iter())
-                    .filter(|(k, _)| keyed(k))
+            let bare = map.get(name).map(|v| (name.to_string(), v.clone()));
+            match known {
+                _ if !members => bare.into_iter().collect(),
+                Some(keys) => {
+                    bare.into_iter()
+                        .chain(keys.iter().filter(|(k, _)| k != name).filter_map(|(k, _)| {
+                            map.get(k.as_str()).map(|v| (k.clone(), v.clone()))
+                        }))
+                        .collect()
+                }
+                None => (map.iter())
+                    .filter(|(k, _)| *k == name || k.starts_with(pfx))
                     .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            } else {
-                map.get(name)
-                    .map(|v| (name.to_string(), v.clone()))
-                    .into_iter()
-                    .collect()
+                    .collect(),
             }
         }
         LocalMeta {
-            origin,
             members,
             typedef: self.var_typedef_types.get(name).cloned(),
             class: self.var_class_types.get(name).cloned(),
             container: self.var_container_types.get(name).cloned(),
             type_args: self.var_type_args.get(name).cloned(),
-            decl_types: pick(&m.var_decl_types, name, members, &keyed),
-            struct_members: pick(&m.struct_members, name, members, &keyed),
-            packed_fields: pick(&m.packed_struct_fields, name, members, &keyed),
-            elem_widths: pick(&m.packed_signal_elem_widths, name, members, &keyed),
-            full_dims: pick(&m.packed_full_dims, name, members, &keyed),
+            decl_types: pick(
+                &m.var_decl_types,
+                name,
+                &pfx,
+                members,
+                known.map(|k| &k.decl_types[..]),
+            ),
+            struct_members: pick(
+                &m.struct_members,
+                name,
+                &pfx,
+                members,
+                known.map(|k| &k.struct_members[..]),
+            ),
+            packed_fields: pick(
+                &m.packed_struct_fields,
+                name,
+                &pfx,
+                members,
+                known.map(|k| &k.packed_fields[..]),
+            ),
+            elem_widths: pick(
+                &m.packed_signal_elem_widths,
+                name,
+                &pfx,
+                members,
+                known.map(|k| &k.elem_widths[..]),
+            ),
+            full_dims: pick(
+                &m.packed_full_dims,
+                name,
+                &pfx,
+                members,
+                known.map(|k| &k.full_dims[..]),
+            ),
             width: self.widths.get(name).copied(),
             signed: self.signed_signals.contains(name),
             real: self.real_signals.contains(name),
@@ -287,8 +323,8 @@ impl Simulator {
     }
 
     /// Make `meta` the name-keyed metadata of local `name` again, replacing
-    /// what the installed declaration (`members`: a struct's) registered.
-    fn apply_local_meta(&mut self, name: &str, meta: &LocalMeta, members: bool) {
+    /// `out`, the installed declaration's entries just captured.
+    fn apply_local_meta(&mut self, name: &str, meta: &LocalMeta, out: &LocalMeta) {
         fn put<V: Clone>(map: &mut HashMap<String, V>, k: &str, v: &Option<V>) {
             match v {
                 Some(v) => {
@@ -309,14 +345,12 @@ impl Simulator {
         fn keyed<V: Clone>(
             map: &mut HashMap<String, V>,
             name: &str,
-            members: bool,
+            out: &[(String, V)],
             v: &[(String, V)],
         ) {
-            if members {
-                let pfx = format!("{name}.");
-                map.retain(|k, _| k != name && !k.starts_with(&pfx));
-            } else {
-                map.remove(name);
+            map.remove(name);
+            for (k, _) in out {
+                map.remove(k.as_str());
             }
             map.extend(v.iter().cloned());
         }
@@ -329,40 +363,64 @@ impl Simulator {
         flag(&mut self.real_signals, name, meta.real);
         flag(&mut self.string_signals, name, meta.string);
         let m = &mut self.module;
-        keyed(&mut m.var_decl_types, name, members, &meta.decl_types);
-        keyed(&mut m.struct_members, name, members, &meta.struct_members);
+        keyed(
+            &mut m.var_decl_types,
+            name,
+            &out.decl_types,
+            &meta.decl_types,
+        );
+        keyed(
+            &mut m.struct_members,
+            name,
+            &out.struct_members,
+            &meta.struct_members,
+        );
         keyed(
             &mut m.packed_struct_fields,
             name,
-            members,
+            &out.packed_fields,
             &meta.packed_fields,
         );
         keyed(
             &mut m.packed_signal_elem_widths,
             name,
-            members,
+            &out.elem_widths,
             &meta.elem_widths,
         );
-        keyed(&mut m.packed_full_dims, name, members, &meta.full_dims);
+        keyed(
+            &mut m.packed_full_dims,
+            name,
+            &out.full_dims,
+            &meta.full_dims,
+        );
     }
 
-    /// Save the installed metadata of `name` for every frame sharing it.
-    fn save_installed_meta(&mut self, name: &str) {
-        let Some(owner) = self.local_meta_owner.get(name) else {
-            return;
-        };
-        let meta = self.capture_local_meta(name, owner.origin.clone());
-        for g in owner.gens.clone() {
-            let list = self.local_meta_saved.entry(g).or_default();
-            list.retain(|(n, _)| n != name);
-            list.push((name.to_string(), meta.clone()));
+    /// Capture the installed metadata of `name`, which declaration `origin`
+    /// registered, into `local_meta_cache` and return a copy of it.
+    fn save_installed_meta(&mut self, name: &str, origin: u32) -> LocalMeta {
+        let list = self.local_meta_cache.entry(name.to_string()).or_default();
+        let at = list.iter().position(|(o, _)| *o == origin);
+        let known = at.map(|i| std::mem::take(&mut list[i].1));
+        let meta = self.capture_local_meta(name, known.as_ref());
+        if meta.members && known.is_none_or(|k| k.members != meta.members) {
+            self.local_meta_scans += 1;
         }
+        let list = self
+            .local_meta_cache
+            .get_mut(name)
+            .expect("entry made above");
+        match at {
+            Some(i) => list[i].1 = meta.clone(),
+            None => list.push((origin, meta.clone())),
+        }
+        meta
     }
 
     /// A frame-local `name` declared by `stmt` is being declared in the
-    /// current frame: save the metadata a live frame registered under the
-    /// same name for another declaration, then make this frame its owner.
-    /// Frames running the same declaration share the installed entries.
+    /// current frame: record the claim in the running process's context, and
+    /// when another declaration's metadata is installed under the name, save
+    /// it before this one registers its own. Frames running the same
+    /// declaration share the installed entries.
     pub(super) fn claim_local_meta(&mut self, name: &str, stmt: &Statement) {
         let Some(&g) = self.local_gen_stack.last() else {
             return;
@@ -372,115 +430,115 @@ impl Simulator {
             class: self.class_context_stack.last().cloned().flatten(),
             spec: self.current_spec.clone(),
         };
-        match self.local_meta_owner.get_mut(name) {
-            Some(owner) if owner.origin == origin => {
-                if !owner.gens.contains(&g) {
-                    owner.gens.push(g);
-                }
+        let id = match self.local_meta_origin_ids.get(&origin) {
+            Some(&id) => id,
+            None => {
+                let id = self.local_meta_origins.len() as u32;
+                self.local_meta_origins.push(origin.clone());
+                self.local_meta_origin_ids.insert(origin, id);
+                id
             }
-            Some(_) => {
-                self.save_installed_meta(name);
-                self.local_meta_owner.insert(
-                    name.to_string(),
-                    MetaOwner {
-                        origin,
-                        gens: vec![g],
-                    },
-                );
+        };
+        // The frame's claims are the tail of the list (deeper frames popped
+        // theirs). A declaration run again (a loop body) moves its claim to
+        // the end, so the list stays bounded by the frame's declarations and
+        // the one executed last wins.
+        let tail = self
+            .local_meta_claims
+            .iter()
+            .rposition(|c| c.frame != g)
+            .map_or(0, |i| i + 1);
+        let again = self.local_meta_claims[tail..]
+            .iter()
+            .position(|c| c.name == name && c.origin == id);
+        match again {
+            Some(i) if tail + i + 1 == self.local_meta_claims.len() => {}
+            Some(i) => {
+                let c = self.local_meta_claims.remove(tail + i);
+                self.local_meta_claims.push(c);
+            }
+            None => self.local_meta_claims.push(MetaClaim {
+                frame: g,
+                name: name.to_string(),
+                origin: id,
+            }),
+        }
+        match self.local_meta_owner.get(name).copied() {
+            Some(o) if o == id => {}
+            Some(o) => {
+                self.save_installed_meta(name, o);
+                self.local_meta_owner.insert(name.to_string(), id);
             }
             None => {
-                self.local_meta_owner.insert(
-                    name.to_string(),
-                    MetaOwner {
-                        origin,
-                        gens: vec![g],
-                    },
-                );
+                self.local_meta_owner.insert(name.to_string(), id);
             }
         }
-        self.local_meta_owned
-            .entry(g)
-            .or_default()
-            .push(name.to_string());
     }
 
-    /// The running frames may hold locals whose metadata another frame's
-    /// declaration displaced since: restore them, the innermost frame's
-    /// declaration winning over an outer one's of the same name.
+    /// The running process's frames may hold locals whose metadata another
+    /// process's declaration displaced since: install them again, a later
+    /// claim of a name (an inner frame's, or the declaration executed last in
+    /// a frame) winning over an earlier one. Only contested names (those with
+    /// a `local_meta_cache` entry) are looked at, and a swap moves just the
+    /// name's own entries, so the work is bounded by the process's claims of
+    /// contested names, whatever the size of the tables (#943).
     pub(super) fn reapply_local_meta(&mut self) {
-        self.local_meta_reapplies += 1;
-        let mut seen: HashSet<String> = HashSet::default();
-        for i in (0..self.local_gen_stack.len()).rev() {
-            let g = self.local_gen_stack[i];
-            let mut kept = Vec::new();
-            for (name, meta) in self.local_meta_saved.remove(&g).unwrap_or_default() {
-                if !seen.insert(name.clone()) {
-                    kept.push((name, meta));
-                    continue;
-                }
-                match self.local_meta_owner.get_mut(&name) {
-                    Some(owner) if owner.origin == meta.origin => {
-                        if !owner.gens.contains(&g) {
-                            owner.gens.push(g);
-                        }
-                        continue;
-                    }
-                    Some(_) => self.save_installed_meta(&name),
-                    None => {}
-                }
-                let members = meta.members
-                    || self.module.struct_members.contains_key(&name)
-                    || self.module.packed_struct_fields.contains_key(&name);
-                self.apply_local_meta(&name, &meta, members);
-                self.local_meta_owner.insert(
-                    name.clone(),
-                    MetaOwner {
-                        origin: meta.origin.clone(),
-                        gens: vec![g],
-                    },
-                );
-            }
-            if let Some(names) = self.local_meta_owned.get(&g) {
-                for n in names {
-                    if !seen.contains(n)
-                        && self
-                            .local_meta_owner
-                            .get(n)
-                            .is_some_and(|o| o.gens.contains(&g))
-                    {
-                        seen.insert(n.clone());
-                    }
-                }
-            }
-            if !kept.is_empty() {
-                self.local_meta_saved.insert(g, kept);
-            }
+        if self.local_meta_cache.is_empty() || self.local_meta_claims.is_empty() {
+            return;
         }
+        self.local_meta_reapplies += 1;
+        let claims = std::mem::take(&mut self.local_meta_claims);
+        for (i, c) in claims.iter().enumerate().rev() {
+            if !self.local_meta_cache.contains_key(&c.name)
+                || claims[i + 1..].iter().any(|d| d.name == c.name)
+            {
+                continue;
+            }
+            self.install_local_meta(&c.name, c.origin);
+        }
+        self.local_meta_claims = claims;
     }
 
-    /// Frame generation `g` is gone: forget what it owned and what it saved.
-    /// True when a name it owned is left without an owner while a live frame
-    /// saved metadata under that name: only then can `reapply_local_meta`
-    /// restore anything. Re-running it after every other pop rescanned every
-    /// live frame per call, so a displaced outer local made each later call
-    /// pay for the whole stack (#833).
+    /// Install the cached metadata of declaration `origin` under `name`,
+    /// saving the installed declaration's first.
+    fn install_local_meta(&mut self, name: &str, origin: u32) {
+        let Some(cur) = self.local_meta_owner.get(name).copied() else {
+            return;
+        };
+        if cur == origin {
+            return;
+        }
+        let Some(at) = (self.local_meta_cache.get(name))
+            .and_then(|l| l.iter().position(|(o, _)| *o == origin))
+        else {
+            return;
+        };
+        let out = self.save_installed_meta(name, cur);
+        let list = self.local_meta_cache.get_mut(name).expect("checked above");
+        let meta = std::mem::take(&mut list[at].1);
+        self.apply_local_meta(name, &meta, &out);
+        let list = self.local_meta_cache.get_mut(name).expect("checked above");
+        list[at].1 = meta;
+        if let Some(o) = self.local_meta_owner.get_mut(name) {
+            *o = origin;
+        }
+        self.local_meta_swaps += 1;
+    }
+
+    /// Frame generation `g` is gone: drop its claims (and any of a frame
+    /// above it). True when one was of a contested name: the process's
+    /// remaining claims may need their own declaration's metadata back.
+    /// Re-checking after every other pop rescanned every live frame per
+    /// call, so a displaced outer local made each later call pay for the
+    /// whole stack (#833).
     fn release_local_meta(&mut self, g: u64) -> bool {
-        self.local_meta_saved.remove(&g);
         let mut restorable = false;
-        if let Some(names) = self.local_meta_owned.remove(&g) {
-            for n in names {
-                if let Some(owner) = self.local_meta_owner.get_mut(&n) {
-                    owner.gens.retain(|&x| x != g);
-                    if owner.gens.is_empty() {
-                        self.local_meta_owner.remove(&n);
-                        restorable = restorable
-                            || self
-                                .local_meta_saved
-                                .values()
-                                .any(|l| l.iter().any(|(s, _)| *s == n));
-                    }
-                }
+        while let Some(c) = self.local_meta_claims.last() {
+            if c.frame < g {
+                break;
             }
+            restorable = restorable || self.local_meta_cache.contains_key(&c.name);
+            self.local_meta_claims.pop();
         }
         restorable
     }
@@ -893,7 +951,7 @@ impl Simulator {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
         if let Some(g) = self.local_gen_stack.pop() {
-            if !self.local_meta_owned.is_empty() && self.release_local_meta(g) {
+            if !self.local_meta_claims.is_empty() && self.release_local_meta(g) {
                 self.reapply_local_meta();
             }
             if self.task_string_formals.last().is_some_and(|e| e.fgen == g) {
@@ -913,7 +971,7 @@ impl Simulator {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
         if let Some(g) = self.local_gen_stack.pop() {
-            if !self.local_meta_owned.is_empty() && self.release_local_meta(g) {
+            if !self.local_meta_claims.is_empty() && self.release_local_meta(g) {
                 self.reapply_local_meta();
             }
             if self.task_string_formals.last().is_some_and(|e| e.fgen == g) {

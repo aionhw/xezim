@@ -2122,12 +2122,12 @@ struct WaiterValueCtx {
 /// typedef, class, declared type, struct members, packed layout and widths,
 /// under the bare name and its `name.member` keys. Two concurrent processes
 /// whose same-named locals differ in type share these tables, so the one
-/// that declared last displaced the other's; `capture_local_meta` saves a
-/// displaced entry and `reapply_local_meta` restores it when its process
-/// runs again.
+/// that declared last displaced the other's; `capture_local_meta` keeps a
+/// displaced declaration's entries in `local_meta_cache` and
+/// `reapply_local_meta` installs them again when a process whose frames
+/// claim that declaration runs.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct LocalMeta {
-    origin: MetaOrigin,
     /// A struct's: `name.member` entries belong to it.
     members: bool,
     typedef: Option<String>,
@@ -2147,20 +2147,24 @@ pub(super) struct LocalMeta {
 
 /// Where a frame-local's declaration came from: its statement, and the class
 /// and specialization it ran in. Frames running the same declaration register
-/// the same metadata.
-#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// the same metadata, so the cache of displaced metadata is keyed by it.
+#[derive(Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct MetaOrigin {
     span: (usize, usize),
     class: Option<String>,
     spec: Option<(String, String)>,
 }
 
-/// The declaration whose metadata is installed under a local's name, and the
-/// live frames that share it.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub(super) struct MetaOwner {
-    origin: MetaOrigin,
-    gens: Vec<u64>,
+/// A frame-local declaration a process has executed: the frame it declared
+/// into, the local's name and its declaration (an index into
+/// `local_meta_origins`). The list rides the process context, not the frame
+/// generation: a fork child shares its parent's frames (§9.3.2), and its
+/// block's `T x;` hides the parent's `U x;` from the child only.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct MetaClaim {
+    frame: u64,
+    name: String,
+    origin: u32,
 }
 
 /// A process parked on a CLASS-FIELD named event (`event m_event` inside a
@@ -4867,6 +4871,8 @@ struct ProcessContext {
     current_auto_task: Option<String>,
     /// See `Simulator::task_string_formals`.
     task_string_formals: Vec<TaskFrameStrings>,
+    /// See `Simulator::local_meta_claims`.
+    local_meta_claims: Vec<MetaClaim>,
 }
 
 /// Frame-local string classifications for task formals and scalar locals.
@@ -7768,13 +7774,19 @@ pub struct Simulator {
     /// `var_class_types`; populated at VarDecl exec time when the
     /// data type is a `TypeReference` whose name is in `module.typedefs`.
     var_typedef_types: HashMap<String, String>,
-    /// The frame generation whose declaration last registered each
-    /// frame-local's name-keyed metadata, the names each generation owns,
-    /// and the metadata of locals another frame's declaration displaced, by
-    /// the generation they belong to (see `LocalMeta`).
-    local_meta_owner: HashMap<String, MetaOwner>,
-    local_meta_owned: HashMap<u64, Vec<String>>,
-    local_meta_saved: HashMap<u64, Vec<(String, LocalMeta)>>,
+    /// The declaration whose name-keyed metadata is installed under each
+    /// frame-local's name (an index into `local_meta_origins`, interned
+    /// through `local_meta_origin_ids`), and the metadata of the declarations
+    /// another one displaced, by name and declaration (see `LocalMeta`). A
+    /// name with a cache entry is contested: only its claims are checked when
+    /// a process runs again, and a swap moves just that name's own entries.
+    local_meta_owner: HashMap<String, u32>,
+    local_meta_origins: Vec<MetaOrigin>,
+    local_meta_origin_ids: HashMap<MetaOrigin, u32>,
+    local_meta_cache: HashMap<String, Vec<(u32, LocalMeta)>>,
+    /// The frame-local declarations the running process's live frames
+    /// executed, outermost first (see `MetaClaim`); part of its context.
+    local_meta_claims: Vec<MetaClaim>,
     /// Names of `string`-typed variables (locals, params, package globals) so
     /// `{a, b}` concatenation involving them is treated as string concat.
     string_signals: HashSet<String>,
@@ -9128,9 +9140,14 @@ pub struct Simulator {
     /// Compiled-to-compiled calls dispatched directly (`vm_try_direct_call_from`),
     /// without the interpreter's binding (`[PROF] vm_direct_calls`).
     vm_direct_calls: u64,
-    /// Rescans of the live frames for displaced local metadata
-    /// (`reapply_local_meta`, `[PROF] local_meta_reapplies`).
+    /// Checks of the running process's claims for displaced local metadata
+    /// (`reapply_local_meta`, `[PROF] local_meta_reapplies`), the displaced
+    /// declarations installed again (`[PROF] local_meta_swaps`), and the
+    /// captures that scanned the tables for a struct local's `name.member`
+    /// keys (`[PROF] local_meta_scans`, one per declaration at most).
     local_meta_reapplies: u64,
+    local_meta_swaps: u64,
+    local_meta_scans: u64,
     /// SV-2023: blocked mailbox `get`/`peek` proxies keyed by mailbox handle.
     /// Each waiter records the suspended process pid, the destination lvalue
     /// expression to receive the value, and the post-get continuation
