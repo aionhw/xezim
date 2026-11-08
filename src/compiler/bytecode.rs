@@ -870,6 +870,29 @@ pub enum Insn {
     /// the four-state VM does not write it because it is dead on both paths.
     /// Appended so existing serialized instruction discriminants stay stable.
     CmpBranchConst(BinOpConstKind, RegId, Box<Value>, RegId, u32),
+    /// §7.5 / §7.10 / §7.4.6: element read of a design-scope dynamic array or
+    /// queue (dest, operand, index register). The exec arm reads the LIVE
+    /// collection exactly as the interpreter's element read does: the element
+    /// cell for an index inside both `size()` and the placeholder cell range,
+    /// otherwise the interpreter's own element read (by-name storage past the
+    /// cells, the element type's default past `size()` or for an x index). A
+    /// dense `LoadArrayElem` over the placeholder cells read x from index 64
+    /// on and a stale element past `size()`. Main executor only: every other
+    /// executor and lowering treats it like `EvalExprFallback`.
+    LoadDynElem(RegId, Box<DynElemOp>, RegId),
+}
+
+/// The collection a `LoadDynElem` reads.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DynElemOp {
+    /// The collection, as its `arrays` key.
+    pub name: Box<str>,
+    /// `<name>.size`, the key its live size is kept under.
+    pub size_key: Box<str>,
+    /// The placeholder element cells `(first_id, lo, hi)`, if any.
+    pub cells: Option<(usize, i64, i64)>,
+    /// Context width of the read (the interpreter's x-index default).
+    pub ctx_width: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<Insn>() <= 24, "Insn grew past 24 bytes");
@@ -1245,6 +1268,7 @@ impl Insn {
             | BinOpConst(a, b, _, _)
             | BlockingAssignBitDyn(_, a, b)
             | LoadArrayElem(a, _, b)
+            | LoadDynElem(a, _, b)
             | BlockingAssignArray(_, a, b, _)
             | LoadClassMember(a, b, _)
             | StoreClassMember(a, b, _) => {
@@ -1473,6 +1497,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::LoadSignalRange(..) => "LoadRng",
         Insn::LoadSignalRangeDyn(..) => "LoadRngDyn",
         Insn::LoadArrayElem(..) => "LoadArr",
+        Insn::LoadDynElem(..) => "LoadDynElem",
         Insn::BlockingAssign(..) => "Assign",
         Insn::BlockingAssignRange(..) => "AssignRng",
         Insn::BlockingAssignRangeDyn(..) => "AssignRngDyn",
@@ -2913,6 +2938,12 @@ impl<'a> BytecodeCompiler<'a> {
             .is_some_and(|s| d.contains(&s.name.name) || q.contains(&s.name.name))
     }
 
+    /// Is `name` (an `arrays` key) a dynamic array or queue?
+    fn is_dynamic_collection(&self, name: &str) -> bool {
+        self.dynamic_arrays.is_some_and(|d| d.contains(name))
+            || self.queue_vars.is_some_and(|q| q.contains(name))
+    }
+
     pub fn set_array_first_id(&mut self, arrays: &'a HashMap<Arc<str>, (usize, i64, i64)>) {
         self.array_first_id = Some(arrays);
     }
@@ -2922,7 +2953,20 @@ impl<'a> BytecodeCompiler<'a> {
     /// name. A block-local array of a process is declared at run time into
     /// by-name storage that has neither, and a compiled store into it was
     /// dropped: `for (int i ...) arr[i] = v;` left `arr` 0 (§6.21).
+    ///
+    /// A dynamic array or queue has no operand either (§7.5, §7.10): its
+    /// `0..63` element cells are only a placeholder backing. Elements past
+    /// them live in by-name storage, and a cell outside the live size keeps
+    /// a stale value, so a compiled read of `q[64]` came back x (a 2-state
+    /// `t += q[i]` then summed to 0) and `q[i]` past `q.size()` read an old
+    /// element instead of the default (§7.4.6). A plain element read compiles
+    /// to `Insn::LoadDynElem` instead; every other shape bails to the
+    /// interpreter, as stores already do (`collection_store_denied`).
     fn array_operand(&mut self, name: String) -> Option<Box<ArrayOperand>> {
+        if self.is_dynamic_collection(&name) {
+            self.bail("dynamic_collection_elem");
+            return None;
+        }
         if let Some(&(first_id, lo, hi)) = self
             .array_first_id
             .and_then(|arrays| arrays.get(name.as_str()))
@@ -3856,6 +3900,10 @@ impl<'a> BytecodeCompiler<'a> {
             }
             if let Some(ew) = self.decl_elem_width_in(&p.data_type, Some(&name)) {
                 if ew > 0 && w > ew && w % ew == 0 {
+                    if self.decl_outer_dim_unnormalized(&p.data_type) {
+                        self.bail("Expr_Call_packed_outer_dim");
+                        return None;
+                    }
                     elem_binds.push((p.name.name.clone(), ew));
                 }
             }
@@ -4103,6 +4151,10 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                         if let Some(ew) = self.decl_elem_width(data_type) {
                             if ew > 0 && w > ew && w % ew == 0 {
+                                if self.decl_outer_dim_unnormalized(data_type) {
+                                    self.bail("Expr_Call_packed_outer_dim");
+                                    return false;
+                                }
                                 self.local_var_elem.insert(d.name.name.clone(), ew);
                             }
                         }
@@ -6929,6 +6981,11 @@ impl<'a> BytecodeCompiler<'a> {
         if lo1 < 0 || lo2 < 0 {
             return None;
         }
+        // A queue or dynamic array of rows: see `array_operand`.
+        if self.is_dynamic_collection(&key) {
+            self.bail("dynamic_collection_elem");
+            return None;
+        }
         let first_id = *self
             .signal_name_to_id
             .get(format!("{}[{}][{}]", key, lo1, lo2).as_str())?;
@@ -7875,6 +7932,20 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         scoped_arrays::resolve_type_width(dt, self.params, self.typedefs, &view)
+    }
+
+    /// §7.4.1: is the outermost packed dimension of `dt` other than the
+    /// normalized `[N-1:0]` (`u8_t [0:3]`, `logic [1:4][7:0]`)? A
+    /// register-backed local's element select slices `[i*ew +: ew]`, which
+    /// addresses only that shape: an ascending local came back reversed.
+    fn decl_outer_dim_unnormalized(&self, dt: &crate::ast::types::DataType) -> bool {
+        let (Some(p), Some(tt)) = (self.params, self.typedef_types) else {
+            return false;
+        };
+        crate::compiler::elaborate::packed_full_dims_of(dt, p)
+            .or_else(|| crate::compiler::elaborate::packed_full_dims_chained(dt, p, tt))
+            .and_then(|d| d.first().copied())
+            .is_some_and(|(l, r)| l < r || l.min(r) != 0)
     }
 
     /// Packed ELEMENT width of a declared type, for register-backed locals:
@@ -15903,6 +15974,25 @@ impl<'a> BytecodeCompiler<'a> {
                     if let Some(name) = self.lookup_array_name(hier) {
                         let idx_reg = self.compile_expr(index, 0)?;
                         let dest = self.alloc_reg();
+                        // §7.5 / §7.10: a dynamic array or queue reads its
+                        // live collection (see `Insn::LoadDynElem`).
+                        if self.is_dynamic_collection(&name) {
+                            let cells = self
+                                .array_first_id
+                                .and_then(|m| m.get(name.as_str()).copied());
+                            let size_key = format!("{name}.size").into_boxed_str();
+                            self.emit(Insn::LoadDynElem(
+                                dest,
+                                Box::new(DynElemOp {
+                                    name: name.into_boxed_str(),
+                                    size_key,
+                                    cells,
+                                    ctx_width,
+                                }),
+                                idx_reg,
+                            ));
+                            return Some(dest);
+                        }
                         let array = self.array_operand(name)?;
                         self.emit(Insn::LoadArrayElem(dest, array, idx_reg));
                         return Some(dest);
@@ -21896,7 +21986,7 @@ impl<'a> BytecodeCompiler<'a> {
                 f(*i);
                 f(*v);
             }
-            Insn::LoadArrayElem(_, _, i) => f(*i),
+            Insn::LoadArrayElem(_, _, i) | Insn::LoadDynElem(_, _, i) => f(*i),
             Insn::NbaAssignArray(_, i, v, _) | Insn::BlockingAssignArray(_, i, v, _) => {
                 f(*i);
                 f(*v);
@@ -22232,6 +22322,7 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::LoadSignalBit(d, _, _)
             | Insn::LoadSignalRangeDyn(d, _, _, _)
             | Insn::LoadArrayElem(d, _, _)
+            | Insn::LoadDynElem(d, _, _)
             | Insn::Pow(d, _, _)
             | Insn::Add(d, _, _)
             | Insn::Sub(d, _, _)
@@ -22373,6 +22464,7 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::BranchUnlessZero(a, _)
             | Insn::LoadSignalRangeDyn(_, _, a, _)
             | Insn::LoadArrayElem(_, _, a)
+            | Insn::LoadDynElem(_, _, a)
             | Insn::NbaAssign(_, a, _)
             | Insn::BlockingAssign(_, a, _)
             | Insn::NbaAssignRange(_, _, _, a)
@@ -22561,6 +22653,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::LoadSignalBit(d, _, _)
                 | Insn::LoadSignalRange(d, _, _, _)
                 | Insn::LoadArrayElem(d, _, _)
+                | Insn::LoadDynElem(d, _, _)
                 | Insn::Add(d, _, _)
                 | Insn::Sub(d, _, _)
                 | Insn::Mul(d, _, _)
@@ -23130,6 +23223,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::Replicate(d, _, _)
                 | Insn::Select(d, _, _, _)
                 | Insn::LoadArrayElem(d, _, _)
+                | Insn::LoadDynElem(d, _, _)
                 | Insn::Move(d, _)
                 | Insn::EvalExprFallback(_, d, _)
                 | Insn::SetSigned(d)
@@ -23920,7 +24014,8 @@ impl<'a> BytecodeCompiler<'a> {
                 // instead of the element.
                 Insn::RangeSelect(d, _, _, _)
                 | Insn::RangeSelectW(d, _, _, _, _)
-                | Insn::LoadArrayElem(d, _, _) => store(&mut rw, *d, None),
+                | Insn::LoadArrayElem(d, _, _)
+                | Insn::LoadDynElem(d, _, _) => store(&mut rw, *d, None),
 
                 // Stamp/clear `is_signed`; storage and width are untouched.
                 Insn::SetSigned(_) | Insn::ClearSigned(_) | Insn::DropXz(_) => {}
@@ -27580,7 +27675,10 @@ fn ts_for_each_reg_def(ins: &Insn, mut f: impl FnMut(RegId)) {
             f(a.d1);
             f(a.d2);
         }
-        Insn::EvalExprFallback(_, d, _) | Insn::Format(d, _) | Insn::StrOp(d, _, _) => f(*d),
+        Insn::EvalExprFallback(_, d, _)
+        | Insn::LoadDynElem(d, _, _)
+        | Insn::Format(d, _)
+        | Insn::StrOp(d, _, _) => f(*d),
         _ => {}
     }
 }

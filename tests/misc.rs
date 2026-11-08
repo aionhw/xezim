@@ -612,3 +612,5 @@ mod import_sized_dimension_895;
 mod macro_actual_count_888;
 #[path = "misc/typed_localparam_dimension_894.rs"]
 mod typed_localparam_dimension_894;
+#[path = "misc/review_class_param_undeclared_888.rs"]
+mod review_class_param_undeclared_888;

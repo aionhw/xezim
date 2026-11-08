@@ -172,6 +172,8 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
             SourceDefinition::Udp(_) => {}
         }
     }
+    check_class_and_package_undeclared(defs, elab, &pkg_names, &mut errs);
+    check_nettype_partial_drivers(defs, elab, &mut errs);
     check_named_block_refs(defs, &mut errs);
     if xezim_core::sv_parser::strict_checks() {
         errs.extend(crate::type_lint::check(defs, elab));
@@ -3628,6 +3630,823 @@ fn check_param_override_idents(
                     ));
                 }
             }
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// #888: undeclared identifiers in class and package parameter-override lists
+// ---------------------------------------------------------------------------
+//
+// Three positions are visited by neither the elaborator nor any existing
+// should-fail check:
+//
+//   * a class specialization's parameter-override list (`R #(A #(bad)) x;`,
+//     `typedef R #(A #(bad)) t;`, `extends B #(bad)`, a method's return type
+//     or port). `check_param_override_idents` covers module instantiations
+//     only, and a nested override is worse than merely unvisited: the parser
+//     keeps the inner argument list as source text
+//     (`ExprKind::Specialization::type_args_text`), so no walk of the
+//     expression tree can reach the name at all.
+//   * a class value-parameter default (`class A #(int W = bad)`).
+//     `check_param_value_refs` is fed module parameters only.
+//   * a class property or package-scope variable initializer (`int m = bad;`),
+//     which elaboration folds to 0. The package arm of `lint_should_fail`
+//     already says as much: "a package's own bare names are not resolved here".
+//
+// Resolution here is whole-design rather than scoping-accurate: a name is
+// reported only when it is declared NOWHERE in the design. That is the same
+// "only fire on a definite LRM violation" bar the rest of this file holds, and
+// it is what keeps an override that resolves through a package import, a class
+// parameter, an enclosing class member or a local typedef clean.
+
+/// Keywords and built-in spellings that are legal in a type-argument position
+/// without being declared. `type_args_text` preserves the argument list as
+/// source text, so these have to be recognised by spelling.
+fn reserved_type_arg_name(n: &str) -> bool {
+    matches!(
+        n,
+        "virtual"
+            | "const"
+            | "var"
+            | "type"
+            | "enum"
+            | "struct"
+            | "union"
+            | "packed"
+            | "signed"
+            | "unsigned"
+            | "tagged"
+            | "null"
+            | "this"
+            | "super"
+            | "new"
+            | "default"
+            | "mailbox"
+            | "semaphore"
+            | "process"
+            | "rand"
+            | "randc"
+            | "void"
+    )
+}
+
+/// Identifier runs in a preserved type-argument list (`"16, wrong_"`,
+/// `"A #(W, D)"`). A run preceded by `::` is a member name owned by the scope
+/// to its left and is left to that scope rather than guessed at here.
+fn idents_in_type_arg_text(text: &str) -> Vec<String> {
+    let cs: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < cs.len() {
+        // A string actual (`holder #(int, "base_test")`) is a value, not a
+        // name; its contents are never an identifier.
+        if cs[i] == '"' {
+            i += 1;
+            while i < cs.len() {
+                if cs[i] == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if cs[i] == '"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+        // §5.7: a number is never a name. A digit starts a decimal, real or
+        // time literal (`16`, `1.5e3`, `10ns`); `'` plus an optional `s` and
+        // a base starts the digits of a based literal (`8'hFF`, `'b0`).
+        if cs[i].is_ascii_digit() {
+            while i < cs.len() && (word(cs[i]) || cs[i] == '.') {
+                i += 1;
+            }
+            continue;
+        }
+        if cs[i] == '\'' {
+            let mut j = i + 1;
+            if j < cs.len() && matches!(cs[j], 's' | 'S') {
+                j += 1;
+            }
+            if j < cs.len() && matches!(cs[j], 'b' | 'B' | 'o' | 'O' | 'd' | 'D' | 'h' | 'H') {
+                j += 1;
+                // §5.7.1: white space may separate the base from the digits.
+                while j < cs.len() && cs[j].is_whitespace() {
+                    j += 1;
+                }
+                while j < cs.len() && (word(cs[j]) || cs[j] == '?') {
+                    j += 1;
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // §20: a system function (`$clog2`, `$bits`) names nothing in the design.
+        if cs[i] == '$' {
+            i += 1;
+            while i < cs.len() && word(cs[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        if !(cs[i].is_alphabetic() || cs[i] == '_') {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < cs.len() && (cs[j].is_alphanumeric() || cs[j] == '_' || cs[j] == '$') {
+            j += 1;
+        }
+        let mut k = i;
+        while k > 0 && cs[k - 1].is_whitespace() {
+            k -= 1;
+        }
+        let is_member = k >= 2 && cs[k - 1] == ':' && cs[k - 2] == ':';
+        if !is_member {
+            out.push(cs[i..j].iter().collect());
+        }
+        i = j;
+    }
+    out
+}
+/// The parser retains some type actuals as source text rather than a parsed
+/// name — virtual interface types above all (`virtual I`, `virtual my_if #(T)`),
+/// whose interface and parameters need interface resolution to judge. Anything
+/// that is not a plain identifier is such a retention and is left alone, the
+/// same guard `type_lint::check_type_actual` applies.
+fn is_plain_ident(n: &str) -> bool {
+    let mut ch = n.chars();
+    match ch.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    n.chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Every name the design declares, harvested from the AST. Whole-design on
+/// purpose — see the note above. Names the elaboration already indexes
+/// (`top_declares`) and package members (`pkg_names`) are tested separately.
+fn design_declared_names(defs: &[&SourceDefinition]) -> HashSet<String> {
+    use xezim_core::ast::decl::PackageItem;
+    let mut out = HashSet::new();
+    for d in defs {
+        match d {
+            SourceDefinition::Module(m) => {
+                for p in &m.params {
+                    note_param_names(p, &mut out);
+                }
+                note_port_list_names(&m.ports, &mut out);
+                note_items_names(&m.items, &mut out);
+            }
+            SourceDefinition::Interface(m) => {
+                for p in &m.params {
+                    note_param_names(p, &mut out);
+                }
+                note_port_list_names(&m.ports, &mut out);
+                note_items_names(&m.items, &mut out);
+            }
+            SourceDefinition::Program(m) => {
+                for p in &m.params {
+                    note_param_names(p, &mut out);
+                }
+                note_port_list_names(&m.ports, &mut out);
+                note_items_names(&m.items, &mut out);
+            }
+            SourceDefinition::Package(p) => {
+                out.insert(p.name.name.clone());
+                for it in &p.items {
+                    match it {
+                        PackageItem::Parameter(pd) => note_param_names(pd, &mut out),
+                        PackageItem::Data(dd) => {
+                            note_data_type_names(&dd.data_type, &mut out);
+                            note_declarator_names(&dd.declarators, &mut out);
+                        }
+                        PackageItem::Net(nd) => {
+                            note_data_type_names(&nd.data_type, &mut out);
+                            note_net_declarator_names(&nd.declarators, &mut out);
+                        }
+                        PackageItem::Typedef(td) => {
+                            out.insert(td.name.name.clone());
+                            note_data_type_names(&td.data_type, &mut out);
+                        }
+                        PackageItem::Function(f) => note_function_names(f, &mut out),
+                        PackageItem::Task(t) => note_task_names(t, &mut out),
+                        PackageItem::Class(c) => note_class_names(c, &mut out),
+                        _ => {}
+                    }
+                }
+            }
+            SourceDefinition::Class(c) => note_class_names(c, &mut out),
+            SourceDefinition::Typedef(td) => {
+                out.insert(td.name.name.clone());
+                note_data_type_names(&td.data_type, &mut out);
+            }
+            SourceDefinition::Udp(_) => {}
+        }
+    }
+    out
+}
+
+fn note_param_names(pd: &ParameterDeclaration, out: &mut HashSet<String>) {
+    match &pd.kind {
+        ParameterKind::Data { assignments, .. } => {
+            out.extend(assignments.iter().map(|a| a.name.name.clone()))
+        }
+        ParameterKind::Type { assignments } => {
+            out.extend(assignments.iter().map(|a| a.name.name.clone()))
+        }
+    }
+}
+
+fn note_declarator_names(ds: &[VarDeclarator], out: &mut HashSet<String>) {
+    out.extend(ds.iter().map(|d| d.name.name.clone()));
+}
+
+/// `NetDeclaration` keeps its own declarator type; same shape, distinct type.
+fn note_net_declarator_names(
+    ds: &[xezim_core::ast::decl::NetDeclarator],
+    out: &mut HashSet<String>,
+) {
+    out.extend(ds.iter().map(|d| d.name.name.clone()));
+}
+
+fn note_data_type_names(dt: &DataType, out: &mut HashSet<String>) {
+    match dt {
+        DataType::Struct(su) => {
+            for m in &su.members {
+                out.extend(m.declarators.iter().map(|d| d.name.name.clone()));
+                note_data_type_names(&m.data_type, out);
+            }
+        }
+        DataType::Enum(et) => {
+            out.extend(et.members.iter().map(|m| m.name.name.clone()));
+            if let Some(b) = &et.base_type {
+                note_data_type_names(b, out);
+            }
+        }
+        _ => {}
+    }
+}
+fn note_function_names(f: &xezim_core::ast::decl::FunctionDeclaration, out: &mut HashSet<String>) {
+    out.insert(f.name.name.name.clone());
+    for p in &f.ports {
+        out.insert(p.name.name.clone());
+        note_data_type_names(&p.data_type, out);
+    }
+    note_data_type_names(&f.return_type, out);
+    for st in f.items.iter() {
+        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            note_declarator_names(declarators, out);
+        }
+    }
+}
+
+fn note_task_names(t: &xezim_core::ast::decl::TaskDeclaration, out: &mut HashSet<String>) {
+    out.insert(t.name.name.name.clone());
+    for p in &t.ports {
+        out.insert(p.name.name.clone());
+        note_data_type_names(&p.data_type, out);
+    }
+    for st in t.items.iter() {
+        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            note_declarator_names(declarators, out);
+        }
+    }
+}
+
+fn note_class_names(c: &ClassDeclaration, out: &mut HashSet<String>) {
+    out.insert(c.name.name.clone());
+    for p in &c.params {
+        note_param_names(p, out);
+    }
+    for it in &c.items {
+        match it {
+            ClassItem::Property(pr) => {
+                note_declarator_names(&pr.declarators, out);
+                note_data_type_names(&pr.data_type, out);
+            }
+            ClassItem::Typedef(td) => {
+                out.insert(td.name.name.clone());
+                note_data_type_names(&td.data_type, out);
+            }
+            ClassItem::Parameter(pd) => note_param_names(pd, out),
+            ClassItem::Method(m) => match &m.kind {
+                ClassMethodKind::Function(f)
+                | ClassMethodKind::PureVirtual(f)
+                | ClassMethodKind::Extern(f) => note_function_names(f, out),
+                ClassMethodKind::Task(t) => note_task_names(t, out),
+            },
+            ClassItem::Class(inner) => note_class_names(inner, out),
+            _ => {}
+        }
+    }
+}
+
+fn note_items_names(items: &[ModuleItem], out: &mut HashSet<String>) {
+    for it in items {
+        match it {
+            ModuleItem::DataDeclaration(d) => {
+                note_declarator_names(&d.declarators, out);
+                note_data_type_names(&d.data_type, out);
+            }
+            ModuleItem::NetDeclaration(d) => {
+                note_net_declarator_names(&d.declarators, out);
+                note_data_type_names(&d.data_type, out);
+            }
+            ModuleItem::PortDeclaration(d) => {
+                note_declarator_names(&d.declarators, out);
+                note_data_type_names(&d.data_type, out);
+            }
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                note_param_names(pd, out)
+            }
+            ModuleItem::TypedefDeclaration(td) => {
+                out.insert(td.name.name.clone());
+                note_data_type_names(&td.data_type, out);
+            }
+            ModuleItem::FunctionDeclaration(f) => note_function_names(f, out),
+            ModuleItem::TaskDeclaration(t) => note_task_names(t, out),
+            ModuleItem::ClassDeclaration(c) => note_class_names(c, out),
+            ModuleItem::ModuleInstantiation(mi) => {
+                out.extend(mi.instances.iter().map(|i| i.name.name.clone()))
+            }
+            ModuleItem::GenerateRegion(g) => note_items_names(&g.items, out),
+            ModuleItem::GenerateIf(g) => {
+                for (_, its) in &g.branches {
+                    note_items_names(its, out);
+                }
+            }
+            ModuleItem::GenerateFor(g) => {
+                out.insert(g.var.clone());
+                note_items_names(&g.items, out);
+            }
+            ModuleItem::GenvarDeclaration(g) => {
+                out.extend(g.names.iter().map(|n| n.name.clone()));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn note_port_list_names(ports: &PortList, out: &mut HashSet<String>) {
+    match ports {
+        PortList::Ansi(ps) => {
+            for p in ps {
+                out.insert(p.name.name.clone());
+                if let Some(dt) = &p.data_type {
+                    note_data_type_names(dt, out);
+                }
+            }
+        }
+        PortList::NonAnsi(ns) => out.extend(ns.iter().map(|n| n.name.clone())),
+        PortList::Empty => {}
+    }
+}
+/// The #888 finder: walks the positions listed at the head of this section and
+/// reports every identifier declared nowhere in the design.
+struct UndeclaredFinder<'a> {
+    elab: &'a ElaboratedModule,
+    pkg_names: &'a HashSet<String>,
+    declared: &'a HashSet<String>,
+    /// Identical messages reported once, whichever instance surfaced them.
+    seen: HashSet<String>,
+    errs: Vec<String>,
+}
+
+impl<'a> UndeclaredFinder<'a> {
+    /// A name needs no declaration here if it is a keyword, a built-in
+    /// spelling, a package member, something the elaboration indexes, or
+    /// something the design declares anywhere.
+    fn known(&self, n: &str) -> bool {
+        !is_plain_ident(n)
+            || n.starts_with('$')
+            || is_builtin_type(n)
+            || reserved_type_arg_name(n)
+            || self.pkg_names.contains(n)
+            || top_declares(n, self.elab)
+            || self.declared.contains(n)
+    }
+
+    fn name(&mut self, n: &str, what: &str) {
+        if self.known(n) {
+            return;
+        }
+        let msg =
+            format!("{what} refers to undeclared identifier '{n}' (LRM 1800-2017 §6.20.2, §8.25)");
+        if self.seen.insert(msg.clone()) {
+            self.errs.push(msg);
+        }
+    }
+
+    fn init_idents(&mut self, init: &Expression, label: &str) {
+        let mut ids = Vec::new();
+        collect_idents(init, &mut ids);
+        let what = format!("initializer of '{label}'");
+        for n in ids {
+            self.name(&n, &what);
+        }
+    }
+
+    /// A parameter-override actual: `int`, `my_t`, `A #(bad)`, `.D(bad)`.
+    fn actual(&mut self, e: &Expression, what_owner: &str) {
+        match &e.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                let n = h.path[0].name.name.clone();
+                self.name(&n, &format!("parameter override of '{what_owner}'"));
+            }
+            // The nested list is preserved as text, so its names have to be
+            // recovered by spelling — this is the miss at the heart of #888.
+            ExprKind::Specialization {
+                base,
+                type_args_text,
+            } => {
+                self.actual(base, what_owner);
+                let what = format!("parameter override of '{what_owner}'");
+                for t in idents_in_type_arg_text(type_args_text) {
+                    self.name(&t, &what);
+                }
+            }
+            ExprKind::TypeLiteral(dt) => self.data_type(dt, what_owner),
+            ExprKind::NamedArg { expr: Some(x), .. } => self.actual(x, what_owner),
+            ExprKind::Paren(x) => self.actual(x, what_owner),
+            ExprKind::Unary { operand, .. } => self.actual(operand, what_owner),
+            ExprKind::Binary { left, right, .. } => {
+                self.actual(left, what_owner);
+                self.actual(right, what_owner);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.actual(condition, what_owner);
+                self.actual(then_expr, what_owner);
+                self.actual(else_expr, what_owner);
+            }
+            _ => {}
+        }
+    }
+    /// Recurse through a type, checking every parameter-override list it holds.
+    fn data_type(&mut self, dt: &DataType, owner: &str) {
+        match dt {
+            DataType::TypeReference { type_args, .. } => {
+                for a in type_args {
+                    self.actual(a, owner);
+                }
+            }
+            DataType::Interface { type_args, .. } => {
+                for a in type_args {
+                    self.actual(a, owner);
+                }
+            }
+            DataType::Struct(su) => {
+                for m in &su.members {
+                    self.data_type(&m.data_type, owner);
+                }
+            }
+            DataType::Enum(et) => {
+                if let Some(b) = &et.base_type {
+                    self.data_type(b, owner);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn param_default(&mut self, pd: &ParameterDeclaration, owner: &str) {
+        if let ParameterKind::Data { assignments, .. } = &pd.kind {
+            for a in assignments {
+                if let Some(init) = &a.init {
+                    let mut ids = Vec::new();
+                    collect_idents(init, &mut ids);
+                    let what = format!("default value of parameter '{}' of '{owner}'", a.name.name);
+                    for n in ids {
+                        self.name(&n, &what);
+                    }
+                }
+            }
+        }
+    }
+
+    fn ports(&mut self, ports: &[xezim_core::ast::decl::FunctionPort], owner: &str) {
+        for p in ports {
+            self.data_type(&p.data_type, owner);
+            if let Some(d) = &p.default {
+                self.actual(d, owner);
+            }
+        }
+    }
+
+    fn function(&mut self, f: &xezim_core::ast::decl::FunctionDeclaration) {
+        let owner = f.name.name.name.clone();
+        self.data_type(&f.return_type, &owner);
+        self.ports(&f.ports, &owner);
+    }
+
+    fn task(&mut self, t: &xezim_core::ast::decl::TaskDeclaration) {
+        let owner = t.name.name.name.clone();
+        self.ports(&t.ports, &owner);
+    }
+
+    fn class(&mut self, c: &ClassDeclaration) {
+        use xezim_core::ast::decl::ParamValue;
+        let owner = c.name.name.clone();
+        for p in &c.params {
+            self.param_default(p, &owner);
+        }
+        if let Some(x) = &c.extends {
+            for a in &x.args {
+                match a {
+                    ParamValue::Expr(e) => self.actual(e, &owner),
+                    ParamValue::Type(t) => self.data_type(t, &owner),
+                }
+            }
+        }
+        for it in &c.items {
+            match it {
+                ClassItem::Property(pr) => {
+                    self.data_type(&pr.data_type, &owner);
+                    for d in &pr.declarators {
+                        if let Some(init) = &d.init {
+                            self.init_idents(init, &format!("{}.{}", owner, d.name.name));
+                        }
+                    }
+                }
+                ClassItem::Typedef(td) => self.data_type(&td.data_type, &td.name.name),
+                ClassItem::Parameter(pd) => self.param_default(pd, &owner),
+                ClassItem::Method(m) => match &m.kind {
+                    ClassMethodKind::Function(f)
+                    | ClassMethodKind::PureVirtual(f)
+                    | ClassMethodKind::Extern(f) => self.function(f),
+                    ClassMethodKind::Task(t) => self.task(t),
+                },
+                ClassItem::Class(inner) => self.class(inner),
+                _ => {}
+            }
+        }
+    }
+
+    fn items(&mut self, items: &[ModuleItem]) {
+        for it in items {
+            match it {
+                ModuleItem::DataDeclaration(d) => {
+                    let owner = d
+                        .declarators
+                        .first()
+                        .map(|x| x.name.name.clone())
+                        .unwrap_or_default();
+                    self.data_type(&d.data_type, &owner);
+                    for dc in &d.declarators {
+                        if let Some(init) = &dc.init {
+                            self.init_idents(init, &dc.name.name);
+                        }
+                    }
+                }
+                ModuleItem::NetDeclaration(d) => {
+                    let owner = d
+                        .declarators
+                        .first()
+                        .map(|x| x.name.name.clone())
+                        .unwrap_or_default();
+                    self.data_type(&d.data_type, &owner);
+                    for dc in &d.declarators {
+                        if let Some(init) = &dc.init {
+                            self.init_idents(init, &dc.name.name);
+                        }
+                    }
+                }
+                ModuleItem::PortDeclaration(d) => {
+                    let owner = d
+                        .declarators
+                        .first()
+                        .map(|x| x.name.name.clone())
+                        .unwrap_or_default();
+                    self.data_type(&d.data_type, &owner);
+                }
+                ModuleItem::TypedefDeclaration(td) => self.data_type(&td.data_type, &td.name.name),
+                ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                    self.param_default(pd, "")
+                }
+                ModuleItem::FunctionDeclaration(f) => self.function(f),
+                ModuleItem::TaskDeclaration(t) => self.task(t),
+                ModuleItem::ClassDeclaration(c) => self.class(c),
+                ModuleItem::GenerateRegion(g) => self.items(&g.items),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, its) in &g.branches {
+                        self.items(its);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => self.items(&g.items),
+                _ => {}
+            }
+        }
+    }
+}
+/// The #888 entry point: report identifiers in class and package
+/// parameter-override lists, class value-parameter defaults, class property
+/// initializers and package-scope variable initializers that are declared
+/// nowhere in the design.
+pub fn check_class_and_package_undeclared(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+    pkg_names: &HashSet<String>,
+    errs: &mut Vec<String>,
+) {
+    use xezim_core::ast::decl::PackageItem;
+    let declared = design_declared_names(defs);
+    let mut f = UndeclaredFinder {
+        elab,
+        pkg_names,
+        declared: &declared,
+        seen: HashSet::new(),
+        errs: Vec::new(),
+    };
+    for d in defs {
+        match d {
+            SourceDefinition::Module(m) => {
+                for p in &m.params {
+                    f.param_default(p, &m.name.name);
+                }
+                f.items(&m.items);
+            }
+            SourceDefinition::Interface(m) => {
+                for p in &m.params {
+                    f.param_default(p, &m.name.name);
+                }
+                f.items(&m.items);
+            }
+            SourceDefinition::Program(m) => {
+                for p in &m.params {
+                    f.param_default(p, &m.name.name);
+                }
+                f.items(&m.items);
+            }
+            SourceDefinition::Package(p) => {
+                for it in &p.items {
+                    match it {
+                        PackageItem::Parameter(pd) => f.param_default(pd, &p.name.name),
+                        PackageItem::Data(dd) => {
+                            for dc in &dd.declarators {
+                                f.data_type(&dd.data_type, &dc.name.name);
+                                if let Some(init) = &dc.init {
+                                    f.init_idents(
+                                        init,
+                                        &format!("{}.{}", p.name.name, dc.name.name),
+                                    );
+                                }
+                            }
+                        }
+                        PackageItem::Net(nd) => {
+                            for dc in &nd.declarators {
+                                f.data_type(&nd.data_type, &dc.name.name);
+                                if let Some(init) = &dc.init {
+                                    f.init_idents(
+                                        init,
+                                        &format!("{}.{}", p.name.name, dc.name.name),
+                                    );
+                                }
+                            }
+                        }
+                        PackageItem::Typedef(td) => f.data_type(&td.data_type, &td.name.name),
+                        PackageItem::Function(fn_) => f.function(fn_),
+                        PackageItem::Task(t) => f.task(t),
+                        PackageItem::Class(c) => f.class(c),
+                        _ => {}
+                    }
+                }
+            }
+            SourceDefinition::Class(c) => f.class(c),
+            SourceDefinition::Typedef(td) => f.data_type(&td.data_type, &td.name.name),
+            SourceDefinition::Udp(_) => {}
+        }
+    }
+    errs.extend(f.errs);
+}
+
+/// §10.3: a continuous assignment to a net of a user-defined nettype drives
+/// the whole net, so its left-hand side shall not index or select into the
+/// nettype's data type (`assign p.V = v;`, `assign p[0] = b;`). Such an
+/// assignment elaborated, and each member then had a driver of its own.
+fn check_nettype_partial_drivers(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
+    if elab.nettype_resolvers.is_empty() {
+        return;
+    }
+    let is_nettype = |dt: &DataType| {
+        matches!(dt, DataType::TypeReference { name, .. }
+            if elab.nettype_resolvers.contains_key(&name.name.name))
+    };
+    fn nets_in(
+        items: &[ModuleItem],
+        is_nettype: &dyn Fn(&DataType) -> bool,
+        out: &mut HashSet<String>,
+    ) {
+        for it in items {
+            match it {
+                ModuleItem::DataDeclaration(d) if is_nettype(&d.data_type) => {
+                    out.extend(d.declarators.iter().map(|x| x.name.name.clone()))
+                }
+                ModuleItem::NetDeclaration(d) if is_nettype(&d.data_type) => {
+                    out.extend(d.declarators.iter().map(|x| x.name.name.clone()))
+                }
+                ModuleItem::PortDeclaration(d) if is_nettype(&d.data_type) => {
+                    out.extend(d.declarators.iter().map(|x| x.name.name.clone()))
+                }
+                ModuleItem::GenerateRegion(g) => nets_in(&g.items, is_nettype, out),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, its) in &g.branches {
+                        nets_in(its, is_nettype, out);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => nets_in(&g.items, is_nettype, out),
+                _ => {}
+            }
+        }
+    }
+    /// The nettype net a target selects into, if it does.
+    fn partial_target(e: &Expression, nets: &HashSet<String>) -> Option<String> {
+        let root_net = |x: &Expression| match &x.kind {
+            ExprKind::Ident(h) if h.root.is_none() && nets.contains(&h.path[0].name.name) => {
+                Some(h.path[0].name.name.clone())
+            }
+            _ => None,
+        };
+        match &e.kind {
+            ExprKind::Ident(h) if h.root.is_none() && !h.path.is_empty() => {
+                let n = &h.path[0].name.name;
+                (nets.contains(n) && (h.path.len() > 1 || !h.path[0].selects.is_empty()))
+                    .then(|| n.clone())
+            }
+            ExprKind::MemberAccess { expr, .. }
+            | ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. } => {
+                root_net(expr).or_else(|| partial_target(expr, nets))
+            }
+            ExprKind::Concatenation(xs) => xs.iter().find_map(|x| partial_target(x, nets)),
+            _ => None,
+        }
+    }
+    fn walk(
+        items: &[ModuleItem],
+        nets: &HashSet<String>,
+        elab: &ElaboratedModule,
+        errs: &mut Vec<String>,
+    ) {
+        for it in items {
+            match it {
+                ModuleItem::ContinuousAssign(ca) => {
+                    for (l, _) in &ca.assignments {
+                        if let Some(n) = partial_target(l, nets) {
+                            let at = xezim_core::elaborate::span_location(elab, l.span)
+                                .map(|a| format!(" (at {a})"))
+                                .unwrap_or_default();
+                            errs.push(format!(
+                                "continuous assignment to net '{n}' of a user-defined nettype \
+                                 selects part of it; it shall drive the whole net (IEEE \
+                                 1800-2017 §10.3){at}"
+                            ));
+                        }
+                    }
+                }
+                ModuleItem::GenerateRegion(g) => walk(&g.items, nets, elab, errs),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, its) in &g.branches {
+                        walk(its, nets, elab, errs);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => walk(&g.items, nets, elab, errs),
+                _ => {}
+            }
+        }
+    }
+    for d in defs {
+        let (ports, items) = match d {
+            SourceDefinition::Module(m) => (&m.ports, &m.items),
+            SourceDefinition::Interface(m) => (&m.ports, &m.items),
+            SourceDefinition::Program(m) => (&m.ports, &m.items),
+            _ => continue,
+        };
+        let mut nets = HashSet::new();
+        if let PortList::Ansi(ps) = ports {
+            for p in ps {
+                if p.data_type.as_ref().is_some_and(|dt| is_nettype(dt)) {
+                    nets.insert(p.name.name.clone());
+                }
+            }
+        }
+        nets_in(items, &is_nettype, &mut nets);
+        if !nets.is_empty() {
+            walk(items, &nets, elab, errs);
         }
     }
 }

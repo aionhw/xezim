@@ -2718,6 +2718,11 @@ impl Simulator {
         chatter!("[PROF] vm_direct_calls={}", self.vm_direct_calls);
         chatter!("[PROF] local_meta_reapplies={}", self.local_meta_reapplies);
         chatter!(
+            "[PROF] local_meta_swaps={} local_meta_scans={}",
+            self.local_meta_swaps,
+            self.local_meta_scans
+        );
+        chatter!(
             "[PROF] edge_waiters={:.1}ms edge_cg={:.1}ms waiter_iters={}",
             self.prof_edge_waiters as f64 / 1e6,
             self.prof_edge_cg as f64 / 1e6,

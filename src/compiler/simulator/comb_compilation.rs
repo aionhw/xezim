@@ -2482,6 +2482,7 @@ impl Simulator {
                             | I::BranchIfSignalFalse(..)
                             | I::StmtFallback(..)
                             | I::EvalExprFallback(..)
+                            | I::LoadDynElem(..)
                     )
                 }) {
                     continue;
@@ -4135,6 +4136,7 @@ impl Simulator {
                         RIns::StmtFallback(..)
                             | RIns::CovHit(..)
                             | RIns::EvalExprFallback(..)
+                            | RIns::LoadDynElem(..)
                             | RIns::LoadProcessLocal(..)
                             | RIns::Format(..)
                             | RIns::CaseJump(..)

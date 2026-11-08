@@ -714,6 +714,16 @@ impl Simulator {
         // Only genuine `static` members — param_defaults (class localparams)
         // also satisfy static_prop_key but are constants — and only when no
         // nearer instance property hides it.
+        // §8.14/§6.20: nor when the nearest declaration is a constant: no
+        // write can target a localparam, so a write by name to an object
+        // whose class shadows its instance property with one (a constraint
+        // solution, a member write through a base-typed reference) is the
+        // instance property's (`rand_var_key`).
+        let key = self.rand_var_key(handle, name);
+        if key != name {
+            let key = key.into_owned();
+            return self.set_instance_prop_if_changed(handle, &key, val);
+        }
         let static_of = match self.heap.get(handle) {
             Some(Some(inst)) if self.member_is_static_prop(&inst.class_name, name) => {
                 Some((inst.class_name.clone(), inst.spec.clone()))
@@ -729,6 +739,12 @@ impl Simulator {
                 return changed;
             }
         }
+        self.store_instance_prop(handle, name, val)
+    }
+
+    /// Store `val`, already fitted, in the object's OWN instance property
+    /// `name`; true when the value changed.
+    fn store_instance_prop(&mut self, handle: usize, name: &str, val: Value) -> bool {
         if let Some(Some(inst)) = self.heap.get_mut(handle) {
             if inst.properties.get(name).is_none_or(|cur| *cur != val) {
                 inst.properties.insert(name.to_string(), val);
@@ -736,6 +752,18 @@ impl Simulator {
             }
         }
         false
+    }
+
+    /// `set_prop_if_changed` for a reference that resolves to the instance
+    /// property (§8.14): no same-named static of the object's class applies.
+    pub(super) fn set_instance_prop_if_changed(
+        &mut self,
+        handle: usize,
+        name: &str,
+        val: Value,
+    ) -> bool {
+        let val = self.fit_class_prop(handle, name, &val);
+        self.store_instance_prop(handle, name, val)
     }
 
     // ---------------------------------------------------------------------
@@ -4612,9 +4640,22 @@ impl Simulator {
             return Some(failed.is_none());
         }
         let arr_name = Self::foreach_base_name(array)?;
+        // §7.4.1/§12.7.3: a packed multi-dimensional property or a packed
+        // array of packed structs (`cand_t [0:2] c`) loops over its leading
+        // packed dimensions, one per loop variable; unchecked, a violating
+        // trial was accepted (#928).
         let dims = match self.fixed_foreach_dims(handle, &arr_name) {
             Some((dims, _)) => dims,
-            None => self.state_foreach_dims(handle, array, &arr_name, idx_names.len())?,
+            None => match self
+                .packed_prop_foreach_dims(handle, &arr_name)
+                .filter(|(d, _)| (1..=d.len()).contains(&idx_names.len()))
+            {
+                Some((mut dims, _)) => {
+                    dims.truncate(idx_names.len());
+                    dims
+                }
+                None => self.state_foreach_dims(handle, array, &arr_name, idx_names.len())?,
+            },
         };
         if idx_names.len() != dims.len() {
             return None;

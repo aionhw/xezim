@@ -33,6 +33,7 @@ impl Simulator {
             current_static_task: self.current_static_task.clone(),
             current_auto_task: self.current_auto_task.clone(),
             task_string_formals: self.task_string_formals.clone(),
+            local_meta_claims: self.local_meta_claims.clone(),
         }
     }
 
@@ -94,6 +95,7 @@ impl Simulator {
             && self.current_static_task.is_none()
             && self.current_auto_task.is_none()
             && self.task_string_formals.is_empty()
+            && self.local_meta_claims.is_empty()
             && !self.ref_redirect_hot
     }
 
@@ -128,6 +130,7 @@ impl Simulator {
             current_static_task: self.current_static_task.take(),
             current_auto_task: self.current_auto_task.take(),
             task_string_formals: std::mem::take(&mut self.task_string_formals),
+            local_meta_claims: std::mem::take(&mut self.local_meta_claims),
         }
     }
 
@@ -159,7 +162,8 @@ impl Simulator {
         self.current_static_task = ctx.current_static_task;
         self.current_auto_task = ctx.current_auto_task;
         self.task_string_formals = ctx.task_string_formals;
-        if !self.local_meta_saved.is_empty() {
+        self.local_meta_claims = ctx.local_meta_claims;
+        if !self.local_meta_cache.is_empty() && !self.local_meta_claims.is_empty() {
             self.reapply_local_meta();
         }
     }
@@ -1216,6 +1220,13 @@ impl Simulator {
         //       into `self.signals`, which is what the parent reads from.
         let child_frames: &[HashMap<String, Value>] = &child_ctx.local_stack;
         let child_frames_gen: &[u64] = &child_ctx.local_gen_stack;
+        // §6.21, §9.3.2: a variable a block of the child declared is the
+        // child's own, even when it has the name of a variable in a frame
+        // the child shares with its parent (the block's declaration hides
+        // it): its writes reach neither the parent nor the siblings, and the
+        // value its block's exit puts back is no write either (#943).
+        let child_private =
+            |g: u64, k: &str| Self::block_declares(&child_ctx.block_scope_saves, g, k);
         let baseline = sibling_baseline.as_deref();
         let signal_caps = self.fork_signal_captures.get(&pid);
         // Parent-frame keys the child's writes reached, for the wake below.
@@ -1230,6 +1241,7 @@ impl Simulator {
                         child_frames,
                         child_frames_gen,
                         baseline,
+                        &child_private,
                     )
                 } else {
                     // Parent is the active process — its context is `saved`.
@@ -1239,6 +1251,7 @@ impl Simulator {
                         child_frames,
                         child_frames_gen,
                         baseline,
+                        &child_private,
                     )
                 };
             }
@@ -1250,10 +1263,14 @@ impl Simulator {
         let mut stored: Vec<(String, Value)> = Vec::new();
         if let Some(caps) = signal_caps {
             let top = child_frames.last();
+            let top_gen = child_frames_gen.last().copied().unwrap_or(0);
             for nm in caps {
                 let Some(v) = top.and_then(|f| f.get(nm)) else {
                     continue;
                 };
+                if child_private(top_gen, nm) {
+                    continue;
+                }
                 let inherited_unchanged = baseline
                     .and_then(|b| b.last())
                     .and_then(|f| f.get(nm))
@@ -1280,16 +1297,25 @@ impl Simulator {
                 let Some(other) = self.process_contexts.get_mut(&other_pid) else {
                     continue;
                 };
+                let top_gen = other.local_gen_stack.last().copied().unwrap_or(0);
                 let Some(top) = other.local_stack.last_mut() else {
                     continue;
                 };
                 for (n, v) in &stored {
+                    if Self::block_declares(&other.block_scope_saves, top_gen, n) {
+                        continue;
+                    }
                     if let Some(slot) = top.get_mut(n) {
                         *slot = v.clone();
                     }
                 }
                 if let Some(base) = self.fork_baselines.get_mut(&other_pid) {
-                    Self::sync_fork_baseline(base, &other.local_stack);
+                    Self::sync_fork_baseline(
+                        base,
+                        &other.local_stack,
+                        &other.local_gen_stack,
+                        &other.block_scope_saves,
+                    );
                 }
             }
         }
@@ -1310,6 +1336,13 @@ impl Simulator {
                         sibling_baseline.get(i).and_then(|base| base.get(*k))
                             .is_some_and(|old| old != *v)
                     }).map(|(k, v)| (k.clone(), v.clone())).collect()).collect();
+                // The child's own block variables are no sibling's (#943).
+                let mut changes = changes;
+                if !child_ctx.block_scope_saves.is_empty() {
+                    for (frame, g) in changes.iter_mut().zip(child_frames_gen) {
+                        frame.retain(|k, _| !child_private(*g, k));
+                    }
+                }
                 // Only a fork child holding one of the changed frames' own
                 // activations can receive a write (`merge_fork_writes`
                 // matches frames by generation), so visit just those, not
@@ -1373,13 +1406,51 @@ impl Simulator {
                         &visible_storage
                     };
                     let updates = Self::merge_fork_writes(
-                        &mut other.local_stack, &other.local_gen_stack,
-                        visible, child_frames_gen, None,
+                        &mut other.local_stack,
+                        &other.local_gen_stack,
+                        visible,
+                        child_frames_gen,
+                        None,
+                        &|g, k| Self::block_declares(&other.block_scope_saves, g, k),
                     );
+                    // §6.21: where a block of the sibling hides the variable,
+                    // the value is for the hidden one, which the block's exit
+                    // puts back.
+                    // A write of a variable the sibling shares at the fork
+                    // (the writer's and the sibling's fork-time scopes agree).
+                    let hidden = if other.block_scope_saves.is_empty() {
+                        Vec::new()
+                    } else {
+                        let base_scopes = self.fork_local_scopes.get(other_pid);
+                        let shared = |g: u64, k: &str| {
+                            sibling_scopes.get(&g).and_then(|m| m.get(k))
+                                == base_scopes.and_then(|sc| sc.get(&g)).and_then(|m| m.get(k))
+                        };
+                        Self::deliver_to_hidden(
+                            &mut other.block_scope_saves,
+                            &other.local_gen_stack,
+                            &changes,
+                            child_frames_gen,
+                            &shared,
+                        )
+                    };
                     // The sibling now holds these values: a later write of
                     // the value it held at the fork is a write too.
                     if let Some(base) = self.fork_baselines.get_mut(other_pid) {
-                        Self::sync_fork_baseline(base, &other.local_stack);
+                        Self::sync_fork_baseline(
+                            base,
+                            &other.local_stack,
+                            &other.local_gen_stack,
+                            &other.block_scope_saves,
+                        );
+                        if !hidden.is_empty() {
+                            let frames = Arc::make_mut(base);
+                            for (i, k, v) in hidden {
+                                if let Some(b) = frames.get_mut(i).and_then(|f| f.get_mut(&k)) {
+                                    *b = v;
+                                }
+                            }
+                        }
                     }
                     written.extend(updates);
                 }
@@ -1392,7 +1463,12 @@ impl Simulator {
         // read as "unchanged" and be dropped, the parent keeping 0.
         drop(sibling_baseline);
         if let Some(base) = self.fork_baselines.get_mut(&pid) {
-            Self::sync_fork_baseline(base, child_frames);
+            Self::sync_fork_baseline(
+                base,
+                child_frames,
+                child_frames_gen,
+                &child_ctx.block_scope_saves,
+            );
         }
         if !written.is_empty() {
             // A child wrote a key a parked `wait` of the parent reads —
@@ -2124,10 +2200,12 @@ impl Simulator {
         child_frames: &[HashMap<String, Value>],
         child_gens: &[u64],
         baseline: Option<&Vec<HashMap<String, Value>>>,
+        private: &dyn Fn(u64, &str) -> bool,
     ) -> Vec<String> {
         let mut propagated = Vec::new();
         let n = parent_frames.len().min(child_frames.len());
         for i in 0..n {
+            let g = child_gens.get(i).copied().unwrap_or(0);
             let same_activation = parent_gens.get(i).copied() == child_gens.get(i).copied();
             if !same_activation {
                 // The parent slot `i` no longer belongs to the activation this
@@ -2149,7 +2227,7 @@ impl Simulator {
                         paired = false;
                         break;
                     }
-                    if v == bv {
+                    if v == bv || private(g, k) {
                         continue;
                     }
                     if let Some(slot) = parent_frames[i].get_mut(k) {
@@ -2169,7 +2247,7 @@ impl Simulator {
                 let inherited_unchanged = base_frame
                     .and_then(|f| f.get(k))
                     .is_some_and(|old| old == v);
-                if inherited_unchanged {
+                if inherited_unchanged || private(g, k) {
                     continue;
                 }
                 match parent_frames[i].get_mut(k) {
@@ -2190,28 +2268,89 @@ impl Simulator {
 
     /// Move a fork child's baseline to the values its frames now hold, for
     /// every key it inherited. Copied on write: the snapshot is shared until
-    /// a value actually differs.
+    /// a value actually differs. A key one of the child's open `blocks`
+    /// declared holds the block's own variable, not the inherited one, so
+    /// its baseline stays (see `block_declares`).
     pub(super) fn sync_fork_baseline(
         base: &mut Arc<Vec<HashMap<String, Value>>>,
         frames: &[HashMap<String, Value>],
+        gens: &[u64],
+        blocks: &[BlockScopeSave],
     ) {
+        let moved = |i: usize, k: &str, bv: &Value, cf: &HashMap<String, Value>| {
+            cf.get(k).is_some_and(|v| v != bv)
+                && !Self::block_declares(blocks, gens.get(i).copied().unwrap_or(0), k)
+        };
         let differs = |b: &[HashMap<String, Value>]| {
-            b.iter().zip(frames).any(|(bf, cf)| {
-                bf.iter().any(|(k, bv)| cf.get(k).is_some_and(|v| v != bv))
-            })
+            b.iter()
+                .zip(frames)
+                .enumerate()
+                .any(|(i, (bf, cf))| bf.iter().any(|(k, bv)| moved(i, k, bv, cf)))
         };
         if !differs(base) {
             return;
         }
-        for (bf, cf) in Arc::make_mut(base).iter_mut().zip(frames) {
+        for (i, (bf, cf)) in Arc::make_mut(base).iter_mut().zip(frames).enumerate() {
             for (k, bv) in bf.iter_mut() {
-                if let Some(v) = cf.get(k) {
-                    if v != bv {
+                if moved(i, k, bv, cf) {
+                    if let Some(v) = cf.get(k) {
                         *bv = v.clone();
                     }
                 }
             }
         }
+    }
+
+    /// Store a fork sibling's writes (`frames`, under activations `gens`)
+    /// of `shared` variables that the receiver's open `blocks` hide into the
+    /// hidden variables' saved values, the outermost hiding block's (§6.21).
+    /// Returns them by frame index, key and value.
+    fn deliver_to_hidden(
+        blocks: &mut [BlockScopeSave],
+        receiver_gens: &[u64],
+        frames: &[HashMap<String, Value>],
+        gens: &[u64],
+        shared: &dyn Fn(u64, &str) -> bool,
+    ) -> Vec<(usize, String, Value)> {
+        let mut out = Vec::new();
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(&g) = gens.get(i) else {
+                continue;
+            };
+            if receiver_gens.get(i) != Some(&g) {
+                continue;
+            }
+            for (k, v) in frame {
+                if !shared(g, k) {
+                    continue;
+                }
+                let slot = blocks
+                    .iter_mut()
+                    .filter(|b| b.frame_gen == g)
+                    .find_map(|b| b.shadowed.iter_mut().find(|(n, _)| n == k));
+                if let Some(slot) = slot {
+                    slot.1 = v.clone();
+                    out.push((i, k.clone(), v.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether one of the open `blocks` declared the variable of frame entry
+    /// `key` (its bare name, or a leaf `name.member` / `name[i]` of an
+    /// unpacked aggregate) into the frame of generation `g` (§6.21): the
+    /// entry is then the block's variable, hiding the enclosing one of the
+    /// same name.
+    pub(super) fn block_declares(blocks: &[BlockScopeSave], g: u64, key: &str) -> bool {
+        let names = |n: &String| {
+            key.strip_prefix(n.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+        };
+        !blocks.is_empty()
+            && blocks
+                .iter()
+                .any(|b| b.frame_gen == g && b.declared_names.iter().any(names))
     }
 
     /// Evaluate a `#delay` expression to an integer number of simulator ticks.

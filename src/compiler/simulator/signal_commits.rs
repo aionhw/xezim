@@ -1506,9 +1506,10 @@ impl Simulator {
             for insn in &cb.instructions {
                 match insn {
                     // A counted block must run on every edge.
-                    Insn::StmtFallback(..) | Insn::EvalExprFallback(..) | Insn::CovHit(..) => {
-                        opaque = true
-                    }
+                    Insn::StmtFallback(..)
+                    | Insn::EvalExprFallback(..)
+                    | Insn::LoadDynElem(..)
+                    | Insn::CovHit(..) => opaque = true,
                     // Constant bit/part selects record only the SLICE they
                     // read (see `edge_block_reads_meta`); everything else is
                     // a full-signal read.

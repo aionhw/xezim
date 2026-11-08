@@ -1032,8 +1032,23 @@ impl Simulator {
         } else {
             ctx
         };
+        let handle = self.this_stack.last().copied().flatten()?;
+        self.shadowed_prop_key_in(&viewing, handle, name)
+    }
+
+    /// `shadowed_prop_key` of object `handle` seen from class `viewing`
+    /// (a reference's declared class, §8.14), whether or not it is `this`.
+    pub(super) fn shadowed_prop_key_in(
+        &self,
+        viewing: &str,
+        handle: usize,
+        name: &str,
+    ) -> Option<String> {
+        if self.shadowed_prop_names.is_empty() || !self.shadowed_prop_names.contains(name) {
+            return None;
+        }
         // Nearest declarer at or above the viewing class.
-        let mut cur = Some(viewing);
+        let mut cur = Some(viewing.to_string());
         let mut target: Option<String> = None;
         while let Some(cn) = cur {
             let cd = self.module.classes.get(&cn)?;
@@ -1044,8 +1059,7 @@ impl Simulator {
             cur = cd.extends.clone();
         }
         let target = target?;
-        // The leaf-most declarer for the CURRENT object.
-        let handle = self.this_stack.last().copied().flatten()?;
+        // The leaf-most declarer for the object.
         let leaf = self
             .heap
             .get(handle)

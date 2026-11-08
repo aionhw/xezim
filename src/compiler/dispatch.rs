@@ -177,6 +177,7 @@ impl Opcode {
             Insn::BlockingAssignRangeDyn(_, _, _, _) => Self::BlockingAssignRangeDyn,
             Insn::BlockingAssignBitDyn(_, _, _) => Self::BlockingAssignBitDyn,
             Insn::LoadArrayElem(_, _, _) => Self::LoadArrayElem,
+            Insn::LoadDynElem(..) => Self::LoadArrayElem,
             Insn::NbaAssignArray(_, _, _, _) => Self::NbaAssignArray,
             Insn::BlockingAssignArray(_, _, _, _) => Self::BlockingAssignArray,
             Insn::NbaAssignArrayRange(_, _, _, _, _) => Self::NbaAssignArrayRange,

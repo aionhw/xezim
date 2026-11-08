@@ -291,6 +291,13 @@ impl Simulator {
             // `obj.member` and indexed/call-bearing owners are
             // collection operands, not scalar broadcast values.
             ExprKind::MemberAccess { .. } => self.expr_assoc_name(e),
+            // A ROW of an array of dynamic arrays (`d[i]`, `h.rows[i]`) is a
+            // collection operand too; taken for a scalar, the copy kept
+            // nothing (`d[1] = new[2](d[1])` zeroed the row).
+            ExprKind::Index { .. } if Self::cond_expr_is_effect_free(e, false) => self
+                .class_array_of_coll_key(e)
+                .or_else(|| self.flat_member_name(e))
+                .filter(|n| self.module.dynamic_arrays.contains(n.as_str())),
             _ => None,
         });
         if let Some((dt, tail)) = self.dynamic_assoc_decl(name) {
@@ -1982,17 +1989,24 @@ impl Simulator {
                         }
                         self.continue_flag = false;
                     }
-                } else if let Some(&(l, r)) = self
-                    .module
-                    .packed_full_dims
-                    .get(&*name)
-                    .filter(|d| d.len() >= 2)
+                } else if let Some(&(l, r)) = prop_packed_dims
+                    .as_ref()
                     .and_then(|d| d.first())
+                    .or_else(|| {
+                        self.module
+                            .packed_full_dims
+                            .get(&*name)
+                            .filter(|d| d.len() >= 2)
+                            .and_then(|d| d.first())
+                    })
                 {
                     // §12.7.3 (measured): a MULTI-packed-dim vector
                     // (`logic [3:0][7:0] w`) iterates its OUTERMOST
                     // packed dimension (4 iterations, not 32 bits),
-                    // left→right — [3:0] visits 3,2,1,0.
+                    // left→right — [3:0] visits 3,2,1,0. A class
+                    // property of that shape, or a packed array of
+                    // packed structs (`cand_t [0:2] c`, §7.4.1), too:
+                    // it has no module-scope dimension record (#928).
                     let n = (l - r).abs() + 1;
                     let step: i64 = if l >= r { -1 } else { 1 };
                     let mut idx = l;

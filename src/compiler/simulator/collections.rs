@@ -109,6 +109,56 @@ impl Simulator {
             .map(|dt| super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types))
     }
 
+    /// Whether the elements of collection `name` are class handles
+    /// (`K q[$]`, `K aa[int]`), from the element class the elaborator
+    /// recorded or the declared element type.
+    pub(super) fn coll_elem_is_class_handle(&self, name: &str) -> bool {
+        let leaf = name.rsplit('.').next().unwrap_or(name);
+        let root = name.split('[').next().unwrap_or(name);
+        if [name, leaf, root]
+            .iter()
+            .any(|n| self.module.array_elem_class.contains_key(*n))
+        {
+            return true;
+        }
+        let dt = self
+            .module
+            .var_decl_types
+            .get(name)
+            .or_else(|| self.module.var_decl_types.get(leaf))
+            .or_else(|| self.module.var_decl_types.get(root));
+        matches!(
+            dt.map(|d| self.resolve_dt_ref(d)),
+            Some(DataType::TypeReference { name: tn, .. })
+                if self.module.classes.contains_key(&tn.name.name)
+        )
+    }
+
+    /// The live size of row `name` when the dimension its next select
+    /// indexes is a queue or dynamic one, from the declared shape. None for a
+    /// fixed row (`raw[0]` of `T raw[][2]`), which is registered as dynamic
+    /// but keeps no size.
+    pub(super) fn live_coll_size(&self, name: &str) -> Option<u64> {
+        let sized = match self.coll_shape_at(name) {
+            Some((shape, depth)) => matches!(shape.dims.get(depth), Some(Dim::Dyn | Dim::Queue)),
+            None => {
+                let key = Self::name_with_suffix(name, ".size");
+                self.signals.contains_key(&key) || self.get_signal_value_by_name(&key).is_some()
+            }
+        };
+        sized.then(|| self.get_queue_size(name))
+    }
+
+    /// §7.10.1, §8.4: a read of a queue or dynamic-array element that does
+    /// not exist yields the element type's default — null for a class
+    /// handle, otherwise as `assoc_missing_elem_value`.
+    pub(super) fn coll_missing_elem_value(&self, name: &str) -> Option<Value> {
+        if self.coll_elem_is_class_handle(name) {
+            return Some(Value::zero(32));
+        }
+        self.assoc_missing_elem_value(name)
+    }
+
     /// §7.8.6: the value a read of a NONEXISTENT associative-array element
     /// yields — the element type's default, x for a 4-state integral type and
     /// 0 for a 2-state one, at the element's width and signedness. `None`
@@ -5073,6 +5123,25 @@ impl Simulator {
         // (sizing, element solving, acceptance).
         self.begin_randomize_budget();
         self.obj_rng_stack.push(handle);
+        // §18.7/§8.14: the object's scope is that of the receiver's declared
+        // class, which a derived class's redeclaration can change.
+        let scope = if self.shadowed_prop_names.is_empty() || items.is_empty() {
+            None
+        } else {
+            let dynamic = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.class_name.clone());
+            receiver
+                .as_deref()
+                .and_then(|r| self.var_view_class(r))
+                .filter(|c| {
+                    dynamic
+                        .as_deref()
+                        .is_some_and(|d| d != c && self.class_is_a(d, c))
+                })
+        };
         // §18.7: names in the inline block resolve in the object's scope
         // first, so a property named like the receiver hides it there.
         let receiver = receiver.filter(|r| {
@@ -5090,7 +5159,9 @@ impl Simulator {
         let inline_src_file = (!items.is_empty())
             .then(|| self.current_src_file())
             .flatten();
+        let prev_scope = std::mem::replace(&mut self.inline_constraint_scope, scope);
         let r = self.exec_randomize_inner(handle, items, inline_src_file);
+        self.inline_constraint_scope = prev_scope;
         self.randomize_subset = prev_subset;
         self.rand_receiver_base = prev_base;
         self.rand_receiver = prev_receiver;

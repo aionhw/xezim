@@ -3146,6 +3146,11 @@ impl Simulator {
                     }
                     return Some(key);
                 }
+                // §8.14: the nearest declaration wins — an instance property
+                // hides a same-named static or constant of an ancestor.
+                if cd.properties.contains_key(prop) {
+                    return None;
+                }
                 // §8.23: a NESTED class sees its lexically enclosing class's
                 // statics — hop to the enclosing class when the extends
                 // chain is exhausted.

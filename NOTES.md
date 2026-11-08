@@ -10,6 +10,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Command line**
 
+* `--relax-library-packages` (`XEZIM_RELAX_LIBRARY_PACKAGES=1`) compiles the
+  packages a `-v` library file declares, as if the file were also a source
+  file; by default a library file supplies only modules, interfaces,
+  programs and primitives (#937, requested by Ganesh-TNL). A package a
+  source file declares wins.
 * Checkpoints: `--save-at <time>[,<file>]` saves the state at the end of a
   time slot and `--restore <file>` continues from it, and `$save`,
   `$incsave` and `$restart` do the same from the design (IEEE 1800 Annex D,
@@ -30,6 +35,65 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A class property that a derived class redeclares as a `localparam`,
+  `parameter`, `static` property or typedef resolves in the scope of the
+  reference (§8.14, §8.23, #944, reported by Ganesh-TNL). This covers
+  `this.x`, bare `x`, compound, select and nonblocking writes in base
+  methods, base-typed handles (package-qualified ones included), collection
+  elements, static handles and member chains, base-class constraint blocks
+  and inline `randomize() with` blocks. Writes went to the derived class's
+  static or constant.
+* A `foreach` over a packed array of packed structs, or over another
+  multi-dimensional packed class property, covers every element: in a
+  constraint `foreach (c[i]) c[i].valid == 1'b1` is solved and checked, and
+  a procedural loop runs once per element instead of once (§7.4.1,
+  §18.5.8.1, #928, reported by Ganesh-TNL).
+* Live frames of different processes that declare a local of the same name
+  each keep their own type, and switching between them no longer rescans the
+  module's struct and packed-layout tables; the reporter's matrix drops from
+  78 s to under a second. A fork child's block local named like a variable
+  of its parent keeps its own value (§6.21, §9.3.2, #943, reported by
+  Ganesh-TNL).
+* An ascending packed array of a multi-bit typedef (`u8_t [0:7]`) declared as
+  a non-ANSI port keeps its element order; it was mirrored across the port.
+  A module-local typedef no longer sizes such a port at 32 bits per element,
+  packed struct-array ports get their shape, and a module-local
+  unpacked-array typedef keeps its dimensions in a submodule (§7.4.1,
+  §23.2.2.1, #942, reported by Ganesh-TNL). A function local or formal with
+  an ascending outer packed dimension no longer comes back element-reversed
+  from a continuous assignment or `always_comb`.
+* A compiled read of a module-scope queue or dynamic-array element at index
+  64 or above read x, so a `for` loop `t += q[i]` over 65 elements summed to
+  0, and a read past `size()` returned a stale element (§7.5, §7.10). Such
+  reads now use the live collection.
+* `s += x` on a 2-state local inside a `foreach` of a compiled function kept
+  `s` at x (§6.11.1). `d[i] = new[n](d[i])` keeps the row's elements
+  (§7.5.1), and `$size` and the other array queries of a class member's
+  dynamic array of fixed rows, and `$bits` of a module-scope row, count the
+  row (§20.6.2, §20.7).
+* In a design with more than one top-level module, a `$unit` nettype's
+  resolution function runs; the net read one driver alone. Two drivers of a
+  nettype without a resolution function, through ports or from a child and
+  its parent, are an error, as §6.6.7 requires.
+* A read of a queue or dynamic-array element at or past `size()` gives the
+  element type's default (x, 0, null or "") instead of the element a
+  `delete`, `pop_front` or `pop_back` left behind (§7.10.1, §7.8.6, #949 and
+  #948, contributed by davekeeshan). This includes a row of a fixed array of
+  queues, `fq[1][3]`, and a queue of class handles, which reads null.
+* A package array whose first dimension is sized by a parameter,
+  `logic [31:0] d [N][2]`, keeps all its dimensions (§7.4.2, §26.2, core #169
+  and #168, contributed by chuanseng-ng); `p::d[3][1]` read 0.
+* A user-defined nettype without a resolution function takes an
+  assignment-pattern driver through an output or inout port (§6.6.7, core
+  #170, #945 and #946, contributed by ds54e); the parent net read 0 in every
+  member. A continuous assignment that selects into such a net,
+  `assign p.V = v;`, is now an error (§10.3).
+* A name declared nowhere in the design is an error in a class parameter
+  override, nested ones included (`R #(A #(bad))`), in a class
+  value-parameter default and in a class property or package variable
+  initializer (§6.20.2, §8.25, #947 and #888, contributed by Ganesh-TNL).
+  Literals and system calls in a nested override, such as `8'hFF`,
+  `$clog2(16)` and `10ns`, are not taken for names.
 * A whole-struct write through a port reaches an instance-array element
   actual and a nested struct member actual member by member (§23.3.3.5,
   §7.2, core #166 and #917, contributed by ds54e); the parent read every

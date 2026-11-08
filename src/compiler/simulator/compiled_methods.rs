@@ -3061,6 +3061,12 @@ impl Simulator {
                     compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_typedef_types(&self.module.typedef_types);
                     Self::set_pattern_type_tables(&self.module, &mut compiler);
+                    // §7.5/§7.10: a design-scope dynamic array or queue element
+                    // is read and written by the interpreter (`array_operand`).
+                    compiler.set_collection_denies(
+                        &self.module.dynamic_arrays,
+                        &self.module.queue_vars,
+                    );
                     compiler.method_enum_constants = method_enum_constants;
                     compiler.class_scoped_enums = Some(match &self.class_scoped_enum_cache {
                         Some(rc) => rc.clone(),
@@ -3207,6 +3213,7 @@ impl Simulator {
                             | I::CallStaticScoped(..)
                             | I::StmtFallback(..)
                             | I::EvalExprFallback(..)
+                            | I::LoadDynElem(..)
                     )
                 };
                 let reentrant_static =

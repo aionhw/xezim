@@ -663,3 +663,18 @@ mod unpacked_struct_output_port_whole_write;
 
 #[path = "types/function_result_member_defaults.rs"]
 mod function_result_member_defaults;
+
+#[path = "types/nettype_no_resolver_ports.rs"]
+mod nettype_no_resolver_ports;
+#[path = "types/review_nettype_partial_driver.rs"]
+mod review_nettype_partial_driver;
+#[path = "types/review_nettype_multi_top.rs"]
+mod review_nettype_multi_top;
+
+
+#[path = "types/function_local_ascending_packed.rs"]
+mod function_local_ascending_packed;
+#[path = "types/nonansi_typedef_packed_port_942.rs"]
+mod nonansi_typedef_packed_port_942;
+#[path = "types/two_state_local_in_fallback.rs"]
+mod two_state_local_in_fallback;

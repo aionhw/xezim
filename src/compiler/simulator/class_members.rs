@@ -2565,6 +2565,187 @@ impl Simulator {
         }
     }
 
+    /// Whether the nearest declaration of `member` from class `cn` up is a
+    /// class constant (a `localparam` or `parameter` in the class body).
+    pub(super) fn nearest_decl_is_constant(&self, cn: &str, member: &str) -> bool {
+        let mut cur: Option<&str> = Some(cn);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            let Some(cd) = self.module.classes.get(c) else {
+                return false;
+            };
+            if cd.param_defaults.iter().any(|(p, _)| p == member) {
+                return true;
+            }
+            if cd.properties.contains_key(member)
+                || cd.static_properties.contains(member)
+                || guard > 64
+            {
+                return false;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
+    /// The nearest class from `cn` up that declares `member` as an INSTANCE
+    /// property, passing over static and constant declarations.
+    pub(super) fn nearest_instance_declarer(&self, cn: &str, member: &str) -> Option<String> {
+        let mut cur: Option<&str> = Some(cn);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            let cd = self.module.classes.get(c)?;
+            if guard > 64 {
+                return None;
+            }
+            if cd.properties.contains_key(member)
+                && !cd.static_properties.contains(member)
+                && !cd.param_defaults.iter().any(|(p, _)| p == member)
+            {
+                return Some(c.to_string());
+            }
+            cur = cd.extends.as_deref();
+        }
+        None
+    }
+
+    /// The class whose method is executing: the scope `this`, `super` and a
+    /// bare member name resolve in (§8.14, §8.15, §8.23).
+    pub(super) fn lexical_class(&self) -> Option<String> {
+        self.class_context_stack.last().cloned().flatten()
+    }
+
+    /// §8.14/§8.23: the class a class-handle expression is DECLARED as, the
+    /// scope its members resolve in, whatever class the object is: `this` is
+    /// the class of the running method, `super` its base, and a variable, a
+    /// property, a collection element or a member chain has its declared
+    /// type. None when no declaration is at hand (a function result, a name
+    /// whose type is not recorded); callers then keep the object's class.
+    pub(super) fn ref_view_class(&self, e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::This => self.lexical_class(),
+            ExprKind::Ident(h) if h.root.is_none() && !h.path.is_empty() => {
+                self.path_view_class(&h.path)
+            }
+            // An element of a collection of handles has the collection's
+            // declared element class, which is what the walk records for it.
+            ExprKind::Index { expr, .. } => self.ref_view_class(expr),
+            ExprKind::MemberAccess { expr, member } => {
+                let c = self.ref_view_class(expr)?;
+                self.prop_class_type_from_class(&c, &member.name, None)
+            }
+            ExprKind::Paren(inner) => self.ref_view_class(inner),
+            _ => None,
+        }
+    }
+
+    /// `ref_view_class` of a flattened handle path (`this.child`, `q[0]`,
+    /// `Box::slot.child`): the head's declared class, then each segment's
+    /// declared property type.
+    pub(super) fn path_view_class(&self, path: &[HierPathSegment]) -> Option<String> {
+        let head = path.first()?.name.name.as_str();
+        let mut rest = &path[1..];
+        let mut cls = match head {
+            "this" => self.lexical_class()?,
+            "super" => {
+                let ctx = self.lexical_class()?;
+                self.module.classes.get(&ctx)?.extends.clone()?
+            }
+            _ if !rest.is_empty() && path[0].selects.is_empty() && self.class_scope_head(head) => {
+                // `Class::static_prop...`: the class itself, through a
+                // typedef of a specialization as well.
+                let c = self
+                    .resolve_typeref_class_name_str(head)
+                    .filter(|c| self.module.classes.contains_key(c))
+                    .unwrap_or_else(|| head.to_string());
+                let c = self.class_origin(&c).to_string();
+                let first = &rest[0].name.name;
+                rest = &rest[1..];
+                self.prop_class_type_from_class(&c, first, None)?
+            }
+            _ => self.var_view_class(head)?,
+        };
+        for seg in rest {
+            cls = self.prop_class_type_from_class(&cls, &seg.name.name, None)?;
+        }
+        Some(cls)
+    }
+
+    /// The object a `Class::static_handle.member...` path (a flattened
+    /// identifier, `Box::slot` or `Box::slot.next`) reaches: the static cell's
+    /// handle, then each member's.
+    pub(super) fn static_head_handle(&self, e: &Expression) -> Option<usize> {
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.len() < 2 || h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let head = h.path[0].name.name.as_str();
+        if !self.class_scope_head(head) {
+            return None;
+        }
+        let cls = self
+            .resolve_typeref_class_name_str(head)
+            .filter(|c| self.module.classes.contains_key(c))
+            .unwrap_or_else(|| head.to_string());
+        let key = self.static_prop_key(&cls, &h.path[1].name.name)?;
+        let mut cur = self.class_statics.get(&key)?.to_u64()? as usize;
+        for seg in &h.path[2..] {
+            if cur == 0 {
+                return None;
+            }
+            cur = self.member_handle(cur, &seg.name.name)?;
+        }
+        Some(cur)
+    }
+
+    /// Does `head` name a class (or a typedef of one) rather than a variable,
+    /// as the head of `head::member`?
+    fn class_scope_head(&self, head: &str) -> bool {
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|m| m.contains_key(head))
+        {
+            return false;
+        }
+        self.module.classes.contains_key(head)
+            || self
+                .resolve_typeref_class_name_str(head)
+                .is_some_and(|c| self.module.classes.contains_key(&c))
+                && !self.signal_name_to_id.contains_key(head)
+    }
+
+    /// The declared class of a handle VARIABLE `name` (a local, a module
+    /// variable, a formal or a property of the running method's class),
+    /// collection variables giving their element class.
+    pub(super) fn var_view_class(&self, name: &str) -> Option<String> {
+        if let Some(ctx) = self.lexical_class() {
+            let local = self
+                .local_stack
+                .last()
+                .is_some_and(|m| m.contains_key(name));
+            if !local && let Some(c) = self.prop_class_type_from_class(&ctx, name, None) {
+                return Some(c);
+            }
+        }
+        let c = self
+            .class_of_var(name)
+            .or_else(|| self.elem_class_of_arr(name))
+            .or_else(|| self.declared_collection_elem_class(name))?;
+        let base = c.split('#').next().unwrap_or(&c);
+        // A package-qualified declaration (`pkg::base_c h`) names the class
+        // by its own key.
+        let leaf = base.rsplit("::").next().unwrap_or(base);
+        [leaf, base]
+            .into_iter()
+            .find(|c| self.module.classes.contains_key(*c))
+            .map(str::to_string)
+    }
+
     /// §8.9: the class and specialization whose static `member` an object
     /// reference names. The reference's declared type decides (`var`, when
     /// the reference is a variable), so a static is reachable through a null
@@ -2586,7 +2767,22 @@ impl Simulator {
             .get(handle)
             .and_then(|o| o.as_ref())
             .filter(|_| handle != 0);
-        let decl = var.and_then(|v| self.declared_class_spec(v, resolved));
+        // §8.9/§8.14: `this.s` names what the running method's class sees.
+        // That differs from the object's class only when a derived class
+        // hides a static of the method's class with an instance property.
+        let decl = if var == Some("this") {
+            live.and_then(|inst| {
+                let ctx = self.lexical_class()?;
+                (!self.member_is_static_prop(&inst.class_name, member)
+                    && self.member_is_static_prop(&ctx, member))
+                .then(|| {
+                    let spec = self.inherited_param_spec(&ctx);
+                    (ctx, spec)
+                })
+            })
+        } else {
+            var.and_then(|v| self.declared_class_spec(v, resolved))
+        };
         let (cn, spec) = match (live, decl) {
             (Some(inst), Some((dc, dspec))) if self.class_is_a(&inst.class_name, &dc) => {
                 // The object knows its specialization; the declaration's
@@ -2783,7 +2979,15 @@ impl Simulator {
             _ => return None,
         };
         if live(self, h) {
-            return self.static_write_via_handle(h, None, None, member, val.clone());
+            let via = match &lhs.kind {
+                ExprKind::MemberAccess { expr: recv, .. }
+                    if matches!(recv.kind, ExprKind::This) =>
+                {
+                    Some("this")
+                }
+                _ => None,
+            };
+            return self.static_write_via_handle(h, via, None, member, val.clone());
         }
         let (owner, prop) = null_in?;
         let (cn, spec) = self.null_property_static_target(owner, &prop, member)?;

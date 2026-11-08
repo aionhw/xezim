@@ -292,3 +292,60 @@ fn v_file_module_error_names_the_library_file() {
     assert!(out.contains("cells.v:4:"), "got:\n{}", out);
     assert!(!out.contains("top.v:"), "got:\n{}", out);
 }
+
+/// #937: `--relax-library-packages` compiles the packages a `-v` file
+/// declares, as if the file were also a source file, so an adopted module's
+/// import of one and the top module's import both resolve. A package a source
+/// file declares wins over a library file's of the same name. Without the
+/// switch the import stays an error (see above).
+#[test]
+fn relax_library_packages_compiles_v_file_packages() {
+    let dir = std::env::temp_dir().join("xezim_libflags_relax937");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("lib.v"),
+        "package LIB_PKG;\n  localparam int P_ADD = 4;\n\
+         \x20 class C #(int W = 2); static function int f(); return W * 10; endfunction endclass\n\
+         endpackage\n\
+         module child(input wire [3:0] din, output reg [3:0] dout);\n\
+         \x20 import LIB_PKG::*;\n\
+         \x20 always @* dout = din + P_ADD;\n\
+         endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("top.v"),
+        "module top;\n  reg [3:0] din = 1;\n  wire [3:0] dout;\n\
+         \x20 child u(.din(din), .dout(dout));\n\
+         \x20 initial begin #1 $display(\"dout=%0d f=%0d\", dout, LIB_PKG::C#(3)::f()); \
+         $finish; end\nendmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("own_pkg.sv"),
+        "package LIB_PKG;\n  localparam int P_ADD = 7;\n\
+         \x20 class C #(int W = 2); static function int f(); return W; endfunction endclass\n\
+         endpackage\n",
+    )
+    .unwrap();
+
+    let out = run(&dir, &["--relax-library-packages", "-v", "lib.v", "top.v"]);
+    assert!(out.contains("dout=5 f=30"), "got:\n{}", out);
+    assert!(!out.contains("not found"), "got:\n{}", out);
+
+    let out = run(
+        &dir,
+        &[
+            "--relax-library-packages",
+            "-v",
+            "lib.v",
+            "own_pkg.sv",
+            "top.v",
+        ],
+    );
+    assert!(out.contains("dout=8 f=3"), "got:\n{}", out);
+
+    let out = run(&dir, &["-v", "lib.v", "top.v"]);
+    assert!(out.contains("Package 'LIB_PKG' not found"), "got:\n{}", out);
+    assert!(out.contains("--relax-library-packages"), "got:\n{}", out);
+}

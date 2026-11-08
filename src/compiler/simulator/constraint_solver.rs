@@ -734,7 +734,9 @@ impl Simulator {
         self.dist_geometry_memo.borrow_mut().clear();
         self.push_local_frame(HashMap::default());
         self.method_local_base.push(self.local_stack.len() - 1);
+        let scopes = std::mem::take(&mut self.constraint_scopes);
         let r = self.exec_randomize_solve(handle, inline, inline_src_file);
+        self.constraint_scopes = scopes;
         self.method_local_base.pop();
         self.pop_local_frame();
         r
@@ -963,6 +965,17 @@ impl Simulator {
                     }
                     if seen_constraint_names.insert(con_name.clone()) {
                         constraints.push(con.clone());
+                        // §18.5/§8.14: a base class's block names what that
+                        // class sees, which a derived class's redeclaration
+                        // can change.
+                        if class_depth > 0
+                            && !self.shadowed_prop_names.is_empty()
+                            && let Some(c) = constraints.last()
+                            && !c.items.is_empty()
+                        {
+                            self.constraint_scopes
+                                .insert(c.items.as_ptr() as usize, cname.clone());
+                        }
                         constraint_src_files
                             .push(self.module.src_file_of_module.get(&cname).copied());
                         constraint_depth.push(class_depth);
@@ -989,6 +1002,12 @@ impl Simulator {
                 items: inline.to_vec(),
                 span: crate::ast::Span::new(0, 0),
             });
+            if let Some(scope) = self.inline_constraint_scope.take()
+                && let Some(c) = constraints.last()
+            {
+                self.constraint_scopes
+                    .insert(c.items.as_ptr() as usize, scope);
+            }
             constraint_src_files.push(inline_src_file);
             // §18.5.14.1: an in-line block outranks every class constraint;
             // the soft-priority contest below handles it by name.
@@ -3085,13 +3104,65 @@ impl Simulator {
         fe_failed: &mut bool,
     ) -> bool {
         for con in constraints {
-            for item in &con.items {
-                if !self.rand_item_accept(handle, item, rand_colls, fe_failed) {
-                    return false;
-                }
+            let scope = self.constraint_scope_of(con);
+            if let Some(s) = &scope {
+                self.class_context_stack.push(Some(s.clone()));
+            }
+            let ok = con
+                .items
+                .iter()
+                .all(|item| self.rand_item_accept(handle, item, rand_colls, fe_failed));
+            if scope.is_some() {
+                self.class_context_stack.pop();
+            }
+            if !ok {
+                return false;
             }
         }
         true
+    }
+
+    /// The class constraint block `con` is evaluated in when it is not the
+    /// object's own class (see `constraint_scopes`).
+    pub(super) fn constraint_scope_of(&self, con: &ClassConstraint) -> Option<String> {
+        if self.constraint_scopes.is_empty() {
+            return None;
+        }
+        self.constraint_scopes
+            .get(&(con.items.as_ptr() as usize))
+            .cloned()
+    }
+
+    /// §8.14/§18.4: the storage key of the object's random variable `name`.
+    /// When a derived class hides the base's rand property with a constant
+    /// (`localparam name = 27;`), the variable is the hidden instance copy,
+    /// stored under its declarer's qualified key.
+    pub(super) fn rand_var_key<'a>(
+        &self,
+        handle: usize,
+        name: &'a str,
+    ) -> std::borrow::Cow<'a, str> {
+        if !self.prop_maybe_shadowed(name) {
+            return std::borrow::Cow::Borrowed(name);
+        }
+        let Some(cn) = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.as_str())
+        else {
+            return std::borrow::Cow::Borrowed(name);
+        };
+        if !self.nearest_decl_is_constant(cn, name) {
+            return std::borrow::Cow::Borrowed(name);
+        }
+        match self
+            .nearest_instance_declarer(cn, name)
+            .and_then(|d| self.shadowed_prop_key_in(&d, handle, name))
+        {
+            Some(k) => std::borrow::Cow::Owned(k),
+            None => std::borrow::Cow::Borrowed(name),
+        }
     }
 
     pub(super) fn rand_has_soft(constraints: &[ClassConstraint]) -> bool {

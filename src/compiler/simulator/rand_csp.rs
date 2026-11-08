@@ -4219,11 +4219,13 @@ impl Simulator {
             }
         } else {
             match &var.key {
-                VarKey::Prop(n) => self
-                    .heap
-                    .get(csp.handle)
-                    .and_then(|o| o.as_ref())
-                    .and_then(|i| i.properties.get(n).cloned()),
+                VarKey::Prop(n) => {
+                    let key = self.rand_var_key(csp.handle, n);
+                    self.heap
+                        .get(csp.handle)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|i| i.properties.get(key.as_ref()).cloned())
+                }
                 VarKey::Elem(k) => self.read_coll_elem(k),
                 VarKey::Sub(h, n) => self
                     .heap
@@ -4258,8 +4260,9 @@ impl Simulator {
         }
         match &var.key {
             VarKey::Prop(n) => {
+                let key = self.rand_var_key(csp.handle, n).into_owned();
                 if let Some(Some(inst)) = self.heap.get_mut(csp.handle) {
-                    inst.properties.insert(n.clone(), val);
+                    inst.properties.insert(key, val);
                 }
             }
             VarKey::Elem(k) => self.write_coll_elem(k, val),
@@ -8276,6 +8279,17 @@ impl Simulator {
                 .extend(all.iter().map(|x| (x.1, x.2)));
             elem_dyn = true;
         }
+        // §7.4.1/§12.7.3: a field of an element of a packed array of structs
+        // at an index not known yet (`foreach (c[i]) c[i].valid == 1`): that
+        // field of every element (#928). A whole-variable dynamic select
+        // instead left the solver one opaque vector it could not search.
+        if !elem_dyn && let Some((p, flo, fw)) = self.csp_pdim_field_parts(csp, e, &mut konst) {
+            elem_dyn = true;
+            uses.entry(p.v)
+                .or_default()
+                .0
+                .extend(p.pos.iter().map(|&(lo, _)| (lo + flo, fw)));
+        }
         if !elem_dyn && let Some((v, r)) = self.csp_select_ref(csp, e, &mut konst) {
             let u = uses.entry(v).or_default();
             match r {
@@ -8686,6 +8700,22 @@ impl Simulator {
         e: &Expression,
         konst: &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>,
     ) -> Option<(usize, Option<(u32, u32)>)> {
+        let (p, flo, fw) = self.csp_pdim_field_parts(csp, e, konst)?;
+        if !p.known {
+            return Some((p.v, None));
+        }
+        Some((p.v, Some((p.pos[0].0 + flo, fw))))
+    }
+
+    /// `csp_pdim_field`'s parts: the element reference (every element it may
+    /// name, when an index is not known yet) and the field's offset in the
+    /// element and width.
+    fn csp_pdim_field_parts(
+        &mut self,
+        csp: &Csp,
+        e: &Expression,
+        konst: &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>,
+    ) -> Option<(PdimRef, u32, u32)> {
         if csp.elem_fields.is_empty() {
             return None;
         }
@@ -8726,10 +8756,7 @@ impl Simulator {
         }
         let key = path.join(".");
         let &(_, flo, fw) = fields.iter().find(|(n, ..)| *n == key)?;
-        if !p.known {
-            return Some((p.v, None));
-        }
-        Some((p.v, Some((p.pos[0].0 + flo, fw))))
+        Some((p, flo, fw))
     }
 
     /// `e` as (base, lsb, width, whole): a whole scalar, a field, or a select

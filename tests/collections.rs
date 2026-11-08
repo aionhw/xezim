@@ -104,6 +104,8 @@ mod queue_local_shadow_restore;
 mod queue_member_init;
 #[path = "collections/queue_ops_and_dist.rs"]
 mod queue_ops_and_dist;
+#[path = "collections/queue_read_past_size.rs"]
+mod queue_read_past_size;
 #[path = "collections/queue_store_element_type.rs"]
 mod queue_store_element_type;
 #[path = "collections/sibling_static_collection_collision.rs"]
@@ -299,3 +301,14 @@ mod unpacked_2d_element_width;
 mod assoc_pattern_ident_key;
 #[path = "collections/review_940_exists_rows.rs"]
 mod review_940_exists_rows;
+#[path = "collections/review_queue_read_past_size_948.rs"]
+mod review_queue_read_past_size_948;
+
+#[path = "collections/dyn_collection_compiled_read.rs"]
+mod dyn_collection_compiled_read;
+#[path = "collections/dyn_collection_compiled_read_live.rs"]
+mod dyn_collection_compiled_read_live;
+#[path = "collections/dyn_row_array_queries.rs"]
+mod dyn_row_array_queries;
+#[path = "collections/dyn_row_sized_new_copy.rs"]
+mod dyn_row_sized_new_copy;
