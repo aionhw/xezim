@@ -434,3 +434,6 @@ mod disable_targets;
 
 #[path = "hierarchy/generate_block_data_scopes.rs"]
 mod generate_block_data_scopes;
+
+#[path = "hierarchy/generate_block_data_hiding.rs"]
+mod generate_block_data_hiding;
