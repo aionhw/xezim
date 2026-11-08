@@ -442,3 +442,6 @@ mod generate_block_data_hiding;
 
 #[path = "hierarchy/generate_block_type_scopes.rs"]
 mod generate_block_type_scopes;
+
+#[path = "hierarchy/generate_rename_by_binding.rs"]
+mod generate_rename_by_binding;
