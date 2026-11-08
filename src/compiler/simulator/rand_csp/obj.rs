@@ -162,67 +162,100 @@ impl Simulator {
     /// it at any depth, reads through handle members back to `handle`.
     fn csp_points_back(&self, handle: usize, p: &str) -> bool {
         let sub = self.member_handle(handle, p).unwrap_or(0);
-        let (mut seen, mut subtree) = (HashSet::default(), vec![("".to_string(), sub)]);
+        let (mut seen, mut subtree) = (HashSet::default(), vec![(String::new(), sub)]);
         let _ = self.rand_csp_nested_subs(p, sub, handle, &mut seen, &mut subtree, 0);
         subtree.iter().any(|&(_, o)| {
-            let cons = self.active_constraints(o);
-            let mut visited = HashSet::default();
-            self.csp_reads_back_to(handle, o, &cons, &mut visited)
+            let leaf = |e: &Expression| self.csp_path_reaches(o, e, handle);
+            Self::csp_constraints_match(&self.active_constraints(o), &leaf, &|_| false)
         })
     }
 
-    /// Whether `cons` reads a handle member of `from` that is `target` or
-    /// leads on to it through handle members `cons` also reads.
-    fn csp_reads_back_to(
-        &self,
-        target: usize,
-        from: usize,
-        cons: &[ClassConstraint],
-        visited: &mut HashSet<usize>,
-    ) -> bool {
-        if from == 0 || !visited.insert(from) {
-            return false;
+    /// Whether the member path `e` spells, read from the object `from`, passes
+    /// through `target` before its last member (`owner.p.x`, `p.sum()`).
+    fn csp_path_reaches(&self, from: usize, e: &Expression, target: usize) -> bool {
+        let mut path = match &e.kind {
+            ExprKind::Ident(h) => h.path.iter().map(|s| s.name.name.clone()).collect(),
+            ExprKind::MemberAccess { .. } => Self::csp_member_path(e).unwrap_or_default(),
+            _ => return false,
+        };
+        if path.first().is_some_and(|m| m == "this") {
+            path.remove(0);
         }
-        let Some(inst) = self.heap.get(from).and_then(|o| o.as_ref()) else {
+        let Some((_, hops)) = path.split_last() else {
             return false;
         };
-        inst.properties.keys().any(|q| {
-            let h = self.member_handle(from, q).unwrap_or(0);
-            h != 0
-                && Self::csp_constraints_read(q, cons)
-                && (h == target || self.csp_reads_back_to(target, h, cons, visited))
+        let mut cur = from;
+        hops.iter().any(|m| {
+            cur = self.csp_class_handle(cur, m);
+            cur == target
         })
+    }
+
+    /// The object held by class-typed member `m` of `obj`, 0 for null or for
+    /// a member that is not a class handle.
+    fn csp_class_handle(&self, obj: usize, m: &str) -> usize {
+        let inst = self.heap.get(obj).and_then(|o| o.as_ref());
+        let mut cn = inst.map(|i| i.class_name.clone());
+        for _ in 0..64 {
+            let Some(cd) = cn.and_then(|n| self.module.classes.get(&n)) else {
+                break;
+            };
+            if let Some(sig) = cd.properties.get(m) {
+                let is_obj = sig
+                    .type_name
+                    .as_ref()
+                    .is_some_and(|tn| self.module.classes.contains_key(tn));
+                return if is_obj {
+                    self.member_handle(obj, m).unwrap_or(0)
+                } else {
+                    0
+                };
+            }
+            cn = cd.extends.clone();
+        }
+        0
     }
 
     /// Whether some item of `constraints` may read member `prop`: a name or
     /// member access spelled `prop` anywhere in it. An expression form the
     /// walk does not look inside counts as a read.
     fn csp_constraints_read(prop: &str, constraints: &[ClassConstraint]) -> bool {
+        let leaf = |x: &Expression| match &x.kind {
+            ExprKind::Ident(h) => h.path.iter().any(|s| s.name.name == prop),
+            ExprKind::MemberAccess { member, .. } => member.name == prop,
+            ExprKind::Number(_)
+            | ExprKind::StringLiteral(_)
+            | ExprKind::Unary { .. }
+            | ExprKind::Binary { .. }
+            | ExprKind::Conditional { .. }
+            | ExprKind::Concatenation(_)
+            | ExprKind::Replication { .. }
+            | ExprKind::Call { .. }
+            | ExprKind::SystemCall { .. }
+            | ExprKind::Inside { .. }
+            | ExprKind::Paren(_)
+            | ExprKind::Index { .. }
+            | ExprKind::RangeSelect { .. }
+            | ExprKind::Range(..)
+            | ExprKind::Dollar
+            | ExprKind::Null
+            | ExprKind::This
+            | ExprKind::Empty => false,
+            _ => true,
+        };
+        Self::csp_constraints_match(constraints, &leaf, &|n| n == prop)
+    }
+
+    /// Whether `leaf` holds for some expression node of `constraints`, or
+    /// `name` for a name a `solve` item lists.
+    fn csp_constraints_match(
+        constraints: &[ClassConstraint],
+        leaf: &dyn Fn(&Expression) -> bool,
+        name: &dyn Fn(&str) -> bool,
+    ) -> bool {
         let reads = |e: &Expression| {
             let mut hit = false;
-            Self::walk_operands(e, &mut |x| match &x.kind {
-                ExprKind::Ident(h) => hit |= h.path.iter().any(|s| s.name.name == prop),
-                ExprKind::MemberAccess { member, .. } => hit |= member.name == prop,
-                ExprKind::Number(_)
-                | ExprKind::StringLiteral(_)
-                | ExprKind::Unary { .. }
-                | ExprKind::Binary { .. }
-                | ExprKind::Conditional { .. }
-                | ExprKind::Concatenation(_)
-                | ExprKind::Replication { .. }
-                | ExprKind::Call { .. }
-                | ExprKind::SystemCall { .. }
-                | ExprKind::Inside { .. }
-                | ExprKind::Paren(_)
-                | ExprKind::Index { .. }
-                | ExprKind::RangeSelect { .. }
-                | ExprKind::Range(..)
-                | ExprKind::Dollar
-                | ExprKind::Null
-                | ExprKind::This
-                | ExprKind::Empty => {}
-                _ => hit = true,
-            });
+            Self::walk_operands(e, &mut |x| hit |= leaf(x));
             hit
         };
         let mut hit = false;
@@ -256,7 +289,7 @@ impl Simulator {
                             after_paths,
                             ..
                         } => {
-                            before.iter().chain(after).any(|n| n.name == prop)
+                            before.iter().chain(after).any(|n| name(&n.name))
                                 || before_paths.iter().chain(after_paths).any(reads)
                         }
                         ConstraintItem::Unique { exprs, .. } => exprs.iter().any(reads),
