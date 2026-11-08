@@ -312,8 +312,9 @@ impl Simulator {
     /// §7.8, §7.4.6, §11.5.1: a select past the unpacked dimensions of an
     /// associative array selects into the element: `a[7][3]` of
     /// `logic [31:0] a [int]` is bit 3 of `a[7]`, and `p[1][1]` of
-    /// `logic [3:0][7:0] p [int]` is byte 1 of `p[1]`. `expr` is the
-    /// element (`a[7]`) and `index` the select. Mirrors
+    /// `logic [3:0][7:0] p [int]` is byte 1 of `p[1]` (and `p[1][1][4]`
+    /// bit 4 of that byte). `expr` is the element or a select into it
+    /// (`a[7]`, `p[1][1]`) and `index` the next select. Mirrors
     /// `assoc_elem_bit_write`; without it the read took the select as one
     /// more key and read the absent element `a[7][3]`. None when `expr` does
     /// not name an element of an associative array, or the element is
@@ -338,9 +339,10 @@ impl Simulator {
             Some(_) => return None,
             None => 1,
         };
-        if keys != declared {
-            return None;
-        }
+        // `extra` selects already went into the element (`p[1][1][4]`:
+        // `p[1][1]` is a byte of `p[1]`), so `index` selects within the
+        // packed dimension after them.
+        let extra = keys.checked_sub(declared)?;
         // The element must be a value, not a row the declaration does not
         // show (a typedef'd collection element): the key paths own those.
         if let Some(row) = self.nested_index_name(expr)
@@ -352,13 +354,16 @@ impl Simulator {
         {
             return None;
         }
-        let elem = self.eval_expr(expr);
         let packed = self
             .module
             .packed_full_dims
             .get(&name)
-            .filter(|d| !d.is_empty())
-            .cloned();
+            .filter(|d| d.len() > extra)
+            .map(|d| d[extra..].to_vec());
+        if packed.is_none() && extra > 0 {
+            return None;
+        }
+        let elem = self.eval_expr(expr);
         let Some(dims) = packed else {
             return Some(match self.eval_expr(index).to_index() {
                 Some(i) if i >= 0 && (i as u32) < elem.width => elem.bit_select(i as usize),
@@ -2749,6 +2754,12 @@ impl Simulator {
             }
             _ => return None,
         };
+        // §7.8: an associative array's elements live under their keys, not
+        // in the scalar signal named after the array, so its selects belong
+        // to the associative paths (`assoc_elem_select_read`).
+        if self.is_associative_array(&base_name) {
+            return None;
+        }
         let dims = self.module.packed_full_dims.get(&base_name)?.clone();
         let k = idx_exprs.len();
         idx_exprs.reverse(); // outermost dimension's index first

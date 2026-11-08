@@ -1702,6 +1702,22 @@ impl Simulator {
         let phase_materialize = crate::WallTimer::now();
         Self::materialize_implicit_contassign_nets(&mut module);
         event_bits::complete_ascending_ranges(&mut module);
+        // §7.8: the packed type of an associative array describes its
+        // ELEMENTS; the array's name is never a packed vector itself. These
+        // two maps make the name read and write as one (`p[1]` of
+        // `logic [3:0][7:0] p [int]` as packed element 1, `u[1]` of
+        // `logic [0:7] u [int]` as bit 1), ahead of the associative paths.
+        // `packed_full_dims` stays: the associative paths use it for selects
+        // into an element.
+        {
+            let assoc = &module.associative_arrays;
+            module
+                .ascending_packed
+                .retain(|n, _| !assoc.contains_key(n));
+            module
+                .packed_signal_elem_widths
+                .retain(|n, _| !assoc.contains_key(n));
+        }
         // Lazy always blocks (see `LazyAlways`) everywhere except where a
         // pass reads every always-block body before classification: code
         // coverage instruments them, and opt-in signal placement walks them.
