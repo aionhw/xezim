@@ -1522,6 +1522,7 @@ impl Simulator {
                 span: crate::ast::Span::dummy(),
             },
             span: crate::ast::Span::dummy(),
+            bound: Default::default(),
         };
         let (base, mut type_args) = if let Some((base, sig)) = self.extract_spec_from_string(&tn) {
             let args = Self::split_spec_args(&sig)

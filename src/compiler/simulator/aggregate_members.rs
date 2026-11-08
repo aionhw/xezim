@@ -818,6 +818,7 @@ impl Simulator {
                         span,
                     },
                     span,
+                    bound: Default::default(),
                 },
                 dimensions: Vec::new(),
                 type_args: Vec::new(),

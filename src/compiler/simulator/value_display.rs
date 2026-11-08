@@ -586,6 +586,7 @@ impl Simulator {
                         span: crate::ast::Span::dummy(),
                     },
                     span: crate::ast::Span::dummy(),
+                    bound: Default::default(),
                 },
                 dimensions: Vec::new(),
                 type_args: Vec::new(),
