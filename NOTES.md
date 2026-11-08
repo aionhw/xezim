@@ -34,6 +34,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   args files.
 
 **Correctness**
+* A `foreach` constraint that applies `%` to array elements
+  (`(base[i] % sz[i]) == 0`) now solves: the per-element repair draws the
+  element from the congruence class the body admits instead of relying on
+  generate-and-test draws the final check almost always rejected, so
+  `randomize()` no longer reports "no solution found" for a satisfiable
+  constraint set. Genuinely unsatisfiable modulo constraints still fail.
 
 * A class property that a derived class redeclares as a `localparam`,
   `parameter`, `static` property or typedef resolves in the scope of the

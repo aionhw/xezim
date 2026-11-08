@@ -91,6 +91,8 @@ mod foreach_assoc_key_handle_write;
 mod foreach_cross_elem_whole_equality;
 #[path = "classes/foreach_packed_struct_member_inside.rs"]
 mod foreach_packed_struct_member_inside;
+#[path = "classes/foreach_modulo_constraint.rs"]
+mod foreach_modulo_constraint;
 #[path = "classes/function_local_struct_return_shadow.rs"]
 mod function_local_struct_return_shadow;
 #[path = "classes/implements_typedef_scope.rs"]
