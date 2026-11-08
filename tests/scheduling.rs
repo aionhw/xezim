@@ -458,3 +458,6 @@ mod review_fork_baseline_935;
 
 #[path = "scheduling/review_watchdog_drivers_938.rs"]
 mod review_watchdog_drivers_938;
+
+#[path = "scheduling/fork_child_hidden_locals_943.rs"]
+mod fork_child_hidden_locals_943;
