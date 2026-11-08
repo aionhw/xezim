@@ -45,6 +45,8 @@ mod class_member_operand_width;
 mod class_method_named_put_from_function;
 #[path = "classes/class_scope_array_const_whole_refs.rs"]
 mod class_scope_array_const_whole_refs;
+#[path = "classes/compiled_method_member_array_compare.rs"]
+mod compiled_method_member_array_compare;
 #[path = "classes/compiled_method_static_locals.rs"]
 mod compiled_method_static_locals;
 #[path = "classes/class_param_default_scope.rs"]
