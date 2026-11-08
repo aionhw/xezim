@@ -1368,28 +1368,6 @@ enum ScatterGate {
 // while collecting reads for a PLAIN `always` (star or explicit list),
 // whose sensitivity excludes called-function bodies (only
 // always_comb/always_latch descend into them).
-/// §27.6: hierarchical refs through an UNNAMED generate block's implicit
-/// `genblk<N>` name. Unnamed-branch declarations keep bare names (the
-/// historical leakage other resolution depends on), so `genblk1.x`
-/// resolves by stripping the implicit segments and retrying bare.
-fn strip_genblk_segments(name: &str) -> Option<String> {
-    if !name.starts_with("genblk") && !name.contains(".genblk") {
-        return None;
-    }
-    let stripped: Vec<&str> = name
-        .split('.')
-        .filter(|seg| {
-            !(seg.starts_with("genblk")
-                && seg[6..].chars().all(|c| c.is_ascii_digit())
-                && seg.len() > 6)
-        })
-        .collect();
-    if stripped.is_empty() || stripped.len() == name.split('.').count() {
-        return None;
-    }
-    Some(stripped.join("."))
-}
-
 /// Continuous-assignment targets indexed by leaf name, for the edge-select
 /// alias sharing in `rewrite_edge_select_sensitivities` (built once, on the
 /// first edge term that selects a bit of a vector).

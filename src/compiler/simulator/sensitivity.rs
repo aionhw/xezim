@@ -714,24 +714,6 @@ impl Simulator {
                 return Some(id);
             }
         }
-        // §27.6: an UNNAMED generate branch exposes its declarations through
-        // the implicit `genblk<N>` scope (the runtime resolver strips that
-        // segment and reads the bare name). A continuous-assignment RHS that
-        // reads `u_mod.genblk1.x` must therefore depend on the SAME signal the
-        // value comes from, not on the `u_mod` instance (which is not a
-        // readable scalar and never re-triggers, so the entry evaluates once
-        // and stays X). Retry the resolved (`<top>.` popped) name with every
-        // `genblk<N>` segment removed.
-        if let Some(stripped) = strip_genblk_segments(name) {
-            if let Some(&id) = self.signal_name_to_id.get(&stripped) {
-                return Some(id);
-            }
-            if let Some(tpop) = stripped.strip_prefix(top_prefix) {
-                if let Some(&id) = self.signal_name_to_id.get(tpop) {
-                    return Some(id);
-                }
-            }
-        }
         let mut rest = name;
         while let Some(cut) = rest.rfind('.') {
             rest = &rest[..cut];
