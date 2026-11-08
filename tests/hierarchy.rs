@@ -445,3 +445,5 @@ mod generate_block_type_scopes;
 
 #[path = "hierarchy/generate_rename_by_binding.rs"]
 mod generate_rename_by_binding;
+#[path = "hierarchy/generate_genvar_substitution.rs"]
+mod generate_genvar_substitution;
