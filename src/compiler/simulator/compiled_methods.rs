@@ -3213,6 +3213,7 @@ impl Simulator {
                             | I::CallStaticScoped(..)
                             | I::StmtFallback(..)
                             | I::EvalExprFallback(..)
+                            | I::LoadDynElem(..)
                     )
                 };
                 let reentrant_static =

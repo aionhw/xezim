@@ -947,6 +947,7 @@ impl Simulator {
                             Insn::StmtFallback(..)
                             | Insn::CovHit(..)
                             | Insn::EvalExprFallback(..)
+                            | Insn::LoadDynElem(..)
                             | Insn::BlockingAssignArray(..)
                             | Insn::BlockingAssignArrayRange(..)
                             | Insn::BlockingAssignRangeDyn(..) => unsupported = true,
@@ -3100,6 +3101,7 @@ impl Simulator {
             Insn::StmtFallback(..) => "StmtFallback",
             Insn::InitLocalColl(..) => "InitLocalColl",
             Insn::EvalExprFallback(..) => "EvalExprFallback",
+            Insn::LoadDynElem(..) => "LoadDynElem",
             Insn::ClearSigned(..) => "ClearSigned",
             Insn::Pow(..) => "Pow",
             Insn::SetSigned(..) => "SetSigned",

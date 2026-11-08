@@ -4017,7 +4017,9 @@ impl Simulator {
                         | Insn::BlockingAssignBitDyn(sg, _, _) => {
                             w.push((*sg as usize, 0, u32::MAX))
                         }
-                        Insn::StmtFallback(..) | Insn::EvalExprFallback(..) => ranged = false,
+                        Insn::StmtFallback(..)
+                        | Insn::EvalExprFallback(..)
+                        | Insn::LoadDynElem(..) => ranged = false,
                         _ => {}
                     }
                 }

@@ -776,6 +776,7 @@ impl Simulator {
                 // These should never appear in parallel-eligible blocks
                 Insn::StmtFallback(..)
                 | Insn::EvalExprFallback(..)
+                | Insn::LoadDynElem(..)
                 | Insn::BlockingAssign(..)
                 | Insn::BlockingAssignString(..)
                 | Insn::BlockingAssignRange(..)
@@ -1702,6 +1703,7 @@ impl Simulator {
                 | Insn::BlockingAssignArrayRange(..)
                 | Insn::StmtFallback(..)
                 | Insn::EvalExprFallback(..)
+                | Insn::LoadDynElem(..)
                 | Insn::CovHit(..) => {
                     unsupported = true;
                 }
@@ -4053,6 +4055,10 @@ impl Simulator {
                         }
                     }
                 }
+                Insn::LoadDynElem(dest, op, idx_reg) => {
+                    let v = self.load_dyn_elem(op, *idx_reg);
+                    self.vm_regs[*dest as usize] = v;
+                }
                 Insn::EvalExprFallback(payload, r, ctxw) => {
                     // Expression-level AST escape hatch: interpret one
                     // sub-expression; the rest of the statement stays
@@ -4806,5 +4812,46 @@ impl Simulator {
             pc += 1;
         }
         self.prof_insns_executed += local_count;
+    }
+
+    /// `Insn::LoadDynElem`: element `idx_reg` of a design-scope dynamic array
+    /// or queue, read as the interpreter reads it (§7.5, §7.10, §7.4.6). An
+    /// index inside both the live size and the placeholder element cells
+    /// reads its cell, as the interpreter's own first lookup does; anything
+    /// else (an x index, past `size()`, past the cells) takes that same
+    /// interpreter read.
+    #[inline]
+    pub(super) fn load_dyn_elem(
+        &mut self,
+        op: &super::bytecode::DynElemOp,
+        idx_reg: super::bytecode::RegId,
+    ) -> Value {
+        let ir = &self.vm_regs[idx_reg as usize];
+        if let Some((first, lo, hi)) = op.cells
+            && !ir.has_xz()
+            && let (Some(i), Some(ix)) = (ir.to_i64(), ir.to_index())
+            && i >= 0
+            && ix >= lo
+            && ix <= hi
+            && *self.spec_static_coll_key(&op.name) == *op.name
+        {
+            let size = match self.signals.get(&*op.size_key) {
+                Some(v) => v.to_u64().unwrap_or(0),
+                None => self.get_queue_size(&op.name),
+            };
+            // `get_queue_size`'s clamp of a garbage size.
+            let size = if size > 1 << 26 { 0 } else { size };
+            let eid = first + (ix - lo) as usize;
+            if (i as u64) < size && !is_packed_id(eid) {
+                let mut v = self.signal_table[eid].clone();
+                if self.signal_signed[eid] {
+                    v.is_signed = true;
+                }
+                return v;
+            }
+        }
+        let idx_val = self.vm_regs[idx_reg as usize].clone();
+        let store = self.spec_static_coll_key(&op.name).into_owned();
+        self.coll_elem_read(&op.name, &store, idx_val, op.ctx_width)
     }
 }

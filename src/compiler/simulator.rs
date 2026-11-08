@@ -338,7 +338,8 @@ fn method_boost_enabled() -> bool {
 // §18.8 (#846): mode builtins retain their receiver expressions in compiled code.
 // §11.4.10, §11.4.3: shift, `/`, `%` and `**` operands of unknown width keep their loaded width.
 // §8.25: compiled methods take type-parameter formals and locals.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3069;
+// §7.5/§7.10: design-scope dynamic-array and queue elements read the live collection.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_306a;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
