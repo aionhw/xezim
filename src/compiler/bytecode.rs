@@ -3875,6 +3875,10 @@ impl<'a> BytecodeCompiler<'a> {
             }
             if let Some(ew) = self.decl_elem_width_in(&p.data_type, Some(&name)) {
                 if ew > 0 && w > ew && w % ew == 0 {
+                    if self.decl_outer_dim_unnormalized(&p.data_type) {
+                        self.bail("Expr_Call_packed_outer_dim");
+                        return None;
+                    }
                     elem_binds.push((p.name.name.clone(), ew));
                 }
             }
@@ -4122,6 +4126,10 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                         if let Some(ew) = self.decl_elem_width(data_type) {
                             if ew > 0 && w > ew && w % ew == 0 {
+                                if self.decl_outer_dim_unnormalized(data_type) {
+                                    self.bail("Expr_Call_packed_outer_dim");
+                                    return false;
+                                }
                                 self.local_var_elem.insert(d.name.name.clone(), ew);
                             }
                         }
@@ -7899,6 +7907,20 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         scoped_arrays::resolve_type_width(dt, self.params, self.typedefs, &view)
+    }
+
+    /// §7.4.1: is the outermost packed dimension of `dt` other than the
+    /// normalized `[N-1:0]` (`u8_t [0:3]`, `logic [1:4][7:0]`)? A
+    /// register-backed local's element select slices `[i*ew +: ew]`, which
+    /// addresses only that shape: an ascending local came back reversed.
+    fn decl_outer_dim_unnormalized(&self, dt: &crate::ast::types::DataType) -> bool {
+        let (Some(p), Some(tt)) = (self.params, self.typedef_types) else {
+            return false;
+        };
+        crate::compiler::elaborate::packed_full_dims_of(dt, p)
+            .or_else(|| crate::compiler::elaborate::packed_full_dims_chained(dt, p, tt))
+            .and_then(|d| d.first().copied())
+            .is_some_and(|(l, r)| l < r || l.min(r) != 0)
     }
 
     /// Packed ELEMENT width of a declared type, for register-backed locals:
