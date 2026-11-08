@@ -83,6 +83,8 @@ mod generate_block_subroutines;
 mod generate_block_type_scopes;
 #[path = "hierarchy/generate_label_hier_roots.rs"]
 mod generate_label_hier_roots;
+#[path = "hierarchy/generate_rename_by_binding.rs"]
+mod generate_rename_by_binding;
 #[path = "hierarchy/generate_scope_names.rs"]
 mod generate_scope_names;
 #[path = "hierarchy/generate_scope_tree.rs"]
