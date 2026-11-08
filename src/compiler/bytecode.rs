@@ -2913,6 +2913,12 @@ impl<'a> BytecodeCompiler<'a> {
             .is_some_and(|s| d.contains(&s.name.name) || q.contains(&s.name.name))
     }
 
+    /// Is `name` (an `arrays` key) a dynamic array or queue?
+    fn is_dynamic_collection(&self, name: &str) -> bool {
+        self.dynamic_arrays.is_some_and(|d| d.contains(name))
+            || self.queue_vars.is_some_and(|q| q.contains(name))
+    }
+
     pub fn set_array_first_id(&mut self, arrays: &'a HashMap<Arc<str>, (usize, i64, i64)>) {
         self.array_first_id = Some(arrays);
     }
@@ -2922,7 +2928,20 @@ impl<'a> BytecodeCompiler<'a> {
     /// name. A block-local array of a process is declared at run time into
     /// by-name storage that has neither, and a compiled store into it was
     /// dropped: `for (int i ...) arr[i] = v;` left `arr` 0 (§6.21).
+    ///
+    /// A dynamic array or queue has no operand either (§7.5, §7.10): its
+    /// `0..63` element cells are only a placeholder backing. Elements past
+    /// them live in by-name storage, and a cell outside the live size keeps
+    /// a stale value, so a compiled read of `q[64]` came back x (a 2-state
+    /// `t += q[i]` then summed to 0) and `q[i]` past `q.size()` read an old
+    /// element instead of the default (§7.4.6). Bail to the interpreter,
+    /// which reads the live collection; stores already bail
+    /// (`collection_store_denied`).
     fn array_operand(&mut self, name: String) -> Option<Box<ArrayOperand>> {
+        if self.is_dynamic_collection(&name) {
+            self.bail("dynamic_collection_elem");
+            return None;
+        }
         if let Some(&(first_id, lo, hi)) = self
             .array_first_id
             .and_then(|arrays| arrays.get(name.as_str()))
@@ -6927,6 +6946,11 @@ impl<'a> BytecodeCompiler<'a> {
     ) -> Option<(Box<ArrayOperand>, RegId)> {
         let (key, ((lo1, hi1), (lo2, hi2), _w)) = self.arrays_2d_entry(hier)?;
         if lo1 < 0 || lo2 < 0 {
+            return None;
+        }
+        // A queue or dynamic array of rows: see `array_operand`.
+        if self.is_dynamic_collection(&key) {
+            self.bail("dynamic_collection_elem");
             return None;
         }
         let first_id = *self
