@@ -335,8 +335,8 @@ impl<'a> Names<'a> {
             match self.step(&cur, seg) {
                 Step::Item => return Ok(()),
                 Step::Scope(s) => cur = s,
-                // §27.6: an unnamed generate block's implicit name. Its
-                // declarations are flattened into the enclosing scope.
+                // §27.6: an implicit block name the lint has no record of (a
+                // block of processes only). Core rejects one naming no block.
                 Step::Missing if implicit(&seg.name) => {}
                 Step::Missing => {
                     let declared = self
