@@ -306,3 +306,5 @@ mod review_queue_read_past_size_948;
 
 #[path = "collections/dyn_collection_compiled_read.rs"]
 mod dyn_collection_compiled_read;
+#[path = "collections/dyn_row_sized_new_copy.rs"]
+mod dyn_row_sized_new_copy;
