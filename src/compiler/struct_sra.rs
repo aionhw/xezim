@@ -411,6 +411,7 @@ impl Ctx<'_> {
                                     data_type: mdt.clone(),
                                     lifetime: *lifetime,
                                     declarators: vec![VarDeclarator {
+                                        decl: crate::ast::binding::Bound::UNSET,
                                         name: Identifier {
                                             name: leaf(&d.name.name, m),
                                             span: d.name.span,
@@ -758,6 +759,7 @@ pub(crate) fn scalarize_member_call(
                 data_type: mdt.clone(),
                 lifetime: None,
                 declarators: vec![VarDeclarator {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: Identifier {
                         name: leaf(&fname, m),
                         span: fd.span,
