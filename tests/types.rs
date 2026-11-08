@@ -133,6 +133,8 @@ mod generate_with_array_queries;
 mod header_parameter_declared_signedness;
 #[path = "types/hierarchy_and_type_overrides.rs"]
 mod hierarchy_and_type_overrides;
+#[path = "types/implicit_net_in_submodule.rs"]
+mod implicit_net_in_submodule;
 #[path = "types/implicit_port_net_and_packed_typedef_array.rs"]
 mod implicit_port_net_and_packed_typedef_array;
 #[path = "types/inc_dec_result_signedness.rs"]
