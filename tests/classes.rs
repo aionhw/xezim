@@ -91,6 +91,8 @@ mod explicit_param_static_coll_read;
 mod foreach_assoc_key_handle_write;
 #[path = "classes/foreach_cross_elem_whole_equality.rs"]
 mod foreach_cross_elem_whole_equality;
+#[path = "classes/foreach_modulo_constraint.rs"]
+mod foreach_modulo_constraint;
 #[path = "classes/foreach_packed_struct_member_inside.rs"]
 mod foreach_packed_struct_member_inside;
 #[path = "classes/function_local_struct_return_shadow.rs"]
