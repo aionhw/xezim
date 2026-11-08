@@ -36,24 +36,14 @@ fn passes(src: &str, max_time: u64) -> (u64, Vec<String>) {
 
 /// The reporter's consolidated reproducer: sections A (evaluator), B
 /// (constraints), C (wide reductions) and D (wide element chains), each
-/// with its CTRL shapes.
-///
-/// Known open (the reference honours it): `foreach (c[i]) c[i].valid == 1'b1`
-/// over a packed array of structs — the solver does not model a FIELD of an
-/// element named through the loop variable (the whole element, `c[i] == K`,
-/// and explicit `c[0].valid == 1'b1` are modelled). That one check is the
-/// only FAIL line this test accepts.
+/// with its CTRL shapes. Every check passes, `foreach (c[i]) c[i].valid ==
+/// 1'b1` included (§18.5.8.1).
 #[test]
 fn packed_struct_array_property_928() {
     let (failures, out) = passes(include_str!("packed_struct_array_property_928.sv"), 100);
     let fails: Vec<&String> = out.iter().filter(|m| m.starts_with("FAIL")).collect();
-    assert_eq!(
-        fails,
-        ["FAIL @0 : foreach element.member: honoured"],
-        "FAIL lines: {:#?}",
-        fails
-    );
-    assert_eq!(failures, 1);
+    assert!(fails.is_empty(), "FAIL lines: {:#?}", fails);
+    assert_eq!(failures, 0);
 }
 
 /// Neighbouring shapes: a two-level typedef (`carr_t [1:0]`), a struct
@@ -78,4 +68,58 @@ fn packed_struct_array_property_928_probes() {
     );
     assert_eq!(t.len(), 37, "every probe must report: {:#?}", t);
     assert_eq!(failures, 0);
+}
+
+/// The open items of the first round: `foreach (c[i]) c[i].valid == 1'b1` and
+/// the other field-of-element bodies over a packed array of structs (one-
+/// and two-dimensional, ascending and descending), and the procedural
+/// one-variable `foreach` over a multi-dimensional packed class property,
+/// which ran its body once (§7.4.1, §12.7.3, §18.5.8.1).
+#[test]
+fn packed_struct_array_foreach_928() {
+    let sim =
+        simulate(include_str!("packed_struct_array_foreach_928.sv"), 100).expect("simulate failed");
+    let t: Vec<&str> = sim
+        .output
+        .iter()
+        .map(|o| o.message.trim())
+        .filter(|m| m.starts_with("T|"))
+        .collect();
+    assert_eq!(
+        t,
+        [
+            "T|fe1 ok=1 v=111",
+            "T|fe2 ok=1 m=3,4,5 v=010",
+            "T|fe3 ok=1 m=7,8,9",
+            "T|fe4 ok=1 m=0,1,2,10,11,12",
+            "T|fe5 ok=1 v=111",
+            "T|fe6 ok=1 m=0,1,2",
+            "T|c k=0",
+            "T|c k=1",
+            "T|c k=2",
+            "T|w k=2",
+            "T|w k=1",
+            "T|w k=0",
+            "T|t k=1",
+            "T|t k=2",
+            "T|t k=3",
+            "T|m k=0",
+            "T|m k=1",
+            "T|m2 k=0 j=0",
+            "T|m2 k=0 j=1",
+            "T|m2 k=0 j=2",
+            "T|m2 k=1 j=0",
+            "T|m2 k=1 j=1",
+            "T|m2 k=1 j=2",
+            "T|thisc k=0",
+            "T|thisc k=1",
+            "T|thisc k=2",
+            "T|mc k=0",
+            "T|mc k=1",
+            "T|mc k=2",
+            "T|pc k=0",
+            "T|pc k=1",
+            "T|pc k=2",
+        ]
+    );
 }
