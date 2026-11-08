@@ -333,6 +333,44 @@ impl Simulator {
                         return self.get_expr_type_name(&r);
                     }
                 }
+                // §8.14/§8.23 (#944): a free FUNCTION receiving a class handle
+                // (`mk_base().prop_val`) — the receiver's declared type is the
+                // callee's DECLARED return class (a derived object may live at
+                // the call site, but the write is typed at the returned class).
+                // A `Call` base can otherwise fall through `get_expr_type_name`
+                // to None, so a shadowed property write on a function result
+                // would resolve against the dynamic leaf instead of the
+                // declared return class.
+                if m.is_none() {
+                    if let ExprKind::Ident(h) = &func.kind
+                        && h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                    {
+                        if let Some(dt) = self
+                            .module
+                            .functions
+                            .get(h.path[0].name.name.as_str())
+                            .map(|f| f.return_type.clone())
+                        {
+                            let tn = Self::collection_elem_typename(&dt)?;
+                            let tnname = crate::ast::types::TypeName {
+                                scopes: Vec::new(),
+                                name: crate::ast::Identifier {
+                                    name: tn.name.name.clone(),
+                                    span: crate::ast::Span::dummy(),
+                                },
+                                span: crate::ast::Span::dummy(),
+                            };
+                            // Only a genuine class return contributes a
+                            // declared type; scalar returns fall through.
+                            let resolved = self.resolve_typeref_class_name(&tnname);
+                            if resolved.as_deref().is_some_and(|c| self.module.classes.contains_key(c))
+                            {
+                                return resolved;
+                            }
+                        }
+                    }
+                }
                 None
             }
             // LRM §8.4: `arr[i]` / `arr[i][j]` / `arr[i][j][k]` element
@@ -347,6 +385,18 @@ impl Simulator {
                 if let ExprKind::Ident(bh) = &cur.kind {
                     let bname = self.resolve_hier_name(bh);
                     if let Some(cn) = self.module.array_elem_class.get(&*bname).cloned() {
+                        return Some(cn);
+                    }
+                    // §8.14/§8.23 (#944): a collection-index receiver whose
+                    // element class is recorded only on the comprehensive
+                    // collection-element ladder (queues / dynamic arrays,
+                    // typed-typedef elements, class-member arrays) — e.g.
+                    // `cls_base q[$]` — must still resolve to its element
+                    // class here, so a shadowed property write `q[i].X = v`
+                    // resolves `X` against q's declared element type (the
+                    // base class) and lands on the base's instance cell, not
+                    // the derived class's static shadow.
+                    if let Some(cn) = self.collection_element_class_named(&bname) {
                         return Some(cn);
                     }
                     // §8.20 + §6.20.3: a class-MEMBER array whose element
@@ -395,6 +445,21 @@ impl Simulator {
                         if self.module.enum_members.contains_key(&t) {
                             return Some(t);
                         }
+                    }
+                }
+                // §8.14/§8.23 (#944) + §8.20: an element of a COLLECTION FIELD
+                // of the enclosing class (`this.pool[i]` in a base method,
+                // `base_cb q[$]` as a member of `this`) whose element type is
+                // a class. The root is a `MemberAccess` (not an `Ident` the
+                // `array_elem_class` table keys), so resolve the field's
+                // declared element class through the class-context chain —
+                // the same ladder `collection_element_class_named` uses. A
+                // shadowed property write `recv.X = v` then resolves `X`
+                // against that declared element class instead of the dynamic
+                // leaf's static shadow.
+                if let ExprKind::MemberAccess { member, .. } = &cur.kind {
+                    if let Some(cn) = self.collection_element_class_named(&member.name) {
+                        return Some(cn);
                     }
                 }
                 None
@@ -871,7 +936,7 @@ impl Simulator {
     /// the unshadowed path correctly does) would re-resolve from the executing
     /// class and find the wrong copy, so the member is renamed to the
     /// qualified storage key outright.
-    pub(super) fn super_rewrite(&self, e: &Expression) -> Option<Expression> {
+    pub(super) fn super_rewrite(&mut self, e: &Expression) -> Option<Expression> {
         if !self.shadowed_prop_names.is_empty() {
             let member: Option<(&str, crate::ast::Span)> = match &e.kind {
                 ExprKind::Ident(h)
@@ -925,7 +990,7 @@ impl Simulator {
     }
 
     #[inline(never)]
-    pub(super) fn shadowed_member_rewrite(&self, e: &Expression) -> Option<Expression> {
+    pub(super) fn shadowed_member_rewrite(&mut self, e: &Expression) -> Option<Expression> {
         let (prefix, m, span): (Expression, &str, crate::ast::Span) = match &e.kind {
             ExprKind::Ident(h)
                 if h.path.len() >= 2
@@ -963,21 +1028,33 @@ impl Simulator {
                         (**base).clone()
                     }
                     ExprKind::Index { .. } => (**base).clone(),
+                    // §8.14/§8.23 (#944): a function-result handle receiver
+                    // (`mk_base().prop_val`). The prefix's static type is the
+                    // callee's declared return class (resolved by
+                    // `get_expr_type_name`), so a derived `localparam` shadow
+                    // does not divert the write to the leaf's static cell.
+                    ExprKind::Call { .. } => (**base).clone(),
                     _ => return None,
                 };
                 (prefix, member.name.as_str(), e.span)
             }
             _ => return None,
         };
-        // The static class of the prefix.
+        // The static class of the prefix. The declared type may be a
+        // fully-qualified package-scoped name (`pkg::cls_base`), but instance
+        // property keys and `module.classes` are both keyed by the class's
+        // BARE leaf name (see `instantiate_class_with_type_args`), so the
+        // shadow qkey must also be built from the bare name. #944
         let static_cls: String = if matches!(prefix.kind, ExprKind::This) {
-            self.class_context_stack.last().cloned().flatten()?
+            let c = self.class_context_stack.last().cloned().flatten()?;
+            c.rsplit("::").next().unwrap_or(&c).to_string()
         } else {
             let tn = self.get_expr_type_name(&prefix)?;
             let tn = match self.extract_spec_from_string(&tn) {
                 Some((base, _)) => base,
                 None => tn,
             };
+            let tn = tn.rsplit("::").next().unwrap_or(&tn).to_string();
             if self.module.classes.contains_key(&tn) {
                 tn
             } else {
@@ -985,6 +1062,15 @@ impl Simulator {
                     .filter(|c| self.module.classes.contains_key(c))?
             }
         };
+        // §8.14/§8.23 (#944): a function-result handle receiver
+        // (`mk_base().prop_val`) is not a syntactically resolvable Ident / This
+        // handle, so fall back to evaluating the receiver to its live object.
+        // Resolved before `declarer_from` captures `self`, since evaluating a
+        // call can require `&mut self`.
+        let handle = self
+            .eval_handle_expr(&prefix)
+            .or_else(|| self.eval_expr(&prefix).to_u64().map(|h| h as usize))
+            .filter(|&h| h != 0)?;
         let declarer_from = |start: &str| -> Option<String> {
             let mut cur = Some(start.to_string());
             let mut guard = 0;
@@ -1002,7 +1088,6 @@ impl Simulator {
             None
         };
         let target = declarer_from(&static_cls)?;
-        let handle = self.eval_handle_expr(&prefix).filter(|&h| h != 0)?;
         let inst = self.heap.get(handle)?.as_ref()?;
         let leaf = declarer_from(&inst.class_name)?;
         if leaf == target {

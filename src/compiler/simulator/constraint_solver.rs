@@ -1287,8 +1287,9 @@ impl Simulator {
                         }
                         acc
                     };
+                    let key = self.rand_prop_storage_key(handle, name);
                     if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                        inst.properties.insert(name.clone(), v);
+                        inst.properties.insert(key, v);
                     }
                 }
                 let ok = constraints.iter().all(|con| {
@@ -2094,8 +2095,9 @@ impl Simulator {
                             };
                             val = Value::from_f64(pick);
                             solved_props.insert(name.clone(), val.clone());
+                            let rkey = self.rand_prop_storage_key(handle, name);
                             if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                inst.properties.insert(name.clone(), val);
+                                inst.properties.insert(rkey, val);
                             }
                             pids_to_solve.remove(i);
                             progress = true;
@@ -2134,8 +2136,9 @@ impl Simulator {
                             if let Some(pick) = pick {
                                 val = Value::from_u64(pick, *width);
                                 solved_props.insert(name.clone(), val.clone());
+                                let rkey = self.rand_prop_storage_key(handle, name);
                                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                    inst.properties.insert(name.clone(), val);
+                                    inst.properties.insert(rkey, val);
                                 }
                                 pids_to_solve.remove(i);
                                 progress = true;
@@ -2199,8 +2202,9 @@ impl Simulator {
                         }
                         val.is_signed = sgn;
                         solved_props.insert(name.clone(), val.clone());
+                        let rkey = self.rand_prop_storage_key(handle, name);
                         if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                            inst.properties.insert(name.clone(), val);
+                            inst.properties.insert(rkey, val);
                         }
                         self.narrow_from_fired_implications(
                             handle,
@@ -2342,8 +2346,9 @@ impl Simulator {
                             let mut v = Value::from_u64(masked, w);
                             v.is_signed = s;
                             solved_props.insert(name.clone(), v.clone());
+                            let rkey = self.rand_prop_storage_key(handle, &name);
                             if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                inst.properties.insert(name, v);
+                                inst.properties.insert(rkey, v);
                             }
                         }
                     }
@@ -2478,11 +2483,12 @@ impl Simulator {
                     if excl.is_empty() {
                         continue;
                     }
+                    let rkey = self.rand_prop_storage_key(handle, name);
                     let cur = self
                         .heap
                         .get(handle)
                         .and_then(|o| o.as_ref())
-                        .and_then(|i| i.properties.get(name))
+                        .and_then(|i| i.properties.get(&rkey))
                         .and_then(|v| v.to_u64());
                     if let Some(cv) = cur {
                         if excl.contains(&cv) {
@@ -2503,10 +2509,10 @@ impl Simulator {
                                     .heap
                                     .get(handle)
                                     .and_then(|o| o.as_ref())
-                                    .and_then(|i| i.properties.get(name))
+                                    .and_then(|i| i.properties.get(&rkey))
                                     .map(|v| v.width)
                                     .unwrap_or(32);
-                                if self.set_prop_if_changed(handle, name, Value::from_u64(pick, w))
+                                if self.set_prop_if_changed(handle, &rkey, Value::from_u64(pick, w))
                                 {
                                     changed = true;
                                 }

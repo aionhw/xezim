@@ -1147,3 +1147,7 @@ mod vif_collection_formals_925;
 mod review_940_constraint_memos;
 #[path = "classes/review_940_process_status.rs"]
 mod review_940_process_status;
+#[path = "classes/issue944.rs"]
+mod issue944;
+#[path = "classes/issue944_ref.rs"]
+mod issue944_ref;

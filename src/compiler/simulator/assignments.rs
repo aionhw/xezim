@@ -4027,14 +4027,25 @@ impl Simulator {
                         return ok;
                     }
                 }
+                // §8.14/§8.23 (#944): `this.X = v` inside a method must resolve
+                // in the LEXICAL scope of the method's DECLARING class, not the
+                // receiver's dynamic class. When a derived class shadows the
+                // base's instance property `X` with a non-instance member
+                // (class `localparam`/`parameter`/`static`), resolving against
+                // the dynamic class below would find that member and divert the
+                // write into the per-class static slot, leaving the base's
+                // instance property unwritten. The declaring class of the
+                // running method is tracked on `class_context_stack` (pushed at
+                // method entry in both the interpreted and compiled paths); its
+                // `static_prop_key` returns None for the base-only instance
+                // property, so the write falls through to the instance-property
+                // arm below. A genuine static property declared in the lexical
+                // class itself still resolves by that class.
                 let cn = if obj == "this" {
-                    self.this_stack
+                    self.class_context_stack
                         .last()
-                        .copied()
+                        .cloned()
                         .flatten()
-                        .and_then(|h| self.heap.get(h))
-                        .and_then(|o| o.as_ref())
-                        .map(|i| i.class_name.clone())
                 } else {
                     // A named reference was resolved above, by its
                     // declared type.
@@ -4574,8 +4585,20 @@ impl Simulator {
                                 && handle < self.heap.len()
                                 && self.heap[handle].is_some()
                             {
-                                let fitted = self.fit_class_prop(handle, prop_name, val);
-                                return self.set_prop_if_changed(handle, prop_name, fitted);
+                                // §8.14/§8.23 (#944): resolve a shadowed
+                                // instance-property write against the
+                                // receiver's DECLARED type (the chain's
+                                // static holder / base-typed handle), not its
+                                // dynamic leaf. A class `localparam`/etc.
+                                // shadow must not divert `Cls::holder.X = v`
+                                // into the per-class static slot; the base's
+                                // instance cell is keyed `Decl::X`.
+                                let key = self
+                                    .get_expr_type_name(&head_expr)
+                                    .and_then(|dc| self.declared_shadowed_key(&dc, handle, prop_name))
+                                    .unwrap_or_else(|| prop_name.clone());
+                                let fitted = self.fit_class_prop(handle, &key, val);
+                                return self.set_prop_if_changed(handle, &key, fitted);
                             }
                         }
                     }
@@ -5273,23 +5296,62 @@ impl Simulator {
                 }
                 // §11.5.1: splice a selected class property back into the
                 // object, including static and nested hierarchical receivers.
-                if let ExprKind::Ident(hier) = &expr.kind
-                    && let Some(h) = self.hier_parent_handle(hier)
-                {
-                    let member = &hier.path.last().unwrap().name.name;
-                    if let Some(mut cur) = self
-                        .static_read_via_handle(h, None, None, member)
-                        .or_else(|| self.read_member_value(h, member))
-                    {
-                        if oob_write_discard(msb_i, src_base, cur.width) {
-                            return false;
-                        }
-                        let rhs = val.resize_for_assign((msb_i - src_base + 1).max(1) as u32);
-                        for bit in lsb..=msb.min(cur.width.saturating_sub(1) as usize) {
-                            cur.set_bit(bit, rhs.get_bit((bit as i64 - src_base) as usize));
-                        }
-                        return self.set_prop_if_changed(h, member, cur);
+                // For plain hierarchical Ident receivers (`top.u.obj.n`) use
+                // `hier_parent_handle` (it resolves module->class handle
+                // chains that `prop_chain_root`'s module hops miss), then fall
+                // back to `prop_chain_root` for MemberAccess/Call receivers
+                // (`this.vec`, `h.vec`, `mk().vec`).
+                let ident_splice: Option<(usize, String, Value)> = (|| {
+                    let ExprKind::Ident(hier) = &expr.kind else {
+                        return None;
+                    };
+                    let h = self.hier_parent_handle(hier)?;
+                    let member = hier.path.last().unwrap().name.name.clone();
+                    let cur = self
+                        .static_read_via_handle(h, None, None, &member)
+                        .or_else(|| self.read_member_value(h, &member))?;
+                    Some((h, member, cur))
+                })();
+                let recv_splice: Option<(usize, String, Value)> = (|| {
+                    if let ExprKind::Ident(..) = &expr.kind {
+                        return None; // Ident handled above; never duplicate
                     }
+                    let (h, member) = self.prop_chain_root(expr)?;
+                    let base_is_this = matches!(&expr.kind, ExprKind::MemberAccess { expr: b, .. } if matches!(&b.kind, ExprKind::This));
+                    let key = if base_is_this {
+                        self.shadowed_prop_key(&member, false)
+                            .unwrap_or_else(|| member.clone())
+                    } else {
+                        self.get_expr_type_name(expr)
+                            .and_then(|dc| self.declared_shadowed_key(&dc, h, &member))
+                            .unwrap_or_else(|| member.clone())
+                    };
+                    let cur = self
+                        .static_read_via_handle(h, None, None, &key)
+                        .or_else(|| self.read_member_value(h, &key))
+                        .or_else(|| {
+                            // Fall back to the bare key only when the
+                            // namespaced one is absent (no shadow in play).
+                            if &key == &member {
+                                None
+                            } else {
+                                self.read_member_value(h, &member)
+                            }
+                        })
+                        .or_else(|| self.static_read_via_handle(h, None, None, &member));
+                    Some((h, key, cur?))
+                })();
+                if let Some((h, member, mut cur)) =
+                    ident_splice.or(recv_splice)
+                {
+                    if oob_write_discard(msb_i, src_base, cur.width) {
+                        return false;
+                    }
+                    let rhs = val.resize_for_assign((msb_i - src_base + 1).max(1) as u32);
+                    for bit in lsb..=msb.min(cur.width.saturating_sub(1) as usize) {
+                        cur.set_bit(bit, rhs.get_bit((bit as i64 - src_base) as usize));
+                    }
+                    return self.set_prop_if_changed(h, &member, cur);
                 }
                 // Fast path: resolve target signal_id directly (avoids format!
                 // + HashMap lookup on every call for tight memory-init loops).

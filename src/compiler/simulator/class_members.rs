@@ -2586,8 +2586,26 @@ impl Simulator {
             .get(handle)
             .and_then(|o| o.as_ref())
             .filter(|_| handle != 0);
+        // §8.14/§8.23 (#944): `this.X` in a method resolves in the LEXICAL
+        // scope of the method's DECLARING class, not in the receiver's dynamic
+        // class, so a derived class's non-instance shadow (class `localparam` /
+        // `parameter` / `static`) of a base instance property cannot divert the
+        // write into the per-class static slot. Computed once here for the
+        // `this` receiver below.
+        let this_lexical = (var.is_none()
+            && self.this_stack.last().copied().flatten() == Some(handle))
+            .then(|| self.class_context_stack.last().cloned().flatten());
         let decl = var.and_then(|v| self.declared_class_spec(v, resolved));
         let (cn, spec) = match (live, decl) {
+            // A genuine static declared in (or inherited by) the declaring
+            // class still resolves — `member_is_static_prop` and
+            // `static_prop_key` walk the ancestor chain from the declaring
+            // class.
+            (Some(inst), None) if this_lexical.as_ref().is_some_and(|x| x.is_some()) => {
+                let ctx = this_lexical.flatten().unwrap();
+                let entry = self.chain_entry_of(&inst.class_name, &ctx).unwrap_or(ctx);
+                (entry, inst.spec.clone())
+            }
             (Some(inst), Some((dc, dspec))) if self.class_is_a(&inst.class_name, &dc) => {
                 // The object knows its specialization; the declaration's
                 // spelling may still name type parameters (`this_type h;`).
@@ -2727,6 +2745,93 @@ impl Simulator {
         }
     }
 
+    /// §8.14/§8.23 (#944): the DECLARED (static) class of a member-receiver
+    /// expression `recv` in a write `recv.X = v`. The member `X` resolves
+    /// against this class, NOT the receiver's dynamic class — a derived
+    /// class's non-instance shadow must not divert the write. Returns `None`
+    /// when the receiver is not a live, statically-typed holder whose declared
+    /// class is determinable, in which case the caller keeps its dynamic
+    /// fallback.
+    pub(super) fn receiver_declared_class(&mut self, recv: &Expression) -> Option<String> {
+        use crate::ast::expr::ExprKind;
+        match &recv.kind {
+            ExprKind::This => self.class_context_stack.last().cloned().flatten(),
+            ExprKind::Call { func, .. } => {
+                // A function-result handle (`mk_base().prop_val`): the
+                // receiver's DECLARED type is the callee's return class, not
+                // the dynamic object's leaf. A derived `localparam` shadow in
+                // that leaf must not divert the write to a per-class static
+                // cell, so resolve the return type statically (the callee can
+                // hold a derived object, but the write is typed at the
+                // declared return class).
+                let dt = self.call_return_type(func)?;
+                let tn = Self::collection_elem_typename(&dt)?;
+                self.resolve_typeref_class_name(&tn)
+            }
+            ExprKind::Index { expr, .. } => {
+                // Queue / assoc / dynamic-array element handle: the element's
+                // declared class (`q[i]`, `aa["k"]`, `pool[i]`).
+                match &expr.kind {
+                    ExprKind::Ident(h)
+                        if h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                    {
+                        self.collection_element_class(expr)
+                    }
+                    ExprKind::MemberAccess { member, .. } => {
+                        // `this.pool[i]`: a collection FIELD of the enclosing
+                        // class, resolved by name through the class context.
+                        self.collection_element_class_named(&member.name)
+                    }
+                    _ => None,
+                }
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                // `this.child`, `a.b`: the leaf member property's declared
+                // class through the live base object's chain.
+                let base_h = self.eval_handle_expr(base)?;
+                if base_h == 0 || !self.heap.get(base_h).is_some_and(|o| o.is_some()) {
+                    return None;
+                }
+                self.prop_class_type(base_h, &member.name)
+            }
+            ExprKind::Ident(h)
+                if h.path.len() == 2
+                    && h.path[0].selects.is_empty()
+                    && h.path[1].selects.is_empty() =>
+            {
+                // `Cls::static_holder` (a class-scoped static property whose
+                // DECLARED type is the receiver class, e.g. `cls_box::slot_b`
+                // where `slot_b` is `static cls_base slot_b`). Resolve the
+                // static property's declared type, not the dynamic object.
+                let cls = &h.path[0].name.name;
+                if !self.module.classes.contains_key(cls) {
+                    return None;
+                }
+                let owners = self.prop_owners(cls);
+                let (_, cd) = owners.get(&h.path[1].name.name)?;
+                let tn = cd.properties.get(&h.path[1].name.name)?.type_name.clone()?;
+                self.resolve_typeref_class_name_str(&tn)
+            }
+            _ => None,
+        }
+    }
+
+    /// §8.9: write the static member of the declared class `dc` through the
+    /// object handle, mirroring `static_write_via_handle` but pinning the
+    /// class to the receiver's DECLARED type rather than walking the dynamic
+    /// class to its leaf-most static declarer. `dc` has already been
+    /// confirmed to declare `member` as a static property by the caller.
+    pub(super) fn static_write_in_declared(
+        &mut self,
+        dc: &str,
+        _handle: usize,
+        member: &str,
+        val: Value,
+    ) -> Option<bool> {
+        let (entry, spec) = (dc.to_string(), None);
+        Some(self.static_write_in(&entry, spec, member, val))
+    }
+
     /// §8.9: `a.b.s = v` / `f.g.s = v` — a static property at the end of a
     /// chain of handles is the shared cell of the last object's class. A
     /// single-variable receiver (`h.s`) resolves by its declared type in the
@@ -2742,7 +2847,7 @@ impl Simulator {
         }
         let live = |sim: &Self, h: usize| h != 0 && sim.heap.get(h).is_some_and(|o| o.is_some());
         // (receiver handle, or the live owner and property holding null)
-        let (h, null_in, member) = match &lhs.kind {
+        let (h, null_in, member, recv) = match &lhs.kind {
             ExprKind::MemberAccess { expr: recv, member } => {
                 if !statics.contains(member.name.as_str())
                     || matches!(&recv.kind, ExprKind::Ident(rh) if rh.path.len() == 1)
@@ -2750,10 +2855,10 @@ impl Simulator {
                     return None;
                 }
                 match self.eval_handle_expr(recv).filter(|&h| live(self, h)) {
-                    Some(h) => (h, None, &member.name),
+                    Some(h) => (h, None, &member.name, Some(recv)),
                     None => {
                         let (o, p) = self.handle_chain_owner(recv)?;
-                        (0, Some((o, p)), &member.name)
+                        (0, Some((o, p)), &member.name, Some(recv))
                     }
                 }
             }
@@ -2778,11 +2883,27 @@ impl Simulator {
                     }
                     h = next;
                 }
-                (h, null_in, &hier.path[n - 1].name.name)
+                (h, null_in, &hier.path[n - 1].name.name, None)
             }
             _ => return None,
         };
         if live(self, h) {
+            // §8.14/§8.23 (#944): a member write `recv.X = v` resolves `X`
+            // against the RECEIVER's DECLARED type, not its dynamic class.
+            // When the receiver's declared class chain declares `X` as an
+            // INSTANCE property (the base-class-typed owner of a derived
+            // object), a derived class's non-instance shadow (class
+            // `localparam`/`parameter`/`static`) must NOT divert the write
+            // into the per-class static slot. Only divert when the member is
+            // a genuine static of the declared chain; otherwise defer to the
+            // instance-property write path below.
+            if let Some(dc) = recv.and_then(|r| self.receiver_declared_class(r)) {
+                if !self.member_is_static_prop(&dc, member) {
+                    return None;
+                }
+                return self
+                    .static_write_in_declared(&dc, h, member, val.clone());
+            }
             return self.static_write_via_handle(h, None, None, member, val.clone());
         }
         let (owner, prop) = null_in?;

@@ -1066,6 +1066,69 @@ impl Simulator {
         None
     }
 
+    /// §8.14/§8.23 (#944): the storage `key` for a write to member `name` of
+    /// a live object whose DECLARED (static) type is `dc` — i.e. the receiver
+    /// of a handle-membership write like `recv.name = v` reached through a
+    /// chain, a collection element, a function result or a static holder. A
+    /// class `localparam`/`parameter`/`static` shadow in the object's DERIVED
+    /// leaf must not divert the write, so the base's instance cell is keyed
+    /// `<declaring-class>::name` when the leaf's declarer differs. Mirrors
+    /// `shadowed_prop_key` but takes the viewing class `dc` explicitly (the
+    /// chain receiver's declared type) and the object `handle` directly,
+    /// instead of `class_context_stack` / `this_stack` (which are unset for
+    /// module-scope chain receivers such as `Cls::holder.name`). Returns
+    /// `None` when the member is not shadowed, i.e. the bare `name` key.
+    pub(super) fn declared_shadowed_key(&self, dc: &str, handle: usize, member: &str) -> Option<String> {
+        if self.shadowed_prop_names.is_empty() || !self.shadowed_prop_names.contains(member) {
+            return None;
+        }
+        if handle == 0 || member.contains("::") {
+            return None;
+        }
+        // Nearest declarer of `member` at or above the DECLARED class `dc`
+        // (the receiver's static type).
+        let mut cur = Some(dc);
+        let mut target: Option<String> = None;
+        let mut seen: HashSet<&str> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn) {
+                break;
+            }
+            let Some(cd) = self.module.classes.get::<str>(cn) else {
+                break;
+            };
+            if cd.properties.contains_key(member) {
+                target = Some(cn.to_string());
+                break;
+            }
+            cur = cd.extends.as_deref();
+        }
+        let target = target?;
+        // Nearest declarer of `member` at or above the object's LEAF class.
+        let leaf = self.heap.get(handle).and_then(|o| o.as_ref())?.class_name.clone();
+        let mut cur = Some(leaf.as_str());
+        let mut leaf_target: Option<String> = None;
+        let mut seen: HashSet<&str> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn) {
+                break;
+            }
+            let Some(cd) = self.module.classes.get::<str>(cn) else {
+                break;
+            };
+            if cd.properties.contains_key(member) {
+                leaf_target = Some(cn.to_string());
+                break;
+            }
+            cur = cd.extends.as_deref();
+        }
+        let leaf_target = leaf_target?;
+        if leaf_target == target {
+            return None;
+        }
+        Some(format!("{}::{}", target, member))
+    }
+
     pub(super) fn fit_class_prop(&self, handle: usize, prop: &str, val: &Value) -> Value {
         // §10.7: every integral store takes the destination's signedness,
         // including stores whose width already matches the declaration.

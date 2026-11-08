@@ -4215,6 +4215,28 @@ impl Simulator {
         self.csp_write_value(csp, v, val);
     }
 
+    /// Resolve the canonical storage key for rand property `n` of the object
+    /// being solved (handle `h`). §8.14/§8.23 (#944): when a derived class
+    /// shadows `n` (a `localparam`/`parameter`/`static`), the rand instance
+    /// property is stored under the namespaced key `<Declarer>::n` (see
+    /// `instantiate_class_with_type_args`), so the solver's bare-name reads
+    /// and writes must be redirected to that key or randomize() writes the
+    /// shadowing per-class slot and the base accessor never sees the value.
+    pub(super) fn rand_prop_storage_key(&self, h: usize, n: &str) -> String {
+        if let Some(Some(inst)) = self.heap.get(h) {
+            if inst.properties.keys().any(|k| k.ends_with(&format!("::{}", n))) {
+                // Prefer the namespaced key owned by whatever class holds the
+                // live instance property; fall back to bare if none exists.
+                for k in inst.properties.keys() {
+                    if k.ends_with(&format!("::{}", n)) {
+                        return k.clone();
+                    }
+                }
+            }
+        }
+        n.to_string()
+    }
+
     /// The current value of base variable `v` (not a segment).
     fn csp_read(&mut self, csp: &Csp, v: usize) -> Option<Value> {
         let var = &csp.vars[v];
@@ -4229,11 +4251,13 @@ impl Simulator {
             }
         } else {
             match &var.key {
-                VarKey::Prop(n) => self
-                    .heap
-                    .get(csp.handle)
-                    .and_then(|o| o.as_ref())
-                    .and_then(|i| i.properties.get(n).cloned()),
+                VarKey::Prop(n) => {
+                    let key = self.rand_prop_storage_key(csp.handle, n);
+                    self.heap
+                        .get(csp.handle)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|i| i.properties.get(&key).cloned())
+                }
                 VarKey::Elem(k) => self.read_coll_elem(k),
                 VarKey::Sub(h, n) => self
                     .heap
@@ -4268,8 +4292,9 @@ impl Simulator {
         }
         match &var.key {
             VarKey::Prop(n) => {
+                let key = self.rand_prop_storage_key(csp.handle, n);
                 if let Some(Some(inst)) = self.heap.get_mut(csp.handle) {
-                    inst.properties.insert(n.clone(), val);
+                    inst.properties.insert(key, val);
                 }
             }
             VarKey::Elem(k) => self.write_coll_elem(k, val),
