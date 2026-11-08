@@ -291,6 +291,13 @@ impl Simulator {
             // `obj.member` and indexed/call-bearing owners are
             // collection operands, not scalar broadcast values.
             ExprKind::MemberAccess { .. } => self.expr_assoc_name(e),
+            // A ROW of an array of dynamic arrays (`d[i]`, `h.rows[i]`) is a
+            // collection operand too; taken for a scalar, the copy kept
+            // nothing (`d[1] = new[2](d[1])` zeroed the row).
+            ExprKind::Index { .. } if Self::cond_expr_is_effect_free(e, false) => self
+                .class_array_of_coll_key(e)
+                .or_else(|| self.flat_member_name(e))
+                .filter(|n| self.module.dynamic_arrays.contains(n.as_str())),
             _ => None,
         });
         if let Some((dt, tail)) = self.dynamic_assoc_decl(name) {
