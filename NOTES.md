@@ -708,6 +708,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   select into a multi-dimensional packed element reads that slice. It read
   an absent element instead, x for 4-state and 0 for 2-state (§7.8,
   §11.5.1, #956).
+* An associative array of a multi-dimensional, offset or ascending packed
+  type (`logic [3:0][7:0] p [int]`, `logic [8:1] r [int]`,
+  `logic [0:7] u [int]`) stores whole elements: `p[1] = 32'h11223344` made
+  no entry, `u[1] = 8'h80` wrote one bit, and `p[1][2] = 8'hFF` wrote one
+  bit of the slice (§7.8, §7.4.1, #958).
 
 **Performance**
 
