@@ -47,6 +47,8 @@ mod class_method_named_put_from_function;
 mod class_scope_array_const_whole_refs;
 #[path = "classes/compiled_method_static_locals.rs"]
 mod compiled_method_static_locals;
+#[path = "classes/compiled_method_member_array_compare.rs"]
+mod compiled_method_member_array_compare;
 #[path = "classes/class_param_default_scope.rs"]
 mod class_param_default_scope;
 #[path = "classes/class_queue_struct_prop_copy.rs"]

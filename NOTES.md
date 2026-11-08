@@ -34,6 +34,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   args files.
 
 **Correctness**
+* A comparison between two elements of a class-member fixed-size array
+  inside a compiled method (`base[i] < base[j] + len[j]`) now evaluates
+  at the elements' declared width. Width inference sized the element
+  select at 1 bit, so the comparison used only the least significant
+  bits of each element; the interpreter path was already correct.
 
 * A class property that a derived class redeclares as a `localparam`,
   `parameter`, `static` property or typedef resolves in the scope of the

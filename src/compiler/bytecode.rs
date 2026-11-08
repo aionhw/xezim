@@ -1093,6 +1093,11 @@ pub(super) struct PreboundCompiledMethod {
     /// the dims to slice instead. Absent ⇒ single-vector elements, where
     /// the old bit-select lowering is correct.
     pub coll_elem_packed_dims: std::rc::Rc<HashMap<String, Vec<(i64, i64)>>>,
+    /// Declared ELEMENT width of every member in the element-access plan
+    /// set (fixed arrays, queues, associative members) — the width table
+    /// `expr_max_width` consults for a member element select. Without it
+    /// the select sized at 1 bit (see `member_elem_plan_width`).
+    pub coll_elem_widths: std::rc::Rc<HashMap<String, u32>>,
     /// class-perf row 2: names of NON-INPUT formals (output / inout / ref —
     /// the interpreter's `output_bindings` copy-out set) admitted to the
     /// compiled path as plain scalars (integral / string / enum / class
@@ -1987,6 +1992,9 @@ pub struct BytecodeCompiler<'a> {
     /// array — `arr[j][2]` must select the packed ELEMENT (ew-bit slice),
     /// not one bit of the loaded element.
     pub coll_elem_packed_dims: HashMap<String, Vec<(i64, i64)>>,
+    /// Mirrored plan fact (`PreboundCompiledMethod::coll_elem_widths`):
+    /// declared element widths of the element-access plan members.
+    pub coll_elem_widths: HashMap<String, u32>,
     /// Unpacked dims of the typedefs this body's locals are declared with
     /// (`typedef int q_t[$]; q_t q;`), keyed by the type's source spelling
     /// (`p::q_t`). The declarator itself carries no dims, so without this a
@@ -2342,6 +2350,7 @@ impl<'a> BytecodeCompiler<'a> {
             static_coll_member_names: HashSet::default(),
             coll_elem_member_names: HashSet::default(),
             coll_elem_packed_dims: HashMap::default(),
+            coll_elem_widths: HashMap::default(),
             typedef_coll_dims: HashMap::default(),
             typedef_coll_strings: HashSet::default(),
             member_coll_strings: HashSet::default(),
@@ -6402,6 +6411,54 @@ impl<'a> BytecodeCompiler<'a> {
         }
         let dims = self.coll_elem_packed_dims.get(name)?;
         Some(dims.iter().map(|(l, r)| (l - r).abs() as u32 + 1).product())
+    }
+
+    /// The declared ELEMENT width of a member of the element-access plan
+    /// set, from the mirrored plan fact (`coll_elem_widths`): fixed-array
+    /// members record it in `array_properties`, queues in
+    /// `queue_properties`, associative members in their property width.
+    /// `explicit_this` (a `this.m[i]` / `this.m` spelling) skips the
+    /// local-shadow guard — the spelling names the member unambiguously.
+    fn member_elem_plan_width(&self, name: &str, explicit_this: bool) -> Option<u32> {
+        if !self.coll_elem_member_names.contains(name) {
+            return None;
+        }
+        // A body-local declaration shadows the member (the same
+        // precedence `member_coll_elem_target` applies before lowering
+        // an element read): plain locals, local collections and local
+        // arrays all keep the member's width off their selects.
+        if !explicit_this
+            && (self.local_var_regs.contains_key(name)
+                || self.local_coll_names.contains(name)
+                || self.local_var_array.contains_key(name))
+        {
+            return None;
+        }
+        self.coll_elem_widths.get(name).copied().filter(|&w| w > 0)
+    }
+
+    /// `member_elem_plan_width` for a bare or `this.`-prefixed Ident base
+    /// of an element select.
+    fn member_elem_plan_width_of(
+        &self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<u32> {
+        if hier.root.is_some() {
+            return None;
+        }
+        match hier.path.as_slice() {
+            [seg] if seg.selects.is_empty() => {
+                self.member_elem_plan_width(&seg.name.name, false)
+            }
+            [this_seg, seg]
+                if this_seg.selects.is_empty()
+                    && seg.selects.is_empty()
+                    && this_seg.name.name == "this" =>
+            {
+                self.member_elem_plan_width(&seg.name.name, true)
+            }
+            _ => None,
+        }
     }
 
     /// Pure admission probe for member-collection ELEMENT access (Step
@@ -21203,6 +21260,17 @@ impl<'a> BytecodeCompiler<'a> {
                             .and_then(|n| self.assoc_elem_widths.and_then(|m| m.get(&n).copied()))
                     })
                     .or_else(|| self.member_coll_elem_decl_width(hier))
+                    // A member of the element-access plan set whose element
+                    // is a plain vector (`int unsigned base[5]`, read as
+                    // `base[i]`): the read lowers to `LoadCollElem`, but
+                    // none of the tables above carries its element width
+                    // (packed dims: none recorded; module array tables:
+                    // module scope only), so the select sized at 1 bit —
+                    // and a self-determined context (`(base[i] < base[j])
+                    // ? …`) then resized both element reads to their LSBs,
+                    // comparing 0 < 0. The plan's element-width fact
+                    // (`coll_elem_widths`) is the missing table.
+                    .or_else(|| self.member_elem_plan_width_of(hier))
                     .unwrap_or(1),
                 // issue-301: a select INTO a member-collection element
                 // (`arr[i][2]` on `bit [8:0][7:0] arr[3]`) — the width is
@@ -21213,6 +21281,22 @@ impl<'a> BytecodeCompiler<'a> {
                 // store-backed shapes above were safe.
                 ExprKind::Index { expr: root, .. } => {
                     self.member_coll_elem_index_width(root).unwrap_or(1)
+                }
+                // `this.base[i]`: the same width sources as the bare
+                // spelling, in the same order — multi-dim packed dims
+                // first, then the plan element-width fact.
+                ExprKind::MemberAccess { expr: recv, member }
+                    if matches!(recv.kind, ExprKind::This) =>
+                {
+                    self.coll_elem_packed_dims
+                        .get(&member.name)
+                        .map(|dims| {
+                            dims.iter()
+                                .map(|(l, r)| (l - r).abs() as u32 + 1)
+                                .product()
+                        })
+                        .or_else(|| self.member_elem_plan_width(&member.name, true))
+                        .unwrap_or(1)
                 }
                 _ => 1,
             },

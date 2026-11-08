@@ -339,7 +339,9 @@ fn method_boost_enabled() -> bool {
 // §11.4.10, §11.4.3: shift, `/`, `%` and `**` operands of unknown width keep their loaded width.
 // §8.25: compiled methods take type-parameter formals and locals.
 // §7.5/§7.10: design-scope dynamic-array and queue elements read the live collection.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_306a;
+// §11.6.1: member element selects size at the declared element width
+// (`coll_elem_widths` plan fact in `expr_max_width`).
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_306b;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
