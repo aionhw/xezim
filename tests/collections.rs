@@ -314,3 +314,5 @@ mod dyn_row_array_queries;
 mod dyn_row_sized_new_copy;
 #[path = "collections/assoc_elem_select_read.rs"]
 mod assoc_elem_select_read;
+#[path = "collections/assoc_packed_elem.rs"]
+mod assoc_packed_elem;
