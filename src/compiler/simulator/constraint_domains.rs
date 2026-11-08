@@ -4541,9 +4541,22 @@ impl Simulator {
             return Some(failed.is_none());
         }
         let arr_name = Self::foreach_base_name(array)?;
+        // §7.4.1/§12.7.3: a packed multi-dimensional property or a packed
+        // array of packed structs (`cand_t [0:2] c`) loops over its leading
+        // packed dimensions, one per loop variable; unchecked, a violating
+        // trial was accepted (#928).
         let dims = match self.fixed_foreach_dims(handle, &arr_name) {
             Some((dims, _)) => dims,
-            None => self.state_foreach_dims(handle, array, &arr_name, idx_names.len())?,
+            None => match self
+                .packed_prop_foreach_dims(handle, &arr_name)
+                .filter(|(d, _)| (1..=d.len()).contains(&idx_names.len()))
+            {
+                Some((mut dims, _)) => {
+                    dims.truncate(idx_names.len());
+                    dims
+                }
+                None => self.state_foreach_dims(handle, array, &arr_name, idx_names.len())?,
+            },
         };
         if idx_names.len() != dims.len() {
             return None;
