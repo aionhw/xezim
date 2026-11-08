@@ -242,12 +242,26 @@ impl Simulator {
                         .map(|(n, _)| n.clone()),
                 );
                 for (n, dt) in &cd.property_types {
-                    if let DataType::IntegerVector { dimensions, .. }
-                    | DataType::Implicit { dimensions, .. } = dt
-                    {
-                        if !dimensions.is_empty() {
-                            packed_vec_props.insert(n.clone());
+                    // §7.4.1 / §6.18: an alias-typed or enum-typed property
+                    // (`byte_t tx;`, `e_t [1:0] penum;`) is a packed vector
+                    // too. Its dimensions live behind the typedef, so the
+                    // declared-type arms alone admitted only the direct
+                    // spellings and every `<obj>.<prop>[i]` write on an
+                    // alias-typed property was dropped (§10 of the ledger).
+                    let vector_like = match dt {
+                        DataType::IntegerVector { dimensions, .. }
+                        | DataType::Implicit { dimensions, .. } => !dimensions.is_empty(),
+                        DataType::TypeReference { .. } | DataType::Enum(_) => {
+                            Self::decl_is_packed_vector(
+                                dt,
+                                Some(cd.as_ref()),
+                                &self.module.typedef_types,
+                            )
                         }
+                        _ => false,
+                    };
+                    if vector_like {
+                        packed_vec_props.insert(n.clone());
                     }
                 }
                 constant_arrays.extend(cd.array_properties.keys().filter(|name| {

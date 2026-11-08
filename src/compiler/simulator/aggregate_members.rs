@@ -3516,6 +3516,125 @@ impl Simulator {
         })
     }
 
+    /// §7.4.1 / §6.18: followed through typedef aliases, does a declaration
+    /// name a PACKED VECTOR (a vector, an integral atom, or an enum — a
+    /// packed vector of its base type)? Class-local typedefs are searched
+    /// before the design-wide table; an unresolvable alias, a struct or a
+    /// class handle answers `false` and stays with the aggregate paths.
+    ///
+    /// Cheap syntactic gate for the `<obj>.<prop>[i]` select paths, which
+    /// must not evaluate a receiver for every unrelated member select.
+    pub(super) fn decl_is_packed_vector(
+        dt: &crate::ast::types::DataType,
+        local: Option<&super::elaborate::ElaboratedClass>,
+        typedefs: &HashMap<String, crate::ast::types::DataType>,
+    ) -> bool {
+        use crate::ast::types::DataType;
+        // Borrowed, never cloned: this runs once per member select on a
+        // property, and a `DataType` clone carries its dimension expressions.
+        let mut cur = dt;
+        for _ in 0..32 {
+            match cur {
+                DataType::TypeReference { name, .. } => {
+                    let Some(next) = local
+                        .and_then(|cd| cd.typedef_targets.get(&name.name.name))
+                        .or_else(|| typedefs.get(&name.name.name))
+                    else {
+                        return false;
+                    };
+                    cur = next;
+                }
+                // §6.19.1: an enum with no base type is `int` — still a vector.
+                DataType::Enum(e) => match &e.base_type {
+                    Some(base) => cur = base.as_ref(),
+                    None => return true,
+                },
+                DataType::IntegerVector { .. }
+                | DataType::Implicit { .. }
+                | DataType::IntegerAtom { .. } => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// §7.4.1 / §6.18: the packed dimensions of a declaration as evaluated
+    /// `(left, right)` pairs, following typedef aliases and an enum's base
+    /// type. The alias's own dimensions come first, then the target's, which
+    /// is the order the slot arithmetic in [`Self::class_packed_elem_ref`]
+    /// walks. An integral atom or an unbased enum contributes its single
+    /// implicit dimension, so `byte b; b[3]` selects a bit of it.
+    fn decl_packed_dim_bounds(
+        dt: &crate::ast::types::DataType,
+        local: Option<&super::elaborate::ElaboratedClass>,
+        typedefs: &HashMap<String, crate::ast::types::DataType>,
+        params: &HashMap<String, Value>,
+    ) -> Option<Vec<(i64, i64)>> {
+        use crate::ast::types::{DataType, IntegerAtomType};
+        let mut out: Vec<(i64, i64)> = Vec::new();
+        // Borrowed, never cloned — same reason as `decl_is_packed_vector`.
+        let mut cur = dt;
+        for _ in 0..32 {
+            match cur {
+                DataType::TypeReference {
+                    name, dimensions, ..
+                } => {
+                    Self::push_dim_bounds(&mut out, dimensions, params)?;
+                    cur = local
+                        .and_then(|cd| cd.typedef_targets.get(&name.name.name))
+                        .or_else(|| typedefs.get(&name.name.name))?;
+                }
+                DataType::Enum(e) => {
+                    // §7.4.2: dims written after the enum body are a packed
+                    // array of the enum; then its base supplies the element.
+                    Self::push_dim_bounds(&mut out, &e.dimensions, params)?;
+                    match &e.base_type {
+                        Some(base) => cur = base.as_ref(),
+                        // §6.19.1: an enum with no base type is `int`.
+                        None => {
+                            out.push((31, 0));
+                            return Some(out);
+                        }
+                    }
+                }
+                DataType::IntegerVector { dimensions, .. }
+                | DataType::Implicit { dimensions, .. } => {
+                    Self::push_dim_bounds(&mut out, dimensions, params)?;
+                    return Some(out);
+                }
+                DataType::IntegerAtom { kind, .. } => {
+                    let w = match kind {
+                        IntegerAtomType::Byte => 8,
+                        IntegerAtomType::ShortInt => 16,
+                        IntegerAtomType::Int | IntegerAtomType::Integer => 32,
+                        IntegerAtomType::LongInt | IntegerAtomType::Time => 64,
+                    };
+                    out.push((w - 1, 0));
+                    return Some(out);
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn push_dim_bounds(
+        out: &mut Vec<(i64, i64)>,
+        dims: &[crate::ast::types::PackedDimension],
+        params: &HashMap<String, Value>,
+    ) -> Option<()> {
+        for d in dims {
+            let crate::ast::types::PackedDimension::Range { left, right, .. } = d else {
+                return None;
+            };
+            out.push((
+                crate::elaborate::const_eval_i64_with_params(left, Some(params))?,
+                crate::elaborate::const_eval_i64_with_params(right, Some(params))?,
+            ));
+        }
+        Some(())
+    }
+
     /// Shape of a multi-dimensional packed-array class property as
     /// `(element_width, total_width, outer_left, outer_right)`. `None` unless
     /// the declared type is a packed vector with at least two dimensions whose
@@ -3525,7 +3644,6 @@ impl Simulator {
         handle: usize,
         prop: &str,
     ) -> Option<(u32, u32, i64, i64)> {
-        use crate::ast::types::PackedDimension;
         let inst = self.heap.get(handle)?.as_ref()?;
         // Class value parameters are instance properties (§8.25), so they can
         // size the range; fall back to module scope for everything else.
@@ -3542,6 +3660,9 @@ impl Simulator {
         let mut cur = Some(inst.class_name.clone());
         let mut seen: HashSet<String> = HashSet::default();
         let mut decl: Option<&crate::ast::types::DataType> = None;
+        // The declaring class, whose local typedefs an ALIAS-typed property
+        // may name (`class c; typedef bit [7:0] loc_t; loc_t m;`).
+        let mut declarer: Option<&super::elaborate::ElaboratedClass> = None;
         while let Some(cn) = cur {
             if !seen.insert(cn.clone()) {
                 break;
@@ -3572,23 +3693,22 @@ impl Simulator {
             }
             if let Some(dt) = cd.property_types.get(prop) {
                 decl = Some(dt);
+                declarer = Some(cd.as_ref());
                 break;
             }
             cur = cd.extends.clone();
         }
-        let dims = match decl? {
-            crate::ast::types::DataType::IntegerVector { dimensions, .. } => dimensions,
-            crate::ast::types::DataType::Implicit { dimensions, .. } => dimensions,
-            _ => return None,
-        };
-        // A SINGLE packed dimension is a plain vector, whose element is one
-        // bit. Reads of `obj.v[i]` fell through to a generic bit-select and
-        // were fine, but the WRITE had no handler at all and was silently
-        // dropped — `obj.v[15] = 1'b1` left the property unchanged while the
-        // part-select `obj.v[15:8] = ...` beside it worked. Resolving it here
-        // gives the write a target, and the slot arithmetic below already
-        // honours an ascending declaration.
-        if dims.is_empty() {
+        let decl = decl?;
+        // §7.4.1 / §6.18: the declared type may be an ALIAS (`byte_t tx;`,
+        // `pair_t [1:0] pair;`) or an ENUM (a packed vector of its base), and
+        // `property_types` keeps the alias itself. Matching on the
+        // IntegerVector/Implicit arms alone therefore saw no dimensions at
+        // all, so `this.tx[3] = 1'b1` fell through every arm and was silently
+        // dropped — while the SAME write on a `bit [7:0]` property landed
+        // (§10 of the bug ledger). Reject a non-vector shape before the
+        // parameter scope is materialised; the dimensions themselves are
+        // resolved below when they are actually needed.
+        if !Self::decl_is_packed_vector(decl, declarer, &self.module.typedef_types) {
             return None;
         }
         // Only now is a parameter scope needed.
@@ -3604,19 +3724,18 @@ impl Simulator {
             }
             std::borrow::Cow::Owned(m)
         };
-        let bounds = |d: &PackedDimension| -> Option<(i64, i64)> {
-            let PackedDimension::Range { left, right, .. } = d else {
-                return None;
-            };
-            Some((
-                crate::elaborate::const_eval_i64_with_params(left, Some(&*params))?,
-                crate::elaborate::const_eval_i64_with_params(right, Some(&*params))?,
-            ))
-        };
-        let (left, right) = bounds(&dims[0])?;
+        let dims =
+            Self::decl_packed_dim_bounds(decl, declarer, &self.module.typedef_types, &*params)?;
+        // A SINGLE packed dimension is a plain vector, whose element is one
+        // bit. Reads of `obj.v[i]` fell through to a generic bit-select and
+        // were fine, but the WRITE had no handler at all and was silently
+        // dropped — `obj.v[15] = 1'b1` left the property unchanged while the
+        // part-select `obj.v[15:8] = ...` beside it worked. Resolving it here
+        // gives the write a target, and the slot arithmetic below already
+        // honours an ascending declaration.
+        let &(left, right) = dims.first()?;
         let mut elem_w: u32 = 1;
-        for d in &dims[1..] {
-            let (l, r) = bounds(d)?;
+        for &(l, r) in &dims[1..] {
             elem_w = elem_w.checked_mul(((l - r).abs() + 1) as u32)?;
         }
         let outer = ((left - right).abs() + 1) as u32;
