@@ -670,3 +670,7 @@ mod nettype_no_resolver_ports;
 mod review_nettype_partial_driver;
 #[path = "types/review_nettype_multi_top.rs"]
 mod review_nettype_multi_top;
+
+
+#[path = "types/two_state_local_in_fallback.rs"]
+mod two_state_local_in_fallback;
