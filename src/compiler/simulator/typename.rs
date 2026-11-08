@@ -183,6 +183,7 @@ impl Simulator {
                 .collect(),
             name: ident(leaf),
             span,
+            bound: Default::default(),
         }
     }
 

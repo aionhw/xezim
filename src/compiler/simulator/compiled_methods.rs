@@ -2297,6 +2297,7 @@ impl Simulator {
                                         span,
                                     },
                                     span,
+                                    bound: Default::default(),
                                 },
                                 dimensions: Vec::new(),
                                 type_args: Vec::new(),
@@ -2586,6 +2587,7 @@ impl Simulator {
                                             span: crate::ast::Span::dummy(),
                                         },
                                         span: crate::ast::Span::dummy(),
+                                        bound: Default::default(),
                                     },
                                     dimensions: Vec::new(),
                                     type_args: Vec::new(),
@@ -3041,6 +3043,7 @@ impl Simulator {
                                             span,
                                         },
                                         span,
+                                        bound: Default::default(),
                                     },
                                     dimensions: vec![],
                                     type_args: vec![],
@@ -5238,6 +5241,7 @@ impl Simulator {
                                 span: crate::ast::Span::dummy(),
                             },
                             span: crate::ast::Span::dummy(),
+                            bound: Default::default(),
                         };
                         if let Some(resolved) = self.resolve_typeref_class_name(&tn) {
                             return Some(resolved);

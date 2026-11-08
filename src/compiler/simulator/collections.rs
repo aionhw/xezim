@@ -1471,6 +1471,7 @@ impl Simulator {
                         span: crate::ast::Span::dummy(),
                     },
                     span: crate::ast::Span::dummy(),
+                    bound: Default::default(),
                 };
                 // Resolve a typedef alias to a PARAMETERIZED class with its
                 // specialization args intact (`BaseType` → `base_class#(9)`),
@@ -1619,6 +1620,7 @@ impl Simulator {
                     span: crate::ast::Span::dummy(),
                 },
                 span: crate::ast::Span::dummy(),
+                bound: Default::default(),
             };
             return self.resolve_typeref_class_name(&synth);
         }
@@ -1658,6 +1660,7 @@ impl Simulator {
                     span: crate::ast::Span::dummy(),
                 },
                 span: crate::ast::Span::dummy(),
+                bound: Default::default(),
             };
             return self.resolve_typeref_class_name(&synth);
         }
@@ -1804,6 +1807,7 @@ impl Simulator {
                         span: crate::ast::Span::dummy(),
                     },
                     span: crate::ast::Span::dummy(),
+                    bound: Default::default(),
                 };
                 self.resolve_typeref_class_name(&synth)?
             };

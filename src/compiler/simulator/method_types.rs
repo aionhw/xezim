@@ -288,6 +288,7 @@ impl Simulator {
                 span: crate::ast::Span::dummy(),
             },
             span: crate::ast::Span::dummy(),
+            bound: Default::default(),
         };
         self.resolve_typeref_class_name(&tnname)
     }

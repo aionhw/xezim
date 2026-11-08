@@ -1262,6 +1262,7 @@ pub(crate) fn type_ref(name: &str) -> DataType {
                 span,
             },
             span,
+            bound: Default::default(),
         },
         dimensions: Vec::new(),
         type_args: Vec::new(),
