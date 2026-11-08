@@ -309,6 +309,77 @@ impl Simulator {
         self.assoc_elem_width(name).filter(|&w| w > 0)
     }
 
+    /// §7.8, §7.4.6, §11.5.1: a select past the unpacked dimensions of an
+    /// associative array selects into the element: `a[7][3]` of
+    /// `logic [31:0] a [int]` is bit 3 of `a[7]`, and `p[1][1]` of
+    /// `logic [3:0][7:0] p [int]` is byte 1 of `p[1]`. `expr` is the
+    /// element (`a[7]`) and `index` the select. Mirrors
+    /// `assoc_elem_bit_write`; without it the read took the select as one
+    /// more key and read the absent element `a[7][3]`. None when `expr` does
+    /// not name an element of an associative array, or the element is
+    /// itself a collection (`aq[k][i]` of `int aq[int][$]`).
+    pub(super) fn assoc_elem_select_read(
+        &mut self,
+        expr: &Expression,
+        index: &Expression,
+    ) -> Option<Value> {
+        let mut root = expr;
+        let mut keys = 0usize;
+        while let ExprKind::Index { expr: inner, .. } = &root.kind {
+            root = inner;
+            keys += 1;
+        }
+        if keys == 0 {
+            return None;
+        }
+        let name = self.assoc_array_storage_name(root)?;
+        let declared = match self.coll_shape_at(&name) {
+            Some((shape, 0)) => shape.dims.len(),
+            Some(_) => return None,
+            None => 1,
+        };
+        if keys != declared {
+            return None;
+        }
+        // The element must be a value, not a row the declaration does not
+        // show (a typedef'd collection element): the key paths own those.
+        if let Some(row) = self.nested_index_name(expr)
+            && (self.is_associative_array(&row)
+                || self.module.dynamic_arrays.contains(&row)
+                || self
+                    .signals
+                    .contains_key(&Self::name_with_suffix(&row, ".size")))
+        {
+            return None;
+        }
+        let elem = self.eval_expr(expr);
+        let packed = self
+            .module
+            .packed_full_dims
+            .get(&name)
+            .filter(|d| !d.is_empty())
+            .cloned();
+        let Some(dims) = packed else {
+            return Some(match self.eval_expr(index).to_index() {
+                Some(i) if i >= 0 && (i as u32) < elem.width => elem.bit_select(i as usize),
+                _ => Value::new(1),
+            });
+        };
+        let (dl, dr) = dims[0];
+        let stride: i64 = dims[1..].iter().map(|&(l, r)| (l - r).abs() + 1).product();
+        let (lo, hi) = (dl.min(dr), dl.max(dr));
+        let Some(i) = self
+            .eval_expr(index)
+            .to_index()
+            .filter(|i| (lo..=hi).contains(i))
+        else {
+            return Some(Value::new(stride.max(1) as u32));
+        };
+        let slot = if dl >= dr { i - lo } else { hi - i };
+        let lsb = (slot * stride) as usize;
+        Some(elem.range_select(lsb + stride as usize - 1, lsb))
+    }
+
     pub(super) fn assoc_elem_width(&self, name: &str) -> Option<u32> {
         if let Some(&w) = self.module.assoc_elem_widths.get(name) {
             return Some(w);
