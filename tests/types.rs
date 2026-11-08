@@ -674,5 +674,7 @@ mod review_nettype_multi_top;
 
 #[path = "types/function_local_ascending_packed.rs"]
 mod function_local_ascending_packed;
+#[path = "types/nonansi_typedef_packed_port_942.rs"]
+mod nonansi_typedef_packed_port_942;
 #[path = "types/two_state_local_in_fallback.rs"]
 mod two_state_local_in_fallback;
