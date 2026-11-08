@@ -3122,6 +3122,28 @@ impl Simulator {
                             return Value::from_u64(bits, 32);
                         }
                     }
+                    // §20.6.2: a ROW of a dynamic array or queue is an unpacked
+                    // array too: a dynamic row (`d[i]` on `int d[][]`) counts
+                    // its current elements, a fixed one (`r[i]` on `bit [7:0]
+                    // r[][2]`) its declared ones. Sized by the evaluated row,
+                    // both read one element's width.
+                    if let ExprKind::Index { expr: base, .. } = &arg.kind {
+                        if let Some(row) = self
+                            .array_operand_name(arg)
+                            .filter(|n| self.module.dynamic_arrays.contains(n))
+                            && let Some(&(_, _, ew)) = self.module.arrays.get(&row)
+                        {
+                            return Value::from_u64(self.get_queue_size(&row) * ew as u64, 32);
+                        }
+                        if let Some(nm) = self
+                            .array_operand_name(base)
+                            .filter(|n| self.module.dynamic_arrays.contains(n))
+                            && let Some(&(_, (b0, b1), ew)) = self.module.arrays_2d.get(&nm)
+                        {
+                            let n = (b1 - b0).unsigned_abs() + 1;
+                            return Value::from_u64(n * ew as u64, 32);
+                        }
+                    }
                     Value::from_u64(self.eval_expr(arg).width as u64, 32)
                 } else {
                     Value::zero(32)
@@ -4161,7 +4183,16 @@ impl Simulator {
                         return Value::from_u64(n as u64, 32);
                     }
                     if let ExprKind::Ident(hier) = &arg.kind {
-                        let aname = self.resolve_hier_name(hier);
+                        let mut aname = self.resolve_hier_name(hier);
+                        // A class-member collection (`h.raw`) is shaped under
+                        // its instance store (see the bound queries below).
+                        if self.foreach_dims(&aname).is_none()
+                            && let Some(nm) = self
+                                .array_operand_name(arg)
+                                .filter(|n| self.foreach_dims(n).is_some())
+                        {
+                            aname = std::borrow::Cow::Owned(nm);
+                        }
                         // §20.7: EVERY unpacked dimension counts, not just
                         // the first — `int m[2][3]` has two, `int n[2][3][4]`
                         // three. Only the 1-D table was consulted.
@@ -4387,6 +4418,21 @@ impl Simulator {
                     {
                         if let Some(scoped) = self.handle_member_array_name(arg) {
                             aname = Some(std::borrow::Cow::Owned(scoped));
+                        }
+                    }
+                    // A class-member QUEUE / dynamic array of fixed rows
+                    // (`h.raw` on `bit [7:0] raw[][2]`) has its shape under
+                    // its instance store `<h>#raw` too; unfound, `$size(h.raw,
+                    // 2)` reported the element's 8 bits (§20.7).
+                    if aname
+                        .as_deref()
+                        .is_none_or(|n| self.foreach_dims(n).is_none())
+                    {
+                        if let Some(nm) = self
+                            .array_operand_name(arg)
+                            .filter(|n| self.foreach_dims(n).is_some())
+                        {
+                            aname = Some(std::borrow::Cow::Owned(nm));
                         }
                     }
                     if let Some(aname) = aname {
