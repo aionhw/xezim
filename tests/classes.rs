@@ -364,6 +364,10 @@ mod instance_struct_member_and_class_param;
 mod issue35_mixed_sign_constraints;
 #[path = "classes/issue4_coupled_constraints.rs"]
 mod issue4_coupled_constraints;
+#[path = "classes/issue944.rs"]
+mod issue944;
+#[path = "classes/issue944_ref.rs"]
+mod issue944_ref;
 #[path = "classes/ivtest_class_struct_cluster.rs"]
 mod ivtest_class_struct_cluster;
 #[path = "classes/local_shadows_sig.rs"]
