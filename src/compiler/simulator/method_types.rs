@@ -561,6 +561,26 @@ impl Simulator {
                     } else {
                         0
                     };
+                    // §7.4.1, §7.4.5: past the unpacked dimensions the
+                    // indices select packed elements of the unpacked
+                    // element. `packed_full_dims` lists only the packed
+                    // array dimensions, so for an array of packed structs
+                    // (`le_t [1:0] b [2]`) the product of the remaining
+                    // dimensions leaves out the struct's own width and
+                    // `b[0][1]` came out one bit wide: a nonblocking store
+                    // or continuous assignment kept bit 0. The unpacked
+                    // element's width over the packed elements selected so
+                    // far is right for any element type.
+                    if num_unpacked > 0
+                        && depth > num_unpacked
+                        && let Some(w) = self.packed_select_width_in_unpacked_elem(
+                            &n,
+                            num_unpacked,
+                            depth - num_unpacked,
+                        )
+                    {
+                        return w;
+                    }
                     if let Some(dims) = self.module.packed_full_dims.get(&*n) {
                         let pdepth = depth.saturating_sub(num_unpacked);
                         if pdepth < dims.len() {
@@ -600,5 +620,50 @@ impl Simulator {
             }
             _ => self.infer_width(expr),
         }
+    }
+
+    /// Width of `pdepth` packed selects into an element of the fixed-size
+    /// unpacked array `name` with `num_unpacked` dimensions: the element's
+    /// declared width over the number of packed elements those selects
+    /// pick from. `None` when the element width or its packed shape is not
+    /// known, or the selects reach a single bit, so the caller keeps its
+    /// other answers.
+    fn packed_select_width_in_unpacked_elem(
+        &self,
+        name: &str,
+        num_unpacked: usize,
+        pdepth: usize,
+    ) -> Option<u32> {
+        let elem_w = match num_unpacked {
+            1 => self.module.arrays.get(name).map(|&(_, _, w)| w),
+            2 => self.module.arrays_2d.get(name).map(|&(_, _, w)| w),
+            _ => None,
+        }
+        .or_else(|| {
+            self.module
+                .arrays_nd
+                .get(name)
+                .filter(|(shape, _)| shape.len() == num_unpacked)
+                .map(|(_, w)| *w)
+        })? as u64;
+        let selected: u64 = match self.module.packed_full_dims.get(name) {
+            Some(dims) if pdepth <= dims.len() => dims[..pdepth]
+                .iter()
+                .map(|(l, r)| (l - r).unsigned_abs() + 1)
+                .product(),
+            Some(_) => return None,
+            // A single `[N-1:0]` dimension is not recorded; its element
+            // width is.
+            None if pdepth == 1 => {
+                let ew = *self.module.packed_signal_elem_widths.get(name)? as u64;
+                if ew <= 1 {
+                    return None;
+                }
+                elem_w / ew
+            }
+            None => return None,
+        };
+        (selected > 0 && elem_w.is_multiple_of(selected) && elem_w > selected)
+            .then(|| (elem_w / selected) as u32)
     }
 }
