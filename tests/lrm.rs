@@ -85,3 +85,5 @@ mod constraint_real_bounds;
 mod harness;
 #[path = "lrm/implicit_static_subroutines_keep_their_variables_when_compiled.rs"]
 mod implicit_static_subroutines_keep_their_variables_when_compiled;
+#[path = "lrm/review_970_static_task_inline.rs"]
+mod review_970_static_task_inline;
