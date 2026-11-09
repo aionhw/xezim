@@ -6,6 +6,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 # What's new in 0.11
 
+### Unreleased
+
+**Correctness**
+
+* An assignment pattern written to a row of a multi-dimensional unpacked
+  array assigns each element of the row, in a blocking store and in a
+  continuous assignment: `c[0] = '{V, V}` on `logic [39:0] c [2][2]` and
+  `assign c[0] = '{a, b};` left the row x (§10.9.1, §10.10, §7.6, §10.3,
+  #999).
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
