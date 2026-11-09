@@ -1158,6 +1158,8 @@ mod packed_struct_array_property_928;
 mod review_940_constraint_memos;
 #[path = "classes/review_940_process_status.rs"]
 mod review_940_process_status;
+#[path = "classes/review_955_compiled_check_signedness.rs"]
+mod review_955_compiled_check_signedness;
 #[path = "classes/review_973_atom_struct_selects.rs"]
 mod review_973_atom_struct_selects;
 #[path = "classes/review_979_modulo_bounds.rs"]
