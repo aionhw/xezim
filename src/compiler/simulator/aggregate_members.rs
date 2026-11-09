@@ -163,9 +163,13 @@ impl Simulator {
         if h.path.len() != 1 || !h.path[0].selects.is_empty() {
             return None;
         }
-        // A local of the same name shadows the property (§8.10).
+        // A local of the same name shadows the property (§8.10), a local
+        // queue / dynamic / associative array (kept under its own storage
+        // key, not in the frame) included.
         let nm = &h.path[0].name.name;
-        if self.local_stack.last().is_some_and(|l| l.contains_key(nm)) {
+        if self.local_stack.last().is_some_and(|l| l.contains_key(nm))
+            || self.dyn_name_lookup(nm).is_some()
+        {
             return None;
         }
         let this = self
@@ -3552,6 +3556,9 @@ impl Simulator {
                 DataType::IntegerVector { .. }
                 | DataType::Implicit { .. }
                 | DataType::IntegerAtom { .. } => return true,
+                // §7.2.1: a packed structure (or union) can be selected like
+                // a vector of its total width.
+                DataType::Struct(su) => return su.packed,
                 _ => return false,
             }
         }
@@ -3609,6 +3616,30 @@ impl Simulator {
                         IntegerAtomType::Int | IntegerAtomType::Integer => 32,
                         IntegerAtomType::LongInt | IntegerAtomType::Time => 64,
                     };
+                    out.push((w - 1, 0));
+                    return Some(out);
+                }
+                // §7.2.1: a packed structure is one vector of its members'
+                // total width (a packed union: of its widest member); dims
+                // written after the body make a packed array of it.
+                DataType::Struct(su) if su.packed => {
+                    Self::push_dim_bounds(&mut out, &su.dimensions, params)?;
+                    let mut w: i64 = 0;
+                    for m in &su.members {
+                        let mw =
+                            Self::decl_packed_dim_bounds(&m.data_type, local, typedefs, params)?
+                                .iter()
+                                .map(|&(l, r)| (l - r).abs() + 1)
+                                .product::<i64>();
+                        let n = m.declarators.len().max(1) as i64;
+                        w = match su.kind {
+                            crate::ast::types::StructUnionKind::Struct => w + mw * n,
+                            crate::ast::types::StructUnionKind::Union => w.max(mw),
+                        };
+                    }
+                    if w == 0 {
+                        return None;
+                    }
                     out.push((w - 1, 0));
                     return Some(out);
                 }
@@ -3704,8 +3735,8 @@ impl Simulator {
         // `property_types` keeps the alias itself. Matching on the
         // IntegerVector/Implicit arms alone therefore saw no dimensions at
         // all, so `this.tx[3] = 1'b1` fell through every arm and was silently
-        // dropped — while the SAME write on a `bit [7:0]` property landed
-        // (§10 of the bug ledger). Reject a non-vector shape before the
+        // dropped — while the SAME write on a `bit [7:0]` property landed.
+        // Reject a non-vector shape before the
         // parameter scope is materialised; the dimensions themselves are
         // resolved below when they are actually needed.
         if !Self::decl_is_packed_vector(decl, declarer, &self.module.typedef_types) {

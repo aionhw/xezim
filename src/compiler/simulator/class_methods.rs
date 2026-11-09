@@ -247,11 +247,24 @@ impl Simulator {
                     // too. Its dimensions live behind the typedef, so the
                     // declared-type arms alone admitted only the direct
                     // spellings and every `<obj>.<prop>[i]` write on an
-                    // alias-typed property was dropped (§10 of the ledger).
+                    // alias-typed property was dropped. So are an integral
+                    // atom (`int i; i[31]`, §6.11) and a packed structure
+                    // (§7.2.1).
                     let vector_like = match dt {
                         DataType::IntegerVector { dimensions, .. }
                         | DataType::Implicit { dimensions, .. } => !dimensions.is_empty(),
-                        DataType::TypeReference { .. } | DataType::Enum(_) => {
+                        // An unpacked collection of them indexes its unpacked
+                        // dimension first (§7.4.2): not this select, and
+                        // admitting it would evaluate the receiver twice.
+                        DataType::TypeReference { .. }
+                        | DataType::Enum(_)
+                        | DataType::IntegerAtom { .. }
+                        | DataType::Struct(_)
+                            if !cd.array_properties.contains_key(n)
+                                && !cd.array_nd_properties.contains_key(n)
+                                && !cd.queue_properties.contains_key(n)
+                                && !cd.assoc_properties.contains_key(n) =>
+                        {
                             Self::decl_is_packed_vector(
                                 dt,
                                 Some(cd.as_ref()),
