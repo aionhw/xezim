@@ -146,7 +146,15 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   literals and `$time` in packages and `$unit` scopes scaled by their own
   time unit (§3.14.2.3); shared package import bindings, type-aware prepared
   body keys and narrower parameter lookups during elaboration; and `$` queue
-  selects evaluated with their own queue bounds in compiled code (§7.10).
+  selects evaluated with their own queue bounds in compiled code (§7.10);
+  and generate blocks as scopes: a scope tree and name binder per definition
+  that the generate rename follows, unlabelled-block data, bare upward calls,
+  `disable` targets and typedefs bound through it, and undeclared names
+  reported by binding (§23.9, §27.6, #952).
+- **[Shabbar Vejlani](https://github.com/shabbarvejlani)** — class-member
+  element selects sized at their declared width in compiled methods
+  (§11.6.1), and `foreach` modulo equalities solved by drawing each element
+  from its congruence class (§18.5.8.1).
 
 ## Bug reports
 
@@ -173,6 +181,7 @@ work. Thank you in particular to
 [philipaxer](https://github.com/philipaxer),
 [rharikrishna25](https://github.com/rharikrishna25),
 [rpjayaraman](https://github.com/rpjayaraman),
+[shabbarvejlani](https://github.com/shabbarvejlani),
 [soronpo](https://github.com/soronpo),
 [taichi-ishitani](https://github.com/taichi-ishitani),
 [urbanij](https://github.com/urbanij) and
