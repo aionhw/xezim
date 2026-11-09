@@ -242,6 +242,8 @@ mod class_param_property_widths;
 mod class_param_siblings;
 #[path = "classes/class_program_test.rs"]
 mod class_program_test;
+#[path = "classes/class_property_edge_operands_993.rs"]
+mod class_property_edge_operands_993;
 #[path = "classes/class_property_packed_selects.rs"]
 mod class_property_packed_selects;
 #[path = "classes/class_property_param_width.rs"]
@@ -860,10 +862,10 @@ mod string_local_name_leak;
 mod vif_null_compare_indexed_receiver;
 #[path = "classes/vif_return_own_definition_name.rs"]
 mod vif_return_own_definition_name;
-#[path = "classes/vif_property_named_like_instance.rs"]
-mod vif_property_named_like_instance;
 #[path = "classes/vif_property_event_controls_988.rs"]
 mod vif_property_event_controls_988;
+#[path = "classes/vif_property_named_like_instance.rs"]
+mod vif_property_named_like_instance;
 #[path = "classes/vif_receiver_neighbor_shapes.rs"]
 mod vif_receiver_neighbor_shapes;
 #[path = "classes/vif_receiver_operation_matrix.rs"]
