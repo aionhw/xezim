@@ -3402,12 +3402,9 @@ impl<'a> Builder<'a> {
             Some(l) => l.clone(),
             None => implicit.to_string(),
         };
-        // A labeled block scopes its declarations; an unlabeled one leaves
-        // them in the enclosing flat namespace.
-        let flat_prefix = match label {
-            Some(l) => format!("{}{}.", ctx.flat_prefix, l),
-            None => ctx.flat_prefix.clone(),
-        };
+        // §27.6: every block scopes its declarations, an unlabelled one
+        // under its implicit name (`genblk1.x`), as elaboration keys them.
+        let flat_prefix = format!("{}{}.", ctx.flat_prefix, name);
         let inst_prefix = format!("{}{}.", ctx.inst_prefix, name);
         let params = self.merge_params(ctx, &flat_prefix, None);
         let sub = self.gen_scope(
@@ -3557,10 +3554,7 @@ impl<'a> Builder<'a> {
         if self.inst_by_path.keys().any(|p| p.starts_with(&ipre)) {
             return true;
         }
-        let fpre = match label {
-            Some(l) => format!("{}{}.", ctx.flat_prefix, l),
-            None => ctx.flat_prefix.clone(),
-        };
+        let fpre = format!("{}{}.", ctx.flat_prefix, name);
         items.iter().any(|it| {
             let names: Vec<&str> = match it {
                 ModuleItem::DataDeclaration(dd) => dd
