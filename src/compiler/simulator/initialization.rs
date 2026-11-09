@@ -4771,6 +4771,7 @@ impl Simulator {
             dpi_value_change_cbs: HashMap::default(),
             chained_coll_member_names: std::cell::OnceCell::new(),
             elem_inside_hint: Vec::new(),
+            elem_rel_bound: Vec::new(),
             rand_tight_mode: false,
             vpi_cb: Box::default(),
             vpi_cb_mask: 0,

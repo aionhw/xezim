@@ -10212,6 +10212,11 @@ pub struct Simulator {
     /// anywhere in the element's full domain.
     elem_inside_hint: Vec<(i64, i64)>,
     /// Set after several trials failed a strict foreach check: relational
+    /// §18.5.8.1: the `<` / `<=` / `>` / `>=` bounds the current foreach
+    /// body puts on the element being solved (`arr[i] OP bound`), for the
+    /// modulo repair's draw.
+    #[serde(skip)]
+    elem_rel_bound: Vec<(crate::ast::expr::BinaryOp, Value)>,
     /// repicks take the BOUND value (minimal/maximal feasible) instead of a
     /// uniform draw, so a globally coupled monotone chain (`g[i][j][k] >
     /// g[i-1][j][k]` over a 4x4x4 grid in [1:2000]) is solved greedily in

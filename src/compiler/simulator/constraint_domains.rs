@@ -3135,6 +3135,7 @@ impl Simulator {
                     self.push_local_frame(frame);
                 }
                 let has_bare_inside = Self::body_has_bare_inside(body, &arr_name);
+                let has_modulo = Self::body_has_modulo(body);
                 loop {
                     let mut suffix = String::new();
                     if single_var {
@@ -3159,6 +3160,11 @@ impl Simulator {
                         let mut hint: Vec<(i64, i64)> = Vec::new();
                         self.body_inside_ranges(body, &arr_name, &mut hint);
                         self.elem_inside_hint = hint;
+                    }
+                    if has_modulo {
+                        let mut bounds = Vec::new();
+                        self.body_rel_bounds(body, &arr_name, &suffix, &mut bounds);
+                        self.elem_rel_bound = bounds;
                     }
 
                     if self.solve_forced_array_elem(
@@ -3235,6 +3241,7 @@ impl Simulator {
                         }
                     }
                     self.elem_inside_hint.clear();
+                    self.elem_rel_bound.clear();
                     if !single_var {
                         self.pop_local_frame();
                     }
@@ -3769,6 +3776,118 @@ impl Simulator {
             .any(|n| self.elem_index_suffix(n, arr_name).as_deref() == Some(idx))
     }
 
+    /// §18.5.8.1: does a foreach body hold a `%` anywhere in an expression?
+    pub(super) fn body_has_modulo(item: &ConstraintItem) -> bool {
+        match item {
+            ConstraintItem::Block(items) => items.iter().any(Self::body_has_modulo),
+            ConstraintItem::Expr(e) => {
+                let mut hit = false;
+                crate::type_lint::visit_expr(e, &mut |x| {
+                    hit |= matches!(
+                        x.kind,
+                        ExprKind::Binary {
+                            op: BinaryOp::Mod,
+                            ..
+                        }
+                    );
+                });
+                hit
+            }
+            _ => false,
+        }
+    }
+
+    /// §18.5.8.1: the hard `<` / `<=` / `>` / `>=` constraints of a foreach
+    /// body on element `idx` of `arr_name` (`arr[i] < K`, `K >= arr[i]`),
+    /// each normalized to `arr[i] OP bound` with the bound evaluated.
+    pub(super) fn body_rel_bounds(
+        &mut self,
+        item: &ConstraintItem,
+        arr_name: &str,
+        idx: &str,
+        out: &mut Vec<(BinaryOp, Value)>,
+    ) {
+        match item {
+            ConstraintItem::Block(items) => {
+                for it in items {
+                    self.body_rel_bounds(it, arr_name, idx, out);
+                }
+            }
+            ConstraintItem::Expr(e) => {
+                let mut e = e;
+                while let ExprKind::Paren(inner) = &e.kind {
+                    e = inner;
+                }
+                let ExprKind::Binary { op, left, right } = &e.kind else {
+                    return;
+                };
+                let mirrored = match op {
+                    BinaryOp::Lt => BinaryOp::Gt,
+                    BinaryOp::Leq => BinaryOp::Geq,
+                    BinaryOp::Gt => BinaryOp::Lt,
+                    BinaryOp::Geq => BinaryOp::Leq,
+                    _ => return,
+                };
+                let unparen = |mut x: &Expression| {
+                    while let ExprKind::Paren(inner) = &x.kind {
+                        x = inner;
+                    }
+                    x.clone()
+                };
+                let (l, r) = (unparen(left), unparen(right));
+                let on_l = self.elem_index_suffix(&l, arr_name).as_deref() == Some(idx);
+                let on_r = self.elem_index_suffix(&r, arr_name).as_deref() == Some(idx);
+                let (bound, eff) = match (on_l, on_r) {
+                    (true, false) => (&r, *op),
+                    (false, true) => (&l, mirrored),
+                    _ => return,
+                };
+                if self.expr_mentions_elem(bound, arr_name, idx) {
+                    return;
+                }
+                out.push((eff, self.eval_expr(bound)));
+            }
+            _ => {}
+        }
+    }
+
+    /// The value range `elem_rel_bound` admits for an element of the given
+    /// signedness. A bound is used only where the comparison orders values
+    /// as written (§11.8.1): both operands signed, or an unsigned element
+    /// against a non-negative bound.
+    fn elem_rel_range(&self, elem_signed: bool) -> Option<(i128, i128)> {
+        if self.elem_rel_bound.is_empty() {
+            return None;
+        }
+        let (mut lo, mut hi) = (i128::MIN, i128::MAX);
+        for (op, v) in &self.elem_rel_bound {
+            if v.has_xz() || v.width > 64 {
+                continue;
+            }
+            let b = if v.is_signed {
+                match v.to_i64() {
+                    Some(b) if elem_signed || b >= 0 => i128::from(b),
+                    _ => continue,
+                }
+            } else if elem_signed {
+                continue;
+            } else {
+                match v.to_u64() {
+                    Some(b) => i128::from(b),
+                    None => continue,
+                }
+            };
+            match op {
+                BinaryOp::Lt => hi = hi.min(b - 1),
+                BinaryOp::Leq => hi = hi.min(b),
+                BinaryOp::Gt => lo = lo.max(b + 1),
+                BinaryOp::Geq => lo = lo.max(b),
+                _ => {}
+            }
+        }
+        Some((lo, hi))
+    }
+
     /// §18.5.7 structural repair for a modulo equality over ONE fixed-array
     /// element inside a foreach body: `(arr[i] % k) == r`, in either
     /// operand order (the caller tries both). `mod_side` is the candidate
@@ -3845,7 +3964,8 @@ impl Simulator {
         // Already satisfied? Ask the evaluator, not an arithmetic model:
         // it is the same judgment the final check will make, at the
         // operation's own width and signedness.
-        if self.exact_cmp(&BinaryOp::Eq, mod_side, rem_side) == Some(true) {
+        let satisfied = self.exact_cmp(&BinaryOp::Eq, mod_side, rem_side) == Some(true);
+        if satisfied && self.elem_rel_bound.is_empty() {
             return Some(false);
         }
         let k_val = self.eval_expr(k_expr);
@@ -3870,6 +3990,35 @@ impl Simulator {
         // §11.8.1: the `%` (and the comparison around it) is unsigned
         // when any operand is unsigned.
         let op_unsigned = !elem_signed || !k_val.is_signed || !r_val.is_signed;
+        // §18.5.8.1: the body's own `<` / `<=` / `>` / `>=` bounds on this
+        // element, as a value range. Drawn values must respect them too, or
+        // the relational repair that runs next undoes the draw. Applied where
+        // the element's value and the drawn bit pattern agree (an unsigned
+        // element, or a signed element in a signed operation).
+        let rel = if op_unsigned && elem_signed {
+            None
+        } else {
+            self.elem_rel_range(elem_signed)
+        };
+        if satisfied {
+            let v = if elem_signed {
+                cur.to_i64().map(i128::from)
+            } else {
+                cur.to_u64().map(i128::from)
+            };
+            if rel.is_none_or(|(lo, hi)| v.is_some_and(|v| lo <= v && v <= hi)) {
+                return Some(false);
+            }
+        }
+        let clip = |segments: &mut Vec<(i128, i128)>| {
+            if let Some((lo, hi)) = rel {
+                segments.retain_mut(|(a, b)| {
+                    *a = (*a).max(lo);
+                    *b = (*b).min(hi);
+                    *a <= *b
+                });
+            }
+        };
         // Ceiling division on possibly-negative values (p > 0).
         let ceil_div = |a: i128, p: i128| -> i128 { if a >= 0 { (a + p - 1) / p } else { a / p } };
         // Per segment: (first admitted value, count of admitted values),
@@ -3952,6 +4101,7 @@ impl Simulator {
                     }
                 }
             }
+            clip(&mut segments);
             let mut classes: Vec<(i128, i128)> = Vec::new();
             for &(a, b) in &segments {
                 // Admitted: v = r_u + m·k_u, m >= 0.
@@ -3994,6 +4144,7 @@ impl Simulator {
                     }
                 }
             }
+            clip(&mut segments);
             if segments.is_empty() {
                 return None;
             }
