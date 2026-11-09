@@ -341,6 +341,24 @@ enum Node {
         wrap: Option<Wrap>,
     },
     AllDiff(Vec<usize>),
+    /// §11.8.2: `u` is `v` wrapped into `w` bits of signedness `s` — `v`'s
+    /// bits read unsigned (`v + 2^w` below zero) or signed. Domains map
+    /// exactly both ways, so `x < 32'h8000_0010` on an `int x` keeps the
+    /// two runs of `x` it allows (`csp_wrap_enforce`).
+    Wrap {
+        v: usize,
+        u: usize,
+        w: u32,
+        s: bool,
+    },
+    /// §11.4.3: `p == x * y` for the product variable `p` of a relation
+    /// (`LinCx::prod`): bounds `p` by the factors, and once one factor is
+    /// fixed bounds the other by `p`.
+    Mul {
+        p: usize,
+        x: usize,
+        y: usize,
+    },
     /// §20.9: `c == $countones(x)` for a variable `x` of `w` bits and its
     /// count variable `c` (see `Csp::pop`): a fixed `x` fixes `c`.
     Pop {
@@ -581,6 +599,10 @@ pub(crate) struct Csp {
     /// the same terms let the search decide them inconsistently, a conflict
     /// that only shows at the last term.
     carry_accs: Vec<(Lin, u32, bool)>,
+    /// §11.8.2: a variable read at `(w, s)` other than its own type — a
+    /// signed one in an unsigned relation, a cast of one — is the variable
+    /// `u` tied to it by `Node::Wrap`: (v, w, s, u). One per reading.
+    wraps: Vec<(usize, u32, bool, usize)>,
     /// Variable count before translation: the carry variables live above
     /// it and are made afresh by every translation.
     carry_base: Option<usize>,
@@ -612,14 +634,44 @@ struct Carry {
     w: u32,
     s: bool,
     k: (i128, i128),
+    /// The pair's variables: `s` here, `k` next to it.
+    sv: usize,
 }
 
+/// §11.4.3: the product `x * y` of two variables, as a variable `p` tied to
+/// them by `Node::Mul`, with the bounds `r` of its value.
+struct Prod {
+    x: usize,
+    y: usize,
+    r: (i128, i128),
+    p: usize,
+}
+
+/// §11.8.2: a variable `v` read wrapped into `(w, s)`, as the variable `u`
+/// (`Node::Wrap`).
+struct Wrp {
+    v: usize,
+    w: u32,
+    s: bool,
+    u: usize,
+}
+
+/// Largest magnitude a product variable (`Prod`) may take: with
+/// coefficients up to `COEF_MAX` its terms stay far below i128 overflow.
+const PROD_MAX: i128 = 1 << 80;
+
 /// Translation context of `csp_lin`: the initial domains, and the carries
-/// of the relation, numbered from `base`.
+/// and products of the relation, numbered from `base` in creation order.
 struct LinCx<'a> {
     dom0: &'a [Dom],
     base: usize,
+    /// The next free variable number.
+    next: usize,
     carries: Vec<Carry>,
+    prods: Vec<Prod>,
+    wraps: Vec<Wrp>,
+    /// The readings earlier relations made (`Csp::wraps`).
+    made_wraps: &'a [(usize, u32, bool, usize)],
     /// The pairs earlier relations made (`Csp::carries`, `Csp::carry_accs`).
     made: &'a [(usize, usize, Vec<usize>)],
     made_accs: &'a [(Lin, u32, bool)],
@@ -630,7 +682,11 @@ impl<'a> LinCx<'a> {
         LinCx {
             dom0: &csp.dom0,
             base: csp.vars.len(),
+            next: csp.vars.len(),
             carries: Vec::new(),
+            prods: Vec::new(),
+            wraps: Vec::new(),
+            made_wraps: &csp.wraps,
             made: &csp.carries,
             made_accs: &csp.carry_accs,
         }
@@ -642,12 +698,13 @@ impl<'a> LinCx<'a> {
             let d = self.dom0.get(v)?;
             return Some((d.first()?.0, d.last()?.1));
         }
-        let c = self.carries.get((v - self.base) / 2)?;
-        Some(if (v - self.base) % 2 == 0 {
-            ws_range(c.w, c.s)
-        } else {
-            c.k
-        })
+        if let Some(c) = self.carries.iter().find(|c| c.sv == v || c.sv + 1 == v) {
+            return Some(if c.sv == v { ws_range(c.w, c.s) } else { c.k });
+        }
+        if let Some(w) = self.wraps.iter().find(|w| w.u == v) {
+            return Some(ws_range(w.w, w.s));
+        }
+        self.prods.iter().find(|p| p.p == v).map(|p| p.r)
     }
 
     fn range(&self, l: &Lin) -> Option<(i128, i128)> {
@@ -687,16 +744,87 @@ impl<'a> LinCx<'a> {
             .iter()
             .position(|c| c.acc == *acc && c.w == w && c.s == s)
         {
-            return Some(self.base + 2 * i);
+            return Some(self.carries[i].sv);
         }
         let k = (floor_div(lo - rlo, m), floor_div(hi - rlo, m));
+        let sv = self.next;
+        self.next += 2;
         self.carries.push(Carry {
             acc: acc.clone(),
             w,
             s,
             k,
+            sv,
         });
-        Some(self.base + 2 * (self.carries.len() - 1))
+        Some(sv)
+    }
+
+    /// §11.4.3: the product of the variables `x` and `y` as a new variable
+    /// (`Prod`), so a relation on `base + cnt * pitch` is linear in it and
+    /// propagates once either factor is known. None when the product could
+    /// leave `PROD_MAX`.
+    fn prod(&mut self, x: usize, y: usize) -> Option<usize> {
+        let (xa, xb) = self.bounds(x)?;
+        let (ya, yb) = self.bounds(y)?;
+        let cs = [
+            xa.checked_mul(ya)?,
+            xa.checked_mul(yb)?,
+            xb.checked_mul(ya)?,
+            xb.checked_mul(yb)?,
+        ];
+        let r = (*cs.iter().min()?, *cs.iter().max()?);
+        if r.0 < -PROD_MAX || r.1 > PROD_MAX {
+            return None;
+        }
+        if let Some(p) = self
+            .prods
+            .iter()
+            .find(|p| (p.x, p.y) == (x, y) || (p.x, p.y) == (y, x))
+        {
+            return Some(p.p);
+        }
+        let p = self.next;
+        self.next += 1;
+        self.prods.push(Prod { x, y, r, p });
+        Some(p)
+    }
+
+    /// §11.8.2: `v` read at `(w, s)`: itself when its values all keep
+    /// their value there, else a variable `Node::Wrap` ties to it. None
+    /// when `w` exceeds 64 bits.
+    fn wrap(&mut self, v: usize, w: u32, s: bool) -> Option<usize> {
+        if w == 0 || w > 64 {
+            return None;
+        }
+        let (lo, hi) = self.bounds(v)?;
+        let (rlo, rhi) = ws_range(w, s);
+        if lo >= rlo && hi <= rhi {
+            return Some(v);
+        }
+        if let Some(&(.., u)) = self
+            .made_wraps
+            .iter()
+            .find(|m| (m.0, m.1, m.2) == (v, w, s))
+        {
+            return Some(u);
+        }
+        if let Some(r) = self.wraps.iter().find(|r| (r.v, r.w, r.s) == (v, w, s)) {
+            return Some(r.u);
+        }
+        let u = self.next;
+        self.next += 1;
+        self.wraps.push(Wrp { v, w, s, u });
+        Some(u)
+    }
+
+    /// The carries, products and wrapped readings made so far, for
+    /// `csp_add_carries`.
+    fn take(&mut self) -> (Vec<Carry>, Vec<Prod>, Vec<Wrp>) {
+        (
+            std::mem::take(&mut self.carries),
+            std::mem::take(&mut self.prods),
+            std::mem::take(&mut self.wraps),
+        )
     }
 }
 
@@ -762,6 +890,8 @@ struct St {
     /// that happened in this run: the run is then retried, not concluded.
     level_tries: u32,
     level_cut: bool,
+    /// Inside `csp_probe`: an `if` does not probe its own branches.
+    probing: bool,
 }
 
 impl St {
@@ -891,6 +1021,8 @@ impl Node {
             }
             Node::AllDiff(vs) => out.extend(vs.iter().copied()),
             Node::Pop { x, c, .. } => out.extend([*x, *c]),
+            Node::Mul { p, x, y } => out.extend([*p, *x, *y]),
+            Node::Wrap { v, u, .. } => out.extend([*v, *u]),
             Node::Eval { src, .. } => out.extend(srcs[*src].deps.iter().copied()),
             Node::Fun {
                 var, other, whole, ..
@@ -2095,6 +2227,7 @@ impl Simulator {
             pop_rev: HashMap::default(),
             carries: Vec::new(),
             carry_accs: Vec::new(),
+            wraps: Vec::new(),
             carry_base: None,
             sizes: HashMap::default(),
             size_phase: false,
@@ -2305,6 +2438,7 @@ impl Simulator {
             pop_rev: HashMap::default(),
             carries: Vec::new(),
             carry_accs: Vec::new(),
+            wraps: Vec::new(),
             carry_base: None,
             sizes: HashMap::default(),
             size_phase: false,
@@ -2504,6 +2638,7 @@ impl Simulator {
         csp.opaque = false;
         csp.carries.clear();
         csp.carry_accs.clear();
+        csp.wraps.clear();
         match csp.carry_base {
             Some(b) => {
                 csp.vars.truncate(b);
@@ -2608,6 +2743,7 @@ impl Simulator {
             cut: false,
             level_tries: 0,
             level_cut: false,
+            probing: false,
         };
         let mut level_tries: u32 = 16;
         loop {
@@ -3083,6 +3219,17 @@ impl Simulator {
         }
         for &x in csp.slice_vars.values() {
             aux.composite[x] = aux.dists[x].is_empty();
+        }
+        // A product variable is fixed by its factors (`Node::Mul`).
+        for node in &csp.nodes {
+            if let Node::Mul { p, .. } = node {
+                aux.composite[*p] = true;
+            }
+        }
+        // A wrapped reading (`Node::Wrap`) is fixed by its variable, which
+        // is decided uniformly over its own values.
+        for &(.., u) in &csp.wraps {
+            aux.composite[u] = true;
         }
         // A variable split into segments (`csp_split_slices`) that some
         // relation reads as a number (`last == base + n`), itself or through
@@ -3563,6 +3710,8 @@ impl Simulator {
                 // pigeonhole: the free variables need that many values
                 free == 0 || dom_size(&dom_norm(pool)) >= free
             }
+            Node::Mul { p, x, y } => Self::csp_mul_enforce(*p, *x, *y, st),
+            Node::Wrap { v, u, w, s } => Self::csp_wrap_enforce(*v, *u, *w, *s, st),
             Node::Pop { x, c, w } => {
                 if let Some(v) = st.fixed(*x) {
                     let n = Self::bits_at(v, *w).count_ones() as i128;
@@ -3646,6 +3795,35 @@ impl Simulator {
                         Some(x) => x as i128,
                         None => return true,
                     },
+                    // A signed variable that can be negative reads as its
+                    // bits unsigned, `var + 2^vw` below zero: the values
+                    // that read as an allowed one (`row_bytes ==
+                    // ((w + 15) / 16) * 128` with an `int row_bytes`, #994).
+                    (true, false) if vw <= 64 => {
+                        let Some(k) = c.to_u64().map(i128::from) else {
+                            return true;
+                        };
+                        let (top, half) = ((1i128 << vw) - 1, 1i128 << (vw - 1).min(63));
+                        let read: Dom = match op {
+                            BinaryOp::Eq | BinaryOp::CaseEq => vec![(k, k)],
+                            BinaryOp::Neq | BinaryOp::CaseNeq => {
+                                dom_minus(&vec![(0, top)], &vec![(k, k)])
+                            }
+                            BinaryOp::Lt => vec![(0, k - 1)],
+                            BinaryOp::Leq => vec![(0, k)],
+                            BinaryOp::Gt => vec![(k + 1, top)],
+                            _ => vec![(k, top)],
+                        };
+                        let read = dom_clip(&read, 0, top);
+                        let mut vals = dom_clip(&read, 0, half - 1);
+                        vals.extend(
+                            dom_clip(&read, half, top)
+                                .into_iter()
+                                .map(|(a, b)| (a - (top + 1), b - (top + 1))),
+                        );
+                        let nd = dom_meet(&st.d[*var], &dom_norm(vals));
+                        return st.set(*var, nd);
+                    }
                     // §11.8.2: an unsigned variable makes the relation
                     // unsigned; the signed side is zero-extended to it.
                     (false, true) if c.width <= vw => match c.to_u64() {
@@ -3702,10 +3880,136 @@ impl Simulator {
                     if self.csp_status(csp, els, st) == Some(false) {
                         return self.csp_enforce(csp, cond, st);
                     }
-                    true
+                    // A branch that is not refuted outright may still fail
+                    // once enforced (two bounds of one wrapped side that
+                    // cross): enforce each on its own, take the other when
+                    // one fails, and keep what both leave of a variable they
+                    // both narrow. Otherwise the condition's variable, or a
+                    // variable both branches bound alike, is refuted one
+                    // value at a time. Not nested: a probe takes no probes.
+                    if st.probing {
+                        return true;
+                    }
+                    let then_d = self.csp_probe(csp, &[cond, then], st);
+                    let els_d = self.csp_probe(csp, &[ncond, els], st);
+                    match (then_d, els_d) {
+                        (None, None) => false,
+                        (None, Some(_)) => {
+                            self.csp_enforce(csp, ncond, st) && self.csp_enforce(csp, els, st)
+                        }
+                        (Some(_), None) => {
+                            self.csp_enforce(csp, cond, st) && self.csp_enforce(csp, then, st)
+                        }
+                        (Some(t), Some(e)) => {
+                            for (v, dt) in t {
+                                if let Some((_, de)) = e.iter().find(|(u, _)| *u == v) {
+                                    let mut both = dt;
+                                    both.extend(de.iter().copied());
+                                    let nd = dom_meet(&st.d[v], &dom_norm(both));
+                                    if !st.set(v, nd) {
+                                        return false;
+                                    }
+                                }
+                            }
+                            true
+                        }
+                    }
                 }
             },
         }
+    }
+
+    /// The domains enforcing `ns` in turn leaves to the variables it
+    /// narrows, None when it fails; the domains are restored either way.
+    fn csp_probe(&mut self, csp: &Csp, ns: &[&Node], st: &mut St) -> Option<Vec<(usize, Dom)>> {
+        let (mark, dmark) = (st.trail.len(), st.dirty.len());
+        st.probing = true;
+        let ok = ns.iter().all(|n| self.csp_enforce(csp, n, st));
+        st.probing = false;
+        let out = ok.then(|| {
+            let mut vs: Vec<usize> = st.trail[mark..].iter().map(|t| t.0).collect();
+            vs.sort_unstable();
+            vs.dedup();
+            vs.into_iter().map(|v| (v, st.d[v].clone())).collect()
+        });
+        st.undo(mark);
+        st.dirty.truncate(dmark);
+        out
+    }
+
+    /// `u` is `v` wrapped into `(w, s)` (`Node::Wrap`): each period of `v`'s
+    /// domain maps onto `u`'s type range, and `u`'s values back onto every
+    /// period `v`'s bounds reach (at most a few: `v` is a variable of `w`
+    /// bits or fewer).
+    fn csp_wrap_enforce(v: usize, u: usize, w: u32, s: bool, st: &mut St) -> bool {
+        let m = 1i128 << w;
+        let (rlo, rhi) = ws_range(w, s);
+        let (vlo, vhi) = st.bounds(v);
+        if vlo > vhi {
+            return false;
+        }
+        let (j0, j1) = (floor_div(vlo - rlo, m), floor_div(vhi - rlo, m));
+        if j1 - j0 > 4 {
+            return true;
+        }
+        let mut to_u: Vec<(i128, i128)> = Vec::new();
+        for j in j0..=j1 {
+            let k = j * m;
+            to_u.extend(
+                dom_clip(&st.d[v], rlo + k, rhi + k)
+                    .iter()
+                    .map(|&(a, b)| (a - k, b - k)),
+            );
+        }
+        let nu = dom_meet(&st.d[u], &dom_norm(to_u));
+        if !st.set(u, nu) {
+            return false;
+        }
+        let mut to_v: Vec<(i128, i128)> = Vec::new();
+        for j in j0..=j1 {
+            let k = j * m;
+            to_v.extend(st.d[u].iter().map(|&(a, b)| (a + k, b + k)));
+        }
+        let nv = dom_meet(&st.d[v], &dom_norm(to_v));
+        st.set(v, nv)
+    }
+
+    /// `p == x * y` (`Node::Mul`): `p` within the product of the factors'
+    /// bounds, and a factor within `p / a` once the other is fixed at `a`.
+    fn csp_mul_enforce(p: usize, x: usize, y: usize, st: &mut St) -> bool {
+        let ((xa, xb), (ya, yb)) = (st.bounds(x), st.bounds(y));
+        let cs = [
+            xa.checked_mul(ya),
+            xa.checked_mul(yb),
+            xb.checked_mul(ya),
+            xb.checked_mul(yb),
+        ];
+        if let [Some(a), Some(b), Some(c), Some(d)] = cs {
+            let nd = dom_clip(&st.d[p], a.min(b).min(c).min(d), a.max(b).max(c).max(d));
+            if !st.set(p, nd) {
+                return false;
+            }
+        }
+        let (pa, pb) = st.bounds(p);
+        for (f, o) in [(x, y), (y, x)] {
+            let Some(a) = st.fixed(f) else {
+                continue;
+            };
+            if a == 0 {
+                // `p` already holds 0 alone; the other factor is free.
+                continue;
+            }
+            let (lo, hi) = if a > 0 {
+                (ceil_div(pa, a), floor_div(pb, a))
+            } else {
+                (ceil_div(pb, a), floor_div(pa, a))
+            };
+            let nd = dom_clip(&st.d[o], lo, hi);
+            if !st.set(o, nd) {
+                return false;
+            }
+        }
+        true
     }
 
     /// §11.4.5/§11.8.2: an equality compared at `w` bits holds exactly when
@@ -3885,7 +4189,36 @@ impl Simulator {
             (Some(a), Some(b)) => return Some(holds(sg * (wrapv(a) - wrapv(b)) + delta)),
             (None, Some(b)) => (la, wrapv(b), true),
             (Some(a), None) => (lb, wrapv(a), false),
-            (None, None) => return None,
+            (None, None) => {
+                // Both sides open. A side whose bounds stay inside the type
+                // holds its own value, one of `[kmin, kmax]`: the other
+                // side's wrapped value must meet the relation with one of
+                // them, a bound rather than a value (`(a - 8'h70) <= top -
+                // rb` bounds `a` before `rb` is known, #994).
+                let in_type = |l: &Lin| {
+                    let (a, b) = st.lin_bounds(l);
+                    (a >= rlo && b <= rhi).then_some((a, b))
+                };
+                let (x, (kmin, kmax), left) = match (in_type(lb), in_type(la)) {
+                    (Some(r), _) => (la, r, true),
+                    (None, Some(r)) => (lb, r, false),
+                    (None, None) => return None,
+                };
+                let set = match rel {
+                    Rel::Le => {
+                        let r = if (sg == 1) == left {
+                            (rlo, kmax - delta)
+                        } else {
+                            (kmin + delta, rhi)
+                        };
+                        if r.0 <= r.1 { vec![r] } else { Vec::new() }
+                    }
+                    Rel::Eq if left => vec![(kmin - sg * delta, kmax - sg * delta)],
+                    Rel::Eq => vec![(kmin + sg * delta, kmax + sg * delta)],
+                    Rel::Ne => return None,
+                };
+                return Self::csp_wrap_set(x, &dom_norm(set), false, w, s, st);
+            }
         };
         let (set, neg) = match rel {
             Rel::Le => {
@@ -3967,6 +4300,21 @@ impl Simulator {
                     return Some(!*neg);
                 }
                 None
+            }
+            Node::Wrap { v, u, w, s } => {
+                let (rlo, _) = ws_range(*w, *s);
+                let wv = rlo + (st.fixed(*v)? - rlo).rem_euclid(1i128 << *w);
+                if !dom_has(&st.d[*u], wv) {
+                    return Some(false);
+                }
+                st.fixed(*u).map(|_| true)
+            }
+            Node::Mul { p, x, y } => {
+                let xy = st.fixed(*x)?.checked_mul(st.fixed(*y)?)?;
+                if !dom_has(&st.d[*p], xy) {
+                    return Some(false);
+                }
+                st.fixed(*p).map(|_| true)
             }
             Node::Pop { x, c, w } => {
                 let n = Self::bits_at(st.fixed(*x)?, *w).count_ones() as i128;
@@ -5796,6 +6144,7 @@ impl Simulator {
             cut: false,
             level_tries: 0,
             level_cut: false,
+            probing: false,
         };
         let mut out = Vec::with_capacity(dom.len() + 1);
         for &k in dom {
@@ -6094,7 +6443,7 @@ impl Simulator {
         let mut fits = Vec::new();
         let mut cx = LinCx::new(csp);
         let lin = Self::csp_lin(&a, w, false, &mut fits, &mut cx)?;
-        let carries = std::mem::take(&mut cx.carries);
+        let carries = cx.take();
         self.csp_add_carries(csp, carries);
         fits.push(Fit {
             lin: lin.clone(),
@@ -6337,7 +6686,7 @@ impl Simulator {
         ) else {
             return fallback(self, csp);
         };
-        let carries = std::mem::take(&mut cx.carries);
+        let carries = cx.take();
         let (rlo, rhi) = ws_range(w, s);
         let nleaf = fits.len();
         fits.push(Fit {
@@ -6595,7 +6944,7 @@ impl Simulator {
         } else {
             None
         };
-        let carries = std::mem::take(&mut cx.carries);
+        let carries = cx.take();
         let Some(lin) = lin else {
             return self.csp_eval_node(csp, whole, env, neg);
         };
@@ -7559,6 +7908,15 @@ impl Simulator {
                 // an unsigned context zero-extends a signed operand; one that
                 // already fills the context is only reinterpreted (§11.8.2)
                 if *vs && !s {
+                    // §11.8.2: the operand's value in that context is its
+                    // own bits read unsigned, `v + 2^vw` when `v` is
+                    // negative: a variable of its own (`LinCx::wrap`), so
+                    // the relation propagates over it instead of waiting
+                    // until `v` is fixed — `rb == w * 8` with an `int rb`
+                    // and a `longint unsigned w` bounds `rb` at once (#994).
+                    if let Some(u) = cx.wrap(*v, *vw, false) {
+                        return Some(Lin::var(u));
+                    }
                     fits.push(Fit {
                         lin: Lin::var(*v),
                         lo: 0,
@@ -7595,6 +7953,12 @@ impl Simulator {
                     y.scale(x.k)
                 } else if y.is_const() {
                     x.scale(y.k)
+                } else if let ([(a, 1)], [(b, 1)], 0, 0) = (&x.t[..], &y.t[..], x.k, y.k) {
+                    // Two variables (`cnt * pitch`): their product is a
+                    // variable of its own, exact as an integer; computed at
+                    // `w` bits it wraps like any other operand, which the
+                    // side fits of the relation see.
+                    Some(Lin::var(cx.prod(*a, *b)?))
                 } else {
                     None
                 }
@@ -7633,6 +7997,15 @@ impl Simulator {
                 s: cs,
             } => {
                 let l = Self::csp_lin(inner, *iw, *is, fits, cx)?;
+                // §6.24.1, §11.8.2: the cast of one variable reads its low
+                // `cw` bits, signed only when the context is signed too;
+                // read wrapped (see `Ae::Var`) the relation propagates over
+                // every value, not just those the cast leaves alone.
+                if let ([(v, 1)], 0) = (&l.t[..], l.k)
+                    && let Some(u) = cx.wrap(*v, *cw, *cs && s)
+                {
+                    return Some(Lin::var(u));
+                }
                 Self::csp_leaf_fit(&l, *iw, *is, *cw, *cs, w, s, fits);
                 Some(l)
             }
@@ -7909,9 +8282,67 @@ impl Simulator {
 
     /// Create the variables of a translated relation's carries (`LinCx`)
     /// and their defining equalities `acc - s - 2^w·k == 0`.
-    fn csp_add_carries(&mut self, csp: &mut Csp, carries: Vec<Carry>) {
-        for c in carries {
+    fn csp_add_carries(
+        &mut self,
+        csp: &mut Csp,
+        (carries, prods, wraps): (Vec<Carry>, Vec<Prod>, Vec<Wrp>),
+    ) {
+        // A wrapped reading is one variable, numbered before the carries
+        // and products made after it (`LinCx::next`).
+        let mut wraps = wraps.into_iter().peekable();
+        // All are numbered in creation order (`LinCx::next`): make the
+        // variables in that order.
+        let mut carries = carries.into_iter().peekable();
+        let mut prods = prods.into_iter().peekable();
+        loop {
+            let next_other = match (carries.peek(), prods.peek()) {
+                (Some(c), Some(p)) => Some(c.sv.min(p.p)),
+                (Some(c), None) => Some(c.sv),
+                (None, Some(p)) => Some(p.p),
+                (None, None) => None,
+            };
+            if let Some(r) = wraps.next_if(|r| next_other.is_none_or(|n| r.u < n)) {
+                debug_assert_eq!(r.u, csp.vars.len());
+                csp.vars.push(CspVar {
+                    key: VarKey::Aux,
+                    width: r.w,
+                    signed: r.s,
+                });
+                let (lo, hi) = ws_range(r.w, r.s);
+                csp.dom0.push(vec![(lo, hi)]);
+                csp.wraps.push((r.v, r.w, r.s, r.u));
+                csp.nodes.push(Node::Wrap {
+                    v: r.v,
+                    u: r.u,
+                    w: r.w,
+                    s: r.s,
+                });
+                continue;
+            }
+            let c = match (carries.peek(), prods.peek()) {
+                (None, None) => break,
+                (Some(c), Some(p)) if p.p < c.sv => None,
+                (None, Some(_)) => None,
+                _ => carries.next(),
+            };
+            let Some(c) = c else {
+                let p = prods.next().expect("a pending product");
+                debug_assert_eq!(p.p, csp.vars.len());
+                csp.vars.push(CspVar {
+                    key: VarKey::Aux,
+                    width: 128,
+                    signed: true,
+                });
+                csp.dom0.push(vec![p.r]);
+                csp.nodes.push(Node::Mul {
+                    p: p.p,
+                    x: p.x,
+                    y: p.y,
+                });
+                continue;
+            };
             debug_assert!(csp.vars.len() >= csp.carry_base.unwrap_or(0));
+            debug_assert_eq!(c.sv, csp.vars.len());
             let sv = csp.vars.len();
             csp.vars.push(CspVar {
                 key: VarKey::Aux,
