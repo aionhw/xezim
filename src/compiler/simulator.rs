@@ -1641,7 +1641,9 @@ struct CombEntryCold {
 // sensitivity exclusion; their layout is readable but their edges are stale.
 // §9.7 (#940): `Insn::LoadProcessStatus` renumbers the instructions after it.
 // §9.2.2.2: whole-struct reads of a collapsed continuous copy depended on
-// member ids that the collapse left unused; those edges are stale.
+// member ids that the collapse left unused; those edges are stale. Reads of
+// an element of an unpacked array of structs, or of the whole array, now
+// depend on its members too.
 const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB031";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the

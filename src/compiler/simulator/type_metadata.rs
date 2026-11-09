@@ -1601,8 +1601,10 @@ impl Simulator {
 
     /// Every signal below each unpacked-struct VARIABLE (`s.a`, `s.arr[1]`,
     /// `s.in.x`), keyed by the variable's name: what a whole-struct read
-    /// depends on. Covers instance-scoped structs too, which have member
-    /// leaves but no container signal. One pass over the signal names.
+    /// depends on. An unpacked array of structs is keyed by each element
+    /// (`pa[0]`) and by the array (`pa`). Covers instance-scoped structs too,
+    /// which have member leaves but no container signal. One pass over the
+    /// signal names.
     pub(super) fn build_unpacked_struct_sens(&self) -> HashMap<String, Vec<usize>> {
         let mut names: HashSet<&str> = HashSet::default();
         for (name, dt) in &self.module.var_decl_types {
@@ -1620,13 +1622,30 @@ impl Simulator {
         for (name, &id) in self.signal_name_to_id.iter() {
             let name: &str = name.as_ref();
             for (pos, _) in name.match_indices('.') {
-                if names.contains(&name[..pos]) {
-                    out.entry(name[..pos].to_string()).or_default().push(id);
+                let prefix = &name[..pos];
+                if names.contains(prefix) {
+                    out.entry(prefix.to_string()).or_default().push(id);
+                    continue;
+                }
+                // §7.2, §9.2.2.2: a member of an element of an unpacked
+                // array of unpacked structs (`pa[0].a`). A read of the
+                // element (`c = pa[0]`) or of the whole array (`ra = pa`)
+                // depends on it, as a whole-struct read does on its members.
+                let mut base = prefix;
+                while base.ends_with(']')
+                    && let Some(open) = base.rfind('[')
+                {
+                    base = &base[..open];
+                }
+                if base.len() < prefix.len() && names.contains(base) {
+                    out.entry(prefix.to_string()).or_default().push(id);
+                    out.entry(base.to_string()).or_default().push(id);
                 }
             }
         }
         for v in out.values_mut() {
             v.sort_unstable();
+            v.dedup();
         }
         out
     }
