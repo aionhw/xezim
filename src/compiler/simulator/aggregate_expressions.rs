@@ -2557,6 +2557,10 @@ impl Simulator {
                     .remove(&idx)
                     .unwrap_or_else(|| Value::zero(32))
             }
+            VIF_VALUE_MARKER => {
+                let token = args.first().map_or(0, |a| self.vif_handle_value(a));
+                Value::from_u64(token, 32)
+            }
             // `@prop` on a non-event class property: true once the property
             // differs from the value captured when the wait was armed.
             VC_CHANGED_MARKER => {

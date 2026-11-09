@@ -559,6 +559,11 @@ const VC_CHANGED_MARKER: &str = "$__xz_vc_changed";
 /// change (an untagged term of an `or` list); an `iff` guard must hold when
 /// it fires. Never user-visible.
 const VC_EDGE_MARKER: &str = "$__xz_vc_edge";
+/// Internal `$__xz_vif_value(expr)`: the identity of the interface instance
+/// the virtual-interface operand `expr` holds (the `iface_handle_token` of the
+/// bound instance, 0 for null). `@(vif)` / `@(vifs[i])` waits for this value
+/// to change (§9.4.2, §25.9). Never user-visible.
+const VIF_VALUE_MARKER: &str = "$__xz_vif_value";
 /// Ends a deferred declaration initializer: `(<target>, ...)` records the
 /// values it gave as their default sampled values (see `sampled_defaults`).
 const SAMPLED_DEFAULT_MARKER: &str = "$__xz_sampled_default";

@@ -5384,6 +5384,14 @@ impl Simulator {
                                 return;
                             }
                         }
+                        // `@(vif)` — see `vif_value_change_cond`.
+                        if let Some(cond) = self.vif_value_change_cond(e) {
+                            let pid = self.current_pid;
+                            let wait = Self::vc_wait_stmt(cond.clone(), stmt, stmt.span);
+                            self.park_condition_waiter(pid, vec![wait].into(), &cond);
+                            self.break_flag = true;
+                            return;
+                        }
                         if let Some(cond) = self.class_prop_value_change_cond(e) {
                             let pid = self.current_pid;
                             let wait = Self::vc_wait_stmt(cond.clone(), stmt, stmt.span);

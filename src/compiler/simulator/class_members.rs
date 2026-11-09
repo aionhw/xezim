@@ -2027,21 +2027,111 @@ impl Simulator {
                 return Some(v);
             }
         }
-        if let ExprKind::Ident(h) = &e.kind {
-            if h.path.len() == 1 {
-                let name = &h.path[0].name.name;
-                if let Some(locals) = self.local_stack.last() {
-                    if let Some(v) = locals.get(name) {
-                        return v.to_u64().map(|x| x as i64);
-                    }
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => self
+                .scalar_name_value_self(&h.path[0].name.name)?
+                .to_u64()
+                .map(|x| x as i64),
+            // `cfg.idx`, `this.idx`: a property read through a handle.
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let recv = Expression::new(ExprKind::Ident(hier_prefix(h)), e.span);
+                let oh = self.eval_handle_expr(&recv).filter(|&oh| oh != 0)?;
+                let leaf = &h.path.last()?.name.name;
+                self.read_member_value(oh, leaf)?.to_u64().map(|x| x as i64)
+            }
+            ExprKind::MemberAccess { expr: recv, member } => {
+                let oh = self.eval_handle_expr(recv).filter(|&oh| oh != 0)?;
+                self.read_member_value(oh, &member.name)?
+                    .to_u64()
+                    .map(|x| x as i64)
+            }
+            ExprKind::Paren(inner) => self.eval_scalar_self(inner),
+            // §11.4: an index computed from such names (`q[n-1]`).
+            ExprKind::Unary { op, operand } => {
+                let v = self.eval_scalar_self(operand)?;
+                match op {
+                    UnaryOp::Plus => Some(v),
+                    UnaryOp::Minus => Some(v.wrapping_neg()),
+                    UnaryOp::BitNot => Some(!v),
+                    _ => None,
                 }
-                return self
-                    .get_signal_value_by_name(name)
-                    .and_then(|v| v.to_u64())
-                    .map(|x| x as i64);
+            }
+            ExprKind::Binary { op, left, right } => {
+                let (l, r) = (self.eval_scalar_self(left)?, self.eval_scalar_self(right)?);
+                match op {
+                    BinaryOp::Add => Some(l.wrapping_add(r)),
+                    BinaryOp::Sub => Some(l.wrapping_sub(r)),
+                    BinaryOp::Mul => Some(l.wrapping_mul(r)),
+                    BinaryOp::Div if r != 0 => Some(l.wrapping_div(r)),
+                    BinaryOp::Mod if r != 0 => Some(l.wrapping_rem(r)),
+                    BinaryOp::BitAnd => Some(l & r),
+                    BinaryOp::BitOr => Some(l | r),
+                    BinaryOp::BitXor => Some(l ^ r),
+                    BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft if (0..64).contains(&r) => {
+                        Some(l << r)
+                    }
+                    BinaryOp::ShiftRight if (0..64).contains(&r) => Some(((l as u64) >> r) as i64),
+                    BinaryOp::ArithShiftRight if (0..64).contains(&r) => Some(l >> r),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The value of a bare name in a `&self` context, resolved the way the
+    /// running scope sees it: a local of the innermost frame, else — inside a
+    /// class method — a property of `this` or a static property of the class
+    /// (§8.11, a class member hides a module-scope name), else a signal or
+    /// variable. Without the class tier an index naming a property
+    /// (`dst[j] = src[j]` with `j` a property, `@(posedge vifs[idx].clk)`)
+    /// read nothing, so the virtual-interface element it selected resolved
+    /// to no instance.
+    fn scalar_name_value_self(&self, name: &str) -> Option<Value> {
+        if let Some(v) = self.local_stack.last().and_then(|l| l.get(name)) {
+            return Some(v.clone());
+        }
+        if let Some(th) = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .filter(|&h| h != 0)
+            && let Some(inst) = self.heap.get(th).and_then(|o| o.as_ref())
+        {
+            let key = self.shadowed_prop_key(name, false);
+            if let Some(v) = inst.properties.get(key.as_deref().unwrap_or(name)) {
+                return Some(v.clone());
             }
         }
-        None
+        if let Some(ctx) = self.class_context_stack.last().and_then(|c| c.as_deref())
+            && let Some(key) = self.static_prop_key(ctx, name)
+        {
+            if let Some(v) = self.class_statics.get(&key) {
+                return Some(v.clone());
+            }
+            // A static cell is materialized on its first `&mut` access; until
+            // then it holds its declaration's constant initializer (§8.9).
+            let head = key
+                .strip_suffix(name)
+                .and_then(|k| k.strip_suffix("::"))
+                .unwrap_or(&key);
+            let seed = self
+                .module
+                .classes
+                .get(head.split('#').next().unwrap_or(head))
+                .and_then(|cd| match cd.property_inits.get(name) {
+                    Some(init) => super::elaborate::const_eval_i64_with_params(init, None)
+                        .map(|v| Value::from_u64(v as u64, 64)),
+                    None => cd.properties.get(name).map(|sig| sig.value.clone()),
+                });
+            if seed.is_some() {
+                return seed;
+            }
+        }
+        self.get_signal_value_by_name(name)
     }
 
     /// §8.9: whether `member`, looked up from class `cn` up its chain, is a

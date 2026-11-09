@@ -4565,6 +4565,14 @@ impl Simulator {
                         // `@prop` / `@(h.prop)` on a NON-event class property:
                         // a value-change wait, resumed by an ordinary write
                         // of the property (never by `->`).
+                        // `@(vif)` / `@(vifs[i])`: a change of the instance a
+                        // virtual-interface variable refers to.
+                        if let Some(cond) = self.vif_value_change_cond(event) {
+                            let wait = Self::vc_wait_stmt(cond.clone(), body, stmt.span);
+                            let cont = pc.pushed(vec![wait], pc.start + i + 1);
+                            self.park_condition_waiter(pid, cont, &cond);
+                            return;
+                        }
                         if let Some(cond) = self.class_prop_value_change_cond(event) {
                             let wait = Self::vc_wait_stmt(cond.clone(), body, stmt.span);
                             let cont = pc.pushed(vec![wait], pc.start + i + 1);

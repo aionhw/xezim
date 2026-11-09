@@ -676,6 +676,92 @@ impl Simulator {
         Some(expr)
     }
 
+    /// `@(vif)` / `@(vifs[i])` / `@(cfg.vif)`: an event control on a
+    /// virtual-interface VARIABLE, not on a member of the interface. §9.4.2
+    /// makes it a wait for a change of the operand's value, and §25.9 makes
+    /// that value the instance the variable refers to, so the wait resumes
+    /// when the variable is assigned a different instance (or null). Such an
+    /// operand has no signal: a bare property read back a constant, so the
+    /// wait never resumed, and an element (`@(vifs[0])`) armed on nothing and
+    /// returned at once, spinning its loop at one time step. `None` for an
+    /// edge or `iff` term, or any term that is not such a variable.
+    pub(super) fn vif_value_change_cond(&mut self, event: &EventControl) -> Option<Expression> {
+        let EventControl::EventExpr(terms) = event else {
+            return None;
+        };
+        if self.module.interfaces.is_empty()
+            || terms
+                .iter()
+                .any(|t| t.edge.is_some() || t.iff.is_some() || !self.vif_handle_term(&t.expr))
+        {
+            return None;
+        }
+        let mut conds = Vec::with_capacity(terms.len());
+        for t in terms {
+            conds.push(self.value_change_cond(Self::vif_value_expr(t.expr.clone())));
+        }
+        let mut conds = conds.into_iter();
+        let first = conds.next()?;
+        Some(conds.fold(first, |left, right| {
+            let span = left.span;
+            Expression::new(
+                ExprKind::Binary {
+                    op: BinaryOp::LogOr,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            )
+        }))
+    }
+
+    /// Is `e` a declared virtual-interface variable — a bare name, a
+    /// property reached through handles, or an element of a collection of
+    /// them — rather than a member of the interface it refers to?
+    fn vif_handle_term(&self, e: &Expression) -> bool {
+        let mut e = e;
+        while let ExprKind::Paren(inner) = &e.kind {
+            e = inner;
+        }
+        let mut base = e;
+        while let ExprKind::Index { expr, .. } = &base.kind {
+            base = expr;
+        }
+        let name = match &base.kind {
+            ExprKind::Ident(h) if h.root.is_none() => match h.path.last() {
+                Some(s) => s.name.name.as_str(),
+                None => return false,
+            },
+            ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+            _ => return false,
+        };
+        if !self.vif_name_possible(name) && !self.vif_tokens_stored {
+            return false;
+        }
+        self.vif_operand(e).is_some() || self.vif_recv_target(e).is_some()
+    }
+
+    /// `$__xz_vif_value(e)`.
+    fn vif_value_expr(e: Expression) -> Expression {
+        let span = e.span;
+        Expression::new(
+            ExprKind::SystemCall {
+                name: VIF_VALUE_MARKER.to_string(),
+                args: vec![e],
+            },
+            span,
+        )
+    }
+
+    /// The `$__xz_vif_value` of `e` (see [`VIF_VALUE_MARKER`]).
+    pub(super) fn vif_handle_value(&self, e: &Expression) -> u64 {
+        let bound = match self.vif_operand(e) {
+            Some(b) => b,
+            None => self.vif_recv_target(e).map(|(b, _)| b),
+        };
+        bound.map_or(0, |b| Self::iface_handle_token(&b))
+    }
+
     /// `@(posedge prop)` / `@(negedge prop)` / `@(edge prop)` where the term is
     /// a NON-signal operand — a class property, a static, or a procedural
     /// local. §9.4.2 makes the wait edge-sensitive on the operand's value, but
@@ -1002,6 +1088,16 @@ impl Simulator {
             self.this_stack.last().copied().flatten()?
         } else if let Some(h) = self.eval_ident_handle(segs[0]) {
             i = 1;
+        // §25.9: a virtual-interface variable's value is the instance it
+        // refers to (`@(cfg.vif)`), which its plain read does not carry.
+        let expr = if !self.module.interfaces.is_empty()
+            && !matches!(&expr.kind, ExprKind::SystemCall { name, .. } if name == VIF_VALUE_MARKER)
+            && self.vif_handle_term(&expr)
+        {
+            Self::vif_value_expr(expr)
+        } else {
+            expr
+        };
             h
         } else if self.this_stack.last().copied().flatten().is_some() {
             // Class-scope shorthand: `bus.clk_i` inside a method is
