@@ -1860,6 +1860,35 @@ fn dim_idents(dt: &DataType, out: &mut Vec<String>) {
 /// expression. Only descends pure operator/paren/conditional trees — never into
 /// calls, indexing, or member access — so a function-call or array-based width
 /// is never mistaken for an undeclared identifier.
+/// `collect_idents` without the names core's binding resolved to a
+/// declaration of their own definition (§23.9), an implicit net of that
+/// definition included (§6.10): those are declared where they are used.
+fn collect_unbound_idents(e: &Expression, out: &mut Vec<String>) {
+    match &e.kind {
+        ExprKind::Ident(h) if h.path.len() == 1 => {
+            if h.bound.as_decl().is_none() {
+                out.push(h.path[0].name.name.clone());
+            }
+        }
+        ExprKind::Unary { operand, .. } => collect_unbound_idents(operand, out),
+        ExprKind::Binary { left, right, .. } => {
+            collect_unbound_idents(left, out);
+            collect_unbound_idents(right, out);
+        }
+        ExprKind::Paren(x) => collect_unbound_idents(x, out),
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_unbound_idents(condition, out);
+            collect_unbound_idents(then_expr, out);
+            collect_unbound_idents(else_expr, out);
+        }
+        _ => {}
+    }
+}
+
 fn collect_idents(e: &Expression, out: &mut Vec<String>) {
     match &e.kind {
         ExprKind::Ident(h) if h.path.len() == 1 => {
@@ -4018,25 +4047,6 @@ struct UndeclaredFinder<'a> {
     errs: Vec<String>,
 }
 
-/// §6.10: an undeclared identifier used as a primitive/instance port actual, a
-/// continuous-assign target, or (transitively) read from one creates an implicit
-/// 1-bit net, so a later reference to it is not an undeclared name.
-///
-/// Names created in the TOP module are already in `elab.signals` and so answer
-/// true from `top_declares`. Names created inside a SUB-MODULE are registered
-/// under their elaborated path (`u.bBIST`, `g_top[0].rom.bBIST`), which is why
-/// the bare identifier is matched as a trailing path component here. Without
-/// this, a legal vendor ROM model (`buf sBIST (bBIST, BIST);` followed by
-/// `wire iCEB = bBIST ? ... : ...;`) was rejected at elaboration.
-fn implicit_net_declares(n: &str, elab: &ElaboratedModule) -> bool {
-    elab.implicit_nets.contains(n)
-        || elab.implicit_nets.iter().any(|scoped| {
-            scoped.len() > n.len()
-                && scoped.ends_with(n)
-                && scoped.as_bytes()[scoped.len() - n.len() - 1] == b'.'
-        })
-}
-
 impl<'a> UndeclaredFinder<'a> {
     /// A name needs no declaration here if it is a keyword, a built-in
     /// spelling, a package member, something the elaboration indexes, or
@@ -4049,7 +4059,6 @@ impl<'a> UndeclaredFinder<'a> {
             || self.pkg_names.contains(n)
             || top_declares(n, self.elab)
             || self.declared.contains(n)
-            || implicit_net_declares(n, self.elab)
     }
 
     fn name(&mut self, n: &str, what: &str) {
@@ -4065,7 +4074,7 @@ impl<'a> UndeclaredFinder<'a> {
 
     fn init_idents(&mut self, init: &Expression, label: &str) {
         let mut ids = Vec::new();
-        collect_idents(init, &mut ids);
+        collect_unbound_idents(init, &mut ids);
         let what = format!("initializer of '{label}'");
         for n in ids {
             self.name(&n, &what);
