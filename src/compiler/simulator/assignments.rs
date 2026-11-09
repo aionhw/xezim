@@ -1138,6 +1138,26 @@ impl Simulator {
             if consumed == 0 {
                 return None;
             }
+        } else if let Some(nu) = self
+            .module
+            .arrays_2d
+            .contains_key(root)
+            .then_some(2)
+            .or_else(|| self.module.arrays_nd.get(root).map(|(s, _)| s.len()))
+        {
+            // §7.4.1: an element of a multi-dimensional unpacked array
+            // (`s3[1][0].f0[1]`) is the signal named by all its unpacked
+            // indices; none of its prefixes is one.
+            if lead_len < nu {
+                return None;
+            }
+            for &(_, i) in &steps[..nu] {
+                storage.push('[');
+                Self::push_i64(&mut storage, i);
+                storage.push(']');
+            }
+            self.get_signal_value_by_name(&storage)?;
+            consumed = nu;
         }
         let pre = &steps[consumed..lead_len];
         let fields = self.module.packed_struct_fields.get(root)?;
@@ -1277,8 +1297,16 @@ impl Simulator {
         base: &Expression,
         idx: &Expression,
     ) -> Option<(String, u32, u32)> {
-        // Left of the trailing index must be `<...>.field`.
-        if !matches!(base.kind, ExprKind::MemberAccess { .. }) {
+        // Left of the trailing index must be `<...>.field`, possibly with
+        // more indices after the field: §7.4.1, `sa[1].f0[3][7]` selects an
+        // element of a multi-dimensional packed member at every index, and
+        // as `<...>.field[3]` this shape was declined, so the store was
+        // dropped.
+        let mut field = base;
+        while let ExprKind::Index { expr, .. } = &field.kind {
+            field = expr;
+        }
+        if !matches!(field.kind, ExprKind::MemberAccess { .. }) {
             return None;
         }
         let (root, mut steps) = self.packed_path_steps(base)?;

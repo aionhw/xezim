@@ -605,6 +605,17 @@ impl Simulator {
                         }
                     }
                 }
+                // §7.4.1: an element of a multi-dimensional packed member
+                // (`sa[i].f0[j][k]`, `s.f0[j][k]` on an array of packed
+                // structs): the width of the slice the store resolves to.
+                // Effect-free indices only, as they are evaluated here.
+                if let ExprKind::Index { expr: b, index: ix } = &expr.kind
+                    && matches!(cur.kind, ExprKind::MemberAccess { .. })
+                    && Self::cond_expr_is_effect_free(expr, false)
+                    && let Some((_, _, w)) = self.packed_struct_elem_slice(b, ix)
+                {
+                    return w;
+                }
                 // §18.4/§7.2: an element of a class aggregate member —
                 // width from the resolved storage (a packed-dimension slot
                 // of a struct member fell through to 1 here, resizing an
