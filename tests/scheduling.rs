@@ -461,3 +461,6 @@ mod review_watchdog_drivers_938;
 
 #[path = "scheduling/fork_child_hidden_locals_943.rs"]
 mod fork_child_hidden_locals_943;
+
+#[path = "scheduling/unpacked_struct_copy_chain.rs"]
+mod unpacked_struct_copy_chain;
