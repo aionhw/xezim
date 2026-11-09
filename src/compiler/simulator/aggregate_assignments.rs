@@ -3820,7 +3820,10 @@ impl Simulator {
         }
         idx_exprs.reverse();
         let name = self.resolve_hier_name(h).into_owned();
-        if self.fixed_unpacked_dims(&name).is_none() {
+        // Any fixed element type, unpacked structs included: the spread
+        // below takes a struct element's pattern member-wise, as the
+        // whole-array spread does.
+        if self.module.dynamic_arrays.contains(&name) || self.is_associative_array(&name) {
             return false;
         }
         let Some(dims) = self.foreach_dims(&name) else {
