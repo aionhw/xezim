@@ -185,6 +185,8 @@ mod prepared_body_key;
 mod repro_import;
 #[path = "hierarchy/resource_pool_scope_lookup.rs"]
 mod resource_pool_scope_lookup;
+#[path = "hierarchy/review_disable_block_paths.rs"]
+mod review_disable_block_paths;
 #[path = "hierarchy/same_name_port_hop.rs"]
 mod same_name_port_hop;
 #[path = "hierarchy/submodule_array_element_assigns.rs"]
