@@ -35,6 +35,69 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A generate block is a scope of its own. Each definition gets a scope tree
+  and a binder that resolves every simple name, and the generate rename
+  follows that binding:
+  - an unlabelled block keeps its data under `genblk<n>` (§27.5, §27.6);
+  - a bare upward subroutine call resolves through the instance tree
+    (§23.8.1);
+  - a `disable` names its block by path (§9.6.2);
+  - a block's typedefs are the block's (§6.18);
+  - an undeclared bare name inside an instance is an error, as it is at the
+    top level (§6.10, §23.9).
+
+  (#952, contributed by philipaxer)
+* A generate block's tasks, functions and processes take their time scope and
+  clocking blocks from their instance (§3.14.2.1, §14.3, contributed by
+  philipaxer).
+* A task or void function with no written lifetime is static on the compiled
+  tier too, so a local or output formal that carries a value keeps it between
+  calls from a clocked process (§6.21, §13.3.1, #970, contributed by
+  philipaxer). A subroutine whose variables are all written before they are
+  read stays inlined.
+* An implicit net created inside a sub-module counts as declared for a later
+  initializer in that module (§6.10, #982, #983, contributed by davekeeshan).
+  An implicit net of one module no longer declares the same name in an
+  unrelated one. An implicit net used in a generate block belongs to that
+  block: each loop iteration has its own, and `g[0].n` reaches it.
+* Array queries and `$bits` over a generate-block variable are answered from
+  its declared shape, also from outside the block (`$size(g[0].arr)`)
+  (§20.6.2, §20.7, xezim-core#178, xezim-core#179, contributed by
+  chuanseng-ng).
+* A comparison between two elements of a class-member array in a compiled
+  method (`base[i] < base[j] + len[j]`) evaluates at the elements' declared
+  width; it used only their lowest bit (§11.6.1, #977, #980, contributed by
+  shabbarvejlani).
+* A `foreach` modulo equality on array elements (`(base[i] % sz[i]) == 0`)
+  is solved by drawing the element from its congruence class, within the
+  element's `<`, `<=`, `>` and `>=` bounds. `randomize()` used to report no
+  solution (§18.5.8.1, #976, #979, contributed by shabbarvejlani).
+* A bit, part or element select written to a class property lands. This
+  covers properties declared through a typedef or an enum, and `int`,
+  `byte`, `shortint` and packed struct or union properties; the write was
+  dropped (§7.4.1, §6.11, #972, #973, contributed by davekeeshan).
+* A select past an associative array's dimensions selects into the element
+  (`a[k][3]`, `p[k][1]`, `p[k][3:2]`), and elements of multi-dimensional,
+  offset and ascending packed types are stored whole (§7.8, §7.4.1, §11.5.1,
+  #956, #958, #957, #959, contributed by chuanseng-ng).
+* A static method called through a handle runs on the handle's declared class
+  and specialization (§8.23, §8.25, #953, #954, contributed by davekeeshan).
+  This holds through a null handle and in compiled code, where it returned 0,
+  and through a base-typed handle to a derived object, where it ran the
+  derived class's method.
+* `@(posedge x)`, `@(negedge x)` and `@(edge x)` on a class property or a
+  procedural local wait for the transition; they returned at once (§9.4.2,
+  #950, #951, contributed by davekeeshan). The edges follow Table 9-2 on the
+  LSB, and `or` lists and `iff` guards over class properties wait for their
+  own transitions.
+* VPI handles to an unlabelled generate block's variables read the block's
+  own value (§27.6, §37).
+* A typedef that depends on the genvar of a generate-for block inside an
+  instance has each iteration's width (§6.18, §27.4).
+* `$unit::x` in a generate block that declares `x` reads the compilation
+  unit's `x` (§3.12.1).
+* Regression suites for base-class properties shadowed by a derived class's
+  parameter or static (§8.14, #944, #960, contributed by Thomasb81).
 * A class property that a derived class redeclares as a `localparam`,
   `parameter`, `static` property or typedef resolves in the scope of the
   reference (§8.14, §8.23, #944, reported by Ganesh-TNL). This covers
@@ -706,6 +769,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
+* Constrained randomization of large and chunked arrays with `foreach`
+  constraints is much faster: 2.2× and 125× fewer instructions on the two
+  benchmarks of #876 (§18.5.8.1, #955, contributed by Thomasb81). The
+  rewritten shapes can pick different solutions than before for the same
+  seed. Seeded runs remain reproducible.
+* Binding a scope with many local names is linear in the number of names
+  (§23.9).
 * A package function call no longer copies the parameter table (#920,
   contributed by auty1395); 33 s to 2.6 s on the reported design.
 * More code runs compiled (#940, contributed by Thomasb81): `repeat`,
