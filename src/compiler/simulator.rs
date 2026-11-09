@@ -341,7 +341,8 @@ fn method_boost_enabled() -> bool {
 // §7.5/§7.10: design-scope dynamic-array and queue elements read the live collection.
 // §11.6.1: member element selects size at the declared element width
 // (`coll_elem_widths` plan fact in `expr_max_width`).
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_306b;
+// §7.4.1/§7.4.5: a packed select inside an unpacked array's element reads that element.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_306c;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never

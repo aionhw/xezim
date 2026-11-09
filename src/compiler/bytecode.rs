@@ -11422,7 +11422,7 @@ impl<'a> BytecodeCompiler<'a> {
         index: &Expression,
     ) -> Option<RegId> {
         let (hier, idx_exprs) = self.flatten_index_chain_exprs(base, index)?;
-        if idx_exprs.len() < 2 {
+        if idx_exprs.len() < 2 || self.is_unpacked_chain_root(hier) {
             return None;
         }
         let dims = self.chain_root_dims(hier)?;
@@ -11441,6 +11441,53 @@ impl<'a> BytecodeCompiler<'a> {
             idx_regs.push(self.compile_expr(e, 0)?);
         }
         let root_sig = self.lookup_signal_id(hier);
+        let lo_reg = self.emit_packed_chain_offset(&dims, idx_regs)?;
+        // A signal root is sliced IN PLACE. `compile_expr_root_of` copied
+        // the whole vector into a register first, so a loop reading one
+        // byte of a 512-bit table cloned all 512 bits on every iteration —
+        // the copy, not the select, was the cost.
+        if let Some(sig) = root_sig {
+            let dest = self.alloc_reg();
+            self.emit(Insn::LoadSignalRangeDyn(
+                dest,
+                as_sig_id(sig),
+                lo_reg,
+                width as u32,
+            ));
+            return Some(dest);
+        }
+        let root = self.compile_expr_root_of(base)?;
+        Some(self.emit_dyn_slice(root, lo_reg, width as u32))
+    }
+
+    /// `src[lo +: width]` with a run-time `lo`.
+    fn emit_dyn_slice(&mut self, src: RegId, lo_reg: RegId, width: u32) -> RegId {
+        let hi_reg = if width == 1 {
+            lo_reg
+        } else {
+            let wm1 = self.alloc_reg();
+            self.emit(Insn::LoadConst(
+                wm1,
+                Box::new(Value::from_u64((width - 1) as u64, 32)),
+            ));
+            let h = self.alloc_reg();
+            self.emit(Insn::Add(h, lo_reg, wm1));
+            h
+        };
+        let dest = self.alloc_reg();
+        self.emit(Insn::RangeSelect(dest, src, hi_reg, lo_reg));
+        dest
+    }
+
+    /// Run-time bit offset of the packed element that `idx_regs` (outermost
+    /// first) select out of a vector with packed dimensions `dims`:
+    /// `off = Σ slot_k * (product of the counts below level k)`.
+    fn emit_packed_chain_offset(
+        &mut self,
+        dims: &[(i64, i64)],
+        idx_regs: Vec<RegId>,
+    ) -> Option<RegId> {
+        let counts: Vec<i64> = dims.iter().map(|(l, r)| (l - r).abs() + 1).collect();
         let mut off_reg: Option<RegId> = None;
         for (k, idx_reg) in idx_regs.into_iter().enumerate() {
             let (l, r) = dims[k];
@@ -11492,37 +11539,7 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             });
         }
-        let lo_reg = off_reg?;
-        // A signal root is sliced IN PLACE. `compile_expr_root_of` copied
-        // the whole vector into a register first, so a loop reading one
-        // byte of a 512-bit table cloned all 512 bits on every iteration —
-        // the copy, not the select, was the cost.
-        if let Some(sig) = root_sig {
-            let dest = self.alloc_reg();
-            self.emit(Insn::LoadSignalRangeDyn(
-                dest,
-                as_sig_id(sig),
-                lo_reg,
-                width as u32,
-            ));
-            return Some(dest);
-        }
-        let root = self.compile_expr_root_of(base)?;
-        let hi_reg = if width == 1 {
-            lo_reg
-        } else {
-            let wm1 = self.alloc_reg();
-            self.emit(Insn::LoadConst(
-                wm1,
-                Box::new(Value::from_u64((width - 1) as u64, 32)),
-            ));
-            let h = self.alloc_reg();
-            self.emit(Insn::Add(h, lo_reg, wm1));
-            h
-        };
-        let dest = self.alloc_reg();
-        self.emit(Insn::RangeSelect(dest, root, hi_reg, lo_reg));
-        Some(dest)
+        off_reg
     }
 
     /// `(lsb, width)` of a chained packed element select, from the root's
@@ -11531,13 +11548,20 @@ impl<'a> BytecodeCompiler<'a> {
     /// existing, separately-tested path.
     fn chained_packed_slice(&self, base: &Expression, index: &Expression) -> Option<(u32, u32)> {
         let (hier, idxs) = self.flatten_const_index_chain(base, index)?;
-        if idxs.len() < 2 {
+        if idxs.len() < 2 || self.is_unpacked_chain_root(hier) {
             return None;
         }
         let dims: Vec<(i64, i64)> = self.chain_root_dims(hier)?;
         if dims.len() < idxs.len() {
             return None;
         }
+        Self::packed_chain_offset(&dims, &idxs)
+    }
+
+    /// `(lsb, width)` of the packed element that the constant `idxs`
+    /// (outermost first) select out of a vector with packed dimensions
+    /// `dims`; None when an index is outside its declared range.
+    fn packed_chain_offset(dims: &[(i64, i64)], idxs: &[i64]) -> Option<(u32, u32)> {
         let counts: Vec<i64> = dims.iter().map(|(l, r)| (l - r).abs() + 1).collect();
         let mut off: i64 = 0;
         for (k, &d) in idxs.iter().enumerate() {
@@ -11565,6 +11589,96 @@ impl<'a> BytecodeCompiler<'a> {
         }
         let root = cur.clone();
         self.compile_expr(&root, 0)
+    }
+
+    /// True when a chain's root is an unpacked array (one-, two- or
+    /// more-dimensional): its first indices address elements, never the
+    /// packed dimensions `packed_full_dims` lists for the element.
+    fn is_unpacked_chain_root(&self, hier: &HierarchicalIdentifier) -> bool {
+        self.lookup_array_name(hier).is_some() || self.is_multi_dim_array(hier)
+    }
+
+    /// §7.4.1, §7.4.5: how many indices of the chain `base[index]` address
+    /// the root's UNPACKED dimensions, when the indices after them select into
+    /// a multi-dimensional packed element (`d[1][0]` on
+    /// `logic [1:0][7:0] d [2]`): 2 for a two-dimensional array, the length
+    /// of the constant prefix naming a stored element for a deeper one, 1 for
+    /// a one-dimensional array. None for any other chain.
+    fn unpacked_elem_select_depth(&self, base: &Expression, index: &Expression) -> Option<usize> {
+        let (hier, idxs) = self.flatten_index_chain_exprs(base, index)?;
+        if self.is_assoc_target(hier) {
+            return None;
+        }
+        let packed = self.packed_full_dims_of(hier)?;
+        if packed.len() < 2 {
+            return None;
+        }
+        let n = idxs.len();
+        let depth = if self.arrays_2d_entry(hier).is_some() {
+            2
+        } else if self.is_multi_dim_array(hier) {
+            (1..n).find(|&k| match Self::chain_prefix(base, n - 1 - k) {
+                Some(Expression {
+                    kind: ExprKind::Index { expr, index },
+                    ..
+                }) => self.multi_dim_elem_signal_id(expr, index).is_some(),
+                _ => false,
+            })?
+        } else if self.lookup_array_name(hier).is_some() {
+            1
+        } else {
+            return None;
+        };
+        (n > depth && n - depth <= packed.len()).then_some(depth)
+    }
+
+    /// The node `strip` `Index` levels below `e` (`e` itself for 0).
+    fn chain_prefix(e: &Expression, strip: usize) -> Option<&Expression> {
+        let mut cur = e;
+        for _ in 0..strip {
+            let ExprKind::Index { expr, .. } = &cur.kind else {
+                return None;
+            };
+            cur = expr;
+        }
+        Some(cur)
+    }
+
+    /// Read `base[index]` whose first `depth` indices name an unpacked
+    /// element and the rest select a packed element inside it: the element
+    /// through its own read path, then a constant or run-time slice of it.
+    fn compile_unpacked_elem_packed_select(
+        &mut self,
+        base: &Expression,
+        index: &Expression,
+        depth: usize,
+    ) -> Option<RegId> {
+        let (hier, idxs) = self.flatten_index_chain_exprs(base, index)?;
+        let dims = self.packed_full_dims_of(hier)?;
+        let packed_idxs = &idxs[depth..];
+        let counts: Vec<i64> = dims.iter().map(|(l, r)| (l - r).abs() + 1).collect();
+        let width = u32::try_from(counts[packed_idxs.len()..].iter().product::<i64>()).ok()?;
+        let elem_expr = Self::chain_prefix(base, idxs.len() - depth - 1)?;
+        let elem = self.compile_expr(elem_expr, 0)?;
+        let consts: Option<Vec<i64>> = packed_idxs
+            .iter()
+            .map(|e| self.eval_const_expr(e).map(|v| v as i64))
+            .collect();
+        if let Some(consts) = consts {
+            let dest = self.alloc_reg();
+            match Self::packed_chain_offset(dims, &consts) {
+                Some((lo, w)) => self.emit(Insn::RangeSelectConst(dest, elem, lo + w - 1, lo)),
+                // §11.5.1: an index outside the declared range reads x.
+                None => self.emit(Insn::LoadConst(dest, Box::new(Value::new(width)))),
+            }
+            return Some(dest);
+        }
+        let mut idx_regs = Vec::with_capacity(packed_idxs.len());
+        for e in packed_idxs {
+            idx_regs.push(self.compile_expr(e, 0)?);
+        }
+        let lo_reg = self.emit_packed_chain_offset(dims, idx_regs)?;
+        Some(self.emit_dyn_slice(elem, lo_reg, width))
     }
 
     /// The base's registered packed ELEMENT width (>1), if it is a
@@ -16000,6 +16114,20 @@ impl<'a> BytecodeCompiler<'a> {
                 // only ever sees one level. Constant indices only: that is the
                 // shape RTL uses (and what a genvar unrolls to), and it leaves
                 // the single-level dynamic path untouched.
+                // §7.4.1, §7.4.5: indices past an unpacked array's dimensions
+                // select into the element's packed dimensions — `d[1][0]` on
+                // `logic [1:0][7:0] d [2]` is a byte of element `d[1]`. The
+                // packed chain below would take `[1]` as a packed index of the
+                // root, and the bit select further down would take `[0]` as a
+                // bit. An element that does not compile keeps the read on the
+                // AST path, which walks the chain itself.
+                if let Some(depth) = self.unpacked_elem_select_depth(expr, index) {
+                    let r = self.compile_unpacked_elem_packed_select(expr, index, depth);
+                    if r.is_none() {
+                        self.bail("unpacked_elem_packed_select");
+                    }
+                    return r;
+                }
                 if let Some((lo, w)) = self.chained_packed_slice(expr, index) {
                     let base = self.compile_expr_root_of(expr)?;
                     let dest = self.alloc_reg();
