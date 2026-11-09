@@ -100,6 +100,10 @@ pub type RegId = u16;
 /// Unpacked two-dimensional bounds and the width of one element.
 type Array2dShape = ((i64, i64), (i64, i64), u32);
 
+/// Packed dimensions of an unpacked array's element, outermost first, and
+/// whether their range labels are the declared ones.
+type ElemPackedDims = (Vec<(i64, i64)>, bool);
+
 /// A signal-table index inside an instruction. `u32`, not `usize`: the
 /// largest design measured here has 35.1 M signals and `u32` covers 4.29 B,
 /// so the extra four bytes per field were pure footprint. Fourteen `Insn`
@@ -11601,35 +11605,74 @@ impl<'a> BytecodeCompiler<'a> {
     /// §7.4.1, §7.4.5: how many indices of the chain `base[index]` address
     /// the root's UNPACKED dimensions, when the indices after them select into
     /// a multi-dimensional packed element (`d[1][0]` on
-    /// `logic [1:0][7:0] d [2]`): 2 for a two-dimensional array, the length
-    /// of the constant prefix naming a stored element for a deeper one, 1 for
-    /// a one-dimensional array. None for any other chain.
-    fn unpacked_elem_select_depth(&self, base: &Expression, index: &Expression) -> Option<usize> {
+    /// `logic [1:0][7:0] d [2]`, `b[0][1]` on `le_t [1:0] b [2]` with `le_t`
+    /// a packed struct): 2 for a two-dimensional array, the length of the
+    /// constant prefix naming a stored element for a deeper one, 1 for a
+    /// one-dimensional array; with the element's packed dimensions. None for
+    /// any other chain. The flag is false when the element's packed range
+    /// labels are not known here (see `elem_packed_dims`).
+    fn unpacked_elem_select_depth(
+        &self,
+        base: &Expression,
+        index: &Expression,
+    ) -> Option<(usize, ElemPackedDims)> {
         let (hier, idxs) = self.flatten_index_chain_exprs(base, index)?;
         if self.is_assoc_target(hier) {
             return None;
         }
-        let packed = self.packed_full_dims_of(hier)?;
-        if packed.len() < 2 {
-            return None;
-        }
         let n = idxs.len();
-        let depth = if self.arrays_2d_entry(hier).is_some() {
-            2
+        let (depth, elem_w) = if let Some((_, shape)) = self.arrays_2d_entry(hier) {
+            (2, Some(shape.2))
         } else if self.is_multi_dim_array(hier) {
-            (1..n).find(|&k| match Self::chain_prefix(base, n - 1 - k) {
+            (1..n).find_map(|k| match Self::chain_prefix(base, n - 1 - k) {
                 Some(Expression {
                     kind: ExprKind::Index { expr, index },
                     ..
-                }) => self.multi_dim_elem_signal_id(expr, index).is_some(),
-                _ => false,
+                }) => self
+                    .multi_dim_elem_signal_id(expr, index)
+                    .map(|id| (k, self.signal_widths.get(id).copied())),
+                _ => None,
             })?
-        } else if self.lookup_array_name(hier).is_some() {
-            1
         } else {
-            return None;
+            let name = self.lookup_array_name(hier)?;
+            (1, self.arrays.get(&name).map(|&(_, _, w)| w))
         };
-        (n > depth && n - depth <= packed.len()).then_some(depth)
+        let (dims, labelled) = self.elem_packed_dims(hier, elem_w)?;
+        (dims.len() >= 2 && n > depth && n - depth <= dims.len())
+            .then_some((depth, (dims, labelled)))
+    }
+
+    /// §7.4.1: the packed dimensions of an element of the unpacked array
+    /// `hier`, outermost first, down to single bits, and whether their range
+    /// labels are the declared ones. `packed_full_dims` lists the packed
+    /// ARRAY dimensions; a packed struct element adds none, so when the
+    /// element (`elem_w` bits) is wider than their product the rest is one
+    /// more dimension of that width. When no dimensions are recorded (a
+    /// single `[N-1:0]` range, or any range of a typedef-named struct type)
+    /// the packed element width still gives the shape, but not whether the
+    /// range is `[N-1:0]`, `[0:N-1]` or offset, so the labels are not known.
+    fn elem_packed_dims(
+        &self,
+        hier: &HierarchicalIdentifier,
+        elem_w: Option<u32>,
+    ) -> Option<ElemPackedDims> {
+        let (mut dims, labelled) = match self.packed_full_dims_of(hier) {
+            Some(d) => (d.clone(), true),
+            None => {
+                let (ew, w) = (self.packed_elem_width_of(hier)?, elem_w?);
+                if ew <= 1 || w <= ew || !w.is_multiple_of(ew) {
+                    return None;
+                }
+                (vec![(i64::from(w / ew) - 1, 0)], false)
+            }
+        };
+        if let Some(w) = elem_w.map(i64::from) {
+            let count: i64 = dims.iter().map(|(l, r)| (l - r).abs() + 1).product();
+            if count > 0 && w > count && w % count == 0 {
+                dims.push((w / count - 1, 0));
+            }
+        }
+        Some((dims, labelled))
     }
 
     /// The node `strip` `Index` levels below `e` (`e` itself for 0).
@@ -11652,9 +11695,9 @@ impl<'a> BytecodeCompiler<'a> {
         base: &Expression,
         index: &Expression,
         depth: usize,
+        dims: &[(i64, i64)],
     ) -> Option<RegId> {
-        let (hier, idxs) = self.flatten_index_chain_exprs(base, index)?;
-        let dims = self.packed_full_dims_of(hier)?;
+        let (_, idxs) = self.flatten_index_chain_exprs(base, index)?;
         let packed_idxs = &idxs[depth..];
         let counts: Vec<i64> = dims.iter().map(|(l, r)| (l - r).abs() + 1).collect();
         let width = u32::try_from(counts[packed_idxs.len()..].iter().product::<i64>()).ok()?;
@@ -16121,8 +16164,17 @@ impl<'a> BytecodeCompiler<'a> {
                 // root, and the bit select further down would take `[0]` as a
                 // bit. An element that does not compile keeps the read on the
                 // AST path, which walks the chain itself.
-                if let Some(depth) = self.unpacked_elem_select_depth(expr, index) {
-                    let r = self.compile_unpacked_elem_packed_select(expr, index, depth);
+                // Without the declared range labels the select would be
+                // placed by guess; the AST path reads it from the element's
+                // declaration.
+                if let Some((depth, (dims, labelled))) =
+                    self.unpacked_elem_select_depth(expr, index)
+                {
+                    let r = if labelled {
+                        self.compile_unpacked_elem_packed_select(expr, index, depth, &dims)
+                    } else {
+                        None
+                    };
                     if r.is_none() {
                         self.bail("unpacked_elem_packed_select");
                     }
