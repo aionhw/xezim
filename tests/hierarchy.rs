@@ -187,6 +187,8 @@ mod repro_import;
 mod resource_pool_scope_lookup;
 #[path = "hierarchy/review_disable_block_paths.rs"]
 mod review_disable_block_paths;
+#[path = "hierarchy/review_generate_typedef_in_instance.rs"]
+mod review_generate_typedef_in_instance;
 #[path = "hierarchy/review_implicit_net_scope.rs"]
 mod review_implicit_net_scope;
 #[path = "hierarchy/review_unit_names_in_blocks.rs"]
