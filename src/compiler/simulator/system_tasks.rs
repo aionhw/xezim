@@ -967,9 +967,9 @@ impl Simulator {
                 self.vcd_dump_all();
             }
             "$dumpflush" => {
-                // §21.7.1.9: force everything buffered so far out to the file.
+                // §21.7.1.6: wait until preceding output is readable.
                 if let Some(w) = self.vcd_writer.as_mut() {
-                    let _ = w.flush();
+                    let _ = w.flush_sync();
                 }
             }
             "$dumplimit" => {
