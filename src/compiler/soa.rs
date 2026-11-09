@@ -40,6 +40,26 @@
 use xezim_core::value::LogicBit;
 use xezim_core::value::Value;
 
+thread_local! {
+    /// Monotonic count of observable state changes: a packed cell that took a
+    /// new value, or any write to the string-keyed / class-property stores.
+    /// The zero-delay stall guard reads it to tell a finite phase that is
+    /// still changing state (progress) from a process re-arming with nothing
+    /// changing (livelock). Per thread for the same reason as
+    /// `STORE_WRITE_MASK`: concurrent simulations must not see each other.
+    static STATE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline(always)]
+pub(crate) fn bump_state_epoch() {
+    STATE_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
+}
+
+#[inline]
+pub(crate) fn state_epoch() -> u64 {
+    STATE_EPOCH.with(|e| e.get())
+}
+
 /// Flag indicating the signal is signed (IEEE 1800 §6.11).
 pub const FLAG_SIGNED: u8 = 1 << 0;
 /// Flag indicating the signal is two-state (e.g. `bit`, `byte`, `int`), where X/Z collapse to 0.
@@ -143,6 +163,7 @@ impl InlineSignalArray {
     pub fn set_bits(&mut self, idx: usize, val_bits: u64, xz_bits: u64) {
         self.val_bits[idx] = val_bits;
         self.xz_bits[idx] = xz_bits;
+        bump_state_epoch();
     }
 
     /// Write bits with width masking, two-state folding, and change detection.
@@ -164,6 +185,7 @@ impl InlineSignalArray {
 
         self.val_bits[idx] = new_val;
         self.xz_bits[idx] = new_xz;
+        bump_state_epoch();
         true
     }
 
@@ -438,6 +460,7 @@ impl PackedWideSignalArray {
             return false;
         }
         self.data[wide_idx] = new_bytes;
+        bump_state_epoch();
         true
     }
 

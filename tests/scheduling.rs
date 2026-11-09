@@ -14,6 +14,9 @@
 #[path = "scheduling/concurrent_struct_formal_geometry.rs"]
 mod concurrent_struct_formal_geometry;
 
+#[path = "scheduling/finite_zero_delay_phase.rs"]
+mod finite_zero_delay_phase;
+
 #[path = "scheduling/named_branch_frames.rs"]
 mod named_branch_frames;
 

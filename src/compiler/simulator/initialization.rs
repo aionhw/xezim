@@ -3911,6 +3911,10 @@ impl Simulator {
             rand_scope_row_owners: HashMap::default(),
             p_top_level: false,
             null_call_reported: Default::default(),
+            cascade_limit_explicit: std::env::var("XEZIM_CASCADE_LIMIT")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .is_some(),
             cascade_limit: std::env::var("XEZIM_CASCADE_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -4713,6 +4717,12 @@ impl Simulator {
             zero_delay_defer_pending: false,
             stall_time: 0,
             stall_pid_hits: HashMap::default(),
+            stall_pid_epoch: HashMap::default(),
+            stall_epoch0: 0,
+            stall_limit_explicit: std::env::var("XEZIM_STALL_LIMIT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some(),
             stall_limit: std::env::var("XEZIM_STALL_LIMIT")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())

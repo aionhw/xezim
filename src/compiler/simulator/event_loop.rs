@@ -305,10 +305,44 @@ impl Simulator {
         self.drain_edge_exec_rescan();
     }
 
+    /// Hash of every signal's current value, for cascade recurrence
+    /// detection. Only called once per `SAMPLE` generations and only after a
+    /// cascade has already outrun `cascade_limit`.
+    fn cascade_state_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for v in &self.signal_table {
+            let (a, b) = v.raw_bits();
+            a.hash(&mut h);
+            b.hash(&mut h);
+        }
+        h.finish()
+    }
+
     pub(super) fn drain_edge_cascade(&mut self, cascade_limit: u32) -> (u64, u64, u64, u64) {
         let (mut t_snap, mut t_nba, mut t_settle, mut t_edges) = (0u64, 0u64, 0u64, 0u64);
         let mut cascade_iter = 0u32;
-        while cascade_iter < cascade_limit && !self.finished {
+        // Past `cascade_limit` generations (default mode only): signal-state
+        // hashes sampled every `SAMPLE` generations. A repeat means the
+        // cascade is cycling (`always @(fb) fb <= ~fb;`) and will never
+        // converge; a finite relay that keeps changing state (a counter, a
+        // growing queue) never repeats and runs to completion inside its
+        // timestamp (§4.4).
+        const SAMPLE: u32 = 1024;
+        let mut seen_states: HashSet<u64> = HashSet::default();
+        let mut cycling = false;
+        while !self.finished {
+            if cascade_iter >= cascade_limit {
+                if self.cascade_limit_explicit {
+                    break;
+                }
+                if (cascade_iter - cascade_limit) % SAMPLE == 0
+                    && !seen_states.insert(self.cascade_state_hash())
+                {
+                    cycling = true;
+                    break;
+                }
+            }
             // Inactive region precedes the NBA region (§4.5): `#0`
             // continuations parked by this round's active-region work run
             // before its NBAs commit.
@@ -335,6 +369,8 @@ impl Simulator {
             if self.nba_fast.is_empty()
                 && self.nba_queue.is_empty()
                 && self.packed_nba.is_empty()
+                && self.pending_nba_triggers.is_empty()
+                && self.pending_nba_instance_triggers.is_empty()
                 && self.inactive_queue.is_empty()
             {
                 break;
@@ -371,6 +407,8 @@ impl Simulator {
                 && self.nba_fast.is_empty()
                 && self.nba_queue.is_empty()
                 && self.packed_nba.is_empty()
+                && self.pending_nba_triggers.is_empty()
+                && self.pending_nba_instance_triggers.is_empty()
             {
                 break;
             }
@@ -382,10 +420,12 @@ impl Simulator {
         // pending writes and carried on with stale state — worse than a hang,
         // because nothing ever said so. Report it like the other delta-loop
         // detectors and stop. The pending targets ARE the feedback signals.
-        if cascade_iter >= cascade_limit
+        if (cycling || (self.cascade_limit_explicit && cascade_iter >= cascade_limit))
             && !(self.nba_fast.is_empty()
                 && self.nba_queue.is_empty()
-                && self.packed_nba.is_empty())
+                && self.packed_nba.is_empty()
+                && self.pending_nba_triggers.is_empty()
+                && self.pending_nba_instance_triggers.is_empty())
             && !self.finished
         {
             eprintln!(
@@ -530,6 +570,66 @@ impl Simulator {
         line
     }
 
+    /// Per-process zero-delay stall check, run before each activation of
+    /// `pid`. Returns true when the activation must be re-parked unexecuted
+    /// and the outer loop asked to defer-and-advance.
+    ///
+    /// A count alone cannot tell a finite phase (`repeat (N) #0; n++;`,
+    /// request/ack relays, mailbox ping-pongs) from a livelock, and a
+    /// conforming simulator never splits the former across timestamps. So by
+    /// default a full window of `stall_limit` activations only trips the guard
+    /// when NO observable state changed during it (`state_epoch` unmoved since
+    /// the window began); if state did change, the phase is making progress
+    /// and the window restarts. Setting `XEZIM_STALL_LIMIT` explicitly opts in
+    /// to the strict mode: a hard per-process cap, no progress test.
+    pub(super) fn stall_pid_tripped(&mut self, pid: usize) -> bool {
+        let limit = self.stall_limit;
+        let hits = self.stall_pid_hits.entry(pid).or_insert(0);
+        if *hits >= limit {
+            if self.stall_limit_explicit {
+                return true;
+            }
+            let now = state_epoch();
+            let base = self
+                .stall_pid_epoch
+                .get(&pid)
+                .copied()
+                .unwrap_or(self.stall_epoch0);
+            if now == base {
+                return true;
+            }
+            *self.stall_pid_hits.entry(pid).or_insert(0) = 0;
+            self.stall_pid_epoch.insert(pid, now);
+        }
+        *self.stall_pid_hits.entry(pid).or_insert(0) += 1;
+        false
+    }
+
+    /// Forget the per-timestamp stall bookkeeping (time moved, or a livelock
+    /// was broken by jumping ahead).
+    pub(super) fn reset_stall_window(&mut self) {
+        self.stall_pid_hits.clear();
+        self.stall_pid_epoch.clear();
+        self.stall_edge_block_hits.clear();
+        self.stall_epoch0 = state_epoch();
+    }
+
+    /// Outer-loop counterpart of `stall_pid_tripped`: true (and the delta
+    /// counter restarted) when the default progress-aware guard sees state
+    /// changed over the last window of delta cycles.
+    pub(super) fn stall_outer_progressing(&mut self) -> bool {
+        if self.stall_limit_explicit {
+            return false;
+        }
+        let now = state_epoch();
+        if now == self.stall_epoch0 {
+            return false;
+        }
+        self.stall_epoch0 = now;
+        self.stall_iters = 0;
+        true
+    }
+
     /// Attempt to break a zero-delay (delta) livelock by deferring every
     /// process stuck at the current timestamp to the next scheduled event and
     /// advancing time to it. Returns true if it advanced, false if NOTHING is
@@ -584,8 +684,7 @@ impl Simulator {
         publish_sim_time(ft);
         self.stall_iters = 0;
         self.stall_time = ft;
-        self.stall_pid_hits.clear();
-        self.stall_edge_block_hits.clear();
+        self.reset_stall_window();
         true
     }
 
@@ -1207,6 +1306,40 @@ impl Simulator {
         }
     }
 
+    /// A same-timestamp fixpoint loop (condition-waiter drain, end-of-tick
+    /// late re-pass) has run a full window of passes. Returns true — and
+    /// restarts the window — when observable state changed during it: a
+    /// finite handshake relay with more rounds than the window is making
+    /// progress and must finish inside its timestamp (§4.4). Returns false
+    /// when nothing changed (a genuine stall; stop and let the outer
+    /// detectors report it) or when `XEZIM_STALL_LIMIT` was set explicitly,
+    /// which keeps the window a hard cap.
+    pub(super) fn fixpoint_window_progressed_u64(&self, passes: &mut u64, window_epoch: &mut u64) -> bool {
+        if self.stall_limit_explicit {
+            return false;
+        }
+        let now = state_epoch();
+        if now == *window_epoch {
+            return false;
+        }
+        *window_epoch = now;
+        *passes = 0;
+        true
+    }
+
+    pub(super) fn fixpoint_window_progressed(&self, passes: &mut u32, window_epoch: &mut u64) -> bool {
+        if self.stall_limit_explicit {
+            return false;
+        }
+        let now = state_epoch();
+        if now == *window_epoch {
+            return false;
+        }
+        *window_epoch = now;
+        *passes = 0;
+        true
+    }
+
     /// Resume level-sensitive `wait(expr)` waiters parked in
     /// `condition_waiters` whose condition has just become true. IEEE
     /// 1800-2023 §9.7.4: `wait(cond)` is level-sensitive — the process
@@ -1263,12 +1396,13 @@ impl Simulator {
     ///     region writes them.
     pub(super) fn drain_condition_waiters(&mut self, pre_inactive: bool, from_repass: bool) {
         let mut guard = 0u32;
+        let mut guard_epoch = state_epoch();
         while (!self.condition_waiters.is_empty() || !self.ready_condition_waiters.is_empty())
             && !self.finished
             && !self.zero_delay_defer_pending
         {
             guard += 1;
-            if guard > 10000 {
+            if guard > 10000 && !self.fixpoint_window_progressed(&mut guard, &mut guard_epoch) {
                 break;
             }
             let prog_before = self.cond_progress;
@@ -1785,6 +1919,7 @@ impl Simulator {
             && !self.zero_delay_defer_pending
         {
             let mut late_passes = 0u32;
+            let mut late_epoch = state_epoch();
             loop {
                 let epoch_before = self.late_resume_epoch;
                 if self.dirty_any {
@@ -1826,7 +1961,12 @@ impl Simulator {
                     accum.t_cond += t.elapsed().as_nanos() as u64;
                 }
                 late_passes += 1;
-                if self.finished || late_passes > 10_000 || self.late_resume_epoch == epoch_before {
+                if self.finished || self.late_resume_epoch == epoch_before {
+                    break;
+                }
+                if late_passes > 10_000
+                    && !self.fixpoint_window_progressed(&mut late_passes, &mut late_epoch)
+                {
                     break;
                 }
             }
@@ -2457,8 +2597,7 @@ impl Simulator {
                 }
                 self.stall_iters = 0;
                 self.stall_time = next_time;
-                self.stall_pid_hits.clear();
-                self.stall_edge_block_hits.clear();
+                self.reset_stall_window();
                 // Time advanced on its own — any spinner that asked to be
                 // deferred resolved itself, so DON'T service a stale defer
                 // request (it would fire at the new time and jump past a clock
@@ -2475,7 +2614,10 @@ impl Simulator {
                     self.stall_time = self.time;
                     self.stall_iters = 1;
                 }
-                if self.stall_limit > 0 && self.stall_iters > self.stall_limit {
+                if self.stall_limit > 0
+                    && self.stall_iters > self.stall_limit
+                    && !self.stall_outer_progressing()
+                {
                     // Try to BREAK the zero-delay livelock by deferring the stuck
                     // current-time processes to the next scheduled event. Only a
                     // livelock with NOTHING ahead is fatal.

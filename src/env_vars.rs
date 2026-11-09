@@ -121,7 +121,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_CASCADE_LIMIT",
-        "Scheduling: max same-time edge cascade rounds before the runaway guard trips",
+        "Scheduling: opt-in hard cap on same-time edge/NBA cascade rounds (unset: a cascade runs on while state changes and trips only when state recurs)",
     ),
     (
         "XEZIM_CASEJUMP_LIMIT",
@@ -864,7 +864,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_STACK_MB", "Main simulation thread stack size in MB"),
     (
         "XEZIM_STALL_LIMIT",
-        "Stall detector: process activations without progress before aborting",
+        "Scheduling: zero-delay activations per process before the stall guard trips; unset: progress-aware (trips only when a window changes no state), set: hard cap, 0 disables",
     ),
     ("XEZIM_STUCK_CLOCK", "Stuck-clock detector: enable (0/1)"),
     (

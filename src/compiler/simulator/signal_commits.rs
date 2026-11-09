@@ -1093,6 +1093,7 @@ impl Simulator {
         if id >= self.signal_table.len() {
             return;
         }
+        bump_state_epoch();
         let (edge_sidecar, armed_sidecar) = if self.signal_commit_plan.is_empty() {
             // Quiet signal (no armed / edge readers): nothing below applies
             // unless a global observer is active.
