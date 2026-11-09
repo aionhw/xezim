@@ -1158,6 +1158,8 @@ mod packed_struct_array_property_928;
 mod review_940_constraint_memos;
 #[path = "classes/review_940_process_status.rs"]
 mod review_940_process_status;
+#[path = "classes/review_951_edge_table.rs"]
+mod review_951_edge_table;
 #[path = "classes/review_954_static_dispatch.rs"]
 mod review_954_static_dispatch;
 #[path = "classes/review_955_compiled_check_signedness.rs"]
