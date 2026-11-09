@@ -4237,15 +4237,17 @@ impl<'a> BytecodeCompiler<'a> {
         };
         // §13.3.1: a STATIC subroutine's variables — its locals and output
         // formals — keep their values between calls; an inline gives each
-        // call fresh registers. Only an input-only static body with no
-        // declarations behaves the same either way. No written lifetime is
+        // call fresh registers. That differs only for a variable whose value
+        // can carry from one call to the next (`static_local_carries`): one
+        // written whole on every path before it is read behaves the same
+        // either way, so the call still inlines. No written lifetime is
         // static; elaboration marks a subroutine of an `automatic` module
         // automatic (§13.3.1).
         if !matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic))
-            && (ports
-                .iter()
-                .any(|p| !matches!(p.direction, PortDirection::Input))
-                || body.iter().any(Self::stmt_declares))
+            && (ports.iter().any(|p| {
+                !matches!(p.direction, PortDirection::Input)
+                    && Self::static_local_carries(&p.name.name, &body)
+            }) || (body.iter().any(Self::stmt_declares) && Self::stmts_carry_static(&body)))
         {
             return false;
         }
@@ -12257,6 +12259,34 @@ impl<'a> BytecodeCompiler<'a> {
         self.insns[jump] = Insn::Jump(end);
         self.insns[bz] = Insn::BranchUnlessZero(r, end);
         Some(r)
+    }
+
+    /// §6.21, §13.3.1: does a static subroutine body, or any block nested in
+    /// it, declare a variable whose value can carry from one call to the next?
+    fn stmts_carry_static(stmts: &[Statement]) -> bool {
+        fn nested(s: &Statement) -> bool {
+            match &s.kind {
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    BytecodeCompiler::stmts_carry_static(stmts)
+                }
+                StatementKind::If {
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => nested(then_stmt) || else_stmt.as_ref().is_some_and(|e| nested(e)),
+                StatementKind::Case { items, .. } => items.iter().any(|it| nested(&it.stmt)),
+                StatementKind::For { body, .. }
+                | StatementKind::Foreach { body, .. }
+                | StatementKind::While { body, .. }
+                | StatementKind::DoWhile { body, .. }
+                | StatementKind::Repeat { body, .. }
+                | StatementKind::Forever { body }
+                | StatementKind::TimingControl { stmt: body, .. }
+                | StatementKind::Wait { stmt: body, .. } => nested(body),
+                _ => false,
+            }
+        }
+        Self::block_has_carried_static(stmts) || stmts.iter().any(nested)
     }
 
     /// §6.21: does a process block declare a static local whose value can
