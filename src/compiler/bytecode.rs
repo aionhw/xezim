@@ -2535,16 +2535,22 @@ impl<'a> BytecodeCompiler<'a> {
         while let ExprKind::Paren(inner) = &unwrapped.kind {
             unwrapped = inner;
         }
-        let hier = match &unwrapped.kind {
-            ExprKind::Ident(hier) => hier.clone(),
-            ExprKind::Index { expr: base, .. } => {
-                let ExprKind::Ident(hier) = &base.kind else {
-                    return None;
-                };
-                hier.clone()
-            }
-            _ => return None,
+        // §7.4.1: an element of an unpacked array of any rank
+        // (`s3[1][0]`), not only of a one-dimensional one; its read path
+        // resolves the element.
+        let mut root = unwrapped;
+        let mut levels = 0;
+        while let ExprKind::Index { expr: base, .. } = &root.kind {
+            root = base;
+            levels += 1;
+        }
+        let ExprKind::Ident(hier) = &root.kind else {
+            return None;
         };
+        if levels > 1 && !self.is_multi_dim_array(hier) {
+            return None;
+        }
+        let hier = hier.clone();
         let (key, fields) = self.packed_struct_layout_for_hier(&hier)?;
         let value = self.compile_expr(unwrapped, 0)?;
         Some((value, key, hier, fields))
@@ -2701,6 +2707,26 @@ impl<'a> BytecodeCompiler<'a> {
         member: &str,
     ) -> Option<(u32, Option<(i64, i64)>)> {
         let widths = self.packed_elem_widths?;
+        for candidate in self.packed_member_keys(root_key, hier, member) {
+            if let Some(&elem_w) = widths.get(candidate.as_str()).filter(|&&w| w > 0) {
+                let dim = self
+                    .packed_full_dims
+                    .and_then(|dims| dims.get(candidate.as_str()))
+                    .and_then(|dims| dims.first())
+                    .copied();
+                return Some((elem_w, dim));
+            }
+        }
+        None
+    }
+
+    /// The names a packed struct member's metadata may be registered under.
+    fn packed_member_keys(
+        &self,
+        root_key: &str,
+        hier: &HierarchicalIdentifier,
+        member: &str,
+    ) -> Vec<String> {
         let raw = Self::hier_raw_name(hier);
         let mut candidates = Vec::with_capacity(4);
         candidates.push(format!("{}.{}", root_key, member));
@@ -2713,17 +2739,85 @@ impl<'a> BytecodeCompiler<'a> {
         if let Some(leaf) = hier.path.last() {
             candidates.push(format!("{}.{}", leaf.name.name, member));
         }
-        for candidate in candidates {
-            if let Some(&elem_w) = widths.get(candidate.as_str()).filter(|&&w| w > 0) {
-                let dim = self
-                    .packed_full_dims
-                    .and_then(|dims| dims.get(candidate.as_str()))
-                    .and_then(|dims| dims.first())
-                    .copied();
-                return Some((elem_w, dim));
-            }
+        candidates
+    }
+
+    /// §7.4.1: `container.member[i][j]…`, two or more indices into a
+    /// multi-dimensional packed member of a packed struct (`sa[1].f0[3][7]`
+    /// on `t3_t [3:0][7:0] f0` of an array of structs). The one-index form
+    /// slices one element of the member's outer dimension; a second index
+    /// then took one BIT of that slice instead of an element of the next
+    /// dimension. The member's dimensions down to single bits place every
+    /// index.
+    fn compile_packed_member_index_chain(
+        &mut self,
+        base: &Expression,
+        index: &Expression,
+    ) -> Option<RegId> {
+        let mut idx_exprs: Vec<&Expression> = vec![index];
+        let mut cur = base;
+        while let ExprKind::Index { expr, index } = &cur.kind {
+            idx_exprs.push(index);
+            cur = expr;
         }
-        None
+        if idx_exprs.len() < 2 {
+            return None;
+        }
+        idx_exprs.reverse();
+        let ExprKind::MemberAccess { expr: root, member } = &cur.kind else {
+            return None;
+        };
+        let (root_value, root_key, hier, fields) = self.compile_packed_struct_value(root)?;
+        let &(_, field_offset, field_w) = fields.iter().find(|(n, _, _)| n == &member.name)?;
+        let all_dims = self.packed_full_dims?;
+        let dims: Vec<(i64, i64)> = self
+            .packed_member_keys(&root_key, &hier, &member.name)
+            .iter()
+            .find_map(|k| all_dims.get(k.as_str()))?
+            .clone();
+        let counts: Vec<i64> = dims.iter().map(|(l, r)| (l - r).abs() + 1).collect();
+        if idx_exprs.len() > dims.len() || counts.iter().product::<i64>() != i64::from(field_w) {
+            return None;
+        }
+        let width = u32::try_from(counts[idx_exprs.len()..].iter().product::<i64>()).ok()?;
+        // §11.5.1: an x/z literal index folds to 0 as a constant; the
+        // run-time path carries the x through the offset.
+        let consts: Option<Vec<i64>> = idx_exprs
+            .iter()
+            .map(|e| {
+                (!self.is_xz_literal(e))
+                    .then(|| self.eval_const_expr(e).map(|v| v as i64))
+                    .flatten()
+            })
+            .collect();
+        if let Some(consts) = consts {
+            let dest = self.alloc_reg();
+            match Self::packed_chain_offset(&dims, &consts) {
+                Some((lo, w)) => {
+                    let lo = field_offset + lo;
+                    self.emit(Insn::RangeSelectConst(dest, root_value, lo + w - 1, lo));
+                }
+                // §11.5.1: an index outside the declared range reads x.
+                None => self.emit(Insn::LoadConst(dest, Box::new(Value::new(width)))),
+            }
+            return Some(dest);
+        }
+        let mut idx_regs = Vec::with_capacity(idx_exprs.len());
+        for e in idx_exprs {
+            idx_regs.push(self.compile_expr(e, 0)?);
+        }
+        let mut lo_reg = self.emit_packed_chain_offset(&dims, idx_regs)?;
+        if field_offset != 0 {
+            let off = self.alloc_reg();
+            self.emit(Insn::LoadConst(
+                off,
+                Box::new(Value::from_u64(u64::from(field_offset), 32)),
+            ));
+            let sum = self.alloc_reg();
+            self.emit(Insn::Add(sum, lo_reg, off));
+            lo_reg = sum;
+        }
+        Some(self.emit_dyn_slice(root_value, lo_reg, width))
     }
 
     /// Emit a dynamic element/field slice from a packed struct container.
@@ -16186,6 +16280,11 @@ impl<'a> BytecodeCompiler<'a> {
                 let member_start = self.insns.len();
                 let member_reg = self.next_reg;
                 if let Some(dest) = self.compile_packed_member_index(expr, index) {
+                    return Some(dest);
+                }
+                self.truncate_insns(member_start);
+                self.next_reg = member_reg;
+                if let Some(dest) = self.compile_packed_member_index_chain(expr, index) {
                     return Some(dest);
                 }
                 self.truncate_insns(member_start);
