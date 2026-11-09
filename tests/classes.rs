@@ -862,6 +862,8 @@ mod vif_null_compare_indexed_receiver;
 mod vif_return_own_definition_name;
 #[path = "classes/vif_property_named_like_instance.rs"]
 mod vif_property_named_like_instance;
+#[path = "classes/vif_property_event_controls_988.rs"]
+mod vif_property_event_controls_988;
 #[path = "classes/vif_receiver_neighbor_shapes.rs"]
 mod vif_receiver_neighbor_shapes;
 #[path = "classes/vif_receiver_operation_matrix.rs"]
