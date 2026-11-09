@@ -199,6 +199,8 @@ mod review_block_implicit_nets;
 mod review_disable_block_paths;
 #[path = "hierarchy/review_disable_nested_block_paths.rs"]
 mod review_disable_nested_block_paths;
+#[path = "hierarchy/review_generate_struct_arrays.rs"]
+mod review_generate_struct_arrays;
 #[path = "hierarchy/review_generate_typedef_in_instance.rs"]
 mod review_generate_typedef_in_instance;
 #[path = "hierarchy/review_implicit_net_scope.rs"]
