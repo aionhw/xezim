@@ -215,6 +215,74 @@ impl Simulator {
     /// was forked inside, or any process parked inside it. That process
     /// resumes at the end of the block, and every process forked inside the
     /// block, the disabling one included, is terminated.
+    /// §9.6.2, §23.8: the process whose top-level block a `disable` target
+    /// names. The target's path is looked up as `<scope>.<path>` from the
+    /// disabling process's scope outward, so `disable g1.blk` and
+    /// `disable r[0].w` find that block and not a namesake in another
+    /// generate block. A target found no other way falls back to its label.
+    pub(super) fn disable_label_pid(
+        &self,
+        target: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<usize> {
+        let mut path = String::new();
+        for (i, seg) in target.path.iter().enumerate() {
+            if i > 0 {
+                path.push('.');
+            }
+            path.push_str(&seg.name.name);
+            for sel in &seg.selects {
+                use std::fmt::Write as _;
+                let _ = write!(path, "[{}]", Self::try_const_u64(sel)?);
+            }
+        }
+        if target.root.is_none() {
+            let mut scope = self
+                .process_scope_hint
+                .get(&self.current_pid)
+                .map(String::as_str)
+                .unwrap_or("");
+            loop {
+                if !scope.is_empty()
+                    && let Some(&pid) = self.disable_labels.get(&format!("{scope}.{path}"))
+                {
+                    return Some(pid);
+                }
+                if scope.is_empty() {
+                    break;
+                }
+                scope = scope.rfind('.').map_or("", |i| &scope[..i]);
+            }
+        }
+        if let Some(&pid) = self.disable_labels.get(&path) {
+            return Some(pid);
+        }
+        // `top.blk`: the top module's own block, registered by its label.
+        let rest = match target.path.split_first() {
+            Some((head, rest)) if !rest.is_empty() && head.name.name == self.module.name => rest,
+            _ => &target.path[target.path.len().saturating_sub(1)..],
+        };
+        match rest {
+            [only] => self.disable_labels.get(&only.name.name).copied(),
+            _ => None,
+        }
+    }
+
+    /// §9.6.2: register a process's top-level block label for `disable`,
+    /// under `<scope>.<label>` when the process belongs to a scope. The bare
+    /// label keeps the first top-module block, then the first scoped one.
+    pub(super) fn register_disable_label(&mut self, label: &str, pid: usize) {
+        match self.process_scope_hint.get(&pid).filter(|s| !s.is_empty()) {
+            Some(scope) => {
+                let key = format!("{scope}.{label}");
+                self.disable_labels.insert(key, pid);
+                self.disable_labels.entry(label.to_string()).or_insert(pid);
+            }
+            None => {
+                self.disable_labels.insert(label.to_string(), pid);
+            }
+        }
+    }
+
     pub(super) fn disable_remote_block(&mut self, x: &str) {
         let me = self.current_pid;
         let mut owner: Option<usize> = None;

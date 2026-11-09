@@ -5273,7 +5273,7 @@ impl Simulator {
                     // the self-unwind path, and the child kept running — a
                     // later `wait fork` then blocked on it forever.
                     if let StatementKind::SeqBlock { name: Some(n), .. } = &s.kind {
-                        self.disable_labels.insert(n.name.clone(), pid_child);
+                        self.register_disable_label(&n.name, pid_child);
                     }
                     self.inherit_fork_child_context(pid_child);
                     self.inherit_fork_m_scope(pid_child, pid, block_name.as_ref());

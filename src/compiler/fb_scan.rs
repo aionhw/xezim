@@ -630,7 +630,7 @@ impl FbScan<'_> {
             // the fallback would never see.
             StatementKind::Disable(target) => {
                 let name = crate::ast::stmt::disable_name(target);
-                if !self.blocks.iter().any(|b| b == name) {
+                if target.path.len() != 1 || !self.blocks.iter().any(|b| b == name) {
                     self.refuse("fb_disable_outer");
                 }
             }

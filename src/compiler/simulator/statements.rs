@@ -5722,7 +5722,7 @@ impl Simulator {
                 }
                 // A label naming ANOTHER process's top-level block terminates
                 // that process; the disabling process carries on.
-                if let Some(&pid) = self.disable_labels.get(name) {
+                if let Some(pid) = self.disable_label_pid(target) {
                     if pid != self.current_pid {
                         self.killed_pids.insert(pid);
                         self.release_killed_process_state(pid);

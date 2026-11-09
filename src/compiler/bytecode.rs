@@ -14308,7 +14308,9 @@ impl<'a> BytecodeCompiler<'a> {
                 // If the block is an active enclosing named block in this compiled unit,
                 // emit a forward Jump(0) and record the patch.
                 let name = crate::ast::stmt::disable_name(target);
-                if self.named_block_patches.contains_key(name) {
+                // A path (`g1.blk`) may name another scope's block of the same
+                // label: the interpreter resolves it (§9.6.2).
+                if target.path.len() == 1 && self.named_block_patches.contains_key(name) {
                     let idx = self.insns.len();
                     self.emit(Insn::Jump(0));
                     self.named_block_patches.get_mut(name).unwrap().push(idx);

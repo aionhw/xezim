@@ -1742,7 +1742,7 @@ impl Simulator {
                 // The outermost `begin/end` is flattened away below, so keep
                 // the label for `%m` here — see `process_m_label`.
                 self.process_m_label.insert(pid, l.clone());
-                self.disable_labels.insert(l, pid);
+                self.register_disable_label(&l, pid);
             }
             self.event_queue.schedule(0, pid, stmts.into());
         }
