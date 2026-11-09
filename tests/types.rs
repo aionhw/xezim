@@ -45,6 +45,8 @@ mod block_local_width_in_index_shift;
 mod block_local_size_query_scope;
 #[path = "types/byte_local_narrow.rs"]
 mod byte_local_narrow;
+#[path = "types/call_result_member_element_select.rs"]
+mod call_result_member_element_select;
 #[path = "types/callback_typedef_static.rs"]
 mod callback_typedef_static;
 #[path = "types/callee_local_keeps_caller_type.rs"]
@@ -273,6 +275,8 @@ mod streaming_and_typedef_array_width;
 mod struct_copy_and_queue_ops;
 #[path = "types/struct_member_array_of_structs_copy.rs"]
 mod struct_member_array_of_structs_copy;
+#[path = "types/struct_member_typedef_element_dims.rs"]
+mod struct_member_typedef_element_dims;
 #[path = "types/struct_named_patterns.rs"]
 mod struct_named_patterns;
 #[path = "types/struct_unpacked_array_member.rs"]
