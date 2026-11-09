@@ -5816,6 +5816,22 @@ impl Simulator {
                         return;
                     }
                 }
+                // §9.6.2: a block this process cannot be executing is another
+                // process's, found now. Posting the disable for the process
+                // loop to resolve lost the rest of a nested `begin ... end`
+                // around it (`#5 begin disable lab.sub; ... end`). A path
+                // names the block's process by its head (`lab.sub`).
+                if !self.disable_may_be_own(target) {
+                    let only = if target.path.len() > 1 {
+                        let mut head = target.clone();
+                        head.path.pop();
+                        self.disable_label_pid(&head)
+                    } else {
+                        None
+                    };
+                    self.disable_remote_block_of(name, only);
+                    return;
+                }
                 // Otherwise unwind this process to the end of the named block
                 // (or the named task): the SeqBlock / task-call arm clears the
                 // flags when it sees its own name, so execution resumes after

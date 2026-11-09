@@ -284,12 +284,46 @@ impl Simulator {
     }
 
     pub(super) fn disable_remote_block(&mut self, x: &str) {
+        self.disable_remote_block_of(x, None);
+    }
+
+    /// §9.6.2: whether a `disable` of `target` may name a block or task this
+    /// process is executing: a named block it is inside, its own top-level
+    /// label or an active task. Inside a subroutine the caller's blocks are
+    /// not on `m_scope_stack`, so any target may be one.
+    pub(super) fn disable_may_be_own(
+        &self,
+        target: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> bool {
+        let name = crate::ast::stmt::disable_name(target);
+        let pid = self.current_pid;
+        self.m_scope_stack
+            .iter()
+            .any(|n| n.starts_with([M_ROOT_MARK, M_SUBR_MARK]) || Self::block_name_matches(name, n))
+            || self
+                .process_m_label
+                .get(&pid)
+                .is_some_and(|l| Self::block_name_matches(name, l))
+            || self.active_task_pids.values().any(|s| s.contains(&pid))
+    }
+
+    /// `disable_remote_block` for a block of process `only`, when the target's
+    /// path names its process (`disable lab.sub`).
+    pub(super) fn disable_remote_block_of(&mut self, x: &str, only: Option<usize>) {
         let me = self.current_pid;
         let mut owner: Option<usize> = None;
         let mut task_owner = false;
         let mut c = me;
         let mut steps = 0;
         while let Some(&a) = self.process_parents.get(&c) {
+            if only.is_some_and(|o| o != a) {
+                c = a;
+                steps += 1;
+                if steps > 100_000 {
+                    break;
+                }
+                continue;
+            }
             if self
                 .fork_spawn_cont
                 .get(&c)
@@ -326,6 +360,7 @@ impl Simulator {
             cands.dedup();
             owner = cands.into_iter().find(|&p| {
                 p != me
+                    && only.is_none_or(|o| o == p)
                     && !self.killed_pids.contains(&p)
                     && self
                         .parked_cont_of(p)
