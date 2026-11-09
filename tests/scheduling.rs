@@ -464,3 +464,5 @@ mod fork_child_hidden_locals_943;
 
 #[path = "scheduling/unpacked_struct_copy_chain.rs"]
 mod unpacked_struct_copy_chain;
+#[path = "scheduling/unpacked_struct_array_sens.rs"]
+mod unpacked_struct_array_sens;
