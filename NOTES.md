@@ -6,6 +6,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 # What's new in 0.11
 
+### Unreleased
+
+**Correctness**
+
+* A nonblocking store, a continuous assignment or a delayed nonblocking
+  store to a packed struct element of an unpacked array writes the whole
+  struct: `b[0][1] <= v` on `le_t [1:0] b [2]` kept one bit, and a row of
+  two structs kept two (§7.4.1, §7.4.5, §10.4.2, §10.3, #997).
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
