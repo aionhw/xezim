@@ -343,7 +343,8 @@ fn method_boost_enabled() -> bool {
 // (`coll_elem_widths` plan fact in `expr_max_width`).
 // §11.5.1, §7.4.1: an x/z index into a struct member keeps the element width,
 // and a chain of indices into a call result's member declines.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_306c;
+// §7.4.1/§7.4.5: a packed select inside an unpacked array's element reads that element.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_306d;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
