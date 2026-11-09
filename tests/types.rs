@@ -692,3 +692,5 @@ mod two_state_local_in_fallback;
 mod packed_struct_elem_store_width;
 #[path = "types/unpacked_elem_packed_select_read.rs"]
 mod unpacked_elem_packed_select_read;
+#[path = "types/unpacked_elem_select_followups.rs"]
+mod unpacked_elem_select_followups;
