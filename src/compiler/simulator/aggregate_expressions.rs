@@ -1430,9 +1430,23 @@ impl Simulator {
                 let DataType::Struct(su) = &access.element_type else {
                     return None;
                 };
-                if access.params.is_none() {
-                    let memo_key = (su.span.start as usize, member.name.clone());
-                    if let Some(cached) = self.packed_struct_member_memo.borrow().get(&memo_key) {
+                // Memoized per declaration position: the root variable, the
+                // offset and width already selected into it, and the member.
+                // (A source span alone is not unique across files.) Not for
+                // instance-parameterized or static roots.
+                let memo_key = (access.params.is_none()
+                    && access.static_target.is_none()
+                    && !access.storage.is_empty())
+                .then(|| {
+                    (
+                        access.storage.clone(),
+                        access.offset,
+                        access.width,
+                        member.name.clone(),
+                    )
+                });
+                if let Some(memo_key) = &memo_key {
+                    if let Some(cached) = self.packed_struct_member_memo.borrow().get(memo_key) {
                         if let Some((offset, width, is_signed, element, dimensions)) = cached {
                             access.offset = access.offset.checked_add(*offset)?;
                             access.width = *width;
@@ -1467,8 +1481,7 @@ impl Simulator {
                                 &m.data_type,
                                 &self.module.typedef_types,
                             );
-                            if access.params.is_none() {
-                                let memo_key = (su.span.start as usize, member.name.clone());
+                            if let Some(memo_key) = memo_key {
                                 self.packed_struct_member_memo.borrow_mut().insert(
                                     memo_key,
                                     Some((
@@ -1489,8 +1502,7 @@ impl Simulator {
                         }
                     }
                 }
-                if access.params.is_none() {
-                    let memo_key = (su.span.start as usize, member.name.clone());
+                if let Some(memo_key) = memo_key {
                     self.packed_struct_member_memo
                         .borrow_mut()
                         .insert(memo_key, None);

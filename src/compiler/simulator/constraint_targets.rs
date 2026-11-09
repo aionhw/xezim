@@ -6,15 +6,18 @@ use crate::{log_eprintln as eprintln, log_println as println};
 
 #[derive(Clone, Debug)]
 pub(super) enum CompiledForeachCheck {
+    /// A member (`off`, `width`) of an unsigned packed struct element equals
+    /// a non-negative constant.
     MemberEq {
         off: u32,
         width: u32,
-        expected: u64,
+        expected: i128,
     },
+    /// The member lies in one of the non-negative `ranges`.
     MemberInside {
         off: u32,
         width: u32,
-        ranges: Vec<(i64, i64)>,
+        ranges: Vec<(i128, i128)>,
     },
     StaticIf {
         then_checks: Vec<CompiledForeachCheck>,
@@ -25,12 +28,14 @@ pub(super) enum CompiledForeachCheck {
         then_checks: Vec<CompiledForeachCheck>,
         else_checks: Vec<CompiledForeachCheck>,
     },
+    /// The element lies in one of the `ranges`; each bound carries its
+    /// signedness (see `foreach_check_bound`).
     ElemInside {
-        ranges: Vec<(i64, i64)>,
+        ranges: Vec<((i128, bool), (i128, bool))>,
     },
     ElemRel {
         op: BinaryOp,
-        bound: i64,
+        bound: (i128, bool),
     },
 }
 
@@ -3344,6 +3349,9 @@ impl Simulator {
     }
 
     /// A pre-compiled fast check for an element-independent foreach body.
+    /// None when the body has a shape the plan does not model, or an element
+    /// meets a comparison whose operand signedness the plan cannot settle;
+    /// the caller then runs the general check.
     pub(super) fn try_fast_check_coll_foreach(
         &mut self,
         handle: usize,
@@ -3367,10 +3375,18 @@ impl Simulator {
             Self::push_i64(&mut idx_str, i);
             idx_str.push(']');
             let elem = self.class_elem_load(handle, &c.prop, &idx_str)?;
+            if elem.has_xz() {
+                return None;
+            }
             let raw = elem.to_u64()?;
-            let elem_i64 = elem.to_i64()?;
+            // §11.8.1: the element's value as its own signedness reads it.
+            let val = if elem.is_signed {
+                i128::from(elem.to_i64()?)
+            } else {
+                i128::from(raw)
+            };
             for chk in &checks {
-                if !Self::check_compiled_foreach_item(chk, raw, elem_i64, i) {
+                if !Self::check_compiled_foreach_item(chk, raw, val, elem.is_signed, i)? {
                     return Some(false);
                 }
             }
@@ -3378,72 +3394,122 @@ impl Simulator {
         Some(true)
     }
 
+    /// §11.8.1: `elem OP bound`, compared as the LRM does when the outcome
+    /// does not depend on the operation width: both operands signed, or a
+    /// non-negative pair. None for the other mixed-signedness cases.
+    fn compiled_foreach_cmp(
+        op: BinaryOp,
+        elem: i128,
+        signed: bool,
+        bound: (i128, bool),
+    ) -> Option<bool> {
+        let (b, b_signed) = bound;
+        if !(signed && b_signed || elem >= 0 && b >= 0) {
+            return None;
+        }
+        Some(match op {
+            BinaryOp::Lt => elem < b,
+            BinaryOp::Leq => elem <= b,
+            BinaryOp::Gt => elem > b,
+            BinaryOp::Geq => elem >= b,
+            _ => elem == b,
+        })
+    }
+
     fn check_compiled_foreach_item(
         item: &CompiledForeachCheck,
         elem_raw: u64,
-        elem_i64: i64,
+        elem: i128,
+        signed: bool,
         idx: i64,
-    ) -> bool {
-        match item {
+    ) -> Option<bool> {
+        let all = |cs: &[CompiledForeachCheck]| -> Option<bool> {
+            for c in cs {
+                if !Self::check_compiled_foreach_item(c, elem_raw, elem, signed, idx)? {
+                    return Some(false);
+                }
+            }
+            Some(true)
+        };
+        let member = |off: u32, width: u32| -> i128 {
+            let mask = if width >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << width) - 1
+            };
+            i128::from((elem_raw >> off) & mask)
+        };
+        Some(match item {
             CompiledForeachCheck::MemberEq {
                 off,
                 width,
                 expected,
-            } => {
-                let mask = if *width >= 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << *width) - 1
-                };
-                let val = (elem_raw >> *off) & mask;
-                val == *expected
-            }
+            } => member(*off, *width) == *expected,
             CompiledForeachCheck::MemberInside { off, width, ranges } => {
-                let mask = if *width >= 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << *width) - 1
-                };
-                let val = ((elem_raw >> *off) & mask) as i64;
+                let val = member(*off, *width);
                 ranges.iter().any(|&(lo, hi)| val >= lo && val <= hi)
             }
             CompiledForeachCheck::StaticIf {
                 then_checks,
                 else_checks,
-            } => {
-                then_checks
-                    .iter()
-                    .all(|c| Self::check_compiled_foreach_item(c, elem_raw, elem_i64, idx))
-                    && else_checks
-                        .iter()
-                        .all(|c| Self::check_compiled_foreach_item(c, elem_raw, elem_i64, idx))
-            }
+            } => all(then_checks)? && all(else_checks)?,
             CompiledForeachCheck::IndexEq {
                 target,
                 then_checks,
                 else_checks,
             } => {
                 if idx == *target {
-                    then_checks
-                        .iter()
-                        .all(|c| Self::check_compiled_foreach_item(c, elem_raw, elem_i64, idx))
+                    all(then_checks)?
                 } else {
-                    else_checks
-                        .iter()
-                        .all(|c| Self::check_compiled_foreach_item(c, elem_raw, elem_i64, idx))
+                    all(else_checks)?
                 }
             }
-            CompiledForeachCheck::ElemInside { ranges } => ranges
-                .iter()
-                .any(|&(lo, hi)| elem_i64 >= lo && elem_i64 <= hi),
-            CompiledForeachCheck::ElemRel { op, bound } => match op {
-                BinaryOp::Lt => elem_i64 < *bound,
-                BinaryOp::Leq => elem_i64 <= *bound,
-                BinaryOp::Gt => elem_i64 > *bound,
-                BinaryOp::Geq => elem_i64 >= *bound,
-                _ => true,
-            },
+            CompiledForeachCheck::ElemInside { ranges } => {
+                let mut hit = false;
+                for &(lo, hi) in ranges {
+                    if Self::compiled_foreach_cmp(BinaryOp::Geq, elem, signed, lo)?
+                        && Self::compiled_foreach_cmp(BinaryOp::Leq, elem, signed, hi)?
+                    {
+                        hit = true;
+                        break;
+                    }
+                }
+                hit
+            }
+            CompiledForeachCheck::ElemRel { op, bound } => {
+                Self::compiled_foreach_cmp(*op, elem, signed, *bound)?
+            }
+        })
+    }
+
+    /// `e` evaluated with `handle` as `this`, as a compiled-check bound: its
+    /// value (sign-extended when signed) and its signedness. None for x/z
+    /// or a value wider than 64 bits.
+    fn foreach_check_bound(&mut self, handle: usize, e: &Expression) -> Option<(i128, bool)> {
+        let v = self.eval_with_this(handle, e);
+        if v.has_xz() || v.width > 64 {
+            return None;
         }
+        if v.is_signed {
+            Some((i128::from(v.to_i64()?), true))
+        } else {
+            Some((i128::from(v.to_u64()?), false))
+        }
+    }
+
+    /// A member check bound: non-negative only (a negative bound against an
+    /// unsigned member depends on the operation width).
+    fn foreach_member_bound(&mut self, handle: usize, e: &Expression) -> Option<i128> {
+        self.foreach_check_bound(handle, e)
+            .map(|(b, _)| b)
+            .filter(|&b| b >= 0)
+    }
+
+    fn eval_with_this(&mut self, handle: usize, e: &Expression) -> Value {
+        self.this_stack.push(Some(handle));
+        let v = self.eval_expr(e);
+        self.this_stack.pop();
+        v
     }
 
     pub(super) fn is_bare_var(e: &Expression, name: &str) -> bool {
@@ -3509,6 +3575,21 @@ impl Simulator {
         if Self::spreads_member_wise(&su) {
             return None;
         }
+        // §11.8.1: a signed member compares sign-extended; the plan reads
+        // members as unsigned bit fields.
+        let signed_member = su
+            .signing
+            .is_some_and(|sg| matches!(sg, crate::ast::types::Signing::Signed))
+            || su.members.iter().any(|m| {
+                m.declarators.iter().any(|d| d.name.name == member)
+                    && super::elaborate::is_type_signed_resolved(
+                        &m.data_type,
+                        &self.module.typedef_types,
+                    )
+            });
+        if signed_member {
+            return None;
+        }
         let (fields, _) = self.packed_agg_layout(&su);
         let f = fields.iter().find(|(m, _, _)| m == member)?;
         let ow = (f.1, f.2);
@@ -3544,9 +3625,7 @@ impl Simulator {
                 ..
             } => {
                 if !Self::expr_reads_var(condition, idx_var) {
-                    self.this_stack.push(Some(handle));
-                    let cond = self.eval_expr(condition).is_true();
-                    self.this_stack.pop();
+                    let cond = self.eval_with_this(handle, condition).is_true();
                     let mut then_checks = Vec::new();
                     let mut else_checks = Vec::new();
                     if cond {
@@ -3592,9 +3671,7 @@ impl Simulator {
                         None
                     };
                     if let Some(texpr) = target_expr {
-                        self.this_stack.push(Some(handle));
-                        let target = self.eval_expr(texpr).to_i64()?;
-                        self.this_stack.pop();
+                        let target = self.eval_with_this(handle, texpr).to_i64()?;
                         let mut then_checks = Vec::new();
                         let mut else_checks = Vec::new();
                         self.try_compile_foreach_item(
@@ -3635,9 +3712,7 @@ impl Simulator {
                         if Self::expr_reads_var(right, idx_var) {
                             return None;
                         }
-                        self.this_stack.push(Some(handle));
-                        let expected = self.eval_expr(right).to_u64()?;
-                        self.this_stack.pop();
+                        let expected = self.foreach_member_bound(handle, right)?;
                         let (off, width) = self.get_array_elem_member_layout(
                             handle, class_name, arr_name, member, left,
                         )?;
@@ -3652,9 +3727,7 @@ impl Simulator {
                         if Self::expr_reads_var(left, idx_var) {
                             return None;
                         }
-                        self.this_stack.push(Some(handle));
-                        let expected = self.eval_expr(left).to_u64()?;
-                        self.this_stack.pop();
+                        let expected = self.foreach_member_bound(handle, left)?;
                         let (off, width) = self.get_array_elem_member_layout(
                             handle, class_name, arr_name, member, right,
                         )?;
@@ -3667,9 +3740,7 @@ impl Simulator {
                     } else if Self::is_arr_elem_bare(left, arr_name, idx_var)
                         && !Self::expr_reads_var(right, idx_var)
                     {
-                        self.this_stack.push(Some(handle));
-                        let expected = self.eval_expr(right).to_i64()?;
-                        self.this_stack.pop();
+                        let expected = self.foreach_check_bound(handle, right)?;
                         out.push(CompiledForeachCheck::ElemInside {
                             ranges: vec![(expected, expected)],
                         });
@@ -3677,9 +3748,7 @@ impl Simulator {
                     } else if Self::is_arr_elem_bare(right, arr_name, idx_var)
                         && !Self::expr_reads_var(left, idx_var)
                     {
-                        self.this_stack.push(Some(handle));
-                        let expected = self.eval_expr(left).to_i64()?;
-                        self.this_stack.pop();
+                        let expected = self.foreach_check_bound(handle, left)?;
                         out.push(CompiledForeachCheck::ElemInside {
                             ranges: vec![(expected, expected)],
                         });
@@ -3695,9 +3764,7 @@ impl Simulator {
                     if Self::is_arr_elem_bare(left, arr_name, idx_var)
                         && !Self::expr_reads_var(right, idx_var)
                     {
-                        self.this_stack.push(Some(handle));
-                        let bound = self.eval_expr(right).to_i64()?;
-                        self.this_stack.pop();
+                        let bound = self.foreach_check_bound(handle, right)?;
                         out.push(CompiledForeachCheck::ElemRel { op: *op, bound });
                         Some(())
                     } else {
@@ -3718,19 +3785,15 @@ impl Simulator {
                                     {
                                         return None;
                                     }
-                                    self.this_stack.push(Some(handle));
-                                    let l = self.eval_expr(lo).to_i64()?;
-                                    let h = self.eval_expr(hi).to_i64()?;
-                                    self.this_stack.pop();
+                                    let l = self.foreach_check_bound(handle, lo)?;
+                                    let h = self.foreach_check_bound(handle, hi)?;
                                     rs.push((l, h));
                                 }
                                 _ => {
                                     if Self::expr_reads_var(r, idx_var) {
                                         return None;
                                     }
-                                    self.this_stack.push(Some(handle));
-                                    let v = self.eval_expr(r).to_i64()?;
-                                    self.this_stack.pop();
+                                    let v = self.foreach_check_bound(handle, r)?;
                                     rs.push((v, v));
                                 }
                             }
@@ -3773,9 +3836,7 @@ impl Simulator {
                         if Self::expr_reads_var(wexpr, idx_var) {
                             return None;
                         }
-                        self.this_stack.push(Some(handle));
-                        let wval = self.eval_expr(wexpr).to_i64().unwrap_or(1);
-                        self.this_stack.pop();
+                        let wval = self.eval_with_this(handle, wexpr).to_i64().unwrap_or(1);
                         if wval == 0 {
                             continue;
                         }
@@ -3785,9 +3846,7 @@ impl Simulator {
                             if Self::expr_reads_var(e, idx_var) {
                                 return None;
                             }
-                            self.this_stack.push(Some(handle));
-                            let v = self.eval_expr(e).to_i64()?;
-                            self.this_stack.pop();
+                            let v = self.foreach_check_bound(handle, e)?;
                             ranges.push((v, v));
                         }
                         ConstraintRange::Range { lo, hi } => {
@@ -3796,15 +3855,17 @@ impl Simulator {
                             {
                                 return None;
                             }
-                            self.this_stack.push(Some(handle));
-                            let l = self.eval_expr(lo).to_i64()?;
-                            let h = self.eval_expr(hi).to_i64()?;
-                            self.this_stack.pop();
+                            let l = self.foreach_check_bound(handle, lo)?;
+                            let h = self.foreach_check_bound(handle, hi)?;
                             ranges.push((l, h));
                         }
                     }
                 }
                 if let Some((off, width)) = off_w {
+                    if ranges.iter().any(|&((l, _), (h, _))| l < 0 || h < 0) {
+                        return None;
+                    }
+                    let ranges = ranges.iter().map(|&((l, _), (h, _))| (l, h)).collect();
                     out.push(CompiledForeachCheck::MemberInside { off, width, ranges });
                 } else {
                     out.push(CompiledForeachCheck::ElemInside { ranges });

@@ -8945,7 +8945,7 @@ pub struct Simulator {
     #[serde(skip)]
     packed_struct_member_memo: std::cell::RefCell<
         HashMap<
-            (usize, String),
+            (String, u32, u32, String),
             Option<(u32, u32, bool, crate::ast::types::DataType, Vec<(i64, i64)>)>,
         >,
     >,
