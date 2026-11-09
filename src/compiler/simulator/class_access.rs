@@ -687,6 +687,12 @@ impl Simulator {
             .and_then(|s| crate::sv_parser::strip_unit_scope_name(&s.name.name))
         {
             if !self.unit_scope_decl_exists(&hier.path[0].name.name) {
+                // The unit's own storage, by its plain name: a scope search
+                // would bind a generate block's declaration of the same name.
+                if hier.path.len() == 1 && self.unit_scope_decl_exists(bare) {
+                    let _ = hier.cached_resolved_name.set(bare.to_string());
+                    return bare.to_string();
+                }
                 let mut stripped = hier.clone();
                 stripped.path[0].name.name = bare.to_string();
                 stripped.cached_signal_id = crate::ast::cache::SignalCache::new(None);
