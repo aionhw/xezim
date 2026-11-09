@@ -461,14 +461,11 @@ impl Simulator {
                     continue;
                 }
                 for member in &su.members {
-                    let ew = super::elaborate::packed_inner_elem_width(
+                    let (ew, fdims) = super::elaborate::packed_member_meta(
                         &member.data_type,
                         &module.parameters,
                         &module.typedefs,
-                    );
-                    let fdims = super::elaborate::packed_full_dims_of(
-                        &member.data_type,
-                        &module.parameters,
+                        &module.typedef_types,
                     );
                     for mdecl in &member.declarators {
                         let key = format!("{}.{}", prefix, mdecl.name.name);

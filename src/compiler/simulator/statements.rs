@@ -2451,14 +2451,11 @@ impl Simulator {
                         }
                         budget -= 1;
                         for m in &su.members {
-                            let ew = super::elaborate::packed_inner_elem_width(
+                            let (ew, fd) = super::elaborate::packed_member_meta(
                                 &m.data_type,
                                 &self.module.parameters,
                                 &self.module.typedefs,
-                            );
-                            let fd = super::elaborate::packed_full_dims_of(
-                                &m.data_type,
-                                &self.module.parameters,
+                                &self.module.typedef_types,
                             );
                             for mdecl in &m.declarators {
                                 let key = format!("{}.{}", prefix, mdecl.name.name);

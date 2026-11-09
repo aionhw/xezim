@@ -2005,15 +2005,25 @@ impl Simulator {
         }
         if let DataType::Struct(su) = self.resolve_dt(dt) {
             for m in &su.members {
-                if let Some(ew) = super::elaborate::packed_inner_elem_width(
+                let (ew, fd) = super::elaborate::packed_member_meta(
                     &m.data_type,
                     &self.module.parameters,
                     &self.module.typedefs,
-                ) {
-                    for mdecl in &m.declarators {
-                        let key = format!("{}.{}", name, mdecl.name.name);
+                    &self.module.typedef_types,
+                );
+                for mdecl in &m.declarators {
+                    let key = format!("{}.{}", name, mdecl.name.name);
+                    if let Some(ew) = ew {
                         self.note_elem_width_key(&key);
-                        self.module.packed_signal_elem_widths.insert(key, ew);
+                        self.module
+                            .packed_signal_elem_widths
+                            .insert(key.clone(), ew);
+                    }
+                    // §7.4.1: every dimension, so `a.f0[i][j][k]` of a
+                    // typedef-element member selects an element at each index.
+                    if let Some(fd) = &fd {
+                        self.meta_note(&key);
+                        self.module.packed_full_dims.insert(key, fd.clone());
                     }
                 }
             }
