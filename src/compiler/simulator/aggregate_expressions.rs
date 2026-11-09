@@ -2596,22 +2596,31 @@ impl Simulator {
                     .get(2)
                     .map(|a| self.eval_expr(a).to_u64().unwrap_or(3))
                     .unwrap_or(3);
-                // LSB state: 0, 1, or 2 for "unknown" (§9.4.2 an edge on a
-                // multi-bit operand is the LSB; an unknown bit behaves as an
-                // in-between level so x→1 / 1→x / x→0 fire).
+                // §9.4.2: an edge is detected on the LSB only. LSB state: 0,
+                // 1, or 2 for x/z; Table 9-2: posedge is 0→x/z/1 and x/z→1,
+                // negedge is 1→x/z/0 and x/z→0.
                 let state = |v: &Value| -> u8 {
-                    if v.has_xz() {
+                    let b = v.bit_select(0);
+                    if b.has_xz() {
                         2
                     } else {
-                        v.to_u64().unwrap_or(0) as u8 & 1
+                        b.to_u64().unwrap_or(0) as u8 & 1
                     }
                 };
                 let (p, c) = (state(&prev), state(&cur));
-                let hit = match kind {
-                    1 => (0 == p || 2 == p) && 1 == c,
-                    2 => 1 == p && c != 1,
-                    _ => p != c,
+                let posedge = (p == 0 && c != 0) || (p == 2 && c == 1);
+                let negedge = (p == 1 && c != 1) || (p == 2 && c == 0);
+                let mut hit = match kind {
+                    0 => prev != cur,
+                    1 => posedge,
+                    2 => negedge,
+                    _ => posedge || negedge,
                 };
+                // `iff`: an edge while the guard is false is consumed without
+                // triggering (§9.4.2), so it re-baselines instead of latching.
+                if hit && let Some(guard) = args.get(3) {
+                    hit = self.eval_expr(guard).is_true();
+                }
                 if hit {
                     self.vc_saved.remove(&idx);
                     Value::from_u64(1, 1)

@@ -692,21 +692,42 @@ impl Simulator {
         let EventControl::EventExpr(terms) = event else {
             return None;
         };
-        if terms.len() != 1 || terms[0].iff.is_some() {
+        // Plain value-change lists (`@(a or b)`, no edge, no `iff`) keep
+        // `class_prop_value_change_cond`.
+        if terms.iter().all(|t| t.edge.is_none() && t.iff.is_none()) {
             return None;
         }
-        let term = &terms[0];
-        let edge = term.edge?;
-        if !self.edge_wait_operand(&term.expr) {
-            return None;
+        // §9.4.2: every term of an `or` list must be such an operand; validate
+        // them all before arming any snapshot. A list naming a real signal
+        // keeps the signal-sensitivity path.
+        for t in terms {
+            if !self.edge_wait_operand(&t.expr) {
+                return None;
+            }
         }
-        let expr = term.expr.clone();
-        let code = match edge {
-            Edge::Posedge => 1,
-            Edge::Negedge => 2,
-            Edge::Edge => 3,
-        };
-        Some(self.edge_value_change_cond(expr, code))
+        let mut conds = Vec::with_capacity(terms.len());
+        for t in terms {
+            let code = match t.edge {
+                Some(Edge::Posedge) => 1,
+                Some(Edge::Negedge) => 2,
+                Some(Edge::Edge) => 3,
+                None => 0,
+            };
+            conds.push(self.edge_value_change_cond(t.expr.clone(), code, t.iff.clone()));
+        }
+        let mut conds = conds.into_iter();
+        let first = conds.next()?;
+        Some(conds.fold(first, |left, right| {
+            let span = left.span;
+            Expression::new(
+                ExprKind::Binary {
+                    op: BinaryOp::LogOr,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            )
+        }))
     }
 
     /// A term usable as an edge-sensitive value-change wait: something with no
@@ -714,6 +735,24 @@ impl Simulator {
     /// property of `this` or of a class handle, a static member, or a local of
     /// the running method.
     fn edge_wait_operand(&mut self, e: &Expression) -> bool {
+        // Fast path for the common `@(posedge clk)` of a module process: a
+        // bare signal name outside any class context and not shadowed by a
+        // procedural local keeps the signal path.
+        if let ExprKind::Ident(h) = &e.kind
+            && h.root.is_none()
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && self.this_stack.last().copied().flatten().is_none()
+            && self
+                .signal_name_to_id
+                .contains_key(h.path[0].name.name.as_str())
+            && !self
+                .local_stack
+                .iter()
+                .any(|f| f.contains_key(h.path[0].name.name.as_str()))
+        {
+            return false;
+        }
         if let Some((h, f)) = self.expr_handle_prop_any(e) {
             return !self.class_prop_is_event(h, &f);
         }
@@ -779,8 +818,14 @@ impl Simulator {
     }
 
     /// Arm `expr` and return the condition that becomes true on the `code`
-    /// transition (1 = posedge, 2 = negedge, 3 = any edge).
-    fn edge_value_change_cond(&mut self, expr: Expression, code: u64) -> Expression {
+    /// transition (1 = posedge, 2 = negedge, 3 = any edge, 0 = any change)
+    /// while the optional `iff` guard holds.
+    fn edge_value_change_cond(
+        &mut self,
+        expr: Expression,
+        code: u64,
+        iff: Option<Expression>,
+    ) -> Expression {
         let val = self.eval_expr(&expr);
         let idx = self.intra_saved_next;
         self.intra_saved_next += 1;
@@ -801,7 +846,11 @@ impl Simulator {
         Expression::new(
             ExprKind::SystemCall {
                 name: VC_EDGE_MARKER.to_string(),
-                args: vec![num(idx), expr, num(code)],
+                args: {
+                    let mut a = vec![num(idx), expr, num(code)];
+                    a.extend(iff);
+                    a
+                },
             },
             span,
         )

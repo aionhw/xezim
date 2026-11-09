@@ -550,13 +550,14 @@ const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
 /// control (`@prop` on a non-event class property) was armed. Never
 /// user-visible.
 const VC_CHANGED_MARKER: &str = "$__xz_vc_changed";
-/// Internal `$__xz_vc_edge(idx, expr, edge)`: true once `expr` has made the
+/// Internal `$__xz_vc_edge(idx, expr, edge[, iff])`: true once `expr` has made the
 /// requested TRANSITION relative to `Simulator::vc_saved[idx]`. Used by
 /// `@(posedge prop)` / `@(negedge prop)` / `@(edge prop)` when `prop` is a
 /// class property or a procedural local — an edge-qualified event term has no
 /// backing signal, so it is armed as an edge-sensitive value-change wait
-/// (§9.4.2). `edge` is 1 = posedge, 2 = negedge, 3 = any edge. Never
-/// user-visible.
+/// (§9.4.2). `edge` is 1 = posedge, 2 = negedge, 3 = any edge, 0 = any
+/// change (an untagged term of an `or` list); an `iff` guard must hold when
+/// it fires. Never user-visible.
 const VC_EDGE_MARKER: &str = "$__xz_vc_edge";
 /// Ends a deferred declaration initializer: `(<target>, ...)` records the
 /// values it gave as their default sampled values (see `sampled_defaults`).
@@ -10211,12 +10212,12 @@ pub struct Simulator {
     /// repick (`arr[i] > arr[i-1]`) lands INSIDE the declared range instead of
     /// anywhere in the element's full domain.
     elem_inside_hint: Vec<(i64, i64)>,
-    /// Set after several trials failed a strict foreach check: relational
     /// §18.5.8.1: the `<` / `<=` / `>` / `>=` bounds the current foreach
     /// body puts on the element being solved (`arr[i] OP bound`), for the
     /// modulo repair's draw.
     #[serde(skip)]
     elem_rel_bound: Vec<(crate::ast::expr::BinaryOp, Value)>,
+    /// Set after several trials failed a strict foreach check: relational
     /// repicks take the BOUND value (minimal/maximal feasible) instead of a
     /// uniform draw, so a globally coupled monotone chain (`g[i][j][k] >
     /// g[i-1][j][k]` over a 4x4x4 grid in [1:2000]) is solved greedily in
