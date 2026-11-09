@@ -58,6 +58,31 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   of a select that leaves several packed dimensions (`$size(a3[1])`) describe
   the dimensions left (§20.7, §7.4.5, #984, reported by Ganesh-TNL).
 
+* A path from a nested generate block through an enclosing one names the
+  enclosing block's declaration when both declare the name (`g.x`, `g.f()`,
+  `g.t`, `disable g.t`): the call recursed until the stack overflowed and the
+  read gave the nested block's value. An interface or module instance of a
+  generate block can be a value or path head in the block (a virtual interface
+  handed to a class, `u.a[i].f = ...`), where it was undeclared, and `-> ev`
+  in a method of a class declared in the block fires the class's own event
+  (§23.6, §23.9, §25.9, §15.5.1, core #184 / #989, contributed by philipaxer).
+
+* A generate loop's genvar reads its iteration's value in properties,
+  sequences, covergroup bins, gate terminals, formal defaults, typedefs and
+  the other items of the loop body; a formal, local, class member or property
+  formal of the same name hides it (§27.4, §13.5, §8.3, §16.8, core #185 /
+  #990, contributed by philipaxer).
+
+* `disable lab.sub` of another process's block, from inside a nested `begin
+  ... end`, stops that block and lets the nested block go on; it ended the
+  disabling block too. `disable l[1].lab.sub` stops that iteration's block,
+  not the first `sub` found (§9.6.2, #952).
+
+* An unpacked array of unpacked structs declared in a generate block stores
+  its elements member-wise (`g.q[2].f` read x), and `%p` prints an element or
+  nested member of a generate block's variable (`q[2]`, `o.in`, `l[1].t[1]`)
+  from its declared type (§7.2, §21.2.1.7, §27, #952).
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
