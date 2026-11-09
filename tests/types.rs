@@ -680,3 +680,5 @@ mod function_local_ascending_packed;
 mod nonansi_typedef_packed_port_942;
 #[path = "types/two_state_local_in_fallback.rs"]
 mod two_state_local_in_fallback;
+#[path = "types/packed_struct_elem_store_width.rs"]
+mod packed_struct_elem_store_width;
