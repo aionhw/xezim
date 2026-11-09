@@ -29,6 +29,8 @@ mod drive_strength_pull;
 mod dump_formats_agree;
 #[path = "gates/dump_merged_sv.rs"]
 mod dump_merged_sv;
+#[path = "gates/dumpflush.rs"]
+mod dumpflush;
 #[path = "gates/fn_return_member_inlines.rs"]
 mod fn_return_member_inlines;
 #[path = "gates/fst_roundtrip.rs"]
