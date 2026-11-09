@@ -6,6 +6,58 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 # What's new in 0.11
 
+### Unreleased
+
+**Correctness**
+
+* An index naming a class property selects the virtual interface it names:
+  `dst[j] = src[j]` with `j` a property, `@(posedge vifs[idx].clk)`,
+  `vifs[n-1]`, `vifs[cfg.idx]` and a static index copied a null handle or
+  armed the wait on nothing, so the wait returned at once and its loop spun at
+  one time step (§25.9, §9.4.2, #988, reported by Ganesh-TNL).
+
+* `@(vif)`, `@(vifs[0])` and `@(cfg.vif)` on a virtual-interface variable wait
+  for it to refer to another instance; they never resumed, or returned at once
+  (§9.4.2, §25.9, #988, reported by Ganesh-TNL).
+
+* An edge on a select of a class property (`@(posedge bus[1])`), on a property
+  of a handle-array element (`@(posedge subs[1].clk)`), and an `or` list
+  mixing a signal with a class property (`@(posedge clk or posedge h.rst)`)
+  wait for their edges; they spun at one time step, or at the head of a
+  `forever` loop missed the property's edge (§9.4.2, #993, reported by
+  Ganesh-TNL).
+
+* `randomize()` solves relations that read a signed variable unsigned
+  (`row_bytes == line_width * 8` with an `int row_bytes`, `byte` or `shortint`
+  sizes, `x < 32'h8000_0010` on an `int x`), products of two variables (`start
+  + cnt * pitch - 1 <= top`), a wrapped side bounded by an open one
+  (`(start_addr - 8'h70) <= top - row_bytes`), and `if`/`->` branches that
+  fail only once enforced; these satisfiable classes returned 0 (§11.8.2,
+  §11.4.3, §18.5, #994, reported by Ganesh-TNL).
+
+* A signed member of a packed struct class property reads signed, a struct
+  member's signedness decides a relation's (`m.s + 4'sd1 < l.s + b.u`
+  sign-extended its left side), and `randomize()` solves `p.s inside
+  {[-4:-1]}` (§7.2.1, §11.8.2, §18.5, #994, reported by Ganesh-TNL).
+
+* A packed struct member that is a packed array of a typedef element (`t3_t
+  [3:0][7:0] f0`), or whose dimensions live in its typedef, selects an element
+  at every index on variables, ports, locals and formals, and an x/z index
+  into it in compiled code reads x at the element width (§7.2, §7.4.1,
+  §11.5.1, #984, reported by Ganesh-TNL).
+
+* A non-ANSI port of a packed struct type records its members' packed shapes,
+  so `arg.vec[1]` selects a byte on the port and in a callee whose formal has
+  the port's name (§23.2.2.1, §7.4.1, #984, reported by Ganesh-TNL).
+
+* An element select of a packed-array member of a call result (`set_td(a, i,
+  j, k).f0[1][1][1]`) selects by the member's dimensions instead of a bit
+  (§13.4.1, §7.4.1, #984, reported by Ganesh-TNL).
+
+* `$size`, `$left`, `$right`, `$high`, `$low`, `$increment` and `$dimensions`
+  of a select that leaves several packed dimensions (`$size(a3[1])`) describe
+  the dimensions left (§20.7, §7.4.5, #984, reported by Ganesh-TNL).
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
