@@ -6380,6 +6380,8 @@ enum ClassAggRef {
         /// §7.2.1: a 2-state member of a 4-state struct — its reads and
         /// writes convert x/z to 0.
         two_state: bool,
+        /// §7.2.1: a whole member declared signed reads signed.
+        signed: bool,
     },
     /// Member of an UNPACKED struct — its own cell, keyed `<prop>.<member>`.
     Unpacked { handle: usize, key: String, w: u32 },

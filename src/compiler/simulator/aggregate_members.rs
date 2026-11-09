@@ -2533,7 +2533,7 @@ impl Simulator {
         mut off: u32,
         total: u32,
     ) -> Option<ClassAggRef> {
-        let packed = |off: u32, w: u32, two_state: bool| {
+        let packed = |off: u32, w: u32, two_state: bool, signed: bool| {
             Some(ClassAggRef::Packed {
                 handle,
                 prop: prop.to_string(),
@@ -2541,6 +2541,7 @@ impl Simulator {
                 w,
                 total,
                 two_state,
+                signed,
             })
         };
         let mut i = 0usize;
@@ -2560,7 +2561,7 @@ impl Simulator {
                         off = off.checked_add(u32::try_from(slot).ok()?.checked_mul(w)?)?;
                         i += 1;
                     }
-                    None => return packed(off, w, false),
+                    None => return packed(off, w, false, false),
                     Some(_) => return None,
                 }
             }
@@ -2597,11 +2598,18 @@ impl Simulator {
                     // bit range of the member's slice.
                     let (o, sw) = self.packed_array_slice(dt, params, w, &rest[i + 1..])?;
                     let two_state = self.mixed_member_two_state(root, dt);
-                    return packed(off + o, sw, two_state);
+                    // §7.2.1, §11.5.1: the whole member keeps its declared
+                    // signedness; a select of it is unsigned.
+                    let signed = i + 1 == rest.len()
+                        && super::elaborate::is_type_signed_resolved(
+                            dt,
+                            &self.module.typedef_types,
+                        );
+                    return packed(off + o, sw, two_state, signed);
                 }
             }
         }
-        packed(off, w, false)
+        packed(off, w, false, false)
     }
 
     /// Offset and width — within a `total_w`-bit value whose packed
@@ -3517,6 +3525,7 @@ impl Simulator {
             w: elem_w,
             total,
             two_state: false,
+            signed: false,
         })
     }
 
@@ -4307,11 +4316,14 @@ impl Simulator {
         let layout = self.class_packed_layout(&su, &value_params);
         let total = layout.1;
         let &(_, off, w) = layout.0.iter().find(|(n, _, _)| *n == field)?;
-        let two_state = su
+        let member = su
             .members
             .iter()
-            .find(|m| m.declarators.iter().any(|d| d.name.name == field))
-            .is_some_and(|m| self.mixed_member_two_state(&su, &m.data_type));
+            .find(|m| m.declarators.iter().any(|d| d.name.name == field));
+        let two_state = member.is_some_and(|m| self.mixed_member_two_state(&su, &m.data_type));
+        let signed = member.is_some_and(|m| {
+            super::elaborate::is_type_signed_resolved(&m.data_type, &self.module.typedef_types)
+        });
         Some(ClassAggRef::Packed {
             handle,
             prop,
@@ -4319,6 +4331,7 @@ impl Simulator {
             w,
             total,
             two_state,
+            signed,
         })
     }
 
@@ -4332,6 +4345,7 @@ impl Simulator {
                 w,
                 total,
                 two_state,
+                signed,
             } => {
                 let whole = self
                     .heap
@@ -4347,6 +4361,7 @@ impl Simulator {
                 if *two_state && out.has_xz() {
                     out = out.to_two_state();
                 }
+                out.is_signed = *signed;
                 out
             }
             ClassAggRef::Unpacked { handle, key, w } => self
@@ -4393,6 +4408,7 @@ impl Simulator {
                 w,
                 total,
                 two_state,
+                ..
             } => {
                 let val = &if *two_state && val.has_xz() {
                     val.to_two_state()

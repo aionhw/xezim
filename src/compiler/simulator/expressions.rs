@@ -5,6 +5,26 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// §7.2.1: the signedness of a packed-struct member read (`m.s`,
+    /// `p.s` and `o.p.s` of a struct class property): its declared type's.
+    /// Unknown, an unsigned sibling (`p.s + 1 < l.s + b.u`) did not make the
+    /// relation unsigned, and the signed side was sign-extended (§11.8.2).
+    fn member_signed_hint(&mut self, expr: &Expression) -> Option<bool> {
+        if let Some(ClassAggRef::Packed { signed, .. }) = self.class_agg_member(expr) {
+            return Some(signed);
+        }
+        let ExprKind::Ident(h) = &expr.kind else {
+            return None;
+        };
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let name = self.resolve_hier_name(h).into_owned();
+        let (base, ..) = self.packed_leaf_of_hier(&name)?;
+        let field = name.strip_prefix(&base)?.strip_prefix('.')?;
+        Some(self.struct_member_signed(&base, field))
+    }
+
     /// Outlined from `eval_expr_ctx` (see `exec_stmt_blocking_assign`): keeps
     /// the dispatcher's stack frame small.
     #[inline(never)]
@@ -1972,23 +1992,33 @@ impl Simulator {
         }
         match &expr.kind {
             ExprKind::Number(n) => Some(self.eval_number(n).is_signed),
-            ExprKind::Ident(h) => self.plain_ident_read(h).map(|v| v.is_signed).or_else(|| {
-                let name = self.resolve_hier_name(h);
-                self.signal_name_to_id
-                    .get(name.as_ref())
-                    .map(|&id| self.signal_signed[id])
-                    .or_else(|| {
-                        self.module.var_decl_types.get(name.as_ref()).map(|dt| {
-                            super::elaborate::is_type_signed_resolved(
-                                dt,
-                                &self.module.typedef_types,
-                            )
+            ExprKind::Ident(h) => {
+                let hint = self.plain_ident_read(h).map(|v| v.is_signed).or_else(|| {
+                    let name = self.resolve_hier_name(h);
+                    self.signal_name_to_id
+                        .get(name.as_ref())
+                        .map(|&id| self.signal_signed[id])
+                        .or_else(|| {
+                            self.module.var_decl_types.get(name.as_ref()).map(|dt| {
+                                super::elaborate::is_type_signed_resolved(
+                                    dt,
+                                    &self.module.typedef_types,
+                                )
+                            })
                         })
-                    })
-                    .or_else(|| {
-                        self.get_expr_type_name(expr)
-                            .and_then(|name| self.concrete_type_signed(&name))
-                    })
+                        .or_else(|| {
+                            self.get_expr_type_name(expr)
+                                .and_then(|name| self.concrete_type_signed(&name))
+                        })
+                });
+                if hint.is_none() && h.path.len() >= 2 {
+                    return self.member_signed_hint(expr);
+                }
+                hint
+            }
+            ExprKind::MemberAccess { .. } => self.member_signed_hint(expr).or_else(|| {
+                self.get_expr_type_name(expr)
+                    .and_then(|name| self.concrete_type_signed(&name))
             }),
             ExprKind::Paren(e) => self.expression_signed_hint(e),
             ExprKind::Index { .. } => {

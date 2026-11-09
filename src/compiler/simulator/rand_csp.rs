@@ -543,6 +543,9 @@ pub(crate) struct Csp {
     aux_base: HashMap<usize, (usize, u32, u32)>,
     /// Packed-struct field layout (name, lsb, width) of a base variable.
     fields: HashMap<usize, Vec<(String, u32, u32)>>,
+    /// §7.2.1: the fields of `fields` declared signed, by base variable and
+    /// field name: a select of one reads its bits signed (`csp_slice_ae`).
+    signed_fields: HashSet<(usize, String)>,
     /// §7.4.5: a field that is a packed array of elements (`bit [63:0][23:0]
     /// f`), keyed by (base, lsb, width): the declared (left, right) of its
     /// first dimension and its element width, so `f[k]` names an element.
@@ -2213,6 +2216,7 @@ impl Simulator {
             slice_vars: HashMap::default(),
             aux_base: HashMap::default(),
             fields: HashMap::default(),
+            signed_fields: HashSet::default(),
             field_elems: HashMap::default(),
             elem_fields: HashMap::default(),
             pdims: HashMap::default(),
@@ -2424,6 +2428,7 @@ impl Simulator {
             slice_vars: HashMap::default(),
             aux_base: HashMap::default(),
             fields: HashMap::default(),
+            signed_fields: HashSet::default(),
             field_elems: HashMap::default(),
             elem_fields: HashMap::default(),
             pdims: HashMap::default(),
@@ -8063,6 +8068,7 @@ impl Simulator {
         csp.slice_vars.clear();
         csp.aux_base.clear();
         csp.fields.clear();
+        csp.signed_fields.clear();
         csp.field_elems.clear();
         csp.pdims.clear();
         csp.elem_fields.clear();
@@ -8085,6 +8091,9 @@ impl Simulator {
                     }
                 }
                 if !fields.is_empty() {
+                    for f in self.csp_signed_members(csp, name) {
+                        csp.signed_fields.insert((*v, f));
+                    }
                     csp.fields.insert(*v, fields);
                 }
                 if let Some((left, right)) = lsb {
@@ -8127,10 +8136,17 @@ impl Simulator {
                 (None, Some(&e)) if !skip => self.csp_packed_dims(csp, &name, csp.vars[e].width),
                 _ => None,
             };
+            let signed = match &shape {
+                Some((fields, _)) if !fields.is_empty() => self.csp_signed_members(csp, &name),
+                _ => Vec::new(),
+            };
             for v in elems {
                 match &shape {
                     Some((fields, lsb)) => {
                         if !fields.is_empty() {
+                            for f in &signed {
+                                csp.signed_fields.insert((v, f.clone()));
+                            }
                             csp.fields.insert(v, fields.clone());
                         }
                         if let Some((left, right)) = *lsb {
@@ -8553,6 +8569,74 @@ impl Simulator {
             },
             _ => Some((Vec::new(), Some((0, 0)))),
         }
+    }
+
+    /// §7.2.1: the members of the packed struct `name` is declared with
+    /// that are signed, by their dotted path from it (`s`, `a.x`): their
+    /// selects read signed although the struct itself is unsigned.
+    fn csp_signed_members(&mut self, csp: &Csp, name: &str) -> Vec<String> {
+        let su: Option<crate::ast::types::StructUnionType> = if csp.scope.is_some() {
+            let name = self.dyn_name_lookup(name).unwrap_or(name);
+            self.module
+                .var_decl_types
+                .get(name)
+                .cloned()
+                .and_then(|dt| {
+                    match crate::compiler::elaborate::resolve_typedef_chain(
+                        &dt,
+                        &self.module.typedef_types,
+                    ) {
+                        DataType::Struct(su) => Some(su.clone()),
+                        _ => None,
+                    }
+                })
+        } else {
+            let (owner, name) = Self::csp_owner(csp, name);
+            let name = match name.split_once('[') {
+                Some((b, _)) if csp.nd_dims.contains_key(b) => b,
+                _ => name,
+            };
+            self.class_prop_struct(owner, name)
+                .map(|su| (*su).clone())
+                .or_else(|| {
+                    let dt = self.csp_prop_decl_type(owner, name)?;
+                    match crate::compiler::elaborate::resolve_typedef_chain(
+                        &dt,
+                        &self.module.typedef_types,
+                    ) {
+                        DataType::Struct(su) => Some(su.clone()),
+                        _ => None,
+                    }
+                })
+        };
+        let mut out = Vec::new();
+        let Some(su) = su.filter(|su| su.packed) else {
+            return out;
+        };
+        let mut todo = vec![(String::new(), su, 0u32)];
+        while let Some((prefix, su, depth)) = todo.pop() {
+            for m in &su.members {
+                let tt = &self.module.typedef_types;
+                let signed = crate::compiler::elaborate::is_type_signed_resolved(&m.data_type, tt);
+                let inner =
+                    match crate::compiler::elaborate::resolve_typedef_chain(&m.data_type, tt) {
+                        DataType::Struct(n) if n.packed && n.dimensions.is_empty() && depth < 8 => {
+                            Some(n.clone())
+                        }
+                        _ => None,
+                    };
+                for d in &m.declarators {
+                    let path = format!("{prefix}{}", d.name.name);
+                    if signed {
+                        out.push(path.clone());
+                    }
+                    if let Some(n) = &inner {
+                        todo.push((format!("{path}."), n.clone(), depth + 1));
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn csp_scan_item(
@@ -9744,11 +9828,44 @@ impl Simulator {
             return Some(Self::csp_var_ae(csp, v));
         }
         let segs = csp.segs.get(&v)?;
-        if let Some(&(_, _, x)) = segs.iter().find(|s| s.0 == lo && s.1 == w) {
-            return Some(Ae::Var(x, w, false));
+        let x = match segs.iter().find(|s| s.0 == lo && s.1 == w) {
+            Some(&(_, _, x)) => x,
+            None => *csp.slice_vars.get(&(v, lo, w))?,
+        };
+        // §7.2.1, §11.5.1: a signed member reads its bits signed (`p.s <
+        // 0` of a `bit signed [3:0] s`); a bit or part select stays
+        // unsigned.
+        if Self::csp_signed_field(csp, e, v, lo, w) {
+            return Some(Ae::Cast {
+                inner: Box::new(Ae::Var(x, w, false)),
+                iw: w,
+                is: false,
+                w,
+                s: true,
+            });
         }
-        let &x = csp.slice_vars.get(&(v, lo, w))?;
         Some(Ae::Var(x, w, false))
+    }
+
+    /// Whether `e`, selecting bits `[lo +: w]` of `v`, names a signed
+    /// member of it (`csp_signed_members`) rather than a select of bits.
+    fn csp_signed_field(csp: &Csp, e: &Expression, v: usize, lo: u32, w: u32) -> bool {
+        let leaf = match &Self::unparen(e).kind {
+            ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                h.path.last().map_or("", |s| s.name.name.as_str())
+            }
+            _ => return false,
+        };
+        csp.fields.get(&v).is_some_and(|fs| {
+            fs.iter().any(|(n, flo, fw)| {
+                (*flo, *fw) == (lo, w)
+                    && (n == leaf || n.strip_suffix(leaf).is_some_and(|p| p.ends_with('.')))
+                    && csp.signed_fields.contains(&(v, n.clone()))
+            })
+        })
     }
 }
 
