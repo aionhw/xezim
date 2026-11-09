@@ -3060,9 +3060,16 @@ impl Simulator {
                         (self.eval_ident_handle(head).unwrap_or(0), 1)
                     };
                     let last_seg = hier.path.len() - 1;
+                    // The object holding the receiver property, when the walk
+                    // reaches the receiver itself (for its declared
+                    // specialization if the receiver is null).
+                    let mut receiver_owner: Option<usize> = None;
                     for (si, seg) in hier.path[loop_start..last_seg].iter().enumerate() {
                         if handle == 0 {
                             break;
+                        }
+                        if loop_start + si + 1 == last_seg {
+                            receiver_owner = Some(handle);
                         }
                         // §19.8: `cg.cp.get_coverage()` — the walk reached a
                         // covergroup and the next segment names one of its
@@ -3108,8 +3115,18 @@ impl Simulator {
                             if self.is_static_method(&base_cls, method_name) {
                                 // §8.25: seed the specialization context from
                                 // the declared type, as the 2-segment arm does.
-                                let saved = self
-                                    .spec_for_null_receiver(None, &decl_full)
+                                // A property declared `P #(8) p8` names its
+                                // specialization in the owner's property
+                                // table, not in the flat type text.
+                                let owner_spec = receiver_owner.and_then(|o| {
+                                    self.cast_dest_property_type(
+                                        o,
+                                        &hier.path[last_seg - 1].name.name,
+                                    )
+                                    .and_then(|(_, spec, _)| spec)
+                                });
+                                let saved = owner_spec
+                                    .or_else(|| self.spec_for_null_receiver(None, &decl_full))
                                     .map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
                                 let res = self.exec_static_method_via_object(
                                     &base_cls,
@@ -3196,7 +3213,20 @@ impl Simulator {
                             .flatten()
                             .and_then(|th| self.prop_class_type(th, obj_name))
                     });
-                    let base_cls = if handle != 0 {
+                    // §8.23: a static method is not virtual, so when the
+                    // DECLARED class's chain declares it, a live receiver of a
+                    // derived class still runs the declared class's method
+                    // (a derived class's same-named static hides it only for
+                    // receivers declared as the derived class).
+                    let declared_static = handle != 0
+                        && self
+                            .class_member_names()
+                            .static_methods
+                            .contains(method_name.as_str())
+                        && decl_cls_opt.as_ref().is_some_and(|d| {
+                            self.is_static_method(d.split('#').next().unwrap_or(d), method_name)
+                        });
+                    let base_cls = if handle != 0 && !declared_static {
                         self.heap
                             .get(handle)
                             .and_then(|o| o.as_ref())
