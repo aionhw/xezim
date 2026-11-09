@@ -169,6 +169,78 @@ endmodule",
     assert_line(&msgs, "r1=12 r2=78 r3=9a");
 }
 
+/// The packed elements are packed structs: the element type adds no packed
+/// dimension, so a select of one struct is the element width over the
+/// array's element count, and a further select goes inside the struct.
+#[test]
+fn packed_struct_elements() {
+    let msgs = messages(
+        "package q; typedef struct packed { logic [31:0] pc; logic [7:0] m; } ent_t; endpackage
+module t;
+  typedef struct packed { logic [31:0] pc; logic [7:0] m; } le_t;
+  logic clk = 0;
+  q::ent_t [1:0] a [2];
+  le_t [0:1] u [2];
+  le_t [1:0] b [2][2];
+  le_t [2:1] o [1:2];
+  struct packed { logic [15:0] x; logic [7:0] y; } [1:0] c [2];
+  logic [39:0] r1, r2, r3, r4; logic [23:0] r5; logic [3:0] r6; logic r7; logic [7:0] r8; logic [39:0] r9; logic eq;
+  int i = 1, j = 0;
+  initial begin
+    a[0] = {40'hDEAD0000A5, 40'h1122334455};
+    u[1] = {40'hABCDEF0123, 40'h4567890ABC};
+    b[1][0] = {40'h0102030405, 40'hA0B0C0D0E0};
+    c[1] = {24'h123456, 24'h789ABC};
+    o[2] = {40'h1111111111, 40'h2222222222};
+    #1 clk = 1;
+    #1 $display(\"r1=%h r2=%h r3=%h r4=%h r5=%h r6=%h r7=%b r8=%h r9=%h eq=%b\",
+                r1, r2, r3, r4, r5, r6, r7, r8, r9, eq);
+  end
+  always @(posedge clk) begin
+    r1 = a[0][1]; r2 = a[j][i - 1]; r3 = u[1][0]; r4 = b[1][0][0];
+    r5 = c[i][j]; r6 = a[0][1][7:4]; r7 = a[0][0][0]; r8 = a[0][1].m; r9 = o[2][1];
+    eq = a[0][1] === 40'hDEAD0000A5;
+  end
+endmodule",
+    );
+    assert_line(
+        &msgs,
+        "r1=dead0000a5 r2=1122334455 r3=abcdef0123 r4=a0b0c0d0e0 r5=789abc r6=a r7=1 r8=a5 r9=2222222222 eq=1",
+    );
+}
+
+/// Inline struct types whose packed ranges are recorded: a select of one
+/// struct, a row of structs and a struct inside a row, with constant and
+/// run-time indices, in a block of its own so it stays compiled.
+#[test]
+fn struct_elements_with_recorded_ranges() {
+    let msgs = messages(
+        "module t;
+  logic clk = 0;
+  struct packed { logic [31:0] pc; logic [7:0] m; } [0:1] x [2];
+  struct packed { logic [31:0] pc; logic [7:0] m; } [2:1] z [2];
+  struct packed { logic [15:0] p; logic [7:0] q; } [1:0][1:0] y [2];
+  logic [39:0] r1, r2, r3; logic [47:0] r4; logic [23:0] r5; logic [3:0] r6; logic eq;
+  int i = 1, j = 0;
+  initial begin
+    x[1] = {40'hABCDEF0123, 40'h4567890ABC};
+    z[0] = {40'h1111111111, 40'h2222222222};
+    y[1] = {24'h010203, 24'h040506, 24'h0708A9, 24'h0BCDEF};
+    #1 clk = 1;
+    #1 $display(\"r1=%h r2=%h r3=%h r4=%h r5=%h r6=%h eq=%b\", r1, r2, r3, r4, r5, r6, eq);
+  end
+  always @(posedge clk) begin
+    r1 = x[1][0]; r2 = x[i][i]; r3 = z[0][2]; r4 = y[1][1]; r5 = y[i][j][i];
+    r6 = x[1][0][7:4]; eq = z[j][1] === 40'h2222222222;
+  end
+endmodule",
+    );
+    assert_line(
+        &msgs,
+        "r1=abcdef0123 r2=4567890abc r3=1111111111 r4=010203040506 r5=0708a9 r6=2 eq=1",
+    );
+}
+
 /// Guard: selects that already read right in compiled code.
 #[test]
 fn selects_that_already_work() {
