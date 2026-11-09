@@ -83,6 +83,36 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   nested member of a generate block's variable (`q[2]`, `o.in`, `l[1].t[1]`)
   from its declared type (§7.2, §21.2.1.7, §27, #952).
 
+* An assignment pattern written to a row of a multi-dimensional unpacked array
+  assigns each element of the row, in a blocking store and in a continuous
+  assignment: `c[0] = '{V, V}` on `logic [39:0] c [2][2]` and `assign c[0] =
+  '{a, b};` left the row x. Rows of struct elements are spread too (§10.9.1,
+  §10.10, §7.6, §10.3, #999, contributed by chuanseng-ng).
+
+* A nonblocking store, a continuous assignment or a delayed nonblocking store
+  to a packed struct element of an unpacked array writes the whole struct:
+  `b[0][1] <= v` on `le_t [1:0] b [2]` kept one bit, and a row of two structs
+  kept two (§7.4.1, §7.4.5, §10.4.2, §10.3, #997, contributed by
+  chuanseng-ng).
+
+* A packed element selected inside an unpacked array's element reads right in
+  compiled code: `d[1][0]` on `logic [1:0][7:0] d [2]` is the low byte of
+  `d[1]`, for queues, dynamic arrays, run-time indices and arrays of packed
+  structs. It read `0X` or one bit. A three-dimensional array element at
+  run-time indices read `000X`, and an x or z literal index read element 0
+  instead of x (§7.4.1, §7.4.5, §11.5.1, #985, contributed by chuanseng-ng).
+
+* `always_comb` and `always @*` follow a whole read of an unpacked struct that
+  is a continuous copy of another (`assign q = p; always_comb c = q;`), of an
+  element of an unpacked struct array (`c = pa[0]`) and of the whole array;
+  they missed every change after time zero (§9.2.2.2, §9.4.2.2, §7.2, #991,
+  contributed by ds54e).
+
+* A store to an element of a multi-dimensional packed member of a struct array
+  element (`sa[1].f0[3][7] = v`) was dropped, a nonblocking one kept one bit,
+  and the same select in compiled code took one bit (§7.4.1, §7.2, §10.4.2,
+  #984).
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
