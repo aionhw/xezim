@@ -15839,6 +15839,14 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Paren(inner) => self.compile_expr_typed(inner, ctx_width, unsigned_context),
             ExprKind::Index { expr, index } => {
+                // §13.4.1, §7.4.1: two or more indices into a packed-array
+                // member of a call result (`mk().f0[i][j]`) have no shape
+                // here: past the first, each was a bit select of the
+                // element. The AST path takes the member's dimensions.
+                if matches!(&expr.kind, ExprKind::Index { .. }) && chain_has_call_base(expr) {
+                    self.bail("call_member_index_chain");
+                    return None;
+                }
                 // Step 8 (string formals): a select on a string formal takes
                 // the interpreter's char-select path (`string_signals`
                 // registry, out-of-range → NUL byte, not X) — bail. An index
@@ -30509,6 +30517,16 @@ pub(crate) fn system_function_is_real(name: &str) -> bool {
             | "$acosh"
             | "$atanh"
     )
+}
+
+/// Whether a member/select chain is rooted at a call (`mk().f0[1]`).
+fn chain_has_call_base(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {
+            matches!(expr.kind, ExprKind::Call { .. }) || chain_has_call_base(expr)
+        }
+        _ => false,
+    }
 }
 
 /// IEEE 1800-2017 §20/§21 result type of a system FUNCTION as (width,

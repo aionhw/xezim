@@ -25,6 +25,74 @@ impl Simulator {
         Some(self.struct_member_signed(&base, field))
     }
 
+    /// `base[index]` where the index chain ends in a member of a packed
+    /// struct that is a call result: the element its packed dimensions
+    /// (the member's declared ones, through its typedef) address, x for an
+    /// x/z or out-of-range index (§11.5.1). None for any other shape.
+    fn call_member_elem_select(&mut self, base: &Expression, index: &Expression) -> Option<Value> {
+        let mut idx: Vec<&Expression> = vec![index];
+        let mut cur = base;
+        while let ExprKind::Index { expr: b, index: i2 } = &cur.kind {
+            idx.push(i2);
+            cur = b;
+        }
+        let ExprKind::MemberAccess { expr: sb, member } = &cur.kind else {
+            return None;
+        };
+        let su = self.chain_base_packed_struct(sb)?;
+        let m_dt = su
+            .members
+            .iter()
+            .find(|m| m.declarators.iter().any(|d| d.name.name == member.name))?
+            .data_type
+            .clone();
+        let params = &self.module.parameters;
+        let dims = super::elaborate::packed_member_meta(
+            &m_dt,
+            params,
+            &self.module.typedefs,
+            &self.module.typedef_types,
+        )
+        .1
+        .or_else(|| Self::packed_dim_bounds(&m_dt, params))?;
+        if dims.len() < idx.len() {
+            return None;
+        }
+        let base_v = self.eval_expr(cur);
+        let mut w = base_v.width as u64;
+        let mut lsb = 0u64;
+        let mut known = true;
+        for (k, ie) in idx.iter().rev().enumerate() {
+            let (l, r) = dims[k];
+            let count = (l - r).unsigned_abs() + 1;
+            if w % count != 0 {
+                return None;
+            }
+            w /= count;
+            let iv = self.eval_expr(ie);
+            let off = (!iv.has_xz())
+                .then(|| iv.to_i64())
+                .flatten()
+                .map(|i| i - l.min(r))
+                .filter(|&o| o >= 0 && (o as u64) < count);
+            match off {
+                Some(o) if known => {
+                    let slot = if l >= r {
+                        o as u64
+                    } else {
+                        count - 1 - o as u64
+                    };
+                    lsb += slot * w;
+                }
+                _ => known = false,
+            }
+        }
+        if !known {
+            return Some(Value::new(w.max(1) as u32));
+        }
+        Some(base_v.range_select((lsb + w - 1) as usize, lsb as usize))
+    }
+
     /// Outlined from `eval_expr_ctx` (see `exec_stmt_blocking_assign`): keeps
     /// the dispatcher's stack frame small.
     #[inline(never)]
@@ -5874,6 +5942,15 @@ impl Simulator {
                             }
                         };
                     }
+                }
+                // §13.4.1, §7.4.1: an element of a packed-array member of a
+                // call result (`mk().f0[i]`, `set(a).f0[i][j][k]`). The
+                // name-keyed shapes below know no call value, so each index
+                // was a bit select of the member.
+                if Self::chain_has_call_base(expr)
+                    && let Some(v) = self.call_member_elem_select(expr, index)
+                {
+                    return v;
                 }
                 // §7.4.1: MULTI-LEVEL packed element select — `x[i][j]` on
                 // `T [0:0][1:0] x;` peels the whole index chain against the
