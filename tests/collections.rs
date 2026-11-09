@@ -321,3 +321,5 @@ mod assoc_elem_select_read;
 mod assoc_packed_elem;
 #[path = "collections/unpacked_row_pattern_store.rs"]
 mod unpacked_row_pattern_store;
+#[path = "collections/unpacked_row_pattern_followups.rs"]
+mod unpacked_row_pattern_followups;
