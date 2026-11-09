@@ -653,6 +653,8 @@ mod body_typedef_first_instance_680;
 
 #[path = "types/return_expr_context_width.rs"]
 mod return_expr_context_width;
+#[path = "types/return_expr_unary_context_width.rs"]
+mod return_expr_unary_context_width;
 #[path = "types/type_param_header_defaults.rs"]
 mod type_param_header_defaults;
 
