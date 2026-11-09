@@ -44,3 +44,38 @@ endmodule"#,
     );
     assert_lines(&msgs, &["r1=xx r2=xx c1=xx c2=xx"]);
 }
+
+/// §7.4.1, §7.4.5: an element of a three-dimensional unpacked array read at
+/// run-time indices, whole, by bit, by part-select, or by packed element, in
+/// an `always` block. It read bits of the array's placeholder.
+#[test]
+fn three_dimensional_elements_at_run_time_indices() {
+    let msgs = messages(
+        r#"module t;
+  logic clk = 0;
+  logic [15:0] a3 [2][2][2];
+  logic [1:0][7:0] p3 [2][0:1][2];
+  int i, j, k, b;
+  logic [15:0] r1;
+  logic r2;
+  logic [3:0] r3;
+  logic [7:0] r4, r5;
+  wire [15:0] c1 = a3[i][j][k];
+  always @(posedge clk) begin
+    r1 = a3[i][j][k];
+    r2 = a3[i][j][k][b];
+    r3 = a3[i][1][k][b +: 4];
+    r4 = p3[i][j][k][1];
+    r5 = p3[1][j][1][0];
+  end
+  initial begin
+    a3[1][1][1] = 16'h1234;
+    p3[1][1][1] = 16'habcd;
+    i = 1; j = 1; k = 1; b = 4;
+    #1 clk = 1;
+    #1 $display("r1=%h r2=%b r3=%h r4=%h r5=%h c1=%h", r1, r2, r3, r4, r5, c1);
+  end
+endmodule"#,
+    );
+    assert_lines(&msgs, &["r1=1234 r2=1 r3=3 r4=ab r5=cd c1=1234"]);
+}
