@@ -778,17 +778,32 @@ impl Simulator {
         let EventControl::EventExpr(terms) = event else {
             return None;
         };
-        // Plain value-change lists (`@(a or b)`, no edge, no `iff`) keep
-        // `class_prop_value_change_cond`.
-        if terms.iter().all(|t| t.edge.is_none() && t.iff.is_none()) {
+        // A plain value change of one operand (`@x`, no edge, no `iff`) keeps
+        // `class_prop_value_change_cond` or the signal path.
+        let plain = terms.iter().all(|t| t.edge.is_none() && t.iff.is_none());
+        if plain && terms.len() == 1 {
             return None;
         }
-        // §9.4.2: every term of an `or` list must be such an operand; validate
-        // them all before arming any snapshot. A list naming a real signal
-        // keeps the signal-sensitivity path.
+        // §9.4.2: validate every term of an `or` list before arming any
+        // snapshot. A list of real signals keeps the signal-sensitivity path.
+        let mut props = 0;
         for t in terms {
-            if !self.edge_wait_operand(&t.expr) {
-                return None;
+            if self.edge_wait_operand(&t.expr) {
+                props += 1;
+            }
+        }
+        if props == 0 || (plain && props == terms.len()) {
+            return None;
+        }
+        // A list MIXING such operands with signals (`@(posedge clk or posedge
+        // h.rst)`) is one wait on all of them: a signal term is armed by its
+        // value like the rest, which is only sound for a plain variable or
+        // net — not an event, a clocking block or a cell placeholder.
+        if props < terms.len() {
+            for t in terms {
+                if !self.edge_wait_operand(&t.expr) && !self.plain_signal_term(t) {
+                    return None;
+                }
             }
         }
         let mut conds = Vec::with_capacity(terms.len());
@@ -816,6 +831,22 @@ impl Simulator {
         }))
     }
 
+    /// Is the event term `t` a plain signal operand whose value the
+    /// condition-waiter machinery can sample?
+    fn plain_signal_term(&self, t: &crate::ast::stmt::EventExpr) -> bool {
+        let ev = EventControl::EventExpr(vec![t.clone()]);
+        if self.is_clocking_event(&ev) {
+            return false;
+        }
+        let sens = self.event_to_sens(&ev);
+        !sens.is_empty()
+            && sens.iter().all(|s| {
+                s.value_of.is_none()
+                    && self.signal_name_to_id.contains_key(s.signal_name.as_str())
+                    && !self.module.events.contains(s.signal_name.as_str())
+            })
+    }
+
     /// A term usable as an edge-sensitive value-change wait: something with no
     /// backing signal that the condition-waiter machinery can re-evaluate — a
     /// property of `this` or of a class handle, a static member, or a local of
@@ -840,6 +871,33 @@ impl Simulator {
             return false;
         }
         if let Some((h, f)) = self.expr_handle_prop_any(e) {
+            return !self.class_prop_is_event(h, &f);
+        }
+        // §9.4.2/§11.5.1: an edge on a SELECT of such an operand
+        // (`@(posedge bus[1])`) is detected on the selected value. The
+        // select-free name tiers below never matched it, so it fell to the
+        // signal path, armed on nothing and returned at once.
+        match &e.kind {
+            ExprKind::Paren(inner) => return self.edge_wait_operand(inner),
+            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
+                return self.edge_select_base(base);
+            }
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && !h.path[0].selects.is_empty() =>
+            {
+                return self.class_operand_name(&h.path[0].name.name);
+            }
+            _ => {}
+        }
+        // A property reached through a selected or nested receiver
+        // (`@(posedge subs[1].clk)`, `@(posedge b.sub.clk)`): the receiver is
+        // evaluated now, as §9.4.2 samples the event expression when the wait
+        // executes. Only a chain rooted at a class handle qualifies; one
+        // through a virtual interface keeps the signal path (§25.9).
+        if self.chain_rooted_at_handle(e)
+            && !self.chain_may_name_vif(e)
+            && let Some((h, f)) = self.expr_instance_prop_field_general(e)
+        {
             return !self.class_prop_is_event(h, &f);
         }
         // `h.STATIC` — the receiver is a class handle, but a static property
@@ -903,6 +961,93 @@ impl Simulator {
             || self.signals.contains_key(name.as_str())
     }
 
+    /// The operand of a select in an edge wait (`bus` of `bus[1]`, `subs[1].v`
+    /// of `subs[1].v[3:0]`): a class property, static or procedural local —
+    /// never a module signal or memory, whose selects `event_to_sens` arms.
+    fn edge_select_base(&mut self, base: &Expression) -> bool {
+        match &base.kind {
+            ExprKind::Paren(inner) => self.edge_select_base(inner),
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                self.edge_select_base(expr)
+            }
+            ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+                self.class_operand_name(&h.path[0].name.name)
+            }
+            ExprKind::This => false,
+            _ => self.edge_wait_operand(base),
+        }
+    }
+
+    /// Does the bare `name` denote a procedural local, a property of `this`
+    /// or a static class member, with no signal behind it?
+    fn class_operand_name(&self, name: &str) -> bool {
+        if self.local_stack.iter().any(|f| f.contains_key(name)) {
+            return true;
+        }
+        if self.signal_name_to_id.contains_key(name) {
+            return false;
+        }
+        self.this_stack
+            .last()
+            .copied()
+            .flatten()
+            .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+            .is_some_and(|inst| inst.properties.contains_key(name))
+            || self
+                .class_context_stack
+                .last()
+                .and_then(|c| c.as_deref())
+                .is_some_and(|c| self.static_prop_key(c, name).is_some())
+    }
+
+    /// Is `e` a member chain (`a.b`, `a[i].b`, `this.a[i].b`) whose root is
+    /// `this` or a name holding a class handle, with a select or more than
+    /// one hop below it — the shapes only `expr_instance_prop_field_general`
+    /// resolves?
+    fn chain_rooted_at_handle(&self, e: &Expression) -> bool {
+        // `this`, a handle, or a property / local holding a collection of
+        // handles (`subs` of `subs[1].clk`).
+        let root_ok = |me: &Self, n: &str| {
+            n == "this"
+                || n == "super"
+                || me.class_operand_name(n)
+                || me.eval_ident_handle(n).is_some_and(|h| h != 0)
+        };
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                h.root.is_none()
+                    && h.path.len() >= 2
+                    && (h.path.len() > 2 || !h.path[0].selects.is_empty())
+                    && h.path.last().is_some_and(|s| s.selects.is_empty())
+                    && h.path[1..h.path.len() - 1]
+                        .iter()
+                        .all(|s| s.selects.len() <= 1)
+                    && root_ok(self, &h.path[0].name.name)
+            }
+            ExprKind::MemberAccess { expr, .. } => {
+                let mut cur = expr.as_ref();
+                let mut nested = false;
+                loop {
+                    match &cur.kind {
+                        ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {
+                            nested = true;
+                            cur = expr;
+                        }
+                        ExprKind::Paren(inner) => cur = inner,
+                        ExprKind::This => return nested,
+                        ExprKind::Ident(h) => {
+                            return (nested || h.path.len() > 1 || !h.path[0].selects.is_empty())
+                                && h.root.is_none()
+                                && root_ok(self, &h.path[0].name.name);
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Arm `expr` and return the condition that becomes true on the `code`
     /// transition (1 = posedge, 2 = negedge, 3 = any edge, 0 = any change)
     /// while the optional `iff` guard holds.
@@ -943,6 +1088,16 @@ impl Simulator {
     }
 
     pub(super) fn value_change_cond(&mut self, expr: Expression) -> Expression {
+        // §25.9: a virtual-interface variable's value is the instance it
+        // refers to (`@(cfg.vif)`), which its plain read does not carry.
+        let expr = if !self.module.interfaces.is_empty()
+            && !matches!(&expr.kind, ExprKind::SystemCall { name, .. } if name == VIF_VALUE_MARKER)
+            && self.vif_handle_term(&expr)
+        {
+            Self::vif_value_expr(expr)
+        } else {
+            expr
+        };
         let val = self.eval_expr(&expr);
         let idx = self.intra_saved_next;
         self.intra_saved_next += 1;
@@ -1088,16 +1243,6 @@ impl Simulator {
             self.this_stack.last().copied().flatten()?
         } else if let Some(h) = self.eval_ident_handle(segs[0]) {
             i = 1;
-        // §25.9: a virtual-interface variable's value is the instance it
-        // refers to (`@(cfg.vif)`), which its plain read does not carry.
-        let expr = if !self.module.interfaces.is_empty()
-            && !matches!(&expr.kind, ExprKind::SystemCall { name, .. } if name == VIF_VALUE_MARKER)
-            && self.vif_handle_term(&expr)
-        {
-            Self::vif_value_expr(expr)
-        } else {
-            expr
-        };
             h
         } else if self.this_stack.last().copied().flatten().is_some() {
             // Class-scope shorthand: `bus.clk_i` inside a method is

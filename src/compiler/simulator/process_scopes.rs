@@ -2430,7 +2430,12 @@ impl Simulator {
                                     self.forever_sens_cache
                                         .insert(key, (resolved.clone(), is_clk_ev));
                                 }
-                                if sens.is_empty() {
+                                // A term naming no signal (`@(posedge clk or
+                                // posedge h.rst)`, a class property) needs the
+                                // general path, which arms it by value: a
+                                // waiter on the resolved terms alone never
+                                // saw it change (§9.4.2).
+                                if sens.is_empty() || (!is_star && resolved.len() != sens.len()) {
                                     (Vec::new(), is_clk_ev)
                                 } else {
                                     (resolved, is_clk_ev)
