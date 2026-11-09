@@ -694,3 +694,5 @@ mod packed_struct_elem_store_width;
 mod unpacked_elem_packed_select_read;
 #[path = "types/unpacked_elem_select_followups.rs"]
 mod unpacked_elem_select_followups;
+#[path = "types/struct_array_member_elem_select.rs"]
+mod struct_array_member_elem_select;
