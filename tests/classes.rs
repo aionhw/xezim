@@ -135,6 +135,8 @@ mod randomize_assoc_joint_solve;
 mod randomize_assoc_keys_joint_solve;
 #[path = "classes/randomize_failure_diag.rs"]
 mod randomize_failure_diag;
+#[path = "classes/randomize_unsigned_reads_and_products.rs"]
+mod randomize_unsigned_reads_and_products;
 #[path = "classes/static_fixed_array_storage.rs"]
 mod static_fixed_array_storage;
 #[path = "classes/static_param_class_collection_reuse.rs"]
