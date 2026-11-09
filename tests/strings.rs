@@ -85,6 +85,8 @@ mod percent_p_string_values;
 mod ref_arg_assoc_writeback;
 #[path = "strings/ref_arg_collection_writeback.rs"]
 mod ref_arg_collection_writeback;
+#[path = "strings/review_vpi_unlabelled_block_data.rs"]
+mod review_vpi_unlabelled_block_data;
 #[path = "strings/string_eq_relational_2state.rs"]
 mod string_eq_relational_2state;
 #[path = "strings/string_index_write_frame_local.rs"]
