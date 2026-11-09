@@ -680,3 +680,5 @@ mod function_local_ascending_packed;
 mod nonansi_typedef_packed_port_942;
 #[path = "types/two_state_local_in_fallback.rs"]
 mod two_state_local_in_fallback;
+#[path = "types/unpacked_elem_packed_select_read.rs"]
+mod unpacked_elem_packed_select_read;
