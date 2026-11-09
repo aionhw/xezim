@@ -120,6 +120,7 @@ package pkg;
   typedef bit [7:0] byte_t;
   typedef bit [0:7] ascend_t;   // ascending labels mirror the bit order
 endpackage
+import pkg::*;
 
 class holder;
   typedef bit [7:0] loc_t;      // class-local alias
@@ -183,6 +184,7 @@ package pkg;
   typedef enum bit {E_ZERO, E_ONE} e_t;
   typedef enum bit [2:0] {C_A = 3'd1, C_B = 3'd5} code_t;
 endpackage
+import pkg::*;
 
 class cfg;
   e_t    [1:0] pvec;   // packed: two 1-bit elements
