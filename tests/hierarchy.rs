@@ -185,6 +185,8 @@ mod prepared_body_key;
 mod repro_import;
 #[path = "hierarchy/resource_pool_scope_lookup.rs"]
 mod resource_pool_scope_lookup;
+#[path = "hierarchy/review_block_implicit_nets.rs"]
+mod review_block_implicit_nets;
 #[path = "hierarchy/review_disable_block_paths.rs"]
 mod review_disable_block_paths;
 #[path = "hierarchy/review_generate_typedef_in_instance.rs"]
