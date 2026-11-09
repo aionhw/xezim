@@ -1158,6 +1158,8 @@ mod packed_struct_array_property_928;
 mod review_940_constraint_memos;
 #[path = "classes/review_940_process_status.rs"]
 mod review_940_process_status;
+#[path = "classes/review_979_modulo_bounds.rs"]
+mod review_979_modulo_bounds;
 #[path = "classes/static_shadow_write_944.rs"]
 mod static_shadow_write_944;
 #[path = "classes/vif_collection_formals_925.rs"]
