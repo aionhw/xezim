@@ -989,6 +989,10 @@ impl Simulator {
             self.jit_nba_side_len = 0;
         }
         self.collapse_identity_port_nets();
+        // §9.2.2.2 / §7.2: identity copies re-point member names at their
+        // sources. Build whole-struct sensitivity after the final collapse,
+        // or it waits on the old member ids, which no longer change.
+        self.unpacked_struct_sens = self.build_unpacked_struct_sens();
         mark_compile_phase("identity port-net collapse", &mut compile_phase_start);
         self.compile_edge_blocks();
         self.drop_compiled_edge_block_asts();

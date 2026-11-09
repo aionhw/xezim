@@ -4796,7 +4796,6 @@ impl Simulator {
             in_pre_process_settle: false,
         };
         sim.unpacked_struct_leaves = sim.build_unpacked_struct_leaves();
-        sim.unpacked_struct_sens = sim.build_unpacked_struct_sens();
         sim.has_coll_rows = !sim.module.coll_shapes.is_empty()
             || sim
                 .module
