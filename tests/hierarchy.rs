@@ -143,6 +143,8 @@ mod nonansi_port_expressions;
 mod nonansi_port_redeclaration;
 #[path = "hierarchy/nonansi_ports_and_vif_accessors.rs"]
 mod nonansi_ports_and_vif_accessors;
+#[path = "hierarchy/nonansi_struct_port_member_select.rs"]
+mod nonansi_struct_port_member_select;
 #[path = "hierarchy/nonansi_wildcard_placeholders.rs"]
 mod nonansi_wildcard_placeholders;
 #[path = "hierarchy/nonzero_lsb_port_select.rs"]
