@@ -11508,20 +11508,11 @@ impl<'a> BytecodeCompiler<'a> {
             return Some(dest);
         }
         let root = self.compile_expr_root_of(base)?;
-        let hi_reg = if width == 1 {
-            lo_reg
-        } else {
-            let wm1 = self.alloc_reg();
-            self.emit(Insn::LoadConst(
-                wm1,
-                Box::new(Value::from_u64((width - 1) as u64, 32)),
-            ));
-            let h = self.alloc_reg();
-            self.emit(Insn::Add(h, lo_reg, wm1));
-            h
-        };
+        // §11.5.1: `lo +: width`, so an x/z index reads x at the element's
+        // width; a computed upper bound is x as well and lost it (`00x`
+        // for `s.f0[i][j]` of 3-bit elements).
         let dest = self.alloc_reg();
-        self.emit(Insn::RangeSelect(dest, root, hi_reg, lo_reg));
+        self.emit(Insn::RangeSelectW(dest, root, lo_reg, width as u32, true));
         Some(dest)
     }
 
@@ -16187,15 +16178,9 @@ impl<'a> BytecodeCompiler<'a> {
                             return Some(dest);
                         }
                         let base = self.compile_expr(expr, 0)?;
-                        let em1_reg = self.alloc_reg();
-                        self.emit(Insn::LoadConst(
-                            em1_reg,
-                            Box::new(Value::from_u64((elem_w - 1) as u64, 32)),
-                        ));
-                        let hi_reg = self.alloc_reg();
-                        self.emit(Insn::Add(hi_reg, lo_reg, em1_reg));
+                        // §11.5.1: an x/z index reads x at the element's width.
                         let dest = self.alloc_reg();
-                        self.emit(Insn::RangeSelect(dest, base, hi_reg, lo_reg));
+                        self.emit(Insn::RangeSelectW(dest, base, lo_reg, elem_w, true));
                         return Some(dest);
                     }
                 }
