@@ -3921,16 +3921,66 @@ impl Simulator {
     /// path leaves unselected when it still names an unpacked array — all of
     /// a member's dimensions for `s.mm`, the inner ones for `s.mm[1]` — so
     /// `%p`, `$bits` and pattern assignment see the whole sub-array.
+    /// §27.6: a generate block's variable is keyed by its scope (`g.q`,
+    /// `l[0].q`), so the declared base of a flat path may span several
+    /// segments: the shortest dotted prefix, its trailing selects counted,
+    /// that names a declared variable, then the rest as `split_flat_path`
+    /// gives it.
+    fn flat_path_scoped_segs(&self, flat: &str) -> Option<Vec<(String, usize)>> {
+        let mut depth = 0usize;
+        let ends = flat
+            .char_indices()
+            .filter(|&(_, c)| {
+                match c {
+                    '[' => depth += 1,
+                    ']' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                c == '.' && depth == 0
+            })
+            .map(|(i, _)| i)
+            .skip(1)
+            .chain(std::iter::once(flat.len()));
+        for end in ends {
+            let mut key = &flat[..end];
+            let mut selects = 0usize;
+            while key.ends_with(']') {
+                let mut d = 0usize;
+                let open = key.char_indices().rev().find_map(|(i, c)| {
+                    match c {
+                        ']' => d += 1,
+                        '[' => d -= 1,
+                        _ => {}
+                    }
+                    (d == 0).then_some(i)
+                })?;
+                key = &key[..open];
+                selects += 1;
+            }
+            if self.module.var_decl_types.contains_key(key) {
+                let mut segs = vec![(key.to_string(), selects)];
+                if end < flat.len() {
+                    segs.extend(Self::split_flat_path(&flat[end + 1..]));
+                }
+                return Some(segs);
+            }
+        }
+        None
+    }
+
     pub(super) fn flat_path_type(&self, flat: &str) -> Option<(DataType, Option<Vec<Vec<i64>>>)> {
         // Without a select the first segment is the text before the first
         // `.`; a base with no declared type answers None before any split.
         if !flat.as_bytes().contains(&b'[') {
             let base = flat.split('.').next().unwrap_or(flat);
-            if !self.module.var_decl_types.contains_key(base) {
+            if !self.module.var_decl_types.contains_key(base) && base.len() == flat.len() {
                 return None;
             }
         }
-        let segs = Self::split_flat_path(flat);
+        let mut segs = Self::split_flat_path(flat);
+        if !self.module.var_decl_types.contains_key(&segs.first()?.0) {
+            segs = self.flat_path_scoped_segs(flat)?;
+        }
         let (base, base_idx) = segs.first()?.clone();
         // For an array (or associative array) this is already the ELEMENT type.
         let mut dt = self.module.var_decl_types.get(&base)?.clone();
