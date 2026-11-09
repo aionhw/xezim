@@ -11666,6 +11666,31 @@ impl<'a> BytecodeCompiler<'a> {
         Some((dims, labelled))
     }
 
+    /// True for a chain `base[index]` over an unpacked array of three or
+    /// more dimensions where no constant prefix of the indices names a
+    /// stored element (`a3[i][j][k]`, `a3[i][j][k][b]`): elements are
+    /// separate signals reached by their flat names, and a run-time index
+    /// has none.
+    fn nd_chain_names_no_element(&self, base: &Expression, index: &Expression) -> bool {
+        let Some((hier, idxs)) = self.flatten_index_chain_exprs(base, index) else {
+            return false;
+        };
+        let n = idxs.len();
+        if n < 2 || !self.is_multi_dim_array(hier) || self.arrays_2d_entry(hier).is_some() {
+            return false;
+        }
+        if self.multi_dim_elem_signal_id(base, index).is_some() {
+            return false;
+        }
+        !(1..n).any(|k| match Self::chain_prefix(base, n - 1 - k) {
+            Some(Expression {
+                kind: ExprKind::Index { expr, index },
+                ..
+            }) => self.multi_dim_elem_signal_id(expr, index).is_some(),
+            _ => false,
+        })
+    }
+
     /// A literal with x or z bits (`'x`, `2'b1z`), possibly parenthesized.
     fn is_xz_literal(&self, e: &Expression) -> bool {
         match &e.kind {
@@ -16279,6 +16304,15 @@ impl<'a> BytecodeCompiler<'a> {
                     let dest = self.alloc_reg();
                     self.emit(Insn::LoadSignal(dest, as_sig_id(id)));
                     return Some(dest);
+                }
+                // §7.4.1, §7.4.5: the AST fallback the note above relies on
+                // was never reached for three or more dimensions: no arm
+                // below matches, and the bit select at the end took
+                // `a3[i][j][k]` as bits of the array's placeholder signal
+                // (`000X`), and `a3[i][j][k][b]` as one of them.
+                if self.nd_chain_names_no_element(expr, index) {
+                    self.bail("nd_unpacked_dyn_index");
+                    return None;
                 }
                 // Array element access
                 if let ExprKind::Ident(hier) = &expr.kind {
