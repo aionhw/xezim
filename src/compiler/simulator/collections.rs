@@ -324,6 +324,80 @@ impl Simulator {
         expr: &Expression,
         index: &Expression,
     ) -> Option<Value> {
+        let (packed, _) = self.assoc_elem_select_dims(expr)?;
+        let elem = self.eval_expr(expr);
+        let Some(dims) = packed else {
+            return Some(match self.eval_expr(index).to_index() {
+                Some(i) if i >= 0 && (i as u32) < elem.width => elem.bit_select(i as usize),
+                _ => Value::new(1),
+            });
+        };
+        let (dl, dr) = dims[0];
+        let stride: i64 = dims[1..].iter().map(|&(l, r)| (l - r).abs() + 1).product();
+        let (lo, hi) = (dl.min(dr), dl.max(dr));
+        let Some(i) = self
+            .eval_expr(index)
+            .to_index()
+            .filter(|i| (lo..=hi).contains(i))
+        else {
+            return Some(Value::new(stride.max(1) as u32));
+        };
+        let slot = if dl >= dr { i - lo } else { hi - i };
+        let lsb = (slot * stride) as usize;
+        Some(elem.range_select(lsb + stride as usize - 1, lsb))
+    }
+
+    /// §7.4.6, §11.5.1: a part-select of an associative array element whose
+    /// packed type has more than one dimension selects whole elements of the
+    /// leading packed dimension: `p[k][3:2]` of `logic [3:0][7:0] p [int]` is
+    /// bytes 3 and 2 of `p[k]` (`[a+:w]` / `[a-:w]` likewise). A
+    /// one-dimensional element keeps the plain bit part-select. None when
+    /// `expr` does not name such an element.
+    pub(super) fn assoc_elem_range_read(
+        &mut self,
+        expr: &Expression,
+        left: &Expression,
+        right: &Expression,
+        kind: RangeKind,
+    ) -> Option<Value> {
+        let (Some(dims), _) = self.assoc_elem_select_dims(expr)? else {
+            return None;
+        };
+        if dims.len() < 2 {
+            return None;
+        }
+        let (dl, dr) = dims[0];
+        let stride: i64 = dims[1..].iter().map(|&(l, r)| (l - r).abs() + 1).product();
+        let (lo, hi) = (dl.min(dr), dl.max(dr));
+        let a = self.eval_expr(left).to_index();
+        let b = self.eval_expr(right).to_index();
+        let (i1, i2) = match (kind, a, b) {
+            (RangeKind::Constant, Some(a), Some(b)) => (a, b),
+            (RangeKind::IndexedUp, Some(a), Some(w)) if w > 0 => (a, a + w - 1),
+            (RangeKind::IndexedDown, Some(a), Some(w)) if w > 0 => (a - w + 1, a),
+            _ => return Some(Value::new(stride.max(1) as u32)),
+        };
+        let count = (i1 - i2).abs() + 1;
+        if ![i1, i2].iter().all(|i| (lo..=hi).contains(i)) {
+            return Some(Value::new((count * stride).max(1) as u32));
+        }
+        let elem = self.eval_expr(expr);
+        let slot = |i: i64| if dl >= dr { i - lo } else { hi - i };
+        let (s1, s2) = (slot(i1), slot(i2));
+        let lsb = (s1.min(s2) * stride) as usize;
+        let msb = ((s1.max(s2) + 1) * stride) as usize - 1;
+        Some(elem.range_select(msb, lsb))
+    }
+
+    /// The associative array element `expr` names (`a[k]`, or a select into
+    /// it like `p[k][1]`), as the packed dimensions left to select into
+    /// (None for a one-dimensional element) and the number of selects already
+    /// applied past the keys. None when `expr` is not such an element, or the
+    /// element is itself a collection (`aq[k][i]` of `int aq[int][$]`).
+    fn assoc_elem_select_dims(
+        &mut self,
+        expr: &Expression,
+    ) -> Option<(Option<Vec<(i64, i64)>>, usize)> {
         let mut root = expr;
         let mut keys = 0usize;
         while let ExprKind::Index { expr: inner, .. } = &root.kind {
@@ -333,7 +407,29 @@ impl Simulator {
         if keys == 0 {
             return None;
         }
-        let name = self.assoc_array_storage_name(root)?;
+        // Hot path (every nested index read once any associative array
+        // exists): outside a class method, a plain name that is not a
+        // registered associative array cannot reach one through a class
+        // member or a scoped spelling.
+        let ExprKind::Ident(h) = &root.kind else {
+            return None;
+        };
+        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let name = {
+            let nm = self.resolve_hier_name(h);
+            if self.module.associative_arrays.contains_key(&*nm) {
+                nm.into_owned()
+            } else if self.this_stack.last().copied().flatten().is_none()
+                && !nm.bytes().any(|b| matches!(b, b'#' | b'.' | b':' | b'['))
+            {
+                return None;
+            } else {
+                drop(nm);
+                self.assoc_array_storage_name(root)?
+            }
+        };
         let declared = match self.coll_shape_at(&name) {
             Some((shape, 0)) => shape.dims.len(),
             Some(_) => return None,
@@ -363,26 +459,7 @@ impl Simulator {
         if packed.is_none() && extra > 0 {
             return None;
         }
-        let elem = self.eval_expr(expr);
-        let Some(dims) = packed else {
-            return Some(match self.eval_expr(index).to_index() {
-                Some(i) if i >= 0 && (i as u32) < elem.width => elem.bit_select(i as usize),
-                _ => Value::new(1),
-            });
-        };
-        let (dl, dr) = dims[0];
-        let stride: i64 = dims[1..].iter().map(|&(l, r)| (l - r).abs() + 1).product();
-        let (lo, hi) = (dl.min(dr), dl.max(dr));
-        let Some(i) = self
-            .eval_expr(index)
-            .to_index()
-            .filter(|i| (lo..=hi).contains(i))
-        else {
-            return Some(Value::new(stride.max(1) as u32));
-        };
-        let slot = if dl >= dr { i - lo } else { hi - i };
-        let lsb = (slot * stride) as usize;
-        Some(elem.range_select(lsb + stride as usize - 1, lsb))
+        Some((packed, extra))
     }
 
     pub(super) fn assoc_elem_width(&self, name: &str) -> Option<u32> {

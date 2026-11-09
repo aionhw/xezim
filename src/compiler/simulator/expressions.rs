@@ -6143,6 +6143,14 @@ impl Simulator {
                 kind,
                 ..
             } => {
+                // §11.5.1: a part-select into a multi-dimensional packed
+                // associative array element selects whole packed elements.
+                if !self.module.associative_arrays.is_empty()
+                    && matches!(expr.kind, ExprKind::Index { .. })
+                    && let Some(v) = self.assoc_elem_range_read(expr, left, right, *kind)
+                {
+                    return v;
+                }
                 // A module-level plain name is never a class property.
                 let plain = matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() == 1);
                 if (!plain || !self.this_stack.is_empty())
