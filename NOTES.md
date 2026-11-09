@@ -6,6 +6,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 # What's new in 0.11
 
+### Unreleased
+
+**Correctness**
+
+* A packed element selected inside an unpacked array's element reads right
+  in compiled code (an `always` block, a continuous assignment):
+  `d[1][0]` on `logic [1:0][7:0] d [2]` is the low byte of `d[1]`, for one-,
+  two- and three-dimensional arrays, queues, dynamic arrays, run-time
+  indices, part-selects of the element and arrays of packed structs
+  (`b[0][1]` on `le_t [1:0] b [2]`). It read `0X` or one bit (§7.4.1,
+  §7.4.5, §11.5.1, #985).
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
