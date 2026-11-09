@@ -187,6 +187,8 @@ mod repro_import;
 mod resource_pool_scope_lookup;
 #[path = "hierarchy/review_disable_block_paths.rs"]
 mod review_disable_block_paths;
+#[path = "hierarchy/review_unit_names_in_blocks.rs"]
+mod review_unit_names_in_blocks;
 #[path = "hierarchy/same_name_port_hop.rs"]
 mod same_name_port_hop;
 #[path = "hierarchy/submodule_array_element_assigns.rs"]
