@@ -3786,6 +3786,83 @@ impl Simulator {
         false
     }
 
+    /// §10.9.1, §10.10, §7.6: a pattern written to a ROW of a fixed
+    /// multi-dimensional unpacked array (`c[0] = '{V, V}` on
+    /// `logic [39:0] c [2][2]`, `d[1] = '{'{..}, '{..}}` on `d [2][2][2]`).
+    /// Each element is its own signal, so the pattern spreads over the
+    /// dimensions left below the selected indices, as a whole-array pattern
+    /// does. Without this the row was stored as one packed value under a name
+    /// with no storage, and every element read x. False when the target is
+    /// not such a row or an index is not a known in-range value, leaving the
+    /// other paths to it.
+    pub(super) fn assign_unpacked_row_pattern(
+        &mut self,
+        lvalue: &Expression,
+        items: &[AssignmentPatternItem],
+    ) -> bool {
+        if items.is_empty() {
+            return false;
+        }
+        let mut idx_exprs: Vec<&Expression> = Vec::new();
+        let mut cur = lvalue;
+        while let ExprKind::Index { expr, index } = &cur.kind {
+            idx_exprs.push(index);
+            cur = expr;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return false;
+        };
+        if idx_exprs.is_empty() {
+            return false;
+        }
+        idx_exprs.reverse();
+        let name = self.resolve_hier_name(h).into_owned();
+        if self.fixed_unpacked_dims(&name).is_none() {
+            return false;
+        }
+        let Some(dims) = self.foreach_dims(&name) else {
+            return false;
+        };
+        let k = idx_exprs.len();
+        if k >= dims.len() {
+            return false;
+        }
+        let mut idx: Vec<i64> = Vec::with_capacity(k);
+        for (ie, &(lo, hi)) in idx_exprs.iter().zip(&dims) {
+            if !Self::cond_expr_is_effect_free(ie, false) {
+                return false;
+            }
+            let v = self.eval_expr(ie);
+            match v.to_i64() {
+                Some(i) if !v.has_xz() && (lo..=hi).contains(&i) => idx.push(i),
+                _ => return false,
+            }
+        }
+        let cells: i64 = dims[k..]
+            .iter()
+            .map(|&(lo, hi)| (hi - lo + 1).max(0))
+            .product();
+        if cells <= 0 || cells > (1 << 20) {
+            return false;
+        }
+        let Some(dt) = self.module.var_decl_types.get(&name).cloned() else {
+            return false;
+        };
+        // Each remaining dimension's direction from its declared bounds.
+        let descending: Vec<bool> = match self
+            .module
+            .unpacked_decl_dims
+            .get(&name)
+            .filter(|d| d.len() == dims.len())
+        {
+            Some(decl) => decl[k..].iter().map(|&(l, r)| l > r).collect(),
+            None => vec![false; dims.len() - k],
+        };
+        let base = Self::elem_name(&name, &idx);
+        self.assign_pattern_array(&base, &dims[k..], &dt, items, &descending);
+        true
+    }
+
     /// `arr[i] = '{...}` / `assoc[key] = '{...}` where the element is an
     /// unpacked struct: spread the pattern into that element's members.
     pub(super) fn assign_pattern_element(

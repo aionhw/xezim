@@ -453,6 +453,9 @@ impl Simulator {
                         &params_snapshot,
                     )
                 })
+                .or_else(|| {
+                    Self::row_pattern_assign_parts(&ca, &decl_dims_snapshot, &params_snapshot)
+                })
                 .unwrap_or_else(|| vec![ca])
             })
             .flat_map(|ca| {
@@ -4940,5 +4943,88 @@ impl Simulator {
         // the module is no longer read. Same for combinational always blocks
         // — edge-sensitive ones were moved into self.edge_blocks earlier.
         self.drop_comb_source_ast();
+    }
+
+    /// §10.3, §10.9.1, §7.6: `assign c[0] = '{a, b};` on a multi-dimensional
+    /// unpacked array drives each element of the row. A row has no signal of
+    /// its own, so as one assignment it drove nothing and every element read
+    /// x. The pattern is split over the dimensions left below the row's
+    /// constant indices, as for a whole-array pattern assign, and each element
+    /// assignment keeps the row's own selects.
+    fn row_pattern_assign_parts(
+        ca: &crate::compiler::elaborate::ContinuousAssignment,
+        decl_dims: &HashMap<String, Vec<(i64, i64)>>,
+        params: &HashMap<String, Value>,
+    ) -> Option<Vec<crate::compiler::elaborate::ContinuousAssignment>> {
+        if !matches!(ca.rhs.kind, ExprKind::AssignmentPattern(_)) {
+            return None;
+        }
+        let mut idx_exprs: Vec<&Expression> = Vec::new();
+        let mut cur = &ca.lhs;
+        while let ExprKind::Index { expr, index } = &cur.kind {
+            idx_exprs.push(index);
+            cur = expr;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        let [seg] = h.path.as_slice() else {
+            return None;
+        };
+        if idx_exprs.is_empty() || !seg.selects.is_empty() {
+            return None;
+        }
+        idx_exprs.reverse();
+        let name = &seg.name.name;
+        let dims = decl_dims.get(name)?;
+        let k = idx_exprs.len();
+        if k >= dims.len() {
+            return None;
+        }
+        for (ie, &(l, r)) in idx_exprs.iter().zip(dims) {
+            let i = crate::compiler::elaborate::const_eval_i64_with_params(ie, Some(params))?;
+            if i < l.min(r) || i > l.max(r) {
+                return None;
+            }
+        }
+        // The row's remaining dimensions, under the array's own name: the
+        // parts come back as `name[j]...`, and only their indices are kept.
+        let row_dims: HashMap<String, Vec<(i64, i64)>> =
+            std::iter::once((name.clone(), dims[k..].to_vec())).collect();
+        let parts = crate::compiler::elaborate::whole_array_assign_parts_dir(
+            cur,
+            &ca.rhs,
+            ca.delay,
+            &HashMap::default(),
+            None,
+            Some(&row_dims),
+        )?;
+        Some(
+            parts
+                .into_iter()
+                .map(|p| {
+                    let mut elem_idx: Vec<Expression> = Vec::new();
+                    let mut e = p.lhs;
+                    while let ExprKind::Index { expr, index } = e.kind {
+                        elem_idx.push(*index);
+                        e = *expr;
+                    }
+                    let lhs = elem_idx.into_iter().rev().fold(ca.lhs.clone(), |acc, ix| {
+                        Expression::new(
+                            ExprKind::Index {
+                                expr: Box::new(acc),
+                                index: Box::new(ix),
+                            },
+                            ca.lhs.span,
+                        )
+                    });
+                    crate::compiler::elaborate::ContinuousAssignment {
+                        lhs,
+                        rhs: p.rhs,
+                        ..ca.clone()
+                    }
+                })
+                .collect(),
+        )
     }
 }
