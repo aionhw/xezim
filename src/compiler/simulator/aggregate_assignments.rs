@@ -3812,7 +3812,10 @@ impl Simulator {
         let ExprKind::Ident(h) = &cur.kind else {
             return false;
         };
-        if idx_exprs.is_empty() {
+        // §8.4, §23.9: in a method a bare name is the property of `this` (or
+        // a local), not a same-named module array; the class row spread
+        // owns it.
+        if idx_exprs.is_empty() || self.bare_selected_storage_shadows_signal(h) {
             return false;
         }
         idx_exprs.reverse();
