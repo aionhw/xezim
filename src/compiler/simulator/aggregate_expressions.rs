@@ -2495,6 +2495,17 @@ impl Simulator {
         None
     }
 
+    /// Whether `base` names a dynamic array, queue or associative array,
+    /// whose rows' shape the declared dimensions do not give (§7.5, §7.8).
+    fn query_base_is_collection(&mut self, base: &Expression) -> bool {
+        if self.assoc_operand_name(base).is_some() {
+            return true;
+        }
+        self.array_operand_name(base).is_some_and(|n| {
+            self.module.dynamic_arrays.contains(&n) || self.module.queue_vars.contains(&n)
+        })
+    }
+
     pub(super) fn eval_expr_system_call_body(
         &mut self,
         expr: &Expression,
@@ -4283,6 +4294,26 @@ impl Simulator {
                         let n = super::elaborate::type_query_bound(name, &q, 1).unwrap_or(0);
                         return Value::from_u64(n as u64, 32);
                     }
+                    // §7.4.5: a select of `k` elements leaves the dimensions
+                    // after the first `k` (`$dimensions(a3[1])` of `logic
+                    // [1:0][3:0][7:0] a3` is 2). A select that leaves one
+                    // dimension or none keeps the answers below.
+                    if name == "$dimensions"
+                        && let Some((base, k)) = Self::peel_index_selects(arg)
+                        && !self.query_base_is_collection(&base)
+                    {
+                        let probe = Expression::new(
+                            ExprKind::SystemCall {
+                                name: "$dimensions".to_string(),
+                                args: vec![base.clone()],
+                            },
+                            base.span,
+                        );
+                        let nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
+                        if nd > k + 1 {
+                            return Value::from_u64((nd - k) as u64, 32);
+                        }
+                    }
                     // A class property or a struct member path (`m`,
                     // `this.m`, `a.w`): its declared type, unpacked and
                     // packed dimensions alike. A multi-dimensional packed
@@ -4373,7 +4404,24 @@ impl Simulator {
                         },
                         base.span,
                     );
-                    let nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
+                    let mut nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
+                    if nd <= k && !self.query_base_is_collection(&base) {
+                        // §7.4.5: past the unpacked dimensions the selects
+                        // name elements of the packed ones, numbered on from
+                        // them: `$size(a3[1])` of `logic [1:0][3:0][7:0] a3`
+                        // is `$size(a3, 2)`, 4, not the 32 bits of `a3[1]`.
+                        // A dynamic array, queue or associative array keeps
+                        // its own row answers below (its rows' shape is not
+                        // in the declared dimensions).
+                        let probe = Expression::new(
+                            ExprKind::SystemCall {
+                                name: "$dimensions".to_string(),
+                                args: vec![base.clone()],
+                            },
+                            base.span,
+                        );
+                        nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
+                    }
                     if nd > k {
                         let call = Expression::new(
                             ExprKind::SystemCall {
