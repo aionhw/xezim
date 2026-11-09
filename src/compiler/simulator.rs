@@ -344,6 +344,7 @@ fn method_boost_enabled() -> bool {
 // §11.5.1, §7.4.1: an x/z index into a struct member keeps the element width,
 // and a chain of indices into a call result's member declines.
 // §7.4.1/§7.4.5: a packed select inside an unpacked array's element reads that element.
+// §11.5.1: an x/z literal index into a packed element reads x.
 const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_306d;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so

@@ -11666,6 +11666,15 @@ impl<'a> BytecodeCompiler<'a> {
         Some((dims, labelled))
     }
 
+    /// A literal with x or z bits (`'x`, `2'b1z`), possibly parenthesized.
+    fn is_xz_literal(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(n) => self.eval_number_static(n).is_some_and(|v| v.has_xz()),
+            ExprKind::Paren(i) => self.is_xz_literal(i),
+            _ => false,
+        }
+    }
+
     /// The node `strip` `Index` levels below `e` (`e` itself for 0).
     fn chain_prefix(e: &Expression, strip: usize) -> Option<&Expression> {
         let mut cur = e;
@@ -11694,9 +11703,16 @@ impl<'a> BytecodeCompiler<'a> {
         let width = u32::try_from(counts[packed_idxs.len()..].iter().product::<i64>()).ok()?;
         let elem_expr = Self::chain_prefix(base, idxs.len() - depth - 1)?;
         let elem = self.compile_expr(elem_expr, 0)?;
+        // §11.5.1: an x/z index reads x. `eval_const_expr` folds an x/z
+        // literal to 0, so such an index is never taken as a constant; the
+        // run-time path below carries the x through the offset.
         let consts: Option<Vec<i64>> = packed_idxs
             .iter()
-            .map(|e| self.eval_const_expr(e).map(|v| v as i64))
+            .map(|e| {
+                (!self.is_xz_literal(e))
+                    .then(|| self.eval_const_expr(e).map(|v| v as i64))
+                    .flatten()
+            })
             .collect();
         if let Some(consts) = consts {
             let dest = self.alloc_reg();
@@ -12003,11 +12019,18 @@ impl<'a> BytecodeCompiler<'a> {
         if !matches!(outer_base.kind, ExprKind::Index { .. }) {
             return None;
         }
+        // §11.5.1: an x/z literal folds to 0 here; it names no element.
+        if self.is_xz_literal(last_index) {
+            return None;
+        }
         let mut subs: Vec<u32> = vec![self.eval_const_expr(last_index)?];
         let mut cur = outer_base;
         let hier = loop {
             match &cur.kind {
                 ExprKind::Index { expr: b, index: i } => {
+                    if self.is_xz_literal(i) {
+                        return None;
+                    }
                     subs.push(self.eval_const_expr(i)?);
                     cur = b;
                 }
@@ -16311,7 +16334,11 @@ impl<'a> BytecodeCompiler<'a> {
                         // write lands correctly. (This was the FlooNOC "router
                         // never forwards" root cause: the arbiter's selected
                         // index came out X.)
-                        if let Some(idx) = self.eval_const_expr(index) {
+                        // §11.5.1: an x/z literal index reads x; it folds to
+                        // 0 here, so the run-time path below takes it.
+                        if !self.is_xz_literal(index)
+                            && let Some(idx) = self.eval_const_expr(index)
+                        {
                             let base = self.compile_expr(expr, 0)?;
                             // §11.5.1: a constant index outside the declared
                             // range reads x. `eval_const_expr` folds in u32, so
