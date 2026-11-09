@@ -6,7 +6,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 # What's new in 0.11
 
-### Unreleased
+### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
 
@@ -892,6 +892,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   the product of its timing checks and the library's size: 20,000 sky130
   cells against a 19 MB cell library took 55.7 s, now 8.5 s (#898, reported
   by Blebowski).
+
+**Validation**
+
+* xezim `603c9bf3`, pinned to xezim-core `212dde0`, passes 6,610 default
+  tests with one existing ignored test, plus the two JIT smoke tests and the
+  DPI tests on the nested-scheduler fallback. Core and parser pass 514 and
+  233 tests. Both repositories pass their minimum supported Rust version
+  checks. The release commits change only version numbers and the core pin.
+* Artifacts written by 0.11.4 or earlier are refused with the "recompile
+  with current xezim" message; recompile saved designs.
+* Some `foreach` constraint shapes over large or chunked arrays can pick
+  different solutions than 0.11.4 for the same seed (#955). Runs with one
+  seed remain reproducible.
 
 ### 0.11.4 — class-object reclamation, linear elaboration, class and randomization correctness (October 2026)
 
