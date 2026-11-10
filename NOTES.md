@@ -113,6 +113,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the same select in compiled code took one bit (§7.4.1, §7.2, §10.4.2,
   #984).
 
+* An assignment pattern on a whole multi-dimensional unpacked array whose
+  element is a multi-dimensional packed type assigns every element: `n =
+  '{default: 80'h0}` on `logic [1:0][39:0] n [2][2]`, the same declaration
+  initializer, and positional, keyed, nested and nonblocking patterns left
+  every element x (§10.9.1, §7.4, §6.8, #1013, contributed by chuanseng-ng).
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
