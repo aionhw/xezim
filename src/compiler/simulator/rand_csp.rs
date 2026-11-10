@@ -7765,6 +7765,18 @@ impl Simulator {
     }
 
     fn csp_countones(&mut self, csp: &Csp, x: &Expression, env: &Env) -> Option<Ae> {
+        // §20.9: `$countones({a, b, ...})` is the sum of the parts' counts.
+        if let ExprKind::Concatenation(parts) = &Self::unparen(x).kind {
+            let terms = parts
+                .iter()
+                .map(|p| self.csp_countones(csp, p, env))
+                .collect::<Option<Vec<_>>>()?;
+            return Some(Ae::Sum {
+                terms,
+                w: 32,
+                s: true,
+            });
+        }
         let mut konst = |me: &mut Self, e: &Expression| -> Option<i64> {
             if !me.csp_free(csp, e, env) {
                 return None;
@@ -8821,14 +8833,25 @@ impl Simulator {
         if let ExprKind::SystemCall { name, args } = &Self::unparen(e).kind
             && name == "$countones"
             && let [x] = args.as_slice()
-            && let Some((v, lo, w, whole)) = self.csp_slice_base_k(csp, x, &mut konst)
-            && w > 0
         {
-            if whole && lo == 0 && w == csp.vars[v].width && w <= 64 && !csp.wide.contains(&v) {
-                CSP_SCAN_POPS.with(|p| p.borrow_mut().push(v));
-            } else if csp.vars.len() + w as usize <= MAX_VARS {
-                let u = uses.entry(v).or_default();
-                u.0.extend((lo..lo + w).map(|b| (b, 1)));
+            // §20.9: the ones of a concatenation are those of its parts.
+            let parts: &[Expression] = match &Self::unparen(x).kind {
+                ExprKind::Concatenation(parts) => parts,
+                _ => std::slice::from_ref(x),
+            };
+            for x in parts {
+                let Some((v, lo, w, whole)) = self.csp_slice_base_k(csp, x, &mut konst) else {
+                    continue;
+                };
+                if w == 0 {
+                    continue;
+                }
+                if whole && lo == 0 && w == csp.vars[v].width && w <= 64 && !csp.wide.contains(&v) {
+                    CSP_SCAN_POPS.with(|p| p.borrow_mut().push(v));
+                } else if csp.vars.len() + w as usize <= MAX_VARS {
+                    let u = uses.entry(v).or_default();
+                    u.0.extend((lo..lo + w).map(|b| (b, 1)));
+                }
             }
         }
         // `x & MASK`: the runs of ones in the mask are selects of x.
