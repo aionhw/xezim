@@ -335,3 +335,6 @@ mod unpacked_packed_elem_pattern;
 
 #[path = "collections/package_array_operand_in_method.rs"]
 mod package_array_operand_in_method;
+
+#[path = "collections/unpacked_struct_concat_1035.rs"]
+mod unpacked_struct_concat_1035;
