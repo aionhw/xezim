@@ -1195,6 +1195,8 @@ mod randomize_countones_concat;
 
 #[path = "classes/constraint_inline_caller_foreach.rs"]
 mod constraint_inline_caller_foreach;
+#[path = "classes/rand_specialized_handle_1034.rs"]
+mod rand_specialized_handle_1034;
 
 #[path = "classes/rand_dyn_array_of_unpacked_structs.rs"]
 mod rand_dyn_array_of_unpacked_structs;
