@@ -298,8 +298,12 @@ impl Simulator {
     /// not a random *value* — the object it points at is randomized, and the
     /// enclosing object's constraints may refer to its members.
     pub(super) fn prop_class_type(&self, handle: usize, prop: &str) -> Option<String> {
-        self.prop_class_binding(handle, prop)
-            .filter(|t| self.module.classes.contains_key(t))
+        // §18.4: a class specialization is still a handle, never a scalar
+        // random target. Preserve its full binding for constructors elsewhere.
+        self.prop_class_or_spec_type(handle, prop).map(|t| {
+            self.extract_spec_from_string(&t)
+                .map_or(t, |(base, _)| base)
+        })
     }
 
     /// `prop_class_type`, also answering a binding that names a specialized
@@ -441,7 +445,13 @@ impl Simulator {
                         tn = Some(r);
                     }
                 }
-                return tn.and_then(|t| self.resolved_class_key(&t));
+                return tn.and_then(|t| {
+                    self.resolved_class_key(&t).or_else(|| {
+                        self.extract_spec_from_string(&t)
+                            .map(|(base, _)| base)
+                            .filter(|base| self.module.classes.contains_key(base))
+                    })
+                });
             }
             cur = cd.extends.as_deref();
         }
