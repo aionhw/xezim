@@ -2,8 +2,8 @@
 //! mailboxes or semaphores, and performs a FINITE number of rounds, finishes
 //! inside the timestamp it started in, however many rounds that is. The
 //! zero-delay stall guard must not split such a phase across timestamps; it
-//! may only trip when a whole window of activations changed no observable
-//! state. Setting `XEZIM_STALL_LIMIT` explicitly opts in to a hard
+//! includes suspended loop control and every data width when checking
+//! progress. Setting `XEZIM_STALL_LIMIT` explicitly opts in to a hard
 //! per-process cap instead.
 
 use std::process::Command;
@@ -12,7 +12,8 @@ fn run(name: &str, src: &str, limit: Option<&str>) -> String {
     let path = std::env::temp_dir().join(format!("xezim_{name}_{}.sv", std::process::id()));
     std::fs::write(&path, src).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
-    cmd.args(["--no-cache", "--simulate", "-s", "top"]).arg(&path);
+    cmd.args(["--no-cache", "--simulate", "-s", "top"])
+        .arg(&path);
     match limit {
         Some(l) => cmd.env("XEZIM_STALL_LIMIT", l),
         None => cmd.env_remove("XEZIM_STALL_LIMIT"),
@@ -290,7 +291,10 @@ endmodule
 
     // Strict mode cut off at limit
     let strict_text = run("edge_exec_rescan_strict", SRC, Some("1000"));
-    assert!(!strict_text.contains("RESULT count=250000"), "{strict_text}");
+    assert!(
+        !strict_text.contains("RESULT count=250000"),
+        "{strict_text}"
+    );
     assert!(strict_text.contains("STALLED"), "{strict_text}");
 }
 
@@ -318,4 +322,73 @@ endmodule
     let strict_text = run("forever_break_strict", SRC, Some("1000"));
     assert!(!strict_text.contains("RESULT i=250000"), "{strict_text}");
     assert!(strict_text.contains("STALLED"), "{strict_text}");
+}
+
+#[test]
+fn empty_finite_repeat_keeps_its_hidden_continuation_counter() {
+    let source = r#"
+module top;
+ initial begin
+   repeat(200001) #0;
+   $display("RESULT empty=1 t=%0t",$time);
+ end
+ initial #1 $finish;
+endmodule
+"#;
+    let first = run("empty_finite_repeat", source, None);
+    let second = run("empty_finite_repeat", source, None);
+    assert!(first.contains("RESULT empty=1 t=0"), "{first}");
+    assert!(!first.contains("STALLED"), "{first}");
+    assert_eq!(first, second, "equal seeds must preserve scheduling");
+}
+
+#[test]
+fn wide_progress_above_bit_63_keeps_an_nba_relay_running() {
+    let source = r#"
+module top;
+ bit [127:0] word_value=0;
+ always @(word_value) if(word_value[127:64]<30000)
+   word_value<=word_value+128'h1_0000000000000000;
+ initial #0 word_value=128'h1_0000000000000000;
+ initial begin #1; $display("RESULT wide=%0d",word_value[127:64]); $finish; end
+endmodule
+"#;
+    let text = run("wide_phase_progress", source, None);
+    assert!(text.contains("RESULT wide=30000"), "{text}");
+    assert!(!text.contains("STALLED"), "{text}");
+}
+
+#[test]
+fn local_collection_progress_keeps_a_finite_phase_running() {
+    let source = r#"
+module top;
+ task automatic phase();
+   int values[$];
+   while(values.size()<200001) begin #0; values.push_back(1); end
+   $display("RESULT queue=%0d t=%0t",values.size(),$time);
+ endtask
+ initial phase();
+ initial #1 $finish;
+endmodule
+"#;
+    let text = run("local_collection_progress", source, None);
+    assert!(text.contains("RESULT queue=200001 t=0"), "{text}");
+    assert!(!text.contains("STALLED"), "{text}");
+}
+
+#[test]
+fn identical_signal_and_property_writes_do_not_mask_livelock() {
+    for (name, source) in [
+        (
+            "same_signal_write",
+            "module top; bit flag; initial forever begin #0; flag=0; end endmodule",
+        ),
+        (
+            "same_property_write",
+            "class C; int value; function void clear(); value=0; endfunction endclass module top; C c; initial begin c=new; forever begin #0; c.clear(); end end endmodule",
+        ),
+    ] {
+        let text = run(name, source, None);
+        assert!(text.contains("STALLED"), "{text}");
+    }
 }
