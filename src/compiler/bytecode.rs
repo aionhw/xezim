@@ -4151,6 +4151,16 @@ impl<'a> BytecodeCompiler<'a> {
         let saved_local_arrays = std::mem::take(&mut self.local_var_array);
         let saved_local_elems = std::mem::take(&mut self.local_var_elem);
         let saved_local_structs = std::mem::take(&mut self.local_var_struct);
+        // §13.4: the body never sees the caller's unrolled loop constants or
+        // register banks, as for an inlined task. An unrolled loop variable
+        // shadows every same-named name, so a callee's own `for (int s ...)`
+        // tested the caller's `s` and never ended, and a module variable `s`
+        // read the caller's loop value.
+        let saved_banks = std::mem::take(&mut self.local_array_regs);
+        let saved_consts = std::mem::take(&mut self.local_const_vars);
+        let saved_const_kinds = std::mem::take(&mut self.local_const_kinds);
+        let saved_const_binds = std::mem::take(&mut self.const_var_binds);
+        let saved_decl_locals = std::mem::take(&mut self.decl_local_regs);
         for (n, sb) in struct_binds {
             if let Some(pfx) = &qpfx {
                 self.local_var_struct
@@ -4271,6 +4281,11 @@ impl<'a> BytecodeCompiler<'a> {
         self.local_var_array = saved_local_arrays;
         self.local_var_elem = saved_local_elems;
         self.local_var_struct = saved_local_structs;
+        self.local_array_regs = saved_banks;
+        self.local_const_vars = saved_consts;
+        self.local_const_kinds = saved_const_kinds;
+        self.const_var_binds = saved_const_binds;
+        self.decl_local_regs = saved_decl_locals;
         if !ok {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
                 eprintln!(
