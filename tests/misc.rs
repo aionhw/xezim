@@ -143,6 +143,8 @@ mod implicit_static_diagnostic;
 mod include_path_from_function_macro;
 #[path = "misc/init_reg_seed.rs"]
 mod init_reg_seed;
+#[path = "misc/inlined_call_caller_loop_constant.rs"]
+mod inlined_call_caller_loop_constant;
 #[path = "misc/inspect_types.rs"]
 mod inspect_types;
 #[path = "misc/interconnect_and_var_ports.rs"]
