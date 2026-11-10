@@ -2769,8 +2769,12 @@ impl Simulator {
         // Register per-instance associative-array members under an
         // instance-scoped name `<handle>#<member>` so the existing
         // signal-keyed assoc machinery gives each instance its own map.
+        let mut hidden_collections: HashSet<&str> = HashSet::default();
         for cdef in classes_to_init {
             for (prop, &is_str) in &cdef.assoc_properties {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 self.module
                     .associative_arrays
                     .insert(format!("{}#{}", handle, prop), is_str);
@@ -2778,6 +2782,9 @@ impl Simulator {
             // §8.25: a key sized by a class parameter takes this object's
             // specialization, not the default `assoc_index_props` holds.
             for (prop, kdt) in &cdef.assoc_key_decl_types {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 if let Some(kw) = self.param_sized_key_width(kdt, &instance, &classes_to_init) {
                     let signed = cdef.assoc_index_props.get(prop).is_some_and(|&(_, s)| s);
                     self.module
@@ -2790,6 +2797,9 @@ impl Simulator {
             // package/module array path) so push_back/size/index/foreach resolve
             // to independent storage with size starting at 0.
             for (prop, &(width, max)) in &cdef.queue_properties {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 let scoped = format!("{}#{}", handle, prop);
                 if cdef.property_types.get(prop).is_some_and(|dt| {
                     matches!(
@@ -2818,6 +2828,9 @@ impl Simulator {
             // the instance-scoped name as a real fixed array and default every
             // element to 0 so index reads / foreach see a populated range.
             for (prop, &(lo, hi, width)) in &cdef.array_properties {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 let scoped = format!("{}#{}", handle, prop);
                 // §8.25: sized by a value parameter — this object's size.
                 let (lo, hi) = match cdef
@@ -2859,6 +2872,9 @@ impl Simulator {
             // foreach resolve, and default every element to 0 (a class-handle
             // element's default is null). Oversized shapes stay lazy.
             for (prop, (shape, width)) in &cdef.array_nd_properties {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 let scoped = format!("{}#{}", handle, prop);
                 // §8.25: sized by a value parameter — this object's shape.
                 let own_shape = cdef
@@ -2911,6 +2927,11 @@ impl Simulator {
                         }
                     }
                 }
+            }
+            // The chain is leaf-first: a base declaration cannot change the
+            // shape of a property hidden by the derived class (§8.14).
+            if classes_to_init.len() > 1 {
+                hidden_collections.extend(cdef.properties.keys().map(String::as_str));
             }
         }
         // Record concrete bindings for the leaf class's TYPE parameters

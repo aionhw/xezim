@@ -1977,6 +1977,10 @@ impl Simulator {
     /// class property: it keeps the plain hierarchical name, as before.
     pub(super) fn array_actual_storage(&mut self, arg: &Expression) -> Option<String> {
         use crate::ast::expr::ExprKind;
+        let arg = Self::unparen(arg);
+        if matches!(arg.kind, ExprKind::Call { .. }) {
+            return self.collection_call_actual(arg);
+        }
         let ExprKind::Ident(h) = &arg.kind else {
             // An explicit member access `c.member` / `this.member` naming an
             // unpacked-array property: evaluate the receiver to its object
@@ -2302,6 +2306,13 @@ impl Simulator {
     ) -> Option<(String, String, i64, i64)> {
         use crate::ast::types::UnpackedDimension as UD;
         if port.dimensions.is_empty() {
+            if let Some(dims) = self.fn_ret_coll_dims(&port.data_type)
+                && matches!(dims.first(), Some(UD::Range { .. } | UD::Expression { .. }))
+            {
+                let mut expanded = port.clone();
+                expanded.dimensions = dims;
+                return self.bind_array_arg(&expanded, arg);
+            }
             return None;
         }
         let dims = super::elaborate::normalize_unpacked_dims(

@@ -620,6 +620,38 @@ impl Simulator {
         Some(src)
     }
 
+    /// §13.5.1: a collection returned by an actual expression is evaluated
+    /// once in the caller and copied before the callee's frame is entered.
+    pub(super) fn collection_call_actual(&mut self, arg: &Expression) -> Option<String> {
+        let arg = Self::unparen(arg);
+        let ExprKind::Call { func, .. } = &arg.kind else {
+            return None;
+        };
+        if !self.call_returns_collection(func) {
+            return None;
+        }
+        let data_type = self.call_return_type(func)?;
+        let width = resolve_type_width(
+            &data_type,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        self.pending_ret_collection = None;
+        self.vm_ret_vals = None;
+        self.eval_expr(arg);
+        let name = self.take_pending_ret_collection()?;
+        if name == "__xz_ret_coll__" {
+            // A returned value has a zero-based sequence, even when its
+            // source was a fixed array with another declared range (§7.6).
+            // The return side channel supplies size and leaves; collection
+            // consumers also need its type and storage classification.
+            self.module.arrays.insert(name.clone(), (0, -1, width));
+            self.module.dynamic_arrays.insert(name.clone());
+            self.module.var_decl_types.insert(name.clone(), data_type);
+        }
+        Some(name)
+    }
+
     /// Resolve the whole-collection storage name that a collection-return
     /// assignment `q = f(..)` writes into, for the destination expression
     /// `lvalue`. This is the exact resolution shared by the historic

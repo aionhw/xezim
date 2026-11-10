@@ -396,8 +396,9 @@ impl Simulator {
         if let ExprKind::Call { func, .. } = &e.kind {
             let dt = self.call_return_type(func)?;
             self.pending_ret_collection = None;
+            self.vm_ret_vals = None;
             let value = self.eval_expr(e);
-            if let Some(name) = self.pending_ret_collection.take() {
+            if let Some(name) = self.take_pending_ret_collection() {
                 let ident = Self::hier_ident_expr(
                     vec![crate::ast::expr::HierPathSegment {
                         name: crate::ast::Identifier {
