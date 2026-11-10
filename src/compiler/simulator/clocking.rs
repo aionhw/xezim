@@ -45,6 +45,121 @@ impl Simulator {
         Some((lo..=hi).map(|i| (i, format!("{}[{}]", net, i))).collect())
     }
 
+    /// The edge and post-edge delay of a §14.3 edge output skew
+    /// (`output negedge`, `output negedge #d`) for `net` of block `cb`, or
+    /// None when its skew is a plain delay. `raw` is the clocking-visible name.
+    pub(super) fn clocking_drive_edge(
+        &self,
+        cb: &str,
+        raw: &str,
+        net: &str,
+    ) -> Option<(EdgeKind, u64)> {
+        // A clockvar with its own output skew keeps its name; only a drive
+        // queued by net alone recovers the name from the alias map.
+        let declared = |n: &str| {
+            self.clocking_sig_out_edge
+                .get(cb)
+                .is_some_and(|m| m.contains_key(n))
+        };
+        let raw = if declared(raw) {
+            raw
+        } else {
+            self.clocking_sig_alias
+                .get(cb)
+                .and_then(|m| m.iter().find(|(v, n)| n.as_str() == net && declared(v)))
+                .map_or(raw, |(v, _)| v.as_str())
+        };
+        let per_sig = |m: &HashMap<String, u64>| m.get(raw).or_else(|| m.get(net)).copied();
+        if let Some(e) = self
+            .clocking_sig_out_edge
+            .get(cb)
+            .and_then(|m| m.get(raw).or_else(|| m.get(net)))
+        {
+            let d = self.clocking_sig_out_skew.get(cb).and_then(per_sig);
+            return e.map(|e| (e, d.unwrap_or(0)));
+        }
+        let e = self.clocking_out_edge.get(cb).copied()?;
+        Some((e, self.clocking_out_skew.get(cb).copied().unwrap_or(0)))
+    }
+
+    /// Assign a clocking output's net now, with the width and signedness
+    /// handling of a procedural assignment.
+    fn drive_clocking_net(&mut self, net: &str, val: &Value) {
+        let lval = Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: net.to_string(),
+                        span: crate::ast::Span::dummy(),
+                    },
+                    selects: Vec::new(),
+                }],
+                span: crate::ast::Span::dummy(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+            }),
+            crate::ast::Span::dummy(),
+        );
+        self.assign_value(&lval, val);
+    }
+
+    /// `val` at the width of signal `id`, with X/Z bits zeroed when the
+    /// signal is two-state, as an assignment stores it.
+    fn fit_clocking_value(&self, id: usize, val: &Value) -> Value {
+        let v = val.resize(self.signal_widths[id]);
+        if v.has_xz() && self.signal_two_state.get(id).copied().unwrap_or(false) {
+            return v.to_two_state();
+        }
+        v
+    }
+
+    /// §14.3: an output with an edge skew is driven on that edge of the
+    /// block's clock. Of the drives of `cb` waiting for this transition, only
+    /// the last one issued on each output is applied (§14.16.2), so an earlier
+    /// value never reaches the net.
+    fn mature_edge_skew_drives(&mut self, cb: &str, rising: bool) {
+        let Some(pend) = self.clocking_edge_out_pending.remove(cb) else {
+            return;
+        };
+        let mut keep = Vec::new();
+        let mut due: Vec<(String, Value, u64, Option<Expression>)> = Vec::new();
+        for (net, val, edge, delay, target) in pend {
+            let hit = match edge {
+                EdgeKind::Posedge => rising,
+                EdgeKind::Negedge => !rising,
+                _ => true,
+            };
+            if !hit {
+                keep.push((net, val, edge, delay, target));
+                continue;
+            }
+            // A whole-net drive replaces the earlier drives of the net that land at the same time.
+            if target.is_none() {
+                due.retain(|(n, _, d, _)| *n != net || *d != delay);
+            }
+            due.push((net, val, delay, target));
+        }
+        for (net, val, delay, target) in due {
+            if let Some(t) = target {
+                self.drive_clocking_select(&t, val, delay);
+            } else if delay > 0
+                && let Some(&id) = self.signal_name_to_id.get(net.as_str())
+            {
+                // Drives maturing at different times each reach the net, so
+                // this does not replace the net's pending update.
+                let v = self.fit_clocking_value(id, &val);
+                self.delayed_updates.push((self.time + delay, id, v));
+            } else {
+                self.drive_clocking_net(&net, &val);
+                self.clocking_edge_drive_dirty = true;
+            }
+        }
+        if !keep.is_empty() {
+            self.clocking_edge_out_pending.insert(cb.to_string(), keep);
+        }
+    }
+
     /// LRM §14.3 clocking-block input snapshot. Each registered cb
     /// has a clock signal; on every posedge transition of that clock
     /// we snapshot the current values of input-direction signals. The
@@ -139,6 +254,9 @@ impl Simulator {
             };
             let prev = ent.prev;
             ent.prev = cur;
+            if !self.clocking_edge_out_pending.is_empty() && prev != cur && prev != 2 && cur != 2 {
+                self.mature_edge_skew_drives(&ent.cb, cur == 1);
+            }
             // §14.3: advance on the block's declared clock edge (posedge by
             // default; negedge / any-edge when so declared).
             let fired = match ent.edge {
@@ -166,6 +284,14 @@ impl Simulator {
                 let mut keep: Vec<(u64, String, Value, Option<Expression>)> = Vec::new();
                 for (n, net, val, target) in pend.drain(..) {
                     if n <= 1 {
+                        let raw = net.rsplit('.').next().unwrap_or(&net).to_string();
+                        if let Some((edge, d)) = self.clocking_drive_edge(&cb, &raw, &net) {
+                            self.clocking_edge_out_pending
+                                .entry(cb.clone())
+                                .or_default()
+                                .push((net, val, edge, d, target));
+                            continue;
+                        }
                         let skew = self.clocking_net_out_skew(&cb, &net).unwrap_or(dskew);
                         if let Some(t) = target {
                             self.drive_clocking_select(&t, val, skew);
@@ -191,7 +317,18 @@ impl Simulator {
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
                 for (sig, val, target) in pending {
-                    // §14.4 output skew for drives maturing at THIS edge.
+                    let raw = sig.rsplit('.').next().unwrap_or(&sig).to_string();
+                    if let Some((edge, d)) = self.clocking_drive_edge(&cb, &raw, &sig) {
+                        self.clocking_edge_out_pending
+                            .entry(cb.clone())
+                            .or_default()
+                            .push((sig, val, edge, d, target));
+                        continue;
+                    }
+                    // §14.4 output skew for drives maturing at THIS edge. A
+                    // `#0` drive on the plain net is scheduled like one made at
+                    // this event so a later drive in the same time step replaces
+                    // it (§14.16.2).
                     let skew = self.clocking_net_out_skew(&cb, &sig).unwrap_or(dskew);
                     if let Some(t) = target {
                         if skew > 0 {
@@ -201,12 +338,10 @@ impl Simulator {
                         }
                         continue;
                     }
-                    if skew > 0 {
-                        if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
-                            let w = self.signal_widths[id];
-                            self.schedule_delayed_with_delay(id, val.resize(w), skew);
-                            continue;
-                        }
+                    if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
+                        let v = self.fit_clocking_value(id, &val);
+                        self.schedule_delayed_with_delay(id, v, skew);
+                        continue;
                     }
                     let lval = Expression::new(
                         ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {

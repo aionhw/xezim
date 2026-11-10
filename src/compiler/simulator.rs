@@ -7302,6 +7302,10 @@ pub struct Simulator {
     /// slot's edge detection, and the next iteration's snapshot would
     /// otherwise absorb the change and swallow the `@(cb.sig)` event.
     clocking_mirror_dirty: bool,
+    /// Set when `tick_clocking_blocks` drove an edge-skew output, so the
+    /// caller settles and runs one more edge pass: the drive lands after this
+    /// slot's edge detection, and its fan-out must still wake in this slot.
+    clocking_edge_drive_dirty: bool,
     /// §14.16 `cb.out <= ##N v` drives awaiting N further clocking events:
     /// cb → [(remaining_cycles, net, value)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.
@@ -7319,6 +7323,16 @@ pub struct Simulator {
     clocking_out_skew: HashMap<String, u64>,
     /// §14.4 per-signal output-skew overrides: cb → (resolved net → ticks).
     clocking_sig_out_skew: HashMap<String, HashMap<String, u64>>,
+    /// §14.3 edge of a block's `default output negedge` skew.
+    clocking_out_edge: HashMap<String, EdgeKind>,
+    /// §14.3 per-signal skews: cb → (net → edge, or None for a delay-only
+    /// skew that overrides the block's default edge).
+    clocking_sig_out_edge: HashMap<String, HashMap<String, Option<EdgeKind>>>,
+    /// Drives through an edge-skew output, waiting for that edge of the
+    /// block's clock: cb → [(net, value, edge, post-edge delay, select target)]
+    /// in issue order.
+    clocking_edge_out_pending:
+        HashMap<String, Vec<(String, Value, EdgeKind, u64, Option<Expression>)>>,
     /// §14.4 per-cb default INPUT skew in ticks (absent = #0).
     clocking_in_skew: HashMap<String, u64>,
     /// §14.4 per-signal input-skew overrides: cb → (resolved net → ticks).
