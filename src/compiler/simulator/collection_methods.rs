@@ -2049,12 +2049,11 @@ impl Simulator {
     /// §13.5.1: use the formal's complete element width, not a packed array's
     /// inner stride or the previous 32-bit placeholder for literal actuals.
     fn declared_collection_elem_width(&self, dt: &DataType) -> Option<u32> {
-        if let DataType::TypeReference { name, .. } = dt {
-            if self.local_type_param_concrete(dt).is_some()
-                || super::elaborate::lookup_scoped_type(name, &self.module.typedefs).is_none()
-            {
-                return None;
-            }
+        if let DataType::TypeReference { name, .. } = dt
+            && (self.local_type_param_concrete(dt).is_some()
+                || super::elaborate::lookup_scoped_type(name, &self.module.typedefs).is_none())
+        {
+            return None;
         }
         Some(resolve_type_width(
             dt,

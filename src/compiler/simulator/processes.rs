@@ -3065,7 +3065,7 @@ impl Simulator {
             // self-rescheduling process never reaches the outer event loop —
             // the check has to live here. The activation that trips the guard
             // is re-parked UNEXECUTED and must not inflate "ran N times".
-            if self.stall_pid_tripped(pid, Some(&pc)) {
+            if self.stall_pid_tripped(pid, Some(pc)) {
                 // A single process re-arming like this is a zero-delay
                 // livelock (e.g. `always #(period) clk=~clk` whose real
                 // `period` momentarily glitched to 0). Rather than abort the

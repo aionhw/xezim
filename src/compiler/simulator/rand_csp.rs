@@ -7240,20 +7240,20 @@ impl Simulator {
         // A rand sub-object's member (`a.x`, `this.a.x`, `t.a.x`): a
         // `prop.name` variable when the sub-object joined the solve.
         // (Also `s.x`, a member of an unpacked struct member.)
-        if csp.has_subs || csp.dotted {
-            if let Some(mut path) = Self::csp_member_path(e) {
-                if path.len() >= 3 && (path[0] == "this" || recv_ok(self, &path[0])) {
-                    path.remove(0);
+        if (csp.has_subs || csp.dotted)
+            && let Some(mut path) = Self::csp_member_path(e)
+        {
+            if path.len() >= 3 && (path[0] == "this" || recv_ok(self, &path[0])) {
+                path.remove(0);
+            }
+            // `a.x`, or `a.b.x` for a sub-object of a sub-object.
+            if path.len() >= 2 {
+                let n = path.join(".");
+                if known(&n) {
+                    return Some(n);
                 }
-                // `a.x`, or `a.b.x` for a sub-object of a sub-object.
-                if path.len() >= 2 {
-                    let n = path.join(".");
-                    if known(&n) {
-                        return Some(n);
-                    }
-                    if let Some(n) = self.csp_member_through_handles(csp, &path) {
-                        return Some(n);
-                    }
+                if let Some(n) = self.csp_member_through_handles(csp, &path) {
+                    return Some(n);
                 }
             }
         }

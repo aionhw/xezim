@@ -4316,8 +4316,8 @@ impl Simulator {
                     cb_base_flat = f;
                     cb_base = &cb_base_flat;
                 }
-                if let ExprKind::Ident(hier) = &cb_base.kind {
-                    if hier.path.len() >= 2 {
+                if let ExprKind::Ident(hier) = &cb_base.kind
+                    && hier.path.len() >= 2 {
                         let cb_segs: Vec<&str> = hier
                             .path
                             .iter()
@@ -4397,8 +4397,8 @@ impl Simulator {
                                     Some(self.freeze_lvalue_indices(&t))
                                 };
                                 // §14.16 `##N`: wait N further clocking events.
-                                if let Some(n) = intra_cycles {
-                                    if n > 0 {
+                                if let Some(n) = intra_cycles
+                                    && n > 0 {
                                         self.clocking_cycle_pending.entry(cb).or_default().push((
                                             n,
                                             raw_sig.to_string(),
@@ -4408,7 +4408,6 @@ impl Simulator {
                                         ));
                                         return;
                                     }
-                                }
                                 // §14.16.1: a drive executed AT the clocking
                                 // event matures at edge + OUTPUT SKEW (per-sig
                                 // override, else block default, else #0 =
@@ -4452,7 +4451,6 @@ impl Simulator {
                             }
                         }
                     }
-                }
                 // SV-2023: NBA to a ref formal redirects to the caller's
                 // actual lvalue (IEEE 1800-2023 §13.5.2).
                 let written = lvalue;

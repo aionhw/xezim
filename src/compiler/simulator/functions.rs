@@ -380,29 +380,29 @@ impl Simulator {
             }
             // Unpacked ARRAY formal: functions never bound one, so the body read
             // X and a `ref` write never reached the caller (§13.5.2).
-            if let Some(actual) = actual {
-                if let Some(info) = self.bind_array_arg(port, actual) {
-                    // Keep fixed-array formals visible to class-scope lookup (§13.5).
-                    locals.insert(
-                        format!("\u{1}array_formal:{}", port.name.name),
-                        Value::zero(1),
-                    );
-                    // §7.4.1 / §13.5 / §21.2.1.7: every unpacked formal
-                    // retains its element type, including packed geometry.
-                    self.register_formal_type_metadata(&port.name.name, &port.data_type, false);
-                    if is_out {
-                        if !info.1.is_empty() {
-                            array_writebacks.push(info);
-                        }
-                    } else {
-                        // An INPUT array formal is dropped on return too: left
-                        // registered, a later call whose same-named formal
-                        // took the scalar path found it and behaved
-                        // differently (#327's "warming").
-                        array_inputs.push(info);
+            if let Some(actual) = actual
+                && let Some(info) = self.bind_array_arg(port, actual)
+            {
+                // Keep fixed-array formals visible to class-scope lookup (§13.5).
+                locals.insert(
+                    format!("\u{1}array_formal:{}", port.name.name),
+                    Value::zero(1),
+                );
+                // §7.4.1 / §13.5 / §21.2.1.7: every unpacked formal
+                // retains its element type, including packed geometry.
+                self.register_formal_type_metadata(&port.name.name, &port.data_type, false);
+                if is_out {
+                    if !info.1.is_empty() {
+                        array_writebacks.push(info);
                     }
-                    continue;
+                } else {
+                    // An INPUT array formal is dropped on return too: left
+                    // registered, a later call whose same-named formal
+                    // took the scalar path found it and behaved
+                    // differently (#327's "warming").
+                    array_inputs.push(info);
                 }
+                continue;
             }
             // §13.5.3 (1800-2023): an omitted `output`/`inout` argument with a
             // default binds the default as its actual, so `output o = a`
@@ -2366,26 +2366,26 @@ impl Simulator {
             }
             // Unpacked array formal (`int a[2:0]` or `int a[3]`): copy the
             // caller's elements in, and copy them back for an out/inout/ref.
-            if let Some(actual) = actual {
-                if let Some(info) = self.bind_array_arg(port, actual) {
-                    // Keep fixed-array formals visible to class-scope lookup (§13.5).
-                    locals.insert(
-                        format!("\u{1}array_formal:{}", port.name.name),
-                        Value::zero(1),
-                    );
-                    if matches!(
-                        port.direction,
-                        PortDirection::Output | PortDirection::Inout | PortDirection::Ref
-                    ) && !info.1.is_empty()
-                    {
-                        array_writebacks.push(info.clone());
-                    }
-                    // A `ref` alias names the caller's own storage.
-                    if !(matches!(port.direction, PortDirection::Ref) && info.1.is_empty()) {
-                        array_params.push(info.0);
-                    }
-                    continue;
+            if let Some(actual) = actual
+                && let Some(info) = self.bind_array_arg(port, actual)
+            {
+                // Keep fixed-array formals visible to class-scope lookup (§13.5).
+                locals.insert(
+                    format!("\u{1}array_formal:{}", port.name.name),
+                    Value::zero(1),
+                );
+                if matches!(
+                    port.direction,
+                    PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+                ) && !info.1.is_empty()
+                {
+                    array_writebacks.push(info.clone());
                 }
+                // A `ref` alias names the caller's own storage.
+                if !(matches!(port.direction, PortDirection::Ref) && info.1.is_empty()) {
+                    array_params.push(info.0);
+                }
+                continue;
             }
             // §7.10 / §13.5.2: a QUEUE or DYNAMIC-ARRAY formal. Only functions
             // bound one; a task bound nothing, so the body operated on storage

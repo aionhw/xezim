@@ -4801,6 +4801,10 @@ enum FsmWait {
     Edge(u32),
 }
 
+type ClockingOutputDrive = (String, String, Value, Option<Expression>);
+type ClockingCycleDrive = (u64, String, String, Value, Option<Expression>);
+type ClockingEdgeDrive = (String, Value, EdgeKind, u64, Option<Expression>);
+
 /// One clocking block's per-tick poll state: its clock resolved to a
 /// signal-table id once (None: fall back to the by-name read), the edge it
 /// advances on, and the level seen on the previous tick.
@@ -7283,7 +7287,7 @@ pub struct Simulator {
     /// posedge of the cb's clock (output skew).
     /// A drive of a SELECT (`cb.v[2] <= 1`) carries its target: the net with
     /// the drive's indices frozen.
-    clocking_output_pending: HashMap<String, Vec<(String, String, Value, Option<Expression>)>>,
+    clocking_output_pending: HashMap<String, Vec<ClockingOutputDrive>>,
     /// Per-clocking-block previous clock bit (for edge detection).
     clocking_prev_clock: HashMap<String, u8>,
     /// Per-tick clock poll table for `tick_clocking_blocks` (see there).
@@ -7312,7 +7316,7 @@ pub struct Simulator {
     /// §14.16 `cb.out <= ##N v` drives awaiting N further clocking events:
     /// cb → [(remaining_cycles, clockvar, net, value, target)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.
-    clocking_cycle_pending: HashMap<String, Vec<(u64, String, String, Value, Option<Expression>)>>,
+    clocking_cycle_pending: HashMap<String, Vec<ClockingCycleDrive>>,
     /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
     /// resolved net). The snapshot/meta store the NET; reads and drives use
     /// the clocking name, so they translate through this first.
@@ -7334,8 +7338,7 @@ pub struct Simulator {
     /// Drives through an edge-skew output, waiting for that edge of the
     /// block's clock: cb → [(net, value, edge, post-edge delay, select target)]
     /// in issue order.
-    clocking_edge_out_pending:
-        HashMap<String, Vec<(String, Value, EdgeKind, u64, Option<Expression>)>>,
+    clocking_edge_out_pending: HashMap<String, Vec<ClockingEdgeDrive>>,
     /// §14.4 per-cb default INPUT skew in ticks (absent = #0).
     clocking_in_skew: HashMap<String, u64>,
     /// §14.4 per-signal input-skew overrides: cb → (resolved net → ticks).

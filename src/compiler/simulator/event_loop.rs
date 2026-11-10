@@ -323,7 +323,7 @@ impl Simulator {
                 if self.cascade_limit_explicit {
                     break;
                 }
-                if (cascade_iter - cascade_limit) % SAMPLE == 0
+                if (cascade_iter - cascade_limit).is_multiple_of(SAMPLE)
                     && self
                         .progress_state_hash(None)
                         .is_some_and(|state| !seen_states.insert(state))

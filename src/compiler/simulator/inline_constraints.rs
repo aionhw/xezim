@@ -667,12 +667,9 @@ impl Simulator {
                 if matches!(&base.kind, ExprKind::Ident(b)
                     if b.path.len() == 1 && self.module.classes.contains_key(&b.path[0].name.name)) =>
             {
-                let Some(bn) = self
+                let bn = self
                     .expr_assoc_name(cur)
-                    .filter(|n| self.is_associative_array(n))
-                else {
-                    return None;
-                };
+                    .filter(|n| self.is_associative_array(n))?;
                 let mut name = bn.clone();
                 for idx in rev.iter().rev() {
                     let kv = self.eval_expr(idx);

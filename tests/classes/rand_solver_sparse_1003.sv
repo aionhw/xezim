@@ -739,5 +739,3 @@ module tb_top;
     `SVTEST_PASSFAIL
   end
 endmodule
-
-
