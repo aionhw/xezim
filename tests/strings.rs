@@ -41,6 +41,8 @@ mod dpi_unit_scope;
 mod fixed_string_array_dims;
 #[path = "strings/format_lrm_compliance.rs"]
 mod format_lrm_compliance;
+#[path = "strings/format_real_integral_889.rs"]
+mod format_real_integral_889;
 #[path = "strings/format_sibling_fixes.rs"]
 mod format_sibling_fixes;
 #[path = "strings/fwrite_buffered_flush_points.rs"]
@@ -83,6 +85,8 @@ mod percent_p_string_values;
 mod ref_arg_assoc_writeback;
 #[path = "strings/ref_arg_collection_writeback.rs"]
 mod ref_arg_collection_writeback;
+#[path = "strings/review_vpi_unlabelled_block_data.rs"]
+mod review_vpi_unlabelled_block_data;
 #[path = "strings/string_eq_relational_2state.rs"]
 mod string_eq_relational_2state;
 #[path = "strings/string_index_write_frame_local.rs"]

@@ -214,7 +214,7 @@ impl Simulator {
             {
                 let mut stripped = hier.clone();
                 stripped.path.remove(0);
-                stripped.cached_signal_id = std::cell::Cell::new(None);
+                stripped.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                 let f = Expression::new(ExprKind::Ident(stripped), func.span);
                 return self.eval_call_inner(&f, args);
             }
@@ -2705,9 +2705,14 @@ impl Simulator {
                 if matches!(method_name.as_str(), "rand_mode" | "constraint_mode") {
                     let mname = method_name.clone();
                     // Resolve obj_name to a heap handle.
+                    // §18.8/§18.9: the object is the one in the current
+                    // automatic frame, before any same-named design signal.
                     let h_val = self
-                        .get_signal_value_by_name(obj_name)
-                        .map(|v| v.to_u64().unwrap_or(0) as usize)
+                        .eval_ident_handle(obj_name)
+                        .or_else(|| {
+                            self.get_signal_value_by_name(obj_name)
+                                .map(|v| v.to_u64().unwrap_or(0) as usize)
+                        })
                         .unwrap_or(0);
                     if h_val != 0 && self.heap.get(h_val).and_then(|x| x.as_ref()).is_some() {
                         // Middle segments name the targeted prop/constraint;
@@ -3010,8 +3015,9 @@ impl Simulator {
                             root: None,
                             path: hier.path[..hier.path.len() - 1].to_vec(),
                             span: hier.span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         func.span,
                     );
@@ -3063,9 +3069,16 @@ impl Simulator {
                         (self.eval_ident_handle(head).unwrap_or(0), 1)
                     };
                     let last_seg = hier.path.len() - 1;
+                    // The object holding the receiver property, when the walk
+                    // reaches the receiver itself (for its declared
+                    // specialization if the receiver is null).
+                    let mut receiver_owner: Option<usize> = None;
                     for (si, seg) in hier.path[loop_start..last_seg].iter().enumerate() {
                         if handle == 0 {
                             break;
+                        }
+                        if loop_start + si + 1 == last_seg {
+                            receiver_owner = Some(handle);
                         }
                         // §19.8: `cg.cp.get_coverage()` — the walk reached a
                         // covergroup and the next segment names one of its
@@ -3089,6 +3102,55 @@ impl Simulator {
                             .and_then(|i| i.properties.get(&seg.name.name))
                             .and_then(|v| v.to_u64())
                             .unwrap_or(0) as usize;
+                    }
+                    // §8.23: the walk ended at a NULL handle — an
+                    // unallocated intermediate object (`h.null_h.m()`). A
+                    // STATIC method needs no object, so dispatch it on the
+                    // receiver prefix's DECLARED class. Without this the
+                    // call fell through to path[0], which does not define
+                    // the method, and silently returned integer zero.
+                    if handle == 0 {
+                        let prefix: Vec<String> = hier.path[..last_seg]
+                            .iter()
+                            .map(|s| s.name.name.clone())
+                            .collect();
+                        let prefix_refs: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+                        if let Some(decl_full) = self.dotted_name_declared_class(&prefix_refs) {
+                            let base_cls = decl_full
+                                .split('#')
+                                .next()
+                                .unwrap_or(&decl_full)
+                                .to_string();
+                            if self.is_static_method(&base_cls, method_name) {
+                                // §8.25: seed the specialization context from
+                                // the declared type, as the 2-segment arm does.
+                                // A property declared `P #(8) p8` names its
+                                // specialization in the owner's property
+                                // table, not in the flat type text.
+                                let owner_spec = receiver_owner.and_then(|o| {
+                                    self.cast_dest_property_type(
+                                        o,
+                                        &hier.path[last_seg - 1].name.name,
+                                    )
+                                    .and_then(|(_, spec, _)| spec)
+                                });
+                                let saved = owner_spec
+                                    .or_else(|| self.spec_for_null_receiver(None, &decl_full))
+                                    .map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+                                let res = self.exec_static_method_via_object(
+                                    &base_cls,
+                                    method_name,
+                                    args,
+                                    0,
+                                );
+                                if let Some(prev) = saved {
+                                    self.current_spec = prev;
+                                }
+                                if let Some(res) = res {
+                                    return res;
+                                }
+                            }
+                        }
                     }
                     // The walked-to property may be a covergroup instance
                     // (`e.cg.sample()`, `e.cg.get_inst_coverage()`).
@@ -3160,7 +3222,20 @@ impl Simulator {
                             .flatten()
                             .and_then(|th| self.prop_class_type(th, obj_name))
                     });
-                    let base_cls = if handle != 0 {
+                    // §8.23: a static method is not virtual, so when the
+                    // DECLARED class's chain declares it, a live receiver of a
+                    // derived class still runs the declared class's method
+                    // (a derived class's same-named static hides it only for
+                    // receivers declared as the derived class).
+                    let declared_static = handle != 0
+                        && self
+                            .class_member_names()
+                            .static_methods
+                            .contains(method_name.as_str())
+                        && decl_cls_opt.as_ref().is_some_and(|d| {
+                            self.is_static_method(d.split('#').next().unwrap_or(d), method_name)
+                        });
+                    let base_cls = if handle != 0 && !declared_static {
                         self.heap
                             .get(handle)
                             .and_then(|o| o.as_ref())

@@ -202,6 +202,7 @@ impl Simulator {
         self.ready_condition_waiters
             .retain(|(p, _)| !to_kill.contains(p));
         for p in &to_kill {
+            self.cond_waiter_gate.remove(p);
             self.cond_waiter_reads.remove(p);
             self.cond_read_union_dirty = true;
             self.cond_waiter_conditions.remove(p);
@@ -209,6 +210,10 @@ impl Simulator {
         self.inactive_queue.retain(|(p, _)| !to_kill.contains(p));
         self.nba_region_waiters
             .retain(|(p, _)| !to_kill.contains(p));
+        self.deferred_clocking_conts
+            .retain(|(p, _)| !to_kill.contains(p));
+        self.deferred_clocking_guarded
+            .retain(|(w, _)| !to_kill.contains(&w.pid));
         for q in self.mailbox_get_waiters.values_mut() {
             q.retain(|w| !to_kill.contains(&w.pid));
         }
@@ -549,14 +554,16 @@ impl Simulator {
         // higher up must still see grandchildren whose intermediate parent has
         // finished). Without this, completing `X` would orphan its child `G`.
         if let Some(&grandparent) = self.process_parents.get(&child_pid) {
-            let regrandkids: Vec<usize> = self
-                .process_parents
-                .iter()
-                .filter(|&(_, &p)| p == child_pid)
-                .map(|(&c, _)| c)
-                .collect();
-            for c in regrandkids {
-                self.process_parents.insert(c, grandparent);
+            if self.process_parents.values().any(|&p| p == child_pid) {
+                let regrandkids: Vec<usize> = self
+                    .process_parents
+                    .iter()
+                    .filter(|&(_, &p)| p == child_pid)
+                    .map(|(&c, _)| c)
+                    .collect();
+                for c in regrandkids {
+                    self.process_parents.insert(c, grandparent);
+                }
             }
         }
         self.process_parents.remove(&child_pid);

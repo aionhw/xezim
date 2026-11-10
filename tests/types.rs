@@ -25,6 +25,8 @@ mod array_parameter;
 mod array_query_multidim_packed;
 #[path = "types/array_query_of_declared_variable.rs"]
 mod array_query_of_declared_variable;
+#[path = "types/array_query_packed_element_select.rs"]
+mod array_query_packed_element_select;
 #[path = "types/array_read_unknown_index_is_x.rs"]
 mod array_read_unknown_index_is_x;
 #[path = "types/ascending_indexed_part_select.rs"]
@@ -49,6 +51,8 @@ mod block_local_width_in_index_shift;
 mod block_local_size_query_scope;
 #[path = "types/byte_local_narrow.rs"]
 mod byte_local_narrow;
+#[path = "types/call_result_member_element_select.rs"]
+mod call_result_member_element_select;
 #[path = "types/callback_typedef_static.rs"]
 mod callback_typedef_static;
 #[path = "types/callee_local_keeps_caller_type.rs"]
@@ -139,6 +143,8 @@ mod generate_with_array_queries;
 mod header_parameter_declared_signedness;
 #[path = "types/hierarchy_and_type_overrides.rs"]
 mod hierarchy_and_type_overrides;
+#[path = "types/implicit_net_in_submodule.rs"]
+mod implicit_net_in_submodule;
 #[path = "types/implicit_port_net_and_packed_typedef_array.rs"]
 mod implicit_port_net_and_packed_typedef_array;
 #[path = "types/inc_dec_result_signedness.rs"]
@@ -187,6 +193,8 @@ mod nonzero_based_vector_writes;
 mod package_base_constraint_inherited;
 #[path = "types/package_scope_resolution.rs"]
 mod package_scope_resolution;
+#[path = "types/package_struct_formal_layout_reuse.rs"]
+mod package_struct_formal_layout_reuse;
 #[path = "types/package_typedef_scoping.rs"]
 mod package_typedef_scoping;
 #[path = "types/packed_2d_element_in_size_cast.rs"]
@@ -259,6 +267,8 @@ mod scoped_type_cast;
 mod shift_context_width;
 #[path = "types/shift_width_and_scope_hint.rs"]
 mod shift_width_and_scope_hint;
+#[path = "types/compiled_member_operand_width.rs"]
+mod compiled_member_operand_width;
 #[path = "types/signedness_and_power_context.rs"]
 mod signedness_and_power_context;
 #[path = "types/size_cast_context_and_fn_return_default.rs"]
@@ -275,6 +285,8 @@ mod struct_copy_and_queue_ops;
 mod struct_dynamic_member_element_copy;
 #[path = "types/struct_member_array_of_structs_copy.rs"]
 mod struct_member_array_of_structs_copy;
+#[path = "types/struct_member_typedef_element_dims.rs"]
+mod struct_member_typedef_element_dims;
 #[path = "types/struct_named_patterns.rs"]
 mod struct_named_patterns;
 #[path = "types/struct_unpacked_array_member.rs"]
@@ -458,6 +470,8 @@ mod real_to_int_wraps;
 mod real_to_int_wide;
 #[path = "types/real_to_integral_local.rs"]
 mod real_to_integral_local;
+#[path = "types/real_to_integral_stores_889.rs"]
+mod real_to_integral_stores_889;
 #[path = "types/rtoi_out_of_range.rs"]
 mod rtoi_out_of_range;
 #[path = "types/ref_formal_element_write.rs"]
@@ -653,6 +667,8 @@ mod body_typedef_first_instance_680;
 
 #[path = "types/return_expr_context_width.rs"]
 mod return_expr_context_width;
+#[path = "types/return_expr_unary_context_width.rs"]
+mod return_expr_unary_context_width;
 #[path = "types/type_param_header_defaults.rs"]
 mod type_param_header_defaults;
 
@@ -671,3 +687,29 @@ mod unpacked_struct_output_port_whole_write;
 
 #[path = "types/function_result_member_defaults.rs"]
 mod function_result_member_defaults;
+
+#[path = "types/nettype_no_resolver_ports.rs"]
+mod nettype_no_resolver_ports;
+#[path = "types/review_nettype_partial_driver.rs"]
+mod review_nettype_partial_driver;
+#[path = "types/review_nettype_multi_top.rs"]
+mod review_nettype_multi_top;
+
+
+#[path = "types/function_local_ascending_packed.rs"]
+mod function_local_ascending_packed;
+#[path = "types/nonansi_typedef_packed_port_942.rs"]
+mod nonansi_typedef_packed_port_942;
+#[path = "types/two_state_local_in_fallback.rs"]
+mod two_state_local_in_fallback;
+#[path = "types/packed_struct_elem_store_width.rs"]
+mod packed_struct_elem_store_width;
+#[path = "types/unpacked_elem_packed_select_read.rs"]
+mod unpacked_elem_packed_select_read;
+#[path = "types/unpacked_elem_select_followups.rs"]
+mod unpacked_elem_select_followups;
+#[path = "types/struct_array_member_elem_select.rs"]
+mod struct_array_member_elem_select;
+
+#[path = "types/packed_select_geometry_1002.rs"]
+mod packed_select_geometry_1002;

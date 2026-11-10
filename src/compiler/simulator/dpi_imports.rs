@@ -95,20 +95,7 @@ impl Simulator {
         dt: &DataType,
         typedef_types: &HashMap<String, DataType>,
     ) -> DataType {
-        let mut cur = dt.clone();
-        for _ in 0..64 {
-            match &cur {
-                DataType::TypeReference { name, .. } => {
-                    if let Some(next) = typedef_types.get(&name.name.name) {
-                        cur = next.clone();
-                    } else {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        cur
+        Self::resolve_type_ref_borrowed(dt, typedef_types).clone()
     }
 
     /// Returns `Some((width, signed))` when `dt` — either directly or through a

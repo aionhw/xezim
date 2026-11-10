@@ -142,3 +142,80 @@ endmodule
 "#;
     assert_eq!(t_lines(src), ["T|tk=0000000100000002 fk=0000000300000004"]);
 }
+
+#[test]
+fn type_param_output_writeback_and_members() {
+    if !all_policies() {
+        return;
+    }
+    let src = r#"
+class item_c;
+  int id;
+  function new(int v); id = v; endfunction
+endclass
+
+class sqr_c #(type REQ = item_c);
+  REQ last_item;
+  function void item_done(REQ item = null);
+    if (item != null) last_item = item;
+  endfunction
+endclass
+
+class fifo_c #(type T = item_c);
+  T stored;
+  function bit try_get(output T val);
+    if (stored != null) begin
+      val = stored;
+      return 1;
+    end
+    return 0;
+  endfunction
+  function void put_item(T val);
+    stored = val;
+  endfunction
+endclass
+
+class cb_iter #(type T = item_c, type CB = item_c);
+  T m_obj;
+  CB m_cb;
+  function new(T obj = null);
+    m_obj = obj;
+  endfunction
+  function CB set_and_get(CB cb);
+    REQ t;
+    m_cb = cb;
+    t = m_cb;
+    return t;
+  endfunction
+endclass
+
+module top;
+  initial begin
+    sqr_c#(item_c) sqr = new();
+    fifo_c#(item_c) fifo = new();
+    cb_iter#(item_c, item_c) iter = new(new(100));
+    item_c it1, it2, it3, out_it;
+    bit ok;
+    int loop_cnt = 0;
+
+    it1 = new(735);
+    it2 = new(9435);
+    it3 = new(2025);
+
+    fifo.put_item(it2);
+
+    for (int k = 0; k < 1200; k++) begin
+      sqr.item_done(it1);
+      ok = fifo.try_get(out_it);
+      it3 = iter.set_and_get(it1);
+      loop_cnt++;
+    end
+
+    $display("T|seq=%0d tx=%0d cb=%0d cnt=%0d ok=%0d",
+             sqr.last_item.id, out_it.id, it3.id, loop_cnt, ok);
+  end
+endmodule
+"#;
+    assert_eq!(t_lines(src), ["T|seq=735 tx=9435 cb=735 cnt=1200 ok=1"]);
+}
+

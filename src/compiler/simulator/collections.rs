@@ -33,6 +33,25 @@ impl Simulator {
             || self.string_signals.contains(base)
     }
 
+    /// §7.8, §6.18: the element type `dt` of associative array `name` is a
+    /// typedef that carries unpacked dimensions (`typedef int a2_t[2];
+    /// a2_t f[string]`), so each element is itself an array whose entries
+    /// are stored under `f["b"][1]`, never under `f["b"]`.
+    pub(super) fn assoc_elem_typedef_is_array(&self, name: &str, dt: &DataType) -> bool {
+        let DataType::TypeReference { name: tn, .. } = dt else {
+            return false;
+        };
+        let (bare, qual) = (tn.name.name.as_str(), tn.qualified());
+        if let Some((h, _)) = name.split_once('#')
+            && let Ok(h) = h.parse::<usize>()
+        {
+            return self.class_chain_typedef_dims(h, bare).is_some()
+                || self.class_chain_typedef_dims(h, &qual).is_some();
+        }
+        self.typedef_unpacked_dims_of(bare).is_some()
+            || self.module.typedef_unpacked_dims.contains_key(&qual)
+    }
+
     /// The declared INTEGRAL element type of an associative array, from its
     /// declaration: a module / subroutine-local array's `var_decl_types`
     /// entry, or the class property for `<handle>#<member>`. `None` for an
@@ -88,6 +107,56 @@ impl Simulator {
     pub(super) fn assoc_elem_signed(&self, name: &str) -> Option<bool> {
         self.assoc_elem_decl_type(name)
             .map(|dt| super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types))
+    }
+
+    /// Whether the elements of collection `name` are class handles
+    /// (`K q[$]`, `K aa[int]`), from the element class the elaborator
+    /// recorded or the declared element type.
+    pub(super) fn coll_elem_is_class_handle(&self, name: &str) -> bool {
+        let leaf = name.rsplit('.').next().unwrap_or(name);
+        let root = name.split('[').next().unwrap_or(name);
+        if [name, leaf, root]
+            .iter()
+            .any(|n| self.module.array_elem_class.contains_key(*n))
+        {
+            return true;
+        }
+        let dt = self
+            .module
+            .var_decl_types
+            .get(name)
+            .or_else(|| self.module.var_decl_types.get(leaf))
+            .or_else(|| self.module.var_decl_types.get(root));
+        matches!(
+            dt.map(|d| self.resolve_dt_ref(d)),
+            Some(DataType::TypeReference { name: tn, .. })
+                if self.module.classes.contains_key(&tn.name.name)
+        )
+    }
+
+    /// The live size of row `name` when the dimension its next select
+    /// indexes is a queue or dynamic one, from the declared shape. None for a
+    /// fixed row (`raw[0]` of `T raw[][2]`), which is registered as dynamic
+    /// but keeps no size.
+    pub(super) fn live_coll_size(&self, name: &str) -> Option<u64> {
+        let sized = match self.coll_shape_at(name) {
+            Some((shape, depth)) => matches!(shape.dims.get(depth), Some(Dim::Dyn | Dim::Queue)),
+            None => {
+                let key = Self::name_with_suffix(name, ".size");
+                self.signals.contains_key(&key) || self.get_signal_value_by_name(&key).is_some()
+            }
+        };
+        sized.then(|| self.get_queue_size(name))
+    }
+
+    /// §7.10.1, §8.4: a read of a queue or dynamic-array element that does
+    /// not exist yields the element type's default — null for a class
+    /// handle, otherwise as `assoc_missing_elem_value`.
+    pub(super) fn coll_missing_elem_value(&self, name: &str) -> Option<Value> {
+        if self.coll_elem_is_class_handle(name) {
+            return Some(Value::zero(32));
+        }
+        self.assoc_missing_elem_value(name)
     }
 
     /// §7.8.6: the value a read of a NONEXISTENT associative-array element
@@ -185,6 +254,47 @@ impl Simulator {
         fitted
     }
 
+    /// §6.12.2: a REAL stored into an element of the nested collection whose
+    /// chain of selects `expr` roots at a plain name (`m[k1][k2]`, `a[i][k]`,
+    /// `q[i][k]`), rounded to the element type's width and stamped with its
+    /// signedness. `None` for an integral value, a real element type, or a
+    /// root whose element type is unknown (the caller stores `val` as is).
+    /// Only a real value pays the lookups.
+    pub(super) fn fit_real_nested_elem(&self, expr: &Expression, val: &Value) -> Option<Value> {
+        if !val.is_real {
+            return None;
+        }
+        let mut cur = expr;
+        while let ExprKind::Index { expr: inner, .. } = &cur.kind {
+            cur = inner;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        let root = self.resolve_hier_name(h);
+        let dt = self.p_elem_type_ref(&root)?;
+        let dt = self.resolve_dt_ref(&dt);
+        if !matches!(
+            dt,
+            DataType::IntegerVector { .. } | DataType::IntegerAtom { .. } | DataType::Enum(_)
+        ) {
+            return None;
+        }
+        let w = self
+            .assoc_elem_width(&root)
+            .filter(|&w| w > 0)
+            .unwrap_or_else(|| {
+                super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+            });
+        let mut v = Self::real_to_int(val.to_f64(), w.max(1));
+        v.is_signed = super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types);
+        Some(v)
+    }
+
     /// The context width of a value stored into an element of associative
     /// array `name` (§11.6.1): its element width, or none for a `real`
     /// element, whose integral value is self-determined before conversion.
@@ -197,6 +307,159 @@ impl Simulator {
             return None;
         }
         self.assoc_elem_width(name).filter(|&w| w > 0)
+    }
+
+    /// §7.8, §7.4.6, §11.5.1: a select past the unpacked dimensions of an
+    /// associative array selects into the element: `a[7][3]` of
+    /// `logic [31:0] a [int]` is bit 3 of `a[7]`, and `p[1][1]` of
+    /// `logic [3:0][7:0] p [int]` is byte 1 of `p[1]` (and `p[1][1][4]`
+    /// bit 4 of that byte). `expr` is the element or a select into it
+    /// (`a[7]`, `p[1][1]`) and `index` the next select. Mirrors
+    /// `assoc_elem_bit_write`; without it the read took the select as one
+    /// more key and read the absent element `a[7][3]`. None when `expr` does
+    /// not name an element of an associative array, or the element is
+    /// itself a collection (`aq[k][i]` of `int aq[int][$]`).
+    pub(super) fn assoc_elem_select_read(
+        &mut self,
+        expr: &Expression,
+        index: &Expression,
+    ) -> Option<Value> {
+        let (packed, _) = self.assoc_elem_select_dims(expr)?;
+        let elem = self.eval_expr(expr);
+        let Some(dims) = packed else {
+            return Some(match self.eval_expr(index).to_index() {
+                Some(i) if i >= 0 && (i as u32) < elem.width => elem.bit_select(i as usize),
+                _ => Value::new(1),
+            });
+        };
+        let (dl, dr) = dims[0];
+        let stride: i64 = dims[1..].iter().map(|&(l, r)| (l - r).abs() + 1).product();
+        let (lo, hi) = (dl.min(dr), dl.max(dr));
+        let Some(i) = self
+            .eval_expr(index)
+            .to_index()
+            .filter(|i| (lo..=hi).contains(i))
+        else {
+            return Some(Value::new(stride.max(1) as u32));
+        };
+        let slot = if dl >= dr { i - lo } else { hi - i };
+        let lsb = (slot * stride) as usize;
+        Some(elem.range_select(lsb + stride as usize - 1, lsb))
+    }
+
+    /// §7.4.6, §11.5.1: a part-select of an associative array element whose
+    /// packed type has more than one dimension selects whole elements of the
+    /// leading packed dimension: `p[k][3:2]` of `logic [3:0][7:0] p [int]` is
+    /// bytes 3 and 2 of `p[k]` (`[a+:w]` / `[a-:w]` likewise). A
+    /// one-dimensional element keeps the plain bit part-select. None when
+    /// `expr` does not name such an element.
+    pub(super) fn assoc_elem_range_read(
+        &mut self,
+        expr: &Expression,
+        left: &Expression,
+        right: &Expression,
+        kind: RangeKind,
+    ) -> Option<Value> {
+        let (Some(dims), _) = self.assoc_elem_select_dims(expr)? else {
+            return None;
+        };
+        if dims.len() < 2 {
+            return None;
+        }
+        let (dl, dr) = dims[0];
+        let stride: i64 = dims[1..].iter().map(|&(l, r)| (l - r).abs() + 1).product();
+        let (lo, hi) = (dl.min(dr), dl.max(dr));
+        let a = self.eval_expr(left).to_index();
+        let b = self.eval_expr(right).to_index();
+        let (i1, i2) = match (kind, a, b) {
+            (RangeKind::Constant, Some(a), Some(b)) => (a, b),
+            (RangeKind::IndexedUp, Some(a), Some(w)) if w > 0 => (a, a + w - 1),
+            (RangeKind::IndexedDown, Some(a), Some(w)) if w > 0 => (a - w + 1, a),
+            _ => return Some(Value::new(stride.max(1) as u32)),
+        };
+        let count = (i1 - i2).abs() + 1;
+        if ![i1, i2].iter().all(|i| (lo..=hi).contains(i)) {
+            return Some(Value::new((count * stride).max(1) as u32));
+        }
+        let elem = self.eval_expr(expr);
+        let slot = |i: i64| if dl >= dr { i - lo } else { hi - i };
+        let (s1, s2) = (slot(i1), slot(i2));
+        let lsb = (s1.min(s2) * stride) as usize;
+        let msb = ((s1.max(s2) + 1) * stride) as usize - 1;
+        Some(elem.range_select(msb, lsb))
+    }
+
+    /// The associative array element `expr` names (`a[k]`, or a select into
+    /// it like `p[k][1]`), as the packed dimensions left to select into
+    /// (None for a one-dimensional element) and the number of selects already
+    /// applied past the keys. None when `expr` is not such an element, or the
+    /// element is itself a collection (`aq[k][i]` of `int aq[int][$]`).
+    fn assoc_elem_select_dims(
+        &mut self,
+        expr: &Expression,
+    ) -> Option<(Option<Vec<(i64, i64)>>, usize)> {
+        let mut root = expr;
+        let mut keys = 0usize;
+        while let ExprKind::Index { expr: inner, .. } = &root.kind {
+            root = inner;
+            keys += 1;
+        }
+        if keys == 0 {
+            return None;
+        }
+        // Hot path (every nested index read once any associative array
+        // exists): outside a class method, a plain name that is not a
+        // registered associative array cannot reach one through a class
+        // member or a scoped spelling.
+        let ExprKind::Ident(h) = &root.kind else {
+            return None;
+        };
+        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let name = {
+            let nm = self.resolve_hier_name(h);
+            if self.module.associative_arrays.contains_key(&*nm) {
+                nm.into_owned()
+            } else if self.this_stack.last().copied().flatten().is_none()
+                && !nm.bytes().any(|b| matches!(b, b'#' | b'.' | b':' | b'['))
+            {
+                return None;
+            } else {
+                drop(nm);
+                self.assoc_array_storage_name(root)?
+            }
+        };
+        let declared = match self.coll_shape_at(&name) {
+            Some((shape, 0)) => shape.dims.len(),
+            Some(_) => return None,
+            None => 1,
+        };
+        // `extra` selects already went into the element (`p[1][1][4]`:
+        // `p[1][1]` is a byte of `p[1]`), so `index` selects within the
+        // packed dimension after them.
+        let extra = keys.checked_sub(declared)?;
+        // The element must be a value, not a row the declaration does not
+        // show (a typedef'd collection element): the key paths own those.
+        if let Some(row) = self.nested_index_name(expr)
+            && (self.is_associative_array(&row)
+                || self.module.dynamic_arrays.contains(&row)
+                || self
+                    .signals
+                    .contains_key(&Self::name_with_suffix(&row, ".size")))
+        {
+            return None;
+        }
+        let packed = self
+            .module
+            .packed_full_dims
+            .get(&name)
+            .filter(|d| d.len() > extra)
+            .map(|d| d[extra..].to_vec());
+        if packed.is_none() && extra > 0 {
+            return None;
+        }
+        Some((packed, extra))
     }
 
     pub(super) fn assoc_elem_width(&self, name: &str) -> Option<u32> {
@@ -1361,6 +1624,7 @@ impl Simulator {
                         span: crate::ast::Span::dummy(),
                     },
                     span: crate::ast::Span::dummy(),
+                    bound: Default::default(),
                 };
                 // Resolve a typedef alias to a PARAMETERIZED class with its
                 // specialization args intact (`BaseType` → `base_class#(9)`),
@@ -1509,6 +1773,7 @@ impl Simulator {
                     span: crate::ast::Span::dummy(),
                 },
                 span: crate::ast::Span::dummy(),
+                bound: Default::default(),
             };
             return self.resolve_typeref_class_name(&synth);
         }
@@ -1548,6 +1813,7 @@ impl Simulator {
                     span: crate::ast::Span::dummy(),
                 },
                 span: crate::ast::Span::dummy(),
+                bound: Default::default(),
             };
             return self.resolve_typeref_class_name(&synth);
         }
@@ -1694,6 +1960,7 @@ impl Simulator {
                         span: crate::ast::Span::dummy(),
                     },
                     span: crate::ast::Span::dummy(),
+                    bound: Default::default(),
                 };
                 self.resolve_typeref_class_name(&synth)?
             };
@@ -2515,7 +2782,7 @@ impl Simulator {
                 signed: v.is_signed,
                 base: NumberBase::Binary,
                 value: v.to_bin(),
-                cached_val: Cell::new(v.inline_bits().map(|(vbits, xz)| (vbits, xz, v.width))),
+                cached_val: crate::ast::cache::LiteralCache::new(v.inline_bits().map(|(vbits, xz)| (vbits, xz, v.width))),
             })
         };
         Expression::new(kind, expr.span)
@@ -2568,6 +2835,12 @@ impl Simulator {
             }
             _ => return None,
         };
+        // §7.8: an associative array's elements live under their keys, not
+        // in the scalar signal named after the array, so its selects belong
+        // to the associative paths (`assoc_elem_select_read`).
+        if self.is_associative_array(&base_name) {
+            return None;
+        }
         let dims = self.module.packed_full_dims.get(&base_name)?.clone();
         let k = idx_exprs.len();
         idx_exprs.reverse(); // outermost dimension's index first
@@ -2787,13 +3060,10 @@ impl Simulator {
         let mut v = match self.signals.get(name).cloned() {
             Some(v) => v,
             None => {
-                let Some(alt) = strip_genblk_segments(name) else {
-                    // A name read at run time that nothing holds: an input
-                    // port net left out as unobserved would have held it.
-                    self.signal_name_to_id.check_miss(name);
-                    return None;
-                };
-                return self.get_signal_value_by_name(&alt);
+                // A name read at run time that nothing holds: an input
+                // port net left out as unobserved would have held it.
+                self.signal_name_to_id.check_miss(name);
+                return None;
             }
         };
         // §6.11.1: an element of an array-of-queue / array-of-dynamic lives
@@ -2845,6 +3115,8 @@ impl Simulator {
                 let fitted = match self.frame_get(name) {
                     Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
                     Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
+                    // §6.12.2: a real into an integral leaf rounds.
+                    Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                     _ => val,
                 };
                 if let Some(frame) = self.local_stack.last_mut() {
@@ -4648,6 +4920,14 @@ impl Simulator {
                     // std::randomize(vars) with {...}
                     if let ExprKind::Ident(h) = &expr.kind {
                         if h.path.len() == 1 && h.path[0].name.name == "std" {
+                            // §11.4.5: a one-bit `&` / `|` is the logical form
+                            // here too (see `one_bit_logic_item`).
+                            let mut one_bit = constraints.to_vec();
+                            let changed = one_bit
+                                .iter_mut()
+                                .fold(false, |c, it| self.one_bit_logic_item(None, it) | c);
+                            let constraints: &[crate::ast::decl::ConstraintItem] =
+                                if changed { &one_bit } else { constraints };
                             // §18.12 / §18.11.1: `std::randomize()` with an EMPTY
                             // variable list solves nothing — every name in the
                             // `with` block is a state variable, so the call is a
@@ -4901,7 +5181,8 @@ impl Simulator {
                                 // the per-element repair can dead-end (e.g. an
                                 // ascending cross-element chain that exhausts
                                 // its headroom); a fresh seed usually escapes.
-                                if self.inline_constraints_satisfied(constraints) {
+                                let sat = self.inline_constraints_satisfied(constraints);
+                                if sat {
                                     satisfied = true;
                                     break;
                                 }
@@ -5002,6 +5283,25 @@ impl Simulator {
         // (sizing, element solving, acceptance).
         self.begin_randomize_budget();
         self.obj_rng_stack.push(handle);
+        // §18.7/§8.14: the object's scope is that of the receiver's declared
+        // class, which a derived class's redeclaration can change.
+        let scope = if self.shadowed_prop_names.is_empty() || items.is_empty() {
+            None
+        } else {
+            let dynamic = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.class_name.clone());
+            receiver
+                .as_deref()
+                .and_then(|r| self.var_view_class(r))
+                .filter(|c| {
+                    dynamic
+                        .as_deref()
+                        .is_some_and(|d| d != c && self.class_is_a(d, c))
+                })
+        };
         // §18.7: names in the inline block resolve in the object's scope
         // first, so a property named like the receiver hides it there.
         let receiver = receiver.filter(|r| {
@@ -5019,7 +5319,9 @@ impl Simulator {
         let inline_src_file = (!items.is_empty())
             .then(|| self.current_src_file())
             .flatten();
+        let prev_scope = std::mem::replace(&mut self.inline_constraint_scope, scope);
         let r = self.exec_randomize_inner(handle, items, inline_src_file);
+        self.inline_constraint_scope = prev_scope;
         self.randomize_subset = prev_subset;
         self.rand_receiver_base = prev_base;
         self.rand_receiver = prev_receiver;

@@ -215,13 +215,115 @@ impl Simulator {
     /// was forked inside, or any process parked inside it. That process
     /// resumes at the end of the block, and every process forked inside the
     /// block, the disabling one included, is terminated.
+    /// §9.6.2, §23.8: the process whose top-level block a `disable` target
+    /// names. The target's path is looked up as `<scope>.<path>` from the
+    /// disabling process's scope outward, so `disable g1.blk` and
+    /// `disable r[0].w` find that block and not a namesake in another
+    /// generate block. A target found no other way falls back to its label.
+    pub(super) fn disable_label_pid(
+        &self,
+        target: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<usize> {
+        let mut path = String::new();
+        for (i, seg) in target.path.iter().enumerate() {
+            if i > 0 {
+                path.push('.');
+            }
+            path.push_str(&seg.name.name);
+            for sel in &seg.selects {
+                use std::fmt::Write as _;
+                let _ = write!(path, "[{}]", Self::try_const_u64(sel)?);
+            }
+        }
+        if target.root.is_none() {
+            let mut scope = self
+                .process_scope_hint
+                .get(&self.current_pid)
+                .map(String::as_str)
+                .unwrap_or("");
+            loop {
+                if !scope.is_empty()
+                    && let Some(&pid) = self.disable_labels.get(&format!("{scope}.{path}"))
+                {
+                    return Some(pid);
+                }
+                if scope.is_empty() {
+                    break;
+                }
+                scope = scope.rfind('.').map_or("", |i| &scope[..i]);
+            }
+        }
+        if let Some(&pid) = self.disable_labels.get(&path) {
+            return Some(pid);
+        }
+        // `top.blk`: the top module's own block, registered by its label.
+        let rest = match target.path.split_first() {
+            Some((head, rest)) if !rest.is_empty() && head.name.name == self.module.name => rest,
+            _ => &target.path[target.path.len().saturating_sub(1)..],
+        };
+        match rest {
+            [only] => self.disable_labels.get(&only.name.name).copied(),
+            _ => None,
+        }
+    }
+
+    /// §9.6.2: register a process's top-level block label for `disable`,
+    /// under `<scope>.<label>` when the process belongs to a scope. The bare
+    /// label keeps the first top-module block, then the first scoped one.
+    pub(super) fn register_disable_label(&mut self, label: &str, pid: usize) {
+        match self.process_scope_hint.get(&pid).filter(|s| !s.is_empty()) {
+            Some(scope) => {
+                let key = format!("{scope}.{label}");
+                self.disable_labels.insert(key, pid);
+                self.disable_labels.entry(label.to_string()).or_insert(pid);
+            }
+            None => {
+                self.disable_labels.insert(label.to_string(), pid);
+            }
+        }
+    }
+
     pub(super) fn disable_remote_block(&mut self, x: &str) {
+        self.disable_remote_block_of(x, None);
+    }
+
+    /// §9.6.2: whether a `disable` of `target` may name a block or task this
+    /// process is executing: a named block it is inside, its own top-level
+    /// label or an active task. Inside a subroutine the caller's blocks are
+    /// not on `m_scope_stack`, so any target may be one.
+    pub(super) fn disable_may_be_own(
+        &self,
+        target: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> bool {
+        let name = crate::ast::stmt::disable_name(target);
+        let pid = self.current_pid;
+        self.m_scope_stack
+            .iter()
+            .any(|n| n.starts_with([M_ROOT_MARK, M_SUBR_MARK]) || Self::block_name_matches(name, n))
+            || self
+                .process_m_label
+                .get(&pid)
+                .is_some_and(|l| Self::block_name_matches(name, l))
+            || self.active_task_pids.values().any(|s| s.contains(&pid))
+    }
+
+    /// `disable_remote_block` for a block of process `only`, when the target's
+    /// path names its process (`disable lab.sub`).
+    pub(super) fn disable_remote_block_of(&mut self, x: &str, only: Option<usize>) {
         let me = self.current_pid;
         let mut owner: Option<usize> = None;
         let mut task_owner = false;
         let mut c = me;
         let mut steps = 0;
         while let Some(&a) = self.process_parents.get(&c) {
+            if only.is_some_and(|o| o != a) {
+                c = a;
+                steps += 1;
+                if steps > 100_000 {
+                    break;
+                }
+                continue;
+            }
             if self
                 .fork_spawn_cont
                 .get(&c)
@@ -258,6 +360,7 @@ impl Simulator {
             cands.dedup();
             owner = cands.into_iter().find(|&p| {
                 p != me
+                    && only.is_none_or(|o| o == p)
                     && !self.killed_pids.contains(&p)
                     && self
                         .parked_cont_of(p)
@@ -618,8 +721,9 @@ impl Simulator {
                                         selects: vec![],
                                     }],
                                     span: d.span,
-                                    cached_signal_id: std::cell::Cell::new(None),
-                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                    bound: crate::ast::binding::Bound::UNSET,
                                 }),
                                 d.span,
                             );
@@ -752,7 +856,7 @@ impl Simulator {
                             } else {
                                 "x".repeat(w as usize)
                             },
-                            cached_val: std::cell::Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         port.span,
                     )
@@ -776,7 +880,7 @@ impl Simulator {
         let mut ordinal = 0usize;
         let mut functions: Vec<_> = module.functions.keys().cloned().collect();
         functions.sort();
-        let mut rewritten: HashMap<String, Vec<Statement>> = HashMap::default();
+        let mut rewritten: HashMap<String, crate::ast::shared_vec::SharedVec<Statement>> = HashMap::default();
         for key in functions {
             let Some(original) = module.functions.get(&key) else {
                 continue;
@@ -2361,7 +2465,12 @@ impl Simulator {
                                     self.forever_sens_cache
                                         .insert(key, (resolved.clone(), is_clk_ev));
                                 }
-                                if sens.is_empty() {
+                                // A term naming no signal (`@(posedge clk or
+                                // posedge h.rst)`, a class property) needs the
+                                // general path, which arms it by value: a
+                                // waiter on the resolved terms alone never
+                                // saw it change (§9.4.2).
+                                if sens.is_empty() || (!is_star && resolved.len() != sens.len()) {
                                     (Vec::new(), is_clk_ev)
                                 } else {
                                     (resolved, is_clk_ev)
@@ -2459,9 +2568,14 @@ impl Simulator {
             10_000
         };
         let mut safety: u64 = 0;
+        let mut window_state = 0;
         let mut broke = false;
-        while !self.finished && safety < cap {
+        while !self.finished {
             safety += 1;
+            if safety >= cap && !self.fixpoint_window_progressed_u64(&mut safety, &mut window_state)
+            {
+                break;
+            }
             if safety & LOOP_INTERRUPT_POLL_MASK == 0 && loop_stop_requested() {
                 self.take_interrupt();
                 break;
@@ -2549,30 +2663,36 @@ impl Simulator {
         }
     }
 
-    /// Does any INDEX or RANGE bound inside this lvalue mention `$`? Scans the
-    /// whole lvalue tree, unlike `expr_contains_dollar`, which only looks at
+    /// Does any INDEX or RANGE bound of this select chain mention `$`? Scans
+    /// the whole chain, unlike `expr_contains_dollar`, which only looks at
     /// one index expression.
-    pub(super) fn lvalue_mentions_dollar(e: &Expression) -> bool {
+    pub(crate) fn select_mentions_dollar(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Index { expr, index } => {
-                Self::expr_contains_dollar(index) || Self::lvalue_mentions_dollar(expr)
+                Self::expr_contains_dollar(index) || Self::select_mentions_dollar(expr)
             }
             ExprKind::RangeSelect {
                 expr, left, right, ..
             } => {
                 Self::expr_contains_dollar(left)
                     || Self::expr_contains_dollar(right)
-                    || Self::lvalue_mentions_dollar(expr)
+                    || Self::select_mentions_dollar(expr)
             }
-            ExprKind::Paren(i) => Self::lvalue_mentions_dollar(i),
-            ExprKind::MemberAccess { expr, .. } => Self::lvalue_mentions_dollar(expr),
+            ExprKind::Paren(i) => Self::select_mentions_dollar(i),
+            ExprKind::MemberAccess { expr, .. } => Self::select_mentions_dollar(expr),
+            // `$root.top.q[$].f`: a select inside the path.
+            ExprKind::Ident(h) => h
+                .path
+                .iter()
+                .flat_map(|seg| &seg.selects)
+                .any(Self::expr_contains_dollar),
             _ => false,
         }
     }
 
     /// Rewrite every `$`-bearing index/range bound in an lvalue into a literal,
     /// each evaluated against ITS OWN base's bound. Returns a clone; only
-    /// called when `lvalue_mentions_dollar` says there is work to do.
+    /// called when `select_mentions_dollar` says there is work to do.
     pub(super) fn resolve_dollar_in_lvalue(&mut self, e: &Expression) -> Expression {
         let lit = |v: i64, span| {
             Expression::new(
@@ -2581,7 +2701,7 @@ impl Simulator {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: Cell::new(Some((v as u64, 0u64, 64u32))),
+                    cached_val: crate::ast::cache::LiteralCache::new(Some((v as u64, 0u64, 64u32))),
                 }),
                 span,
             )
@@ -2672,27 +2792,65 @@ impl Simulator {
         }
     }
 
-    /// Does this expression mention `$` (§11.4.12 — the last index of the
-    /// collection being indexed)? Used to decide whether an lvalue index has to
-    /// be evaluated with a `dollar_bound` installed.
+    /// Does this index expression mention `$` (§7.10), the last index of the
+    /// collection it indexes? The index of a nested select binds its own `$`,
+    /// so the walk takes only that select's base. Every kind is listed, so a
+    /// new one has to decide.
     pub(super) fn expr_contains_dollar(e: &Expression) -> bool {
+        let one = |x: &Expression| Self::expr_contains_dollar(x);
+        let opt = |x: &Option<Box<Expression>>| x.as_deref().is_some_and(one);
+        let any = |xs: &[Expression]| xs.iter().any(one);
         match &e.kind {
             ExprKind::Dollar => true,
-            ExprKind::Paren(i) => Self::expr_contains_dollar(i),
-            ExprKind::Unary { operand, .. } => Self::expr_contains_dollar(operand),
-            ExprKind::Binary { left, right, .. } => {
-                Self::expr_contains_dollar(left) || Self::expr_contains_dollar(right)
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => one(expr),
+            ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. }
+            | ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::Specialization { base: x, .. }
+            | ExprKind::Matches { expr: x, .. }
+            | ExprKind::ShallowCopy { source: x }
+            | ExprKind::TypedPattern { pattern: x, .. }
+            | ExprKind::RandomizeWith { call: x, .. }
+            | ExprKind::SvaClocked { body: x, .. } => one(x),
+            ExprKind::Binary {
+                left: a, right: b, ..
             }
+            | ExprKind::Range(a, b)
+            | ExprKind::WithClause { expr: a, filter: b }
+            | ExprKind::AssignExpr {
+                lvalue: a,
+                rvalue: b,
+            } => one(a) || one(b),
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
-            } => {
-                Self::expr_contains_dollar(condition)
-                    || Self::expr_contains_dollar(then_expr)
-                    || Self::expr_contains_dollar(else_expr)
-            }
-            _ => false,
+            } => one(condition) || one(then_expr) || one(else_expr),
+            // Casts (`int'($)`, `$signed($)`) parse as calls.
+            ExprKind::Call { func, args } => one(func) || any(args),
+            ExprKind::SystemCall { args, .. } | ExprKind::Concatenation(args) => any(args),
+            ExprKind::Replication { count, exprs } => one(count) || any(exprs),
+            ExprKind::Inside { expr, ranges } => one(expr) || any(ranges),
+            ExprKind::StreamOp {
+                slice_size, exprs, ..
+            } => opt(slice_size) || any(exprs),
+            ExprKind::NamedArg { expr, .. } => opt(expr),
+            ExprKind::Tagged { inner, .. } => opt(inner),
+            ExprKind::AssignmentPattern(items) => items.iter().any(|item| match item {
+                AssignmentPatternItem::Ordered(x)
+                | AssignmentPatternItem::Named(_, x)
+                | AssignmentPatternItem::Typed(_, x)
+                | AssignmentPatternItem::Default(x) => one(x),
+                AssignmentPatternItem::Keyed(k, x) => one(k) || one(x),
+            }),
+            // A select in a hierarchical path segment binds its own `$`.
+            ExprKind::Ident(_)
+            | ExprKind::Number(_)
+            | ExprKind::StringLiteral(_)
+            | ExprKind::TypeLiteral(_)
+            | ExprKind::Null
+            | ExprKind::This
+            | ExprKind::Empty => false,
         }
     }
 
@@ -2754,7 +2912,7 @@ impl Simulator {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: Cell::new(Some((v as u64, 0u64, 64u32))),
+                    cached_val: crate::ast::cache::LiteralCache::new(Some((v as u64, 0u64, 64u32))),
                 }),
                 span,
             )
@@ -3755,7 +3913,8 @@ impl Simulator {
         // Scalar gate outputs are the case that matters; "to 0" is judged on
         // the whole value so a vector net keeps using the rise delay unless it
         // goes fully zero.
-        let delay = if self.gate_fall_delay_by_id.is_empty() {
+        let delay = if self.gate_fall_delay_by_id.is_empty() && self.gate_off_delay_by_id.is_empty()
+        {
             delay
         } else {
             // NB: `to_u64()` MASKS x/z to 0 rather than returning None, so it
@@ -4134,6 +4293,7 @@ impl Simulator {
             return;
         }
         let mut passes: u64 = 0;
+        let mut window_state = 0;
         self.edge_rescan_block_hits.clear();
         self.in_edge_rescan = true;
         let prev_phase = self.edge_dispatch_phase;
@@ -4148,7 +4308,10 @@ impl Simulator {
                 }
             }
             passes += 1;
-            if self.stall_limit > 0 && passes > self.stall_limit {
+            if self.stall_limit > 0
+                && passes > self.stall_limit
+                && !self.fixpoint_window_progressed_u64(&mut passes, &mut window_state)
+            {
                 self.report_edge_rescan_stall(passes);
                 self.abort_run();
                 break;

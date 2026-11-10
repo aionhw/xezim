@@ -5,6 +5,154 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// §23.6: fold a hierarchical reference that walks through an INDEXED
+    /// scope (`tb.gl[0].u.sig`) into the single hierarchical `Ident` spelling
+    /// flat signal names use.
+    ///
+    /// `rewrite_expr_impl` folds `a.b.c` into one `Ident` path, but only when
+    /// the rewritten base is itself an `Ident`: an `Index` base stays an
+    /// `Index` node (a select is not a scope segment for a plain leaf), so
+    /// `gl[0].u.sig` reaches the simulator as
+    /// `MemberAccess{ MemberAccess{ Index{ MemberAccess{ Ident } } } }`.
+    /// Every consumer of a continuous-assign TARGET names it from a single
+    /// `Ident` — `collect_lhs_writes`, the alias fan-out, `cont_driven` — so
+    /// that chain produced no write target at all: `wids` stayed empty and
+    /// the assignment silently drove nothing, with no diagnostic. A testbench
+    /// connecting an instance's INPUT PORT inside a for-generate
+    /// (`assign tb.gen_blk[0].u.port_in = drv.value;`) therefore left the DUT
+    /// input at `z` while the driver side ran normally.
+    ///
+    /// Name-guarded, like the member-access fold above: a packed-array
+    /// element (`a[2].b` of a 2-D vector) or any path with no stored signal
+    /// is left exactly as it was. A non-constant select cannot name a
+    /// generate scope (§27.5), so such a path is left alone too.
+    ///
+    /// A select on the leaf (`g[0].u.c[0]`, `g[0].u.c[2:1]`) stays a select
+    /// of the folded name, the shape `u.c[0]` already has.
+    pub(super) fn fold_indexed_hier_path(&self, e: &Expression) -> Option<Expression> {
+        if let Some(flat) = self.indexed_hier_flat_name(e) {
+            return Some(Self::flat_name_ident(flat, e.span));
+        }
+        let (ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. }) = &e.kind else {
+            return None;
+        };
+        let base = self.fold_indexed_hier_path(expr)?;
+        let mut out = e.clone();
+        if let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &mut out.kind {
+            **expr = base;
+        }
+        Some(out)
+    }
+
+    /// An `Ident` whose single segment is already the fully-qualified stored
+    /// name (`u.a`, `g[0].u.a`, `s.member`). The shape the member-access fold
+    /// above and `fold_indexed_hier_path` both emit: `resolve_hier_name`
+    /// passes a one-segment, select-free path through unchanged, so a name
+    /// that has already been resolved survives the later resolution passes
+    /// (re-resolving a `[0]`-selecting path truncated it back to the leaf).
+    pub(super) fn flat_name_ident(flat: String, span: crate::ast::Span) -> Expression {
+        Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier { name: flat, span },
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            }),
+            span,
+        )
+    }
+
+    /// The stored (`signal_name_to_id`) name a hierarchical path stands for
+    /// when that path enters a scope through an INDEX, or `None` for any
+    /// other shape.
+    pub(super) fn indexed_hier_flat_name(&self, e: &Expression) -> Option<String> {
+        // A plain `u.sig` already folds upstream, and a select on the LAST
+        // segment (`u.sig[2]`) is an ordinary leaf select that compiles
+        // today; only a scope ENTERED through a select needs this.
+        if !matches!(e.kind, ExprKind::MemberAccess { .. }) {
+            return None;
+        }
+        let mut path: Vec<crate::ast::expr::HierPathSegment> = Vec::new();
+        if !Self::fold_hier_path_segments(e, &mut path) || path.len() < 2 {
+            return None;
+        }
+        if !path[..path.len() - 1].iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        // The signal table stores top-level instance and signal names WITHOUT
+        // the top module's own name (`top.u.a` is keyed `u.a`); the read side
+        // strips it explicitly (`resolve_read_name`), the write side does not.
+        // Strip it here so the folded path names a stored signal.
+        if path.len() > 1
+            && !self.module.name.is_empty()
+            && path[0].selects.is_empty()
+            && path[0].name.name == self.module.name
+        {
+            path.remove(0);
+        }
+        let hier = crate::ast::expr::HierarchicalIdentifier {
+            root: None,
+            path,
+            span: e.span,
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
+        };
+        let flat = Self::resolve_hier_name_static(&hier, &self.module);
+        self.signal_name_to_id.get(flat.as_str())?;
+        Some(flat)
+    }
+
+    /// Flatten `a`, `a.b`, `a[0].b`, `a[0].b[1]` into segments, pushing an
+    /// index onto the segment it selects. `false` for anything that is not a
+    /// pure path, a `$root`-qualified path, or a non-constant index.
+    pub(super) fn fold_hier_path_segments(
+        e: &Expression,
+        path: &mut Vec<crate::ast::expr::HierPathSegment>,
+    ) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.root.is_some() || h.path.is_empty() {
+                    return false;
+                }
+                path.extend(h.path.iter().cloned());
+                true
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                if !Self::fold_hier_path_segments(expr, path) {
+                    return false;
+                }
+                path.push(crate::ast::expr::HierPathSegment {
+                    name: member.clone(),
+                    selects: Vec::new(),
+                });
+                true
+            }
+            ExprKind::Index { expr, index } => {
+                // §27.5: only a constant index names a scope.
+                if !matches!(index.kind, ExprKind::Number(_)) {
+                    return false;
+                }
+                if !Self::fold_hier_path_segments(expr, path) {
+                    return false;
+                }
+                match path.last_mut() {
+                    Some(last) => {
+                        last.selects.push(index.as_ref().clone());
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn prepared_comb_cache_eligible(&self) -> bool {
         self.prepared_comb_cache_path.is_some()
             // Instrumented entries hold per-run counters.
@@ -65,6 +213,11 @@ impl Simulator {
                         .all(|&id| id < signal_count)
                 })
             && cache.cont_driven.iter().all(|&id| id < signal_count)
+            && cache
+                .gate_fall_delay_by_id
+                .keys()
+                .chain(cache.gate_off_delay_by_id.keys())
+                .all(|&id| id < signal_count)
     }
 
     pub(super) fn try_load_prepared_comb_cache(&mut self) -> bool {
@@ -137,6 +290,9 @@ impl Simulator {
         self.comb_time0_idx = cache.time0_idx;
         self.comb_time0_deferred = cache.time0_deferred;
         self.cont_driven = cache.cont_driven;
+        self.gate_fall_delay_by_id
+            .extend(cache.gate_fall_delay_by_id);
+        self.gate_off_delay_by_id.extend(cache.gate_off_delay_by_id);
         self.drop_comb_source_ast();
         eprintln!(
             "[CACHE] prepared-comb hit: {} entries from {}",
@@ -174,6 +330,8 @@ impl Simulator {
                 time0_idx: &self.comb_time0_idx,
                 time0_deferred: &self.comb_time0_deferred,
                 cont_driven: &self.cont_driven,
+                gate_fall_delay_by_id: &self.gate_fall_delay_by_id,
+                gate_off_delay_by_id: &self.gate_off_delay_by_id,
             };
             bincode::serde::encode_into_std_write(
                 &payload,
@@ -274,13 +432,14 @@ impl Simulator {
                     .map(|p| p.materialize(&params_snapshot)),
             )
             .flat_map(|ca| {
-                crate::compiler::elaborate::whole_array_assign_parts_dir(
+                crate::compiler::elaborate::whole_array_assign_parts_dir_with_params(
                     &ca.lhs,
                     &ca.rhs,
                     ca.delay,
                     &arrays_snapshot,
                     Some(&descending_snapshot),
                     Some(&decl_dims_snapshot),
+                    Some(&params_snapshot),
                 )
                 .or_else(|| {
                     crate::compiler::elaborate::whole_array_row_assign_parts(
@@ -304,6 +463,9 @@ impl Simulator {
                         Some(&decl_dims_snapshot),
                         &params_snapshot,
                     )
+                })
+                .or_else(|| {
+                    Self::row_pattern_assign_parts(&ca, &decl_dims_snapshot, &params_snapshot)
                 })
                 .unwrap_or_else(|| vec![ca])
             })
@@ -356,8 +518,9 @@ impl Simulator {
                                         selects: Vec::new(),
                                     }],
                                     span: crate::ast::Span::dummy(),
-                                    cached_signal_id: std::cell::Cell::new(None),
-                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                    bound: crate::ast::binding::Bound::UNSET,
                                 }),
                                 ca.lhs.span,
                             );
@@ -396,12 +559,18 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         span,
                     );
                 }
+            }
+            // §23.6: the same fold for a path that enters a scope through a
+            // SELECT (`tb.gl[0].u.sig`). See `fold_indexed_hier_path`.
+            if let Some(folded) = self.fold_indexed_hier_path(&ca.lhs) {
+                ca.lhs = folded;
             }
             let explicit_delay = ca.delay;
             // Captured before `ca.lhs` may be moved into the CombItem below.
@@ -679,7 +848,10 @@ impl Simulator {
             // Try fused-gate fast path first: recognizes yosys patterns like
             // `assign d[0] = a & b` or `assign d[0] = ~(a & b)` — executes
             // without VM dispatch, just bit reads + 4-state combinator + set_bit.
-            let fused = if explicit_delay == 0 && cov_counter.is_none() {
+            let has_transition_delay = explicit_delay > 0
+                || ca.delay_fall.is_some_and(|d| d > 0)
+                || ca.delay_off.is_some_and(|d| d > 0);
+            let fused = if !has_transition_delay && cov_counter.is_none() {
                 self.try_build_fused_gate(&ca.lhs, &ca.rhs, scope_hint.as_deref())
             } else {
                 None
@@ -689,7 +861,7 @@ impl Simulator {
             // the per-net maps consulted by `schedule_delayed_with_delay`,
             // the one point where both the target and the new value are
             // known. Whole-net targets only, like the gate form (§28.11).
-            if explicit_delay > 0 && wids.len() == 1 && lhs_is_bare_ident {
+            if has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
                 if let Some(f) = ca.delay_fall {
                     if f != explicit_delay {
                         self.gate_fall_delay_by_id.insert(wids[0], f);
@@ -708,7 +880,7 @@ impl Simulator {
                 && Self::const_elem_ref(&ca.rhs, &self.module)
                     .and_then(|(base, idx)| self.elem_cell(&base, &idx))
                     .is_some_and(is_packed_id);
-            let item = if explicit_delay > 0 || packed_array_copy {
+            let item = if has_transition_delay || packed_array_copy {
                 CombItem::ContAssign {
                     lhs: Box::new(ca.lhs.clone()),
                     rhs: Box::new(ca.rhs.clone()),
@@ -1117,8 +1289,9 @@ impl Simulator {
                             })
                             .collect(),
                         span: crate::ast::Span::dummy(),
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
                     };
                     let saved_hint = self.name_resolve_hint.borrow().clone();
                     *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
@@ -1489,8 +1662,9 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         };
                         let saved = self.name_resolve_hint.borrow().clone();
                         if !ab.scope.is_empty() {
@@ -2357,6 +2531,7 @@ impl Simulator {
                             | I::BranchIfSignalFalse(..)
                             | I::StmtFallback(..)
                             | I::EvalExprFallback(..)
+                            | I::LoadDynElem(..)
                     )
                 }) {
                     continue;
@@ -4010,6 +4185,7 @@ impl Simulator {
                         RIns::StmtFallback(..)
                             | RIns::CovHit(..)
                             | RIns::EvalExprFallback(..)
+                            | RIns::LoadDynElem(..)
                             | RIns::LoadProcessLocal(..)
                             | RIns::Format(..)
                             | RIns::CaseJump(..)
@@ -4807,5 +4983,89 @@ impl Simulator {
         // the module is no longer read. Same for combinational always blocks
         // — edge-sensitive ones were moved into self.edge_blocks earlier.
         self.drop_comb_source_ast();
+    }
+
+    /// §10.3, §10.9.1, §7.6: `assign c[0] = '{a, b};` on a multi-dimensional
+    /// unpacked array drives each element of the row. A row has no signal of
+    /// its own, so as one assignment it drove nothing and every element read
+    /// x. The pattern is split over the dimensions left below the row's
+    /// constant indices, as for a whole-array pattern assign, and each element
+    /// assignment keeps the row's own selects.
+    fn row_pattern_assign_parts(
+        ca: &crate::compiler::elaborate::ContinuousAssignment,
+        decl_dims: &HashMap<String, Vec<(i64, i64)>>,
+        params: &HashMap<String, Value>,
+    ) -> Option<Vec<crate::compiler::elaborate::ContinuousAssignment>> {
+        if !matches!(ca.rhs.kind, ExprKind::AssignmentPattern(_)) {
+            return None;
+        }
+        let mut idx_exprs: Vec<&Expression> = Vec::new();
+        let mut cur = &ca.lhs;
+        while let ExprKind::Index { expr, index } = &cur.kind {
+            idx_exprs.push(index);
+            cur = expr;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        let [seg] = h.path.as_slice() else {
+            return None;
+        };
+        if idx_exprs.is_empty() || !seg.selects.is_empty() {
+            return None;
+        }
+        idx_exprs.reverse();
+        let name = &seg.name.name;
+        let dims = decl_dims.get(name)?;
+        let k = idx_exprs.len();
+        if k >= dims.len() {
+            return None;
+        }
+        for (ie, &(l, r)) in idx_exprs.iter().zip(dims) {
+            let i = crate::compiler::elaborate::const_eval_i64_with_params(ie, Some(params))?;
+            if i < l.min(r) || i > l.max(r) {
+                return None;
+            }
+        }
+        // The row's remaining dimensions, under the array's own name: the
+        // parts come back as `name[j]...`, and only their indices are kept.
+        let row_dims: HashMap<String, Vec<(i64, i64)>> =
+            std::iter::once((name.clone(), dims[k..].to_vec())).collect();
+        let parts = crate::compiler::elaborate::whole_array_assign_parts_dir_with_params(
+            cur,
+            &ca.rhs,
+            ca.delay,
+            &HashMap::default(),
+            None,
+            Some(&row_dims),
+            Some(params),
+        )?;
+        Some(
+            parts
+                .into_iter()
+                .map(|p| {
+                    let mut elem_idx: Vec<Expression> = Vec::new();
+                    let mut e = p.lhs;
+                    while let ExprKind::Index { expr, index } = e.kind {
+                        elem_idx.push(*index);
+                        e = *expr;
+                    }
+                    let lhs = elem_idx.into_iter().rev().fold(ca.lhs.clone(), |acc, ix| {
+                        Expression::new(
+                            ExprKind::Index {
+                                expr: Box::new(acc),
+                                index: Box::new(ix),
+                            },
+                            ca.lhs.span,
+                        )
+                    });
+                    crate::compiler::elaborate::ContinuousAssignment {
+                        lhs,
+                        rhs: p.rhs,
+                        ..ca.clone()
+                    }
+                })
+                .collect(),
+        )
     }
 }

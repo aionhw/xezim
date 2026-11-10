@@ -947,6 +947,7 @@ impl Simulator {
                             Insn::StmtFallback(..)
                             | Insn::CovHit(..)
                             | Insn::EvalExprFallback(..)
+                            | Insn::LoadDynElem(..)
                             | Insn::BlockingAssignArray(..)
                             | Insn::BlockingAssignArrayRange(..)
                             | Insn::BlockingAssignRangeDyn(..) => unsupported = true,
@@ -3048,6 +3049,7 @@ impl Simulator {
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",
             Insn::LoadProcessLocal(..) => "LoadProcessLocal",
+            Insn::LoadProcessStatus(..) => "LoadProcessStatus",
             Insn::Resize(..) => "Resize",
             Insn::Add(..) => "Add",
             Insn::Sub(..) => "Sub",
@@ -3108,6 +3110,7 @@ impl Simulator {
             Insn::StmtFallback(..) => "StmtFallback",
             Insn::InitLocalColl(..) => "InitLocalColl",
             Insn::EvalExprFallback(..) => "EvalExprFallback",
+            Insn::LoadDynElem(..) => "LoadDynElem",
             Insn::ClearSigned(..) => "ClearSigned",
             Insn::Pow(..) => "Pow",
             Insn::SetSigned(..) => "SetSigned",

@@ -657,9 +657,16 @@ impl Simulator {
                     .get(base)
                     .is_some_and(|cd| cd.declaring_module.is_some()) =>
             {
-                format!("class {}", self.hier_path(base).replace('.', "/"))
+                let (path, leaf) = base.rsplit_once('.').unwrap_or(("", base));
+                let leaf = leaf.rsplit_once("::").map_or(leaf, |(_, name)| name);
+                let visible = if path.is_empty() {
+                    leaf.to_string()
+                } else {
+                    format!("{path}.{leaf}")
+                };
+                format!("class {}", self.hier_path(&visible).replace('.', "/"))
             }
-            None => format!("class {}", base),
+            None => format!("class {}", self.class_source_name(base)),
         }
     }
 
@@ -668,6 +675,15 @@ impl Simulator {
     /// spelling `pkg::C` (§26.3, see `xezim_core::pkg_scope`); this strips
     /// that prefix again for output that names the class.
     pub(super) fn class_source_name<'a>(&self, base: &'a str) -> &'a str {
+        if self
+            .module
+            .classes
+            .get(base)
+            .is_some_and(|cd| cd.declaring_module.is_some())
+            && let Some((_, name)) = base.rsplit_once("::")
+        {
+            return name;
+        }
         self.module
             .class_decl_pkg
             .get(base)
@@ -953,21 +969,31 @@ impl Simulator {
             }
             _ => return None,
         };
-        // The static class of the prefix.
+        // The static class of the prefix. A package-qualified declaration
+        // (`pkg::base_c h`), an element of a collection of handles (`q[0]`),
+        // a static handle (`Box::slot`) or a member chain have one too,
+        // which the type-name lookup does not spell as a class key (#944).
         let static_cls: String = if matches!(prefix.kind, ExprKind::This) {
             self.class_context_stack.last().cloned().flatten()?
         } else {
-            let tn = self.get_expr_type_name(&prefix)?;
-            let tn = match self.extract_spec_from_string(&tn) {
-                Some((base, _)) => base,
-                None => tn,
-            };
-            if self.module.classes.contains_key(&tn) {
-                tn
-            } else {
+            let named = self.get_expr_type_name(&prefix).and_then(|tn| {
+                let tn = match self.extract_spec_from_string(&tn) {
+                    Some((base, _)) => base,
+                    None => tn,
+                };
+                // The class's own key, not its package-qualified alias: the
+                // storage keys below spell the declarer by it.
+                let leaf = tn.rsplit("::").next().unwrap_or(&tn);
+                if self.module.classes.contains_key(leaf) {
+                    return Some(leaf.to_string());
+                }
+                if self.module.classes.contains_key(&tn) {
+                    return Some(tn);
+                }
                 self.resolve_simple_typedef_class(&tn)
-                    .filter(|c| self.module.classes.contains_key(c))?
-            }
+                    .filter(|c| self.module.classes.contains_key(c))
+            });
+            named.or_else(|| self.ref_view_class(&prefix))?
         };
         let declarer_from = |start: &str| -> Option<String> {
             let mut cur = Some(start.to_string());
@@ -986,11 +1012,40 @@ impl Simulator {
             None
         };
         let target = declarer_from(&static_cls)?;
-        let handle = self.eval_handle_expr(&prefix).filter(|&h| h != 0)?;
+        let handle = self
+            .eval_handle_expr(&prefix)
+            .or_else(|| self.static_head_handle(&prefix))
+            .filter(|&h| h != 0)?;
         let inst = self.heap.get(handle)?.as_ref()?;
         let leaf = declarer_from(&inst.class_name)?;
         if leaf == target {
             return None;
+        }
+        // §8.9/§8.14: the visible declaration is a static (or a constant)
+        // that a derived class hides with an instance property: the
+        // reference names the class's shared cell, never a copy in the
+        // object (`this.s` in the base's method, `base_h.s`).
+        let tcd = self.module.classes.get(&target)?;
+        if tcd.static_properties.contains(m) || tcd.param_defaults.iter().any(|(p, _)| p == m) {
+            if self.class_is_parameterized(&target) {
+                return None;
+            }
+            let seg = |name: &str| HierPathSegment {
+                name: crate::ast::Identifier {
+                    name: name.to_string(),
+                    span,
+                },
+                selects: Vec::new(),
+            };
+            let sh = HierarchicalIdentifier {
+                root: None,
+                path: vec![seg(&target), seg(m)],
+                span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            };
+            return Some(Expression::new(ExprKind::Ident(sh), span));
         }
         let qkey = format!("{}::{}", target, m);
         if !inst.properties.contains_key(qkey.as_str()) {
@@ -1003,6 +1058,49 @@ impl Simulator {
             },
             span,
         ))
+    }
+
+    /// `shadowed_member_rewrite` under a bit-, part- or element select of a
+    /// packed member (`this.v[3:0] = x` in a base method, §8.14/§11.5.1).
+    /// A collection member is left alone: its elements are not stored under
+    /// the member's key.
+    pub(super) fn shadowed_select_rewrite(&self, e: &Expression) -> Option<Expression> {
+        let base_of = |b: &Expression| -> Option<Expression> {
+            if let Some(r) = self.shadowed_select_rewrite(b) {
+                return Some(r);
+            }
+            let r = self.shadowed_member_rewrite(b)?;
+            if let ExprKind::MemberAccess { member, .. } = &r.kind
+                && let Some((cls, m)) = member.name.split_once("::")
+                && let Some(cd) = self.module.classes.get(cls)
+                && (cd.array_properties.contains_key(m)
+                    || cd.array_nd_properties.contains_key(m)
+                    || cd.queue_properties.contains_key(m)
+                    || cd.assoc_properties.contains_key(m))
+            {
+                return None;
+            }
+            Some(r)
+        };
+        let kind = match &e.kind {
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => ExprKind::RangeSelect {
+                expr: Box::new(base_of(expr)?),
+                kind: kind.clone(),
+                left: left.clone(),
+                right: right.clone(),
+            },
+            ExprKind::Index { expr, index } => ExprKind::Index {
+                expr: Box::new(base_of(expr)?),
+                index: index.clone(),
+            },
+            _ => return None,
+        };
+        Some(Expression::new(kind, e.span))
     }
 
     pub(super) fn super_as_this(e: &Expression) -> Option<Expression> {
@@ -1018,8 +1116,8 @@ impl Simulator {
             {
                 let mut nh = h.clone();
                 nh.path[0].name.name = "this".to_string();
-                nh.cached_signal_id = std::cell::Cell::new(None);
-                nh.cached_resolved_name = std::cell::OnceCell::new();
+                nh.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                nh.cached_resolved_name = crate::ast::cache::NameCache::new();
                 Some(Expression::new(ExprKind::Ident(nh), e.span))
             }
             // Inside a method body the same text is a MemberAccess chain.

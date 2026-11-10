@@ -741,24 +741,6 @@ impl Simulator {
                 return Some(id);
             }
         }
-        // §27.6: an UNNAMED generate branch exposes its declarations through
-        // the implicit `genblk<N>` scope (the runtime resolver strips that
-        // segment and reads the bare name). A continuous-assignment RHS that
-        // reads `u_mod.genblk1.x` must therefore depend on the SAME signal the
-        // value comes from, not on the `u_mod` instance (which is not a
-        // readable scalar and never re-triggers, so the entry evaluates once
-        // and stays X). Retry the resolved (`<top>.` popped) name with every
-        // `genblk<N>` segment removed.
-        if let Some(stripped) = strip_genblk_segments(name) {
-            if let Some(&id) = self.signal_name_to_id.get(&stripped) {
-                return Some(id);
-            }
-            if let Some(tpop) = stripped.strip_prefix(top_prefix) {
-                if let Some(&id) = self.signal_name_to_id.get(tpop) {
-                    return Some(id);
-                }
-            }
-        }
         let mut rest = name;
         while let Some(cut) = rest.rfind('.') {
             rest = &rest[..cut];
@@ -2298,8 +2280,9 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 let saved = self.name_resolve_hint.borrow().clone();
                 *self.name_resolve_hint.borrow_mut() = hint.clone();
@@ -2651,6 +2634,31 @@ impl Simulator {
                                 span: ee.span,
                             };
                             &ee_norm
+                        }
+                        None => ee,
+                    };
+                    // §23.6/§27.5: the same normalisation for a path that
+                    // enters a scope through an INDEXED one
+                    // (`always @(posedge gen_blk[0].u.sig)`).
+                    // `rewrite_expr_impl` leaves such a path as
+                    // `MemberAccess{MemberAccess{Index{MemberAccess{Ident}}}}`;
+                    // neither `collect_ident_names` (no `MemberAccess` arm) nor
+                    // `member_chain_as_flat_ident_for_sens` (bails on the
+                    // `Index` base) collects an `Ident` from it, so the block
+                    // armed on an EMPTY sensitivity, woke once at t=0 through
+                    // the no-signal fallback, and never fired again — every
+                    // flop inside a generate-array instance whose clock the
+                    // parent substitutes as a hierarchical name was dead.
+                    let ee_idx;
+                    let ee = match self.fold_indexed_hier_path(&ee.expr) {
+                        Some(folded) => {
+                            ee_idx = crate::ast::stmt::EventExpr {
+                                edge: ee.edge,
+                                expr: folded,
+                                iff: ee.iff.clone(),
+                                span: ee.span,
+                            };
+                            &ee_idx
                         }
                         None => ee,
                     };
@@ -3182,6 +3190,93 @@ impl Simulator {
         }
     }
 
+    /// True when `sig_id`'s driver cone reaches a live driver — a free-running
+    /// clock generator, or an edge block / continuous assign whose own fan-in
+    /// (transitively) reaches one — or bottoms out in a VARIABLE with no
+    /// continuous driver (a testbench `reg` driven once by an `initial` block,
+    /// e.g. a stable reset or constant). A signal whose cone bottoms out in a
+    /// NET with no driver — an undriven wire, an unresolved/black-boxed cell,
+    /// an ungenerated behavioural PLL VCO output — is the signature of a DEAD
+    /// clock and returns false.
+    ///
+    /// The distinction matters for the dead-clock watchdog: a control signal
+    /// held stable during a long reset/power-up sequence is driven by a flop
+    /// clocked by a live clock (live), and a held reset is a `reg` written by
+    /// an `initial` block (live) — neither has moved its value yet, but neither
+    /// is dead. Only a NET with no driver is unambiguously dead. Cycle-safe via
+    /// `visited`.
+    pub(super) fn has_live_driver(
+        &self,
+        sig_id: usize,
+        visited: &mut std::collections::HashSet<usize>,
+    ) -> bool {
+        if !visited.insert(sig_id) {
+            return false;
+        }
+        // A free-running clock generator always toggles — live.
+        if self.clock_generators.iter().any(|c| c.signal_id == sig_id) {
+            return true;
+        }
+        // Any one live driver makes it live; the first one found does not
+        // decide alone.
+        let mut driven = false;
+        // An edge block (flop) writing it is live iff any of ITS sensitivities
+        // (clock/reset) is live — the flop fires when that clock toggles.
+        for (bi, cb) in self.compiled_edge_blocks.iter().enumerate() {
+            let Some(cb) = cb else { continue };
+            use super::bytecode::Insn;
+            let writes = cb.instructions.iter().any(|i| {
+                matches!(i,
+                    Insn::NbaAssign(id, ..) | Insn::NbaAssignConst(id, ..)
+                    | Insn::NbaAssignRange(id, ..) | Insn::NbaAssignRangeDyn(id, ..)
+                    | Insn::NbaAssignBitDyn(id, ..) | Insn::NbaAssignArrayRead(id, ..)
+                    | Insn::BlockingAssign(id, ..) | Insn::BlockingAssignRange(id, ..)
+                    | Insn::BlockingAssignRangeDyn(id, ..) | Insn::BlockingAssignBitDyn(id, ..)
+                        if *id as usize == sig_id)
+            });
+            if !writes {
+                continue;
+            }
+            driven = true;
+            let live = self.edge_blocks.get(bi).is_some_and(|block| {
+                block
+                    .resolved_sensitivities
+                    .iter()
+                    .any(|sid| self.has_live_driver(sid.signal_id, visited))
+            });
+            if live {
+                return true;
+            }
+        }
+        // A continuous assign / combinational entry writing it is live iff any
+        // of its read fan-in is live — it recomputes when an input changes.
+        for e in &self.comb_entries {
+            if !e.cold.write_signal_ids.contains(&sig_id) {
+                continue;
+            }
+            driven = true;
+            if e.cold
+                .read_signal_ids
+                .iter()
+                .any(|&r| self.has_live_driver(r, visited))
+            {
+                return true;
+            }
+        }
+        // Every driver found is dead.
+        if driven {
+            return false;
+        }
+        // No continuous driver (no clock generator, edge block, or continuous
+        // assign writes it). A NET with no driver is the dead-clock signature —
+        // an undriven wire / unresolved cell / ungenerated PLL VCO output. A
+        // VARIABLE with no continuous driver is normal: a `reg` driven once by
+        // an `initial` block (a stable reset or constant) — treat it as live so
+        // a held reset does not trip the watchdog.
+        let name = self.name_for_id(sig_id);
+        !(self.module.nets.contains(name) || self.module.implicit_nets.contains(name))
+    }
+
     /// Hang diagnosis: print the longest-parked event waiters — who is
     /// stuck, on which signals, since when, and whether those signals have
     /// EVER changed since the waiter parked (`arm_bits` comparison). A
@@ -3332,6 +3427,7 @@ impl Simulator {
                         value_of: s.value_of.clone(),
                         wake_rank: self.wake_rank_of(name, id),
                         cell: false,
+                        alias_t0: self.alias_t0_kind(name, id),
                     });
                 }
                 self.resolve_sens_cell(s)
@@ -3365,6 +3461,7 @@ impl Simulator {
             value_of: s.value_of.clone(),
             wake_rank: 0,
             cell,
+            alias_t0: 0,
         })
     }
 
@@ -3540,7 +3637,7 @@ impl Simulator {
                         signed: v.is_signed,
                         base: NumberBase::Binary,
                         value: v.to_bin(),
-                        cached_val: Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }
                 };
                 *e = Expression::new(ExprKind::Number(lit), e.span);
@@ -3820,6 +3917,7 @@ impl Simulator {
                     value_of: Some(e.clone()),
                     wake_rank: src.wake_rank,
                     cell: true,
+                    alias_t0: src.alias_t0,
                 });
             }
         }
@@ -3998,6 +4096,11 @@ impl Simulator {
                 }
             }
             ExprKind::SystemCall { name, args } if name == VC_CHANGED_MARKER => {
+                if let Some(a) = args.get(1) {
+                    Self::collect_condition_read_names(a, out);
+                }
+            }
+            ExprKind::SystemCall { name, args } if name == VC_EDGE_MARKER => {
                 if let Some(a) = args.get(1) {
                     Self::collect_condition_read_names(a, out);
                 }
@@ -4282,6 +4385,9 @@ impl Simulator {
                     && self.cond_operand_gated(else_expr, this_h, this_cls)
             }
             ExprKind::SystemCall { name, args } if name == VC_CHANGED_MARKER => args
+                .get(1)
+                .is_some_and(|a| self.cond_operand_gated(a, this_h, this_cls)),
+            ExprKind::SystemCall { name, args } if name == VC_EDGE_MARKER => args
                 .get(1)
                 .is_some_and(|a| self.cond_operand_gated(a, this_h, this_cls)),
             _ => false,

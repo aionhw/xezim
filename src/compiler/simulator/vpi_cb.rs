@@ -704,7 +704,11 @@ impl Simulator {
         // §16.5.1: the assertions tick in the slot of an edge a routine makes.
         self.vpi_observed();
         self.tick_clocking_blocks();
-        if self.clocking_mirror_dirty {
+        let edge_drove = std::mem::take(&mut self.clocking_edge_drive_dirty);
+        if edge_drove && self.dirty_any {
+            self.settle_combinatorial();
+        }
+        if self.clocking_mirror_dirty || edge_drove {
             self.clocking_mirror_dirty = false;
             let saved = self.edge_dispatch_phase;
             self.edge_dispatch_phase = "clocking-mirror";

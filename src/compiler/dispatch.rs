@@ -13,6 +13,7 @@ pub enum Opcode {
     LoadSignal,
     LoadSignalSigned,
     LoadProcessLocal,
+    LoadProcessStatus,
     Resize,
     Add,
     Sub,
@@ -118,6 +119,7 @@ impl Opcode {
             Insn::LoadSignal(_, _) => Self::LoadSignal,
             Insn::LoadSignalSigned(_, _) => Self::LoadSignalSigned,
             Insn::LoadProcessLocal(_, _) => Self::LoadProcessLocal,
+            Insn::LoadProcessStatus(_, _) => Self::LoadProcessStatus,
             Insn::Resize(_, _) => Self::Resize,
             Insn::Add(_, _, _) => Self::Add,
             Insn::Sub(_, _, _) => Self::Sub,
@@ -175,6 +177,7 @@ impl Opcode {
             Insn::BlockingAssignRangeDyn(_, _, _, _) => Self::BlockingAssignRangeDyn,
             Insn::BlockingAssignBitDyn(_, _, _) => Self::BlockingAssignBitDyn,
             Insn::LoadArrayElem(_, _, _) => Self::LoadArrayElem,
+            Insn::LoadDynElem(..) => Self::LoadArrayElem,
             Insn::NbaAssignArray(_, _, _, _) => Self::NbaAssignArray,
             Insn::BlockingAssignArray(_, _, _, _) => Self::BlockingAssignArray,
             Insn::NbaAssignArrayRange(_, _, _, _, _) => Self::NbaAssignArrayRange,
@@ -239,7 +242,7 @@ impl Opcode {
     }
 }
 
-pub const NUM_OPCODES: usize = 99;
+pub const NUM_OPCODES: usize = 100;
 
 /// Sizes the opcode-census arrays, which are indexed by `Opcode as usize`. A
 /// stale value panics at run time under `XEZIM_OPCODE_CENSUS=1`, so pin it to

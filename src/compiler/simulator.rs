@@ -47,6 +47,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::raw::c_void;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use xezim_core::elaborate::resolve_type_width;
@@ -335,7 +336,19 @@ fn method_boost_enabled() -> bool {
 /// salt hash to different keys and are simply recompiled; the safety net is
 /// the suite-level ON == OFF parity run against a warm cache.
 // §18.8 (#846): mode builtins retain their receiver expressions in compiled code.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3067;
+// §11.4.10, §11.4.3: shift, `/`, `%` and `**` operands of unknown width keep their loaded width.
+// §8.25: compiled methods take type-parameter formals and locals.
+// §7.5/§7.10: design-scope dynamic-array and queue elements read the live collection.
+// §11.6.1: member element selects size at the declared element width
+// (`coll_elem_widths` plan fact in `expr_max_width`).
+// §11.5.1, §7.4.1: an x/z index into a struct member keeps the element width,
+// and a chain of indices into a call result's member declines.
+// §7.4.1/§7.4.5: a packed select inside an unpacked array's element reads that element.
+// §11.5.1: an x/z literal index into a packed element reads x.
+// §7.4.1: a run-time index into an unpacked array of three or more dimensions declines.
+// §7.4.1: `a[i].m[j][k]` selects elements of a multi-dimensional packed member.
+// §7.4.1: local packed typedefs and selected struct-array members keep their dimensions.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_306e;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -544,6 +557,20 @@ const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
 /// control (`@prop` on a non-event class property) was armed. Never
 /// user-visible.
 const VC_CHANGED_MARKER: &str = "$__xz_vc_changed";
+/// Internal `$__xz_vc_edge(idx, expr, edge[, iff])`: true once `expr` has made the
+/// requested TRANSITION relative to `Simulator::vc_saved[idx]`. Used by
+/// `@(posedge prop)` / `@(negedge prop)` / `@(edge prop)` when `prop` is a
+/// class property or a procedural local — an edge-qualified event term has no
+/// backing signal, so it is armed as an edge-sensitive value-change wait
+/// (§9.4.2). `edge` is 1 = posedge, 2 = negedge, 3 = any edge, 0 = any
+/// change (an untagged term of an `or` list); an `iff` guard must hold when
+/// it fires. Never user-visible.
+const VC_EDGE_MARKER: &str = "$__xz_vc_edge";
+/// Internal `$__xz_vif_value(expr)`: the identity of the interface instance
+/// the virtual-interface operand `expr` holds (the `iface_handle_token` of the
+/// bound instance, 0 for null). `@(vif)` / `@(vifs[i])` waits for this value
+/// to change (§9.4.2, §25.9). Never user-visible.
+const VIF_VALUE_MARKER: &str = "$__xz_vif_value";
 /// Ends a deferred declaration initializer: `(<target>, ...)` records the
 /// values it gave as their default sampled values (see `sampled_defaults`).
 const SAMPLED_DEFAULT_MARKER: &str = "$__xz_sampled_default";
@@ -1364,28 +1391,6 @@ enum ScatterGate {
 // while collecting reads for a PLAIN `always` (star or explicit list),
 // whose sensitivity excludes called-function bodies (only
 // always_comb/always_latch descend into them).
-/// §27.6: hierarchical refs through an UNNAMED generate block's implicit
-/// `genblk<N>` name. Unnamed-branch declarations keep bare names (the
-/// historical leakage other resolution depends on), so `genblk1.x`
-/// resolves by stripping the implicit segments and retrying bare.
-fn strip_genblk_segments(name: &str) -> Option<String> {
-    if !name.starts_with("genblk") && !name.contains(".genblk") {
-        return None;
-    }
-    let stripped: Vec<&str> = name
-        .split('.')
-        .filter(|seg| {
-            !(seg.starts_with("genblk")
-                && seg[6..].chars().all(|c| c.is_ascii_digit())
-                && seg.len() > 6)
-        })
-        .collect();
-    if stripped.is_empty() || stripped.len() == name.split('.').count() {
-        return None;
-    }
-    Some(stripped.join("."))
-}
-
 /// Continuous-assignment targets indexed by leaf name, for the edge-select
 /// alias sharing in `rewrite_edge_select_sensitivities` (built once, on the
 /// first edge term that selects a bit of a vector).
@@ -1653,8 +1658,14 @@ impl CombEntryCold {
 
 // §9.2.2.2.1 (#844): rebuild dependency tables made before packed-region
 // sensitivity exclusion; their layout is readable but their edges are stale.
-// 030: the vhd branch's per-entry timescale scope merged with main's 029.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB030";
+// §9.7 (#940): `Insn::LoadProcessStatus` renumbers the instructions after it.
+// §9.2.2.2: whole-struct reads of a collapsed continuous copy depended on
+// member ids that the collapse left unused; those edges are stale. Reads of
+// an element of an unpacked array of structs, or of the whole array, now
+// depend on its members too.
+// §10.3.3: keep falling and turn-off delays when prepared tables are restored.
+// 033: the vhd branch's per-entry timescale scope merged with main's 032.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB033";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -1674,6 +1685,8 @@ struct PreparedCombCacheRef<'a> {
     time0_idx: &'a [usize],
     time0_deferred: &'a [CombEntry],
     cont_driven: &'a HashSet<usize>,
+    gate_fall_delay_by_id: &'a HashMap<usize, u64>,
+    gate_off_delay_by_id: &'a HashMap<usize, u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1686,6 +1699,8 @@ struct PreparedCombCache {
     time0_idx: Vec<usize>,
     time0_deferred: Vec<CombEntry>,
     cont_driven: HashSet<usize>,
+    gate_fall_delay_by_id: HashMap<usize, u64>,
+    gate_off_delay_by_id: HashMap<usize, u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1941,6 +1956,14 @@ struct SensitivityId {
     /// waiter armed. Re-resolved whenever an operand moves without firing,
     /// so the wait follows the index to the element it selects now.
     cell: bool,
+    /// §23.3.3, §10.3.3: how the NAME this term was written with starts at
+    /// time 0 when it is a port formal or an identity net (`assign y = x`)
+    /// collapsed onto its source's id: 0 for a name that is no such alias,
+    /// 1 for a 4-state alias (from x), 2 for a 2-state one (from 0). The
+    /// alias takes the source's time-0 value as an update from that start,
+    /// one the source's own readers never see (§6.8: an initializer is no
+    /// event). See `Simulator::alias_t0_kind`.
+    alias_t0: u8,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2129,12 +2152,12 @@ struct WaiterValueCtx {
 /// typedef, class, declared type, struct members, packed layout and widths,
 /// under the bare name and its `name.member` keys. Two concurrent processes
 /// whose same-named locals differ in type share these tables, so the one
-/// that declared last displaced the other's; `capture_local_meta` saves a
-/// displaced entry and `reapply_local_meta` restores it when its process
-/// runs again.
+/// that declared last displaced the other's; `capture_local_meta` keeps a
+/// displaced declaration's entries in `local_meta_cache` and
+/// `reapply_local_meta` installs them again when a process whose frames
+/// claim that declaration runs.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct LocalMeta {
-    origin: MetaOrigin,
     /// A struct's: `name.member` entries belong to it.
     members: bool,
     typedef: Option<String>,
@@ -2154,20 +2177,24 @@ pub(super) struct LocalMeta {
 
 /// Where a frame-local's declaration came from: its statement, and the class
 /// and specialization it ran in. Frames running the same declaration register
-/// the same metadata.
-#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// the same metadata, so the cache of displaced metadata is keyed by it.
+#[derive(Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct MetaOrigin {
     span: (usize, usize),
     class: Option<String>,
     spec: Option<(String, String)>,
 }
 
-/// The declaration whose metadata is installed under a local's name, and the
-/// live frames that share it.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub(super) struct MetaOwner {
-    origin: MetaOrigin,
-    gens: Vec<u64>,
+/// A frame-local declaration a process has executed: the frame it declared
+/// into, the local's name and its declaration (an index into
+/// `local_meta_origins`). The list rides the process context, not the frame
+/// generation: a fork child shares its parent's frames (§9.3.2), and its
+/// block's `T x;` hides the parent's `U x;` from the child only.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct MetaClaim {
+    frame: u64,
+    name: String,
+    origin: u32,
 }
 
 /// A process parked on a CLASS-FIELD named event (`event m_event` inside a
@@ -2751,7 +2778,7 @@ impl ProcCont {
                         signed: false,
                         base: NumberBase::Decimal,
                         value: remaining.to_string(),
-                        cached_val: Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     count.span,
                 );
@@ -2972,6 +2999,7 @@ mod coverage;
 mod dpi_imports;
 mod edges;
 mod event_loop;
+mod stall_progress;
 mod expression_types;
 mod expressions;
 mod file_io;
@@ -3167,6 +3195,9 @@ struct PerTickAccum {
     t_process: u64,
     t_snap: u64,
     t_sched: u64,
+    t_clocking: u64,
+    t_cond: u64,
+    t_late: u64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -3718,6 +3749,7 @@ fn note_store_write(bits: u64) {
     STORE_WRITE_MASK.with(|m| m.set(m.get() | bits));
 }
 
+
 /// An event was triggered or re-bound, so every `<event>.triggered` read may
 /// have changed. A stamp is not a property write, so without this a gated
 /// `wait(ev.triggered)` would never re-check; the waiters read the name
@@ -3968,6 +4000,15 @@ enum MemberCollKind {
     /// met on the chain walk (a type-parameter binding for one of them
     /// changes the answer); `unbound` is the verdict with no binding applied.
     Plain { raws: Vec<String>, unbound: bool },
+}
+
+type PackedAggregateLayout = (Vec<(String, u32, u32)>, u32);
+
+#[derive(Debug)]
+struct ClassPackedLayouts {
+    // Keep the source alive for the lifetime of the pointer-keyed cache.
+    _declaration: Rc<crate::ast::types::StructUnionType>,
+    variants: Vec<(Vec<(String, Value)>, Rc<PackedAggregateLayout>)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -4432,7 +4473,7 @@ impl SvaNfaBuilder {
                 signed: false,
                 base: crate::ast::expr::NumberBase::Decimal,
                 value: "1".to_string(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             span,
         )
@@ -4797,6 +4838,10 @@ enum FsmWait {
     Edge(u32),
 }
 
+type ClockingOutputDrive = (String, String, Value, Option<Expression>);
+type ClockingCycleDrive = (u64, String, String, Value, Option<Expression>);
+type ClockingEdgeDrive = (String, Value, EdgeKind, u64, Option<Expression>);
+
 /// One clocking block's per-tick poll state: its clock resolved to a
 /// signal-table id once (None: fall back to the by-name read), the edge it
 /// advances on, and the level seen on the previous tick.
@@ -4880,6 +4925,8 @@ struct ProcessContext {
     current_auto_task: Option<String>,
     /// See `Simulator::task_string_formals`.
     task_string_formals: Vec<TaskFrameStrings>,
+    /// See `Simulator::local_meta_claims`.
+    local_meta_claims: Vec<MetaClaim>,
 }
 
 /// Frame-local string classifications for task formals and scalar locals.
@@ -5125,6 +5172,11 @@ struct DeclShadowFrame {
     /// §6.21: fresh names a `string` declaration of this activation added
     /// to `string_signals`, taken back out when it ends.
     fresh_strings: Vec<String>,
+    /// Every FRESH name this activation declared (no metadata to put back):
+    /// the geometry such a declaration registers under the bare name is
+    /// removed when it ends (see `drop_fresh_local_geometry`, #916).
+    #[serde(default)]
+    fresh_names: Vec<String>,
 }
 
 /// §6.21: the scope of a `begin…end` block that declares variables, opened
@@ -5559,8 +5611,8 @@ fn hier_prefix(
 ) -> crate::ast::expr::HierarchicalIdentifier {
     let mut p = h.clone();
     p.path.pop();
-    p.cached_signal_id = Cell::new(None);
-    p.cached_resolved_name = std::cell::OnceCell::new();
+    p.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+    p.cached_resolved_name = crate::ast::cache::NameCache::new();
     p
 }
 
@@ -6390,6 +6442,8 @@ enum ClassAggRef {
         /// §7.2.1: a 2-state member of a 4-state struct — its reads and
         /// writes convert x/z to 0.
         two_state: bool,
+        /// §7.2.1: a whole member declared signed reads signed.
+        signed: bool,
     },
     /// Member of an UNPACKED struct — its own cell, keyed `<prop>.<member>`.
     Unpacked { handle: usize, key: String, w: u32 },
@@ -6764,6 +6818,18 @@ pub struct Simulator {
     typedef_target_cache:
         std::cell::RefCell<HashMap<String, HashMap<String, Option<crate::ast::types::DataType>>>>,
     collection_dim_cache: std::cell::RefCell<HashMap<String, bool>>,
+    /// Memoized, structurally-fixed CSP for a rand class. `randomize()` on
+    /// the same class / constraint set / config values re-translated the
+    /// whole constraint graph on every call (csp_vars + csp_split_slices +
+    /// csp_translate are a large constant per call); when the structural and
+    /// config fingerprint is unchanged the post-translate `Csp` is reused
+    /// read-only and only the search (`csp_run`) re-runs against current
+    /// values. The fingerprint includes a hash of every non-rand property
+    /// value the constraints read, so any relevant change rebuilds. Bound the
+    /// table so a long-lived run with many distinct classes can't grow it
+    /// without limit.
+    #[serde(skip)]
+    csp_cache: std::cell::RefCell<HashMap<String, rand_csp::RandCspMemo>>,
     /// Sticky: set the first time a `<base>.` frame marker is created (an
     /// unpacked-struct formal binding, or a struct-return variable via
     /// `unpacked_struct_leaf_keys`); gates `frame_leaf_key_of`'s per-eval
@@ -6810,6 +6876,30 @@ pub struct Simulator {
     member_coll_cache: std::cell::RefCell<HashMap<String, HashMap<String, MemberCollKind>>>,
     /// Per class: properties that are NOT structs (see `class_prop_struct`).
     class_prop_struct_neg: std::cell::RefCell<HashMap<String, HashSet<String>>>,
+    /// Shared aggregate declarations per class and exact concrete type bindings.
+    /// Widths still use each object's value-parameter scope (§8.25).
+    #[serde(skip)]
+    #[allow(clippy::type_complexity)]
+    class_prop_struct_cache: std::cell::RefCell<
+        HashMap<
+            String,
+            Vec<(
+                HashMap<String, String>,
+                HashMap<String, Rc<crate::ast::types::StructUnionType>>,
+            )>,
+        >,
+    >,
+    /// Root packed layouts retain their declaration, so pointer keys cannot be
+    /// reused. Each value-parameter specialization gets its own dimensions.
+    #[serde(skip)]
+    class_packed_layout_cache: std::cell::RefCell<HashMap<usize, ClassPackedLayouts>>,
+    #[serde(skip)]
+    aggregate_type_work: [std::cell::Cell<u64>; 2],
+    #[serde(skip)]
+    aggregate_type_generation: std::cell::Cell<u64>,
+    /// Immutable class parameter names; values are always read from the object.
+    #[serde(skip)]
+    class_value_param_names: std::cell::RefCell<HashMap<String, Rc<Vec<String>>>>,
     name_stats: [std::cell::Cell<u64>; 5],
     name_stats_on: bool,
     frame_pool: Vec<HashMap<String, Value>>,
@@ -6818,14 +6908,22 @@ pub struct Simulator {
     /// replaced for its duration: (name, width, signed, real, string) as they
     /// were before. See `fb_frame_push`.
     fb_meta_saves: Vec<(String, Option<u32>, bool, bool, bool)>,
+    /// Bare-name geometry (`packed_full_dims`, `packed_signal_elem_widths`,
+    /// `packed_struct_fields`, a non-plain `var_decl_types` entry) another
+    /// declaration of a carried local's name registered, set aside for the
+    /// fallback's duration and put back after it. See `fb_frame_push`.
+    fb_geom_saves: Vec<FormalMetadataSnapshot>,
     /// Per carried fallback frame, the `ref` redirections of the compiled
     /// method's formals it set aside (`fb_frame_push`), restored on pop.
     fb_unbound_refs: Vec<Vec<(String, Option<Expression>, Option<String>)>>,
     /// `local_stack` depth below each active fallback frame (see
-    /// `fb_frame_push`): a write inside one leaves 2-state fitting to the
-    /// copy-back, since the carried locals' types are not in
-    /// `var_decl_types`.
+    /// `fb_frame_push`). The carried locals' types are not in
+    /// `var_decl_types`, so a write inside one asks `fb_two_state_names`.
     fb_frame_depths: Vec<usize>,
+    /// The carried locals of 2-state type of every active fallback frame,
+    /// innermost last; `fb_two_state_marks` holds where each frame's start.
+    fb_two_state_names: Vec<Arc<str>>,
+    fb_two_state_marks: Vec<usize>,
     /// Lazily-built leaf index over `module.parameters` for the bytecode
     /// compiler's suffix-match fallback (see `lookup_param_value`). Built
     /// once — parameters are final before any bytecode compilation runs.
@@ -7022,6 +7120,10 @@ pub struct Simulator {
     /// collapsed into a shared id. The dropped connect made them wire-typed
     /// for a dump, and the shared id can't carry per-name typing.
     collapsed_port_children: HashSet<String>,
+    /// §23.3.3, §6.8: whether each renamed input port's formal is 2-state,
+    /// by the formal's path without the top module's prefix (from
+    /// `ElaboratedModule::input_port_actuals`); see `alias_t0_kind`.
+    port_formal_two_state: HashMap<String, bool>,
     /// Set by a `collapse_identity_port_nets` run that reached its fixed
     /// point: the name-map generation it left, the continuous-assign list
     /// (length, buffer) and port-alias count it read, and whether its buffer
@@ -7219,13 +7321,13 @@ pub struct Simulator {
     /// LRM §14.3: per-cb metadata. `(clock_signal_name, [(signal_name, is_input)])`.
     /// Populated at compile() from `module.clocking_blocks`.
     clocking_meta: HashMap<String, (String, Vec<(String, bool)>)>,
-    /// LRM §14.4: pending clocking-output drives. `cb_name → [(signal,
-    /// value)]`. `cb.<out_sig> <= val` queues here instead of driving
+    /// LRM §14.4: pending clocking-output drives. Each drive retains its
+    /// clockvar name, physical net and value. `cb.<out_sig> <= val` queues here instead of driving
     /// immediately; `tick_clocking_blocks` applies them at the next
     /// posedge of the cb's clock (output skew).
     /// A drive of a SELECT (`cb.v[2] <= 1`) carries its target: the net with
     /// the drive's indices frozen.
-    clocking_output_pending: HashMap<String, Vec<(String, Value, Option<Expression>)>>,
+    clocking_output_pending: HashMap<String, Vec<ClockingOutputDrive>>,
     /// Per-clocking-block previous clock bit (for edge detection).
     clocking_prev_clock: HashMap<String, u8>,
     /// Per-tick clock poll table for `tick_clocking_blocks` (see there).
@@ -7247,10 +7349,14 @@ pub struct Simulator {
     /// slot's edge detection, and the next iteration's snapshot would
     /// otherwise absorb the change and swallow the `@(cb.sig)` event.
     clocking_mirror_dirty: bool,
+    /// Set when `tick_clocking_blocks` drove an edge-skew output, so the
+    /// caller settles and runs one more edge pass: the drive lands after this
+    /// slot's edge detection, and its fan-out must still wake in this slot.
+    clocking_edge_drive_dirty: bool,
     /// §14.16 `cb.out <= ##N v` drives awaiting N further clocking events:
-    /// cb → [(remaining_cycles, net, value)]. Decremented at each edge of that
+    /// cb → [(remaining_cycles, clockvar, net, value, target)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.
-    clocking_cycle_pending: HashMap<String, Vec<(u64, String, Value, Option<Expression>)>>,
+    clocking_cycle_pending: HashMap<String, Vec<ClockingCycleDrive>>,
     /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
     /// resolved net). The snapshot/meta store the NET; reads and drives use
     /// the clocking name, so they translate through this first.
@@ -7264,6 +7370,15 @@ pub struct Simulator {
     clocking_out_skew: HashMap<String, u64>,
     /// §14.4 per-signal output-skew overrides: cb → (resolved net → ticks).
     clocking_sig_out_skew: HashMap<String, HashMap<String, u64>>,
+    /// §14.3 edge of a block's `default output negedge` skew.
+    clocking_out_edge: HashMap<String, EdgeKind>,
+    /// §14.3 per-signal skews: cb → (net → edge, or None for a delay-only
+    /// skew that overrides the block's default edge).
+    clocking_sig_out_edge: HashMap<String, HashMap<String, Option<EdgeKind>>>,
+    /// Drives through an edge-skew output, waiting for that edge of the
+    /// block's clock: cb → [(net, value, edge, post-edge delay, select target)]
+    /// in issue order.
+    clocking_edge_out_pending: HashMap<String, Vec<ClockingEdgeDrive>>,
     /// §14.4 per-cb default INPUT skew in ticks (absent = #0).
     clocking_in_skew: HashMap<String, u64>,
     /// §14.4 per-signal input-skew overrides: cb → (resolved net → ticks).
@@ -7453,6 +7568,11 @@ pub struct Simulator {
     /// iter (see drain_edge_cascade). Cached at sim init; override via
     /// XEZIM_CASCADE_LIMIT env var.
     cascade_limit: u32,
+    /// True when `XEZIM_CASCADE_LIMIT` was set explicitly: the cascade is then
+    /// cut off at that many generations (opt-in strict mode). When unset, the
+    /// cascade may run past `cascade_limit` generations and is only declared a
+    /// livelock when the signal state recurs (it is cycling, not progressing).
+    cascade_limit_explicit: bool,
     /// SDF delay annotation (None if no SDF loaded).
     #[serde(skip)]
     pub sdf_annotation: Option<super::sdf::SdfAnnotation>,
@@ -7754,13 +7874,19 @@ pub struct Simulator {
     /// `var_class_types`; populated at VarDecl exec time when the
     /// data type is a `TypeReference` whose name is in `module.typedefs`.
     var_typedef_types: HashMap<String, String>,
-    /// The frame generation whose declaration last registered each
-    /// frame-local's name-keyed metadata, the names each generation owns,
-    /// and the metadata of locals another frame's declaration displaced, by
-    /// the generation they belong to (see `LocalMeta`).
-    local_meta_owner: HashMap<String, MetaOwner>,
-    local_meta_owned: HashMap<u64, Vec<String>>,
-    local_meta_saved: HashMap<u64, Vec<(String, LocalMeta)>>,
+    /// The declaration whose name-keyed metadata is installed under each
+    /// frame-local's name (an index into `local_meta_origins`, interned
+    /// through `local_meta_origin_ids`), and the metadata of the declarations
+    /// another one displaced, by name and declaration (see `LocalMeta`). A
+    /// name with a cache entry is contested: only its claims are checked when
+    /// a process runs again, and a swap moves just that name's own entries.
+    local_meta_owner: HashMap<String, u32>,
+    local_meta_origins: Vec<MetaOrigin>,
+    local_meta_origin_ids: HashMap<MetaOrigin, u32>,
+    local_meta_cache: HashMap<String, Vec<(u32, LocalMeta)>>,
+    /// The frame-local declarations the running process's live frames
+    /// executed, outermost first (see `MetaClaim`); part of its context.
+    local_meta_claims: Vec<MetaClaim>,
     /// Names of `string`-typed variables (locals, params, package globals) so
     /// `{a, b}` concatenation involving them is treated as string concat.
     string_signals: HashSet<String>,
@@ -8296,6 +8422,17 @@ pub struct Simulator {
     /// `meta_key_bits` of every name in `shadowed_prop_names`: a prefilter that
     /// spares the hot member-access paths a hash per access.
     shadowed_prop_mask: u64,
+    /// §18.5/§8.14: the class that declares each constraint block of the
+    /// randomize() call in progress, keyed by the address of the block's item
+    /// list, for the blocks of a base class of the object when some property
+    /// name is shadowed. Their names resolve in that class, not the object's.
+    /// Empty outside a solve and whenever no name is shadowed.
+    constraint_scopes: HashMap<usize, String>,
+    /// §18.7/§8.14: the declared class of the receiver of the
+    /// `obj.randomize() with {…}` call about to solve, when it is a base of
+    /// the object's class and some name is shadowed: the inline block's names
+    /// resolve in it. Taken by the solve that gathers the block.
+    inline_constraint_scope: Option<String>,
     /// §6.11.1 / §7.5: instance-scoped storage names (`<handle>#<member>`) of
     /// queue / dynamic-array class properties whose element type is a SIGNED
     /// integral type (`byte`, `shortint`, `logic signed [7:0]`, ...). Their
@@ -8878,6 +9015,14 @@ pub struct Simulator {
     /// See `nonvirtual_target_class`.
     #[allow(clippy::type_complexity)]
     nonvirtual_target_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
+    /// `class_is_a` answer cache: (derived, base) -> bool.
+    class_is_a_cache: std::cell::RefCell<HashMap<(String, String), bool>>,
+    /// `resolve_interface_port` answer cache: raw name -> bound string.
+    interface_resolve_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
+    /// `canonicalize_spec_sig` cache: (class_name, sig) -> canonical signature.
+    spec_sig_cache: std::cell::RefCell<HashMap<(String, String), String>>,
+    /// Whether any class definition in the design has an N-D array property.
+    has_any_array_nd_properties: std::cell::Cell<Option<bool>>,
     /// `class_has_method` answers by class then method (see there).
     has_method_cache: std::cell::RefCell<HashMap<String, HashMap<String, bool>>>,
     /// See `member_string_keyed_unbound`.
@@ -8908,6 +9053,36 @@ pub struct Simulator {
     /// then property; `None` marks a width the instance's bindings decide.
     #[allow(clippy::type_complexity)]
     prop_width_memo: std::cell::RefCell<HashMap<String, HashMap<String, Option<Option<u32>>>>>,
+    #[serde(skip)]
+    struct_member_offset_memo: std::cell::RefCell<HashMap<(String, String), (u32, u32)>>,
+    #[serde(skip)]
+    packed_struct_member_memo: std::cell::RefCell<
+        HashMap<
+            (String, u32, u32, String),
+            Option<(u32, u32, bool, crate::ast::types::DataType, Vec<(i64, i64)>)>,
+        >,
+    >,
+    /// Per-(handle, prop) cache of `class_prop_packed_dims` and
+    /// `class_prop_signed_of`: a class property's packed-dimension / signed
+    /// status is a per-object invariant, but the helpers walk the class
+    /// hierarchy per call (per foreach element) with identical arguments.
+    #[serde(skip)]
+    class_prop_dims_memo: std::cell::RefCell<HashMap<(usize, String), Option<Vec<(i64, i64)>>>>,
+    #[serde(skip)]
+    class_prop_signed_memo: std::cell::RefCell<HashMap<(usize, String), bool>>,
+    /// Per-randomize cache of resolved `dist` geometries in foreach fast
+    /// paths, keyed by the object, the constraint item (address and source
+    /// span) and its item count. Cleared by each `randomize()`; only a `dist`
+    /// whose bounds and weights read no `foreach` index, no rand variable and
+    /// call nothing is memoized (`dist_memo_eligible`), as only those stay
+    /// constant through one solve.
+    #[serde(skip)]
+    dist_geometry_memo: std::cell::RefCell<
+        HashMap<
+            (usize, usize, usize, usize, usize),
+            crate::compiler::simulator::inline_constraints::ResolvedDist,
+        >,
+    >,
     /// Emptied formal-metadata snapshot vectors of the class-method call path,
     /// reused across calls.
     formal_parts_pool: Vec<Vec<(usize, FormalMetaParts)>>,
@@ -8927,6 +9102,11 @@ pub struct Simulator {
     /// Moves whenever a procedural `typedef` or an inline-enum local edits the
     /// type tables at run time (see `MethodCallPlan`).
     type_tables_gen: u64,
+    /// Packed struct layouts of named formal types by qualified type name,
+    /// each with the `type_tables_gen` it was built under. Laying out a
+    /// `pkg::T` struct copies the whole parameter table to see the
+    /// package's names bare, too costly to repeat on every call.
+    formal_struct_layouts: HashMap<String, (u64, Option<Vec<(String, u32, u32)>>)>,
     /// Emptied `local_type_stack` overlay pairs, reused by `push_local_frame`
     /// (capacity kept, contents cleared) instead of allocating a map pair for
     /// every activation that records a class/typedef-typed name.
@@ -9083,9 +9263,14 @@ pub struct Simulator {
     /// Compiled-to-compiled calls dispatched directly (`vm_try_direct_call_from`),
     /// without the interpreter's binding (`[PROF] vm_direct_calls`).
     vm_direct_calls: u64,
-    /// Rescans of the live frames for displaced local metadata
-    /// (`reapply_local_meta`, `[PROF] local_meta_reapplies`).
+    /// Checks of the running process's claims for displaced local metadata
+    /// (`reapply_local_meta`, `[PROF] local_meta_reapplies`), the displaced
+    /// declarations installed again (`[PROF] local_meta_swaps`), and the
+    /// captures that scanned the tables for a struct local's `name.member`
+    /// keys (`[PROF] local_meta_scans`, one per declaration at most).
     local_meta_reapplies: u64,
+    local_meta_swaps: u64,
+    local_meta_scans: u64,
     /// SV-2023: blocked mailbox `get`/`peek` proxies keyed by mailbox handle.
     /// Each waiter records the suspended process pid, the destination lvalue
     /// expression to receive the value, and the post-get continuation
@@ -10025,6 +10210,15 @@ pub struct Simulator {
     /// Process activations at the current timestamp — the accurate signal for
     /// "who is spinning" (the event queue's own pid_counts is reset per drain).
     stall_pid_hits: HashMap<usize, u64>,
+    /// Last sampled functional data/control state of each pid's guard window.
+    stall_pid_state: HashMap<usize, u64>,
+    /// Last outer-loop state sample; zero means no sample in this timestamp.
+    stall_state0: u64,
+    /// True when `XEZIM_STALL_LIMIT` was set explicitly: the guard is then a
+    /// hard per-process activation cap (opt-in strict mode). When unset, the
+    /// guard is progress-aware and only trips when a full window of
+    /// activations recurred in the same functional data and control state.
+    stall_limit_explicit: bool,
     /// Delta cycles allowed at one timestamp before the run is declared a
     /// zero-delay livelock. Generous by default (real designs settle in a
     /// handful); tune with XEZIM_STALL_LIMIT, 0 disables the check.
@@ -10144,6 +10338,11 @@ pub struct Simulator {
     /// repick (`arr[i] > arr[i-1]`) lands INSIDE the declared range instead of
     /// anywhere in the element's full domain.
     elem_inside_hint: Vec<(i64, i64)>,
+    /// §18.5.8.1: the `<` / `<=` / `>` / `>=` bounds the current foreach
+    /// body puts on the element being solved (`arr[i] OP bound`), for the
+    /// modulo repair's draw.
+    #[serde(skip)]
+    elem_rel_bound: Vec<(crate::ast::expr::BinaryOp, Value)>,
     /// Set after several trials failed a strict foreach check: relational
     /// repicks take the BOUND value (minimal/maximal feasible) instead of a
     /// uniform draw, so a globally coupled monotone chain (`g[i][j][k] >
@@ -10298,6 +10497,23 @@ pub struct Simulator {
     /// registered its waiter — the trigger would be lost. Queue them and
     /// re-fire at the end of the time-0 active region.
     pending_t0_triggers: Vec<String>,
+    /// §23.3.3: the time-0 update of each input port renamed to a whole
+    /// actual signal (see `record_time0_port_edges`): the instance, the
+    /// actual's id, the port's value before the update and the actual's
+    /// value after the pre-process settle (raw v, x).
+    time0_port_edges: Vec<(String, usize, (u64, u64), (u64, u64))>,
+    /// §10.3.3: the ids a collapsed alias name (see `SensitivityId::alias_t0`)
+    /// maps to whose value the pre-process settle left alone, with that
+    /// value (raw v, x): the alias's time-0 update ends there.
+    time0_alias_edges: Vec<(usize, (u64, u64))>,
+    /// Edge blocks a time-0 alias or port update woke before any process
+    /// ran. One that fires on its own at time 0 leaves the list (it runs
+    /// once, as in the reference simulator); the rest run from
+    /// `deliver_time0_port_edges`.
+    edge_t0_pending: Vec<usize>,
+    /// Edge blocks the next edge pass runs although no signal they watch
+    /// changed: those a time-0 port update wakes.
+    edge_forced_fire: Vec<usize>,
     /// True while the compile-time (pre-process) time-0 settle runs.
     in_pre_process_settle: bool,
     /// Call-site (expression span start) → per activation scope (see
@@ -13512,6 +13728,9 @@ struct RandColl {
     /// elements are the rows; the joint solver keys each row like a row of
     /// a multi-dimensional array (`nd_base`) once the outer size is known.
     row_tail: Option<RowTail>,
+    /// §18.4: one rand member of an array of unpacked structs, solved as a
+    /// collection of its own (`prop` is `arr.m`, elements `arr[i].m`).
+    member: Option<StructElemMember>,
 }
 
 /// The rows of a dynamic outer dimension (`RandColl::row_tail`).
@@ -13521,6 +13740,23 @@ enum RowTail {
     Fixed(Vec<(i64, i64)>),
     /// `T a[][]`: every row is a dynamic array with its own size.
     Dyn,
+}
+
+#[derive(Clone, Debug)]
+struct StructElemMember {
+    name: String,
+    signed: bool,
+    enum_type: Option<String>,
+}
+
+impl RandColl {
+    /// Storage key of element `i` (`<h>#arr[i]`, or `<h>#arr[i].m`).
+    fn elem_key(&self, i: impl std::fmt::Display) -> String {
+        match &self.member {
+            Some(m) => format!("{}[{}].{}", self.scoped, i, m.name),
+            None => format!("{}[{}]", self.scoped, i),
+        }
+    }
 }
 
 /// A `.size()` constraint on a rand dynamic array (§18.4): the array must be

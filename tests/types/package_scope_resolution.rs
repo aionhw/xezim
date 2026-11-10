@@ -15,7 +15,7 @@
 //! 3. A sub-module `parameter type` DEFAULT is registered under its bare name
 //!    design-wide during that instance's inlining (restored after). A scope
 //!    whose visibility comes only through a CHAINED wildcard import
-//!    (`import defs_pkg::*` where defs_pkg does `import core_pkg::*`) was
+//!    (`import defs_pkg::*` where defs_pkg imports and exports `core_pkg::*`) was
 //!    not re-bound, so a declaration resolved inside the window carved
 //!    dims x default-width instead of dims x struct-width.
 //! 4. A CLASS-local typedef stomped an existing package type's bare slot
@@ -105,9 +105,58 @@ endmodule
 }
 
 /// (3) Chained wildcard import + a type-parameter default sharing the type's
-/// name. The declaration scope reaches core_pkg only THROUGH defs_pkg.
+/// name. The declaration scope reaches core_pkg only THROUGH defs_pkg, which
+/// exports it (§26.6).
 #[test]
 fn chained_import_scope_survives_type_param_default_window() {
+    let src = r#"
+package core_pkg;
+  typedef struct packed {
+    logic [1:0][63:0] lanes;
+    logic [1:0][7:0]  mask;
+    logic [1:0]       en;
+  } wr_burst_t;                                   // 146
+endpackage
+package defs_pkg;
+  import core_pkg::*;
+  export core_pkg::*;
+  localparam int WR_W = $bits(wr_burst_t);
+endpackage
+module inner;
+  import defs_pkg::*;                              // chained: never names core_pkg
+  wr_burst_t [0:0][1:0] wr_bus;
+  logic [31:0] w_bus, w_elem, w_type;
+  assign w_bus  = $bits(wr_bus);
+  assign w_elem = $bits(wr_bus[0][0]);
+  assign w_type = $bits(wr_burst_t);
+endmodule
+module wrapper #(
+  parameter int W = 4,
+  parameter type wr_burst_t = logic [63:0]         // same NAME, 64-bit default
+) ();
+  logic [W-1:0] cnt;
+  wr_burst_t q;
+  inner u_i ();
+endmodule
+module tb;
+  wrapper #(.W(8)) u_w ();
+  initial #1;
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(
+        u(&sim, "u_w.u_i.w_bus"),
+        292,
+        "carved inside the window: was 128"
+    );
+    assert_eq!(u(&sim, "u_w.u_i.w_elem"), 146, "was 1");
+    assert_eq!(u(&sim, "u_w.u_i.w_type"), 146);
+}
+
+/// §26.6: a declaration a package imports is not visible through a wildcard
+/// import of that package unless the package exports it.
+#[test]
+fn a_chained_import_without_an_export_does_not_make_the_type_visible() {
     let src = r#"
 package core_pkg;
   typedef struct packed {
@@ -141,14 +190,10 @@ module tb;
   initial #1;
 endmodule
 "#;
-    let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(
-        u(&sim, "u_w.u_i.w_bus"),
-        292,
-        "carved inside the window: was 128"
-    );
-    assert_eq!(u(&sim, "u_w.u_i.w_elem"), 146, "was 1");
-    assert_eq!(u(&sim, "u_w.u_i.w_type"), 146);
+    let err = simulate(src, 50)
+        .err()
+        .expect("wr_burst_t is not visible in inner");
+    assert!(err.contains("Undeclared identifier 'wr_burst_t'"), "{err}");
 }
 
 /// (4) Class-local typedef of the same name must not stomp the package type.

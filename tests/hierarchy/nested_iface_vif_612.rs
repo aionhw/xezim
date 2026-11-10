@@ -147,3 +147,112 @@ endmodule
         ["R 44 11 44 44 11", "E 1 0"]
     );
 }
+
+#[test]
+fn nested_child_via_bound_parent_vif() {
+    assert_eq!(
+        shown(
+            r#"interface child_tx_if(input bit clk);
+  logic [7:0] data;
+  logic valid;
+endinterface
+
+interface child_rx_if(input bit clk, input logic [7:0] data, input logic valid);
+endinterface
+
+interface parent_if(input bit clk);
+  child_tx_if tx(clk);
+  child_rx_if rx(clk, tx.data, tx.valid);
+endinterface
+
+typedef virtual parent_if parent_vif_t;
+typedef virtual child_tx_if child_tx_vif_t;
+typedef virtual child_rx_if child_rx_vif_t;
+
+class holder #(type T = int);
+  static T map[string];
+  static function void set(string k, T v);
+    map[k] = v;
+  endfunction
+  static function bit get(string k, output T v);
+    if (map.exists(k)) begin
+      v = map[k];
+      return 1;
+    end
+    return 0;
+  endfunction
+endclass
+
+class driver_c;
+  child_tx_vif_t vif;
+  task run();
+    vif.valid <= 0;
+    vif.data <= 8'h00;
+    @(posedge vif.clk);
+    vif.valid <= 1;
+    vif.data <= 8'hA5;
+    @(posedge vif.clk);
+    vif.valid <= 1;
+    vif.data <= 8'h5A;
+    @(posedge vif.clk);
+    vif.valid <= 0;
+  endtask
+endclass
+
+class monitor_c;
+  child_rx_vif_t vif;
+  int seen[$];
+  task run();
+    forever begin
+      @(posedge vif.clk);
+      if (vif.valid === 1'b1) begin
+        seen.push_back(vif.data);
+      end
+    end
+  endtask
+endclass
+
+class agent_c;
+  parent_vif_t vif;
+  driver_c drv;
+  monitor_c mon;
+
+  function void build();
+    if (!holder#(parent_vif_t)::get("parent", vif)) begin
+      $display("TAG_FAIL: no parent vif");
+    end
+    holder#(child_rx_vif_t)::set("mon_vif", vif.rx);
+    drv = new();
+    mon = new();
+    drv.vif = this.vif.tx;
+    if (!holder#(child_rx_vif_t)::get("mon_vif", mon.vif)) begin
+      $display("TAG_FAIL: no mon vif");
+    end
+  endfunction
+endclass
+
+module top;
+  bit clk = 0;
+  always #5 clk = ~clk;
+
+  parent_if pif(clk);
+
+  initial begin
+    automatic agent_c ag = new();
+    holder#(parent_vif_t)::set("parent", pif);
+    ag.build();
+    fork
+      ag.drv.run();
+      ag.mon.run();
+    join_any
+    #20;
+    $display("TAG_PASS: seen=%0d [%02x, %02x] t=%0t", ag.mon.seen.size(), ag.mon.seen[0], ag.mon.seen[1], $time);
+    $finish;
+  end
+endmodule
+"#,
+            |m| m.starts_with("TAG_")
+        ),
+        ["TAG_PASS: seen=2 [a5, 5a] t=45"]
+    );
+}

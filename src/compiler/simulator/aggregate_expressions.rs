@@ -4,6 +4,10 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// Entries kept by the per-(object, property) shape memos before they are
+/// dropped and rebuilt.
+pub(super) const CLASS_PROP_MEMO_CAP: usize = 1 << 16;
+
 impl Simulator {
     /// §7.4.1: bit offset of ELEMENT `idx` of the packed multi-D signal
     /// `name`, normalized against the declared outer dimension — a descending
@@ -28,6 +32,25 @@ impl Simulator {
         handle: usize,
         prop: &str,
     ) -> Option<Vec<(i64, i64)>> {
+        let key = (handle, prop.to_string());
+        if let Some(cached) = self.class_prop_dims_memo.borrow().get(&key) {
+            return cached.clone();
+        }
+        let r = self.class_prop_packed_dims_uncached(handle, prop);
+        let mut memo = self.class_prop_dims_memo.borrow_mut();
+        // Keyed per object: a long run allocates objects without bound.
+        if memo.len() >= CLASS_PROP_MEMO_CAP {
+            memo.clear();
+        }
+        memo.insert(key, r.clone());
+        r
+    }
+
+    fn class_prop_packed_dims_uncached(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Option<Vec<(i64, i64)>> {
         let cn = self
             .heap
             .get(handle)
@@ -47,12 +70,22 @@ impl Simulator {
                 // of the type this object binds to it; the declared `T`
                 // has none, so `o.w[1] = 7` wrote nothing (#576).
                 let bound = self.bind_type_params_in(dt, &|n| self.obj_type_param(handle, &c, n));
-                let dims = super::elaborate::packed_full_dims_chained(
-                    bound.as_ref().unwrap_or(dt),
+                let bdt = bound.as_ref().unwrap_or(dt);
+                if let Some(dims) = super::elaborate::packed_full_dims_chained(
+                    bdt,
                     &self.module.parameters,
                     &self.module.typedef_types,
-                )?;
-                return if dims.len() >= 2 { Some(dims) } else { None };
+                ) {
+                    return if dims.len() >= 2 { Some(dims) } else { None };
+                }
+                // §7.4.1: a packed ARRAY of packed structs (`cand_t [0:2] a`):
+                // the array dimensions alone — the struct is the element, so
+                // one dimension already selects elements, not bits (#928).
+                let su = self.packed_struct_with_dims(bdt)?;
+                if !su.packed || su.dimensions.is_empty() {
+                    return None;
+                }
+                return Self::packed_range_bounds(&su.dimensions, &self.module.parameters);
             }
             cur = cd.extends.clone();
         }
@@ -481,8 +514,8 @@ impl Simulator {
             let mut identifier = h.clone();
             identifier.path.truncate(1);
             identifier.path[0].selects.clear();
-            identifier.cached_signal_id = Cell::new(None);
-            identifier.cached_resolved_name = std::cell::OnceCell::new();
+            identifier.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+            identifier.cached_resolved_name = crate::ast::cache::NameCache::new();
             std::borrow::Cow::Owned(Expression::new(ExprKind::Ident(identifier), cur.span))
         };
         if steps.is_empty() {
@@ -1397,6 +1430,35 @@ impl Simulator {
                 let DataType::Struct(su) = &access.element_type else {
                     return None;
                 };
+                // Memoized per declaration position: the root variable, the
+                // offset and width already selected into it, and the member.
+                // (A source span alone is not unique across files.) Not for
+                // instance-parameterized or static roots.
+                let memo_key = (access.params.is_none()
+                    && access.static_target.is_none()
+                    && !access.storage.is_empty())
+                .then(|| {
+                    (
+                        access.storage.clone(),
+                        access.offset,
+                        access.width,
+                        member.name.clone(),
+                    )
+                });
+                if let Some(memo_key) = &memo_key {
+                    if let Some(cached) = self.packed_struct_member_memo.borrow().get(memo_key) {
+                        if let Some((offset, width, is_signed, element, dimensions)) = cached {
+                            access.offset = access.offset.checked_add(*offset)?;
+                            access.width = *width;
+                            access.is_signed = *is_signed;
+                            access.dimensions = dimensions.clone();
+                            access.element_type = element.clone();
+                            return Some(access);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
                 let mut remaining = access.width;
                 for m in &su.members {
                     // A member sized by the instance's parameters too.
@@ -1415,17 +1477,35 @@ impl Simulator {
                             remaining
                         };
                         if d.name.name == member.name {
-                            access.offset = access.offset.checked_add(offset)?;
-                            access.width = width;
-                            access.is_signed = super::elaborate::is_type_signed_resolved(
+                            let is_signed = super::elaborate::is_type_signed_resolved(
                                 &m.data_type,
                                 &self.module.typedef_types,
                             );
+                            if let Some(memo_key) = memo_key {
+                                self.packed_struct_member_memo.borrow_mut().insert(
+                                    memo_key,
+                                    Some((
+                                        offset,
+                                        width,
+                                        is_signed,
+                                        element.clone(),
+                                        dimensions.clone(),
+                                    )),
+                                );
+                            }
+                            access.offset = access.offset.checked_add(offset)?;
+                            access.width = width;
+                            access.is_signed = is_signed;
                             access.dimensions = dimensions;
                             access.element_type = element;
                             return Some(access);
                         }
                     }
+                }
+                if let Some(memo_key) = memo_key {
+                    self.packed_struct_member_memo
+                        .borrow_mut()
+                        .insert(memo_key, None);
                 }
                 None
             }
@@ -1977,6 +2057,7 @@ impl Simulator {
             is_object_elem: false,
             nd_base,
             row_tail: None,
+            member: None,
         };
         Self::csp_size_solved(&c, &wrapper)
     }
@@ -2027,9 +2108,6 @@ impl Simulator {
                     && dims.len() >= 2
                 {
                     let w = w.max(1);
-                    if w > 64 {
-                        return Err(rand_csp::CspOutcome::NotApplicable);
-                    }
                     let written = if h.path.len() == 1 && h.path[0].name.name != nm {
                         h.path[0].name.name.clone()
                     } else {
@@ -2129,9 +2207,6 @@ impl Simulator {
                             .map(|t| t.2)
                             .unwrap_or(32)
                             .max(1);
-                        if w > 64 {
-                            return Err(rand_csp::CspOutcome::NotApplicable);
-                        }
                         let signed = self.signed_signals.contains(&nm)
                             || self.module.var_decl_types.get(&nm).is_some_and(|dt| {
                                 super::elaborate::is_type_signed_resolved(
@@ -2223,11 +2298,6 @@ impl Simulator {
                     .get(&nm)
                     .map(|t| t.2 as u32)
                     .unwrap_or(v0.width);
-                if w > 64 && !(empty && dynamic) {
-                    // Left as drawn: a constraint reading it is judged by the
-                    // final check.
-                    continue;
-                }
                 // The declared element type decides the signedness: an
                 // element value written by the per-item repair above may
                 // carry a literal's (`bc[i] == 1` left a `bit` element
@@ -2415,6 +2485,17 @@ impl Simulator {
         None
     }
 
+    /// Whether `base` names a dynamic array, queue or associative array,
+    /// whose rows' shape the declared dimensions do not give (§7.5, §7.8).
+    fn query_base_is_collection(&mut self, base: &Expression) -> bool {
+        if self.assoc_operand_name(base).is_some() {
+            return true;
+        }
+        self.array_operand_name(base).is_some_and(|n| {
+            self.module.dynamic_arrays.contains(&n) || self.module.queue_vars.contains(&n)
+        })
+    }
+
     pub(super) fn eval_expr_system_call_body(
         &mut self,
         expr: &Expression,
@@ -2477,6 +2558,10 @@ impl Simulator {
                     .remove(&idx)
                     .unwrap_or_else(|| Value::zero(32))
             }
+            VIF_VALUE_MARKER => {
+                let token = args.first().map_or(0, |a| self.vif_handle_value(a));
+                Value::from_u64(token, 32)
+            }
             // `@prop` on a non-event class property: true once the property
             // differs from the value captured when the wait was armed.
             VC_CHANGED_MARKER => {
@@ -2490,6 +2575,67 @@ impl Simulator {
                     .unwrap_or_else(|| Value::zero(1));
                 let changed = self.vc_saved.get(&idx).is_none_or(|(_, prev)| *prev != cur);
                 Value::from_u64(changed as u64, 1)
+            }
+            // `@(posedge prop)` / `@(negedge prop)` on a non-signal operand:
+            // true once the operand made the requested transition away from
+            // the value captured when the wait was armed. Bit 0 is the edge
+            // operand (§9.4.2 an edge on a multi-bit value is the LSB), and
+            // an unknown bit counts as 0 for posedge / as 1 for negedge so the
+            // LRM's x→1 / 1→x / x→0 / 1→z transitions still fire.
+            VC_EDGE_MARKER => {
+                let idx = args
+                    .first()
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(0))
+                    .unwrap_or(0);
+                // Latch by removal: a fired wait must stay true when the
+                // resumed `wait` re-evaluates this condition before the body
+                // runs. `vc_release` clears the entry (already gone).
+                let Some((owner, prev)) = self.vc_saved.get(&idx).cloned() else {
+                    return Value::from_u64(1, 1);
+                };
+                let cur = args
+                    .get(1)
+                    .map(|a| self.eval_expr(a))
+                    .unwrap_or_else(|| Value::zero(1));
+                let kind = args
+                    .get(2)
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(3))
+                    .unwrap_or(3);
+                // §9.4.2: an edge is detected on the LSB only. LSB state: 0,
+                // 1, or 2 for x/z; Table 9-2: posedge is 0→x/z/1 and x/z→1,
+                // negedge is 1→x/z/0 and x/z→0.
+                let state = |v: &Value| -> u8 {
+                    let b = v.bit_select(0);
+                    if b.has_xz() {
+                        2
+                    } else {
+                        b.to_u64().unwrap_or(0) as u8 & 1
+                    }
+                };
+                let (p, c) = (state(&prev), state(&cur));
+                let posedge = (p == 0 && c != 0) || (p == 2 && c == 1);
+                let negedge = (p == 1 && c != 1) || (p == 2 && c == 0);
+                let mut hit = match kind {
+                    0 => prev != cur,
+                    1 => posedge,
+                    2 => negedge,
+                    _ => posedge || negedge,
+                };
+                // `iff`: an edge while the guard is false is consumed without
+                // triggering (§9.4.2), so it re-baselines instead of latching.
+                if hit && let Some(guard) = args.get(3) {
+                    hit = self.eval_expr(guard).is_true();
+                }
+                if hit {
+                    self.vc_saved.remove(&idx);
+                    Value::from_u64(1, 1)
+                } else {
+                    // Re-baseline: the operand may move through several values
+                    // between two re-evaluations, and the edge is relative to
+                    // the value LAST SEEN, not to the arming value.
+                    self.vc_saved.insert(idx, (owner, cur));
+                    Value::from_u64(0, 1)
+                }
             }
             // §9.4.5 marker reached from a context that cannot suspend
             // (always-block settle, function body, bytecode fallback):
@@ -2827,6 +2973,7 @@ impl Simulator {
                                         span: arg.span,
                                     },
                                     span: arg.span,
+                                    bound: Default::default(),
                                 },
                                 dimensions: Vec::new(),
                                 type_args: Vec::new(),
@@ -3111,6 +3258,28 @@ impl Simulator {
                                 self.unpacked_nd_bits(&Self::handle_member_key(h, &prop))
                         {
                             return Value::from_u64(bits, 32);
+                        }
+                    }
+                    // §20.6.2: a ROW of a dynamic array or queue is an unpacked
+                    // array too: a dynamic row (`d[i]` on `int d[][]`) counts
+                    // its current elements, a fixed one (`r[i]` on `bit [7:0]
+                    // r[][2]`) its declared ones. Sized by the evaluated row,
+                    // both read one element's width.
+                    if let ExprKind::Index { expr: base, .. } = &arg.kind {
+                        if let Some(row) = self
+                            .array_operand_name(arg)
+                            .filter(|n| self.module.dynamic_arrays.contains(n))
+                            && let Some(&(_, _, ew)) = self.module.arrays.get(&row)
+                        {
+                            return Value::from_u64(self.get_queue_size(&row) * ew as u64, 32);
+                        }
+                        if let Some(nm) = self
+                            .array_operand_name(base)
+                            .filter(|n| self.module.dynamic_arrays.contains(n))
+                            && let Some(&(_, (b0, b1), ew)) = self.module.arrays_2d.get(&nm)
+                        {
+                            let n = (b1 - b0).unsigned_abs() + 1;
+                            return Value::from_u64(n * ew as u64, 32);
                         }
                     }
                     Value::from_u64(self.eval_expr(arg).width as u64, 32)
@@ -4140,6 +4309,26 @@ impl Simulator {
                         let n = super::elaborate::type_query_bound(name, &q, 1).unwrap_or(0);
                         return Value::from_u64(n as u64, 32);
                     }
+                    // §7.4.5: a select of `k` elements leaves the dimensions
+                    // after the first `k` (`$dimensions(a3[1])` of `logic
+                    // [1:0][3:0][7:0] a3` is 2). A select that leaves one
+                    // dimension or none keeps the answers below.
+                    if name == "$dimensions"
+                        && let Some((base, k)) = Self::peel_index_selects(arg)
+                        && !self.query_base_is_collection(&base)
+                    {
+                        let probe = Expression::new(
+                            ExprKind::SystemCall {
+                                name: "$dimensions".to_string(),
+                                args: vec![base.clone()],
+                            },
+                            base.span,
+                        );
+                        let nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
+                        if nd > k + 1 {
+                            return Value::from_u64((nd - k) as u64, 32);
+                        }
+                    }
                     // A class property or a struct member path (`m`,
                     // `this.m`, `a.w`): its declared type, unpacked and
                     // packed dimensions alike. A multi-dimensional packed
@@ -4152,7 +4341,16 @@ impl Simulator {
                         return Value::from_u64(n as u64, 32);
                     }
                     if let ExprKind::Ident(hier) = &arg.kind {
-                        let aname = self.resolve_hier_name(hier);
+                        let mut aname = self.resolve_hier_name(hier);
+                        // A class-member collection (`h.raw`) is shaped under
+                        // its instance store (see the bound queries below).
+                        if self.foreach_dims(&aname).is_none()
+                            && let Some(nm) = self
+                                .array_operand_name(arg)
+                                .filter(|n| self.foreach_dims(n).is_some())
+                        {
+                            aname = std::borrow::Cow::Owned(nm);
+                        }
                         // §20.7: EVERY unpacked dimension counts, not just
                         // the first — `int m[2][3]` has two, `int n[2][3][4]`
                         // three. Only the 1-D table was consulted.
@@ -4221,7 +4419,24 @@ impl Simulator {
                         },
                         base.span,
                     );
-                    let nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
+                    let mut nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
+                    if nd <= k && !self.query_base_is_collection(&base) {
+                        // §7.4.5: past the unpacked dimensions the selects
+                        // name elements of the packed ones, numbered on from
+                        // them: `$size(a3[1])` of `logic [1:0][3:0][7:0] a3`
+                        // is `$size(a3, 2)`, 4, not the 32 bits of `a3[1]`.
+                        // A dynamic array, queue or associative array keeps
+                        // its own row answers below (its rows' shape is not
+                        // in the declared dimensions).
+                        let probe = Expression::new(
+                            ExprKind::SystemCall {
+                                name: "$dimensions".to_string(),
+                                args: vec![base.clone()],
+                            },
+                            base.span,
+                        );
+                        nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
+                    }
                     if nd > k {
                         let call = Expression::new(
                             ExprKind::SystemCall {
@@ -4378,6 +4593,21 @@ impl Simulator {
                     {
                         if let Some(scoped) = self.handle_member_array_name(arg) {
                             aname = Some(std::borrow::Cow::Owned(scoped));
+                        }
+                    }
+                    // A class-member QUEUE / dynamic array of fixed rows
+                    // (`h.raw` on `bit [7:0] raw[][2]`) has its shape under
+                    // its instance store `<h>#raw` too; unfound, `$size(h.raw,
+                    // 2)` reported the element's 8 bits (§20.7).
+                    if aname
+                        .as_deref()
+                        .is_none_or(|n| self.foreach_dims(n).is_none())
+                    {
+                        if let Some(nm) = self
+                            .array_operand_name(arg)
+                            .filter(|n| self.foreach_dims(n).is_some())
+                        {
+                            aname = Some(std::borrow::Cow::Owned(nm));
                         }
                     }
                     if let Some(aname) = aname {

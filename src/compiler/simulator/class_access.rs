@@ -223,8 +223,9 @@ impl Simulator {
             root: hier.root.clone(),
             path: hier.path[..keep].to_vec(),
             span: hier.span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         let e = std::rc::Rc::new(Expression::new(ExprKind::Ident(base), hier.span));
         self.method_receiver_cache.insert(key, e.clone());
@@ -290,8 +291,9 @@ impl Simulator {
                 root: hier.root.clone(),
                 path: vec![hier.path[0].clone()],
                 span: hier.span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             hier.span,
         );
@@ -685,10 +687,16 @@ impl Simulator {
             .and_then(|s| crate::sv_parser::strip_unit_scope_name(&s.name.name))
         {
             if !self.unit_scope_decl_exists(&hier.path[0].name.name) {
+                // The unit's own storage, by its plain name: a scope search
+                // would bind a generate block's declaration of the same name.
+                if hier.path.len() == 1 && self.unit_scope_decl_exists(bare) {
+                    let _ = hier.cached_resolved_name.set(bare.to_string());
+                    return bare.to_string();
+                }
                 let mut stripped = hier.clone();
                 stripped.path[0].name.name = bare.to_string();
-                stripped.cached_signal_id = std::cell::Cell::new(None);
-                stripped.cached_resolved_name = std::cell::OnceCell::new();
+                stripped.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                stripped.cached_resolved_name = crate::ast::cache::NameCache::new();
                 let resolved = self.resolve_hier_name_uncached(&stripped);
                 let _ = hier.cached_resolved_name.set(resolved.clone());
                 return resolved;
@@ -726,6 +734,20 @@ impl Simulator {
             .map(|pos| &self.module.instances[self.instance_path_order[pos]])
     }
 
+    /// §23.9: `scope` and its enclosing generate blocks, ending at the nearest
+    /// enclosing instance, or at the outermost block of the top module.
+    pub(super) fn scopes_to_instance<'s>(&self, scope: &'s str) -> impl Iterator<Item = &'s str> {
+        let mut next = Some(scope);
+        std::iter::from_fn(move || {
+            let s = next?;
+            next = match self.instance_by_path(s) {
+                Some(_) => None,
+                None => s.rsplit_once('.').map(|(outer, _)| outer),
+            };
+            Some(s)
+        })
+    }
+
     pub(super) fn resolve_hier_name_uncached(&self, hier: &HierarchicalIdentifier) -> String {
         // §23.9 / §13.5 (#534): an unpacked-array FORMAL of the running
         // method is bound under its bare name (with a frame marker); it
@@ -759,7 +781,10 @@ impl Simulator {
                     }
                 }
             }
-            let resolve = |name: &str| {
+            let resolve = |name: &str| -> Option<String> {
+                if let Some(cached) = self.interface_resolve_cache.borrow().get(name) {
+                    return cached.clone();
+                }
                 let bound = xezim_core::elaborate::interface_ports::resolve(
                     name,
                     &self.module.interface_port_aliases,
@@ -783,7 +808,11 @@ impl Simulator {
                         || self.module.functions.contains_key(bound.as_ref())
                         || self.module.tasks.contains_key(bound.as_ref())
                         || self.instance_by_path(bound.as_ref()).is_some());
-                known.then(|| bound.into_owned())
+                let res = known.then(|| bound.into_owned());
+                self.interface_resolve_cache
+                    .borrow_mut()
+                    .insert(name.to_string(), res.clone());
+                res
             };
             if let Some(bound) = resolve(&raw) {
                 return bound;

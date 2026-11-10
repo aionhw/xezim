@@ -161,6 +161,37 @@ impl Simulator {
                         .insert("__xz_default_clocking0".to_string(), edge);
                     self.default_clocking_cb = Some(cb_name.clone());
                 }
+                // §14.3 `clocking_skew ::= edge_identifier [delay_control]`
+                // on outputs. A per-signal skew replaces the block default,
+                // edge included.
+                let skew_edge = |e: crate::ast::stmt::Edge| match e {
+                    crate::ast::stmt::Edge::Posedge => EdgeKind::Posedge,
+                    crate::ast::stmt::Edge::Negedge => EdgeKind::Negedge,
+                    crate::ast::stmt::Edge::Edge => EdgeKind::LsbEdge,
+                };
+                if let Some(e) = cd.default_output_edge {
+                    if cd.is_default {
+                        self.clocking_out_edge
+                            .insert("__xz_default_clocking".to_string(), skew_edge(e));
+                    }
+                    self.clocking_out_edge.insert(cb_name.clone(), skew_edge(e));
+                }
+                let sig_edges: HashMap<String, Option<EdgeKind>> = cd
+                    .signals
+                    .iter()
+                    .filter(|s| {
+                        !matches!(
+                            s.direction,
+                            crate::ast::types::PortDirection::Input
+                                | crate::ast::types::PortDirection::Inout
+                        )
+                    })
+                    .filter(|s| s.skew.is_some() || s.skew_edge.is_some())
+                    .map(|s| (s.name.name.clone(), s.skew_edge.map(skew_edge)))
+                    .collect();
+                if !sig_edges.is_empty() {
+                    self.clocking_sig_out_edge.insert(cb_name.clone(), sig_edges);
+                }
                 self.clocking_meta.insert(cb_name.clone(), (clk, sigs));
                 self.clocking_edge.insert(cb_name.clone(), edge);
                 self.clocking_prev_clock.insert(cb_name.clone(), 2);
@@ -992,6 +1023,10 @@ impl Simulator {
             self.jit_nba_side_len = 0;
         }
         self.collapse_identity_port_nets();
+        // §9.2.2.2 / §7.2: identity copies re-point member names at their
+        // sources. Build whole-struct sensitivity after the final collapse,
+        // or it waits on the old member ids, which no longer change.
+        self.unpacked_struct_sens = self.build_unpacked_struct_sens();
         mark_compile_phase("identity port-net collapse", &mut compile_phase_start);
         self.compile_edge_blocks();
         self.drop_compiled_edge_block_asts();
@@ -1427,6 +1462,7 @@ impl Simulator {
         self.in_pre_process_settle = true;
         self.settle_combinatorial();
         self.fire_time0_input_port_blocks();
+        self.record_time0_port_edges();
         self.in_pre_process_settle = false;
         self.time0_settled = true;
         mark_compile_phase("time-0 settle", &mut compile_phase_start);
@@ -1744,7 +1780,7 @@ impl Simulator {
                 // The outermost `begin/end` is flattened away below, so keep
                 // the label for `%m` here — see `process_m_label`.
                 self.process_m_label.insert(pid, l.clone());
-                self.disable_labels.insert(l, pid);
+                self.register_disable_label(&l, pid);
             }
             self.event_queue.schedule(0, pid, stmts.into());
         }

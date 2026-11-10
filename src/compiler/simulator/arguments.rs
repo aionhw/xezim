@@ -194,6 +194,31 @@ impl Simulator {
         Value::from_real_wrapped(f, width)
     }
 
+    /// §6.12.2: a real written into the integral slot whose current value is
+    /// `p` — rounded to the slot's width, stamped with its signedness. The
+    /// by-name stores (frame locals, struct leaves, collection elements) all
+    /// keep the slot's own type this way.
+    #[inline]
+    pub(super) fn real_into_slot(p: &Value, f: f64) -> Value {
+        let mut v = Self::real_to_int(f, p.width.max(1));
+        v.is_signed = p.is_signed;
+        v
+    }
+
+    /// §21.2.1.2 / §6.12.2: an integral format letter (`%d`, `%h`, `%o`,
+    /// `%b`, `%c`) applied to a REAL argument prints the real converted to an
+    /// integer: rounded to the nearest (ties away from zero) 32-bit signed
+    /// integer, the width and signedness of `integer`, so `%0d` of 15151.51
+    /// is `15152`, `%0h` of -15151.51 is `ffffc4d0` and `%d` pads to 11.
+    /// (Simulators agree on the 32-bit two's complement; most print the
+    /// decimal signed, one prints it unsigned.)
+    #[inline(never)]
+    pub(super) fn real_fmt_int(v: &Value) -> Value {
+        let mut i = Value::from_real_wrapped(v.to_f64(), 32);
+        i.is_signed = true;
+        i
+    }
+
     /// §13.4.1: how a function's value converts to its declared return type,
     /// for `ty` already resolved through its typedefs. Anything that is not a
     /// numeric scalar (a handle, string, void, unpacked aggregate or an
@@ -1002,7 +1027,7 @@ impl Simulator {
                                                 signed: true,
                                                 base: NumberBase::Decimal,
                                                 value: i.to_string(),
-                                                cached_val: std::cell::Cell::new(None),
+                                                cached_val: crate::ast::cache::LiteralCache::new(None),
                                             }),
                                             base.span,
                                         )),
@@ -1162,8 +1187,9 @@ impl Simulator {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         );
@@ -2044,7 +2070,7 @@ impl Simulator {
                         } else {
                             i.to_string()
                         },
-                        cached_val: std::cell::Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     base.span,
                 )),
@@ -2068,8 +2094,9 @@ impl Simulator {
                     root: hier.root.clone(),
                     path,
                     span: base.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 }),
                 base.span,
             );
@@ -2101,6 +2128,10 @@ impl Simulator {
     /// class property: it keeps the plain hierarchical name, as before.
     pub(super) fn array_actual_storage(&mut self, arg: &Expression) -> Option<String> {
         use crate::ast::expr::ExprKind;
+        let arg = Self::unparen(arg);
+        if matches!(arg.kind, ExprKind::Call { .. }) {
+            return self.collection_call_actual(arg);
+        }
         let ExprKind::Ident(h) = &arg.kind else {
             // An explicit member access `c.member` / `this.member` naming an
             // unpacked-array property: evaluate the receiver to its object
@@ -2386,6 +2417,31 @@ impl Simulator {
         }
     }
 
+    /// §13.5.1: the per-call storage key of a fixed unpacked array formal (see
+    /// `formal_dyn_key`). The element type and its packed geometry are
+    /// recorded under it as a block local array's declaration does, so an
+    /// element write fits, signs and selects like the declared type.
+    pub(super) fn array_formal_key(&mut self, port: &crate::ast::decl::FunctionPort) -> String {
+        let dt = &port.data_type;
+        let key = self.formal_dyn_key(&port.name.name, dt);
+        self.module.var_decl_types.insert(key.clone(), dt.clone());
+        if let Some(dims) = super::elaborate::packed_full_dims_chained(
+            dt,
+            &self.module.parameters,
+            &self.module.typedef_types,
+        )
+        .filter(|dims| dims.len() > 1)
+        {
+            self.module.packed_full_dims.insert(key.clone(), dims);
+            if let Some(width) = self.ast_decl_elem_width(dt) {
+                self.module
+                    .packed_signal_elem_widths
+                    .insert(key.clone(), width);
+            }
+        }
+        key
+    }
+
     /// Copy a fixed unpacked ARRAY actual into the formal's element signals and
     /// register the formal as an array so `a[i]` resolves inside the body.
     /// Returns `(formal, actual, lo, hi)` so an `output`/`inout`/`ref` formal
@@ -2401,6 +2457,13 @@ impl Simulator {
     ) -> Option<(String, String, i64, i64)> {
         use crate::ast::types::UnpackedDimension as UD;
         if port.dimensions.is_empty() {
+            if let Some(dims) = self.fn_ret_coll_dims(&port.data_type)
+                && matches!(dims.first(), Some(UD::Range { .. } | UD::Expression { .. }))
+            {
+                let mut expanded = port.clone();
+                expanded.dimensions = dims;
+                return self.bind_array_arg(&expanded, arg);
+            }
             return None;
         }
         let dims = super::elaborate::normalize_unpacked_dims(
@@ -2430,6 +2493,46 @@ impl Simulator {
             }
             _ => return None,
         };
+        let descending = match dims.first() {
+            Some(UD::Range { left, right, .. }) => {
+                super::elaborate::const_eval_i64_with_params(left, params)
+                    > super::elaborate::const_eval_i64_with_params(right, params)
+            }
+            _ => false,
+        };
+        // §10.8 / §10.10: an input actual is an assignment-like context, so a
+        // concatenation passed to an unpacked array formal is an unpacked
+        // array concatenation. An array operand contributes all of its
+        // elements; there is no storage to copy back.
+        if let ExprKind::Concatenation(parts) = &Self::unparen(arg).kind {
+            if dims.len() != 1 {
+                return None;
+            }
+            let w = super::elaborate::resolve_type_width(
+                &port.data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+            .max(1);
+            let param = self.array_formal_key(port);
+            self.module.arrays.insert(param.clone(), (lo, hi, w));
+            if descending {
+                self.module.descending_arrays.insert(param.clone());
+            }
+            if self.assign_struct_concat(&param, parts.iter().collect()) {
+                return Some((param, String::new(), lo, hi));
+            }
+            let vals = self.unpacked_concat_operand_values(parts.iter().collect());
+            for (j, v) in vals.into_iter().take((hi - lo + 1) as usize).enumerate() {
+                let idx = if descending {
+                    hi - j as i64
+                } else {
+                    lo + j as i64
+                };
+                self.set_signal_value_by_name(&format!("{}[{}]", param, idx), v.resize(w));
+            }
+            return Some((param, String::new(), lo, hi));
+        }
         // §13.5.3 / §10.9.1: an assignment-pattern actual (in practice a
         // formal's default, `byte v[2] = '{8'hA5, 8'h5A}`) has no storage to
         // copy from: register the formal and assign the pattern's items to
@@ -2439,7 +2542,6 @@ impl Simulator {
             if dims.len() != 1 {
                 return None;
             }
-            let param = port.name.name.clone();
             let dt = &port.data_type;
             let w = super::elaborate::resolve_type_width(
                 dt,
@@ -2447,13 +2549,7 @@ impl Simulator {
                 Some(&self.module.typedefs),
             )
             .max(1);
-            let descending = match dims.first() {
-                Some(UD::Range { left, right, .. }) => {
-                    super::elaborate::const_eval_i64_with_params(left, params)
-                        > super::elaborate::const_eval_i64_with_params(right, params)
-                }
-                _ => false,
-            };
+            let param = self.array_formal_key(port);
             self.module.arrays.insert(param.clone(), (lo, hi, w));
             let ordered: Vec<Expression> =
                 self.pattern_ordered(items).into_iter().cloned().collect();
@@ -2493,6 +2589,18 @@ impl Simulator {
             }
         }
         let caller = self.array_actual_storage(arg)?;
+        // §13.5.2: a `ref` formal is an ALIAS of the actual's storage: the
+        // formal's name maps to the actual's key, so every read and write
+        // goes to the caller's array while the call runs and nothing is
+        // copied back.
+        if matches!(port.direction, PortDirection::Ref)
+            && (self.module.arrays.contains_key(&*caller)
+                || self.module.arrays_2d.contains_key(&*caller)
+                || self.module.arrays_nd.contains_key(&*caller))
+        {
+            self.map_formal_dyn(&port.name.name, &caller);
+            return Some((caller, String::new(), lo, hi));
+        }
         // §13.5.2 multi-dimensional formal (`int a[R][C]`, `a[X][Y][Z]`): copy
         // every element of the caller's array in under the formal's name and
         // register the same shape, so element, `foreach`, `%p`, `$size` and
@@ -2500,20 +2608,24 @@ impl Simulator {
         // copy back through `writeback_array_args`. Only the first dimension
         // was handled before: a 2-D formal read x and never wrote back.
         if dims.len() >= 2 {
-            let param = port.name.name.clone();
+            if !self.module.arrays_2d.contains_key(&*caller)
+                && !self.module.arrays_nd.contains_key(&*caller)
+            {
+                return None;
+            }
+            let param = self.array_formal_key(port);
             let suffixes =
                 if let Some(&((a0, a1), (b0, b1), w)) = self.module.arrays_2d.get(&*caller) {
                     self.module
                         .arrays_2d
                         .insert(param.clone(), ((a0, a1), (b0, b1), w));
                     Self::nd_elem_suffixes(&[(a0, a1), (b0, b1)])
-                } else if let Some((shape, w)) = self.module.arrays_nd.get(&*caller).cloned() {
+                } else {
+                    let (shape, w) = self.module.arrays_nd.get(&*caller).cloned()?;
                     self.module
                         .arrays_nd
                         .insert(param.clone(), (shape.clone(), w));
                     Self::nd_elem_suffixes(&shape)
-                } else {
-                    return None;
                 };
             self.multi_dim_array_names.insert(param.clone());
             if param != caller {
@@ -2537,7 +2649,7 @@ impl Simulator {
         if !self.module.arrays.contains_key(&*caller) {
             return None;
         }
-        let param = port.name.name.clone();
+        let param = self.array_formal_key(port);
         // §7.2: an element of an UNPACKED-struct array is a set of member
         // leaves. Copying `a[i]` alone brought nothing across, so a
         // `pkt_t arr[3]` formal read zero from every member.
@@ -2800,6 +2912,53 @@ impl Simulator {
         true
     }
 
+    /// Copy each `output`/`inout`/`ref` array formal's per-call storage onto
+    /// a fresh key while the call's frame is still live (popping it tears
+    /// the formal's key down), and retarget the writeback at that copy. The
+    /// copy is applied after the caller's shadowed storage is restored, so a
+    /// same-named callee local cannot wipe it (see `stage_queue_param`).
+    pub(super) fn stage_array_writebacks(
+        &mut self,
+        wb: &[(String, String, i64, i64)],
+    ) -> Vec<(String, String, i64, i64)> {
+        let mut staged = Vec::with_capacity(wb.len());
+        for (param, caller, lo, hi) in wb {
+            let bare = param
+                .strip_prefix('@')
+                .and_then(|s| s.rsplit_once('#'))
+                .map_or(param.as_str(), |(b, _)| b);
+            let id = self.next_dyn_id;
+            self.next_dyn_id += 1;
+            let tmp = format!("@{}#{}", bare, id);
+            let moved: Vec<(String, Value)> = self
+                .signals
+                .keys_with_elem_prefix(&format!("{}[", param))
+                .into_iter()
+                .filter_map(|k| {
+                    let v = self.signals.get(&k)?.clone();
+                    Some((format!("{}{}", tmp, &k[param.len()..]), v))
+                })
+                .collect();
+            for (k, v) in moved {
+                self.signals.insert(k, v);
+            }
+            if let Some(shape) = self.module.arrays.get(param).copied() {
+                self.module.arrays.insert(tmp.clone(), shape);
+            }
+            if let Some(shape) = self.module.arrays_2d.get(param).copied() {
+                self.module.arrays_2d.insert(tmp.clone(), shape);
+            }
+            if let Some(shape) = self.module.arrays_nd.get(param).cloned() {
+                self.module.arrays_nd.insert(tmp.clone(), shape);
+            }
+            if self.multi_dim_array_names.contains(param) {
+                self.multi_dim_array_names.insert(tmp.clone());
+            }
+            staged.push((tmp, caller.clone(), *lo, *hi));
+        }
+        staged
+    }
+
     pub(super) fn writeback_array_args(&mut self, wb: &[(String, String, i64, i64)]) {
         for (param, caller, lo, hi) in wb {
             if self.writeback_slice_arg(param, caller) {
@@ -2990,7 +3149,7 @@ impl Simulator {
                     signed: false,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: "0".to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 crate::ast::Span::dummy(),
             )
@@ -3145,7 +3304,7 @@ impl Simulator {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: n.to_string(),
-                    cached_val: Cell::new(Some((n as u64, 0u64, 64u32))),
+                    cached_val: crate::ast::cache::LiteralCache::new(Some((n as u64, 0u64, 64u32))),
                 }),
                 x.span,
             ))

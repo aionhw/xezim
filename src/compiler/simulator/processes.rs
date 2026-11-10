@@ -33,6 +33,7 @@ impl Simulator {
             current_static_task: self.current_static_task.clone(),
             current_auto_task: self.current_auto_task.clone(),
             task_string_formals: self.task_string_formals.clone(),
+            local_meta_claims: self.local_meta_claims.clone(),
         }
     }
 
@@ -94,6 +95,7 @@ impl Simulator {
             && self.current_static_task.is_none()
             && self.current_auto_task.is_none()
             && self.task_string_formals.is_empty()
+            && self.local_meta_claims.is_empty()
             && !self.ref_redirect_hot
     }
 
@@ -128,6 +130,7 @@ impl Simulator {
             current_static_task: self.current_static_task.take(),
             current_auto_task: self.current_auto_task.take(),
             task_string_formals: std::mem::take(&mut self.task_string_formals),
+            local_meta_claims: std::mem::take(&mut self.local_meta_claims),
         }
     }
 
@@ -159,7 +162,8 @@ impl Simulator {
         self.current_static_task = ctx.current_static_task;
         self.current_auto_task = ctx.current_auto_task;
         self.task_string_formals = ctx.task_string_formals;
-        if !self.local_meta_saved.is_empty() {
+        self.local_meta_claims = ctx.local_meta_claims;
+        if !self.local_meta_cache.is_empty() && !self.local_meta_claims.is_empty() {
             self.reapply_local_meta();
         }
     }
@@ -220,8 +224,8 @@ impl Simulator {
                 k += last.selects.len();
                 let mut hb = h.clone();
                 hb.path.last_mut()?.selects.clear();
-                hb.cached_signal_id = std::cell::Cell::new(None);
-                hb.cached_resolved_name = std::cell::OnceCell::new();
+                hb.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                hb.cached_resolved_name = crate::ast::cache::NameCache::new();
                 return Some((Expression::new(ExprKind::Ident(hb), cur.span), k));
             }
         }
@@ -380,7 +384,7 @@ impl Simulator {
                 signed: false,
                 base: NumberBase::Decimal,
                 value: id.to_string(),
-                cached_val: Cell::new(Some((id, 0u64, 64u32))),
+                cached_val: crate::ast::cache::LiteralCache::new(Some((id, 0u64, 64u32))),
             }),
             span,
         );
@@ -1191,7 +1195,6 @@ impl Simulator {
         let mut saved = self.take_process_context();
         let ctx = self.process_contexts.remove(&pid).unwrap_or_default();
         let sibling_baseline = self.fork_baselines.get(&pid).cloned();
-        let mut sibling_scopes = self.fork_local_scopes.get(&pid).cloned().unwrap_or_default();
         let fork_parent = self.process_parents.get(&pid).copied();
         self.restore_process_context(ctx);
         self.run_process_payload(pid, stmts);
@@ -1218,7 +1221,14 @@ impl Simulator {
         //       into `self.signals`, which is what the parent reads from.
         let child_frames: &[HashMap<String, Value>] = &child_ctx.local_stack;
         let child_frames_gen: &[u64] = &child_ctx.local_gen_stack;
-        let baseline = self.fork_baselines.get(&pid).map(Arc::as_ref);
+        // §6.21, §9.3.2: a variable a block of the child declared is the
+        // child's own, even when it has the name of a variable in a frame
+        // the child shares with its parent (the block's declaration hides
+        // it): its writes reach neither the parent nor the siblings, and the
+        // value its block's exit puts back is no write either (#943).
+        let child_private =
+            |g: u64, k: &str| Self::block_declares(&child_ctx.block_scope_saves, g, k);
+        let baseline = sibling_baseline.as_deref();
         let signal_caps = self.fork_signal_captures.get(&pid);
         // Parent-frame keys the child's writes reached, for the wake below.
         let mut written: Vec<String> = Vec::new();
@@ -1232,6 +1242,7 @@ impl Simulator {
                         child_frames,
                         child_frames_gen,
                         baseline,
+                        &child_private,
                     )
                 } else {
                     // Parent is the active process — its context is `saved`.
@@ -1241,6 +1252,7 @@ impl Simulator {
                         child_frames,
                         child_frames_gen,
                         baseline,
+                        &child_private,
                     )
                 };
             }
@@ -1249,31 +1261,89 @@ impl Simulator {
         // `self.signals`. Write only keys the child CHANGED (relative to the
         // fork-time baseline) so an inherited-unchanged value doesn't
         // clobber a sibling's or the parent's concurrent write.
+        let mut stored: Vec<(String, Value)> = Vec::new();
         if let Some(caps) = signal_caps {
             let top = child_frames.last();
+            let top_gen = child_frames_gen.last().copied().unwrap_or(0);
             for nm in caps {
                 let Some(v) = top.and_then(|f| f.get(nm)) else {
                     continue;
                 };
+                if child_private(top_gen, nm) {
+                    continue;
+                }
                 let inherited_unchanged = baseline
                     .and_then(|b| b.last())
                     .and_then(|f| f.get(nm))
                     .is_some_and(|old| old == v);
                 if !inherited_unchanged {
                     self.signals.insert(nm.clone(), v.clone());
+                    stored.push((nm.clone(), v.clone()));
+                }
+            }
+        }
+        // The other children of a fork share these block-locals too, but each
+        // holds a copy in its own capture frame, under its own activation, so
+        // the frame broadcast below never reaches them: hand them the value
+        // and make it their baseline, so a later write of the fork-time value
+        // by one of them is still a write.
+        if !stored.is_empty() {
+            let others: Vec<usize> = self
+                .fork_signal_captures
+                .iter()
+                .filter(|(p, caps)| **p != pid && stored.iter().any(|(n, _)| caps.contains(n)))
+                .map(|(p, _)| *p)
+                .collect();
+            for other_pid in others {
+                let Some(other) = self.process_contexts.get_mut(&other_pid) else {
+                    continue;
+                };
+                let top_gen = other.local_gen_stack.last().copied().unwrap_or(0);
+                let Some(top) = other.local_stack.last_mut() else {
+                    continue;
+                };
+                for (n, v) in &stored {
+                    if Self::block_declares(&other.block_scope_saves, top_gen, n) {
+                        continue;
+                    }
+                    if let Some(slot) = top.get_mut(n) {
+                        *slot = v.clone();
+                    }
+                }
+                if let Some(base) = self.fork_baselines.get_mut(&other_pid) {
+                    Self::sync_fork_baseline(
+                        base,
+                        &other.local_stack,
+                        &other.local_gen_stack,
+                        &other.block_scope_saves,
+                    );
                 }
             }
         }
         // Match both task activation and lexical block activation. Repeated
         // loop-block declarations share a flattened frame but not storage.
         if let Some(sibling_baseline) = &sibling_baseline {
-            Self::overlay_fork_local_scopes(&mut sibling_scopes, &child_ctx.block_scope_saves);
-            let changes: Vec<HashMap<String, Value>> = child_frames.iter().enumerate()
-                .map(|(i, frame)| frame.iter().filter(|(k, v)| {
-                    sibling_baseline.get(i).and_then(|base| base.get(*k))
-                        .is_some_and(|old| old != *v)
-                }).map(|(k, v)| (k.clone(), v.clone())).collect()).collect();
-            if changes.iter().any(|frame| !frame.is_empty()) {
+            let has_changes = child_frames.iter().enumerate().any(|(i, frame)| {
+                frame.iter().any(|(k, v)| {
+                    sibling_baseline.get(i).and_then(|base| base.get(k))
+                        .is_some_and(|old| old != v)
+                })
+            });
+            if has_changes {
+                let mut sibling_scopes = self.fork_local_scopes.get(&pid).cloned().unwrap_or_default();
+                Self::overlay_fork_local_scopes(&mut sibling_scopes, &child_ctx.block_scope_saves);
+                let changes: Vec<HashMap<String, Value>> = child_frames.iter().enumerate()
+                    .map(|(i, frame)| frame.iter().filter(|(k, v)| {
+                        sibling_baseline.get(i).and_then(|base| base.get(*k))
+                            .is_some_and(|old| old != *v)
+                    }).map(|(k, v)| (k.clone(), v.clone())).collect()).collect();
+                // The child's own block variables are no sibling's (#943).
+                let mut changes = changes;
+                if !child_ctx.block_scope_saves.is_empty() {
+                    for (frame, g) in changes.iter_mut().zip(child_frames_gen) {
+                        frame.retain(|k, _| !child_private(*g, k));
+                    }
+                }
                 // Only a fork child holding one of the changed frames' own
                 // activations can receive a write (`merge_fork_writes`
                 // matches frames by generation), so visit just those, not
@@ -1289,6 +1359,12 @@ impl Simulator {
                     .collect();
                 candidates.sort_unstable();
                 candidates.dedup();
+                let has_any_block_saves = !child_ctx.block_scope_saves.is_empty()
+                    || !sibling_scopes.is_empty()
+                    || candidates.iter().any(|p| {
+                        self.fork_local_scopes.get(p).is_some_and(|s| !s.is_empty())
+                            || self.process_contexts.get(p).is_some_and(|c| !c.block_scope_saves.is_empty())
+                    });
                 for other_pid in candidates {
                     let Some(other) = self.process_contexts.get_mut(&other_pid) else {
                         continue;
@@ -1297,23 +1373,103 @@ impl Simulator {
                         continue;
                     }
                     let other_pid = &other_pid;
-                    let mut other_scopes = self.fork_local_scopes.get(other_pid).cloned().unwrap_or_default();
-                    Self::overlay_fork_local_scopes(&mut other_scopes, &other.block_scope_saves);
-                    let mut visible = changes.clone();
-                    for (i, frame) in visible.iter_mut().enumerate() {
-                        let frame_generation = child_frames_gen.get(i).copied().unwrap_or(0);
-                        frame.retain(|key, _| {
-                            sibling_scopes.get(&frame_generation).and_then(|m| m.get(key))
-                                == other_scopes.get(&frame_generation).and_then(|m| m.get(key))
-                        });
-                    }
+                    let visible_storage;
+                    let visible: &[HashMap<String, Value>] = if !has_any_block_saves {
+                        &changes
+                    } else {
+                        let base_scopes = self.fork_local_scopes.get(other_pid);
+                        let has_other_blocks = !other.block_scope_saves.is_empty();
+                        let (other_scopes_storage, other_scopes_ref) = if has_other_blocks {
+                            let mut sc = base_scopes.cloned().unwrap_or_default();
+                            Self::overlay_fork_local_scopes(&mut sc, &other.block_scope_saves);
+                            (Some(sc), None)
+                        } else {
+                            (None, base_scopes)
+                        };
+                        let lookup_other = |f_gen: &u64, key: &str| -> Option<u64> {
+                            if let Some(sc) = &other_scopes_storage {
+                                sc.get(f_gen).and_then(|m| m.get(key)).copied()
+                            } else if let Some(sc) = other_scopes_ref {
+                                sc.get(f_gen).and_then(|m| m.get(key)).copied()
+                            } else {
+                                None
+                            }
+                        };
+                        let mut filtered = changes.clone();
+                        for (i, frame) in filtered.iter_mut().enumerate() {
+                            let frame_generation = child_frames_gen.get(i).copied().unwrap_or(0);
+                            frame.retain(|key, _| {
+                                sibling_scopes.get(&frame_generation).and_then(|m| m.get(key)).copied()
+                                    == lookup_other(&frame_generation, key)
+                            });
+                        }
+                        visible_storage = filtered;
+                        &visible_storage
+                    };
                     let updates = Self::merge_fork_writes(
-                        &mut other.local_stack, &other.local_gen_stack,
-                        &visible, child_frames_gen, None,
+                        &mut other.local_stack,
+                        &other.local_gen_stack,
+                        visible,
+                        child_frames_gen,
+                        None,
+                        &|g, k| Self::block_declares(&other.block_scope_saves, g, k),
                     );
+                    // §6.21: where a block of the sibling hides the variable,
+                    // the value is for the hidden one, which the block's exit
+                    // puts back.
+                    // A write of a variable the sibling shares at the fork
+                    // (the writer's and the sibling's fork-time scopes agree).
+                    let hidden = if other.block_scope_saves.is_empty() {
+                        Vec::new()
+                    } else {
+                        let base_scopes = self.fork_local_scopes.get(other_pid);
+                        let shared = |g: u64, k: &str| {
+                            sibling_scopes.get(&g).and_then(|m| m.get(k))
+                                == base_scopes.and_then(|sc| sc.get(&g)).and_then(|m| m.get(k))
+                        };
+                        Self::deliver_to_hidden(
+                            &mut other.block_scope_saves,
+                            &other.local_gen_stack,
+                            &changes,
+                            child_frames_gen,
+                            &shared,
+                        )
+                    };
+                    // The sibling now holds these values: a later write of
+                    // the value it held at the fork is a write too.
+                    if let Some(base) = self.fork_baselines.get_mut(other_pid) {
+                        Self::sync_fork_baseline(
+                            base,
+                            &other.local_stack,
+                            &other.local_gen_stack,
+                            &other.block_scope_saves,
+                        );
+                        if !hidden.is_empty() {
+                            let frames = Arc::make_mut(base);
+                            for (i, k, v) in hidden {
+                                if let Some(b) = frames.get_mut(i).and_then(|f| f.get_mut(&k)) {
+                                    *b = v;
+                                }
+                            }
+                        }
+                    }
                     written.extend(updates);
                 }
             }
+        }
+        // §9.3.2: this child's writes are published (to the parent and its
+        // siblings), so they become its baseline. A later write is then
+        // compared with what the child last published, not with the value at
+        // the fork: `x = 0; #10; x = 5;` with 5 the fork-time value used to
+        // read as "unchanged" and be dropped, the parent keeping 0.
+        drop(sibling_baseline);
+        if let Some(base) = self.fork_baselines.get_mut(&pid) {
+            Self::sync_fork_baseline(
+                base,
+                child_frames,
+                child_frames_gen,
+                &child_ctx.block_scope_saves,
+            );
         }
         if !written.is_empty() {
             // A child wrote a key a parked `wait` of the parent reads —
@@ -1715,14 +1871,10 @@ impl Simulator {
         // queue, which the scheduler drains inside one delta, so the outer
         // loop's stall counter never sees `initial forever begin #0; ... end`
         // spin — the run_proc_fsm path hung the stall-report test.
-        if self.stall_limit > 0 {
-            let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-            if *hits >= self.stall_limit {
-                self.event_queue.schedule(self.time, pid, Vec::new().into());
-                self.zero_delay_defer_pending = true;
-                return;
-            }
-            *hits += 1;
+        if self.stall_limit > 0 && self.stall_pid_tripped(pid, None) {
+            self.event_queue.schedule(self.time, pid, Vec::new().into());
+            self.zero_delay_defer_pending = true;
+            return;
         }
         let Some(mut f) = self.proc_fsm.remove(&pid) else {
             return;
@@ -1924,17 +2076,13 @@ impl Simulator {
         // Match run_process_stmts' per-process zero-delay protection. The
         // marker was removed from the timing wheel before dispatch, so park it
         // again before asking the outer loop to seek a future event.
-        if self.stall_limit > 0 {
-            let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-            // Check BEFORE counting: the activation that trips the guard is
-            // re-parked UNEXECUTED, so it must not inflate the "ran N times"
-            // attribution in the stall report.
-            if *hits >= self.stall_limit {
-                self.event_queue.schedule(self.time, pid, Vec::new().into());
-                self.zero_delay_defer_pending = true;
-                return;
-            }
-            *hits += 1;
+        // Check BEFORE counting (inside `stall_pid_tripped`): the activation
+        // that trips the guard is re-parked UNEXECUTED, so it must not inflate
+        // the "ran N times" attribution in the stall report.
+        if self.stall_limit > 0 && self.stall_pid_tripped(pid, None) {
+            self.event_queue.schedule(self.time, pid, Vec::new().into());
+            self.zero_delay_defer_pending = true;
+            return;
         }
 
         // Temporarily own the entry so evaluation and assignment can mutably
@@ -2037,16 +2185,20 @@ impl Simulator {
     /// Returns the names of keys actually propagated (child value differs
     /// from both baseline and parent, so a real write landed). The caller
     /// uses this to promote parked condition waiters that read those names.
+    /// `baseline` is what the child last published or was given (see
+    /// `sync_fork_baseline`), so a write back to the fork-time value counts.
     pub(super) fn merge_fork_writes(
         parent_frames: &mut [HashMap<String, Value>],
         parent_gens: &[u64],
         child_frames: &[HashMap<String, Value>],
         child_gens: &[u64],
         baseline: Option<&Vec<HashMap<String, Value>>>,
+        private: &dyn Fn(u64, &str) -> bool,
     ) -> Vec<String> {
-        let mut written = Vec::new();
+        let mut propagated = Vec::new();
         let n = parent_frames.len().min(child_frames.len());
         for i in 0..n {
+            let g = child_gens.get(i).copied().unwrap_or(0);
             let same_activation = parent_gens.get(i).copied() == child_gens.get(i).copied();
             if !same_activation {
                 // The parent slot `i` no longer belongs to the activation this
@@ -2068,7 +2220,7 @@ impl Simulator {
                         paired = false;
                         break;
                     }
-                    if v == bv {
+                    if v == bv || private(g, k) {
                         continue;
                     }
                     if let Some(slot) = parent_frames[i].get_mut(k) {
@@ -2076,7 +2228,7 @@ impl Simulator {
                             *slot = v.clone();
                             // A parked `wait` of the parent may read it.
                             note_store_write(name_bit(k));
-                            written.push(k.clone());
+                            propagated.push(k.clone());
                         }
                     }
                 }
@@ -2088,7 +2240,7 @@ impl Simulator {
                 let inherited_unchanged = base_frame
                     .and_then(|f| f.get(k))
                     .is_some_and(|old| old == v);
-                if inherited_unchanged {
+                if inherited_unchanged || private(g, k) {
                     continue;
                 }
                 match parent_frames[i].get_mut(k) {
@@ -2097,14 +2249,101 @@ impl Simulator {
                             *slot = v.clone();
                             // A parked `wait` of the parent may read it.
                             note_store_write(name_bit(k));
-                            written.push(k.clone());
+                            propagated.push(k.clone());
                         }
                     }
                     None => continue,
                 }
             }
         }
-        written
+        propagated
+    }
+
+    /// Move a fork child's baseline to the values its frames now hold, for
+    /// every key it inherited. Copied on write: the snapshot is shared until
+    /// a value actually differs. A key one of the child's open `blocks`
+    /// declared holds the block's own variable, not the inherited one, so
+    /// its baseline stays (see `block_declares`).
+    pub(super) fn sync_fork_baseline(
+        base: &mut Arc<Vec<HashMap<String, Value>>>,
+        frames: &[HashMap<String, Value>],
+        gens: &[u64],
+        blocks: &[BlockScopeSave],
+    ) {
+        let moved = |i: usize, k: &str, bv: &Value, cf: &HashMap<String, Value>| {
+            cf.get(k).is_some_and(|v| v != bv)
+                && !Self::block_declares(blocks, gens.get(i).copied().unwrap_or(0), k)
+        };
+        let differs = |b: &[HashMap<String, Value>]| {
+            b.iter()
+                .zip(frames)
+                .enumerate()
+                .any(|(i, (bf, cf))| bf.iter().any(|(k, bv)| moved(i, k, bv, cf)))
+        };
+        if !differs(base) {
+            return;
+        }
+        for (i, (bf, cf)) in Arc::make_mut(base).iter_mut().zip(frames).enumerate() {
+            for (k, bv) in bf.iter_mut() {
+                if moved(i, k, bv, cf) {
+                    if let Some(v) = cf.get(k) {
+                        *bv = v.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Store a fork sibling's writes (`frames`, under activations `gens`)
+    /// of `shared` variables that the receiver's open `blocks` hide into the
+    /// hidden variables' saved values, the outermost hiding block's (§6.21).
+    /// Returns them by frame index, key and value.
+    fn deliver_to_hidden(
+        blocks: &mut [BlockScopeSave],
+        receiver_gens: &[u64],
+        frames: &[HashMap<String, Value>],
+        gens: &[u64],
+        shared: &dyn Fn(u64, &str) -> bool,
+    ) -> Vec<(usize, String, Value)> {
+        let mut out = Vec::new();
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(&g) = gens.get(i) else {
+                continue;
+            };
+            if receiver_gens.get(i) != Some(&g) {
+                continue;
+            }
+            for (k, v) in frame {
+                if !shared(g, k) {
+                    continue;
+                }
+                let slot = blocks
+                    .iter_mut()
+                    .filter(|b| b.frame_gen == g)
+                    .find_map(|b| b.shadowed.iter_mut().find(|(n, _)| n == k));
+                if let Some(slot) = slot {
+                    slot.1 = v.clone();
+                    out.push((i, k.clone(), v.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether one of the open `blocks` declared the variable of frame entry
+    /// `key` (its bare name, or a leaf `name.member` / `name[i]` of an
+    /// unpacked aggregate) into the frame of generation `g` (§6.21): the
+    /// entry is then the block's variable, hiding the enclosing one of the
+    /// same name.
+    pub(super) fn block_declares(blocks: &[BlockScopeSave], g: u64, key: &str) -> bool {
+        let names = |n: &String| {
+            key.strip_prefix(n.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+        };
+        !blocks.is_empty()
+            && blocks
+                .iter()
+                .any(|b| b.frame_gen == g && b.declared_names.iter().any(names))
     }
 
     /// Evaluate a `#delay` expression to an integer number of simulator ticks.
@@ -2239,7 +2478,7 @@ impl Simulator {
                         signed: false,
                         base: NumberBase::Decimal,
                         value: idx.to_string(),
-                        cached_val: Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 )],
@@ -2348,7 +2587,10 @@ impl Simulator {
             }
         }
         let eligible = match &stmt.kind {
-            StatementKind::For { .. } => !self.stmt_has_event_wait(stmt),
+            StatementKind::For { .. }
+            | StatementKind::While { .. }
+            | StatementKind::DoWhile { .. }
+            | StatementKind::Repeat { .. } => !self.stmt_has_event_wait(stmt),
             _ => false,
         };
         if !eligible || stmt.span.start == 0 && stmt.span.end == 0 {
@@ -2816,32 +3058,32 @@ impl Simulator {
         // dispatch, so the guard stays accurate while re-entrant work is free
         // to recurse up to the trampoline/stack limits above.
         if self.stall_limit > 0 && depth == 0 {
-            let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-            // One process re-activated this many times at a SINGLE timestamp is
-            // not a busy design, it is a livelock: it keeps re-arming itself and
-            // time can never advance. (Counting per-process, rather than
-            // counting activations at the timestamp, is what makes this safe for
-            // a wide design that legitimately wakes thousands of DISTINCT
-            // processes at time 0.) run_one_tick's inner drain loop re-reads the
-            // queue at the current time, so a self-rescheduling process never
-            // reaches the outer event loop — the check has to live here.
-            // Check BEFORE counting: the activation that trips the guard is
-            // re-parked UNEXECUTED and must not inflate "ran N times".
-            if *hits >= self.stall_limit {
-                // A single process re-arming this many times at one timestamp is
-                // a zero-delay livelock (e.g. `always #(period) clk=~clk` whose
-                // real `period` momentarily glitched to 0). Rather than abort the
+            // One process re-activated `stall_limit` times at a SINGLE
+            // timestamp with NO observable state change in between is not a
+            // busy design, it is a livelock: it keeps re-arming itself and
+            // time can never advance (`stall_pid_tripped` is progress-aware
+            // unless XEZIM_STALL_LIMIT was set explicitly). Counting
+            // per-process, rather than counting activations at the timestamp,
+            // keeps a wide design that legitimately wakes thousands of
+            // DISTINCT processes at time 0 safe. run_one_tick's inner drain
+            // loop re-reads the queue at the current time, so a
+            // self-rescheduling process never reaches the outer event loop —
+            // the check has to live here. The activation that trips the guard
+            // is re-parked UNEXECUTED and must not inflate "ran N times".
+            if self.stall_pid_tripped(pid, Some(pc)) {
+                // A single process re-arming like this is a zero-delay
+                // livelock (e.g. `always #(period) clk=~clk` whose real
+                // `period` momentarily glitched to 0). Rather than abort the
                 // whole run here, RE-PARK this un-executed activation at the
-                // current time and ask the outer event loop to defer-and-advance
-                // to the next scheduled event — a commercial simulator lets time
-                // move past a #0 spinner once its driving value recovers (here,
-                // once a reference-clock edge updates the measured period). The outer
-                // loop declares it fatal only if nothing is scheduled ahead.
+                // current time and ask the outer event loop to
+                // defer-and-advance to the next scheduled event — a
+                // commercial simulator lets time move past a #0 spinner once
+                // its driving value recovers. The outer loop declares it
+                // fatal only if nothing is scheduled ahead.
                 self.event_queue.schedule(self.time, pid, pc.clone());
                 self.zero_delay_defer_pending = true;
                 return;
             }
-            *hits += 1;
         }
         sim_dbg_eprintln!(
             "[DEBUG] running process {} ({} stmts) at time {}",
@@ -3217,7 +3459,7 @@ impl Simulator {
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
-                                    let mut cont: Vec<Statement> = td.items.clone();
+                                    let mut cont: Vec<Statement> = td.items.to_vec();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
                                     // Chain the caller's tail instead of copying it onto the end of
                                     // the spliced body (ProcCont::pushed).
@@ -3247,7 +3489,7 @@ impl Simulator {
                             // bare free-task arm above (Stage 1).
                             self.push_instance_task_context(&mut cleanup);
                             self.task_cleanup.push(cleanup);
-                            let mut cont: Vec<Statement> = td.items.clone();
+                            let mut cont: Vec<Statement> = td.items.to_vec();
                             cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
                             self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                             return;
@@ -3282,7 +3524,7 @@ impl Simulator {
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
-                                    let mut cont: Vec<Statement> = td.items.clone();
+                                    let mut cont: Vec<Statement> = td.items.to_vec();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
                                     self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                                     return;
@@ -4032,8 +4274,9 @@ impl Simulator {
                                             selects: Vec::new(),
                                         }],
                                         span: *span,
-                                        cached_signal_id: std::cell::Cell::new(None),
-                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                        bound: crate::ast::binding::Bound::UNSET,
                                     }),
                                     *span,
                                 ),
@@ -4319,7 +4562,24 @@ impl Simulator {
                         // `@prop` / `@(h.prop)` on a NON-event class property:
                         // a value-change wait, resumed by an ordinary write
                         // of the property (never by `->`).
+                        // `@(vif)` / `@(vifs[i])`: a change of the instance a
+                        // virtual-interface variable refers to.
+                        if let Some(cond) = self.vif_value_change_cond(event) {
+                            let wait = Self::vc_wait_stmt(cond.clone(), body, stmt.span);
+                            let cont = pc.pushed(vec![wait], pc.start + i + 1);
+                            self.park_condition_waiter(pid, cont, &cond);
+                            return;
+                        }
                         if let Some(cond) = self.class_prop_value_change_cond(event) {
+                            let wait = Self::vc_wait_stmt(cond.clone(), body, stmt.span);
+                            let cont = pc.pushed(vec![wait], pc.start + i + 1);
+                            self.park_condition_waiter(pid, cont, &cond);
+                            return;
+                        }
+                        // `@(posedge prop)` / `@(negedge prop)` on a non-signal
+                        // operand (class property or procedural local): an
+                        // edge-sensitive value change, not a signal edge.
+                        if let Some(cond) = self.class_prop_edge_cond(event) {
                             let wait = Self::vc_wait_stmt(cond.clone(), body, stmt.span);
                             let cont = pc.pushed(vec![wait], pc.start + i + 1);
                             self.park_condition_waiter(pid, cont, &cond);
@@ -5027,7 +5287,7 @@ impl Simulator {
                     // the self-unwind path, and the child kept running — a
                     // later `wait fork` then blocked on it forever.
                     if let StatementKind::SeqBlock { name: Some(n), .. } = &s.kind {
-                        self.disable_labels.insert(n.name.clone(), pid_child);
+                        self.register_disable_label(&n.name, pid_child);
                     }
                     self.inherit_fork_child_context(pid_child);
                     self.inherit_fork_m_scope(pid_child, pid, block_name.as_ref());

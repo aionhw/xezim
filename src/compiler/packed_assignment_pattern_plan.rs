@@ -489,7 +489,7 @@ fn int_lit(v: i64) -> Expression {
             signed: true,
             base: NumberBase::Decimal,
             value: v.unsigned_abs().to_string(),
-            cached_val: std::cell::Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     );
@@ -1234,7 +1234,7 @@ fn atom_shape(kind: IntegerAtomType) -> (u32, bool) {
     }
 }
 
-fn ident_expr(id: &crate::ast::Identifier) -> Expression {
+pub(crate) fn ident_expr(id: &crate::ast::Identifier) -> Expression {
     use crate::ast::expr::{HierPathSegment, HierarchicalIdentifier};
     Expression::new(
         ExprKind::Ident(HierarchicalIdentifier {
@@ -1244,8 +1244,9 @@ fn ident_expr(id: &crate::ast::Identifier) -> Expression {
                 selects: Vec::new(),
             }],
             span: id.span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         }),
         id.span,
     )
@@ -1261,6 +1262,7 @@ pub(crate) fn type_ref(name: &str) -> DataType {
                 span,
             },
             span,
+            bound: Default::default(),
         },
         dimensions: Vec::new(),
         type_args: Vec::new(),

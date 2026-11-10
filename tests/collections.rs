@@ -104,6 +104,8 @@ mod queue_local_shadow_restore;
 mod queue_member_init;
 #[path = "collections/queue_ops_and_dist.rs"]
 mod queue_ops_and_dist;
+#[path = "collections/queue_read_past_size.rs"]
+mod queue_read_past_size;
 #[path = "collections/queue_store_element_type.rs"]
 mod queue_store_element_type;
 #[path = "collections/sibling_static_collection_collision.rs"]
@@ -201,6 +203,9 @@ mod next_rest_whole_array_nba_381;
 #[path = "collections/collection_returns_387.rs"]
 mod collection_returns_387;
 
+#[path = "collections/unpacked_row_nonblocking_assign.rs"]
+mod unpacked_row_nonblocking_assign;
+
 #[path = "collections/review_package_collection_aliases.rs"]
 mod review_package_collection_aliases;
 
@@ -259,6 +264,9 @@ mod enclosing_value_parameter_specialization;
 #[path = "collections/lexical_value_parameter_specialization.rs"]
 mod lexical_value_parameter_specialization;
 
+#[path = "collections/parameterized_vif_specialization_cast.rs"]
+mod parameterized_vif_specialization_cast;
+
 #[path = "collections/coll_rows_typed_by_declaration.rs"]
 mod coll_rows_typed_by_declaration;
 
@@ -306,3 +314,49 @@ mod review_real_assoc_store;
 mod reduction_with_struct_field;
 #[path = "collections/struct_return_staging_types.rs"]
 mod struct_return_staging_types;
+
+#[path = "collections/compiled_queue_last_index.rs"]
+mod compiled_queue_last_index;
+#[path = "collections/unpacked_2d_element_width.rs"]
+mod unpacked_2d_element_width;
+#[path = "collections/assoc_pattern_ident_key.rs"]
+mod assoc_pattern_ident_key;
+#[path = "collections/review_940_exists_rows.rs"]
+mod review_940_exists_rows;
+#[path = "collections/review_959_assoc_part_selects.rs"]
+mod review_959_assoc_part_selects;
+#[path = "collections/review_queue_read_past_size_948.rs"]
+mod review_queue_read_past_size_948;
+
+#[path = "collections/dyn_collection_compiled_read.rs"]
+mod dyn_collection_compiled_read;
+#[path = "collections/dyn_collection_compiled_read_live.rs"]
+mod dyn_collection_compiled_read_live;
+#[path = "collections/dyn_row_array_queries.rs"]
+mod dyn_row_array_queries;
+#[path = "collections/dyn_row_sized_new_copy.rs"]
+mod dyn_row_sized_new_copy;
+
+#[path = "collections/assoc_elem_select_read.rs"]
+mod assoc_elem_select_read;
+#[path = "collections/assoc_packed_elem.rs"]
+mod assoc_packed_elem;
+#[path = "collections/unpacked_row_pattern_store.rs"]
+mod unpacked_row_pattern_store;
+#[path = "collections/unpacked_row_pattern_followups.rs"]
+mod unpacked_row_pattern_followups;
+
+#[path = "collections/concat_actual_queue_formal.rs"]
+mod concat_actual_queue_formal;
+
+#[path = "collections/concat_actual_fixed_array_formal.rs"]
+mod concat_actual_fixed_array_formal;
+
+#[path = "collections/unpacked_packed_elem_pattern.rs"]
+mod unpacked_packed_elem_pattern;
+
+#[path = "collections/package_array_operand_in_method.rs"]
+mod package_array_operand_in_method;
+
+#[path = "collections/unpacked_struct_concat_1035.rs"]
+mod unpacked_struct_concat_1035;

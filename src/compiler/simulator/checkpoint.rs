@@ -27,7 +27,7 @@ use serde::ser::{SerializeSeq, Serializer};
 
 /// File magic and format version; bump the last byte with any change to a
 /// state field's type.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x01";
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x04";
 
 #[derive(Default)]
 struct Session {
@@ -955,6 +955,19 @@ impl Simulator {
         self.method_plans.borrow_mut().clear();
         self.fsm_clobber_cache.clear();
         self.class_task_frame_cache.clear();
+        // Serialized callable bodies restore with scope caches disabled.
+        // Rebuild private runtime bodies on their next call (§13.3/§13.4);
+        // static locals and suspended task state live in separate tables.
+        self.fn_decl_cache.clear();
+        self.task_decl_cache.clear();
+        self.class_method_cache.borrow_mut().clear();
+        self.class_prop_struct_cache.borrow_mut().clear();
+        self.class_packed_layout_cache.borrow_mut().clear();
+        self.class_value_param_names.borrow_mut().clear();
+        self.aggregate_type_generation.set(self.type_tables_gen);
+        for count in &self.aggregate_type_work {
+            count.set(0);
+        }
         super::super::interrupt::publish_sim_time(self.time);
         self.checkpoint_restored = true;
         audit::write_digests(self, &format!("{path}.restore"));
@@ -1151,6 +1164,11 @@ checkpoint_state!(
     class_string_props,
     clock_generators,
     clocking_array_leaves,
+    clocking_output_pending,
+    clocking_cycle_pending,
+    clocking_edge_out_pending,
+    clocking_edge_drive_dirty,
+    clocking_prev_clock,
     clocking_hist,
     clocking_hist_slot,
     clocking_last_edge,
@@ -1322,10 +1340,14 @@ checkpoint_state!(
     local_elem_layout,
     local_gen_stack,
     local_iface_aliases,
-    local_meta_owned,
+    local_meta_cache,
+    local_meta_claims,
+    local_meta_origin_ids,
+    local_meta_origins,
     local_meta_owner,
     local_meta_reapplies,
-    local_meta_saved,
+    local_meta_scans,
+    local_meta_swaps,
     local_stack,
     local_type_pool,
     local_type_stack,
@@ -1506,7 +1528,9 @@ checkpoint_state!(
     spec_prop_is_dyn,
     spec_prop_width_cache,
     stall_edge_block_hits,
+    stall_state0,
     stall_iters,
+    stall_pid_state,
     stall_pid_hits,
     stall_time,
     static_block_decls,

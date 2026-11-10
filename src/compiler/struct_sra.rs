@@ -67,8 +67,9 @@ fn ident(name: &str, span: Span) -> Expression {
                 selects: Vec::new(),
             }],
             span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         }),
         span,
     )
@@ -171,8 +172,9 @@ fn split_value(e: &Expression, members: &Members) -> Option<Vec<Expression>> {
                             root: None,
                             path,
                             span: e.span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         e.span,
                     );
@@ -263,7 +265,7 @@ impl Ctx<'_> {
                             signed: true,
                             base: NumberBase::Decimal,
                             value: len.to_string(),
-                            cached_val: std::cell::Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         span,
                     ))
@@ -409,6 +411,7 @@ impl Ctx<'_> {
                                     data_type: mdt.clone(),
                                     lifetime: *lifetime,
                                     declarators: vec![VarDeclarator {
+                                        decl: crate::ast::binding::Bound::UNSET,
                                         name: Identifier {
                                             name: leaf(&d.name.name, m),
                                             span: d.name.span,
@@ -756,6 +759,7 @@ pub(crate) fn scalarize_member_call(
                 data_type: mdt.clone(),
                 lifetime: None,
                 declarators: vec![VarDeclarator {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: Identifier {
                         name: leaf(&fname, m),
                         span: fd.span,
@@ -775,6 +779,6 @@ pub(crate) fn scalarize_member_call(
     out.span = Span::new(fd.span.end, fd.span.end);
     out.return_type = sel_ty;
     out.ports = ports;
-    out.items = items;
+    out.items = items.into();
     Some((out, new_args))
 }

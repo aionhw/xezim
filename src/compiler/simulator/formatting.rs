@@ -115,6 +115,14 @@ impl Simulator {
                 } => {
                     let v = &regs[f.args[ai] as usize];
                     ai += 1;
+                    // §6.12.2: an integral letter prints a real as an integer.
+                    let conv;
+                    let v = if v.is_real && matches!(spec, 'd' | 'b' | 'h' | 'x' | 'o' | 'c') {
+                        conv = Self::real_fmt_int(v);
+                        &conv
+                    } else {
+                        v
+                    };
                     let pad = |out: &mut String, core: String, w: usize, left: bool| {
                         if core.len() >= w {
                             out.push_str(&core);
@@ -1024,8 +1032,23 @@ impl Simulator {
         } else {
             ctx
         };
+        let handle = self.this_stack.last().copied().flatten()?;
+        self.shadowed_prop_key_in(&viewing, handle, name)
+    }
+
+    /// `shadowed_prop_key` of object `handle` seen from class `viewing`
+    /// (a reference's declared class, §8.14), whether or not it is `this`.
+    pub(super) fn shadowed_prop_key_in(
+        &self,
+        viewing: &str,
+        handle: usize,
+        name: &str,
+    ) -> Option<String> {
+        if self.shadowed_prop_names.is_empty() || !self.shadowed_prop_names.contains(name) {
+            return None;
+        }
         // Nearest declarer at or above the viewing class.
-        let mut cur = Some(viewing);
+        let mut cur = Some(viewing.to_string());
         let mut target: Option<String> = None;
         while let Some(cn) = cur {
             let cd = self.module.classes.get(&cn)?;
@@ -1036,8 +1059,7 @@ impl Simulator {
             cur = cd.extends.clone();
         }
         let target = target?;
-        // The leaf-most declarer for the CURRENT object.
-        let handle = self.this_stack.last().copied().flatten()?;
+        // The leaf-most declarer for the object.
         let leaf = self
             .heap
             .get(handle)
@@ -1062,7 +1084,17 @@ impl Simulator {
         // §10.7: every integral store takes the destination's signedness,
         // including stores whose width already matches the declaration.
         if val.is_real {
-            return val.clone();
+            // §6.12.2: a real into an INTEGRAL property rounds to its declared
+            // width (`heap_prop_width` is None for a real, string or handle
+            // property, which keep the value).
+            return match self.heap_prop_width(handle, prop) {
+                Some(w) => {
+                    let mut f = Self::real_to_int(val.to_f64(), w);
+                    f.is_signed = self.class_prop_signed_of(handle, prop);
+                    f
+                }
+                None => val.clone(),
+            };
         }
         let fitted = match self.heap_prop_width(handle, prop) {
             Some(w) => {

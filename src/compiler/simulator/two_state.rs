@@ -4833,6 +4833,7 @@ impl Simulator {
                 Insn::StmtFallback(..)
                     | Insn::EvalExprFallback(..)
                     | Insn::CallFreeFunction(..)
+                    | Insn::LoadDynElem(..)
                     | Insn::NbaAssignArray(..)
                     | Insn::BlockingAssignArray(..)
                     | Insn::NbaAssignArrayRange(..)
@@ -5960,6 +5961,7 @@ impl Simulator {
                             | super::bytecode::Insn::CallFreeFunction(..)
                             | super::bytecode::Insn::CovHit(..)
                             | super::bytecode::Insn::EvalExprFallback(..)
+                            | super::bytecode::Insn::LoadDynElem(..)
                     )
                 })
             });
@@ -5991,6 +5993,7 @@ impl Simulator {
                         | BcInsn::CallFreeFunction(..)
                         | BcInsn::CovHit(..)
                         | BcInsn::EvalExprFallback(..)
+                        | BcInsn::LoadDynElem(..)
                         | BcInsn::BlockingAssign(..)
                         | BcInsn::BlockingAssignRange(..)
                         | BcInsn::BlockingAssignRangeDyn(..)
@@ -6099,7 +6102,7 @@ impl Simulator {
                 for insn in &cb.instructions {
                     let c = match insn {
                         Insn::StmtFallback(..) => 0,
-                        Insn::EvalExprFallback(..) => 0,
+                        Insn::EvalExprFallback(..) | Insn::LoadDynElem(..) => 0,
                         Insn::BlockingAssign(..) => 1,
                         Insn::BlockingAssignRange(..)
                         | Insn::BlockingAssignRangeDyn(..)
@@ -6190,6 +6193,7 @@ impl Simulator {
                             | Insn::CovHit(..)
                             | Insn::EvalExprFallback(..)
                             | Insn::CallFreeFunction(..)
+                            | Insn::LoadDynElem(..)
                             | Insn::BlockingAssign(..)
                             | Insn::BlockingAssignRange(..)
                             | Insn::BlockingAssignRangeDyn(..)

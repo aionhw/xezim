@@ -79,10 +79,12 @@ module tb;
 endmodule
 "#;
 
-fn run(env: &[(&str, &str)]) -> String {
+/// `tag` names this test's source file: the tests run in parallel, and one
+/// reading a file another was still writing saw no module at all.
+fn run(tag: &str, env: &[(&str, &str)]) -> String {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("replicated_clock_edges");
     std::fs::create_dir_all(&dir).unwrap();
-    let sv = dir.join("replicated_clock_edges.sv");
+    let sv = dir.join(format!("{tag}.sv"));
     std::fs::write(&sv, SRC).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
     for (k, v) in env {
@@ -106,7 +108,7 @@ fn t_lines(text: &str) -> Vec<&str> {
 
 #[test]
 fn replicated_gated_clock_bits_keep_edge_counts_and_order() {
-    let o = run(&[]);
+    let o = run("counts", &[]);
     assert_eq!(
         t_lines(&o),
         vec![
@@ -126,7 +128,7 @@ fn replicated_gated_clock_bits_keep_edge_counts_and_order() {
 
 #[test]
 fn replicated_bits_share_one_alias_per_range() {
-    let o = run(&[("XEZIM_DUMP_EDGE_SENS", "1")]);
+    let o = run("alias", &[("XEZIM_DUMP_EDGE_SENS", "1")]);
     for (bit, lo) in [(1, 0), (2, 0), (3, 0), (5, 4), (6, 4), (7, 4)] {
         assert!(
             o.contains(&format!("kclk[{bit}] shares the alias of bit {lo}")),

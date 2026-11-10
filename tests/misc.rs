@@ -13,6 +13,8 @@
 
 #[path = "misc/always_timing_lint_forms.rs"]
 mod always_timing_lint_forms;
+#[path = "misc/cache_scope_regressions.rs"]
+mod cache_scope_regressions;
 #[path = "misc/ansi_net_port_procedural_assign.rs"]
 mod ansi_net_port_procedural_assign;
 #[path = "misc/argument_binding.rs"]
@@ -123,6 +125,8 @@ mod generate_item_restrictions;
 mod generate_loop_genvar;
 #[path = "misc/generate_region_contents.rs"]
 mod generate_region_contents;
+#[path = "misc/generate_scope_param_sized_array.rs"]
+mod generate_scope_param_sized_array;
 #[path = "misc/iface_functions_and_vif_locals.rs"]
 mod iface_functions_and_vif_locals;
 #[path = "misc/ifu_ibuf_casez_dispatch_c910.rs"]
@@ -159,6 +163,8 @@ mod ivtest_tail2_cluster;
 mod ivtest_tail_cluster;
 #[path = "misc/library_flags.rs"]
 mod library_flags;
+#[path = "misc/local_name_geometry_leak_916.rs"]
+mod local_name_geometry_leak_916;
 #[path = "misc/local_shadow_select.rs"]
 mod local_shadow_select;
 #[path = "misc/log_redirect.rs"]
@@ -603,3 +609,15 @@ mod prepared_scope_memory_721;
 
 #[path = "misc/read_before_decl_819.rs"]
 mod read_before_decl_819;
+
+#[path = "misc/nonvhdl_issue_regressions.rs"]
+mod nonvhdl_issue_regressions;
+
+#[path = "misc/import_sized_dimension_895.rs"]
+mod import_sized_dimension_895;
+#[path = "misc/macro_actual_count_888.rs"]
+mod macro_actual_count_888;
+#[path = "misc/typed_localparam_dimension_894.rs"]
+mod typed_localparam_dimension_894;
+#[path = "misc/review_class_param_undeclared_888.rs"]
+mod review_class_param_undeclared_888;

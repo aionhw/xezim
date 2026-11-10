@@ -105,7 +105,7 @@ fn marker(name: &str, id: u64) -> Statement {
             signed: false,
             base: NumberBase::Decimal,
             value: id.to_string(),
-            cached_val: Cell::new(Some((id, 0u64, 64u32))),
+            cached_val: crate::ast::cache::LiteralCache::new(Some((id, 0u64, 64u32))),
         }),
         span,
     );

@@ -819,8 +819,9 @@ impl Simulator {
                     selects: Vec::new(),
                 }],
                 span: crate::ast::Span::dummy(),
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             crate::ast::Span::dummy(),
         );
@@ -854,7 +855,7 @@ impl Simulator {
                 signed: false,
                 base,
                 value: val_str.trim().to_string(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             });
         }
         // Plain decimal integer (optional leading sign).
@@ -866,7 +867,7 @@ impl Simulator {
                 signed: neg,
                 base: NumberBase::Decimal,
                 value: body.to_string(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             });
         }
         None
@@ -1246,9 +1247,9 @@ impl Simulator {
     }
 
     /// Split a virtual-interface type fragment — `virtual [interface]
-    /// I[#(args)][.modport]` in any spacing, including the whitespace-free
-    /// canonical form — into the interface name, its raw `#(...)` arguments
-    /// and the modport. None for anything else.
+    /// I[#(args)][.modport]` in any spacing, including the canonical form —
+    /// into the interface name, its raw `#(...)` arguments and the modport.
+    /// None for anything else, including a class named `virtualI`.
     pub(super) fn parse_vif_frag(
         &self,
         frag: &str,
@@ -1257,6 +1258,9 @@ impl Simulator {
             return None;
         }
         let rest = frag.trim().strip_prefix("virtual")?;
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
         let head_end = rest.find(['#', '.']).unwrap_or(rest.len());
         let head: String = rest[..head_end]
             .chars()
@@ -1306,7 +1310,7 @@ impl Simulator {
         Some((name, args, modport))
     }
 
-    /// The canonical (whitespace-free) key of `virtual name#(args).modport`
+    /// The canonical (`normalize_spec_ws`) key of `virtual name#(args).modport`
     /// (§6.22.1): named arguments moved to their slots and omitted trailing
     /// parameters filled with the interface's defaults, so `virtual I`,
     /// `virtual interface I#(int)` and `virtual I#(.T(int), .N(4))` key one
@@ -1342,7 +1346,7 @@ impl Simulator {
                 args.push(d);
             }
         }
-        let mut out = format!("virtual{}", name);
+        let mut out = format!("virtual {}", name);
         if !args.is_empty() {
             out.push_str("#(");
             out.push_str(&args.join(","));
@@ -1752,7 +1756,11 @@ impl Simulator {
                             .next()
                             .is_none_or(|c| !c.is_alphanumeric() && c != '_')
                     });
-                if integral && signing {
+                // §25.9: `virtual bus_if` is an interface type, while
+                // `virtualbus_if` can name an unrelated class.
+                let vif = word == "virtual"
+                    && tail.starts_with(|c: char| c.is_alphabetic() || c == '_');
+                if (integral && signing) || vif {
                     out.push(' ');
                 }
             } else {
@@ -1977,6 +1985,7 @@ impl Simulator {
                             span: crate::ast::Span::dummy(),
                         },
                         span: crate::ast::Span::dummy(),
+                        bound: Default::default(),
                     },
                     dimensions: Vec::new(),
                     type_args,
@@ -2141,8 +2150,9 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         span,
                     )
@@ -2163,7 +2173,7 @@ impl Simulator {
                         signed: false,
                         base: crate::ast::expr::NumberBase::Decimal,
                         value: v.to_u64()?.to_string(),
-                        cached_val: std::cell::Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 )
@@ -2228,7 +2238,48 @@ impl Simulator {
                         .collect();
                     (frags.len() == ta.len()).then(|| frags.join(","))
                 }
-                _ => Some(String::new()),
+                // An UNSPECIALIZED `new()` (or a `create()` whose receiver
+                // lost its `#(...)` args) of a parameterized class built
+                // while a specialization of the SAME class is active: carry
+                // the active spec's type-argument signature instead of
+                // falling back to the declared DEFAULTS. The factory
+                // `reg_agent#(dut_rw)::type_id::create("bus",..)` resolves
+                // `current_spec=("reg_agent","test.dut_rw")` for the call,
+                // and the registry's body constructs with a bare `new()` —
+                // dropping the args rebuilt `reg_agent#(int)` (the default),
+                // so its member `reg_driver#(DO)` bound `DO` to `int` and
+                // `DO::rw` silently no-op'd. The bare `new` takes the active
+                // specialization of this same class (reconciling scoped
+                // `test.reg_agent` vs bare `reg_agent` spellings behind
+                // `same_class_declaration`).
+                _ => {
+                    let mut inherited: Option<String> = None;
+                    if let Some((cb, cs)) = &self.current_spec {
+                        let same = if *cb == class_name_owned {
+                            true
+                        } else {
+                            (|| {
+                                let cb2 = cb.split('#').next().unwrap_or(cb);
+                                let cn2 = class_name_owned.split('#').next().unwrap_or(&class_name_owned);
+                                if cb2 == cn2 {
+                                    return true;
+                                }
+                                match (self.module.classes.get(cb2), self.module.classes.get(cn2)) {
+                                    (Some(a), Some(b)) => {
+                                        a.name == b.name
+                                            && a.enclosing == b.enclosing
+                                            && a.declaring_module == b.declaring_module
+                                    }
+                                    _ => false,
+                                }
+                            })()
+                        };
+                        if same && !cs.trim().is_empty() {
+                            inherited = Some(cs.clone());
+                        }
+                    }
+                    inherited.or_else(|| Some(String::new()))
+                }
             };
             if let Some(raw_sig) = raw_sig {
                 let sig = self.canonicalize_spec_sig(&class_name_owned, &raw_sig);
@@ -2718,8 +2769,12 @@ impl Simulator {
         // Register per-instance associative-array members under an
         // instance-scoped name `<handle>#<member>` so the existing
         // signal-keyed assoc machinery gives each instance its own map.
+        let mut hidden_collections: HashSet<&str> = HashSet::default();
         for cdef in classes_to_init {
             for (prop, &is_str) in &cdef.assoc_properties {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 self.module
                     .associative_arrays
                     .insert(format!("{}#{}", handle, prop), is_str);
@@ -2727,6 +2782,9 @@ impl Simulator {
             // §8.25: a key sized by a class parameter takes this object's
             // specialization, not the default `assoc_index_props` holds.
             for (prop, kdt) in &cdef.assoc_key_decl_types {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 if let Some(kw) = self.param_sized_key_width(kdt, &instance, &classes_to_init) {
                     let signed = cdef.assoc_index_props.get(prop).is_some_and(|&(_, s)| s);
                     self.module
@@ -2739,6 +2797,9 @@ impl Simulator {
             // package/module array path) so push_back/size/index/foreach resolve
             // to independent storage with size starting at 0.
             for (prop, &(width, max)) in &cdef.queue_properties {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 let scoped = format!("{}#{}", handle, prop);
                 if cdef.property_types.get(prop).is_some_and(|dt| {
                     matches!(
@@ -2767,6 +2828,9 @@ impl Simulator {
             // the instance-scoped name as a real fixed array and default every
             // element to 0 so index reads / foreach see a populated range.
             for (prop, &(lo, hi, width)) in &cdef.array_properties {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 let scoped = format!("{}#{}", handle, prop);
                 // §8.25: sized by a value parameter — this object's size.
                 let (lo, hi) = match cdef
@@ -2808,6 +2872,9 @@ impl Simulator {
             // foreach resolve, and default every element to 0 (a class-handle
             // element's default is null). Oversized shapes stay lazy.
             for (prop, (shape, width)) in &cdef.array_nd_properties {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 let scoped = format!("{}#{}", handle, prop);
                 // §8.25: sized by a value parameter — this object's shape.
                 let own_shape = cdef
@@ -2860,6 +2927,11 @@ impl Simulator {
                         }
                     }
                 }
+            }
+            // The chain is leaf-first: a base declaration cannot change the
+            // shape of a property hidden by the derived class (§8.14).
+            if classes_to_init.len() > 1 {
+                hidden_collections.extend(cdef.properties.keys().map(String::as_str));
             }
         }
         // Record concrete bindings for the leaf class's TYPE parameters
@@ -3106,7 +3178,7 @@ impl Simulator {
                 {
                     let Some(su) = self
                         .class_prop_struct(handle, prop)
-                        .filter(Self::spreads_member_wise)
+                        .filter(|su| Self::spreads_member_wise(su))
                     else {
                         continue;
                     };

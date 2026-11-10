@@ -199,3 +199,153 @@ fn module_timescale_applies_to_v_library_modules() {
         reg
     );
 }
+
+/// #937: a library file supplies modules, not packages. A package the `-v`
+/// file declares (here through an `include`) is not compiled, so the adopted
+/// module's `import` of it is an error at that import, in the library file,
+/// with a note saying where the package was declared. It was an undeclared
+/// name inside the module, reported at a line of the primary file.
+#[test]
+fn v_file_package_is_not_compiled_and_its_import_says_so() {
+    let dir = std::env::temp_dir().join("xezim_libflags_pkg937");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("lib_pkg.h"),
+        "package LIB_PKG;\n  localparam int P_ADD = 4;\nendpackage\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("lib.v"),
+        "`include \"lib_pkg.h\"\n\
+         module child(input wire [3:0] din, output reg [3:0] dout);\n\
+         \x20 import LIB_PKG::*;\n\
+         \x20 always @* dout = din + P_ADD;\n\
+         endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("top.v"),
+        "module top;\n  reg [3:0] din = 1;\n  wire [3:0] dout;\n\
+         \x20 child u(.din(din), .dout(dout));\n\
+         \x20 initial begin #1 $display(\"dout=%0d\", dout); $finish; end\nendmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("top_import.v"),
+        "module top;\n  import LIB_PKG::*;\n\
+         \x20 initial begin $display(\"P=%0d\", P_ADD); $finish; end\nendmodule\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("pkg.sv"), "`include \"lib_pkg.h\"\n").unwrap();
+
+    let out = run(&dir, &["+incdir+.", "-v", "lib.v", "top.v"]);
+    assert!(out.contains("Package 'LIB_PKG' not found"), "got:\n{}", out);
+    assert!(
+        out.contains("lib.v:3:"),
+        "the error names the import:\n{}",
+        out
+    );
+    assert!(
+        out.contains("declared at lib_pkg.h:1:") && out.contains("library file"),
+        "the note names the declaration:\n{}",
+        out
+    );
+    assert!(!out.contains("Undeclared identifier"), "got:\n{}", out);
+    assert!(!out.contains("dout="), "got:\n{}", out);
+
+    // The top module's own import of it gets the same note.
+    let out = run(&dir, &["+incdir+.", "-v", "lib.v", "top_import.v"]);
+    assert!(out.contains("Package 'LIB_PKG' not found"), "got:\n{}", out);
+    assert!(out.contains("declared at lib_pkg.h:1:"), "got:\n{}", out);
+
+    // Compiled as a source file, the package serves the adopted module.
+    let out = run(&dir, &["+incdir+.", "-v", "lib.v", "pkg.sv", "top.v"]);
+    assert!(out.contains("dout=5"), "got:\n{}", out);
+}
+
+/// #937: an error inside a module adopted from a `-v` file names a line of
+/// that file, not of the primary file the byte offset also fits.
+#[test]
+fn v_file_module_error_names_the_library_file() {
+    let dir = std::env::temp_dir().join("xezim_libflags_loc937");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("cells.v"),
+        "// cell library\n\n\
+         module lcell(output reg [3:0] q);\n\
+         \x20 initial q = no_such_name;\n\
+         endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("top.v"),
+        "module top;\n  wire [3:0] q;\n  lcell u(.q(q));\n\
+         \x20 initial begin #1 $display(\"q=%0d\", q); $finish; end\nendmodule\n",
+    )
+    .unwrap();
+    let out = run(&dir, &["-v", "cells.v", "top.v"]);
+    assert!(
+        out.contains("Undeclared identifier 'no_such_name'"),
+        "got:\n{}",
+        out
+    );
+    assert!(out.contains("cells.v:4:"), "got:\n{}", out);
+    assert!(!out.contains("top.v:"), "got:\n{}", out);
+}
+
+/// #937: `--relax-library-packages` compiles the packages a `-v` file
+/// declares, as if the file were also a source file, so an adopted module's
+/// import of one and the top module's import both resolve. A package a source
+/// file declares wins over a library file's of the same name. Without the
+/// switch the import stays an error (see above).
+#[test]
+fn relax_library_packages_compiles_v_file_packages() {
+    let dir = std::env::temp_dir().join("xezim_libflags_relax937");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("lib.v"),
+        "package LIB_PKG;\n  localparam int P_ADD = 4;\n\
+         \x20 class C #(int W = 2); static function int f(); return W * 10; endfunction endclass\n\
+         endpackage\n\
+         module child(input wire [3:0] din, output reg [3:0] dout);\n\
+         \x20 import LIB_PKG::*;\n\
+         \x20 always @* dout = din + P_ADD;\n\
+         endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("top.v"),
+        "module top;\n  reg [3:0] din = 1;\n  wire [3:0] dout;\n\
+         \x20 child u(.din(din), .dout(dout));\n\
+         \x20 initial begin #1 $display(\"dout=%0d f=%0d\", dout, LIB_PKG::C#(3)::f()); \
+         $finish; end\nendmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("own_pkg.sv"),
+        "package LIB_PKG;\n  localparam int P_ADD = 7;\n\
+         \x20 class C #(int W = 2); static function int f(); return W; endfunction endclass\n\
+         endpackage\n",
+    )
+    .unwrap();
+
+    let out = run(&dir, &["--relax-library-packages", "-v", "lib.v", "top.v"]);
+    assert!(out.contains("dout=5 f=30"), "got:\n{}", out);
+    assert!(!out.contains("not found"), "got:\n{}", out);
+
+    let out = run(
+        &dir,
+        &[
+            "--relax-library-packages",
+            "-v",
+            "lib.v",
+            "own_pkg.sv",
+            "top.v",
+        ],
+    );
+    assert!(out.contains("dout=8 f=3"), "got:\n{}", out);
+
+    let out = run(&dir, &["-v", "lib.v", "top.v"]);
+    assert!(out.contains("Package 'LIB_PKG' not found"), "got:\n{}", out);
+    assert!(out.contains("--relax-library-packages"), "got:\n{}", out);
+}

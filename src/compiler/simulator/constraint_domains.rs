@@ -2,15 +2,28 @@
 
 use super::*;
 
+/// Whether the env-gated `class_elem_load` fast-path self-check is active
+/// (`XEZIM_VERIFY_CLASS_ELEM_READS=1`). Computed once (lazily) so the hot
+/// element read path does not re-read the environment per element.
+static XZ_VERIFY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("XEZIM_VERIFY_CLASS_ELEM_READS").as_deref() == Ok("1")
+});
+
 impl Simulator {
     /// `v` sized and signed for the static cell `key` (an initializer or a
     /// store is an assignment to it, §10.7; an unsized fill takes the
     /// cell's width, §5.7.1).
     pub(super) fn fit_static_cell(&self, key: &str, prop: &str, v: Value) -> Value {
-        if v.is_real {
-            return v;
-        }
         match self.static_cell_width(key, prop) {
+            // §6.12.2: a real into an integral static rounds to its width; a
+            // real (or string, handle, collection) cell has no width here
+            // and keeps the value.
+            Some((w, signed)) if v.is_real => {
+                let mut out = Self::real_to_int(v.to_f64(), w);
+                out.is_signed = signed;
+                out
+            }
+            _ if v.is_real => v,
             Some((w, signed)) => {
                 let mut out = if w != v.width {
                     v.resize_for_assign(w)
@@ -701,6 +714,16 @@ impl Simulator {
         // Only genuine `static` members — param_defaults (class localparams)
         // also satisfy static_prop_key but are constants — and only when no
         // nearer instance property hides it.
+        // §8.14/§6.20: nor when the nearest declaration is a constant: no
+        // write can target a localparam, so a write by name to an object
+        // whose class shadows its instance property with one (a constraint
+        // solution, a member write through a base-typed reference) is the
+        // instance property's (`rand_var_key`).
+        let key = self.rand_var_key(handle, name);
+        if key != name {
+            let key = key.into_owned();
+            return self.set_instance_prop_if_changed(handle, &key, val);
+        }
         let static_of = match self.heap.get(handle) {
             Some(Some(inst)) if self.member_is_static_prop(&inst.class_name, name) => {
                 Some((inst.class_name.clone(), inst.spec.clone()))
@@ -716,6 +739,12 @@ impl Simulator {
                 return changed;
             }
         }
+        self.store_instance_prop(handle, name, val)
+    }
+
+    /// Store `val`, already fitted, in the object's OWN instance property
+    /// `name`; true when the value changed.
+    fn store_instance_prop(&mut self, handle: usize, name: &str, val: Value) -> bool {
         if let Some(Some(inst)) = self.heap.get_mut(handle) {
             if inst.properties.get(name).is_none_or(|cur| *cur != val) {
                 inst.properties.insert(name.to_string(), val);
@@ -723,6 +752,18 @@ impl Simulator {
             }
         }
         false
+    }
+
+    /// `set_prop_if_changed` for a reference that resolves to the instance
+    /// property (§8.14): no same-named static of the object's class applies.
+    pub(super) fn set_instance_prop_if_changed(
+        &mut self,
+        handle: usize,
+        name: &str,
+        val: Value,
+    ) -> bool {
+        let val = self.fit_class_prop(handle, name, &val);
+        self.store_instance_prop(handle, name, val)
     }
 
     // ---------------------------------------------------------------------
@@ -814,7 +855,8 @@ impl Simulator {
                 | BinaryOp::Mod
                 | BinaryOp::BitAnd
                 | BinaryOp::BitOr
-                | BinaryOp::BitXor => {
+                | BinaryOp::BitXor
+                | BinaryOp::BitXnor => {
                     let (lw, ls) = self.exact_leaves(left, out)?;
                     let (rw, rs) = self.exact_leaves(right, out)?;
                     let w = lw.max(rw).max(1);
@@ -932,6 +974,7 @@ impl Simulator {
                     BinaryOp::BitAnd => (Self::bits_at(l, w) & Self::bits_at(r, w)) as i128,
                     BinaryOp::BitOr => (Self::bits_at(l, w) | Self::bits_at(r, w)) as i128,
                     BinaryOp::BitXor => (Self::bits_at(l, w) ^ Self::bits_at(r, w)) as i128,
+                    BinaryOp::BitXnor => Self::bits_at(!(l ^ r), w) as i128,
                     _ => return None,
                 })
             }
@@ -1046,21 +1089,83 @@ impl Simulator {
         struct Bound<'a> {
             expr: Option<&'a Expression>,
             leaves: Vec<(u64, u32, bool)>,
-            raw: u64,
+            raw: i128,
             width: u32,
             signed: bool,
             dollar: bool,
         }
-        fn bound<'a>(me: &mut Simulator, e: &'a Expression) -> Option<Bound<'a>> {
+        /// Which end of an `inside` set a bound is, for a real-valued one.
+        #[derive(Clone, Copy, PartialEq)]
+        enum End {
+            Lo,
+            Hi,
+            /// A single `inside {v}` element: the value has to land on an
+            /// integer for any integer operand to equal it.
+            Value,
+        }
+        /// §11.4.13 — a bound built only from real/time literals, which
+        /// `exact_leaves` cannot read. Restricting the fallback to these
+        /// keeps `eval_expr` from running a bound expression that has already
+        /// been (partly) evaluated on the exact path a second time, which
+        /// would repeat a side effect in a function-call bound.
+        fn real_constant(e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::Number(NumberLiteral::Real(_) | NumberLiteral::Time(_)) => true,
+                ExprKind::Paren(inner) => real_constant(inner),
+                ExprKind::Unary {
+                    op: UnaryOp::Plus | UnaryOp::Minus,
+                    operand,
+                } => real_constant(operand),
+                ExprKind::Binary {
+                    op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
+                    left,
+                    right,
+                } => real_constant(left) && real_constant(right),
+                _ => false,
+            }
+        }
+        fn bound<'a>(me: &mut Simulator, e: &'a Expression, end: End) -> Option<Bound<'a>> {
             let mut leaves = Vec::new();
-            let (width, signed) = me.exact_leaves(e, &mut leaves)?;
+            if let Some((width, signed)) = me.exact_leaves(e, &mut leaves) {
+                return Some(Bound {
+                    expr: Some(e),
+                    leaves,
+                    raw: 0,
+                    width,
+                    signed,
+                    dollar: matches!(e.kind, ExprKind::Dollar),
+                });
+            }
+            // §11.4.13 — a real-valued bound. A time literal such as `2000ns`
+            // folds to a real in the current time unit, and an integer
+            // operand is promoted to real for the comparison, so the integer
+            // set is ceil(lo)..floor(hi). Dropping the range instead left
+            // `int x; x inside {[0:2000ns]}` an empty domain, and every
+            // randomize() trial was rejected.
+            if !real_constant(e) {
+                return None;
+            }
+            let v = me.eval_expr(e);
+            if !v.is_real {
+                return None;
+            }
+            let f = v.to_f64();
+            if !f.is_finite() {
+                return None;
+            }
+            let r = match end {
+                End::Lo => f.ceil(),
+                End::Hi => f.floor(),
+                End::Value if f.fract() == 0.0 => f,
+                End::Value => return None,
+            };
             Some(Bound {
-                expr: Some(e),
-                leaves,
-                raw: 0,
-                width,
-                signed,
-                dollar: matches!(e.kind, ExprKind::Dollar),
+                expr: None,
+                leaves: Vec::new(),
+                raw: r as i128,
+                width: 64,
+                signed: true,
+                dollar: false,
             })
         }
         let mut bounds: Vec<(Bound<'_>, Option<Bound<'_>>)> = Vec::new();
@@ -1087,7 +1192,7 @@ impl Simulator {
                                 let b = Bound {
                                     expr: None,
                                     leaves: Vec::new(),
-                                    raw,
+                                    raw: raw as i128,
                                     width: ev.width,
                                     signed: ev.is_signed,
                                     dollar: false,
@@ -1098,7 +1203,7 @@ impl Simulator {
                         }
                         continue;
                     }
-                    if let Some(b) = bound(self, e) {
+                    if let Some(b) = bound(self, e, End::Value) {
                         note(&mut ws, &b);
                         bounds.push((b, None));
                     } else {
@@ -1106,7 +1211,8 @@ impl Simulator {
                     }
                 }
                 ConstraintRange::Range { lo, hi } => {
-                    let (Some(l), Some(h)) = (bound(self, lo), bound(self, hi)) else {
+                    let (Some(l), Some(h)) = (bound(self, lo, End::Lo), bound(self, hi, End::Hi))
+                    else {
                         ws = None;
                         continue;
                     };
@@ -1126,7 +1232,7 @@ impl Simulator {
             let v = if let Some(e) = b.expr {
                 me.exact_fold(e, &b.leaves, &mut 0, w, s)?
             } else {
-                Self::as_ctx(b.raw as i128, b.width, s)
+                Self::as_ctx(b.raw, b.width, s)
             };
             Some(if b.dollar || w == 0 || w > 64 {
                 v
@@ -1780,6 +1886,149 @@ impl Simulator {
         false
     }
 
+    /// §18.5.12, §11.8.2: `solve_bijective_eq` for the rand scalar properties
+    /// of `left == right`, in source order; the first one solved is written.
+    pub(super) fn solve_bijective_eq_prop(
+        &mut self,
+        handle: usize,
+        left: &Expression,
+        right: &Expression,
+        rand_set: &HashSet<String>,
+    ) -> bool {
+        if self.is_rand_dyn_size_expr(handle, left) || self.is_rand_dyn_size_expr(handle, right) {
+            return false;
+        }
+        let mut cands = self.affine_candidates(left, rand_set);
+        for c in self.affine_candidates(right, rand_set) {
+            if !cands.contains(&c) {
+                cands.push(c);
+            }
+        }
+        for name in cands {
+            let is_var = |e: &Expression| {
+                matches!(&e.kind, ExprKind::Ident(h)
+                    if h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && h.path[0].name.name == name)
+            };
+            if let Some(val) = self.solve_bijective_eq(left, right, &is_var) {
+                return self.set_prop_if_changed(handle, &name, val);
+            }
+        }
+        false
+    }
+
+    /// §18.5.12: solve `left == right` exactly for the one operand `is_var`
+    /// names when it occurs once, under operators that are bijections at the
+    /// comparison's context width (§11.8.2): `^`, `~^`, `~`, `+`, `-` and
+    /// unary `+`/`-`. Every other operand keeps its current value. The other
+    /// side's value is undone operator by operator down to the variable,
+    /// which then has to give that value again when extended to the context
+    /// width. Returns the variable's value, or None when the shape does not
+    /// apply or the equality has no solution. `solve_affine_eq` probes three
+    /// points, which a `^` only fits by chance (`x ^ 'hf`, not `x ^ 'hf0`).
+    pub(super) fn solve_bijective_eq(
+        &mut self,
+        left: &Expression,
+        right: &Expression,
+        is_var: &dyn Fn(&Expression) -> bool,
+    ) -> Option<Value> {
+        let mut uses = 0usize;
+        let mut on_left = false;
+        let mut fill = false;
+        for (k, side) in [left, right].into_iter().enumerate() {
+            Self::walk_operands(side, &mut |x| {
+                if is_var(x) {
+                    uses += 1;
+                    on_left |= k == 0;
+                }
+                // §5.7.1: `'1` fills its context, which the exact leaves
+                // cannot express (see `exact_cmp`).
+                fill |= matches!(
+                    x.kind,
+                    ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(_))
+                );
+            });
+        }
+        if uses != 1 || fill {
+            return None;
+        }
+        let (var_side, other) = if on_left {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        let (mut vl, mut ol) = (Vec::new(), Vec::new());
+        let (vw, vs) = self.exact_leaves(var_side, &mut vl)?;
+        let (ow, os) = self.exact_leaves(other, &mut ol)?;
+        let w = vw.max(ow).max(1);
+        if w > 64 {
+            return None;
+        }
+        let s = vs && os;
+        let mut want = self.exact_fold(other, &ol, &mut 0, w, s)?;
+        let mut e = var_side;
+        while !is_var(e) {
+            match &e.kind {
+                ExprKind::Paren(inner)
+                | ExprKind::Unary {
+                    op: UnaryOp::Plus,
+                    operand: inner,
+                } => e = inner,
+                ExprKind::Unary {
+                    op: UnaryOp::Minus,
+                    operand,
+                } => {
+                    want = -want;
+                    e = operand;
+                }
+                ExprKind::Unary {
+                    op: UnaryOp::BitNot,
+                    operand,
+                } => {
+                    want = !want;
+                    e = operand;
+                }
+                ExprKind::Binary {
+                    op: op @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::BitXor | BinaryOp::BitXnor),
+                    left: a,
+                    right: b,
+                } => {
+                    let mut in_a = false;
+                    Self::walk_operands(a, &mut |x| in_a |= is_var(x));
+                    let (inner, known) = if in_a { (a, b) } else { (b, a) };
+                    let mut kl = Vec::new();
+                    self.exact_leaves(known, &mut kl)?;
+                    let c = self.exact_fold(known, &kl, &mut 0, w, s)?;
+                    // Each operator is undone mod 2^w, so the values stay in
+                    // w bits and never overflow.
+                    let (want_w, c) = (Self::bits_at(want, w) as i128, Self::bits_at(c, w) as i128);
+                    want = match op {
+                        BinaryOp::Add => want_w - c,
+                        BinaryOp::Sub if in_a => want_w + c,
+                        BinaryOp::Sub => c - want_w,
+                        BinaryOp::BitXor => want_w ^ c,
+                        _ => !(want_w ^ c),
+                    };
+                    e = inner;
+                }
+                _ => return None,
+            }
+            want = Self::bits_at(want, w) as i128;
+        }
+        let cur = self.eval_expr(e);
+        if cur.is_real || cur.width == 0 || cur.width > w {
+            return None;
+        }
+        let bits = Self::bits_at(want, cur.width);
+        if Self::bits_at(Self::as_ctx(bits as i128, cur.width, s), w) != Self::bits_at(want, w) {
+            return None;
+        }
+        let mut val = Value::from_u64(bits as u64, cur.width);
+        val.is_signed = cur.is_signed;
+        Some(val)
+    }
+
     /// §18.5 — force a relational constraint (`x > K`, `K <= x`) whose rand
     /// side currently violates it. The target is re-picked uniformly from the
     /// interval the relation implies, intersected with its declared `inside`
@@ -2127,6 +2376,87 @@ impl Simulator {
         None
     }
 
+    pub(super) fn body_has_bare_inside(item: &ConstraintItem, arr_name: &str) -> bool {
+        match item {
+            ConstraintItem::Block(items) => items
+                .iter()
+                .any(|i| Self::body_has_bare_inside(i, arr_name)),
+            ConstraintItem::Soft(inner) => Self::body_has_bare_inside(inner, arr_name),
+            ConstraintItem::IfElse {
+                then_item,
+                else_item,
+                ..
+            } => {
+                Self::body_has_bare_inside(then_item, arr_name)
+                    || else_item
+                        .as_ref()
+                        .is_some_and(|i| Self::body_has_bare_inside(i, arr_name))
+            }
+            ConstraintItem::Implication { constraint, .. } => {
+                Self::body_has_bare_inside(constraint, arr_name)
+            }
+            ConstraintItem::Inside { expr, is_dist, .. } => {
+                !*is_dist && Self::index_chain_root_is(expr, arr_name)
+            }
+            ConstraintItem::Expr(e) => {
+                if let ExprKind::Inside { expr, .. } = &e.kind {
+                    Self::index_chain_root_is(expr, arr_name)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn all_dist_weights_positive(
+        weights: &[Option<crate::ast::decl::DistWeight>],
+    ) -> bool {
+        weights.iter().all(|w| match w {
+            Some(crate::ast::decl::DistWeight::Each(e))
+            | Some(crate::ast::decl::DistWeight::Total(e)) => match &e.kind {
+                ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+                    value.parse::<i64>().map(|v| v > 0).unwrap_or(false)
+                }
+                _ => false,
+            },
+            None => true,
+        })
+    }
+
+    pub(super) fn body_needs_generate_and_test(item: &ConstraintItem) -> bool {
+        match item {
+            ConstraintItem::Block(items) => items.iter().any(Self::body_needs_generate_and_test),
+            ConstraintItem::IfElse {
+                then_item,
+                else_item,
+                ..
+            } => {
+                Self::body_needs_generate_and_test(then_item)
+                    || else_item
+                        .as_ref()
+                        .is_some_and(|i| Self::body_needs_generate_and_test(i))
+            }
+            ConstraintItem::Implication { constraint, .. } => {
+                Self::body_needs_generate_and_test(constraint)
+            }
+            ConstraintItem::Soft(inner) => Self::body_needs_generate_and_test(inner),
+            ConstraintItem::Inside { .. } => false,
+            ConstraintItem::Expr(e) => match &e.kind {
+                ExprKind::Inside { .. } => false,
+                ExprKind::Binary {
+                    op: BinaryOp::Eq, ..
+                } => false,
+                ExprKind::Paren(inner) => {
+                    let it = ConstraintItem::Expr((**inner).clone());
+                    Self::body_needs_generate_and_test(&it)
+                }
+                _ => true,
+            },
+            _ => true,
+        }
+    }
+
     pub(super) fn solve_forced(
         &mut self,
         handle: usize,
@@ -2227,6 +2557,13 @@ impl Simulator {
                     // the satisfaction judge uses — do not churn.
                     if self.exact_cmp(&BinaryOp::Eq, left, right) == Some(true) {
                         return false;
+                    }
+                    for arr in rand_set {
+                        if let Some(changed) =
+                            self.solve_forced_array_elem_member(handle, item, rand_set, arr, "*")
+                        {
+                            return changed;
+                        }
                     }
                     if let Some(v) = self.rand_lvalue_name(left, rand_set) {
                         if self.rand_lvalue_name(right, rand_set).is_none() {
@@ -2338,8 +2675,10 @@ impl Simulator {
                     // §18.5.12 — neither side is a bare rand target: the
                     // equality is ALGEBRAIC (`int_val + $signed({1'b0, l_val})
                     // == 32'd50`, `(r_val - 8'd10) * (l_val + 8'd5) == 16'd0`).
-                    // Solve it as an affine equation in one rand variable.
+                    // Solve it as an affine equation in one rand variable,
+                    // else exactly through `^`, `~^` and `~` as well.
                     self.solve_affine_eq(handle, left, right, rand_set)
+                        || self.solve_bijective_eq_prop(handle, left, right, rand_set)
                 }
                 // `a != b` (the desugared form of `unique {…}`, §18.5.5, and
                 // plain inequality constraints): when the two sides are
@@ -2716,6 +3055,7 @@ impl Simulator {
                 let Some((dims, elem_w)) = self
                     .fixed_foreach_dims(handle, &arr_name)
                     .or_else(|| self.packed_prop_foreach_dims(handle, &arr_name))
+                    .or_else(|| self.dynamic_prop_foreach_dims(handle, &arr_name))
                 else {
                     // §18.5.8.1: a loop over a state vector (`bit [0:3]
                     // it;`) only supplies indices: solve the body once per
@@ -2787,44 +3127,63 @@ impl Simulator {
                         }
                     }
                 }
-                loop {
-                    // Bind every index and address the element by its full
-                    // index path — `arr[i][j]`, not just the first dimension.
+                let single_var = idx_names.len() == 1;
+                let var0 = &idx_names[0];
+                if single_var {
                     let mut frame: HashMap<String, Value> = HashMap::default();
-                    let mut suffix = String::new();
-                    for (k, nm) in idx_names.iter().enumerate() {
-                        frame.insert(nm.clone(), Self::signed_loop_val(idx[k]));
-                        suffix.push_str(&format!("[{}]", idx[k]));
-                    }
+                    frame.insert(var0.clone(), Self::signed_loop_val(idx[0]));
                     self.push_local_frame(frame);
-                    let mut elem_rand_set = rand_set.clone();
-                    elem_rand_set.insert(format!("{}{}", arr_name, suffix));
-                    let mut hint: Vec<(i64, i64)> = Vec::new();
-                    self.body_inside_ranges(body, &arr_name, &mut hint);
-                    self.elem_inside_hint = hint;
+                }
+                let has_bare_inside = Self::body_has_bare_inside(body, &arr_name);
+                let has_modulo = Self::body_has_modulo(body);
+                loop {
+                    let mut suffix = String::new();
+                    if single_var {
+                        if let Some(top) = self.local_stack.last_mut() {
+                            if let Some(slot) = top.get_mut(var0) {
+                                *slot = Self::signed_loop_val(idx[0]);
+                            }
+                        }
+                        suffix.push('[');
+                        Self::push_i64(&mut suffix, idx[0]);
+                        suffix.push(']');
+                    } else {
+                        let mut frame: HashMap<String, Value> = HashMap::default();
+                        for (k, nm) in idx_names.iter().enumerate() {
+                            frame.insert(nm.clone(), Self::signed_loop_val(idx[k]));
+                            suffix.push_str(&format!("[{}]", idx[k]));
+                        }
+                        self.push_local_frame(frame);
+                    }
+
+                    if has_bare_inside {
+                        let mut hint: Vec<(i64, i64)> = Vec::new();
+                        self.body_inside_ranges(body, &arr_name, &mut hint);
+                        self.elem_inside_hint = hint;
+                    }
+                    if has_modulo {
+                        let mut bounds = Vec::new();
+                        self.body_rel_bounds(body, &arr_name, &suffix, &mut bounds);
+                        self.elem_rel_bound = bounds;
+                    }
+
                     if self.solve_forced_array_elem(
                         handle,
                         body.as_ref(),
-                        &elem_rand_set,
+                        rand_set,
                         &arr_name,
                         &suffix,
                     ) {
                         changed = true;
                     }
-                    // Structural repair covers equality/relational/inside
-                    // shapes. Anything else the body demands of THIS element
-                    // (`% 2 == 0`, bit tests, …) falls to generate-and-test —
-                    // drawn from the body's own `inside` ranges, since a
-                    // full-width draw would virtually never land in a narrow
-                    // one. Cross-element couplings that no local draw can fix
-                    // are left to the trial checker, which retries or fails
-                    // the randomize() (§18.6.2).
-                    if idx_names.len() == dims.len()
+
+                    let needs_fallback = idx_names.len() == dims.len()
                         && elem_w >= 1
                         && elem_w <= 64
                         && !Self::constraint_unmodeled(body)
-                        && !self.item_holds(handle, body)
-                    {
+                        && Self::body_needs_generate_and_test(body)
+                        && !self.item_holds(handle, body);
+                    if needs_fallback {
                         use rand::Rng;
                         let mut ranges: Vec<(i64, i64)> = Vec::new();
                         self.body_inside_ranges(body, &arr_name, &mut ranges);
@@ -2882,10 +3241,16 @@ impl Simulator {
                         }
                     }
                     self.elem_inside_hint.clear();
-                    self.pop_local_frame();
+                    self.elem_rel_bound.clear();
+                    if !single_var {
+                        self.pop_local_frame();
+                    }
                     let mut k = used.len();
                     loop {
                         if k == 0 {
+                            if single_var {
+                                self.pop_local_frame();
+                            }
                             return changed;
                         }
                         k -= 1;
@@ -3059,7 +3424,9 @@ impl Simulator {
         // `arr[i]`, so these fell through to the generate-and-test fallback,
         // which draws the WHOLE element uniformly and can never hit a narrow
         // member range — randomize() failed. Repair the member slice directly.
-        if let Some(changed) = self.solve_forced_array_elem_member(handle, item, arr_name, idx) {
+        if let Some(changed) =
+            self.solve_forced_array_elem_member(handle, item, rand_set, arr_name, idx)
+        {
             return changed;
         }
         // Handle `arr[i] inside { lo:hi }` directly so the range is
@@ -3174,6 +3541,22 @@ impl Simulator {
                 // caller's local frame, so index and bound expressions
                 // evaluate with the concrete `i`.
                 ExprKind::Binary { op, left, right } => {
+                    // §18.5.7 modulo equality over THIS element —
+                    // `(arr[i] % k) == r` (or the mirrored `r == (arr[i] %
+                    // k)`): a structural shape of its own, repaired by
+                    // drawing the element from the congruence class the
+                    // body admits (see `solve_forced_array_elem_modulo`).
+                    // Any other binary shape falls through to the
+                    // equality/relational repair below.
+                    if matches!(op, BinaryOp::Eq) {
+                        for (mod_side, rem_side) in [(left, right), (right, left)] {
+                            if let Some(changed) = self.solve_forced_array_elem_modulo(
+                                handle, mod_side, rem_side, arr_name, idx,
+                            ) {
+                                return changed;
+                            }
+                        }
+                    }
                     // Element ref: `arr[<index-expr that evals to idx>]`.
                     // The full index PATH of an element ref rooted at `arr`,
                     // matching the `[i]`/`[i][j]` suffix the caller iterates.
@@ -3360,6 +3743,504 @@ impl Simulator {
         }
     }
 
+    /// The full index PATH (`[i]`, `[i][j]`, …) of an element reference
+    /// rooted at the bare name `arr`, with each index expression evaluated
+    /// in the current frame — the same suffix computation the equality /
+    /// relational arm of `solve_forced_array_elem` performs inline.
+    pub(super) fn elem_index_suffix(&mut self, e: &Expression, arr_name: &str) -> Option<String> {
+        let ExprKind::Index { expr: b, index } = &e.kind else {
+            return None;
+        };
+        let here = format!("[{}]", self.eval_expr(index).to_i64()?);
+        match &b.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == arr_name => {
+                Some(here)
+            }
+            _ => self
+                .elem_index_suffix(b, arr_name)
+                .map(|outer| outer + &here),
+        }
+    }
+
+    /// True when any index chain inside `e` addresses element `idx` of
+    /// `arr_name` (index expressions evaluated in the current frame).
+    pub(super) fn expr_mentions_elem(&mut self, e: &Expression, arr_name: &str, idx: &str) -> bool {
+        let mut index_nodes: Vec<Expression> = Vec::new();
+        crate::type_lint::visit_expr(e, &mut |x| {
+            if matches!(x.kind, ExprKind::Index { .. }) {
+                index_nodes.push(x.clone());
+            }
+        });
+        index_nodes
+            .iter()
+            .any(|n| self.elem_index_suffix(n, arr_name).as_deref() == Some(idx))
+    }
+
+    /// §18.5.8.1: does a foreach body hold a `%` anywhere in an expression?
+    pub(super) fn body_has_modulo(item: &ConstraintItem) -> bool {
+        match item {
+            ConstraintItem::Block(items) => items.iter().any(Self::body_has_modulo),
+            ConstraintItem::Expr(e) => {
+                let mut hit = false;
+                crate::type_lint::visit_expr(e, &mut |x| {
+                    hit |= matches!(
+                        x.kind,
+                        ExprKind::Binary {
+                            op: BinaryOp::Mod,
+                            ..
+                        }
+                    );
+                });
+                hit
+            }
+            _ => false,
+        }
+    }
+
+    /// §18.5.8.1: the hard `<` / `<=` / `>` / `>=` constraints of a foreach
+    /// body on element `idx` of `arr_name` (`arr[i] < K`, `K >= arr[i]`),
+    /// each normalized to `arr[i] OP bound` with the bound evaluated.
+    pub(super) fn body_rel_bounds(
+        &mut self,
+        item: &ConstraintItem,
+        arr_name: &str,
+        idx: &str,
+        out: &mut Vec<(BinaryOp, Value)>,
+    ) {
+        match item {
+            ConstraintItem::Block(items) => {
+                for it in items {
+                    self.body_rel_bounds(it, arr_name, idx, out);
+                }
+            }
+            ConstraintItem::Expr(e) => {
+                let mut e = e;
+                while let ExprKind::Paren(inner) = &e.kind {
+                    e = inner;
+                }
+                let ExprKind::Binary { op, left, right } = &e.kind else {
+                    return;
+                };
+                let mirrored = match op {
+                    BinaryOp::Lt => BinaryOp::Gt,
+                    BinaryOp::Leq => BinaryOp::Geq,
+                    BinaryOp::Gt => BinaryOp::Lt,
+                    BinaryOp::Geq => BinaryOp::Leq,
+                    _ => return,
+                };
+                let unparen = |mut x: &Expression| {
+                    while let ExprKind::Paren(inner) = &x.kind {
+                        x = inner;
+                    }
+                    x.clone()
+                };
+                let (l, r) = (unparen(left), unparen(right));
+                let on_l = self.elem_index_suffix(&l, arr_name).as_deref() == Some(idx);
+                let on_r = self.elem_index_suffix(&r, arr_name).as_deref() == Some(idx);
+                let (bound, eff) = match (on_l, on_r) {
+                    (true, false) => (&r, *op),
+                    (false, true) => (&l, mirrored),
+                    _ => return,
+                };
+                if self.expr_mentions_elem(bound, arr_name, idx) {
+                    return;
+                }
+                out.push((eff, self.eval_expr(bound)));
+            }
+            _ => {}
+        }
+    }
+
+    /// The value range `elem_rel_bound` admits for an element of the given
+    /// signedness. A bound is used only where the comparison orders values
+    /// as written (§11.8.1): both operands signed, or an unsigned element
+    /// against a non-negative bound.
+    fn elem_rel_range(&self, elem_signed: bool) -> Option<(i128, i128)> {
+        if self.elem_rel_bound.is_empty() {
+            return None;
+        }
+        let (mut lo, mut hi) = (i128::MIN, i128::MAX);
+        for (op, v) in &self.elem_rel_bound {
+            if v.has_xz() || v.width > 64 {
+                continue;
+            }
+            let b = if v.is_signed {
+                match v.to_i64() {
+                    Some(b) if elem_signed || b >= 0 => i128::from(b),
+                    _ => continue,
+                }
+            } else if elem_signed {
+                continue;
+            } else {
+                match v.to_u64() {
+                    Some(b) => i128::from(b),
+                    None => continue,
+                }
+            };
+            match op {
+                BinaryOp::Lt => hi = hi.min(b - 1),
+                BinaryOp::Leq => hi = hi.min(b),
+                BinaryOp::Gt => lo = lo.max(b + 1),
+                BinaryOp::Geq => lo = lo.max(b),
+                _ => {}
+            }
+        }
+        Some((lo, hi))
+    }
+
+    /// §18.5.7 structural repair for a modulo equality over ONE fixed-array
+    /// element inside a foreach body: `(arr[i] % k) == r`, in either
+    /// operand order (the caller tries both). `mod_side` is the candidate
+    /// `%` expression, `rem_side` the candidate remainder expression.
+    ///
+    /// Returns `Some(changed)` only when the repair is CONFIRMED by the
+    /// ordinary evaluator: either the body already holds for the current
+    /// element, or a drawn candidate was written and re-evaluated equal.
+    /// Every other outcome — the shape does not match, or the arithmetic
+    /// model below cannot produce a confirmed candidate — returns `None`
+    /// (or restores the saved value and returns `None`), so the caller
+    /// falls through to the pre-existing shapes and the generate-and-test
+    /// backstop exactly as if this repair did not exist. The strict final
+    /// check (`check_fixed_foreach_item`) is never weakened or bypassed.
+    ///
+    /// The draw models the `%` in one of two regimes (§11.8.1: the
+    /// operation is unsigned when ANY of its operands is unsigned):
+    /// * signed regime (element, modulus and remainder all signed):
+    ///   truncated-remainder classes in i128 — for `r == 0` the multiples
+    ///   of `|k|`; for `r != 0` the class `v ≡ r (mod |k|)` restricted to
+    ///   `sign(v) == sign(r)`, since the truncated remainder takes the
+    ///   dividend's sign (§11.4.4).
+    /// * unsigned regime: the admitted BIT PATTERNS `u` in the element's
+    ///   domain with `u % k_u == r_u`, where `k_u` / `r_u` are the
+    ///   operands' bit patterns at the operation width.
+    /// In both regimes the candidate set is intersected with the body's
+    /// `inside` hint ranges when present, and a candidate is kept only
+    /// when the evaluator confirms it — so any width/signedness corner
+    /// the model still misses degrades to the old behaviour, never to a
+    /// wrong value. Elements wider than 64 bits are served only in as
+    /// much as their low-word candidates verify; the model works in
+    /// i128 over the i64-representable part of the domain (the same
+    /// reach as the relational repair arm). An element with no stored
+    /// value yet steps aside entirely: its declared width is not
+    /// guessed.
+    pub(super) fn solve_forced_array_elem_modulo(
+        &mut self,
+        handle: usize,
+        mod_side: &Expression,
+        rem_side: &Expression,
+        arr_name: &str,
+        idx: &str,
+    ) -> Option<bool> {
+        // The source spelling parenthesises the modulo sub-expression
+        // (`(arr[i] % k) == r`), and the parser keeps the `Paren` node —
+        // unwrap it (and a parenthesised element ref) before matching.
+        let mut mod_side = mod_side;
+        while let ExprKind::Paren(inner) = &mod_side.kind {
+            mod_side = inner;
+        }
+        let ExprKind::Binary {
+            op: BinaryOp::Mod,
+            left: elem_expr,
+            right: k_expr,
+        } = &mod_side.kind
+        else {
+            return None;
+        };
+        let mut elem_expr = elem_expr.as_ref();
+        while let ExprKind::Paren(inner) = &elem_expr.kind {
+            elem_expr = inner;
+        }
+        if self.elem_index_suffix(elem_expr, arr_name).as_deref() != Some(idx) {
+            return None;
+        }
+        // The modulus and the remainder must not read this same element:
+        // its value is what is being drawn, so a self-referential shape
+        // is not a per-element draw at all (leave it to the trial loop).
+        if self.expr_mentions_elem(k_expr, arr_name, idx)
+            || self.expr_mentions_elem(rem_side, arr_name, idx)
+        {
+            return None;
+        }
+        // Already satisfied? Ask the evaluator, not an arithmetic model:
+        // it is the same judgment the final check will make, at the
+        // operation's own width and signedness.
+        let satisfied = self.exact_cmp(&BinaryOp::Eq, mod_side, rem_side) == Some(true);
+        if satisfied && self.elem_rel_bound.is_empty() {
+            return Some(false);
+        }
+        let k_val = self.eval_expr(k_expr);
+        let r_val = self.eval_expr(rem_side);
+        let elem_name = format!("{}{}", arr_name, idx);
+        // Without a stored element value this repair cannot know the
+        // element's declared width/signedness for sure (the sibling
+        // arms guess 32 bits) — step aside to them and to
+        // generate-and-test instead of drawing at a guessed width.
+        // (In practice elements are populated before repairs run.)
+        let Some(cur) = self
+            .get_signal_value_by_name(&elem_name)
+            .or_else(|| self.class_elem_load(handle, arr_name, idx))
+        else {
+            return None;
+        };
+        let w = cur.width.max(1);
+        // The element's declared signedness: the class table, or the
+        // stored value's own flag (the only source for module-scope
+        // arrays, which the class table does not describe).
+        let elem_signed = self.class_prop_signed_of(handle, arr_name) || cur.is_signed;
+        // §11.8.1: the `%` (and the comparison around it) is unsigned
+        // when any operand is unsigned.
+        let op_unsigned = !elem_signed || !k_val.is_signed || !r_val.is_signed;
+        // §18.5.8.1: the body's own `<` / `<=` / `>` / `>=` bounds on this
+        // element, as a value range. Drawn values must respect them too, or
+        // the relational repair that runs next undoes the draw. Applied where
+        // the element's value and the drawn bit pattern agree (an unsigned
+        // element, or a signed element in a signed operation).
+        let rel = if op_unsigned && elem_signed {
+            None
+        } else {
+            self.elem_rel_range(elem_signed)
+        };
+        if satisfied {
+            let v = if elem_signed {
+                cur.to_i64().map(i128::from)
+            } else {
+                cur.to_u64().map(i128::from)
+            };
+            if rel.is_none_or(|(lo, hi)| v.is_some_and(|v| lo <= v && v <= hi)) {
+                return Some(false);
+            }
+        }
+        let clip = |segments: &mut Vec<(i128, i128)>| {
+            if let Some((lo, hi)) = rel {
+                segments.retain_mut(|(a, b)| {
+                    *a = (*a).max(lo);
+                    *b = (*b).min(hi);
+                    *a <= *b
+                });
+            }
+        };
+        // Ceiling division on possibly-negative values (p > 0).
+        let ceil_div = |a: i128, p: i128| -> i128 { if a >= 0 { (a + p - 1) / p } else { a / p } };
+        // Per segment: (first admitted value, count of admitted values),
+        // plus the step between admitted values.
+        let (classes, step): (Vec<(i128, i128)>, i128) = if op_unsigned {
+            // Operands as bit patterns at the operation width: in an
+            // unsigned operation SV zero-extends every operand from its
+            // stored bits (§11.8.2), whatever its declared signedness.
+            let opw = w.max(k_val.width).max(r_val.width);
+            if opw > 64 {
+                return None;
+            }
+            let bits = |v: &Value| -> Option<i128> {
+                // The operand's stored bits at its own width,
+                // zero-extended (mask first: a wider internal
+                // representation must not leak bits above the width).
+                let own: i128 = if v.width >= 64 {
+                    u64::MAX as i128
+                } else {
+                    (1i128 << v.width) - 1
+                };
+                Some(v.to_u64()? as i128 & own)
+            };
+            let k_u = bits(&k_val)?;
+            let r_u = bits(&r_val)?;
+            // `% 0` has no admitted class; a remainder no `%` result can
+            // take is likewise unmodelled here — step aside.
+            if k_u == 0 || r_u >= k_u {
+                return None;
+            }
+            // Segments: the element's bit-pattern domain, intersected
+            // with the body's `inside` ranges. The hint ranges name
+            // element VALUES, so clamp them to the element's own value
+            // domain first (a signed element's values stop at
+            // 2^(w-1)-1 — patterns above that are negative values, not
+            // large positive ones), then map the negative part across
+            // the sign boundary by +full.
+            let top: i128 = if w >= 64 {
+                u64::MAX as i128
+            } else {
+                (1i128 << w) - 1
+            };
+            let full: i128 = top + 1;
+            let (vlo, vhi): (i128, i128) = if elem_signed {
+                if w >= 64 {
+                    (i64::MIN as i128, i64::MAX as i128)
+                } else {
+                    (-(1i128 << (w - 1)), (1i128 << (w - 1)) - 1)
+                }
+            } else {
+                (0, top)
+            };
+            let mut segments: Vec<(i128, i128)> = Vec::new();
+            if self.elem_inside_hint.is_empty() {
+                segments.push((0, top));
+            } else {
+                for &(rl, rh) in &self.elem_inside_hint {
+                    // A 64-bit unsigned element's bounds at or above
+                    // 2^63 reach the hint as negative i64 bit patterns;
+                    // reinterpret them as the u64 values they name (a
+                    // genuinely negative bound is meaningless for an
+                    // unsigned element, and reinterprets to a range
+                    // that is empty after clamping).
+                    let (rl, rh) = if !elem_signed && w == 64 {
+                        (rl as u64 as i128, rh as u64 as i128)
+                    } else {
+                        (rl as i128, rh as i128)
+                    };
+                    let (a, b) = (vlo.max(rl), vhi.min(rh));
+                    if a > b {
+                        continue;
+                    }
+                    if a >= 0 {
+                        segments.push((a, b));
+                    } else if b < 0 {
+                        segments.push((a + full, b + full));
+                    } else {
+                        segments.push((0, b));
+                        segments.push((a + full, top));
+                    }
+                }
+            }
+            clip(&mut segments);
+            let mut classes: Vec<(i128, i128)> = Vec::new();
+            for &(a, b) in &segments {
+                // Admitted: v = r_u + m·k_u, m >= 0.
+                let m0 = if a <= r_u { 0 } else { ceil_div(a - r_u, k_u) };
+                let f = r_u + m0 * k_u;
+                if f <= b {
+                    classes.push((f, (b - f) / k_u + 1));
+                }
+            }
+            (classes, k_u)
+        } else {
+            let k = k_val.to_i64()?;
+            let r = r_val.to_i64()?;
+            if k == 0 {
+                // `% 0` has no admitted class to draw from (§11.4.4
+                // leaves the result implementation-defined).
+                return None;
+            }
+            // The element type's domain (§6.11), as in the relational
+            // arm.
+            let (lo, hi) = if w >= 64 {
+                (i64::MIN as i128, i64::MAX as i128)
+            } else {
+                (
+                    -((1i128 << (w - 1)) as i128),
+                    ((1i128 << (w - 1)) - 1) as i128,
+                )
+            };
+            // Segments: the domain, intersected with the body's own
+            // `inside` ranges for this element when the caller supplied
+            // them.
+            let mut segments: Vec<(i128, i128)> = Vec::new();
+            if self.elem_inside_hint.is_empty() {
+                segments.push((lo, hi));
+            } else {
+                for &(rl, rh) in &self.elem_inside_hint {
+                    let (a, b) = (lo.max(rl as i128), hi.min(rh as i128));
+                    if a <= b {
+                        segments.push((a, b));
+                    }
+                }
+            }
+            clip(&mut segments);
+            if segments.is_empty() {
+                return None;
+            }
+            let p: i128 = (k as i128).abs();
+            let r128 = r as i128;
+            // |remainder| must be < |divisor| for a nonzero remainder
+            // (§11.4.4); anything else is not this model's shape.
+            if r != 0 && (r128 >= p || r128 <= -p) {
+                return None;
+            }
+            let mut classes: Vec<(i128, i128)> = Vec::new();
+            for &(a, b) in &segments {
+                let (first, count) = if r == 0 {
+                    // Multiples of p, either sign.
+                    let f = ceil_div(a, p) * p;
+                    if f > b { (f, 0) } else { (f, (b - f) / p + 1) }
+                } else if r > 0 {
+                    // v = r + m·p, m >= 0 (a non-positive v has
+                    // remainder <= 0).
+                    let m0 = if a <= r128 { 0 } else { ceil_div(a - r128, p) };
+                    let f = r128 + m0 * p;
+                    if f > b { (f, 0) } else { (f, (b - f) / p + 1) }
+                } else {
+                    // v = r - m·p, m >= 0 (a non-negative v has
+                    // remainder >= 0): values DECREASE in m, so count
+                    // from the segment top.
+                    let m_min = if r128 <= b { 0 } else { ceil_div(r128 - b, p) };
+                    let top = r128 - m_min * p;
+                    if top < a {
+                        (top, 0)
+                    } else {
+                        // Admitted values step DOWN from `top` by p
+                        // while >= a.
+                        let cnt = (top - a) / p + 1;
+                        (top - (cnt - 1) * p, cnt)
+                    }
+                };
+                if count > 0 {
+                    classes.push((first, count));
+                }
+            }
+            (classes, p)
+        };
+        let total: i128 = classes.iter().map(|&(_, c)| c).sum();
+        if total <= 0 {
+            return None;
+        }
+        use rand::Rng;
+        // Draw an ordinal over all admitted values; for domains too wide
+        // to count in a u64, draw within the widest class instead (any
+        // admitted value is a correct repair; only uniformity degrades).
+        let pick = if total <= u64::MAX as i128 {
+            let mut n = self.cur_rng().gen_range(0..total as u64) as i128;
+            let mut chosen = classes[0].0;
+            for &(first, count) in &classes {
+                if n < count {
+                    chosen = first + n * step;
+                    break;
+                }
+                n -= count;
+            }
+            chosen
+        } else {
+            let &(first, count) = classes
+                .iter()
+                .max_by_key(|&&(_, c)| c)
+                .expect("a positive total implies a nonempty class");
+            let steps = (count - 1).min(u64::MAX as i128) as u64;
+            first + (self.cur_rng().gen_range(0..=steps) as i128) * step
+        };
+        let mut v = Value::from_u64(pick as u64, w);
+        v.is_signed = elem_signed;
+        // Keep the current value on any surprise: write the candidate,
+        // judge the body through the ordinary evaluator, restore on a
+        // mismatch (same save/restore discipline as generate-and-test).
+        let saved = cur;
+        self.class_elem_store(handle, arr_name, idx, v.clone());
+        if self.module.arrays.contains_key(arr_name)
+            || self.signal_name_to_id.contains_key(elem_name.as_str())
+        {
+            self.set_signal_value_by_name(&elem_name, v.clone());
+        }
+        if self.exact_cmp(&BinaryOp::Eq, mod_side, rem_side) == Some(true) {
+            return Some(saved.to_u64() != v.to_u64());
+        }
+        // The model and the evaluator disagree for this element: put
+        // the saved value back and step aside entirely.
+        self.class_elem_store(handle, arr_name, idx, saved.clone());
+        if self.module.arrays.contains_key(arr_name)
+            || self.signal_name_to_id.contains_key(elem_name.as_str())
+        {
+            self.set_signal_value_by_name(&elem_name, saved);
+        }
+        None
+    }
+
     /// Repair a packed-struct MEMBER of a fixed-array element inside a foreach
     /// body — `cfg[i].au_bytes inside {lo:hi}` or `cfg[i].byte_addressing == 1`.
     /// `index_chain_root_is` (used by the bare-element arms) is blind to the
@@ -3369,10 +4250,75 @@ impl Simulator {
     /// is not a member-of-element Inside/equality constraint (caller falls
     /// through), otherwise `Some(changed)` — the member slice is re-picked
     /// within the constraint range and spliced back into the element.
+    /// The bounds and weights of a `dist` read nothing that changes during
+    /// one `randomize()`: no bound local (a `foreach` index), no rand
+    /// variable or element of the array being solved, and no call.
+    fn dist_memo_eligible(
+        &self,
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+        rand_set: &HashSet<String>,
+        arr_name: &str,
+    ) -> bool {
+        use crate::ast::decl::DistWeight;
+        let mut ok = true;
+        let mut check = |e: &Expression| {
+            crate::type_lint::visit_expr(e, &mut |x| match &x.kind {
+                ExprKind::Number(_)
+                | ExprKind::Unary { .. }
+                | ExprKind::Binary { .. }
+                | ExprKind::Conditional { .. }
+                | ExprKind::Paren(_)
+                | ExprKind::Range(..)
+                | ExprKind::Index { .. }
+                | ExprKind::RangeSelect { .. }
+                | ExprKind::MemberAccess { .. }
+                | ExprKind::This => {}
+                ExprKind::SystemCall { name, .. }
+                    if matches!(name.as_str(), "$clog2" | "$bits" | "$signed" | "$unsigned") => {}
+                ExprKind::Ident(h) => {
+                    let segs = &h.path;
+                    let first = match segs.first() {
+                        Some(f) if f.name.name == "this" && segs.len() > 1 => &segs[1],
+                        Some(f) => f,
+                        None => return,
+                    };
+                    let n = first.name.name.as_str();
+                    if n == arr_name
+                        || rand_set.contains(n)
+                        || rand_set.iter().any(|r| {
+                            r.strip_prefix(n)
+                                .is_some_and(|t| t.starts_with('[') || t.starts_with('.'))
+                        })
+                        || self.local_stack.iter().any(|f| f.contains_key(n))
+                    {
+                        ok = false;
+                    }
+                }
+                _ => ok = false,
+            })
+        };
+        for r in ranges {
+            match r {
+                ConstraintRange::Value(v) => check(v),
+                ConstraintRange::Range { lo, hi } => {
+                    check(lo);
+                    check(hi);
+                }
+            }
+        }
+        for w in weights.iter().flatten() {
+            let (DistWeight::Each(e) | DistWeight::Total(e)) = w;
+            check(e);
+        }
+        ok
+    }
+
     pub(super) fn solve_forced_array_elem_member(
         &mut self,
         handle: usize,
         item: &ConstraintItem,
+        rand_set: &HashSet<String>,
         arr_name: &str,
         idx: &str,
     ) -> Option<bool> {
@@ -3422,12 +4368,26 @@ impl Simulator {
         // member chain, ranges) — or equality bound.
         enum Op {
             Inside(Vec<ConstraintRange>),
+            Dist(Vec<ConstraintRange>, Vec<Option<crate::ast::decl::DistWeight>>),
             Eq(Expression),
         }
         let (target, op) = match item {
             ConstraintItem::Inside {
-                expr: inner, range, ..
-            } => (Box::new((*inner).clone()), Op::Inside(range.clone())),
+                expr: inner,
+                range,
+                is_dist,
+                dist_weights,
+                ..
+            } => {
+                if *is_dist && !dist_weights.is_empty() {
+                    (
+                        Box::new((*inner).clone()),
+                        Op::Dist(range.clone(), dist_weights.clone()),
+                    )
+                } else {
+                    (Box::new((*inner).clone()), Op::Inside(range.clone()))
+                }
+            }
             ConstraintItem::Expr(e) => match &e.kind {
                 ExprKind::Inside {
                     expr: inner,
@@ -3465,26 +4425,46 @@ impl Simulator {
             _ => return None,
         };
         let (idxs, names, elem_expr) = split(self, &target, arr_name)?;
-        if idxs != idx {
+        if !idx.is_empty() && idx != "*" && idxs != idx {
             return None; // not this element's turn — another index handles it
         }
         // Resolve the whole struct element type + member bit layout. Must use
         // the same width source as the member READ path (packed_agg_layout), so
         // the splice lands on the bits that member-selections observe.
-        let su = self.packed_struct_elem_type(&elem_expr)?;
-        if Self::spreads_member_wise(&su) {
-            return None;
-        }
-        let (fields, _total) = self.packed_agg_layout(&su);
         let (off, w) = {
-            let f = fields.iter().find(|(m, _, _)| m == &names[0])?;
-            // Nested struct member-of-member targets (aper.outer.inner) are not
-            // covered by the flat `packed_agg_layout` here — degenerate to the
-            // caller's fallback rather than splice the wrong bits.
-            if names.len() > 1 {
-                return None;
+            let memo_key = if names.len() == 1 {
+                self.heap.get(handle).and_then(|h| h.as_ref()).map(|inst| {
+                    (format!("{}#{}", inst.class_name, arr_name), names[0].clone())
+                })
+            } else {
+                None
+            };
+            if let Some(ref k) = memo_key {
+                if let Some(&ow) = self.struct_member_offset_memo.borrow().get(k) {
+                    ow
+                } else {
+                    let su = self.packed_struct_elem_type(&elem_expr)?;
+                    if Self::spreads_member_wise(&su) {
+                        return None;
+                    }
+                    let (fields, _total) = self.packed_agg_layout(&su);
+                    let f = fields.iter().find(|(m, _, _)| m == &names[0])?;
+                    let ow = (f.1, f.2);
+                    self.struct_member_offset_memo.borrow_mut().insert(k.clone(), ow);
+                    ow
+                }
+            } else {
+                let su = self.packed_struct_elem_type(&elem_expr)?;
+                if Self::spreads_member_wise(&su) {
+                    return None;
+                }
+                let (fields, _total) = self.packed_agg_layout(&su);
+                let f = fields.iter().find(|(m, _, _)| m == &names[0])?;
+                if names.len() > 1 {
+                    return None;
+                }
+                (f.1, f.2)
             }
-            (f.1, f.2)
         };
         let elem = self
             .class_elem_load(handle, arr_name, &idxs)
@@ -3499,20 +4479,57 @@ impl Simulator {
                 let width = mcur.width.max(1);
                 match self.pick_from_ranges(&cr, width, mcur.is_signed) {
                     Some(picked) => {
-                        let same = picked.to_u64() == mcur.to_u64();
-                        self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, picked);
-                        !same
+                        if picked.to_u64() != mcur.to_u64() {
+                            self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, picked);
+                            true
+                        } else {
+                            false
+                        }
                     }
                     None => return None,
                 }
             }
+            Op::Dist(cr, dw) => {
+                let key = (handle, format!("{}{}.{}", arr_name, idxs, names[0]));
+                // §18.5.4: bounds and weights may read the `foreach` index,
+                // the element's own members or other rand variables; such a
+                // `dist` is evaluated again for every element.
+                let span = match item {
+                    ConstraintItem::Inside { span, .. } => *span,
+                    _ => crate::ast::Span::dummy(),
+                };
+                let memo = (span.start != 0 || span.end != 0)
+                    && self.dist_memo_eligible(&cr, &dw, rand_set, arr_name);
+                let picked = if memo {
+                    let item_key = (
+                        handle,
+                        item as *const ConstraintItem as usize,
+                        span.start,
+                        span.end,
+                        cr.len(),
+                    );
+                    self.pick_dist_value_memoized(item_key, Some(key), &cr, &dw)
+                } else {
+                    self.pick_dist_value(Some(key), &cr, &dw)
+                }
+                .unwrap_or_else(|| Value::zero(w));
+                if picked.to_u64() != mcur.to_u64() {
+                    self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, picked);
+                    true
+                } else {
+                    false
+                }
+            }
             Op::Eq(bound) => {
                 let bv = self.eval_expr(&bound).resize(mcur.width.max(1));
-                let same = bv.to_u64() == mcur.to_u64();
-                let mut p = bv;
-                p.is_signed = signed;
-                self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, p);
-                !same
+                if bv.to_u64() != mcur.to_u64() {
+                    let mut p = bv;
+                    p.is_signed = signed;
+                    self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, p);
+                    true
+                } else {
+                    false
+                }
             }
         };
         Some(changed)
@@ -3577,7 +4594,21 @@ impl Simulator {
             let (lsb, w) = Self::packed_chain_slice(base.width as u64, &dims, &iv)?;
             return Some(base.range_select((lsb + w - 1) as usize, lsb as usize));
         }
-        self.get_signal_value_by_name(&format!("{}#{}{}", handle, arr_name, idx))
+        // Phase-1 fast path: a class unpacked-array element's scoped key
+        // (`5#p08[0]`) is never a dotted name, module signal, array_first_id,
+        // frame, or packed-struct leaf — the entire `get_signal_value_by_name`
+        // walk misses on every one of those and only reaches the `signals`
+        // HashMap at the end. Read the map directly.
+        let scoped_key = format!("{}#{}{}", handle, arr_name, idx);
+        if let Some(v) = self.signals.get(&scoped_key).cloned() {
+            if *XZ_VERIFY {
+                let slow = self.get_signal_value_by_name(&scoped_key);
+                // A real check: the switch is meant for release builds too.
+                assert_eq!(Some(v.clone()), slow, "class_elem_load fast-path diverge");
+            }
+            return Some(v);
+        }
+        self.get_signal_value_by_name(&scoped_key)
     }
 
     pub(super) fn class_elem_store(
@@ -3644,7 +4675,7 @@ impl Simulator {
                 return None;
             }
             match self.resolve_dt(&dt) {
-                DataType::Struct(inner) => level = inner,
+                DataType::Struct(inner) => level = Rc::new(inner),
                 _ => return None,
             }
         }
@@ -3846,6 +4877,23 @@ impl Simulator {
             }
         }
         Some(true)
+    }
+
+    pub(super) fn dynamic_prop_foreach_dims(
+        &self,
+        handle: usize,
+        arr_name: &str,
+    ) -> Option<(Vec<(i64, i64)>, u32)> {
+        if !self.prop_is_rand(handle, arr_name) {
+            return None;
+        }
+        let key = format!("{}#{}", handle, arr_name);
+        let n = self.get_queue_size(&key) as i64;
+        if n <= 0 {
+            return None;
+        }
+        let w = self.class_prop_width_of(handle, arr_name)?;
+        Some((vec![(0, n - 1)], w))
     }
 
     pub(super) fn fixed_foreach_dims(
@@ -4113,9 +5161,22 @@ impl Simulator {
             return Some(failed.is_none());
         }
         let arr_name = Self::foreach_base_name(array)?;
+        // §7.4.1/§12.7.3: a packed multi-dimensional property or a packed
+        // array of packed structs (`cand_t [0:2] c`) loops over its leading
+        // packed dimensions, one per loop variable; unchecked, a violating
+        // trial was accepted (#928).
         let dims = match self.fixed_foreach_dims(handle, &arr_name) {
             Some((dims, _)) => dims,
-            None => self.state_foreach_dims(handle, array, &arr_name, idx_names.len())?,
+            None => match self
+                .packed_prop_foreach_dims(handle, &arr_name)
+                .filter(|(d, _)| (1..=d.len()).contains(&idx_names.len()))
+            {
+                Some((mut dims, _)) => {
+                    dims.truncate(idx_names.len());
+                    dims
+                }
+                None => self.state_foreach_dims(handle, array, &arr_name, idx_names.len())?,
+            },
         };
         if idx_names.len() != dims.len() {
             return None;
@@ -4415,7 +5476,7 @@ impl Simulator {
                         if self.signal_name_to_id.contains_key(scoped.as_str()) {
                             hier.path[0].name.name = scoped;
                             hier.cached_signal_id.set(None);
-                            hier.cached_resolved_name = std::cell::OnceCell::new();
+                            hier.cached_resolved_name = crate::ast::cache::NameCache::new();
                         }
                     }
                 }
@@ -4524,7 +5585,7 @@ impl Simulator {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: i.to_string(),
-                    cached_val: Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )
@@ -4938,11 +5999,15 @@ impl Simulator {
                 // whose weights are all 0 admits no value.
                 let kept;
                 let range: &[ConstraintRange] = if *is_dist && !dist_weights.is_empty() {
-                    kept = self.dist_weighted_ranges(range, dist_weights);
-                    if kept.is_empty() {
-                        return false;
+                    if Self::all_dist_weights_positive(dist_weights) {
+                        range
+                    } else {
+                        kept = self.dist_weighted_ranges(range, dist_weights);
+                        if kept.is_empty() {
+                            return false;
+                        }
+                        &kept
                     }
-                    &kept
                 } else {
                     range
                 };
@@ -5037,9 +6102,13 @@ impl Simulator {
         // foreach loops can also name an array on another class object.
         let Some(dims) = (match self.state_foreach_dims(handle, array, &name, vars.len()) {
             Some(d) => Some(d),
-            None if Self::foreach_plain_member(array) => {
-                self.fixed_foreach_dims(handle, &name).map(|d| d.0)
-            }
+            // §7.4.1: a packed array of structs (`cand_t [0:2] c`) loops over
+            // its elements too; unseen, `foreach (c[i]) c[i].f == K` passed
+            // the check whatever the elements held (#928).
+            None if Self::foreach_plain_member(array) => self
+                .fixed_foreach_dims(handle, &name)
+                .map(|d| d.0)
+                .or_else(|| self.packed_prop_foreach_dims(handle, &name).map(|d| d.0)),
             None => Self::foreach_member_chain(array)
                 .and_then(|(root, members)| self.sub_member_foreach_dims(handle, &root, &members)),
         }) else {

@@ -183,7 +183,18 @@ impl Simulator {
                 )
             })
             .cloned()
-            .map(Arc::new);
+            .map(|mut method| {
+                // §8.3/§13.4: preserve the existing per-origin runtime body
+                // ownership. Uncalled class declarations stay shared in the
+                // elaborated model; this private copy can cache name lookups.
+                let body = match &mut method.kind {
+                    crate::ast::decl::ClassMethodKind::Function(fd) => &mut fd.items,
+                    crate::ast::decl::ClassMethodKind::Task(td) => &mut td.items,
+                    _ => unreachable!("filtered callable method"),
+                };
+                *body = crate::ast::cache::with_fresh_scope_caches(|| body.to_vec()).into();
+                Arc::new(method)
+            });
         self.class_method_cache
             .borrow_mut()
             .entry(class_name.to_string())
@@ -231,12 +242,39 @@ impl Simulator {
                         .map(|(n, _)| n.clone()),
                 );
                 for (n, dt) in &cd.property_types {
-                    if let DataType::IntegerVector { dimensions, .. }
-                    | DataType::Implicit { dimensions, .. } = dt
-                    {
-                        if !dimensions.is_empty() {
-                            packed_vec_props.insert(n.clone());
+                    // §7.4.1 / §6.18: an alias-typed or enum-typed property
+                    // (`byte_t tx;`, `e_t [1:0] penum;`) is a packed vector
+                    // too. Its dimensions live behind the typedef, so the
+                    // declared-type arms alone admitted only the direct
+                    // spellings and every `<obj>.<prop>[i]` write on an
+                    // alias-typed property was dropped. So are an integral
+                    // atom (`int i; i[31]`, §6.11) and a packed structure
+                    // (§7.2.1).
+                    let vector_like = match dt {
+                        DataType::IntegerVector { dimensions, .. }
+                        | DataType::Implicit { dimensions, .. } => !dimensions.is_empty(),
+                        // An unpacked collection of them indexes its unpacked
+                        // dimension first (§7.4.2): not this select, and
+                        // admitting it would evaluate the receiver twice.
+                        DataType::TypeReference { .. }
+                        | DataType::Enum(_)
+                        | DataType::IntegerAtom { .. }
+                        | DataType::Struct(_)
+                            if !cd.array_properties.contains_key(n)
+                                && !cd.array_nd_properties.contains_key(n)
+                                && !cd.queue_properties.contains_key(n)
+                                && !cd.assoc_properties.contains_key(n) =>
+                        {
+                            Self::decl_is_packed_vector(
+                                dt,
+                                Some(cd.as_ref()),
+                                &self.module.typedef_types,
+                            )
                         }
+                        _ => false,
+                    };
+                    if vector_like {
+                        packed_vec_props.insert(n.clone());
                     }
                 }
                 constant_arrays.extend(cd.array_properties.keys().filter(|name| {
@@ -1756,9 +1794,6 @@ impl Simulator {
                         // one; a class method bound it as a scalar, so the
                         // body read X and a user function taking an array —
                         // legal in a constraint — always returned 0.
-                        let prior = self.module.arrays.contains_key(&port.name.name)
-                            || self.module.arrays_2d.contains_key(&port.name.name)
-                            || self.module.arrays_nd.contains_key(&port.name.name);
                         if let Some(info) = self.bind_array_arg(port, actual) {
                             // Keep fixed-array formals visible to class-scope lookup (§13.5).
                             locals.insert(
@@ -1772,7 +1807,7 @@ impl Simulator {
                                 if !info.1.is_empty() {
                                     array_writebacks.push(info);
                                 }
-                            } else if !prior {
+                            } else {
                                 // An input array formal is dropped on return
                                 // too (#327's "warming"; see the function path).
                                 array_inputs.push(info);
@@ -1838,8 +1873,10 @@ impl Simulator {
                         self.this_stack.push(Some(handle));
                         self.class_context_stack.push(Some(cname.clone()));
                         self.push_local_frame_typed(locals.clone(), frame_types.clone());
+                        self.push_pending_formal_dyn(&formal_dyn);
                         let v = self.eval_formal_default(port, def);
                         let v = self.vif_argument_value(port, def, v);
+                        self.pop_pending_formal_dyn();
                         self.pop_local_frame();
                         self.class_context_stack.pop();
                         self.this_stack.pop();
@@ -1863,11 +1900,19 @@ impl Simulator {
                         if plain_class {
                             // A class handle is bound as passed.
                         } else if let Some(pw) = param_w {
-                            let signed = match &port.data_type {
+                            let (signed, two_state) = match &port.data_type {
                                 DataType::TypeReference { name, .. } => self
                                     .class_local_typedef(cname, &name.name.name)
-                                    .is_some_and(super::elaborate::is_type_signed),
-                                _ => false,
+                                    .map_or((false, false), |td| {
+                                        (
+                                            super::elaborate::is_type_signed(td),
+                                            super::elaborate::is_type_two_state_resolved(
+                                                td,
+                                                &self.module.typedef_types,
+                                            ),
+                                        )
+                                    }),
+                                _ => (false, false),
                             };
                             if val.is_real {
                                 val = Self::real_to_int(val.to_f64(), pw);
@@ -1875,6 +1920,10 @@ impl Simulator {
                                 val = val.resize_for_assign(pw);
                             }
                             val.is_signed = signed;
+                            // §6.11.2: x and z become 0 in a 2-state formal.
+                            if two_state && val.has_xz() {
+                                val = val.to_two_state();
+                            }
                         } else if let Some((pw, signed)) =
                             self.scalar_formal_integral(&port.data_type)
                         {
@@ -2082,7 +2131,13 @@ impl Simulator {
                             // cell dropped the upper half. Register the width
                             // too so a later `retname = <narrow>` zero-extends
                             // back, mirroring a typed VarDecl.
-                            let rw = if plan.type_gen == self.type_tables_gen {
+                            // §8.25: a return type sized by the class's
+                            // parameters takes the receiver's specialization.
+                            let rw = if let Some(w) =
+                                self.method_formal_param_width(handle, cname, &f.return_type)
+                            {
+                                w
+                            } else if plan.type_gen == self.type_tables_gen {
                                 rp.width
                             } else {
                                 super::elaborate::resolve_type_width(
@@ -2404,6 +2459,7 @@ impl Simulator {
                             data_type: f.return_type.clone(),
                             lifetime: None,
                             declarators: vec![crate::ast::stmt::VarDeclarator {
+                                decl: crate::ast::binding::Bound::UNSET,
                                 name: f.name.name.clone(),
                                 dimensions: Vec::new(),
                                 init: None,
@@ -2787,6 +2843,7 @@ impl Simulator {
                         .iter()
                         .map(|(p, c, out, _)| (p.as_str(), c.as_str(), *out)),
                 );
+                let staged_arrays = self.stage_array_writebacks(&array_writebacks);
                 self.pop_and_restore_queue_frame();
                 for (tmp, caller) in staged_wb {
                     self.writeback_queue_param(&tmp, &caller);
@@ -2823,7 +2880,8 @@ impl Simulator {
                 // by value and must NOT write back — §18.5.12 relies on
                 // that for array args to constraint functions).
                 if !array_writebacks.is_empty() {
-                    self.writeback_array_args(&array_writebacks);
+                    self.writeback_array_args(&staged_arrays);
+                    self.purge_array_formals(&staged_arrays);
                     self.purge_array_formals(&array_writebacks);
                 }
                 if !array_inputs.is_empty() {

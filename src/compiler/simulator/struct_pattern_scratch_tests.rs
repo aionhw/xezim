@@ -27,7 +27,7 @@ endmodule
                 signed: false,
                 base: NumberBase::Binary,
                 value: value.to_bin(),
-                cached_val: Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             crate::ast::Span::dummy(),
         )

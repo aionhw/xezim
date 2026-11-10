@@ -25,8 +25,8 @@ impl Simulator {
             ExprKind::Ident(h) if h.path.len() >= 2 => {
                 let mut r = h.clone();
                 r.path.pop();
-                r.cached_signal_id = std::cell::Cell::new(None);
-                r.cached_resolved_name = std::cell::OnceCell::new();
+                r.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                r.cached_resolved_name = crate::ast::cache::NameCache::new();
                 Expression::new(ExprKind::Ident(r), func.span)
             }
             _ => return false,
@@ -288,6 +288,7 @@ impl Simulator {
                 span: crate::ast::Span::dummy(),
             },
             span: crate::ast::Span::dummy(),
+            bound: Default::default(),
         };
         self.resolve_typeref_class_name(&tnname)
     }
@@ -549,18 +550,42 @@ impl Simulator {
                     // dim list and the lvalue fell through to width 1 — a
                     // continuous assign then resized its RHS to one bit and
                     // wrote the LSB (0x12 -> 0).
-                    let num_unpacked = if let Some((d, _)) = self.module.arrays_nd.get(&*n) {
-                        d.len()
-                    } else if self.module.arrays_2d.contains_key(&*n) {
-                        2
-                    } else if self.module.arrays.contains_key(&*n)
-                        || self.module.dynamic_arrays.contains(&*n)
-                        || self.is_associative_array(&n)
+                    // The unpacked element's width comes from the same
+                    // lookup, for the packed-select width below.
+                    let (num_unpacked, unpacked_elem_w) =
+                        if let Some((d, w)) = self.module.arrays_nd.get(&*n) {
+                            (d.len(), Some(*w))
+                        } else if let Some(&(_, _, w)) = self.module.arrays_2d.get(&*n) {
+                            (2, Some(w))
+                        } else if let Some(&(_, _, w)) = self.module.arrays.get(&*n) {
+                            (1, Some(w))
+                        } else if self.module.dynamic_arrays.contains(&*n)
+                            || self.is_associative_array(&n)
+                        {
+                            (1, None)
+                        } else {
+                            (0, None)
+                        };
+                    // §7.4.1, §7.4.5: past the unpacked dimensions the
+                    // indices select packed elements of the unpacked
+                    // element. `packed_full_dims` lists only the packed
+                    // array dimensions, so for an array of packed structs
+                    // (`le_t [1:0] b [2]`) the product of the remaining
+                    // dimensions leaves out the struct's own width and
+                    // `b[0][1]` came out one bit wide: a nonblocking store
+                    // or continuous assignment kept bit 0. The unpacked
+                    // element's width over the packed elements selected so
+                    // far is right for any element type.
+                    if depth > num_unpacked
+                        && let Some(elem_w) = unpacked_elem_w
+                        && let Some(w) = self.packed_select_width_in_unpacked_elem(
+                            &n,
+                            elem_w,
+                            depth - num_unpacked,
+                        )
                     {
-                        1
-                    } else {
-                        0
-                    };
+                        return w;
+                    }
                     if let Some(dims) = self.module.packed_full_dims.get(&*n) {
                         let pdepth = depth.saturating_sub(num_unpacked);
                         if pdepth < dims.len() {
@@ -579,6 +604,17 @@ impl Simulator {
                             }
                         }
                     }
+                }
+                // §7.4.1: an element of a multi-dimensional packed member
+                // (`sa[i].f0[j][k]`, `s.f0[j][k]` on an array of packed
+                // structs): the width of the slice the store resolves to.
+                // Effect-free indices only, as they are evaluated here.
+                if let ExprKind::Index { expr: b, index: ix } = &expr.kind
+                    && matches!(cur.kind, ExprKind::MemberAccess { .. })
+                    && Self::cond_expr_is_effect_free(expr, false)
+                    && let Some((_, _, w)) = self.packed_struct_elem_slice(b, ix)
+                {
+                    return w;
                 }
                 // §18.4/§7.2: an element of a class aggregate member —
                 // width from the resolved storage (a packed-dimension slot
@@ -600,5 +636,38 @@ impl Simulator {
             }
             _ => self.infer_width(expr),
         }
+    }
+
+    /// Width of `pdepth` packed selects into an `elem_w`-bit element of the
+    /// fixed-size unpacked array `name`: the element's declared width over
+    /// the number of packed elements those selects pick from. `None` when
+    /// its packed shape is not known, or the selects reach a single bit, so
+    /// the caller keeps its other answers.
+    fn packed_select_width_in_unpacked_elem(
+        &self,
+        name: &str,
+        elem_w: u32,
+        pdepth: usize,
+    ) -> Option<u32> {
+        let elem_w = u64::from(elem_w);
+        let selected: u64 = match self.module.packed_full_dims.get(name) {
+            Some(dims) if pdepth <= dims.len() => dims[..pdepth]
+                .iter()
+                .map(|(l, r)| (l - r).unsigned_abs() + 1)
+                .product(),
+            Some(_) => return None,
+            // A single `[N-1:0]` dimension is not recorded; its element
+            // width is.
+            None if pdepth == 1 => {
+                let ew = *self.module.packed_signal_elem_widths.get(name)? as u64;
+                if ew <= 1 {
+                    return None;
+                }
+                elem_w / ew
+            }
+            None => return None,
+        };
+        (selected > 0 && elem_w.is_multiple_of(selected) && elem_w > selected)
+            .then(|| (elem_w / selected) as u32)
     }
 }

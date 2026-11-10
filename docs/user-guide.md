@@ -345,6 +345,7 @@ relaxed run's design. Every switch also has an environment variable,
 | `--relax-nul-bytes` | a NUL byte in the source (§5.3) | white space |
 | `--relax-cross-hier-item` | `cross vif.mode, cp_a;` (§19.6) | a cross over an implicit coverpoint of `vif.mode` |
 | `--relax-use-before-decl` | a reference to module data before its declaration, including in call arguments (§6.5) | a reference to the later declaration, with a warning |
+| `--relax-library-packages` | a package declared in a `-v` library file, which supplies only modules, interfaces, programs and primitives (#937) | a package compiled as if the file were also a source file |
 | `--relax-implicit-static` | `int x = ...;` in a static subroutine (§6.21) | a static variable with that initializer |
 | `--relax-driver-conflicts` | a variable written by conflicting drivers (§6.5, §9.2.2) | a warning instead of an error |
 

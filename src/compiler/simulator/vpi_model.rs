@@ -1187,6 +1187,9 @@ impl<'a> Builder<'a> {
                 lib_texts.push((path.display().to_string(), text, exact));
             }
         }
+        for ast in &mut asts {
+            xezim_core::scope_tree::build_all(&mut ast.descriptions);
+        }
         let mut b = Builder {
             sim,
             m: VpiModel {
@@ -1667,8 +1670,7 @@ impl<'a> Builder<'a> {
             self.param_decl(p, false, &ctx);
         }
         let mut port_decls = self.ansi_ports(ports, &ctx);
-        let mut ord = 0u32;
-        self.walk_items(items, &ctx, &mut ord, &mut port_decls);
+        self.walk_items(items, &ctx, &mut port_decls);
         // §23.11: instances `bind` adds to this one, connected in its scope.
         let binds: Vec<(&'a BindDirective, u32)> = self
             .sim
@@ -1872,13 +1874,7 @@ impl<'a> Builder<'a> {
 
     // --- scope items ---------------------------------------------------
 
-    fn walk_items(
-        &mut self,
-        items: &'a [ModuleItem],
-        ctx: &Ctx,
-        ord: &mut u32,
-        ports: &mut Vec<PortDecl>,
-    ) {
+    fn walk_items(&mut self, items: &'a [ModuleItem], ctx: &Ctx, ports: &mut Vec<PortDecl>) {
         for it in items {
             match it {
                 ModuleItem::PortDeclaration(pd) => self.port_decl(pd, ctx, ports),
@@ -1904,25 +1900,22 @@ impl<'a> Builder<'a> {
                 ModuleItem::ContinuousAssign(ca) => self.cont_assign(ca, ctx),
                 ModuleItem::ModuleInstantiation(mi) => self.instantiation(mi, ctx),
                 ModuleItem::GateInstantiation(gi) => self.gates(gi, ctx),
-                ModuleItem::GenerateRegion(gr) => self.walk_items(&gr.items, ctx, ord, ports),
+                ModuleItem::GenerateRegion(gr) => self.walk_items(&gr.items, ctx, ports),
                 ModuleItem::GenerateIf(gi) => {
-                    *ord += 1;
                     let labels: Vec<Option<&String>> =
                         gi.branch_labels.iter().map(|l| l.as_ref()).collect();
-                    self.placeholder_labels(&labels, *ord, ctx);
-                    self.generate_if(gi, ctx, *ord);
+                    self.placeholder_labels(&labels, &gi.implicit_name, ctx);
+                    self.generate_if(gi, ctx);
                 }
                 ModuleItem::GenerateCase(gc) => {
-                    *ord += 1;
                     let labels: Vec<Option<&String>> =
                         gc.arms.iter().map(|a| a.label.as_ref()).collect();
-                    self.placeholder_labels(&labels, *ord, ctx);
-                    self.generate_case(gc, ctx, *ord);
+                    self.placeholder_labels(&labels, &gc.implicit_name, ctx);
+                    self.generate_case(gc, ctx);
                 }
                 ModuleItem::GenerateFor(gf) => {
-                    *ord += 1;
-                    self.placeholder_labels(&[gf.name.as_ref()], *ord, ctx);
-                    self.generate_for(gf, ctx, *ord);
+                    self.placeholder_labels(&[gf.name.as_ref()], &gf.implicit_name, ctx);
+                    self.generate_for(gf, ctx);
                 }
                 ModuleItem::FunctionDeclaration(fd) => self.function(fd, ctx, None),
                 ModuleItem::TaskDeclaration(td) => self.task(td, ctx, None),
@@ -1943,9 +1936,9 @@ impl<'a> Builder<'a> {
     }
 
     /// The placeholder signals of generate block names at this level.
-    fn placeholder_labels(&mut self, labels: &[Option<&String>], ord: u32, ctx: &Ctx) {
+    fn placeholder_labels(&mut self, labels: &[Option<&String>], implicit: &str, ctx: &Ctx) {
         let mut names: Vec<String> = labels.iter().flatten().map(|l| (*l).clone()).collect();
-        names.push(format!("genblk{}", ord));
+        names.push(implicit.to_string());
         let inst_prefix = self.inst_flat_prefix(ctx);
         for n in names {
             self.m
@@ -2771,8 +2764,9 @@ impl<'a> Builder<'a> {
                     selects: Vec::new(),
                 }],
                 span: Span::dummy(),
-                cached_signal_id: Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             Span::dummy(),
         );
@@ -3399,21 +3393,18 @@ impl<'a> Builder<'a> {
     fn gen_block(
         &mut self,
         label: Option<&String>,
-        ord: u32,
+        implicit: &str,
         items: &'a [ModuleItem],
         span: Span,
         ctx: &Ctx,
     ) {
         let name = match label {
             Some(l) => l.clone(),
-            None => format!("genblk{}", ord),
+            None => implicit.to_string(),
         };
-        // A labeled block scopes its declarations; an unlabeled one leaves
-        // them in the enclosing flat namespace.
-        let flat_prefix = match label {
-            Some(l) => format!("{}{}.", ctx.flat_prefix, l),
-            None => ctx.flat_prefix.clone(),
-        };
+        // §27.6: every block scopes its declarations, an unlabelled one
+        // under its implicit name (`genblk1.x`), as elaboration keys them.
+        let flat_prefix = format!("{}{}.", ctx.flat_prefix, name);
         let inst_prefix = format!("{}{}.", ctx.inst_prefix, name);
         let params = self.merge_params(ctx, &flat_prefix, None);
         let sub = self.gen_scope(
@@ -3428,9 +3419,8 @@ impl<'a> Builder<'a> {
             NONE,
             0,
         );
-        let mut ord2 = 0u32;
         let mut ports = Vec::new();
-        self.walk_items(items, &sub, &mut ord2, &mut ports);
+        self.walk_items(items, &sub, &mut ports);
     }
 
     fn merge_params(
@@ -3455,27 +3445,33 @@ impl<'a> Builder<'a> {
         std::rc::Rc::new(p)
     }
 
-    fn generate_if(&mut self, gi: &'a GenerateIf, ctx: &Ctx, ord: u32) {
+    fn generate_if(&mut self, gi: &'a GenerateIf, ctx: &Ctx) {
         for (bi, (cond, items)) in gi.branches.iter().enumerate() {
             let take = match cond {
                 Some(e) => match self.eval(e, ctx) {
                     Some(v) => v != 0,
                     None => {
                         let label = gi.branch_labels.get(bi).and_then(|l| l.as_ref());
-                        self.branch_elaborated(label, ord, items, ctx)
+                        let direct = gi.branch_direct.get(bi) == Some(&true);
+                        self.branch_elaborated(label, &gi.implicit_name, direct, items, ctx)
                     }
                 },
                 None => true,
             };
             if take {
+                // §27.5: a directly nested branch is not a scope.
+                if gi.branch_direct.get(bi) == Some(&true) {
+                    self.walk_items(items, ctx, &mut Vec::new());
+                    return;
+                }
                 let label = gi.branch_labels.get(bi).and_then(|l| l.as_ref());
-                self.gen_block(label, ord, items, gi.span, ctx);
+                self.gen_block(label, &gi.implicit_name, items, gi.span, ctx);
                 return;
             }
         }
     }
 
-    fn generate_case(&mut self, gc: &'a GenerateCase, ctx: &Ctx, ord: u32) {
+    fn generate_case(&mut self, gc: &'a GenerateCase, ctx: &Ctx) {
         let sel = self.eval(&gc.selector, ctx);
         let mut chosen = None;
         if let Some(sel) = sel {
@@ -3489,7 +3485,13 @@ impl<'a> Builder<'a> {
             }
         } else {
             for arm in &gc.arms {
-                if self.branch_elaborated(arm.label.as_ref(), ord, &arm.items, ctx) {
+                if self.branch_elaborated(
+                    arm.label.as_ref(),
+                    &gc.implicit_name,
+                    arm.direct,
+                    &arm.items,
+                    ctx,
+                ) {
                     chosen = Some(arm);
                     break;
                 }
@@ -3499,7 +3501,18 @@ impl<'a> Builder<'a> {
             chosen = gc.arms.iter().find(|a| a.values.is_empty());
         }
         if let Some(arm) = chosen {
-            self.gen_block(arm.label.as_ref(), ord, &arm.items, gc.span, ctx);
+            // §27.5: a directly nested arm is not a scope.
+            if arm.direct {
+                self.walk_items(&arm.items, ctx, &mut Vec::new());
+                return;
+            }
+            self.gen_block(
+                arm.label.as_ref(),
+                &gc.implicit_name,
+                &arm.items,
+                gc.span,
+                ctx,
+            );
         }
     }
 
@@ -3508,22 +3521,40 @@ impl<'a> Builder<'a> {
     fn branch_elaborated(
         &self,
         label: Option<&String>,
-        ord: u32,
+        implicit: &str,
+        direct: bool,
         items: &[ModuleItem],
         ctx: &Ctx,
     ) -> bool {
+        // §27.5: a directly nested branch left behind what its inner blocks did.
+        if direct {
+            return match &items[0] {
+                ModuleItem::GenerateIf(g) => g.branches.iter().enumerate().any(|(bi, (_, b))| {
+                    let label = g.branch_labels.get(bi).and_then(|l| l.as_ref());
+                    let direct = g.branch_direct.get(bi) == Some(&true);
+                    self.branch_elaborated(label, &g.implicit_name, direct, b, ctx)
+                }),
+                ModuleItem::GenerateCase(g) => g.arms.iter().any(|a| {
+                    self.branch_elaborated(
+                        a.label.as_ref(),
+                        &g.implicit_name,
+                        a.direct,
+                        &a.items,
+                        ctx,
+                    )
+                }),
+                _ => false,
+            };
+        }
         let name = match label {
             Some(l) => l.clone(),
-            None => format!("genblk{}", ord),
+            None => implicit.to_string(),
         };
         let ipre = format!("{}{}.", ctx.inst_prefix, name);
         if self.inst_by_path.keys().any(|p| p.starts_with(&ipre)) {
             return true;
         }
-        let fpre = match label {
-            Some(l) => format!("{}{}.", ctx.flat_prefix, l),
-            None => ctx.flat_prefix.clone(),
-        };
+        let fpre = format!("{}{}.", ctx.flat_prefix, name);
         items.iter().any(|it| {
             let names: Vec<&str> = match it {
                 ModuleItem::DataDeclaration(dd) => dd
@@ -3545,10 +3576,10 @@ impl<'a> Builder<'a> {
         })
     }
 
-    fn generate_for(&mut self, gf: &'a GenerateFor, ctx: &Ctx, ord: u32) {
+    fn generate_for(&mut self, gf: &'a GenerateFor, ctx: &Ctx) {
         let name = match &gf.name {
             Some(l) => l.clone(),
-            None => format!("genblk{}", ord),
+            None => gf.implicit_name.clone(),
         };
         // The iteration values, as the elaborator computed them.
         let mut values: Vec<i64> = Vec::new();
@@ -3650,9 +3681,8 @@ impl<'a> Builder<'a> {
             );
             elems.push(sub.scope);
             self.m.genvars.insert(sub.scope, (gf.var.clone(), v));
-            let mut ord2 = 0u32;
             let mut ports = Vec::new();
-            self.walk_items(&gf.items, &sub, &mut ord2, &mut ports);
+            self.walk_items(&gf.items, &sub, &mut ports);
         }
         if let OData::GenArray { elems: e } = &mut self.m.objs[arr as usize].d {
             *e = elems;
@@ -4079,8 +4109,9 @@ pub(super) fn ident_expr(name: &str) -> Expression {
                 selects: Vec::new(),
             }],
             span: Span::dummy(),
-            cached_signal_id: Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         }),
         Span::dummy(),
     )
@@ -4328,7 +4359,7 @@ fn flatten_in_place(m: &VpiModel, scope: u32, e: &mut Expression) {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 });
                 e.cached_width.set(None);
                 return;
@@ -4381,7 +4412,7 @@ fn flatten_in_place(m: &VpiModel, scope: u32, e: &mut Expression) {
                 return;
             }
             h.cached_signal_id.set(None);
-            h.cached_resolved_name = std::cell::OnceCell::new();
+            h.cached_resolved_name = crate::ast::cache::NameCache::new();
         }
         ExprKind::Unary { operand, .. } => flatten_in_place(m, scope, operand),
         ExprKind::Binary { left, right, .. } => {

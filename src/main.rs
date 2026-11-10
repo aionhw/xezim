@@ -199,7 +199,7 @@ fn print_usage() {
     eprintln!("  -D <name>[=val]  Define a macro");
     eprintln!("  -uvm, --uvm      Add the UVM library named by XEZIM_UVM_DIR (its src include");
     eprintln!("                   dir and uvm_pkg.sv); XEZIM_UVM_VERSION picks a release");
-    eprintln!("  -s <topmodule>   Specify the top-level module to elaborate");
+    eprintln!("  -s, -top <top>   Specify the top-level module to elaborate");
     eprintln!("  --no-sim         Alias for --compile (deprecated)");
     eprintln!("  --preprocess     Run the preprocessor only; emit expanded text");
     eprintln!("  --dump-tokens    With --parse, print the token stream");
@@ -425,7 +425,8 @@ fn print_usage() {
     );
     eprintln!("                   (instance values still win); -g/<top>/NAME=VAL: one module only");
     eprintln!("  -GNAME=VAL       Same, and it also replaces instance and defparam values");
-    eprintln!("  -sv_seed <n|random>  Same as +seed=<n|random>");
+    eprintln!("  -sv_seed <n|random>  Same as +seed=<n|random>; also -svseed, -seed and the");
+    eprintln!("                   =<n> forms (-sv_seed=5), on the command line or in -f files");
     eprintln!("  -sv_lib <name>, -sv_root <dir>  DPI library <dir>/<name>.so (see --dpi-lib)");
     eprintln!("  -logfile <file>  Same as -l (redirects; the terminal gets nothing)");
     eprintln!("  -c               With no file after it: accepted (batch mode is the only mode)");
@@ -972,13 +973,13 @@ fn process_command_file(
                 continue;
             }
             match t {
-                "-s" => {
+                "-s" | "-top" => {
                     i += 1;
                     let top = toks
                         .get(i)
                         .filter(|top| !top.is_empty() && !top.starts_with('-'))
                         .ok_or_else(|| {
-                            format!("-s requires a top module (in args file '{}')", path)
+                            format!("{} requires a top module (in args file '{}')", t, path)
                         })?;
                     top_modules.push(top.clone());
                 }
@@ -1182,21 +1183,6 @@ fn process_command_file(
                         }
                     }
                 },
-                // commercial-simulator-compatible seed aliases: `-svseed <n>` / `-svseed=<n>`
-                // (and `-seed` likewise) lower onto the `+seed=` plusarg the
-                // simulator already consumes.
-                "-svseed" | "-seed" => {
-                    if i + 1 < toks.len() {
-                        i += 1;
-                        plusargs.push(format!("+seed={}", toks[i]));
-                    }
-                }
-                _ if t.starts_with("-svseed=") => {
-                    plusargs.push(format!("+seed={}", &t["-svseed=".len()..]));
-                }
-                _ if t.starts_with("-seed=") => {
-                    plusargs.push(format!("+seed={}", &t["-seed=".len()..]));
-                }
                 _ if t.starts_with("-s") && t.len() > 2 => {
                     top_modules.push(t[2..].to_string());
                 }
@@ -2284,7 +2270,7 @@ fn run_main() -> i32 {
             _ if arg.starts_with("-l") && arg.len() > 2 => {
                 log_file = Some(arg[2..].to_string());
             }
-            "-s" => {
+            "-s" | "-top" => {
                 i += 1;
                 if i < args.len() {
                     top_modules.push(args[i].clone());
@@ -3127,19 +3113,6 @@ fn run_main() -> i32 {
             }
             _ if arg.starts_with("--timescale=") => {
                 module_timescale_args.push(arg["--timescale=".len()..].to_string());
-            }
-            // commercial-simulator-compatible seed aliases (undocumented): lower onto `+seed=`.
-            "-svseed" | "-seed" => {
-                i += 1;
-                if i < args.len() {
-                    plusargs.push(format!("+seed={}", args[i]));
-                }
-            }
-            _ if arg.starts_with("-svseed=") => {
-                plusargs.push(format!("+seed={}", &arg["-svseed=".len()..]));
-            }
-            _ if arg.starts_with("-seed=") => {
-                plusargs.push(format!("+seed={}", &arg["-seed=".len()..]));
             }
             _ if arg.starts_with('-') => {
                 eprintln!("Warning: unknown flag '{}' (ignored)", arg);

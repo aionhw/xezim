@@ -300,7 +300,7 @@ impl Simulator {
                 signed: v.is_signed,
                 base: NumberBase::Binary,
                 value: v.to_bin(),
-                cached_val: Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }
         };
         Expression::new(ExprKind::Number(lit), span)

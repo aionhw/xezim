@@ -103,6 +103,190 @@ impl Simulator {
         cur
     }
 
+    /// §11.4.5: on one-bit operands `a & b` has the value of `a && b`, and
+    /// `a | b` of `a || b`, X and Z included. Every pass of the solve (the
+    /// forced pass, the domain pass, the CSP and the exact satisfaction check)
+    /// splits the logical forms into their operands, so the bitwise forms are
+    /// rewritten into them, in the item's boolean positions, before any pass
+    /// reads the item. Left bitwise, `s == A & (d ^ 'hf) == 0` reached only
+    /// the CSP, which samples `d`, and `randomize()` returned 0 (#899).
+    pub(super) fn one_bit_logic_item(
+        &mut self,
+        handle: Option<usize>,
+        item: &mut ConstraintItem,
+    ) -> bool {
+        match item {
+            ConstraintItem::Expr(e) => self.one_bit_logic_expr(handle, e),
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } => {
+                let c = self.one_bit_logic_expr(handle, condition);
+                self.one_bit_logic_item(handle, constraint) | c
+            }
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                let mut c = self.one_bit_logic_expr(handle, condition);
+                c |= self.one_bit_logic_item(handle, then_item);
+                if let Some(e) = else_item {
+                    c |= self.one_bit_logic_item(handle, e);
+                }
+                c
+            }
+            ConstraintItem::Foreach { item, .. } | ConstraintItem::Soft(item) => {
+                self.one_bit_logic_item(handle, item)
+            }
+            ConstraintItem::Block(items) => items
+                .iter_mut()
+                .fold(false, |c, i| self.one_bit_logic_item(handle, i) | c),
+            _ => false,
+        }
+    }
+
+    /// `one_bit_logic_item` for an expression in a boolean position; true
+    /// when it rewrote something.
+    fn one_bit_logic_expr(&mut self, handle: Option<usize>, e: &mut Expression) -> bool {
+        let one_bit = match &e.kind {
+            ExprKind::Binary {
+                op: BinaryOp::BitAnd | BinaryOp::BitOr,
+                left,
+                right,
+            } => self.constraint_one_bit(handle, left) && self.constraint_one_bit(handle, right),
+            _ => false,
+        };
+        match &mut e.kind {
+            ExprKind::Paren(inner) => self.one_bit_logic_expr(handle, inner),
+            ExprKind::Unary {
+                op: UnaryOp::LogNot,
+                operand,
+            } => self.one_bit_logic_expr(handle, operand),
+            ExprKind::Binary { op, left, right } => {
+                if one_bit {
+                    *op = if *op == BinaryOp::BitAnd {
+                        BinaryOp::LogAnd
+                    } else {
+                        BinaryOp::LogOr
+                    };
+                }
+                if matches!(
+                    op,
+                    BinaryOp::LogAnd | BinaryOp::LogOr | BinaryOp::LogImplies | BinaryOp::LogEquiv
+                ) {
+                    let l = self.one_bit_logic_expr(handle, left);
+                    self.one_bit_logic_expr(handle, right) | l | one_bit
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// True when the constraint operand `e` of the object `handle` (none for
+    /// `std::randomize`) is one bit wide: a comparison, an `inside`, a
+    /// logical or reduction operator, a bitwise operator over one-bit
+    /// operands, or a name or select whose declared width is one bit
+    /// (`rand bit b`, `data[0]`).
+    pub(super) fn constraint_one_bit(&mut self, handle: Option<usize>, e: &Expression) -> bool {
+        let e = Self::unparen(e);
+        match &e.kind {
+            ExprKind::Binary { op, left, right } => match op {
+                BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::CaseEq
+                | BinaryOp::CaseNeq
+                | BinaryOp::WildcardEq
+                | BinaryOp::WildcardNeq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+                | BinaryOp::LogAnd
+                | BinaryOp::LogOr
+                | BinaryOp::LogImplies
+                | BinaryOp::LogEquiv => true,
+                BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::BitXnor => {
+                    self.constraint_one_bit(handle, left) && self.constraint_one_bit(handle, right)
+                }
+                _ => false,
+            },
+            ExprKind::Unary { op, .. } => matches!(
+                op,
+                UnaryOp::LogNot
+                    | UnaryOp::BitAnd
+                    | UnaryOp::BitNand
+                    | UnaryOp::BitOr
+                    | UnaryOp::BitNor
+                    | UnaryOp::BitXor
+                    | UnaryOp::BitXnor
+            ),
+            ExprKind::Inside { .. } => true,
+            // A one-segment name is the object's property when it has one
+            // (§18.7); a select or member is sized from its declaration.
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                match handle.and_then(|o| self.class_prop_width_of(o, &h.path[0].name.name)) {
+                    Some(w) => w == 1,
+                    None => self.lrm_self_width(e) == Some(1),
+                }
+            }
+            ExprKind::Index { expr: base, .. } => match (handle, Self::bare_name(base)) {
+                (Some(o), Some(p)) if self.class_prop_width_of(o, p).is_some() => {
+                    self.class_prop_bit_select(o, p)
+                }
+                _ => !Self::expr_contains_call(e) && self.lrm_self_width(e) == Some(1),
+            },
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                !Self::expr_contains_call(e) && self.lrm_self_width(e) == Some(1)
+            }
+            _ => false,
+        }
+    }
+
+    /// The name a one-segment, select-free identifier spells.
+    fn bare_name(e: &Expression) -> Option<&str> {
+        match &Self::unparen(e).kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                Some(h.path[0].name.name.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `prop[i]` of the object `handle` is a bit select: `prop` is an
+    /// integral vector with at most one packed dimension, not a collection
+    /// (whose index picks an element), a string (a byte) or a `real`.
+    fn class_prop_bit_select(&self, handle: usize, prop: &str) -> bool {
+        let Some(Some(inst)) = self.heap.get(handle) else {
+            return false;
+        };
+        let mut cur = Some(inst.class_name.as_str());
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                return false;
+            };
+            if let Some(sig) = cd.properties.get(prop) {
+                return !sig.is_real
+                    && !cd.array_properties.contains_key(prop)
+                    && !cd.array_nd_properties.contains_key(prop)
+                    && !cd.queue_properties.contains_key(prop)
+                    && !cd.assoc_properties.contains_key(prop)
+                    && !cd.string_properties.contains(prop)
+                    && self.class_prop_packed_dims(handle, prop).is_none();
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
     pub(super) fn consequent_domains_expr(
         &mut self,
         e: &Expression,
@@ -545,9 +729,14 @@ impl Simulator {
         inline: &[ConstraintItem],
         inline_src_file: Option<u32>,
     ) -> Value {
+        // A fresh scalar snapshot for this object's solve invalidates any
+        // `dist` geometry memoized under a stable constraint-item pointer.
+        self.dist_geometry_memo.borrow_mut().clear();
         self.push_local_frame(HashMap::default());
         self.method_local_base.push(self.local_stack.len() - 1);
+        let scopes = std::mem::take(&mut self.constraint_scopes);
         let r = self.exec_randomize_solve(handle, inline, inline_src_file);
+        self.constraint_scopes = scopes;
         self.method_local_base.pop();
         self.pop_local_frame();
         r
@@ -625,6 +814,7 @@ impl Simulator {
         let mut rand_nd_arrays: Vec<(String, String, Vec<(i64, i64)>, u32)> = Vec::new();
         // §18.4 classification input: rand prop -> its declared type name.
         let mut prop_type_names: HashMap<String, String> = HashMap::default();
+        let mut prop_decl_types: HashMap<String, DataType> = HashMap::default();
 
         // §18.4/§18.5.9/§18.6 — rand class-handle members (`rand SubObject
         // sub_inst`). A rand handle is NOT a random value: "the object handle
@@ -734,6 +924,16 @@ impl Simulator {
                         }
                         if let Some(tn) = &sig.type_name {
                             prop_type_names.insert(prop.clone(), tn.clone());
+                            // §7.4.1: the DECLARED type keeps the packed
+                            // dimensions written before the declarator
+                            // (`cand_t [0:2] a`); the type name alone is one
+                            // struct.
+                            if let Some(dt @ DataType::TypeReference { dimensions, .. }) =
+                                class_def.property_types.get(prop)
+                                && !dimensions.is_empty()
+                            {
+                                prop_decl_types.insert(prop.clone(), dt.clone());
+                            }
                         }
                     }
                     if class_def.randc_properties.contains(prop) {
@@ -765,6 +965,17 @@ impl Simulator {
                     }
                     if seen_constraint_names.insert(con_name.clone()) {
                         constraints.push(con.clone());
+                        // §18.5/§8.14: a base class's block names what that
+                        // class sees, which a derived class's redeclaration
+                        // can change.
+                        if class_depth > 0
+                            && !self.shadowed_prop_names.is_empty()
+                            && let Some(c) = constraints.last()
+                            && !c.items.is_empty()
+                        {
+                            self.constraint_scopes
+                                .insert(c.items.as_ptr() as usize, cname.clone());
+                        }
                         constraint_src_files
                             .push(self.module.src_file_of_module.get(&cname).copied());
                         constraint_depth.push(class_depth);
@@ -791,6 +1002,12 @@ impl Simulator {
                 items: inline.to_vec(),
                 span: crate::ast::Span::new(0, 0),
             });
+            if let Some(scope) = self.inline_constraint_scope.take()
+                && let Some(c) = constraints.last()
+            {
+                self.constraint_scopes
+                    .insert(c.items.as_ptr() as usize, scope);
+            }
             constraint_src_files.push(inline_src_file);
             // §18.5.14.1: an in-line block outranks every class constraint;
             // the soft-priority contest below handles it by name.
@@ -813,6 +1030,21 @@ impl Simulator {
             constraint_src_files.push(None);
             constraint_depth.push(0);
         }
+
+        // §11.4.5: a one-bit `&` / `|` is the logical form (see
+        // `one_bit_logic_item`). The passes below also walk `inline` on its
+        // own, so it is rewritten the same way.
+        let mut inline_one_bit: Option<Vec<ConstraintItem>> = None;
+        for con in &mut constraints {
+            let mut changed = false;
+            for it in &mut con.items {
+                changed |= self.one_bit_logic_item(Some(handle), it);
+            }
+            if changed && con.name.name == "__inline__" {
+                inline_one_bit = Some(con.items.clone());
+            }
+        }
+        let inline: &[ConstraintItem] = inline_one_bit.as_deref().unwrap_or(inline);
 
         // §18.5.5: expand the array SLICE of a `unique {…}` list into the
         // element-wise inequalities it denotes.
@@ -847,19 +1079,23 @@ impl Simulator {
 
         // Rand collection members (dynamic arrays, queues, associative arrays).
         let rand_colls = self.collect_rand_colls(handle, &rand_disabled, &constraints);
-        // `unique {c}` items naming one of those collections (§18.5.5).
-        let unique_colls: Vec<RandColl> = {
-            let mut out: Vec<RandColl> = Vec::new();
-            fn walk(item: &ConstraintItem, out: &mut Vec<String>) {
+        Self::regroup_unique_colls(&mut constraints, &rand_colls);
+        // `unique {c}` / `unique {a, b}` items naming those collections
+        // (§18.5.5), one group per item, with the group's other members.
+        let unique_colls: Vec<(Vec<RandColl>, Vec<String>)> = {
+            let mut out: Vec<(Vec<RandColl>, Vec<String>)> = Vec::new();
+            fn walk(item: &ConstraintItem, out: &mut Vec<Vec<String>>) {
                 match item {
                     ConstraintItem::Unique { exprs, .. } => {
+                        let mut group = Vec::new();
                         for e in exprs {
                             if let ExprKind::Ident(h) = &e.kind {
                                 if let Some(s) = h.path.last() {
-                                    out.push(s.name.name.clone());
+                                    group.push(s.name.name.clone());
                                 }
                             }
                         }
+                        out.push(group);
                     }
                     ConstraintItem::Block(items) => {
                         for i in items {
@@ -870,19 +1106,39 @@ impl Simulator {
                     _ => {}
                 }
             }
-            let mut names: Vec<String> = Vec::new();
+            let mut groups: Vec<Vec<String>> = Vec::new();
             for con in &constraints {
                 for it in &con.items {
-                    walk(it, &mut names);
+                    walk(it, &mut groups);
                 }
             }
-            for n in names {
-                if let Some(c) = rand_colls.iter().find(|c| c.prop == n) {
-                    out.push(c.clone());
+            for g in groups {
+                let mut cs: Vec<RandColl> = Vec::new();
+                let mut scalars: Vec<String> = Vec::new();
+                for n in g {
+                    match rand_colls.iter().find(|c| c.prop == n) {
+                        Some(c) => cs.push(c.clone()),
+                        None => scalars.push(n),
+                    }
+                }
+                if !cs.is_empty() {
+                    out.push((cs, scalars));
                 }
             }
             out
         };
+
+        // An array of unpacked structs is solved through its member
+        // collections, never as one scalar or one struct.
+        let struct_coll_bases: HashSet<String> = rand_colls
+            .iter()
+            .filter(|c| c.member.is_some())
+            .filter_map(|c| c.prop.split_once('.').map(|(b, _)| b.to_string()))
+            .collect();
+        if !struct_coll_bases.is_empty() {
+            rand_props.retain(|(n, _)| !struct_coll_bases.contains(n));
+            prop_type_names.retain(|n, _| !struct_coll_bases.contains(n));
+        }
 
         // ---- IEEE 1800-2017 §18.4: classify the non-scalar rand properties ----
         // Object handles were already split out above (`rand_obj_props`).
@@ -906,11 +1162,16 @@ impl Simulator {
         let mut typed_props: Vec<(&String, &String)> = prop_type_names.iter().collect();
         typed_props.sort_by(|a, b| a.0.cmp(b.0));
         for (prop, tn) in typed_props {
-            let Some(dt) = self.module.typedef_types.get(tn.as_str()) else {
-                continue;
+            let dt = match prop_decl_types.get(prop) {
+                Some(dt) => dt,
+                None => match self.module.typedef_types.get(tn.as_str()) {
+                    Some(dt) => dt,
+                    None => continue,
+                },
             };
-            let DataType::Struct(su) = Self::resolve_type_ref(dt, &self.module.typedef_types)
-            else {
+            // §7.4.1: `cand_t [0:2] a` and `typedef cand_t [0:2] carr_t` keep
+            // their dimensions.
+            let Some(su) = self.packed_struct_with_dims(dt).map(|su| su.into_owned()) else {
                 continue;
             };
             if Self::spreads_member_wise(&su) {
@@ -940,7 +1201,13 @@ impl Simulator {
                 }
                 unpacked_agg_props.push((prop.clone(), members));
             } else {
-                let (_, total) = self.packed_agg_layout(&su);
+                // §7.4.1: a packed ARRAY of structs is drawn at the width of
+                // every element; one struct's layout alone sized the draw and
+                // rewrote a 27-bit `cand_t [0:2]` property as 9 bits (#928).
+                let (_, elem_w) = self.packed_agg_layout(&su);
+                let total =
+                    Self::packed_struct_array_width(&su, elem_w.max(1), &self.module.parameters)
+                        .unwrap_or(elem_w);
                 packed_agg_props.insert(prop.clone(), total);
             }
         }
@@ -1159,6 +1426,9 @@ impl Simulator {
         let array_enums: HashMap<String, String> = rand_colls
             .iter()
             .filter_map(|c| {
+                if let Some(m) = &c.member {
+                    return m.enum_type.clone().map(|tn| (c.prop.clone(), tn));
+                }
                 let prop = c.nd_base.as_ref().map_or(c.prop.as_str(), |(p, _)| p);
                 let tn = self.class_prop_type_name(handle, prop)?;
                 self.module
@@ -2498,9 +2768,10 @@ impl Simulator {
                 }
                 self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
                 self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
-                for c in &unique_colls {
-                    self.enforce_unique_coll(c, &constraints, &pinned_elems);
+                for (cs, scalars) in &unique_colls {
+                    self.enforce_unique_coll(handle, cs, scalars, &constraints, &pinned_elems);
                 }
+                self.enforce_conditional_unique_colls(handle, &constraints, &rand_colls, &pinned_elems);
             }
             {
                 fn collect_unique_items<'a>(
@@ -2848,13 +3119,65 @@ impl Simulator {
         fe_failed: &mut bool,
     ) -> bool {
         for con in constraints {
-            for item in &con.items {
-                if !self.rand_item_accept(handle, item, rand_colls, fe_failed) {
-                    return false;
-                }
+            let scope = self.constraint_scope_of(con);
+            if let Some(s) = &scope {
+                self.class_context_stack.push(Some(s.clone()));
+            }
+            let ok = con
+                .items
+                .iter()
+                .all(|item| self.rand_item_accept(handle, item, rand_colls, fe_failed));
+            if scope.is_some() {
+                self.class_context_stack.pop();
+            }
+            if !ok {
+                return false;
             }
         }
         true
+    }
+
+    /// The class constraint block `con` is evaluated in when it is not the
+    /// object's own class (see `constraint_scopes`).
+    pub(super) fn constraint_scope_of(&self, con: &ClassConstraint) -> Option<String> {
+        if self.constraint_scopes.is_empty() {
+            return None;
+        }
+        self.constraint_scopes
+            .get(&(con.items.as_ptr() as usize))
+            .cloned()
+    }
+
+    /// §8.14/§18.4: the storage key of the object's random variable `name`.
+    /// When a derived class hides the base's rand property with a constant
+    /// (`localparam name = 27;`), the variable is the hidden instance copy,
+    /// stored under its declarer's qualified key.
+    pub(super) fn rand_var_key<'a>(
+        &self,
+        handle: usize,
+        name: &'a str,
+    ) -> std::borrow::Cow<'a, str> {
+        if !self.prop_maybe_shadowed(name) {
+            return std::borrow::Cow::Borrowed(name);
+        }
+        let Some(cn) = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.as_str())
+        else {
+            return std::borrow::Cow::Borrowed(name);
+        };
+        if !self.nearest_decl_is_constant(cn, name) {
+            return std::borrow::Cow::Borrowed(name);
+        }
+        match self
+            .nearest_instance_declarer(cn, name)
+            .and_then(|d| self.shadowed_prop_key_in(&d, handle, name))
+        {
+            Some(k) => std::borrow::Cow::Owned(k),
+            None => std::borrow::Cow::Borrowed(name),
+        }
     }
 
     pub(super) fn rand_has_soft(constraints: &[ClassConstraint]) -> bool {
@@ -3141,8 +3464,9 @@ impl Simulator {
                 selects: Vec::new(),
             }],
             span: expr.span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         Some(Expression::new(ExprKind::Ident(fh), expr.span))
     }
@@ -3453,6 +3777,21 @@ impl Simulator {
     /// §18.3: whether property `prop` of the object `handle` points at is
     /// declared SIGNED (`rand integer`, `rand int`, `rand byte`, …).
     pub(super) fn class_prop_signed_of(&self, handle: usize, prop: &str) -> bool {
+        let key = (handle, prop.to_string());
+        if let Some(&c) = self.class_prop_signed_memo.borrow().get(&key) {
+            return c;
+        }
+        let r = self.class_prop_signed_of_uncached(handle, prop);
+        let mut memo = self.class_prop_signed_memo.borrow_mut();
+        if memo.len() >= super::aggregate_expressions::CLASS_PROP_MEMO_CAP {
+            memo.clear();
+        }
+        memo.insert(key, r);
+        r
+    }
+
+    /// Uncached walk — see `class_prop_signed_of`.
+    fn class_prop_signed_of_uncached(&self, handle: usize, prop: &str) -> bool {
         let Some(Some(inst)) = self.heap.get(handle) else {
             return false;
         };
@@ -3740,7 +4079,7 @@ impl Simulator {
                     }
                 } else if let Some(su) = self
                     .class_prop_struct(handle, prop)
-                    .filter(Self::spreads_member_wise)
+                    .filter(|su| Self::spreads_member_wise(su))
                 {
                     self.seed_class_struct_cells(handle, prop, &su);
                 }
@@ -3759,7 +4098,7 @@ impl Simulator {
                 let fill = self.class_bound_array_fill(cdef, handle, prop, w);
                 let su = self
                     .class_prop_struct(handle, prop)
-                    .filter(Self::spreads_member_wise);
+                    .filter(|su| Self::spreads_member_wise(su));
                 for i in lo..=hi {
                     let en = format!("{}[{}]", scoped, i);
                     self.signals.insert(en.clone(), fill.clone());
@@ -3788,7 +4127,7 @@ impl Simulator {
                 let fill = self.class_bound_array_fill(cdef, handle, prop, w);
                 let su = self
                     .class_prop_struct(handle, prop)
-                    .filter(Self::spreads_member_wise);
+                    .filter(|su| Self::spreads_member_wise(su));
                 for suffix in Self::nd_index_suffixes(shape) {
                     let en = format!("{}{}", scoped, suffix);
                     if self.widths.contains_key(&en) {

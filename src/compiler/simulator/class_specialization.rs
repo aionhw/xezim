@@ -159,8 +159,9 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span: crate::ast::Span::dummy(),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 }),
                 crate::ast::Span::dummy(),
             )
@@ -639,17 +640,18 @@ impl Simulator {
     }
 
     /// `(iface, modport)` of a specialization fragment spelling a virtual
-    /// interface type (`virtual bus_if`, `virtual I#(8).mp`, or the
-    /// `normalize_spec_ws` form `virtualbus_if`), else `None`.
+    /// interface type (`virtual bus_if`, `virtual I#(8).mp`), else `None`.
     fn vif_of_spec_frag(&self, frag: &str) -> Option<(String, Option<String>)> {
         let rest = frag.strip_prefix("virtual")?;
-        let spaced = rest.starts_with(char::is_whitespace);
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
         let rest = rest.trim();
         let end = rest
             .find(|c: char| c == '#' || c == '.' || c.is_whitespace())
             .unwrap_or(rest.len());
         let (name, tail) = rest.split_at(end);
-        if name.is_empty() || (!spaced && !self.module.interfaces.contains(name)) {
+        if name.is_empty() {
             return None;
         }
         let tail = match tail.rfind(')') {
@@ -1520,6 +1522,7 @@ impl Simulator {
                 span: crate::ast::Span::dummy(),
             },
             span: crate::ast::Span::dummy(),
+            bound: Default::default(),
         };
         let (base, mut type_args) = if let Some((base, sig)) = self.extract_spec_from_string(&tn) {
             let args = Self::split_spec_args(&sig)
@@ -2748,6 +2751,23 @@ impl Simulator {
     }
 
     pub(super) fn canonicalize_spec_sig(&self, class_name: &str, sig: &str) -> String {
+        // Enclosing value-parameter references depend on active method lexical context,
+        // so only memoize when no class context is active.
+        let has_ctx = self.class_context_stack.last().is_some_and(|c| c.is_some());
+        if !has_ctx {
+            let key = (class_name.to_string(), sig.to_string());
+            if let Some(cached) = self.spec_sig_cache.borrow().get(&key) {
+                return cached.clone();
+            }
+            let res = self.canonicalize_spec_sig_uncached(class_name, sig);
+            self.spec_sig_cache.borrow_mut().insert(key, res.clone());
+            res
+        } else {
+            self.canonicalize_spec_sig_uncached(class_name, sig)
+        }
+    }
+
+    fn canonicalize_spec_sig_uncached(&self, class_name: &str, sig: &str) -> String {
         // The class's parameter lists are read in place: every call below
         // takes `&self`.
         let Some(cd) = self.module.classes.get(class_name) else {
@@ -2971,7 +2991,7 @@ impl Simulator {
                 if cd.static_properties.contains(name)
                     && cd.static_collections.iter().any(|(n, _, _)| n == name)
                 {
-                    if let Some(key) = self.static_prop_key(&cn, name) {
+                    if let Some(key) = self.static_prop_key(ctx, name) {
                         // Rewrite storage to the per-DECLARING-class key ONLY
                         // when the bare name collides across classes (§8.9) or
                         // the class is parameterized (`#spec`). A statically
@@ -3128,6 +3148,11 @@ impl Simulator {
                     }
                     return Some(key);
                 }
+                // §8.14: the nearest declaration wins — an instance property
+                // hides a same-named static or constant of an ancestor.
+                if cd.properties.contains_key(prop) {
+                    return None;
+                }
                 // §8.23: a NESTED class sees its lexically enclosing class's
                 // statics — hop to the enclosing class when the extends
                 // chain is exhausted.
@@ -3146,12 +3171,15 @@ impl Simulator {
     /// compiled plan. The common (non-parameterized) path always returns 0 and is
     /// untouched.
     pub(super) fn instance_spec_id(&mut self, handle: usize) -> u32 {
-        let Some(spec) = self
-            .heap
-            .get(handle)
-            .and_then(|o| o.as_ref())
-            .and_then(|inst| inst.spec.clone())
-        else {
+        let spec = if handle != 0 {
+            self.heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|inst| inst.spec.clone())
+        } else {
+            self.current_spec.clone()
+        };
+        let Some(spec) = spec else {
             return 0;
         };
         if let Some(&id) = self.compiled_spec_intern.get(&spec) {

@@ -23,8 +23,12 @@ impl Simulator {
                     .filter(|cn| self.module.dynamic_arrays.contains(cn))
             });
             if let Some(ename) = qn {
-                let esize = self.get_queue_size(&ename) as usize;
-                for j in 0..esize {
+                let lo = self.module.arrays.get(&ename).map_or(0, |a| a.0);
+                let mut idx: Vec<i64> = (lo..lo + self.get_queue_size(&ename) as i64).collect();
+                if self.module.descending_arrays.contains(&ename) {
+                    idx.reverse();
+                }
+                for j in idx {
                     if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", ename, j)) {
                         all_vals.push(v);
                     }
@@ -291,6 +295,13 @@ impl Simulator {
             // `obj.member` and indexed/call-bearing owners are
             // collection operands, not scalar broadcast values.
             ExprKind::MemberAccess { .. } => self.expr_assoc_name(e),
+            // A ROW of an array of dynamic arrays (`d[i]`, `h.rows[i]`) is a
+            // collection operand too; taken for a scalar, the copy kept
+            // nothing (`d[1] = new[2](d[1])` zeroed the row).
+            ExprKind::Index { .. } if Self::cond_expr_is_effect_free(e, false) => self
+                .class_array_of_coll_key(e)
+                .or_else(|| self.flat_member_name(e))
+                .filter(|n| self.module.dynamic_arrays.contains(n.as_str())),
             _ => None,
         });
         if let Some((dt, tail)) = self.dynamic_assoc_decl(name) {
@@ -1982,17 +1993,24 @@ impl Simulator {
                         }
                         self.continue_flag = false;
                     }
-                } else if let Some(&(l, r)) = self
-                    .module
-                    .packed_full_dims
-                    .get(&*name)
-                    .filter(|d| d.len() >= 2)
+                } else if let Some(&(l, r)) = prop_packed_dims
+                    .as_ref()
                     .and_then(|d| d.first())
+                    .or_else(|| {
+                        self.module
+                            .packed_full_dims
+                            .get(&*name)
+                            .filter(|d| d.len() >= 2)
+                            .and_then(|d| d.first())
+                    })
                 {
                     // §12.7.3 (measured): a MULTI-packed-dim vector
                     // (`logic [3:0][7:0] w`) iterates its OUTERMOST
                     // packed dimension (4 iterations, not 32 bits),
-                    // left→right — [3:0] visits 3,2,1,0.
+                    // left→right — [3:0] visits 3,2,1,0. A class
+                    // property of that shape, or a packed array of
+                    // packed structs (`cand_t [0:2] c`, §7.4.1), too:
+                    // it has no module-scope dimension record (#928).
                     let n = (l - r).abs() + 1;
                     let step: i64 = if l >= r { -1 } else { 1 };
                     let mut idx = l;
@@ -2442,14 +2460,11 @@ impl Simulator {
                         }
                         budget -= 1;
                         for m in &su.members {
-                            let ew = super::elaborate::packed_inner_elem_width(
+                            let (ew, fd) = super::elaborate::packed_member_meta(
                                 &m.data_type,
                                 &self.module.parameters,
                                 &self.module.typedefs,
-                            );
-                            let fd = super::elaborate::packed_full_dims_of(
-                                &m.data_type,
-                                &self.module.parameters,
+                                &self.module.typedef_types,
                             );
                             for mdecl in &m.declarators {
                                 let key = format!("{}.{}", prefix, mdecl.name.name);
@@ -2768,8 +2783,9 @@ impl Simulator {
                                         selects: Vec::new(),
                                     }],
                                     span: d.name.span,
-                                    cached_signal_id: std::cell::Cell::new(None),
-                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                    bound: crate::ast::binding::Bound::UNSET,
                                 },
                             ),
                             d.name.span,
@@ -2942,8 +2958,9 @@ impl Simulator {
                                             selects: Vec::new(),
                                         }],
                                         span: d.name.span,
-                                        cached_signal_id: std::cell::Cell::new(None),
-                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                        bound: crate::ast::binding::Bound::UNSET,
                                     },
                                 ),
                                 d.name.span,
@@ -3131,8 +3148,9 @@ impl Simulator {
                                             selects: Vec::new(),
                                         }],
                                         span: d.name.span,
-                                        cached_signal_id: std::cell::Cell::new(None),
-                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                        bound: crate::ast::binding::Bound::UNSET,
                                     },
                                 ),
                                 d.name.span,
@@ -3288,8 +3306,9 @@ impl Simulator {
                                     selects: Vec::new(),
                                 }],
                                 span: d.name.span,
-                                cached_signal_id: std::cell::Cell::new(None),
-                                cached_resolved_name: std::cell::OnceCell::new(),
+                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                bound: crate::ast::binding::Bound::UNSET,
                             },
                         ),
                         d.name.span,
@@ -3715,8 +3734,9 @@ impl Simulator {
                                         selects: Vec::new(),
                                     }],
                                     span: d.name.span,
-                                    cached_signal_id: std::cell::Cell::new(None),
-                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                    bound: crate::ast::binding::Bound::UNSET,
                                 },
                             ),
                             d.name.span,
@@ -4243,6 +4263,7 @@ impl Simulator {
                 // nonblocking assignment per leaf, every source leaf read now.
                 if let Some(leaf_nbas) = self
                     .unpacked_array_nba_leaves(lvalue, rvalue)
+                    .or_else(|| self.unpacked_row_nba_leaves(lvalue, rvalue))
                     .or_else(|| self.unpacked_struct_nba_leaves(lvalue, rvalue))
                 {
                     let d = match intra_d {
@@ -4259,7 +4280,7 @@ impl Simulator {
                                 signed: false,
                                 base: NumberBase::Decimal,
                                 value: d.to_string(),
-                                cached_val: Cell::new(None),
+                                cached_val: crate::ast::cache::LiteralCache::new(None),
                             }),
                             stmt.span,
                         )
@@ -4308,8 +4329,8 @@ impl Simulator {
                     cb_base_flat = f;
                     cb_base = &cb_base_flat;
                 }
-                if let ExprKind::Ident(hier) = &cb_base.kind {
-                    if hier.path.len() >= 2 {
+                if let ExprKind::Ident(hier) = &cb_base.kind
+                    && hier.path.len() >= 2 {
                         let cb_segs: Vec<&str> = hier
                             .path
                             .iter()
@@ -4371,8 +4392,9 @@ impl Simulator {
                                                 selects: last_sels.clone(),
                                             }],
                                             span: lvalue.span,
-                                            cached_signal_id: std::cell::Cell::new(None),
-                                            cached_resolved_name: std::cell::OnceCell::new(),
+                                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                            bound: crate::ast::binding::Bound::UNSET,
                                         }),
                                         lvalue.span,
                                     );
@@ -4388,15 +4410,17 @@ impl Simulator {
                                     Some(self.freeze_lvalue_indices(&t))
                                 };
                                 // §14.16 `##N`: wait N further clocking events.
-                                if let Some(n) = intra_cycles {
-                                    if n > 0 {
-                                        self.clocking_cycle_pending
-                                            .entry(cb)
-                                            .or_default()
-                                            .push((n, net, val, target));
+                                if let Some(n) = intra_cycles
+                                    && n > 0 {
+                                        self.clocking_cycle_pending.entry(cb).or_default().push((
+                                            n,
+                                            raw_sig.to_string(),
+                                            net,
+                                            val,
+                                            target,
+                                        ));
                                         return;
                                     }
-                                }
                                 // §14.16.1: a drive executed AT the clocking
                                 // event matures at edge + OUTPUT SKEW (per-sig
                                 // override, else block default, else #0 =
@@ -4410,25 +4434,36 @@ impl Simulator {
                                     .or_else(|| self.clocking_out_skew.get(&cb).copied())
                                     .unwrap_or(0);
                                 if self.clocking_last_edge.get(&cb).copied() == Some(self.time) {
+                                    // §14.3: an edge skew drives on the next
+                                    // such edge of the clock after the event.
+                                    if let Some((edge, d)) =
+                                        self.clocking_drive_edge(&cb, raw_sig, &net)
+                                    {
+                                        self.clocking_edge_out_pending
+                                            .entry(cb)
+                                            .or_default()
+                                            .push((net, val, edge, d, target));
+                                        return;
+                                    }
                                     if let Some(t) = &target {
                                         self.drive_clocking_select(t, val, skew);
                                         return;
                                     }
                                     if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
-                                        let w = self.signal_widths[id];
-                                        self.schedule_delayed_with_delay(id, val.resize(w), skew);
+                                        self.schedule_clocking_update(id, &val, skew);
                                         return;
                                     }
                                 }
-                                self.clocking_output_pending
-                                    .entry(cb)
-                                    .or_default()
-                                    .push((net, val, target));
+                                self.clocking_output_pending.entry(cb).or_default().push((
+                                    raw_sig.to_string(),
+                                    net,
+                                    val,
+                                    target,
+                                ));
                                 return;
                             }
                         }
                     }
-                }
                 // SV-2023: NBA to a ref formal redirects to the caller's
                 // actual lvalue (IEEE 1800-2023 §13.5.2).
                 let written = lvalue;
@@ -5377,7 +5412,24 @@ impl Simulator {
                                 return;
                             }
                         }
+                        // `@(vif)` — see `vif_value_change_cond`.
+                        if let Some(cond) = self.vif_value_change_cond(e) {
+                            let pid = self.current_pid;
+                            let wait = Self::vc_wait_stmt(cond.clone(), stmt, stmt.span);
+                            self.park_condition_waiter(pid, vec![wait].into(), &cond);
+                            self.break_flag = true;
+                            return;
+                        }
                         if let Some(cond) = self.class_prop_value_change_cond(e) {
+                            let pid = self.current_pid;
+                            let wait = Self::vc_wait_stmt(cond.clone(), stmt, stmt.span);
+                            self.park_condition_waiter(pid, vec![wait].into(), &cond);
+                            self.break_flag = true;
+                            return;
+                        }
+                        // `@(posedge prop)` on a non-signal operand — see
+                        // `class_prop_edge_cond`.
+                        if let Some(cond) = self.class_prop_edge_cond(e) {
                             let pid = self.current_pid;
                             let wait = Self::vc_wait_stmt(cond.clone(), stmt, stmt.span);
                             self.park_condition_waiter(pid, vec![wait].into(), &cond);
@@ -5689,10 +5741,11 @@ impl Simulator {
                 self.break_flag = true;
                 self.return_flag = true;
             }
-            StatementKind::Disable(name) => {
+            StatementKind::Disable(target) => {
+                let name = crate::ast::stmt::disable_name(target);
                 // §38.36.1 cbDisable, reported once the disable took effect.
                 if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_DISABLE) != 0 {
-                    self.vpi_note_disable(&name.name);
+                    self.vpi_note_disable(name);
                 }
                 // IEEE 1800-2017 §9.6.2. `disable_target` was set but never
                 // read: the only effect was `break_flag`, a GLOBAL flag. So a
@@ -5705,7 +5758,7 @@ impl Simulator {
                 // fork block has already returned, so trying to unwind to it
                 // below would run off the end of the disabling process and drop
                 // its continuation — which is exactly what used to happen.
-                if let Some(children) = self.fork_block_children.get(&name.name).cloned() {
+                if let Some(children) = self.fork_block_children.get(name).cloned() {
                     let mut to_kill: HashSet<usize> = HashSet::default();
                     for &c in &children {
                         to_kill.insert(c);
@@ -5741,7 +5794,7 @@ impl Simulator {
                         self.release_killed_from_join_waiters(&to_kill);
                         self.wake_await_waiters(&to_kill);
                         if self_doomed {
-                            self.disable_target = Some(name.name.clone());
+                            self.disable_target = Some(name.to_string());
                             self.break_flag = true;
                         }
                         return;
@@ -5749,7 +5802,7 @@ impl Simulator {
                 }
                 // A label naming ANOTHER process's top-level block terminates
                 // that process; the disabling process carries on.
-                if let Some(&pid) = self.disable_labels.get(&name.name) {
+                if let Some(pid) = self.disable_label_pid(target) {
                     if pid != self.current_pid {
                         self.killed_pids.insert(pid);
                         self.release_killed_process_state(pid);
@@ -5780,7 +5833,7 @@ impl Simulator {
                 // those invocations. (Approximation: the whole executing
                 // process is terminated — exact for the common `fork
                 // task_a; task_b; join` + `disable task_b` shape.)
-                if let Some(pids) = self.active_task_pids.get(&name.name).cloned() {
+                if let Some(pids) = self.active_task_pids.get(name).cloned() {
                     // An ANCESTOR executing the task (the disabling process was
                     // forked inside it) is unwound out of the call instead —
                     // see `disable_remote_block`.
@@ -5795,7 +5848,7 @@ impl Simulator {
                     // §35.9: an EXPORTED task that is the target returns 0 to
                     // its C caller, and the process carries on in the C code.
                     let handled = !self.dpi_tasks.is_empty()
-                        && self.dpi_disable_exported_task(&name.name, &mut to_kill);
+                        && self.dpi_disable_exported_task(name, &mut to_kill);
                     if to_kill.is_empty() && handled {
                         return;
                     }
@@ -5829,12 +5882,28 @@ impl Simulator {
                         return;
                     }
                 }
+                // §9.6.2: a block this process cannot be executing is another
+                // process's, found now. Posting the disable for the process
+                // loop to resolve lost the rest of a nested `begin ... end`
+                // around it (`#5 begin disable lab.sub; ... end`). A path
+                // names the block's process by its head (`lab.sub`).
+                if !self.disable_may_be_own(target) {
+                    let only = if target.path.len() > 1 {
+                        let mut head = target.clone();
+                        head.path.pop();
+                        self.disable_label_pid(&head)
+                    } else {
+                        None
+                    };
+                    self.disable_remote_block_of(name, only);
+                    return;
+                }
                 // Otherwise unwind this process to the end of the named block
                 // (or the named task): the SeqBlock / task-call arm clears the
                 // flags when it sees its own name, so execution resumes after
                 // it. For a loop-body block that is `continue`; for a block
                 // enclosing the loop it is `break`.
-                self.disable_target = Some(name.name.clone());
+                self.disable_target = Some(name.to_string());
                 self.break_flag = true;
                 // Not yet known to be this process's own block: the process
                 // loop checks, and hands it to `disable_remote_block` if not.
@@ -5859,6 +5928,22 @@ impl Simulator {
                 }
                 self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
                 self.instance_event_waiters.remove_pids(to_kill.iter());
+                self.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
+                self.ready_condition_waiters
+                    .retain(|(p, _)| !to_kill.contains(p));
+                for p in &to_kill {
+                    self.cond_waiter_gate.remove(p);
+                    self.cond_waiter_reads.remove(p);
+                    self.cond_read_union_dirty = true;
+                    self.cond_waiter_conditions.remove(p);
+                }
+                self.inactive_queue.retain(|(p, _)| !to_kill.contains(p));
+                self.nba_region_waiters
+                    .retain(|(p, _)| !to_kill.contains(p));
+                self.deferred_clocking_conts
+                    .retain(|(p, _)| !to_kill.contains(p));
+                self.deferred_clocking_guarded
+                    .retain(|(w, _)| !to_kill.contains(&w.pid));
                 for q in self.mailbox_get_waiters.values_mut() {
                     q.retain(|w| !to_kill.contains(&w.pid));
                 }
@@ -6707,8 +6792,9 @@ impl Simulator {
                                     selects: Vec::new(),
                                 }],
                                 span: name.span,
-                                cached_signal_id: std::cell::Cell::new(None),
-                                cached_resolved_name: std::cell::OnceCell::new(),
+                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                bound: crate::ast::binding::Bound::UNSET,
                             }),
                             name.span,
                         );
@@ -6757,8 +6843,9 @@ impl Simulator {
                     selects: Vec::new(),
                 }],
                 span: d.name.span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             d.name.span,
         );

@@ -338,7 +338,7 @@ impl Simulator {
         if order.len() != src.names.len() {
             return None;
         }
-        let param = port.name.name.clone();
+        let param = self.array_formal_key(port);
         let out_default = self.output_formal_elem_default(port, src.ew);
         let values = match &out_default {
             Some(d) => vec![d.clone(); order.len()],

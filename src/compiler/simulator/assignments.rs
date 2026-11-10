@@ -1138,6 +1138,26 @@ impl Simulator {
             if consumed == 0 {
                 return None;
             }
+        } else if let Some(nu) = self
+            .module
+            .arrays_2d
+            .contains_key(root)
+            .then_some(2)
+            .or_else(|| self.module.arrays_nd.get(root).map(|(s, _)| s.len()))
+        {
+            // §7.4.1: an element of a multi-dimensional unpacked array
+            // (`s3[1][0].f0[1]`) is the signal named by all its unpacked
+            // indices; none of its prefixes is one.
+            if lead_len < nu {
+                return None;
+            }
+            for &(_, i) in &steps[..nu] {
+                storage.push('[');
+                Self::push_i64(&mut storage, i);
+                storage.push(']');
+            }
+            self.get_signal_value_by_name(&storage)?;
+            consumed = nu;
         }
         let pre = &steps[consumed..lead_len];
         let fields = self.module.packed_struct_fields.get(root)?;
@@ -1277,8 +1297,16 @@ impl Simulator {
         base: &Expression,
         idx: &Expression,
     ) -> Option<(String, u32, u32)> {
-        // Left of the trailing index must be `<...>.field`.
-        if !matches!(base.kind, ExprKind::MemberAccess { .. }) {
+        // Left of the trailing index must be `<...>.field`, possibly with
+        // more indices after the field: §7.4.1, `sa[1].f0[3][7]` selects an
+        // element of a multi-dimensional packed member at every index, and
+        // as `<...>.field[3]` this shape was declined, so the store was
+        // dropped.
+        let mut field = base;
+        while let ExprKind::Index { expr, .. } = &field.kind {
+            field = expr;
+        }
+        if !matches!(field.kind, ExprKind::MemberAccess { .. }) {
             return None;
         }
         let (root, mut steps) = self.packed_path_steps(base)?;
@@ -1357,9 +1385,27 @@ impl Simulator {
                 if !matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() == 1))
             || matches!(&lhs.kind, ExprKind::Ident(h) if h.path.len() >= 3)
         {
+            // §8.14/§8.23: a shadowed member names what the reference's
+            // declared class sees (`this.x` in a base method is the base's
+            // `x`), so resolve that before a static of the OBJECT's class can
+            // claim the write (#944).
+            if !self.shadowed_prop_names.is_empty()
+                && let Some(rewritten) = self.super_rewrite(lhs)
+            {
+                return self.assign_value(&rewritten, val);
+            }
             if let Some(ok) = self.assign_static_through_chain(lhs, val) {
                 return ok;
             }
+        }
+        // §8.14: the same for a select of a shadowed member (`this.v[3:0]`).
+        if matches!(
+            lhs.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+        ) && !self.shadowed_prop_names.is_empty()
+            && let Some(rewritten) = self.shadowed_select_rewrite(lhs)
+        {
+            return self.assign_value(&rewritten, val);
         }
         if let ExprKind::MemberAccess { expr: b, .. }
         | ExprKind::Index { expr: b, .. }
@@ -1482,7 +1528,12 @@ impl Simulator {
             .is_some_and(|f| f.contains_key(name));
         if in_frame {
             if self.fb_frame_depths.last().copied() == Some(self.local_stack.len() - 1) {
-                return false;
+                // A fallback's carried local: its declared kind travelled
+                // with it (`fb_frame_push`).
+                let start = self.fb_two_state_marks.last().copied().unwrap_or(0);
+                return self.fb_two_state_names[start..]
+                    .iter()
+                    .any(|n| n.as_ref() == name);
             }
         } else if !self.in_process_block_scope()
             || self.signal_name_to_id.contains_key(name)
@@ -1565,8 +1616,9 @@ impl Simulator {
                 root: None,
                 path,
                 span: hier.span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             });
         }
         // Identity-bound aggregate: the formal has no storage of its own.
@@ -1602,8 +1654,9 @@ impl Simulator {
             root: ah.root.clone(),
             path,
             span: hier.span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         })
     }
 
@@ -1643,8 +1696,9 @@ impl Simulator {
                             selects: Vec::new(),
                         }],
                         span: id.span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
                     }),
                     id.span,
                 );
@@ -1989,12 +2043,36 @@ impl Simulator {
             Some((dl, dr)) => b - dl.min(dr),
             None => b,
         };
-        if phys < 0 || phys as u32 >= cur.width {
+        // §7.4.1: with a multi-dimensional packed element (`logic [3:0][7:0]
+        // p [int]`), `p[k][j]` selects a whole slice of the leading packed
+        // dimension, so write `stride` bits at slot `phys`.
+        let stride = self
+            .module
+            .packed_full_dims
+            .get(&name)
+            .filter(|d| d.len() > 1)
+            .map_or(1, |d| {
+                d[1..]
+                    .iter()
+                    .map(|&(l, r)| (l - r).unsigned_abs() as usize + 1)
+                    .product()
+            });
+        let Some(lsb) = usize::try_from(phys)
+            .ok()
+            .and_then(|p| p.checked_mul(stride))
+            .filter(|l| {
+                l.checked_add(stride)
+                    .is_some_and(|e| e <= cur.width as usize)
+            })
+        else {
             return Some(false);
+        };
+        let mut changed = false;
+        for i in 0..stride {
+            let nb = val.get_bit(i);
+            changed |= cur.get_bit(lsb + i) != nb;
+            cur.set_bit(lsb + i, nb);
         }
-        let nb = val.get_bit(0);
-        let changed = cur.get_bit(phys as usize) != nb;
-        cur.set_bit(phys as usize, nb);
         if changed || fresh {
             self.set_signal_value_by_name(&elem, cur);
             self.mark_dirty(&elem);
@@ -2252,6 +2330,8 @@ impl Simulator {
                 let prev = self.get_signal_value_by_name(&nm);
                 let fitted = match prev.as_ref() {
                     Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
+                    // §6.12.2: a real into an integral element rounds.
+                    Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                     _ => val.clone(),
                 };
                 let changed = prev.as_ref() != Some(&fitted);
@@ -2310,6 +2390,15 @@ impl Simulator {
                 self.set_queue_size(&qn, k as u64 + 1);
             }
             let elem = format!("{}[{}]", qn, k);
+            // §6.12.2: a real rounds to the element type.
+            let conv;
+            let val = match self.fit_real_nested_elem(expr, val) {
+                Some(v) => {
+                    conv = v;
+                    &conv
+                }
+                None => val,
+            };
             let prev = self.get_signal_value_by_name(&elem);
             let changed = prev.as_ref() != Some(val);
             self.set_signal_value_by_name(&elem, val.clone());
@@ -2317,6 +2406,14 @@ impl Simulator {
         }
         // `a[i][key] = v` on an array of associative arrays.
         if let Some(elem) = self.indexed_assoc_elem(expr, index) {
+            let conv;
+            let val = match self.fit_real_nested_elem(expr, val) {
+                Some(v) => {
+                    conv = v;
+                    &conv
+                }
+                None => val,
+            };
             let prev = self.get_signal_value_by_name(&elem);
             let changed = prev.as_ref() != Some(val);
             self.set_signal_value_by_name(&elem, val.clone());
@@ -2328,6 +2425,14 @@ impl Simulator {
         // the write is silently lost and later reads / `.exists()` /
         // recursion guards see nothing (IEEE 1800-2023 §7.8.1).
         if let Some((_, key)) = self.multidim_assoc_elem(expr, index) {
+            let conv;
+            let val = match self.fit_real_nested_elem(expr, val) {
+                Some(v) => {
+                    conv = v;
+                    &conv
+                }
+                None => val,
+            };
             let changed = self.signals.get(&key).is_none_or(|p| *p != *val);
             if changed {
                 self.signals.insert(key, val.clone());
@@ -2594,6 +2699,13 @@ impl Simulator {
             // which case the value is stored as-is (unchanged).
             let mut fitted = match self.assoc_elem_width(&an) {
                 Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
+                // §6.12.2: a real into an INTEGRAL element rounds to the
+                // declared width (`assoc_store_ctx_width` is None for a real
+                // element, which keeps the value).
+                Some(_) if val.is_real => match self.assoc_store_ctx_width(&an) {
+                    Some(w) => Self::real_to_int(val.to_f64(), w),
+                    None => val.clone(),
+                },
                 _ => self.fit_block_local_array_elem(&an, &elem_name, val.clone()),
             };
             // The element takes its declared signedness, not the RHS's
@@ -2953,11 +3065,7 @@ impl Simulator {
             }
             let fitted = match self.signals.get(&leaf) {
                 Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
-                Some(p) if !p.is_real && val.is_real => {
-                    let mut f = Self::real_to_int(val.to_f64(), p.width.max(1));
-                    f.is_signed = p.is_signed;
-                    f
-                }
+                Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                 Some(p) if !p.is_real && p.width > 0 => {
                     let mut f = val.resize(p.width);
                     f.is_signed = p.is_signed;
@@ -3286,6 +3394,14 @@ impl Simulator {
                 let mut fitted = match self.assoc_elem_width(&name) {
                     Some(w) if w != val.width && !val.is_real && !elem_is_string => {
                         val.resize_for_assign(w)
+                    }
+                    // §6.12.2: a real into an INTEGRAL element rounds to the
+                    // declared width (see the fast path above).
+                    Some(_) if val.is_real && !elem_is_string => {
+                        match self.assoc_store_ctx_width(&name) {
+                            Some(w) => Self::real_to_int(val.to_f64(), w),
+                            None => val.clone(),
+                        }
                     }
                     _ => val.clone(),
                 };
@@ -3623,7 +3739,7 @@ impl Simulator {
                         // wrongly resolves back to the PACKAGE name, and every
                         // element read returns all-x. Reset the cache so the
                         // new name resolves from scratch.
-                        ident.cached_resolved_name = std::cell::OnceCell::new();
+                        ident.cached_resolved_name = crate::ast::cache::NameCache::new();
                         return Some(Expression::new(ExprKind::Ident(ident), lhs.span));
                     }
                 }
@@ -3643,7 +3759,7 @@ impl Simulator {
                 // See the MemberAccess arm above: the cloned node inherits
                 // `cached_resolved_name` from the `<pkg>::<member>` reference;
                 // reset it so the bare `<member>` resolves fresh.
-                ident.cached_resolved_name = std::cell::OnceCell::new();
+                ident.cached_resolved_name = crate::ast::cache::NameCache::new();
                 Some(Expression::new(ExprKind::Ident(ident), lhs.span))
             }
             ExprKind::Index { expr, index } => {
@@ -3743,8 +3859,9 @@ impl Simulator {
                         root: None,
                         path,
                         span: e.span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
                     }),
                     e.span,
                 ))
@@ -3799,8 +3916,9 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span: crate::ast::Span::dummy(),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 }),
                 crate::ast::Span::dummy(),
             );
@@ -3870,7 +3988,7 @@ impl Simulator {
         // rather than each arm having to remember to push the bound. Gated on
         // a cheap scan, so an lvalue without `$` is untouched.
         let dollar_free;
-        let lhs: &Expression = if Self::lvalue_mentions_dollar(lhs) {
+        let lhs: &Expression = if Self::select_mentions_dollar(lhs) {
             dollar_free = self.resolve_dollar_in_lvalue(lhs);
             &dollar_free
         } else {
@@ -3968,8 +4086,9 @@ impl Simulator {
                                 root: h.root.clone(),
                                 path: vec![h.path[0].clone()],
                                 span: h.span,
-                                cached_signal_id: std::cell::Cell::new(None),
-                                cached_resolved_name: std::cell::OnceCell::new(),
+                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                bound: crate::ast::binding::Bound::UNSET,
                             };
                             Some(self.resolve_hier_name(&head_id).into_owned())
                         }
@@ -4198,6 +4317,9 @@ impl Simulator {
                             if let Some(slot) = frame.get_mut(&fname) {
                                 let fitted = if !slot.is_real && !val.is_real && slot.width > 0 {
                                     val.resize(slot.width)
+                                } else if !slot.is_real && val.is_real {
+                                    // §6.12.2: a real into an integral slot rounds.
+                                    Self::real_into_slot(slot, val.to_f64())
                                 } else {
                                     val.clone()
                                 };
@@ -4239,11 +4361,7 @@ impl Simulator {
                         f.is_signed = p.is_signed;
                         f
                     }
-                    Some(p) if !p.is_real && val.is_real => {
-                        let mut f = Self::real_to_int(val.to_f64(), p.width.max(1));
-                        f.is_signed = p.is_signed;
-                        f
-                    }
+                    Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                     _ => val.clone(),
                 };
                 let changed = prev.as_ref() != Some(&fitted);
@@ -4355,6 +4473,13 @@ impl Simulator {
                                 } else {
                                     val.clone()
                                 }
+                            } else if val.is_real
+                                && !is_str
+                                && let Some(p) = self.local_stack[last_idx].get(&joined)
+                                && !p.is_real
+                            {
+                                // §6.12.2: a real into an integral leaf rounds.
+                                Self::real_into_slot(p, val.to_f64())
                             } else {
                                 val.clone()
                             };
@@ -4476,6 +4601,17 @@ impl Simulator {
                             }
                             return true;
                         }
+                    }
+                    // §8.9/§8.14: a shadowed name whose nearest declaration
+                    // from the executing method's class is a STATIC is that
+                    // class's shared cell, though a derived class of the
+                    // object redeclares it as an instance property.
+                    if self.prop_maybe_shadowed(name)
+                        && let Some(ctx) = self.lexical_class()
+                        && self.member_is_static_prop(&ctx, name)
+                        && self.class_static_set(&ctx, name, val.clone())
+                    {
+                        return true;
                     }
                     // Check 'this' properties
                     if let Some(Some(handle)) = self.this_stack.last() {
@@ -4771,12 +4907,11 @@ impl Simulator {
                             } else {
                                 Value::from_f64(val.to_f64())
                             }
+                        } else if val.is_real {
+                            // §6.12.2: round to the nearest, not truncate.
+                            Self::real_to_int(val.to_f64(), w.max(1))
                         } else {
-                            if val.is_real {
-                                Value::from_u64(val.to_f64() as u64, w)
-                            } else {
-                                val.resize(w)
-                            }
+                            val.resize(w)
                         };
                         resized.is_signed = self.signed_signals.contains(&dotted_name);
                         let changed = existing_val != resized;
@@ -6095,6 +6230,10 @@ impl Simulator {
                                         Value::from_f64(val.to_f64())
                                     }
                                     Some(p) if !p.is_real && !val.is_real => val.resize(p.width),
+                                    // §6.12.2: a real into an integral leaf rounds.
+                                    Some(p) if !p.is_real && val.is_real => {
+                                        Self::real_into_slot(p, val.to_f64())
+                                    }
                                     _ => val.clone(),
                                 };
                                 let changed = prev.as_ref() != Some(&fitted);
@@ -6126,6 +6265,11 @@ impl Simulator {
                                 } else {
                                     val.clone()
                                 }
+                            } else if let Some(p) = self.local_stack[last_idx].get(flat.as_str())
+                                && !p.is_real
+                            {
+                                // §6.12.2: a real into an integral leaf rounds.
+                                Self::real_into_slot(p, val.to_f64())
                             } else {
                                 val.clone()
                             };
@@ -6377,6 +6521,10 @@ impl Simulator {
                         let fitted = match prev.as_ref() {
                             Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
                             Some(p) if !p.is_real && !val.is_real => val.resize(p.width),
+                            // §6.12.2: a real into an integral leaf rounds.
+                            Some(p) if !p.is_real && val.is_real => {
+                                Self::real_into_slot(p, val.to_f64())
+                            }
                             _ => val.clone(),
                         };
                         let changed = prev.as_ref() != Some(&fitted);

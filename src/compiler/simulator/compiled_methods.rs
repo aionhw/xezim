@@ -70,7 +70,11 @@ impl Simulator {
     /// statics) still BAILS: the compiled path cannot model shadowed storage
     /// keys nor class-static cells, so those must fall to the AST
     /// interpreter.
-    pub(super) fn bare_class_member_names(&self, cname: &str) -> HashSet<String> {
+    pub(super) fn bare_class_member_names_for(
+        &self,
+        handle: usize,
+        cname: &str,
+    ) -> HashSet<String> {
         use std::collections::HashMap as StdMap;
         // Collect the method-class + its full extends chain (the classes whose
         // instance properties are visible on `this`). Enclosing-class members
@@ -174,10 +178,97 @@ impl Simulator {
         // silently become `this.size()` (infinite dispatch recursion —
         // uvm_queue::size regressed exactly this way). The nonloadable set
         // covers the whole extends chain, same as the walk above.
-        for bad in self.class_nonloadable_member_names(cname) {
+        for bad in self.class_nonloadable_member_names_for(handle, cname) {
             names.remove(&bad);
         }
         names
+    }
+
+    pub(super) fn resolve_type_param_class_for(
+        &self,
+        handle: usize,
+        cname: &str,
+        dt: &DataType,
+    ) -> Option<String> {
+        let crate::ast::types::DataType::TypeReference {
+            name, dimensions, ..
+        } = dt
+        else {
+            return None;
+        };
+        if !dimensions.is_empty() {
+            return None;
+        }
+        let tp = &name.name.name;
+        let mut cur = Some(cname.to_string());
+        let mut seen = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            if cd.type_param_names.iter().any(|p| p == tp) {
+                let bound = if handle != 0 {
+                    self.obj_type_param(handle, &cn, tp)
+                } else {
+                    self.resolve_type_param_binding(tp)
+                };
+                if let Some(b) = bound {
+                    let b = b.trim();
+                    if self.module.classes.contains_key(b) {
+                        return Some(b.to_string());
+                    }
+                    if let Some((_, rhs)) = b.rsplit_once("::")
+                        && self.module.classes.contains_key(rhs)
+                    {
+                        return Some(rhs.to_string());
+                    }
+                    if let Some((base, _)) = b.split_once('#') {
+                        let base = base.trim();
+                        if self.module.classes.contains_key(base) {
+                            return Some(base.to_string());
+                        }
+                    }
+                }
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    pub(super) fn instance_prop_is_vif_capable(
+        &self,
+        handle: usize,
+        cd: &xezim_core::elaborate::ElaboratedClass,
+        cur_class: &str,
+        p: &str,
+    ) -> bool {
+        if !Self::static_is_vif_capable(cd, p) {
+            return false;
+        }
+        if handle == 0 || cd.static_properties.contains(p) || cd.virtual_iface_properties.contains_key(p) {
+            return true;
+        }
+        if let Some(crate::ast::types::DataType::TypeReference {
+            name, dimensions, ..
+        }) = cd.property_types.get(p)
+            && dimensions.is_empty()
+            && cd.type_param_names.contains(&name.name.name)
+            && let Some(bound) = self.obj_type_param(handle, cur_class, &name.name.name)
+        {
+            let b = bound.trim();
+            if b.starts_with("virtual") {
+                return true;
+            }
+            let base = b.split('#').next().unwrap_or(b).trim();
+            if self.module.interfaces.contains(base) {
+                return true;
+            }
+            return false;
+        }
+        true
     }
 
     /// class-perf: chain property names the compiled path must NOT lower to
@@ -189,7 +280,11 @@ impl Simulator {
     /// array_equality_class — every `sa == rhs.sa` compared two zeros "equal").
     /// The caller merges these into the shadow-bail set so any reference bails
     /// to the AST path.
-    pub(super) fn class_nonloadable_member_names(&self, cname: &str) -> HashSet<String> {
+    pub(super) fn class_nonloadable_member_names_for(
+        &self,
+        handle: usize,
+        cname: &str,
+    ) -> HashSet<String> {
         let mut bad: HashSet<String> = HashSet::default();
         let mut seen: HashSet<String> = HashSet::default();
         let mut cur = cname.to_string();
@@ -239,7 +334,7 @@ impl Simulator {
                 // shape; copying the numeric cell alone loses the binding.
                 // This admission set is shared across specializations, so a
                 // type parameter that may carry a vif must keep the AST path.
-                let vif_capable = Self::static_is_vif_capable(cd, p);
+                let vif_capable = self.instance_prop_is_vif_capable(handle, cd, &cur, p);
                 if unpacked || vif_capable || !integral_or_handle {
                     bad.insert(p.clone());
                 }
@@ -285,6 +380,41 @@ impl Simulator {
             .classes
             .contains_key(class)
             .then_some(TypeParamKind::Class)
+    }
+
+    /// class-perf: does the declared return type name a CLASS type parameter
+    /// (bare `T`) whose concrete binding on this specialization is `real`?
+    /// The width-0 passthrough that serves class handles and generic type-
+    /// parameter returns must ALSO be used for a real-bound parameter —
+    /// otherwise `resolve_type_width` treats the bare `T` as an unknown
+    /// typedef (width 32) and the compiled `return e` truncates a real value
+    /// to int (the `P#(real)::get()` regression: 2.5 -> 3.0). The interpreter
+    /// routes the same case through `concrete_ret_conv` to `RetConv::Real`.
+    pub(super) fn param_result_is_real(&self, cname: &str, dt: &DataType) -> bool {
+        let DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = dt
+        else {
+            return false;
+        };
+        if !dimensions.is_empty() || !type_args.is_empty() || !name.scopes.is_empty() {
+            return false;
+        }
+        let tn = name.name.name.as_str();
+        let base = cname.split('#').next().unwrap_or(cname);
+        let Some(cd) = self.module.classes.get(base) else {
+            return false;
+        };
+        if !cd.type_param_names.iter().any(|t| t == tn) {
+            return false;
+        }
+        matches!(
+            self.resolve_type_param_binding(tn).as_deref(),
+            Some("real") | Some("shortreal")
+        )
     }
 
     /// class-perf: does `dt` (a TypeReference, possibly through a typedef
@@ -435,7 +565,7 @@ impl Simulator {
         out
     }
 
-    pub(super) fn class_handle_member_types(&self) -> HashMap<String, HashMap<String, String>> {
+    pub(super) fn class_handle_member_types(&mut self) -> HashMap<String, HashMap<String, String>> {
         let mut out: HashMap<String, HashMap<String, String>> = HashMap::default();
         for (cn, _) in self.module.classes.iter() {
             let mut members: HashMap<String, String> = HashMap::default();
@@ -468,7 +598,59 @@ impl Simulator {
                     // The compiler's scalar-vs-collection paths consult the
                     // collection-name sets FIRST, so this entry is only
                     // visible to element-typed logic.
-                    if let Some(t) = self.typeref_class_name(dt) {
+                    let member_class = {
+                        let mut r = self.typeref_class_name(dt);
+                        // If `dt` is a TypeReference whose leaf is a
+                        // class-local typedef of the declaring class `cur`
+                        // (e.g. `this_type`, declared in every
+                        // parameterized UVM class), resolve it IN `cur`'s
+                        // scope. The module-level `typedef_types` table
+                        // clobbers same-named class-local typedefs — the
+                        // LAST class processed wins arbitrarily — so the
+                        // bare `typeref_class_name` above would resolve
+                        // `uvm_callbacks.m_t_inst` (`this_type`) against
+                        // some unrelated class (uvm_component_registry) and
+                        // bake a wrong static-owner into `m_get_q`.
+                        if let crate::ast::types::DataType::TypeReference {
+                            name: tn,
+                            dimensions,
+                            ..
+                        } = dt
+                            && dimensions.is_empty()
+                        {
+                            let leaf = tn.name.name.as_str();
+                            let is_class_local = {
+                                let mut cname = Some(cur.clone());
+                                let mut s = HashSet::default();
+                                let mut found = false;
+                                while let Some(cn) = cname {
+                                    if !s.insert(cn.clone()) {
+                                        break;
+                                    }
+                                    if let Some(cd) = self.module.classes.get(&cn) {
+                                        if cd.typedef_targets.contains_key(leaf) {
+                                            found = true;
+                                            break;
+                                        }
+                                        cname = cd.extends.clone();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                found
+                            };
+                            if is_class_local {
+                                self.class_context_stack.push(Some(cur.clone()));
+                                let cr = self.resolve_typeref_class_name(tn);
+                                self.class_context_stack.pop();
+                                if cr.is_some() {
+                                    r = cr;
+                                }
+                            }
+                        }
+                        r
+                    };
+                    if let Some(t) = member_class {
                         members.entry(p.clone()).or_insert(t);
                     }
                 }
@@ -682,7 +864,65 @@ impl Simulator {
         out
     }
 
-    pub(super) fn class_typed_member_names(&self, cname: &str) -> HashSet<String> {
+    fn walk_type_param_locals(
+        st: &Statement,
+        cd: &xezim_core::elaborate::ElaboratedClass,
+        out: &mut HashMap<String, String>,
+    ) {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } => {
+                if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
+                    if cd.type_param_names.iter().any(|p| p == &name.name.name) {
+                        for d in declarators {
+                            out.entry(d.name.name.clone()).or_insert_with(|| name.name.name.clone());
+                        }
+                    }
+                }
+            }
+            SK::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::walk_type_param_locals(then_stmt, cd, out);
+                if let Some(e) = else_stmt {
+                    Self::walk_type_param_locals(e, cd, out);
+                }
+            }
+            SK::Case { items, .. } => {
+                for it in items {
+                    Self::walk_type_param_locals(&it.stmt, cd, out);
+                }
+            }
+            SK::For { body, .. }
+            | SK::Foreach { body, .. }
+            | SK::ForeachTail { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body, .. }
+            | SK::ForeverTail { body, .. }
+            | SK::TimingControl { stmt: body, .. }
+            | SK::Wait { stmt: body, .. } => Self::walk_type_param_locals(body, cd, out),
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                for s in stmts {
+                    Self::walk_type_param_locals(s, cd, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn class_typed_member_names_for(
+        &self,
+        handle: usize,
+        cname: &str,
+    ) -> HashSet<String> {
         let mut out = HashSet::default();
         let mut seen = HashSet::default();
         let mut cur = cname.to_string();
@@ -691,7 +931,9 @@ impl Simulator {
                 break;
             }
             for (p, dt) in cd.property_types.iter() {
-                if self.typeref_names_class(dt) {
+                if self.typeref_names_class(dt)
+                    || self.resolve_type_param_class_for(handle, &cur, dt).is_some()
+                {
                     out.insert(p.clone());
                 }
             }
@@ -713,7 +955,15 @@ impl Simulator {
     /// (arrays/queues/assoc/structs/strings/reals), and enclosing-class
     /// members (not instantiated on a nested-class instance).
     pub(super) fn class_member_access_safe_names(&self, cname: &str) -> HashSet<String> {
-        let nonloadable = self.class_nonloadable_member_names(cname);
+        self.class_member_access_safe_names_for(0, cname)
+    }
+
+    pub(super) fn class_member_access_safe_names_for(
+        &self,
+        handle: usize,
+        cname: &str,
+    ) -> HashSet<String> {
+        let nonloadable = self.class_nonloadable_member_names_for(handle, cname);
         let mut safe = HashSet::default();
         let mut seen = HashSet::default();
         let mut cur = cname.to_string();
@@ -1114,6 +1364,71 @@ impl Simulator {
                     out.insert(p.clone(), dims);
                 }
             }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// Declared ELEMENT widths of `cname`'s element-access plan members
+    /// (`class_coll_elem_member_names` set), walked over the extends
+    /// chain: fixed arrays record the element width in
+    /// `array_properties`, queues in `queue_properties`; associative
+    /// members take the property's declared width. Mirrored into the
+    /// bytecode compiler as a plan fact — its width inference has no
+    /// other table for a member element select, and sized one at 1 bit
+    /// when every table missed (a `(base[i] < base[j])` condition in a
+    /// compiled method then compared the elements' LSBs).
+    pub(super) fn class_coll_elem_widths(&self, cname: &str) -> HashMap<String, u32> {
+        let mut out = HashMap::default();
+        if cname.starts_with("__free_fn__") {
+            return out;
+        }
+        let mut seen = HashSet::default();
+        let mut cur = cname.to_string();
+        // §8.14: a property a derived class redeclares is a separate
+        // variable — the LEAF-MOST declarer on the chain owns the name.
+        // Record widths only for names no more-derived class declares
+        // (as ANY kind of property: a scalar redeclaration must also
+        // mask an ancestor's collection width for the same name).
+        let mut declared = HashSet::default();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            // String collections have no integral element width (their
+            // reads lower outside the element path entirely).
+            let strings = self.class_string_coll_member_names(&cur);
+            for (p, &(_, _, w)) in cd.array_properties.iter() {
+                if w > 0 && !declared.contains(p) && !strings.contains(p) {
+                    out.insert(p.clone(), w);
+                }
+            }
+            for (p, &(w, _)) in cd.queue_properties.iter() {
+                if w > 0 && !declared.contains(p) && !strings.contains(p) {
+                    out.insert(p.clone(), w);
+                }
+            }
+            for p in cd.assoc_properties.keys() {
+                if !declared.contains(p)
+                    && !strings.contains(p)
+                    && let Some(Some(w)) = self.class_prop_width_fixed(&cur, p)
+                    && w > 0
+                {
+                    out.insert(p.clone(), w);
+                }
+            }
+            // Mask by every table's keys, not only `properties`: the
+            // leaf-most-wins invariant must hold even for a name the
+            // class records solely as a collection (and a leaf
+            // collection skipped for `w == 0` must still mask an
+            // ancestor's width for the same name).
+            declared.extend(cd.properties.keys().cloned());
+            declared.extend(cd.array_properties.keys().cloned());
+            declared.extend(cd.queue_properties.keys().cloned());
+            declared.extend(cd.assoc_properties.keys().cloned());
             match &cd.extends {
                 Some(b) => cur = b.clone(),
                 None => break,
@@ -1606,9 +1921,10 @@ impl Simulator {
                         return_type: crate::ast::types::DataType::Void(crate::ast::Span::dummy()),
                         name: t.name.clone(),
                         ports: t.ports.clone(),
-                        items: Vec::new(),
+                        items: Default::default(),
                         endlabel: t.endlabel.clone(),
                         strict_body_ports: Vec::new(),
+                        decl: t.decl,
                         span: t.span,
                     };
                     &task_fd_storage
@@ -1648,6 +1964,9 @@ impl Simulator {
                 }
                 let shape_ok = port.dimensions.is_empty()
                     && (self.typeref_names_class(&port.data_type)
+                        || self
+                            .resolve_type_param_class_for(handle, cname, &port.data_type)
+                            .is_some()
                         || Self::is_string_data_type(&port.data_type)
                         || self.enum_type_info(&port.data_type).is_some()
                         || self.scalar_formal_integral(&port.data_type).is_some());
@@ -1694,10 +2013,25 @@ impl Simulator {
                 && !is_string_result
                 && !is_void_result
                 && self.fn_returns_collection(&_f.return_type);
+            let cd_type_params: Option<Vec<String>> = self
+                .module
+                .classes
+                .get(cname)
+                .map(|cd| cd.type_param_names.clone());
+            let is_type_param_result = !is_class_result
+                && cd_type_params.as_ref().is_some_and(|tp| {
+                    match &_f.return_type {
+                        crate::ast::types::DataType::TypeReference { name, .. } => {
+                            tp.iter().any(|p| p == &name.name.name)
+                        }
+                        _ => false,
+                    }
+                });
             let (static_result_width, result_signed) = if is_string_result {
                 (0u32, false)
-            } else if is_class_result {
-                // class handle: width meaningless; pass through untouched.
+            } else if is_class_result || is_type_param_result {
+                // class handle or type parameter (e.g. CB in uvm_callbacks):
+                // width meaningless; pass through untouched.
                 (0u32, false)
             } else if is_void_result {
                 // Step 9e: void / ctor — passthrough result cell.
@@ -1772,8 +2106,19 @@ impl Simulator {
                     // a compile-able integer vector/atom. (String formals are
                     // handled above — allowed, not skipped.)
                     use crate::ast::types::DataType as DT;
-                    let Some(pw) = self.scalar_formal_integral(&port.data_type).map(|(w, _)| w)
-                    else {
+                    let is_type_param_formal = cd_type_params.as_ref().is_some_and(|tp| {
+                        match &port.data_type {
+                            DT::TypeReference { name, .. } => {
+                                tp.iter().any(|p| p == &name.name.name)
+                            }
+                            _ => false,
+                        }
+                    });
+                    let Some(pw) = (if is_type_param_formal {
+                        Some(0)
+                    } else {
+                        self.scalar_formal_integral(&port.data_type).map(|(w, _)| w)
+                    }) else {
                         // class-perf collection-return: a TYPE-PARAM formal
                         // (`KEY_T key` — an unresolvable TypeReference: type
                         // params are never hoisted into `typedef_types`) of a
@@ -1858,6 +2203,7 @@ impl Simulator {
                 static_coll_members: std::rc::Rc::new(self.class_static_coll_member_names(cname)),
                 coll_elem_members: std::rc::Rc::new(self.class_coll_elem_member_names(cname)),
                 coll_elem_packed_dims: std::rc::Rc::new(self.class_coll_elem_packed_dims(cname)),
+                coll_elem_widths: std::rc::Rc::new(self.class_coll_elem_widths(cname)),
                 writeback_formals: std::rc::Rc::new(writeback_formals),
                 static_result_width,
                 result_signed,
@@ -1869,8 +2215,13 @@ impl Simulator {
             pre
         };
         // Effective result width: instance-resolved for param-bounded packed
-        // returns, else the static width from the plan.
-        let result_width = if pre.param_able_result
+        // returns, else the static width from the plan. A type parameter bound
+        // to a real is a width-0 passthrough (see `param_result_is_real`) —
+        // resolving the bare `T` through module typedefs would otherwise yield
+        // an int width and the compiled return would truncate the real.
+        let result_width = if self.param_result_is_real(cname, &pre.return_type) {
+            0
+        } else if pre.param_able_result
             && matches!(
                 &*pre.return_type,
                 crate::ast::types::DataType::TypeReference { .. }
@@ -1880,8 +2231,18 @@ impl Simulator {
             // §8.25: a class typedef sized by a class parameter (`vec_t`).
             w
         } else if pre.param_able_result {
-            let scope = self.instance_param_scope(handle);
-            let w = resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs));
+            // The null handle (a free function) binds no class parameters,
+            // so the parameter table needs no per-call copy.
+            let w = if handle == 0 {
+                resolve_type_width(
+                    &pre.return_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+            } else {
+                let scope = self.instance_param_scope(handle);
+                resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs))
+            };
             if w > 0 { w } else { pre.static_result_width }
         } else {
             pre.static_result_width
@@ -1948,23 +2309,24 @@ impl Simulator {
                 // Members the heap cannot faithfully round-trip (arrays,
                 // queues, assoc, structs, strings, reals) join the shadow-bail
                 // set: any reference bails to AST instead of reading garbage.
-                shadow_names.extend(self.class_nonloadable_member_names(cname));
-                let bare_members = self.bare_class_member_names(cname);
+                shadow_names.extend(self.class_nonloadable_member_names_for(handle, cname));
+                let bare_members = self.bare_class_member_names_for(handle, cname);
                 // Dispatch-handle members: the class-typed subset of the
                 // bare set (the CallMethod gate requires BOTH — an integral
                 // member like uvm_reg_field's `value` must not become a
                 // dispatch base).
-                let member_classes = self.class_typed_member_names(cname);
+                let member_classes = self.class_typed_member_names_for(handle, cname);
                 // Dotted member accesses faithful by runtime bare key (see
                 // the fn doc): statics/nonloadable/enclosing excluded.
-                let member_safe = self.class_member_access_safe_names(cname);
+                let member_safe = self.class_member_access_safe_names_for(handle, cname);
                 // Step 9a: string members — bare/dotted reads lower to
                 // LoadClassMember (byte-vector Value round-trips verbatim).
                 let string_members = self.class_string_member_names(cname);
                 // Step 6: body VarDecls of CLASS type hold heap handles in
                 // registers; the compiler needs their names (it cannot see
                 // the class table).
-                let class_locals = self.class_typed_local_names(body);
+                let mut class_locals = self.class_typed_local_names(body);
+                let cd_opt = self.module.classes.get(cname);
                 // class-perf P2 (typed handle roots): declared class per
                 // handle FORMAL and class-typed body LOCAL, so a dispatch
                 // chain rooted at one (`sched.m_parent.get_phase_type()` —
@@ -1974,8 +2336,17 @@ impl Simulator {
                 let mut handle_local_types = {
                     let mut m: HashMap<String, String> = HashMap::default();
                     for port in ports {
-                        if let Some(cls) = self.typeref_class_name(&port.data_type) {
+                        if let Some(cls) = self
+                            .typeref_class_name(&port.data_type)
+                            .or_else(|| self.resolve_type_param_class_for(handle, cname, &port.data_type))
+                        {
                             m.insert(port.name.name.clone(), cls);
+                        } else if let Some(cd) = cd_opt {
+                            if let crate::ast::types::DataType::TypeReference { name, .. } = &port.data_type {
+                                if cd.type_param_names.iter().any(|p| p == &name.name.name) {
+                                    m.insert(port.name.name.clone(), name.name.name.clone());
+                                }
+                            }
                         }
                     }
                     // A name declared with two classes in different blocks
@@ -1995,6 +2366,35 @@ impl Simulator {
                     }
                     for n in conflict {
                         m.remove(&n);
+                    }
+                    if let Some(cd) = cd_opt {
+                        let mut tp_locals = HashMap::default();
+                        for st in body {
+                            Self::walk_type_param_locals(st, cd, &mut tp_locals);
+                        }
+                        for (vname, tp_name) in tp_locals {
+                            let span = crate::ast::Span::dummy();
+                            let dt = crate::ast::types::DataType::TypeReference {
+                                name: crate::ast::types::TypeName {
+                                    scopes: Vec::new(),
+                                    name: crate::ast::Identifier {
+                                        name: tp_name.clone(),
+                                        span,
+                                    },
+                                    span,
+                                    bound: Default::default(),
+                                },
+                                dimensions: Vec::new(),
+                                type_args: Vec::new(),
+                                span,
+                            };
+                            if let Some(cls) = self.resolve_type_param_class_for(handle, cname, &dt) {
+                                class_locals.insert(vname.clone());
+                                m.entry(vname).or_insert(cls);
+                            } else {
+                                m.entry(vname).or_insert(tp_name);
+                            }
+                        }
                     }
                     m
                 };
@@ -2137,14 +2537,45 @@ impl Simulator {
                     rc
                 });
                 // Walks every class: built once, not per method compile.
-                let handle_member_types = match &self.class_handle_member_types_cache {
-                    Some(rc) => rc.clone(),
+                // Cloned into an owned map below so a non-zero `handle` can
+                // additionally record per-instance TYPE-PARAMETER-bound property
+                // classes (the cached map resolves only statically-named
+                // classes). The walk is still cached; the clone is the cost of
+                // the per-handle type-param specialization (feature 38fc4804).
+                let mut handle_member_types = match &self.class_handle_member_types_cache {
+                    Some(rc) => (**rc).clone(),
                     None => {
-                        let rc = std::rc::Rc::new(self.class_handle_member_types());
-                        self.class_handle_member_types_cache = Some(rc.clone());
-                        rc
+                        let map = self.class_handle_member_types();
+                        self.class_handle_member_types_cache =
+                            Some(std::rc::Rc::new(map.clone()));
+                        map
                     }
                 };
+                if handle != 0 {
+                    let mut cur = Some(cname.to_string());
+                    let mut seen = HashSet::default();
+                    while let Some(cn) = cur {
+                        if !seen.insert(cn.clone()) {
+                            break;
+                        }
+                        if let Some(cd) = self.module.classes.get(&cn) {
+                            for (p, dt) in cd.property_types.iter() {
+                                if let Some(cls) =
+                                    self.resolve_type_param_class_for(handle, &cn, dt)
+                                {
+                                    handle_member_types
+                                        .entry(cname.to_string())
+                                        .or_default()
+                                        .entry(p.clone())
+                                        .or_insert(cls);
+                                }
+                            }
+                            cur = cd.extends.clone();
+                        } else {
+                            break;
+                        }
+                    }
+                }
                 // class-perf P2: FOREACH loop variables over a collection
                 // MEMBER whose element is a class handle (`foreach
                 // (m_successors[succ])` — uvm_phase::m_find_successor_by_name)
@@ -2159,23 +2590,106 @@ impl Simulator {
                                 std::sync::OnceLock::new();
                             EMPTY.get_or_init(HashMap::default)
                         });
-                    fn member_assoc_key_class(
+                    fn member_is_assoc(
                         sim: &Simulator,
                         cname: &str,
                         member: &str,
-                    ) -> Option<String> {
-                        // A member declared with a TYPEDEF'd assoc type
-                        // (`typedef bit edges_t[uvm_phase];` + `edges_t
-                        // m_successors;`): the foreach loop var iterates the
-                        // KEYS, whose class the typedef's unpacked dim
-                        // records. Walk the chain leaf-first.
+                    ) -> bool {
+                        // A member is treated as ASSOCIATIVE (so a foreach
+                        // first var iterates KEYS, not elements) when its key
+                        // is carried by the class chain's assoc-key tables,
+                        // or its typedef carries an associative unpacked dim.
                         let mut cur = Some(cname.to_string());
                         let mut seen = HashSet::default();
                         while let Some(cn) = cur {
                             if !seen.insert(cn.clone()) {
                                 break;
                             }
-                            let cd = sim.module.classes.get(&cn)?;
+                            let Some(cd) = sim.module.classes.get(&cn) else {
+                                break;
+                            };
+                            if cd.assoc_key_types.contains_key(member)
+                                || cd.static_assoc_key_types.contains_key(member)
+                            {
+                                return true;
+                            }
+                            if let Some(dt) = cd.property_types.get(member)
+                                && let crate::ast::types::DataType::TypeReference {
+                                    name: tn, ..
+                                } = dt
+                                && let Some(dims) =
+                                    sim.module.typedef_unpacked_dims.get(&tn.name.name)
+                                && dims.iter().any(|d| {
+                                    matches!(
+                                        d,
+                                        crate::ast::types::UnpackedDimension::Associative { .. }
+                                    )
+                                })
+                            {
+                                return true;
+                            }
+                            cur = cd.extends.clone();
+                        }
+                        false
+                    }
+                    fn member_assoc_key_class(
+                        sim: &Simulator,
+                        cname: &str,
+                        member: &str,
+                        handle: usize,
+                    ) -> Option<String> {
+                        // Resolves the KEY class of an associative member.
+                        // Two shapes reach here:
+                        //  * a DIRECT-decl assoc member (`T p[KEY]` /
+                        //    `uvm_phase p[]`): the foreach var iterates the
+                        //    KEYS; resolve the key type-param through the
+                        //    class chain's assoc-key tables. A NON-CLASS key
+                        //    (string/int) yields None — it must NOT become a
+                        //    handle local (`foreach (p[string]) { k }`).
+                        //  * a TYPEDEF'd assoc type (`typedef bit edges_t
+                        //    [uvm_phase];` + `edges_t m_successors;`): the
+                        //    foreach loop var iterates the KEYS, whose class
+                        //    the typedef's unpacked dim records.
+                        let mut cur = Some(cname.to_string());
+                        let mut seen = HashSet::default();
+                        while let Some(cn) = cur {
+                            if !seen.insert(cn.clone()) {
+                                break;
+                            }
+                            let Some(cd) = sim.module.classes.get(&cn) else {
+                                break;
+                            };
+                            if let Some(kt) = cd
+                                .assoc_key_types
+                                .get(member)
+                                .or_else(|| cd.static_assoc_key_types.get(member))
+                            {
+                                let dt = crate::ast::types::DataType::TypeReference {
+                                    name: crate::ast::types::TypeName {
+                                        scopes: Vec::new(),
+                                        name: crate::ast::Identifier {
+                                            name: kt.clone(),
+                                            span: crate::ast::Span::dummy(),
+                                        },
+                                        span: crate::ast::Span::dummy(),
+                                        bound: Default::default(),
+                                    },
+                                    dimensions: Vec::new(),
+                                    type_args: Vec::new(),
+                                    span: crate::ast::Span::dummy(),
+                                };
+                                // Class binding -> handle local; non-class
+                                // (string/int) -> not a handle local.
+                                if let Some(cls) = sim.resolve_type_param_class_for(handle, &cn, &dt)
+                                {
+                                    return Some(cls);
+                                }
+                                // The declaring class's key table is
+                                // authoritative; a shadowed redeclaration
+                                // elsewhere is resolved there, not by the
+                                // element class fallback below.
+                                return None;
+                            }
                             if let Some(dt) = cd.property_types.get(member)
                                 && let crate::ast::types::DataType::TypeReference {
                                     name: tn, ..
@@ -2201,6 +2715,7 @@ impl Simulator {
                         m: &mut HashMap<String, String>,
                         sim: &Simulator,
                         cname: &str,
+                        handle: usize,
                     ) {
                         use crate::ast::stmt::StatementKind as SK;
                         if let SK::Foreach { array, vars, .. } = &st.kind {
@@ -2209,13 +2724,18 @@ impl Simulator {
                                 && h.path.len() == 1
                                 && h.path[0].selects.is_empty()
                             {
-                                let elem_or_key = member_elem_classes
-                                    .get(h.path[0].name.name.as_str())
-                                    .cloned()
-                                    .or_else(|| {
-                                        member_assoc_key_class(sim, cname, &h.path[0].name.name)
-                                    });
-                                if let Some(cls) = elem_or_key
+                                let name = h.path[0].name.name.as_str();
+                                let cls = if member_is_assoc(sim, cname, name) {
+                                    // Assoc: the first var iterates KEYS. Only
+                                    // a class key becomes a handle local; a
+                                    // non-class key (string/int) stays a
+                                    // NON-handle (so `k.substr()`/`k.len()`
+                                    // lower to StrOps, not a class call).
+                                    member_assoc_key_class(sim, cname, name, handle)
+                                } else {
+                                    member_elem_classes.get(name).cloned()
+                                };
+                                if let Some(cls) = cls
                                     && let Some(Some(v)) = vars.first()
                                 {
                                     m.entry(v.name.clone()).or_insert_with(|| cls);
@@ -2223,7 +2743,7 @@ impl Simulator {
                             }
                         }
                         for sub in Simulator::sub_stmts(st) {
-                            walk_foreach(sub, member_elem_classes, m, sim, cname);
+                            walk_foreach(sub, member_elem_classes, m, sim, cname, handle);
                         }
                     }
                     for st in body {
@@ -2233,6 +2753,7 @@ impl Simulator {
                             &mut handle_local_types,
                             self,
                             cname,
+                            handle,
                         );
                     }
                 }
@@ -2411,6 +2932,20 @@ impl Simulator {
                             cur = cd.extends.clone();
                         }
                         facts.instance_colls.insert(class.clone(), colls);
+                        // §8.23 static methods of this class, for the
+                        // null-handle dispatch at the call site. Keyed by the
+                        // elaborated name AND its specialization-stripped base
+                        // (a receiver's declared class may name either).
+                        if !declaration.static_methods.is_empty() {
+                            let base = class.split('#').next().unwrap_or(class).to_string();
+                            for key in [class.clone(), base] {
+                                facts
+                                    .static_methods
+                                    .entry(key)
+                                    .or_default()
+                                    .extend(declaration.static_methods.iter().cloned());
+                            }
+                        }
                         // Direct superclass (spec args stripped): the
                         // writeback-hierarchy walk in
                         // `emit_arg_slot_writeback` climbs this chain.
@@ -2607,6 +3142,7 @@ impl Simulator {
                                             span,
                                         },
                                         span,
+                                        bound: Default::default(),
                                     },
                                     dimensions: vec![],
                                     type_args: vec![],
@@ -2633,6 +3169,12 @@ impl Simulator {
                     compiler.set_member_wise_struct_ids(&self.member_wise_struct_ids);
                     compiler.set_member_wise_struct_names(&self.member_wise_struct_names);
                     Self::set_pattern_type_tables(&self.module, &mut compiler);
+                    // §7.5/§7.10: a design-scope dynamic array or queue element
+                    // is read and written by the interpreter (`array_operand`).
+                    compiler.set_collection_denies(
+                        &self.module.dynamic_arrays,
+                        &self.module.queue_vars,
+                    );
                     compiler.method_enum_constants = method_enum_constants;
                     compiler.class_scoped_enums = Some(match &self.class_scoped_enum_cache {
                         Some(rc) => rc.clone(),
@@ -2651,6 +3193,7 @@ impl Simulator {
                     compiler.method_admission = Some(admission);
                     // issue-301 plan fact: multi-dim packed coll elements.
                     compiler.coll_elem_packed_dims = (*pre.coll_elem_packed_dims).clone();
+                    compiler.coll_elem_widths = (*pre.coll_elem_widths).clone();
                     compiler.member_coll_strings = self.class_string_coll_member_names(cname);
                     compiler.typedef_coll_dims = self.local_typedef_coll_dims(
                         cname,
@@ -2779,6 +3322,7 @@ impl Simulator {
                             | I::CallStaticScoped(..)
                             | I::StmtFallback(..)
                             | I::EvalExprFallback(..)
+                            | I::LoadDynElem(..)
                     )
                 };
                 let reentrant_static =
@@ -2956,7 +3500,9 @@ impl Simulator {
                 ..
             } = &st.kind
             {
-                let cn = self.derive_var_decl_class_name(data_type);
+                let cn = self
+                    .derive_var_decl_class_name(data_type)
+                    .or_else(|| self.resolve_type_param_class_for(handle, cname, data_type));
                 for d in declarators {
                     if d.dimensions.is_empty() {
                         self.record_var_decl_type_metadata(data_type, &d.name.name, cn.as_deref());
@@ -4342,7 +4888,7 @@ impl Simulator {
                 signed: v.is_signed,
                 base: NumberBase::Hex,
                 value: v.to_hex(),
-                cached_val: std::cell::Cell::new(inline),
+                cached_val: crate::ast::cache::LiteralCache::new(inline),
             }),
             crate::ast::Span::dummy(),
         )
@@ -4375,7 +4921,20 @@ impl Simulator {
             if port.direction == PortDirection::Input || !port.dimensions.is_empty() {
                 continue;
             }
+            let is_type_param = match &port.data_type {
+                DataType::TypeReference {
+                    name, dimensions, ..
+                } if dimensions.is_empty() => {
+                    self.module
+                        .classes
+                        .get(md.class.as_str())
+                        .is_some_and(|cd| cd.type_param_names.contains(&name.name.name))
+                        || self.class_member_names().params.contains(&name.name.name)
+                }
+                _ => false,
+            };
             let ok = self.typeref_names_class(&port.data_type)
+                || is_type_param
                 || Self::is_string_data_type(&port.data_type)
                 || self.enum_type_info(&port.data_type).is_some()
                 || self.scalar_formal_integral(&port.data_type).is_some();
@@ -4439,8 +4998,9 @@ impl Simulator {
                             selects: Vec::new(),
                         }],
                         span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
                     }),
                     span,
                 );
@@ -4485,6 +5045,14 @@ impl Simulator {
     /// name accessed inside a method — the current `this` instance's property
     /// map. Returns the raw handle value (caller checks mailboxes/semaphores).
     pub(super) fn resolve_container_handle(&self, obj_name: &str) -> Option<usize> {
+        // §6.21/§23.9: an automatic local (including a null handle) hides
+        // a same-named module variable. Use the class/local lookup before
+        // resolving a bare receiver through the design's signal table.
+        if !obj_name.contains('.')
+            && let Some(handle) = self.eval_ident_handle(obj_name)
+        {
+            return Some(handle);
+        }
         if let Some(v) = self.get_signal_value_by_name(obj_name) {
             return Some(v.to_u64().unwrap_or(0) as usize);
         }
@@ -4603,8 +5171,9 @@ impl Simulator {
                     root: h.root.clone(),
                     path: vec![seg],
                     span: h.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 let e = Expression::new(ExprKind::Ident(bare), lvalue.span);
                 if let Some(k) = self.lvalue_container_kind(&e) {
@@ -4777,6 +5346,7 @@ impl Simulator {
                                 span: crate::ast::Span::dummy(),
                             },
                             span: crate::ast::Span::dummy(),
+                            bound: Default::default(),
                         };
                         if let Some(resolved) = self.resolve_typeref_class_name(&tn) {
                             return Some(resolved);

@@ -4,6 +4,26 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// One item of an evaluated `dist` (a resolved `Value` or a `lo..=hi` span),
+/// paired with its mass. Built by `resolve_dist_geometry` and cached in hot
+/// foreach loops so the scalar bounds/weights are not re-evaluated per element.
+#[derive(Clone)]
+pub(super) enum DistItem {
+    One(Value),
+    /// lo, hi, width
+    Span(i64, i64, u32),
+}
+
+/// A fully resolved `dist`: its items with masses, the mass vector, and the
+/// total mass. Cheap to clone (the per-solve memo holds one per distinct
+/// `dist`); the deal + value draw keep using `deal_dist_item`/the RNG per call.
+#[derive(Clone)]
+pub(super) struct ResolvedDist {
+    pub(super) items: Vec<(DistItem, u128)>,
+    pub(super) masses: Vec<u128>,
+    pub(super) total: u128,
+}
+
 impl Simulator {
     pub(super) fn randomize_check_items(
         &mut self,
@@ -254,6 +274,19 @@ impl Simulator {
     }
 
     pub(super) fn array_operand_name(&mut self, expr: &Expression) -> Option<String> {
+        // Inside a subroutine body `pkg::arr` parses as a member access on
+        // the package name; the package's collection is stored under its
+        // bare name (or its contested `<pkg>::<name>` store).
+        // A local or property sharing the package's name is an object.
+        if let ExprKind::MemberAccess { expr: base, .. } = &expr.kind
+            && matches!(&base.kind, ExprKind::Ident(h) if !self.ident_shadowed_by_non_collection(h))
+            && let Some(e) = self.strip_package_lvalue(expr)
+            && let ExprKind::Ident(h) = &e.kind
+        {
+            let nm = &h.path[0].name.name;
+            return (self.module.arrays.contains_key(nm) || self.module.dynamic_arrays.contains(nm))
+                .then(|| nm.clone());
+        }
         if let ExprKind::Ident(h) = &expr.kind
             && !self.ident_shadowed_by_non_collection(h)
         {
@@ -626,12 +659,30 @@ impl Simulator {
         // The root must be a plain Ident naming an associative array, or
         // (§7.4.5) a prefix of the chain names one: `v[0]["A"]` of
         // `int v[2][string][string]`, or `a[0].m["A"]` of a struct member.
-        let bh = if let ExprKind::Ident(bh) = &cur.kind {
-            bh
-        } else {
-            return self
-                .inner_assoc_compound_key(start, &rev, 1)
-                .map(|(_, k)| k);
+        let bh = match &cur.kind {
+            ExprKind::Ident(bh) => bh,
+            // `C::aq[k]` inside a class body parses as a member access on
+            // the class name.
+            ExprKind::MemberAccess { expr: base, .. }
+                if matches!(&base.kind, ExprKind::Ident(b)
+                    if b.path.len() == 1 && self.module.classes.contains_key(&b.path[0].name.name)) =>
+            {
+                let bn = self
+                    .expr_assoc_name(cur)
+                    .filter(|n| self.is_associative_array(n))?;
+                let mut name = bn.clone();
+                for idx in rev.iter().rev() {
+                    let kv = self.eval_expr(idx);
+                    let ks = self.nested_level_key(&name, &bn, &kv);
+                    name = format!("{}[{}]", name, ks);
+                }
+                return Some(name);
+            }
+            _ => {
+                return self
+                    .inner_assoc_compound_key(start, &rev, 1)
+                    .map(|(_, k)| k);
+            }
         };
         let mut bn = self.resolve_hier_name(bh);
         if let Some(s) = self.instance_assoc_member(&bn) {
@@ -928,6 +979,22 @@ impl Simulator {
                     } else if self.is_select_of_target(right, targets) {
                         let v = self.eval_expr(left);
                         self.assign_value(right, &v);
+                    } else {
+                        // §18.5.12: a target reached through `^`, `~^`, `~`,
+                        // `+` or `-` (`(sd ^ 32'hf0) == 32'h3`) takes the
+                        // equality's one solution. Only interval narrowing
+                        // saw these, and it reads `+`/`-` alone; the joint
+                        // search gave up on a 32-bit `^`.
+                        for (_, lv) in targets {
+                            let is_var = |x: &Expression| {
+                                !matches!(x.kind, ExprKind::Paren(_))
+                                    && Self::expr_same_ignoring_span(x, lv)
+                            };
+                            if let Some(v) = self.solve_bijective_eq(left, right, &is_var) {
+                                self.assign_value(lv, &v);
+                                break;
+                            }
+                        }
                     }
                 }
                 ExprKind::Inside {
@@ -1933,6 +2000,48 @@ impl Simulator {
         false
     }
 
+    /// Match an element reference with an optional constant offset:
+    /// `arr[idx]` -> Some(0), `arr[idx] + C` / `C + arr[idx]` -> Some(C),
+    /// `arr[idx] - C` -> Some(-C).
+    pub(super) fn inline_foreach_affine_ref(
+        &mut self,
+        e: &Expression,
+        arr: &str,
+        idx: i64,
+    ) -> Option<i64> {
+        let e = match &e.kind {
+            ExprKind::Paren(inner) => inner.as_ref(),
+            _ => e,
+        };
+        if self.inline_foreach_elem_ref(e, arr, idx) {
+            return Some(0);
+        }
+        if let ExprKind::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } = &e.kind
+        {
+            if self.inline_foreach_elem_ref(left, arr, idx) {
+                return self.eval_expr(right).to_i64();
+            }
+            if self.inline_foreach_elem_ref(right, arr, idx) {
+                return self.eval_expr(left).to_i64();
+            }
+        }
+        if let ExprKind::Binary {
+            op: BinaryOp::Sub,
+            left,
+            right,
+        } = &e.kind
+        {
+            if self.inline_foreach_elem_ref(left, arr, idx) {
+                return self.eval_expr(right).to_i64().map(|c| -c);
+            }
+        }
+        None
+    }
+
     /// §18.5.7: solve one inline-`foreach` body item for element `arr[idx]`.
     /// The loop index variable is already bound in the top local_stack frame,
     /// so index expressions (`i`, `i+1`) and value expressions (`i + 5`)
@@ -1982,8 +2091,9 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span: crate::ast::Span::dummy(),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 }),
                 crate::ast::Span::dummy(),
             );
@@ -2166,9 +2276,9 @@ impl Simulator {
             &mut excl,
         );
         // Phase 2: equality / inside / dist pins.
-        let pinned = self.apply_inline_foreach_pins(item, arr, idx, w);
+        let _ = self.apply_inline_foreach_pins(item, arr, idx, w);
         // Phase 3: repair against the accumulated interval / exclusions.
-        if pinned || !(any_rel || !excl.is_empty()) || lo > hi {
+        if lo > hi {
             return;
         }
         let cur = self
@@ -2211,51 +2321,135 @@ impl Simulator {
         match item {
             CI::Expr(e) => {
                 if let ExprKind::Binary { op, left, right } = &e.kind {
-                    if !matches!(
+                    if matches!(
                         op,
                         BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq | BinaryOp::Neq
                     ) {
-                        return;
+                        let off_l = self.inline_foreach_affine_ref(left, arr, idx);
+                        let off_r = self.inline_foreach_affine_ref(right, arr, idx);
+                        if off_l.is_some() && off_r.is_none() {
+                            let off = off_l.unwrap();
+                            let b = self
+                                .eval_expr(right)
+                                .to_i64()
+                                .unwrap_or(0)
+                                .saturating_sub(off);
+                            match op {
+                                BinaryOp::Lt => {
+                                    *hi = (*hi).min(b.saturating_sub(1));
+                                    *any = true;
+                                }
+                                BinaryOp::Leq => {
+                                    *hi = (*hi).min(b);
+                                    *any = true;
+                                }
+                                BinaryOp::Gt => {
+                                    *lo = (*lo).max(b.saturating_add(1));
+                                    *any = true;
+                                }
+                                BinaryOp::Geq => {
+                                    *lo = (*lo).max(b);
+                                    *any = true;
+                                }
+                                BinaryOp::Neq => excl.push(b),
+                                _ => {}
+                            }
+                        } else if off_r.is_some() && off_l.is_none() {
+                            let off = off_r.unwrap();
+                            let b = self
+                                .eval_expr(left)
+                                .to_i64()
+                                .unwrap_or(0)
+                                .saturating_sub(off);
+                            match op {
+                                BinaryOp::Lt => {
+                                    *lo = (*lo).max(b.saturating_add(1));
+                                    *any = true;
+                                }
+                                BinaryOp::Leq => {
+                                    *lo = (*lo).max(b);
+                                    *any = true;
+                                }
+                                BinaryOp::Gt => {
+                                    *hi = (*hi).min(b.saturating_sub(1));
+                                    *any = true;
+                                }
+                                BinaryOp::Geq => {
+                                    *hi = (*hi).min(b);
+                                    *any = true;
+                                }
+                                BinaryOp::Neq => excl.push(b),
+                                _ => {}
+                            }
+                        }
                     }
-                    let on_l = self.inline_foreach_elem_ref(left, arr, idx);
-                    let on_r = self.inline_foreach_elem_ref(right, arr, idx);
-                    if on_l == on_r {
-                        return;
+                }
+                if let ExprKind::Inside {
+                    expr: inner,
+                    ranges,
+                } = &e.kind
+                {
+                    if let Some(off) = self.inline_foreach_affine_ref(inner, arr, idx) {
+                        let mut in_lo = i64::MAX;
+                        let mut in_hi = i64::MIN;
+                        for r in ranges {
+                            match &r.kind {
+                                ExprKind::Range(lo_e, hi_e) => {
+                                    if let (Some(l), Some(h)) = (
+                                        self.eval_expr(lo_e).to_i64(),
+                                        self.eval_expr(hi_e).to_i64(),
+                                    ) {
+                                        in_lo = in_lo.min(l.saturating_sub(off));
+                                        in_hi = in_hi.max(h.saturating_sub(off));
+                                    }
+                                }
+                                _ => {
+                                    if let Some(v) = self.eval_expr(r).to_i64() {
+                                        in_lo = in_lo.min(v.saturating_sub(off));
+                                        in_hi = in_hi.max(v.saturating_sub(off));
+                                    }
+                                }
+                            }
+                        }
+                        if in_lo <= in_hi {
+                            *lo = (*lo).max(in_lo);
+                            *hi = (*hi).min(in_hi);
+                            *any = true;
+                        }
                     }
-                    // Normalize to `arr[i] OP bound` (mirror the op when the
-                    // element sits on the right: `5 < arr[i]` ≡ `arr[i] > 5`).
-                    let (bound_side, eff) = if on_l {
-                        (right, *op)
-                    } else {
-                        let m = match op {
-                            BinaryOp::Lt => BinaryOp::Gt,
-                            BinaryOp::Gt => BinaryOp::Lt,
-                            BinaryOp::Leq => BinaryOp::Geq,
-                            BinaryOp::Geq => BinaryOp::Leq,
-                            other => *other,
-                        };
-                        (left, m)
-                    };
-                    let b = self.eval_expr(bound_side).to_i64().unwrap_or(0);
-                    match eff {
-                        BinaryOp::Lt => {
-                            *hi = (*hi).min(b.saturating_sub(1));
-                            *any = true;
+                }
+            }
+            CI::Inside {
+                expr,
+                range,
+                is_dist: false,
+                ..
+            } => {
+                if let Some(off) = self.inline_foreach_affine_ref(expr, arr, idx) {
+                    let mut in_lo = i64::MAX;
+                    let mut in_hi = i64::MIN;
+                    for r in range {
+                        match r {
+                            ConstraintRange::Range { lo: lo_e, hi: hi_e } => {
+                                if let (Some(l), Some(h)) =
+                                    (self.eval_expr(lo_e).to_i64(), self.eval_expr(hi_e).to_i64())
+                                {
+                                    in_lo = in_lo.min(l.saturating_sub(off));
+                                    in_hi = in_hi.max(h.saturating_sub(off));
+                                }
+                            }
+                            ConstraintRange::Value(v_e) => {
+                                if let Some(v) = self.eval_expr(v_e).to_i64() {
+                                    in_lo = in_lo.min(v.saturating_sub(off));
+                                    in_hi = in_hi.max(v.saturating_sub(off));
+                                }
+                            }
                         }
-                        BinaryOp::Leq => {
-                            *hi = (*hi).min(b);
-                            *any = true;
-                        }
-                        BinaryOp::Gt => {
-                            *lo = (*lo).max(b.saturating_add(1));
-                            *any = true;
-                        }
-                        BinaryOp::Geq => {
-                            *lo = (*lo).max(b);
-                            *any = true;
-                        }
-                        BinaryOp::Neq => excl.push(b),
-                        _ => {}
+                    }
+                    if in_lo <= in_hi {
+                        *lo = (*lo).max(in_lo);
+                        *hi = (*hi).min(in_hi);
+                        *any = true;
                     }
                 }
             }
@@ -2328,6 +2522,19 @@ impl Simulator {
                         let target = self
                             .get_signal_value_by_name(&elem_name)
                             .unwrap_or_else(|| Value::zero(w));
+                        let cr: Vec<_> = ranges
+                            .iter()
+                            .map(|r| match &r.kind {
+                                ExprKind::Range(lo, hi) => ConstraintRange::Range {
+                                    lo: (**lo).clone(),
+                                    hi: (**hi).clone(),
+                                },
+                                _ => ConstraintRange::Value(r.clone()),
+                            })
+                            .collect();
+                        if !target.has_xz() && self.value_in_ranges(&target, &cr) {
+                            return false;
+                        }
                         if let Some(v) = self.pick_inside_value(ranges, &target) {
                             self.set_signal_value_by_name(&elem_name, v);
                             return true;
@@ -2345,6 +2552,13 @@ impl Simulator {
                 ..
             } => {
                 if self.inline_foreach_elem_ref(expr, arr, idx) {
+                    if !*is_dist {
+                        if let Some(cv) = self.get_signal_value_by_name(&elem_name) {
+                            if !cv.has_xz() && self.value_in_ranges(&cv, range) {
+                                return false;
+                            }
+                        }
+                    }
                     let picked = if *is_dist && !dist_weights.is_empty() {
                         // Per-element target: no stable key, draw independently.
                         self.pick_dist_value(None, range, dist_weights)
@@ -3176,8 +3390,8 @@ impl Simulator {
                             },
                             selects: Vec::new(),
                         });
-                        fh.cached_signal_id = std::cell::Cell::new(None);
-                        fh.cached_resolved_name = std::cell::OnceCell::new();
+                        fh.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                        fh.cached_resolved_name = crate::ast::cache::NameCache::new();
                         return Some(self.resolve_hier_name(&fh).into_owned());
                     }
                 }
@@ -3198,8 +3412,9 @@ impl Simulator {
                             })
                             .collect(),
                         span: e.span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
                     };
                     return Some(self.resolve_hier_name(&fh).into_owned());
                 }
@@ -3258,17 +3473,100 @@ impl Simulator {
         ranges: &[ConstraintRange],
         weights: &[Option<crate::ast::decl::DistWeight>],
     ) -> Option<Value> {
-        use crate::ast::decl::DistWeight;
+        let g = self.resolve_dist_geometry(ranges, weights)?;
+        self.pick_dist_draw(key, &g)
+    }
+
+    /// Memoized twin of `pick_dist_value` for hot foreach fast paths where
+    /// the scalar bounds/weights are loop-invariant. `item_ptr` identifies the
+    /// constraint site; the resolved geometry is cached per solve (cleared at
+    /// the fast-path entry) so re-evaluation + Vec building happen once per
+    /// array rather than once per element. The per-element deal + value draw
+    /// still consume the RNG stream identically to `pick_dist_value`.
+    pub(super) fn pick_dist_value_memoized(
+        &mut self,
+        item_ptr: (usize, usize, usize, usize, usize),
+        key: Option<(usize, String)>,
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+    ) -> Option<Value> {
+        let g = {
+            let memo = self.dist_geometry_memo.borrow();
+            memo.get(&item_ptr).map(Clone::clone)
+        };
+        let g = match g {
+            Some(g) => g,
+            None => {
+                let resolved = self.resolve_dist_geometry(ranges, weights);
+                if let Some(r) = resolved {
+                    self.dist_geometry_memo.borrow_mut().insert(item_ptr, r.clone());
+                    r
+                } else {
+                    return None;
+                }
+            }
+        };
+        self.pick_dist_draw(key, &g)
+    }
+
+    /// Deal and draw one value from a resolved `dist` geometry.
+    fn pick_dist_draw(
+        &mut self,
+        key: Option<(usize, String)>,
+        g: &ResolvedDist,
+    ) -> Option<Value> {
         use rand::Rng;
+        let dealt = match key {
+            Some(k) => self.deal_dist_item(k, &g.masses),
+            None => None,
+        };
+        let idx = match dealt {
+            Some(i) => i,
+            None => {
+                // No stable identity for the target (a foreach element, say)
+                // or weights too fine to schedule: an independent draw.
+                let mut draw = match u64::try_from(g.total) {
+                    Ok(t) => (self.cur_rng().r#gen::<u64>() % t) as u128,
+                    Err(_) => self.cur_rng().gen_range(0..g.total),
+                };
+                let mut pick = g.masses.len() - 1;
+                for (i, m) in g.masses.iter().enumerate() {
+                    if draw < *m {
+                        pick = i;
+                        break;
+                    }
+                    draw -= *m;
+                }
+                pick
+            }
+        };
+        match g.items[idx].0.clone() {
+            DistItem::One(v) => Some(v),
+            DistItem::Span(l, h, bw) => {
+                // §18.5.4: the values inside one item are equiprobable under
+                // both `:=` and `:/`.
+                let v = if h > l {
+                    self.cur_rng().gen_range(l..=h)
+                } else {
+                    l
+                };
+                Some(Value::from_u64(v as u64, bw))
+            }
+        }
+    }
+
+    /// Resolve a `dist`'s items + masses once (the scalar bounds/weights are
+    /// re-evaluated by `pick_dist_value` on every call); callers in hot
+    /// foreach loops memoize the `ResolvedDist` so the re-evaluation and Vec
+    /// building happen once per solve rather than once per element.
+    pub(super) fn resolve_dist_geometry(
+        &mut self,
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+    ) -> Option<ResolvedDist> {
+        use crate::ast::decl::DistWeight;
         // Fixed-point scaler: keeps `Total(w)` masses exact for small w.
         const SCALER: u128 = 1024;
-
-        #[derive(Clone)]
-        enum DistItem {
-            One(Value),
-            /// lo, hi, width
-            Span(i64, i64, u32),
-        }
         let mut items: Vec<(DistItem, u128)> = Vec::new();
         for (i, r) in ranges.iter().enumerate() {
             let w_kind = weights.get(i).and_then(|w| w.as_ref());
@@ -3316,45 +3614,7 @@ impl Simulator {
         if total == 0 {
             return None;
         }
-
-        let dealt = match key {
-            Some(k) => self.deal_dist_item(k, &masses),
-            None => None,
-        };
-        let idx = match dealt {
-            Some(i) => i,
-            None => {
-                // No stable identity for the target (a foreach element, say)
-                // or weights too fine to schedule: an independent draw.
-                let mut draw = match u64::try_from(total) {
-                    Ok(t) => (self.cur_rng().r#gen::<u64>() % t) as u128,
-                    Err(_) => self.cur_rng().gen_range(0..total),
-                };
-                let mut pick = masses.len() - 1;
-                for (i, m) in masses.iter().enumerate() {
-                    if draw < *m {
-                        pick = i;
-                        break;
-                    }
-                    draw -= *m;
-                }
-                pick
-            }
-        };
-
-        match items[idx].0.clone() {
-            DistItem::One(v) => Some(v),
-            DistItem::Span(l, h, bw) => {
-                // §18.5.4: the values inside one item are equiprobable under
-                // both `:=` and `:/`.
-                let v = if h > l {
-                    self.cur_rng().gen_range(l..=h)
-                } else {
-                    l
-                };
-                Some(Value::from_u64(v as u64, bw))
-            }
-        }
+        Some(ResolvedDist { items, masses, total })
     }
 
     /// §18.5.4: the items of a `dist` whose weight is not 0, the values it
@@ -3717,10 +3977,16 @@ impl Simulator {
                     .strip_prefix(self.module.name.as_str())
                     .and_then(|rest| rest.strip_prefix('.'))
                     .unwrap_or(s);
-                self.module
-                    .instances
-                    .iter()
-                    .find(|i| i.path == rel || i.path == *s)
+                // §3.2, §3.14.2.1: time units belong to design elements; a
+                // generate block is not one. An instance may share the top
+                // module's name, so the unstripped path is tried as well.
+                let instance = |scope| {
+                    self.scopes_to_instance(scope)
+                        .last()
+                        .and_then(|p| self.instance_by_path(p))
+                };
+                instance(rel)
+                    .or_else(|| instance(s))
                     .map(|i| i.def_name.as_str())
                     .unwrap_or(self.module.name.as_str())
             }

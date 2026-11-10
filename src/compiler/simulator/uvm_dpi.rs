@@ -222,7 +222,7 @@ fn int_lit(v: i64) -> Expression {
             signed: true,
             base: NumberBase::Decimal,
             value: v.to_string(),
-            cached_val: Cell::new(Some((v as u32 as u64, 0u64, 32u32))),
+            cached_val: crate::ast::cache::LiteralCache::new(Some((v as u32 as u64, 0u64, 32u32))),
         }),
         crate::ast::Span::dummy(),
     )

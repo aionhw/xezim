@@ -135,7 +135,7 @@ impl Simulator {
         }
         let (h, p) = self.class_prop_receiver(e)?;
         let su = self.class_prop_struct(h, &p)?;
-        Self::spreads_member_wise(&su).then_some(su)
+        Self::spreads_member_wise(&su).then(|| (*su).clone())
     }
 
     /// Declared ELEMENT width (bits) of the collection named `name`, where
@@ -635,7 +635,7 @@ impl Simulator {
                             signed: true,
                             base: NumberBase::Binary,
                             value: idx.to_bin(),
-                            cached_val: Cell::new(idx.inline_bits().map(|(v, xz)| (v, xz, 64))),
+                            cached_val: crate::ast::cache::LiteralCache::new(idx.inline_bits().map(|(v, xz)| (v, xz, 64))),
                         }),
                         x.span,
                     )),
@@ -1907,8 +1907,29 @@ impl Simulator {
         }
         if let Some(parts) = literal_elems {
             let key = self.formal_dyn_key(pname, queue_data_type);
-            self.module.arrays.insert(key.clone(), (0, -1, 32));
+            let width = self
+                .declared_collection_elem_width(queue_data_type)
+                .unwrap_or(32);
+            self.module.arrays.insert(key.clone(), (0, -1, width));
             self.module.dynamic_arrays.insert(key.clone());
+            // §10.10: a queue or array operand of `{..}` contributes all of
+            // its elements (`{jal}`, `{q, X}`).
+            if matches!(arg.kind, ExprKind::Concatenation(_))
+                && !parts
+                    .iter()
+                    .any(|p| matches!(p.kind, ExprKind::AssignmentPattern(_)))
+            {
+                if self.assign_struct_concat(&key, parts.clone()) {
+                    return Some((key, String::new()));
+                }
+                let vals = self.unpacked_concat_operand_values(parts);
+                let n = vals.len() as u64;
+                for (j, v) in vals.into_iter().enumerate() {
+                    self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
+                }
+                self.set_queue_size(&key, n);
+                return Some((key, String::new()));
+            }
             // An element that is itself a `'{..}` pattern (a dynamic array of
             // UNPACKED structs) is scattered member-wise, not evaluated.
             for (j, part) in parts.iter().enumerate() {
@@ -1927,6 +1948,9 @@ impl Simulator {
         }
         if let Some((vals, w)) = self.collection_slice_values(arg) {
             let key = self.formal_dyn_key(pname, queue_data_type);
+            let w = self
+                .declared_collection_elem_width(queue_data_type)
+                .unwrap_or(w);
             self.module.arrays.insert(key.clone(), (0, -1, w));
             self.module.dynamic_arrays.insert(key.clone());
             let n = vals.len() as u64;
@@ -1934,6 +1958,33 @@ impl Simulator {
                 self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
             }
             self.set_queue_size(&key, n);
+            return Some((key, String::new()));
+        }
+        // §25.9/§25.10: an interface INSTANCE array as the actual of a
+        // virtual-interface collection formal (`new(2, intf)` with
+        // `InputInterface intf[2]`): each element binds to the matching
+        // instance, held as its handle token. No collection variable backs
+        // the actual, so the copy below had nothing to copy and every
+        // element of the formal read null (#925).
+        if let ExprKind::Ident(h) = &arg.kind
+            && h.root.is_none()
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && self.is_virtual_iface_type(queue_data_type)
+            && let Some(insts) = self.iface_instance_array(&h.path[0].name.name)
+        {
+            let key = self.formal_dyn_key(pname, queue_data_type);
+            self.register_formal_shape(&key, dims);
+            self.module.arrays.insert(key.clone(), (0, -1, 32));
+            self.module.dynamic_arrays.insert(key.clone());
+            self.vif_tokens_stored = true;
+            for (j, inst) in insts.iter().enumerate() {
+                self.set_signal_value_by_name(
+                    &format!("{}[{}]", key, j),
+                    Value::from_u64(Self::iface_handle_token(inst), 32),
+                );
+            }
+            self.set_queue_size(&key, insts.len() as u64);
             return Some((key, String::new()));
         }
         let cname = self.queue_actual_storage(arg)?;
@@ -1948,6 +1999,9 @@ impl Simulator {
             self.get_queue_size(&cname)
         };
         let w = self.module.arrays.get(&*cname).map(|t| t.2).unwrap_or(32);
+        let w = self
+            .declared_collection_elem_width(queue_data_type)
+            .unwrap_or(w);
         let key = self.formal_dyn_key(pname, queue_data_type);
         self.register_formal_shape(&key, dims);
         // A queue of unpacked structs keeps its members as separate leaves
@@ -1990,6 +2044,22 @@ impl Simulator {
         }
         self.set_queue_size(&key, size);
         Some((key, cname))
+    }
+
+    /// §13.5.1: use the formal's complete element width, not a packed array's
+    /// inner stride or the previous 32-bit placeholder for literal actuals.
+    fn declared_collection_elem_width(&self, dt: &DataType) -> Option<u32> {
+        if let DataType::TypeReference { name, .. } = dt
+            && (self.local_type_param_concrete(dt).is_some()
+                || super::elaborate::lookup_scoped_type(name, &self.module.typedefs).is_none())
+        {
+            return None;
+        }
+        Some(resolve_type_width(
+            dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        ))
     }
 
     /// The per-call storage key of a queue / dynamic-array / associative
@@ -2074,11 +2144,44 @@ impl Simulator {
         self.formal_dyn.push(formals);
     }
 
+    /// §13.5.3: a default may read an EARLIER array formal. Show the call's
+    /// formals queued so far, as `commit_formal_dyn` will enter them, in a
+    /// scratch callee frame while a default is evaluated; supplied actuals
+    /// are bound before it and never see it.
+    pub(super) fn push_pending_formal_dyn(&mut self, (base, names, formals): &FormalDynSetup) {
+        let mut names = names.clone();
+        let mut formals = formals.clone();
+        for (pname, target) in &self.pending_formal_dyn[*base..] {
+            match names.iter_mut().find(|(k, _)| k == pname) {
+                Some(slot) => slot.1 = pname.clone(),
+                None => names.push((pname.clone(), pname.clone())),
+            }
+            match formals.iter_mut().find(|(k, _)| k == pname) {
+                Some(slot) => slot.1 = target.clone(),
+                None => formals.push((pname.clone(), target.clone())),
+            }
+        }
+        self.local_dyn.push(names);
+        self.formal_dyn.push(formals);
+    }
+
+    /// Drop the scratch frame `push_pending_formal_dyn` entered.
+    pub(super) fn pop_pending_formal_dyn(&mut self) {
+        self.local_dyn.pop();
+        self.formal_dyn.pop();
+    }
+
     /// The storage key of a queue / dynamic-array (or fixed unpacked array)
     /// ACTUAL: a plain name (a caller-local one under its per-process rename
     /// `@q#7`), or a member chain `obj.q` / `a.b.q` mapped to the owning
     /// object's `<handle>#q` storage. `None` when `arg` names no collection.
     pub(super) fn queue_actual_storage(&mut self, arg: &Expression) -> Option<String> {
+        let arg = Self::unparen(arg);
+        if matches!(arg.kind, ExprKind::Call { .. }) {
+            return self.collection_call_actual(arg).filter(|name| {
+                self.module.arrays.contains_key(name) || self.module.dynamic_arrays.contains(name)
+            });
+        }
         // §13.5.2 (#854): resolve selected rows through one path, which
         // captures side-effectful receivers and evaluates selectors once.
         // Repeated probes would consume an actual's selectors again.
@@ -3029,11 +3132,10 @@ impl Simulator {
             // `self.mailboxes` (keyed by handle), not in `obj[i]` signal slots.
             // This expression path (e.g. `m.num()` inside `$display(...)`) must
             // resolve the handle before falling back to the queue/assoc count.
-            if let Some(handle_val) = self.get_signal_value_by_name(obj_name) {
-                let handle = handle_val.to_u64().unwrap_or(0) as usize;
-                if let Some(q) = self.mailboxes.get(&handle) {
-                    return Some(Self::int_count(q.len() as u64));
-                }
+            if let Some(handle) = self.resolve_container_handle(obj_name)
+                && let Some(q) = self.mailboxes.get(&handle)
+            {
+                return Some(Self::int_count(q.len() as u64));
             }
             // Count distinct TOP-LEVEL keys: for `obj[KEY]` storage this is
             // just the element count (== queue/dynamic-array size), but for
@@ -3106,20 +3208,30 @@ impl Simulator {
             return Some(out);
         }
         if matches!(bm, BuiltinM::And | BuiltinM::Or | BuiltinM::Xor) {
-            let mut acc: Option<u64> = None;
+            // §7.12.3: the result has the ELEMENT type — its width and
+            // signedness — and is folded over the elements' full values.
+            // `to_u64` kept the low word of a wide element and the result
+            // was built 32 bits wide, so `p.and()` over `bit [95:0]`
+            // elements could never equal a 96-bit target (#928).
+            let (w, signed) = self.array_elem_sign_width(obj_name);
+            let w = w.max(1);
+            let mut acc: Option<Value> = None;
             for elem in self.reduction_elem_names(obj_name) {
                 if let Some(v) = self.get_signal_value_by_name(&elem) {
-                    let x = v.to_u64().unwrap_or(0);
-                    acc = Some(match (acc, mname) {
-                        (None, _) => x,
-                        (Some(a), "and") => a & x,
-                        (Some(a), "or") => a | x,
-                        (Some(a), "xor") => a ^ x,
-                        (Some(a), _) => a,
+                    let x = if v.width == w { v } else { v.resize(w) };
+                    acc = Some(match acc {
+                        None => x,
+                        Some(a) => match bm {
+                            BuiltinM::And => a.bitwise_and(&x),
+                            BuiltinM::Or => a.bitwise_or(&x),
+                            _ => a.bitwise_xor(&x),
+                        },
                     });
                 }
             }
-            return Some(Value::from_u64(acc.unwrap_or(0), 32));
+            let mut out = acc.unwrap_or_else(|| Value::zero(w));
+            out.is_signed = signed;
+            return Some(out);
         }
         if bm == BuiltinM::Min {
             let cur_size = self.get_queue_size(obj_name) as usize;
@@ -3268,6 +3380,25 @@ impl Simulator {
                     || self.module.dynamic_arrays.contains(&elem_name)
                 {
                     return Some(Value::from_u64(1, 1));
+                }
+                if self
+                    .assoc_elem_decl_type(obj_name)
+                    .is_some_and(|dt| !self.assoc_elem_typedef_is_array(obj_name, dt))
+                    // Scalar-integral fast path: a flat-key miss with a scalar
+                    // element can have no compound children, so `.exists` is
+                    // false. But a MULTIDIMENSIONAL row (`v[0]` of
+                    // `int v[2][string][string]`, or `x["k"]` of
+                    // `int x[string][3]`) still stores its entries under a
+                    // compound key `v[0]["A"]["B"]`; the scalar element type is
+                    // only reported via the §7.4.5 dimension collapse, and the
+                    // element below the current select chain is itself an
+                    // array (of any kind, fixed-size too), so `.exists` must
+                    // fall through to the prefix scan. Skip the fast path then.
+                    && !self
+                        .coll_shape_at(obj_name)
+                        .is_some_and(|(shape, depth)| shape.dims.get(depth + 1).is_some())
+                {
+                    return Some(Value::from_u64(0, 1));
                 }
                 // A multidimensional associative array (`m[K1][K2]`, IEEE
                 // 1800-2023 §7.8.1) stores elements under the compound key

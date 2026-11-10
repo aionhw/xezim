@@ -312,6 +312,37 @@ impl Simulator {
             };
             if is_queue_init {
                 let scoped_q = format!("{}#{}", handle, pname);
+                if let ExprKind::AssignmentPattern(items) = &init.kind
+                    && let Some(su) = self
+                        .collection_elem_struct(handle, &pname)
+                        .filter(Self::spreads_member_wise)
+                {
+                    // Calls, including ones nested in a pattern, read the queue before it grows. The resize drops a value stored earlier, so a saved call is written last.
+                    let base = prop_ident_expr(&pname);
+                    let mut calls = Vec::new();
+                    for (i, item) in items.iter().enumerate() {
+                        let e = item.expr();
+                        if !(matches!(e.kind, ExprKind::AssignmentPattern(_))
+                            || Self::cond_expr_is_effect_free(e, false))
+                        {
+                            calls.push((i, self.eval_expr(e)));
+                        }
+                    }
+                    for (i, item) in items.iter().enumerate() {
+                        let e = item.expr();
+                        if matches!(e.kind, ExprKind::AssignmentPattern(_))
+                            || Self::cond_expr_is_effect_free(e, false)
+                        {
+                            let elem = Self::index_expr(&base, i as i64);
+                            self.assign_class_unpacked_elem(&elem, e, &su);
+                        }
+                    }
+                    self.set_queue_size(&scoped_q, items.len() as u64);
+                    for (i, v) in calls {
+                        self.set_signal_value_by_name(&format!("{scoped_q}[{i}]"), v);
+                    }
+                    continue;
+                }
                 self.populate_queue_from_init(&scoped_q, &init);
                 continue;
             }
@@ -344,22 +375,7 @@ impl Simulator {
                     // write now uses.
                     if let Some(su) = self.class_prop_struct(handle, &pname) {
                         if Self::spreads_member_wise(&su) {
-                            let base = Expression::new(
-                                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                                    root: None,
-                                    path: vec![crate::ast::expr::HierPathSegment {
-                                        name: crate::ast::Identifier {
-                                            name: pname.clone(),
-                                            span: crate::ast::Span::dummy(),
-                                        },
-                                        selects: Vec::new(),
-                                    }],
-                                    span: crate::ast::Span::dummy(),
-                                    cached_signal_id: std::cell::Cell::new(None),
-                                    cached_resolved_name: std::cell::OnceCell::new(),
-                                }),
-                                crate::ast::Span::dummy(),
-                            );
+                            let base = prop_ident_expr(&pname);
                             let elems = self.pattern_elems(items, &indices);
                             let owned: Vec<(usize, Option<Expression>)> =
                                 elems.into_iter().map(|e| e.cloned()).enumerate().collect();
@@ -396,7 +412,7 @@ impl Simulator {
             if let ExprKind::AssignmentPattern(items) = &init.kind
                 && let Some(su) = self
                     .class_prop_struct(handle, &pname)
-                    .filter(Self::spreads_member_wise)
+                    .filter(|su| Self::spreads_member_wise(su))
             {
                 let base =
                     Self::hier_ident_expr(Self::iface_path_segs(&pname, init.span), init.span);
@@ -478,4 +494,24 @@ impl Simulator {
             inst.properties.insert(pname.to_string(), value);
         }
     }
+}
+
+fn prop_ident_expr(name: &str) -> Expression {
+    Expression::new(
+        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+            root: None,
+            path: vec![crate::ast::expr::HierPathSegment {
+                name: crate::ast::Identifier {
+                    name: name.to_string(),
+                    span: crate::ast::Span::dummy(),
+                },
+                selects: Vec::new(),
+            }],
+            span: crate::ast::Span::dummy(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
+        }),
+        crate::ast::Span::dummy(),
+    )
 }

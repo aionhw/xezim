@@ -102,3 +102,128 @@ endmodule
         "multi-dim elements"
     );
 }
+
+/// §6.18 / §7.4.1: a property declared through a TYPEDEF is the same packed
+/// vector as its target, so a bit/part select on it must address the
+/// property's bits. It did not: `class_prop_packed_shape` matched only a
+/// `DataType::IntegerVector` / `Implicit` declaration, and an alias keeps the
+/// `TypeReference` in `property_types` (a class-local alias too). Every
+/// select fell through the class arms and was silently dropped, while the
+/// identical write on a `bit [7:0]` property landed — so the property read
+/// back its pre-write value and only the alias-typed spelling disagreed.
+/// Both parse shapes (`p.tx[3]` at module scope and `this.tx[3]` in a
+/// method) take the same path.
+#[test]
+fn typedef_packed_property_selects() {
+    let src = r#"
+package pkg;
+  typedef bit [7:0] byte_t;
+  typedef bit [0:7] ascend_t;   // ascending labels mirror the bit order
+endpackage
+import pkg::*;
+
+class holder;
+  typedef bit [7:0] loc_t;      // class-local alias
+  byte_t   tx;
+  pkg::byte_t qualified;
+  loc_t     loc;
+  ascend_t  asc;
+  bit [7:0] plain;              // the built-in control
+  function void via_this();
+    this.tx = 8'h00; this.tx[3] = 1'b1;
+    this.asc = 8'h00; this.asc[1] = 1'b1;   // ascending: label 1 is bit 6
+  endfunction
+endclass
+
+module tb;
+  import pkg::*;
+  holder h;
+  int r_this, r_asc, r_handle, r_qualified, r_local, r_plain, r_part;
+  initial begin
+    h = new();
+    h.via_this();
+    r_this = h.tx;
+    r_asc  = h.asc;
+    h.tx = 8'h00; h.tx[3] = 1'b1;
+    r_handle = h.tx;
+    h.qualified = 8'h00; h.qualified[7] = 1'b1;
+    r_qualified = h.qualified;
+    h.loc = 8'h00; h.loc[0] = 1'b1;
+    r_local = h.loc;
+    h.plain = 8'h00; h.plain[3] = 1'b1;
+    r_plain = h.plain;
+    h.tx = 8'h00; h.tx[7:4] = 4'hA;
+    r_part = h.tx;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "r_this"), 0x08, "this-qualified write on an alias");
+    assert_eq!(u(&sim, "r_asc"), 0x40, "an ascending alias maps by label");
+    assert_eq!(
+        u(&sim, "r_handle"),
+        0x08,
+        "handle-qualified write on an alias"
+    );
+    assert_eq!(u(&sim, "r_qualified"), 0x80, "package-qualified alias");
+    assert_eq!(u(&sim, "r_local"), 0x01, "class-local alias");
+    assert_eq!(u(&sim, "r_plain"), 0x08, "the built-in control still lands");
+    assert_eq!(u(&sim, "r_part"), 0xA0, "a part-select on an alias");
+}
+
+/// §6.19.1 / §7.4.2: an ENUM is a packed vector of its base type, and a
+/// packed array of an enum indexes its elements first. A property declared
+/// `e_t [1:0] v` therefore has two 1-bit elements, and `this.v[1] = e1` must
+/// write the second — the shape UVM's `uvm_config_db#(T)::get(..., this.v[i])`
+/// writes through an `inout` formal. Reporting no shape (the alias case
+/// above) also reported no element width, so the element write vanished.
+#[test]
+fn enum_typedef_packed_array_property_selects() {
+    let src = r#"
+package pkg;
+  typedef enum bit {E_ZERO, E_ONE} e_t;
+  typedef enum bit [2:0] {C_A = 3'd1, C_B = 3'd5} code_t;
+endpackage
+import pkg::*;
+
+class cfg;
+  e_t    [1:0] pvec;   // packed: two 1-bit elements
+  e_t    uvec [1:0];   // unpacked: the workaround spelling
+  code_t       code;   // 3-bit base, single element
+  function void set_packed();
+    this.pvec = 2'b00;
+    this.pvec[0] = E_ONE;
+    this.pvec[1] = E_ONE;
+  endfunction
+endclass
+
+module tb;
+  import pkg::*;
+  cfg c;
+  int r_packed, r_code, r_unpacked0, r_unpacked1, r_whole;
+  initial begin
+    c = new();
+    c.set_packed();
+    r_packed = c.pvec;
+    c.uvec[0] = E_ONE;
+    c.uvec[1] = E_ONE;
+    r_unpacked0 = c.uvec[0];
+    r_unpacked1 = c.uvec[1];
+    c.code = C_A; c.code[2] = 1'b1;   // 3'b001 -> 3'b101
+    r_code = c.code;
+    c.pvec = 2'b00; c.pvec[1] = E_ONE;
+    r_whole = c.pvec;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 50).expect("simulate failed");
+    assert_eq!(u(&sim, "r_packed"), 0b11, "both enum elements written");
+    assert_eq!(u(&sim, "r_unpacked0"), 1, "unpacked element 0");
+    assert_eq!(u(&sim, "r_unpacked1"), 1, "unpacked element 1");
+    assert_eq!(
+        u(&sim, "r_code"),
+        0b101,
+        "the enum base is the element width"
+    );
+    assert_eq!(u(&sim, "r_whole"), 0b10, "element 1 alone");
+}

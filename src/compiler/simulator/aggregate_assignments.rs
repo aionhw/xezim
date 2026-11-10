@@ -132,8 +132,8 @@ impl Simulator {
                 .last_mut()
                 .map(|s| std::mem::take(&mut s.selects))
                 .unwrap_or_default();
-            bare.cached_signal_id = std::cell::Cell::new(None);
-            bare.cached_resolved_name = std::cell::OnceCell::new();
+            bare.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+            bare.cached_resolved_name = crate::ast::cache::NameCache::new();
             let mut all = lsel;
             all.extend(sels);
             return (Expression::new(ExprKind::Ident(bare), cur.span), all);
@@ -260,17 +260,8 @@ impl Simulator {
             .cloned()
             .filter(|dt| matches!(self.resolve_dt_ref(dt), DataType::Struct(_)));
         for item in items {
-            match item {
-                AssignmentPatternItem::Keyed(k, v) => {
-                    let kv = self.eval_expr(k);
-                    let key = self.assoc_key_str(scoped, &kv);
-                    let target = Self::name_with_key(scoped, &key);
-                    match &elem_dt {
-                        Some(dt) => self.assign_pattern_or_leaf(&target, dt, v),
-                        None => self.pattern_leaf_at_elem_width(&target, v, val_w),
-                    }
-                }
-                AssignmentPatternItem::Default(e) if elem_dt.is_none() => {
+            if let AssignmentPatternItem::Default(e) = item {
+                if elem_dt.is_none() {
                     let mut v = if val_w > 0 {
                         self.eval_expr_ctx(e, val_w)
                     } else {
@@ -293,7 +284,17 @@ impl Simulator {
                     }
                     self.class_assoc_defaults.insert(scoped.to_string(), v);
                 }
-                _ => {}
+                continue;
+            }
+            let Some(k) = self.array_pattern_key(item) else {
+                continue;
+            };
+            let kv = self.eval_expr(&k);
+            let key = self.assoc_key_str(scoped, &kv);
+            let target = Self::name_with_key(scoped, &key);
+            match &elem_dt {
+                Some(dt) => self.assign_pattern_or_leaf(&target, dt, item.expr()),
+                None => self.pattern_leaf_at_elem_width(&target, item.expr(), val_w),
             }
         }
     }
@@ -640,22 +641,22 @@ impl Simulator {
                     self.eval_builtin_method(name, "delete", &[]);
                     self.module.assoc_defaults.remove(name);
                     for item in items {
-                        match item {
-                            AssignmentPatternItem::Keyed(k, v) => {
-                                let kv = self.eval_expr(k);
-                                let key = self.assoc_key_str(name, &kv);
-                                let cell = format!("{}[{}]", name, key);
-                                match elem_dt {
-                                    Some(dt) => self.assign_pattern_or_leaf(&cell, dt, v),
-                                    None => self.pattern_leaf_at_elem_width(&cell, v, elem_w),
-                                }
-                            }
-                            AssignmentPatternItem::Default(d) => {
-                                self.module
-                                    .assoc_defaults
-                                    .insert(name.to_string(), d.clone());
-                            }
-                            _ => {}
+                        if let AssignmentPatternItem::Default(d) = item {
+                            self.module
+                                .assoc_defaults
+                                .insert(name.to_string(), d.clone());
+                            continue;
+                        }
+                        let Some(k) = self.array_pattern_key(item) else {
+                            continue;
+                        };
+                        let kv = self.eval_expr(&k);
+                        let key = self.assoc_key_str(name, &kv);
+                        let cell = format!("{}[{}]", name, key);
+                        let v = item.expr();
+                        match elem_dt {
+                            Some(dt) => self.assign_pattern_or_leaf(&cell, dt, v),
+                            None => self.pattern_leaf_at_elem_width(&cell, v, elem_w),
                         }
                     }
                     if !items.is_empty() {
@@ -676,12 +677,24 @@ impl Simulator {
                 true
             }
             ExprKind::Concatenation(exprs) if !is_assoc => {
-                let vals = self.unpacked_concat_operand_values(exprs.iter().collect());
-                let n = vals.len() as u64;
+                if self.assign_struct_concat(name, exprs.iter().collect()) {
+                    return true;
+                }
+                let mut flat: Vec<&Expression> = exprs.iter().collect();
+                while let Some(i) = flat
+                    .iter()
+                    .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
+                {
+                    if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
+                        flat.splice(i..i, c);
+                    }
+                }
+                let vals = self.unpacked_concat_operand_values(flat);
+                self.set_queue_size(name, vals.len() as u64);
                 for (i, v) in vals.into_iter().enumerate() {
+                    let v = self.fit_queue_push_elem(name, v);
                     self.set_signal_value_by_name(&format!("{}[{}]", name, i), v);
                 }
-                self.set_queue_size(name, n);
                 true
             }
             ExprKind::Call { .. } => {
@@ -1235,10 +1248,13 @@ impl Simulator {
                     }
                     pos += 1;
                 }
-                AssignmentPatternItem::Keyed(k, v) => {
-                    if let Some(key) = self.eval_expr(k).to_i64() {
+                AssignmentPatternItem::Keyed(_, _) | AssignmentPatternItem::Named(_, _) => {
+                    let Some(k) = self.array_pattern_key(item) else {
+                        continue;
+                    };
+                    if let Some(key) = self.eval_expr(&k).to_i64() {
                         if let Some(p) = first.iter().position(|&i| i == key) {
-                            per_elem[p] = Some(v);
+                            per_elem[p] = Some(item.expr());
                         }
                     }
                 }
@@ -1685,6 +1701,159 @@ impl Simulator {
             leaves.push((lhs, value));
         }
         Some(leaves)
+    }
+
+    /// Declared bounds of a fixed multi-dimensional unpacked array, outermost
+    /// first, or None for anything else (queues, associative arrays, 1-D
+    /// arrays, arrays of unpacked structs).
+    fn fixed_unpacked_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+        if self.module.dynamic_arrays.contains(name) || self.is_associative_array(name) {
+            return None;
+        }
+        if let Some(dt) = self.module.var_decl_types.get(name)
+            && matches!(self.resolve_dt(dt), DataType::Struct(_))
+        {
+            return None;
+        }
+        if let Some(&(r0, r1, _)) = self.module.arrays_2d.get(name) {
+            return Some(match self.module.unpacked_decl_dims.get(name) {
+                Some(d) if d.len() == 2 => d.clone(),
+                _ => vec![r0, r1],
+            });
+        }
+        let (shape, _) = self.module.arrays_nd.get(name)?;
+        Some(match self.module.unpacked_decl_dims.get(name) {
+            Some(d) if d.len() == shape.len() => d.clone(),
+            _ => shape.clone(),
+        })
+    }
+
+    /// For an array operand that is a whole array or a row of a multi-
+    /// dimensional unpacked array (`q`, `q[1]`), the dimensions left below the
+    /// selected indices and the leaf-path suffixes in declared order.
+    fn unpacked_row_suffixes(&mut self, expr: &Expression) -> Option<Vec<String>> {
+        let mut idx_exprs: Vec<&Expression> = Vec::new();
+        let mut cur = expr;
+        while let ExprKind::Index { expr: inner, index } = &cur.kind {
+            idx_exprs.push(index);
+            cur = inner;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        let nm = self.resolve_hier_name(h).into_owned();
+        let dims = self.fixed_unpacked_dims(&nm)?;
+        let k = idx_exprs.len();
+        if k >= dims.len() {
+            return None;
+        }
+        for ie in &idx_exprs {
+            if !Self::cond_expr_is_effect_free(ie, false) || self.eval_expr(ie).has_xz() {
+                return None;
+            }
+        }
+        let mut total: u64 = 1;
+        for &(l, r) in &dims[k..] {
+            total = total
+                .checked_mul(l.abs_diff(r) + 1)
+                .filter(|&t| t <= 1 << 16)?;
+        }
+        let mut suffixes = vec![String::new()];
+        for &(l, r) in &dims[k..] {
+            let idx: Vec<i64> = if l <= r {
+                (l..=r).collect()
+            } else {
+                (r..=l).rev().collect()
+            };
+            suffixes = suffixes
+                .iter()
+                .flat_map(|p| idx.iter().map(move |i| format!("{}[{}]", p, i)))
+                .collect();
+        }
+        Some(suffixes)
+    }
+
+    /// §10.4.2 / §7.6: a nonblocking assignment whose target is a ROW of a
+    /// multi-dimensional unpacked array (`q[1] <= in_i`, `q[i] <= q[i+1]`,
+    /// `q[0] <= '{default: 0}`). Each element is its own signal, so the row is
+    /// updated as one nonblocking assignment per element, every source read
+    /// now. Without this the single update queued against `q[1]` landed on no
+    /// storage and the row read back x.
+    pub(super) fn unpacked_row_nba_leaves(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> Option<Vec<(Expression, Value)>> {
+        // Only a 2-D or N-D unpacked array has rows (`fixed_unpacked_dims`);
+        // most designs have none, and every indexed NBA comes through here.
+        if !matches!(lvalue.kind, ExprKind::Index { .. })
+            || (self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty())
+        {
+            return None;
+        }
+        let targets = self.unpacked_row_suffixes(lvalue)?;
+        let mut values: Vec<Value> = Vec::with_capacity(targets.len());
+        if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
+            // A flat pattern over a single remaining dimension: element i is
+            // the i-th positional item, the item keyed by its declared index,
+            // or the default.
+            let first = targets.first()?;
+            if first.matches('[').count() != 1 {
+                return None;
+            }
+            let indices: Vec<i64> = targets
+                .iter()
+                .map(|s| s.trim_matches(['[', ']']).parse().ok())
+                .collect::<Option<_>>()?;
+            let elems = self.pattern_elems(items, &indices);
+            // §11.8.2: a real element lends no integral width. Lending the
+            // 64-bit element width wraps `u - 2` at 64 bits.
+            let mut cur = lvalue;
+            let mut idx = vec![indices[0]];
+            while let ExprKind::Index { expr, index } = &cur.kind {
+                idx.insert(0, self.eval_expr(index).to_i64().unwrap_or(0));
+                cur = expr;
+            }
+            let real_row = matches!(&cur.kind, ExprKind::Ident(h) if self
+                .lookup_signal_real(&Self::elem_name(&self.resolve_hier_name(h), &idx)));
+            for (sfx, e) in targets.iter().zip(elems) {
+                let e = e?;
+                values.push(if real_row {
+                    self.eval_expr(e)
+                } else {
+                    self.eval_target_rhs(&Self::append_leaf_path(lvalue, sfx), e)
+                });
+            }
+        } else {
+            // A row or whole multi-dimensional array, or a plain 1-D unpacked
+            // array of the same element count (`q[1] <= in_i`).
+            let sources = match self.unpacked_row_suffixes(rvalue) {
+                Some(s) => s,
+                None => {
+                    let src = self.foreach_check_operand_name(rvalue)?;
+                    if self.module.dynamic_arrays.contains(&src) || self.is_associative_array(&src)
+                    {
+                        return None;
+                    }
+                    let (elems, _) = self.stream_elem_order(&src)?;
+                    elems.iter().map(|e| e[src.len()..].to_string()).collect()
+                }
+            };
+            if sources.len() != targets.len() {
+                return None;
+            }
+            for sfx in &sources {
+                let leaf = Self::append_leaf_path(rvalue, sfx);
+                values.push(self.eval_expr(&leaf));
+            }
+        }
+        Some(
+            targets
+                .iter()
+                .zip(values)
+                .map(|(sfx, v)| (Self::append_leaf_path(lvalue, sfx), v))
+                .collect(),
+        )
     }
 
     pub(super) fn unpacked_struct_nba_leaves(
@@ -3024,8 +3193,9 @@ impl Simulator {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         )
@@ -3604,10 +3774,13 @@ impl Simulator {
         for item in items {
             match item {
                 AssignmentPatternItem::Default(e) => default = Some(e),
-                AssignmentPatternItem::Keyed(k, v) => {
-                    let ki = self.eval_expr(k).to_i64().unwrap_or(0);
+                AssignmentPatternItem::Keyed(_, _) | AssignmentPatternItem::Named(_, _) => {
+                    let Some(k) = self.array_pattern_key(item) else {
+                        continue;
+                    };
+                    let ki = self.eval_expr(&k).to_i64().unwrap_or(0);
                     if let Some(p) = indices.iter().position(|&i| i == ki) {
-                        out[p] = Some(v);
+                        out[p] = Some(item.expr());
                     }
                 }
                 AssignmentPatternItem::Ordered(e) => {
@@ -3691,6 +3864,32 @@ impl Simulator {
             } else {
                 self.assign_pattern_or_leaf(&target, dt, e);
             }
+        }
+    }
+
+    /// §10.9.1 — the index expression of a keyed array-pattern item.
+    ///
+    /// `'{ K : v }` parses as a struct member designator (`Named`) whenever
+    /// the key is a bare identifier, because a member name and an index are
+    /// spelled the same (§10.9.1, §10.9.2). On an ARRAY target the
+    /// identifier is a constant or variable used as an index, which is how
+    /// `elaborate::array_params` already reads it for parameters. Reading it
+    /// as a member name here dropped the item instead, so
+    /// `'{ PM_PAGE : '{1,1} }` left an associative array empty. A name that
+    /// denotes a type is a type key (`'{ byte_t : 3 }`), not an index, and is
+    /// not read here.
+    fn array_pattern_key(&self, item: &AssignmentPatternItem) -> Option<Expression> {
+        match item {
+            AssignmentPatternItem::Keyed(k, _) => Some(k.clone()),
+            AssignmentPatternItem::Named(id, _) => {
+                let n = id.name.as_str();
+                let is_type = !self.module.parameters.contains_key(n)
+                    && !self.signals.contains_key(n)
+                    && self.lookup_typedef_target(n).is_some();
+                (!is_type)
+                    .then(|| crate::compiler::packed_assignment_pattern_plan::ident_expr(id))
+            }
+            _ => None,
         }
     }
 
@@ -3781,15 +3980,15 @@ impl Simulator {
         if self.module.associative_arrays.contains_key(base) {
             let mut wrote = false;
             for item in items {
-                if let AssignmentPatternItem::Keyed(k, v) = item {
-                    let kv = self.eval_expr(k);
-                    let key = self.assoc_key_str(base, &kv);
-                    self.assign_pattern_or_leaf(&format!("{}[{}]", base, key), &dt, v);
-                    wrote = true;
-                } else if let AssignmentPatternItem::Default(e) = item {
+                if let AssignmentPatternItem::Default(e) = item {
                     self.module
                         .assoc_defaults
                         .insert(base.to_string(), e.clone());
+                    wrote = true;
+                } else if let Some(k) = self.array_pattern_key(item) {
+                    let kv = self.eval_expr(&k);
+                    let key = self.assoc_key_str(base, &kv);
+                    self.assign_pattern_or_leaf(&format!("{}[{}]", base, key), &dt, item.expr());
                     wrote = true;
                 }
             }
@@ -3858,10 +4057,11 @@ impl Simulator {
         }
 
         // §10.9.1: a packed multi-D vector takes a pattern as one packed
-        // value, evaluated against its declared type by the caller.
-        if !self.module.arrays.contains_key(base)
-            && self.module.packed_signal_elem_widths.contains_key(base)
-        {
+        // value, evaluated against its declared type by the caller. An
+        // unpacked array of any rank whose element is packed multi-D also
+        // has an inner element width recorded, so test the fixed-array
+        // tables, not only the 1-D one.
+        if !registered_fixed && self.module.packed_signal_elem_widths.contains_key(base) {
             return false;
         }
 
@@ -3895,6 +4095,89 @@ impl Simulator {
             }
         }
         false
+    }
+
+    /// §10.9.1, §10.10, §7.6: a pattern written to a ROW of a fixed
+    /// multi-dimensional unpacked array (`c[0] = '{V, V}` on
+    /// `logic [39:0] c [2][2]`, `d[1] = '{'{..}, '{..}}` on `d [2][2][2]`).
+    /// Each element is its own signal, so the pattern spreads over the
+    /// dimensions left below the selected indices, as a whole-array pattern
+    /// does. Without this the row was stored as one packed value under a name
+    /// with no storage, and every element read x. False when the target is
+    /// not such a row or an index is not a known in-range value, leaving the
+    /// other paths to it.
+    pub(super) fn assign_unpacked_row_pattern(
+        &mut self,
+        lvalue: &Expression,
+        items: &[AssignmentPatternItem],
+    ) -> bool {
+        if items.is_empty() {
+            return false;
+        }
+        let mut idx_exprs: Vec<&Expression> = Vec::new();
+        let mut cur = lvalue;
+        while let ExprKind::Index { expr, index } = &cur.kind {
+            idx_exprs.push(index);
+            cur = expr;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return false;
+        };
+        // §8.4, §23.9: in a method a bare name is the property of `this` (or
+        // a local), not a same-named module array; the class row spread
+        // owns it.
+        if idx_exprs.is_empty() || self.bare_selected_storage_shadows_signal(h) {
+            return false;
+        }
+        idx_exprs.reverse();
+        let name = self.resolve_hier_name(h).into_owned();
+        // Any fixed element type, unpacked structs included: the spread
+        // below takes a struct element's pattern member-wise, as the
+        // whole-array spread does.
+        if self.module.dynamic_arrays.contains(&name) || self.is_associative_array(&name) {
+            return false;
+        }
+        let Some(dims) = self.foreach_dims(&name) else {
+            return false;
+        };
+        let k = idx_exprs.len();
+        if k >= dims.len() {
+            return false;
+        }
+        let mut idx: Vec<i64> = Vec::with_capacity(k);
+        for (ie, &(lo, hi)) in idx_exprs.iter().zip(&dims) {
+            if !Self::cond_expr_is_effect_free(ie, false) {
+                return false;
+            }
+            let v = self.eval_expr(ie);
+            match v.to_i64() {
+                Some(i) if !v.has_xz() && (lo..=hi).contains(&i) => idx.push(i),
+                _ => return false,
+            }
+        }
+        let cells: i64 = dims[k..]
+            .iter()
+            .map(|&(lo, hi)| (hi - lo + 1).max(0))
+            .product();
+        if cells <= 0 || cells > (1 << 20) {
+            return false;
+        }
+        let Some(dt) = self.module.var_decl_types.get(&name).cloned() else {
+            return false;
+        };
+        // Each remaining dimension's direction from its declared bounds.
+        let descending: Vec<bool> = match self
+            .module
+            .unpacked_decl_dims
+            .get(&name)
+            .filter(|d| d.len() == dims.len())
+        {
+            Some(decl) => decl[k..].iter().map(|&(l, r)| l > r).collect(),
+            None => vec![false; dims.len() - k],
+        };
+        let base = Self::elem_name(&name, &idx);
+        self.assign_pattern_array(&base, &dims[k..], &dt, items, &descending);
+        true
     }
 
     /// `arr[i] = '{...}` / `assoc[key] = '{...}` where the element is an
@@ -4057,6 +4340,53 @@ impl Simulator {
     /// path leaves unselected when it still names an unpacked array — all of
     /// a member's dimensions for `s.mm`, the inner ones for `s.mm[1]` — so
     /// `%p`, `$bits` and pattern assignment see the whole sub-array.
+    /// §27.6: a generate block's variable is keyed by its scope (`g.q`,
+    /// `l[0].q`), so the declared base of a flat path may span several
+    /// segments: the shortest dotted prefix, its trailing selects counted,
+    /// that names a declared variable, then the rest as `split_flat_path`
+    /// gives it.
+    fn flat_path_scoped_segs(&self, flat: &str) -> Option<Vec<(String, usize)>> {
+        let mut depth = 0usize;
+        let ends = flat
+            .char_indices()
+            .filter(|&(_, c)| {
+                match c {
+                    '[' => depth += 1,
+                    ']' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                c == '.' && depth == 0
+            })
+            .map(|(i, _)| i)
+            .skip(1)
+            .chain(std::iter::once(flat.len()));
+        for end in ends {
+            let mut key = &flat[..end];
+            let mut selects = 0usize;
+            while key.ends_with(']') {
+                let mut d = 0usize;
+                let open = key.char_indices().rev().find_map(|(i, c)| {
+                    match c {
+                        ']' => d += 1,
+                        '[' => d -= 1,
+                        _ => {}
+                    }
+                    (d == 0).then_some(i)
+                })?;
+                key = &key[..open];
+                selects += 1;
+            }
+            if self.module.var_decl_types.contains_key(key) {
+                let mut segs = vec![(key.to_string(), selects)];
+                if end < flat.len() {
+                    segs.extend(Self::split_flat_path(&flat[end + 1..]));
+                }
+                return Some(segs);
+            }
+        }
+        None
+    }
+
     pub(super) fn flat_path_type(&self, flat: &str) -> Option<(DataType, Option<Vec<Vec<i64>>>)> {
         // Without a select the base is a dotted prefix; a path none of whose
         // prefixes has a declared type answers None before any split.
@@ -4069,9 +4399,17 @@ impl Simulator {
         {
             return None;
         }
-        let segs = Self::split_flat_path(flat);
+        let mut segs = Self::split_flat_path(flat);
+        // An instance prefix (`u.s`) is a root of several unselected
+        // segments; a generate scope's (`l[0].q`) carries selects.
         let (first, base) =
-            Self::flat_path_root(&segs, |b| self.module.var_decl_types.contains_key(b))?;
+            match Self::flat_path_root(&segs, |b| self.module.var_decl_types.contains_key(b)) {
+                Some(r) => r,
+                None => {
+                    segs = self.flat_path_scoped_segs(flat)?;
+                    (0, segs.first()?.0.clone())
+                }
+            };
         let base_idx = segs[first].1;
         // For an array (or associative array) this is already the ELEMENT type.
         let mut dt = self.module.var_decl_types.get(&base)?.clone();

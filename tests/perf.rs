@@ -54,5 +54,11 @@ mod struct_resolver_compiled;
 #[path = "perf/displaced_local_meta_reapply.rs"]
 mod displaced_local_meta_reapply;
 
+#[path = "perf/same_name_live_frames_943.rs"]
+mod same_name_live_frames_943;
+
 #[path = "perf/const_index_array_arming.rs"]
 mod const_index_array_arming;
+
+#[path = "perf/class_aggregate_resolution.rs"]
+mod class_aggregate_resolution;

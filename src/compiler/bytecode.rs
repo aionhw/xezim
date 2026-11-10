@@ -56,6 +56,11 @@ pub(crate) struct MethodAdmission {
     /// NON-virtual method that some subclass redeclares (the only case where
     /// the object's dynamic class would pick a different body).
     pub nonvirtual_targets: HashMap<String, HashMap<String, String>>,
+    /// §8.23: class -> the STATIC methods it declares. A static method needs
+    /// no object (§8.7/§8.25), so a call through a NULL handle of a known
+    /// declared class is legal and must dispatch on that class; `CallMethod`
+    /// dispatches on the live object's class, which does not exist there.
+    pub static_methods: HashMap<String, HashSet<String>>,
     /// Instance collection members per declared class, for element access
     /// through a handle of that class (`p.contents[i]`). Only members whose
     /// elements load as one plain value join: string and multi-dimensional
@@ -95,6 +100,13 @@ pub(crate) struct FnFacts {
 /// encoding keeps each instruction at 24 bytes; the allocator uses a wider
 /// counter and falls back before an ID would overflow this representation.
 pub type RegId = u16;
+
+/// Unpacked two-dimensional bounds and the width of one element.
+type Array2dShape = ((i64, i64), (i64, i64), u32);
+
+/// Packed dimensions of an unpacked array's element, outermost first, and
+/// whether their range labels are the declared ones.
+type ElemPackedDims = (Vec<(i64, i64)>, bool);
 
 /// A signal-table index inside an instruction. `u32`, not `usize`: the
 /// largest design measured here has 35.1 M signals and `u32` covers 4.29 B,
@@ -404,6 +416,8 @@ pub enum Insn {
     LoadSignalSigned(RegId, SigId),
     /// Load a value from the active process's innermost local frame.
     LoadProcessLocal(RegId, Box<str>),
+    /// §9.7: Query the status of a process from its handle.
+    LoadProcessStatus(RegId, RegId),
     /// Resize register to given width.
     Resize(RegId, u32),
 
@@ -869,6 +883,29 @@ pub enum Insn {
     /// the four-state VM does not write it because it is dead on both paths.
     /// Appended so existing serialized instruction discriminants stay stable.
     CmpBranchConst(BinOpConstKind, RegId, Box<Value>, RegId, u32),
+    /// §7.5 / §7.10 / §7.4.6: element read of a design-scope dynamic array or
+    /// queue (dest, operand, index register). The exec arm reads the LIVE
+    /// collection exactly as the interpreter's element read does: the element
+    /// cell for an index inside both `size()` and the placeholder cell range,
+    /// otherwise the interpreter's own element read (by-name storage past the
+    /// cells, the element type's default past `size()` or for an x index). A
+    /// dense `LoadArrayElem` over the placeholder cells read x from index 64
+    /// on and a stale element past `size()`. Main executor only: every other
+    /// executor and lowering treats it like `EvalExprFallback`.
+    LoadDynElem(RegId, Box<DynElemOp>, RegId),
+}
+
+/// The collection a `LoadDynElem` reads.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DynElemOp {
+    /// The collection, as its `arrays` key.
+    pub name: Box<str>,
+    /// `<name>.size`, the key its live size is kept under.
+    pub size_key: Box<str>,
+    /// The placeholder element cells `(first_id, lo, hi)`, if any.
+    pub cells: Option<(usize, i64, i64)>,
+    /// Context width of the read (the interpreter's x-index default).
+    pub ctx_width: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<Insn>() <= 24, "Insn grew past 24 bytes");
@@ -1069,6 +1106,11 @@ pub(super) struct PreboundCompiledMethod {
     /// the dims to slice instead. Absent ⇒ single-vector elements, where
     /// the old bit-select lowering is correct.
     pub coll_elem_packed_dims: std::rc::Rc<HashMap<String, Vec<(i64, i64)>>>,
+    /// Declared ELEMENT width of every member in the element-access plan
+    /// set (fixed arrays, queues, associative members) — the width table
+    /// `expr_max_width` consults for a member element select. Without it
+    /// the select sized at 1 bit (see `member_elem_plan_width`).
+    pub coll_elem_widths: std::rc::Rc<HashMap<String, u32>>,
     /// class-perf row 2: names of NON-INPUT formals (output / inout / ref —
     /// the interpreter's `output_bindings` copy-out set) admitted to the
     /// compiled path as plain scalars (integral / string / enum / class
@@ -1255,6 +1297,7 @@ impl Insn {
             | BinOpConst(a, b, _, _)
             | BlockingAssignBitDyn(_, a, b)
             | LoadArrayElem(a, _, b)
+            | LoadDynElem(a, _, b)
             | BlockingAssignArray(_, a, b, _)
             | LoadClassMember(a, b, _)
             | StoreClassMember(a, b, _) => {
@@ -1372,6 +1415,7 @@ impl Insn {
             // non-offsettable (side effects / interpreter re-entry).
             LoadClassStatic(a, _) => *a += rb,
             LoadProcessLocal(..)
+            | LoadProcessStatus(..)
             | Format(..)
             | CaseMaskJump(..)
             | StmtFallback(..)
@@ -1403,6 +1447,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::LoadSignal(..) => "Load",
         Insn::LoadSignalSigned(..) => "LoadS",
         Insn::LoadProcessLocal(..) => "LoadLocal",
+        Insn::LoadProcessStatus(..) => "ProcStatus",
         Insn::Resize(..) => "Resize",
         Insn::Add(..) => "Add",
         Insn::Sub(..) => "Sub",
@@ -1481,6 +1526,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::LoadSignalRange(..) => "LoadRng",
         Insn::LoadSignalRangeDyn(..) => "LoadRngDyn",
         Insn::LoadArrayElem(..) => "LoadArr",
+        Insn::LoadDynElem(..) => "LoadDynElem",
         Insn::BlockingAssign(..) => "Assign",
         Insn::BlockingAssignRange(..) => "AssignRng",
         Insn::BlockingAssignRangeDyn(..) => "AssignRngDyn",
@@ -1523,6 +1569,18 @@ struct LocalArrayBind {
     /// The elements' declared signedness when every element is stamped with
     /// it (an inlined array formal); None when unknown.
     elem_signed: Option<bool>,
+}
+
+/// A member of a packed-struct formal that an inlined body reads as a slice
+/// of the formal's register.
+#[derive(Clone)]
+struct FormalMember {
+    off: u32,
+    width: u32,
+    signed: bool,
+    /// Declared range (`[7:4]`) that selects on the member are labeled by;
+    /// None for a 1-bit member without one.
+    dim: Option<(i64, i64)>,
 }
 
 /// `format!("{}.{}", scope, name)` without the formatting machinery: the
@@ -1965,6 +2023,9 @@ pub struct BytecodeCompiler<'a> {
     /// array — `arr[j][2]` must select the packed ELEMENT (ew-bit slice),
     /// not one bit of the loaded element.
     pub coll_elem_packed_dims: HashMap<String, Vec<(i64, i64)>>,
+    /// Mirrored plan fact (`PreboundCompiledMethod::coll_elem_widths`):
+    /// declared element widths of the element-access plan members.
+    pub coll_elem_widths: HashMap<String, u32>,
     /// Unpacked dims of the typedefs this body's locals are declared with
     /// (`typedef int q_t[$]; q_t q;`), keyed by the type's source spelling
     /// (`p::q_t`). The declarator itself carries no dims, so without this a
@@ -2084,6 +2145,13 @@ pub struct BytecodeCompiler<'a> {
     /// Register-backed local -> packed element width, for `local[i]`
     /// splice/extract compilation.
     pub local_var_elem: std::collections::HashMap<String, u32>,
+    /// Packed-struct formals of an inlined pure function: name -> (the
+    /// formal's register, its flattened members). Keyed like
+    /// `local_var_regs`, and honored only while the name still resolves to
+    /// that register.
+    local_var_struct: HashMap<String, (RegId, Vec<(String, FormalMember)>)>,
+    /// Packed geometry follows a local's register through inlined frames.
+    local_packed_types: HashMap<RegId, crate::ast::types::DataType>,
     /// Loop variables bound to COMPILE-TIME constants by the unroller. Read
     /// before every other name source, so `state[col*4]` folds to a constant
     /// index while `col` is unrolled.
@@ -2174,7 +2242,8 @@ pub struct BytecodeCompiler<'a> {
     /// `typedef_types` key: such a type is not packed.
     typedef_unpacked_dims: Option<&'a HashMap<String, Vec<crate::ast::types::UnpackedDimension>>>,
     /// Declared types of explicitly typed value parameters.
-    param_decl_types: Option<&'a HashMap<String, crate::ast::types::DataType>>,
+    param_decl_types:
+        Option<&'a xezim_core::shared_names::SharedNameMap<crate::ast::types::DataType>>,
     /// Ports collapsed onto the nets they connect, formal to actual.
     port_aliases: Option<&'a HashMap<String, String>>,
     /// Stack of pending `break` jump-target patches, one entry per enclosing
@@ -2184,6 +2253,9 @@ pub struct BytecodeCompiler<'a> {
     /// Same stack-of-Vecs shape, but for `continue` — patched to the loop's
     /// step (or condition-recheck) address.
     loop_continue_patches: Vec<Vec<usize>>,
+    /// Stack of pending `disable <named_block>` jump-target patches, by block name.
+    /// LRM §9.6.2: disabling an active named block terminates that block.
+    named_block_patches: HashMap<String, Vec<usize>>,
     /// Set of signal names declared as `string` (LRM §6.16). When a
     /// concatenation involves any of these, the bytecode bails to the AST
     /// interpreter, which has byte-level (not bit-level) concat semantics.
@@ -2332,6 +2404,7 @@ impl<'a> BytecodeCompiler<'a> {
             static_coll_member_names: HashSet::default(),
             coll_elem_member_names: HashSet::default(),
             coll_elem_packed_dims: HashMap::default(),
+            coll_elem_widths: HashMap::default(),
             typedef_coll_dims: HashMap::default(),
             typedef_coll_strings: HashSet::default(),
             member_coll_strings: HashSet::default(),
@@ -2359,6 +2432,8 @@ impl<'a> BytecodeCompiler<'a> {
             local_typedef_types: HashMap::default(),
             unresolved_type_names: HashSet::default(),
             local_var_elem: std::collections::HashMap::new(),
+            local_var_struct: HashMap::default(),
+            local_packed_types: HashMap::default(),
             cast_widths: None,
             pattern_ctx: None,
             inline_ret_ty: None,
@@ -2380,6 +2455,7 @@ impl<'a> BytecodeCompiler<'a> {
             port_aliases: None,
             loop_break_patches: Vec::new(),
             loop_continue_patches: Vec::new(),
+            named_block_patches: HashMap::default(),
             foreach_slot_count: 0,
             string_signals: None,
             local_var_is_string: HashSet::default(),
@@ -2508,19 +2584,167 @@ impl<'a> BytecodeCompiler<'a> {
         while let ExprKind::Paren(inner) = &unwrapped.kind {
             unwrapped = inner;
         }
-        let hier = match &unwrapped.kind {
-            ExprKind::Ident(hier) => hier.clone(),
-            ExprKind::Index { expr: base, .. } => {
-                let ExprKind::Ident(hier) = &base.kind else {
-                    return None;
-                };
-                hier.clone()
-            }
-            _ => return None,
+        // §7.4.1: an element of an unpacked array of any rank
+        // (`s3[1][0]`), not only of a one-dimensional one; its read path
+        // resolves the element.
+        let mut root = unwrapped;
+        let mut levels = 0;
+        while let ExprKind::Index { expr: base, .. } = &root.kind {
+            root = base;
+            levels += 1;
+        }
+        let ExprKind::Ident(hier) = &root.kind else {
+            return None;
         };
+        if levels > 1 && !self.is_multi_dim_array(hier) {
+            return None;
+        }
+        let hier = hier.clone();
         let (key, fields) = self.packed_struct_layout_for_hier(&hier)?;
         let value = self.compile_expr(unwrapped, 0)?;
         Some((value, key, hier, fields))
+    }
+
+    /// The flattened member layout of a packed-struct formal, computed as the
+    /// interpreter's `register_formal_type_metadata` does. A 4-state struct
+    /// with 2-state members is left out: those members read x/z as 0, which
+    /// a slice does not do (see `mixed_packed_vars`).
+    fn packed_formal_layout(
+        &self,
+        dt: &crate::ast::types::DataType,
+        width: u32,
+    ) -> Option<Vec<(String, FormalMember)>> {
+        use crate::compiler::elaborate as el;
+        let types = self.typedef_types?;
+        let fields = el::packed_struct_field_layout(dt, self.params?, self.typedefs?, types)?;
+        if fields.is_empty() || fields.iter().any(|&(_, off, w)| w == 0 || off + w > width) {
+            return None;
+        }
+        if !el::is_type_two_state_resolved(dt, types) && Self::has_two_state_member(dt, types) {
+            return None;
+        }
+        Some(
+            fields
+                .into_iter()
+                .filter_map(|(n, off, width)| {
+                    let (signed, dim) = self.struct_member_type(dt, &n)?;
+                    Some((
+                        n,
+                        FormalMember {
+                            off,
+                            width,
+                            signed,
+                            dim,
+                        },
+                    ))
+                })
+                .collect(),
+        )
+    }
+
+    /// Signedness and declared range of the member at dotted `path` (`p.hi`)
+    /// of a packed struct. None when it, or a member on the way to it, has
+    /// more than one dimension or one that does not span its bits (a packed
+    /// array of wider elements): a select on it picks elements, not bits.
+    fn struct_member_type(
+        &self,
+        dt: &crate::ast::types::DataType,
+        path: &str,
+    ) -> Option<(bool, Option<(i64, i64)>)> {
+        use crate::compiler::elaborate as el;
+        let (params, typedefs, types) = (self.params?, self.typedefs?, self.typedef_types?);
+        let crate::ast::types::DataType::Struct(su) = el::resolve_typedef_chain(dt, types) else {
+            return None;
+        };
+        let (head, rest) = path
+            .split_once('.')
+            .map_or((path, None), |(h, r)| (h, Some(r)));
+        let m = su
+            .members
+            .iter()
+            .find(|m| m.declarators.iter().any(|d| d.name.name == head))?;
+        let q = el::type_query_dims_of(&m.data_type, Some(params), Some(typedefs), Some(types));
+        let w = el::resolve_type_width(&m.data_type, Some(params), Some(typedefs));
+        let dim = match q.dims[..] {
+            [] => q.whole,
+            [d] => Some(d),
+            _ => return None,
+        };
+        match dim {
+            Some((l, r)) if l.abs_diff(r) + 1 != u64::from(w) => return None,
+            None if w != 1 => return None,
+            _ => {}
+        }
+        match rest {
+            Some(r) => self.struct_member_type(&m.data_type, r),
+            None => Some((el::is_type_signed_resolved(&m.data_type, types), dim)),
+        }
+    }
+
+    fn has_two_state_member(
+        dt: &crate::ast::types::DataType,
+        types: &HashMap<String, crate::ast::types::DataType>,
+    ) -> bool {
+        use crate::compiler::elaborate as el;
+        let crate::ast::types::DataType::Struct(su) = el::resolve_typedef_chain(dt, types) else {
+            return false;
+        };
+        su.members.iter().any(|m| {
+            el::is_type_two_state_resolved(&m.data_type, types)
+                || Self::has_two_state_member(&m.data_type, types)
+        })
+    }
+
+    /// The dotted name of a select-free member chain (`c.p.hi`), whether it
+    /// arrives as nested member accesses or folded into one identifier, as
+    /// in an instance's rewritten function body.
+    fn member_chain_name(expr: &Expression) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(hier)
+                if hier.root.is_none() && hier.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                Some(Self::hier_raw_name(hier))
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                Some(cat_dot(&Self::member_chain_name(expr)?, &member.name))
+            }
+            _ => None,
+        }
+    }
+
+    /// The member of a register-bound packed-struct formal that `expr`
+    /// reads (`c.a`, `c.p.hi`), with the formal's register.
+    fn formal_struct_member(&self, expr: &Expression) -> Option<(RegId, &FormalMember)> {
+        if self.local_var_struct.is_empty() {
+            return None;
+        }
+        let dotted = Self::member_chain_name(expr)?;
+        let mut cut = dotted.len();
+        while let Some(i) = dotted[..cut].rfind('.') {
+            let (base, member) = (&dotted[..i], &dotted[i + 1..]);
+            if let Some((slot, fields)) = self.local_var_struct.get(base)
+                && self.local_var_regs.get(base).map(|b| b.0) == Some(*slot)
+            {
+                let (_, m) = fields.iter().find(|f| f.0 == member)?;
+                return Some((*slot, m));
+            }
+            cut = i;
+        }
+        None
+    }
+
+    /// §7.2.1: a packed struct is a vector whose members are fixed bit
+    /// ranges, so a member of a packed-struct formal is a constant slice of
+    /// its register, with the member's own signedness.
+    fn compile_formal_struct_member(&mut self, expr: &Expression) -> Option<RegId> {
+        let (slot, m) = self.formal_struct_member(expr)?;
+        let (off, w, signed) = (m.off, m.width, m.signed);
+        let dest = self.alloc_reg();
+        self.emit(Insn::RangeSelectConst(dest, slot, off + w - 1, off));
+        if signed {
+            self.emit(Insn::SetSigned(dest));
+        }
+        Some(dest)
     }
 
     /// Metadata for a packed-array member of a packed struct. The elaborated
@@ -2532,6 +2756,26 @@ impl<'a> BytecodeCompiler<'a> {
         member: &str,
     ) -> Option<(u32, Option<(i64, i64)>)> {
         let widths = self.packed_elem_widths?;
+        for candidate in self.packed_member_keys(root_key, hier, member) {
+            if let Some(&elem_w) = widths.get(candidate.as_str()).filter(|&&w| w > 0) {
+                let dim = self
+                    .packed_full_dims
+                    .and_then(|dims| dims.get(candidate.as_str()))
+                    .and_then(|dims| dims.first())
+                    .copied();
+                return Some((elem_w, dim));
+            }
+        }
+        None
+    }
+
+    /// The names a packed struct member's metadata may be registered under.
+    fn packed_member_keys(
+        &self,
+        root_key: &str,
+        hier: &HierarchicalIdentifier,
+        member: &str,
+    ) -> Vec<String> {
         let raw = Self::hier_raw_name(hier);
         let mut candidates = Vec::with_capacity(4);
         candidates.push(format!("{}.{}", root_key, member));
@@ -2544,17 +2788,85 @@ impl<'a> BytecodeCompiler<'a> {
         if let Some(leaf) = hier.path.last() {
             candidates.push(format!("{}.{}", leaf.name.name, member));
         }
-        for candidate in candidates {
-            if let Some(&elem_w) = widths.get(candidate.as_str()).filter(|&&w| w > 0) {
-                let dim = self
-                    .packed_full_dims
-                    .and_then(|dims| dims.get(candidate.as_str()))
-                    .and_then(|dims| dims.first())
-                    .copied();
-                return Some((elem_w, dim));
-            }
+        candidates
+    }
+
+    /// §7.4.1: `container.member[i][j]…`, two or more indices into a
+    /// multi-dimensional packed member of a packed struct (`sa[1].f0[3][7]`
+    /// on `t3_t [3:0][7:0] f0` of an array of structs). The one-index form
+    /// slices one element of the member's outer dimension; a second index
+    /// then took one BIT of that slice instead of an element of the next
+    /// dimension. The member's dimensions down to single bits place every
+    /// index.
+    fn compile_packed_member_index_chain(
+        &mut self,
+        base: &Expression,
+        index: &Expression,
+    ) -> Option<RegId> {
+        let mut idx_exprs: Vec<&Expression> = vec![index];
+        let mut cur = base;
+        while let ExprKind::Index { expr, index } = &cur.kind {
+            idx_exprs.push(index);
+            cur = expr;
         }
-        None
+        if idx_exprs.len() < 2 {
+            return None;
+        }
+        idx_exprs.reverse();
+        let ExprKind::MemberAccess { expr: root, member } = &cur.kind else {
+            return None;
+        };
+        let (root_value, root_key, hier, fields) = self.compile_packed_struct_value(root)?;
+        let &(_, field_offset, field_w) = fields.iter().find(|(n, _, _)| n == &member.name)?;
+        let all_dims = self.packed_full_dims?;
+        let dims: Vec<(i64, i64)> = self
+            .packed_member_keys(&root_key, &hier, &member.name)
+            .iter()
+            .find_map(|k| all_dims.get(k.as_str()))?
+            .clone();
+        let counts: Vec<i64> = dims.iter().map(|(l, r)| (l - r).abs() + 1).collect();
+        if idx_exprs.len() > dims.len() || counts.iter().product::<i64>() != i64::from(field_w) {
+            return None;
+        }
+        let width = u32::try_from(counts[idx_exprs.len()..].iter().product::<i64>()).ok()?;
+        // §11.5.1: an x/z literal index folds to 0 as a constant; the
+        // run-time path carries the x through the offset.
+        let consts: Option<Vec<i64>> = idx_exprs
+            .iter()
+            .map(|e| {
+                (!self.is_xz_literal(e))
+                    .then(|| self.eval_const_expr(e).map(|v| v as i64))
+                    .flatten()
+            })
+            .collect();
+        if let Some(consts) = consts {
+            let dest = self.alloc_reg();
+            match Self::packed_chain_offset(&dims, &consts) {
+                Some((lo, w)) => {
+                    let lo = field_offset + lo;
+                    self.emit(Insn::RangeSelectConst(dest, root_value, lo + w - 1, lo));
+                }
+                // §11.5.1: an index outside the declared range reads x.
+                None => self.emit(Insn::LoadConst(dest, Box::new(Value::new(width)))),
+            }
+            return Some(dest);
+        }
+        let mut idx_regs = Vec::with_capacity(idx_exprs.len());
+        for e in idx_exprs {
+            idx_regs.push(self.compile_expr(e, 0)?);
+        }
+        let mut lo_reg = self.emit_packed_chain_offset(&dims, idx_regs)?;
+        if field_offset != 0 {
+            let off = self.alloc_reg();
+            self.emit(Insn::LoadConst(
+                off,
+                Box::new(Value::from_u64(u64::from(field_offset), 32)),
+            ));
+            let sum = self.alloc_reg();
+            self.emit(Insn::Add(sum, lo_reg, off));
+            lo_reg = sum;
+        }
+        Some(self.emit_dyn_slice(root_value, lo_reg, width))
     }
 
     /// Emit a dynamic element/field slice from a packed struct container.
@@ -2820,6 +3132,12 @@ impl<'a> BytecodeCompiler<'a> {
             .is_some_and(|s| d.contains(&s.name.name) || q.contains(&s.name.name))
     }
 
+    /// Is `name` (an `arrays` key) a dynamic array or queue?
+    fn is_dynamic_collection(&self, name: &str) -> bool {
+        self.dynamic_arrays.is_some_and(|d| d.contains(name))
+            || self.queue_vars.is_some_and(|q| q.contains(name))
+    }
+
     pub fn set_array_first_id(&mut self, arrays: &'a HashMap<Arc<str>, (usize, i64, i64)>) {
         self.array_first_id = Some(arrays);
     }
@@ -2829,7 +3147,20 @@ impl<'a> BytecodeCompiler<'a> {
     /// name. A block-local array of a process is declared at run time into
     /// by-name storage that has neither, and a compiled store into it was
     /// dropped: `for (int i ...) arr[i] = v;` left `arr` 0 (§6.21).
+    ///
+    /// A dynamic array or queue has no operand either (§7.5, §7.10): its
+    /// `0..63` element cells are only a placeholder backing. Elements past
+    /// them live in by-name storage, and a cell outside the live size keeps
+    /// a stale value, so a compiled read of `q[64]` came back x (a 2-state
+    /// `t += q[i]` then summed to 0) and `q[i]` past `q.size()` read an old
+    /// element instead of the default (§7.4.6). A plain element read compiles
+    /// to `Insn::LoadDynElem` instead; every other shape bails to the
+    /// interpreter, as stores already do (`collection_store_denied`).
     fn array_operand(&mut self, name: String) -> Option<Box<ArrayOperand>> {
+        if self.is_dynamic_collection(&name) {
+            self.bail("dynamic_collection_elem");
+            return None;
+        }
         if let Some(&(first_id, lo, hi)) = self
             .array_first_id
             .and_then(|arrays| arrays.get(name.as_str()))
@@ -2938,7 +3269,10 @@ impl<'a> BytecodeCompiler<'a> {
         self.port_aliases = Some(a);
     }
 
-    pub fn set_param_decl_types(&mut self, t: &'a HashMap<String, crate::ast::types::DataType>) {
+    pub fn set_param_decl_types(
+        &mut self,
+        t: &'a xezim_core::shared_names::SharedNameMap<crate::ast::types::DataType>,
+    ) {
         self.param_decl_types = Some(t);
     }
 
@@ -2955,6 +3289,118 @@ impl<'a> BytecodeCompiler<'a> {
     fn packed_outer_dim(&self, hier: &HierarchicalIdentifier) -> Option<(i64, i64)> {
         self.packed_full_dims_of(hier)
             .and_then(|d| d.first().copied())
+    }
+
+    fn record_local_packed_type(&mut self, reg: RegId, dt: &crate::ast::types::DataType) {
+        let (Some(params), Some(types)) = (self.params, self.typedef_types) else {
+            return;
+        };
+        if crate::compiler::elaborate::packed_full_dims_chained(dt, params, types)
+            .is_some_and(|dims| dims.len() > 1)
+        {
+            self.local_packed_types.insert(reg, dt.clone());
+        }
+    }
+
+    /// §7.4.1/§11.5.1: register-backed packed typedefs retain every
+    /// dimension, including the bounds checked for each chained index.
+    fn compile_typed_packed_chain(
+        &mut self,
+        base: &Expression,
+        last: &Expression,
+    ) -> Option<RegId> {
+        let mut indices = vec![last];
+        let mut root = base;
+        while let ExprKind::Index { expr, index } = &root.kind {
+            indices.push(index);
+            root = expr;
+        }
+        if indices.len() < 2 {
+            return None;
+        }
+        let ExprKind::Ident(h) = &root.kind else {
+            return None;
+        };
+        let (reg, _) = self.local_var_reg_of(h)?;
+        let dt = self.local_packed_types.get(&reg)?.clone();
+        let dims = crate::compiler::elaborate::packed_full_dims_chained(
+            &dt,
+            self.params?,
+            self.typedef_types?,
+        )?;
+        if dims.len() < indices.len() || dims.len() < 2 {
+            return None;
+        }
+        let width = dims[indices.len()..]
+            .iter()
+            .try_fold(1u64, |n, (l, r)| n.checked_mul(l.abs_diff(*r) + 1))?;
+        let width = u32::try_from(width).ok()?;
+        let default =
+            if crate::compiler::elaborate::is_type_two_state_resolved(&dt, self.typedef_types?) {
+                Value::zero(width)
+            } else {
+                Value::new(width)
+            };
+        indices.reverse();
+        let value = self.compile_expr(root, 0)?;
+        let consts: Option<Vec<i64>> = indices
+            .iter()
+            .map(|e| {
+                (!self.is_xz_literal(e))
+                    .then(|| self.fold_const(e).and_then(|v| v.to_i64()))
+                    .flatten()
+            })
+            .collect();
+        let dest = self.alloc_reg();
+        if let Some(consts) = consts {
+            match Self::packed_chain_offset(&dims, &consts) {
+                Some((lo, w)) => self.emit(Insn::RangeSelectConst(dest, value, lo + w - 1, lo)),
+                None => self.emit(Insn::LoadConst(dest, Box::new(default))),
+            }
+            return Some(dest);
+        }
+        let mut regs = Vec::new();
+        for index in &indices {
+            if self.expr_max_width(index) > 64 {
+                return None;
+            }
+            regs.push(self.compile_expr(index, 0)?);
+        }
+        self.emit(Insn::LoadConst(dest, Box::new(default)));
+        let mut guards = Vec::new();
+        for ((expr, reg), &(left, right)) in indices.iter().zip(&regs).zip(&dims) {
+            let iw = if self.expr_max_width(expr) >= 64 {
+                65
+            } else {
+                64
+            };
+            let idx = self.alloc_reg();
+            self.emit(Insn::Move(idx, *reg));
+            self.emit(Insn::Resize(idx, iw));
+            self.emit(Insn::SetSigned(idx));
+            for (kind, bound) in [
+                (CmpKind::Geq, left.min(right)),
+                (CmpKind::Leq, left.max(right)),
+            ] {
+                let mut v = Value::from_u64(bound as u64, 64);
+                v.is_signed = true;
+                let constant = self.alloc_reg();
+                self.emit(Insn::LoadConst(constant, Box::new(v.resize(iw))));
+                let tmp = self.alloc_reg();
+                guards.push(self.insns.len());
+                self.emit(Insn::CmpBranch(kind, idx, constant, tmp, 0));
+            }
+        }
+        let offset = self.emit_packed_chain_offset(&dims, regs)?;
+        let selected = self.emit_dyn_slice(value, offset, width);
+        self.emit(Insn::Move(dest, selected));
+        let end = self.insns.len() as u32;
+        for guard in guards {
+            if let Insn::CmpBranch(_, _, _, _, target) = &mut self.insns[guard] {
+                *target = end;
+            }
+        }
+        Some(dest)
     }
 
     /// Declared packed dimensions of `hier`: a register-backed local or
@@ -3376,7 +3822,7 @@ impl<'a> BytecodeCompiler<'a> {
                 h.path[0].name.name.clone()
             }
             _ => {
-                self.bail("Expr_Call");
+                self.bail("Expr_Call_func_not_single_ident");
                 return None;
             }
         };
@@ -3752,6 +4198,7 @@ impl<'a> BytecodeCompiler<'a> {
         let mut string_formal_names: Vec<String> = Vec::new();
         let mut real_formal_names: Vec<String> = Vec::new();
         let mut array_binds: Vec<(String, LocalArrayBind)> = Vec::new();
+        let mut struct_binds: Vec<(String, (RegId, Vec<(String, FormalMember)>))> = Vec::new();
         for (i, (p, a)) in fd.ports.iter().zip(args).enumerate() {
             if is_unsized_dim(p) {
                 // Dynamic-array formal from a fixed assignment pattern: one
@@ -3828,6 +4275,7 @@ impl<'a> BytecodeCompiler<'a> {
             };
             let formal_is_real = self.decl_is_real(&p.data_type, Some(&name));
             let slot = self.alloc_reg();
+            self.record_local_packed_type(slot, &p.data_type);
             if matches!(p.direction, PortDirection::Output) {
                 // §13.5.3: an output formal does NOT read the actual; it
                 // starts at its type's default and is copied out on return.
@@ -3865,8 +4313,17 @@ impl<'a> BytecodeCompiler<'a> {
                 self.note_local_dims(slot, Self::port_effective_type(&fd.ports, i));
             }
             binds.push((p.name.name.clone(), (slot, w)));
+            if let Some(fields) =
+                self.packed_formal_layout(Self::port_effective_type(&fd.ports, i), w)
+            {
+                struct_binds.push((p.name.name.clone(), (slot, fields)));
+            }
             if let Some(ew) = self.decl_elem_width_in(&p.data_type, Some(&name)) {
                 if ew > 0 && w > ew && w % ew == 0 {
+                    if self.decl_outer_dim_unnormalized(&p.data_type) {
+                        self.bail("Expr_Call_packed_outer_dim");
+                        return None;
+                    }
                     elem_binds.push((p.name.name.clone(), ew));
                 }
             }
@@ -3885,6 +4342,14 @@ impl<'a> BytecodeCompiler<'a> {
         let saved_local_reals = std::mem::take(&mut self.local_var_is_real);
         let saved_local_arrays = std::mem::take(&mut self.local_var_array);
         let saved_local_elems = std::mem::take(&mut self.local_var_elem);
+        let saved_local_structs = std::mem::take(&mut self.local_var_struct);
+        for (n, sb) in struct_binds {
+            if let Some(pfx) = &qpfx {
+                self.local_var_struct
+                    .insert(format!("{pfx}.{n}"), sb.clone());
+            }
+            self.local_var_struct.insert(n, sb);
+        }
         for (n, ab) in array_binds {
             if let Some(pfx) = &qpfx {
                 self.local_var_array
@@ -3965,6 +4430,7 @@ impl<'a> BytecodeCompiler<'a> {
         // the caller. A failed body can leave unfinished loop frames behind.
         let saved_break_patches = std::mem::take(&mut self.loop_break_patches);
         let saved_continue_patches = std::mem::take(&mut self.loop_continue_patches);
+        let saved_named_block_patches = std::mem::take(&mut self.named_block_patches);
         self.inline_ret = Some((Some(ret_slot), ret_w));
         let saved_ret_real = std::mem::replace(&mut self.inline_ret_real, ret_is_real);
         let saved_ret_ty = self.inline_ret_ty.replace(fd.return_type.clone());
@@ -3981,6 +4447,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.inline_ret_jumps = saved_ret_jumps;
         self.loop_break_patches = saved_break_patches;
         self.loop_continue_patches = saved_continue_patches;
+        self.named_block_patches = saved_named_block_patches;
         if ok {
             for (target, value, width) in &ref_writes {
                 if !self.compile_blocking_target(target, *value, *width) {
@@ -3996,6 +4463,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.local_var_is_real = saved_local_reals;
         self.local_var_array = saved_local_arrays;
         self.local_var_elem = saved_local_elems;
+        self.local_var_struct = saved_local_structs;
         if !ok {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
                 eprintln!(
@@ -4104,6 +4572,10 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                         if let Some(ew) = self.decl_elem_width(data_type) {
                             if ew > 0 && w > ew && w % ew == 0 {
+                                if self.decl_outer_dim_unnormalized(data_type) {
+                                    self.bail("Expr_Call_packed_outer_dim");
+                                    return false;
+                                }
                                 self.local_var_elem.insert(d.name.name.clone(), ew);
                             }
                         }
@@ -4113,6 +4585,7 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                         self.note_local_dims(slot, data_type);
                         self.local_var_regs.insert(d.name.name.clone(), (slot, w));
+                        self.record_local_packed_type(slot, data_type);
                     }
                 }
                 // `return` — early or final — compiles via compile_stmt's
@@ -4159,7 +4632,7 @@ impl<'a> BytecodeCompiler<'a> {
         // returns would need a result variable; those stay on the AST.)
         let (ports, body, lifetime): (
             Vec<crate::ast::decl::FunctionPort>,
-            Vec<Statement>,
+            crate::ast::shared_vec::SharedVec<Statement>,
             Option<crate::ast::types::Lifetime>,
         ) = if let Some(td) = self.tasks.and_then(|t| t.get(task_name)) {
             (td.ports.clone(), td.items.clone(), td.lifetime)
@@ -4173,13 +4646,17 @@ impl<'a> BytecodeCompiler<'a> {
         };
         // §13.3.1: a STATIC subroutine's variables — its locals and output
         // formals — keep their values between calls; an inline gives each
-        // call fresh registers. Only an input-only static body with no
-        // declarations behaves the same either way.
-        if matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
-            && (ports
-                .iter()
-                .any(|p| !matches!(p.direction, PortDirection::Input))
-                || body.iter().any(Self::stmt_declares))
+        // call fresh registers. That differs only for a variable whose value
+        // can carry from one call to the next (`static_local_carries`): one
+        // written whole on every path before it is read behaves the same
+        // either way, so the call still inlines. No written lifetime is
+        // static; elaboration marks a subroutine of an `automatic` module
+        // automatic (§13.3.1).
+        if !matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic))
+            && (ports.iter().any(|p| {
+                !matches!(p.direction, PortDirection::Input)
+                    && Self::static_local_carries(&p.name.name, &body)
+            }) || (body.iter().any(Self::stmt_declares) && Self::stmts_carry_static(&body)))
         {
             return false;
         }
@@ -4334,6 +4811,7 @@ impl<'a> BytecodeCompiler<'a> {
             // when a failed lowering leaves unfinished loop frames behind.
             let saved_break_patches = std::mem::take(&mut self.loop_break_patches);
             let saved_continue_patches = std::mem::take(&mut self.loop_continue_patches);
+            let saved_named_block_patches = std::mem::take(&mut self.named_block_patches);
             self.inline_ret = Some((None, 0));
             for st in &body {
                 if !self.compile_stmt(st) {
@@ -4350,6 +4828,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.inline_ret_jumps = saved_ret_jumps;
             self.loop_break_patches = saved_break_patches;
             self.loop_continue_patches = saved_continue_patches;
+            self.named_block_patches = saved_named_block_patches;
             self.inlining_stack.pop();
             self.inline_foreign -= foreign as u32;
             self.m_labels = saved_labels;
@@ -5616,7 +6095,7 @@ impl<'a> BytecodeCompiler<'a> {
             // all-or-nothing failure propagates.
             match saved_local {
                 Some(b) => {
-                    self.local_var_regs.insert(var, b);
+                    self.local_var_regs.insert(var.clone(), b);
                 }
                 None => {
                     self.local_var_regs.remove(&var);
@@ -5945,6 +6424,7 @@ impl<'a> BytecodeCompiler<'a> {
                 self.method_handle_names.contains(name)
                     || (self.bare_member_names.contains(name)
                         && self.member_class_names.contains(name))
+                    || self.static_member_names.contains(name)
             }
             crate::ast::expr::ExprKind::MemberAccess {
                 expr: inner,
@@ -5976,6 +6456,27 @@ impl<'a> BytecodeCompiler<'a> {
     /// refuse — a conservative decline to the AST interpreter, never a
     /// wrong dispatch. The bare-member ROOT additionally keeps the
     /// bare-key-stability requirement (`bare_member_names`).
+    /// §8.23: the class whose body a call to `method` binds to when the
+    /// receiver's DECLARED class is `rc` and `method` is STATIC. A static
+    /// method needs no object, so this is the legal dispatch for a call
+    /// through a null handle (which has no dynamic class to dispatch on).
+    /// `None` when no class on the declared chain declares `method` static.
+    fn declared_static_target(&self, rc: &str, method: &str) -> Option<String> {
+        let adm = self.method_admission.as_ref()?;
+        let mut cur = rc.split('#').next().unwrap_or(rc).to_string();
+        for _ in 0..64 {
+            if adm
+                .static_methods
+                .get(&cur)
+                .is_some_and(|m| m.contains(method))
+            {
+                return Some(cur);
+            }
+            cur = adm.class_parents.get(&cur)?.clone();
+        }
+        None
+    }
+
     fn method_handle_chain_class(&self, expr: &crate::ast::expr::Expression) -> Option<String> {
         if !self.method_mode {
             return None;
@@ -5998,6 +6499,10 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 if self.method_handle_names.contains(name) {
                     return Some(UNTYPED.to_string());
+                }
+                if self.static_member_names.contains(name) {
+                    let cls = self.method_class.as_deref()?;
+                    return self.handle_member_types?.get(cls)?.get(name).cloned();
                 }
                 if self.bare_member_names.contains(name) {
                     // Step 9e: a COLLECTION member carries its ELEMENT class
@@ -6383,6 +6888,52 @@ impl<'a> BytecodeCompiler<'a> {
         }
         let dims = self.coll_elem_packed_dims.get(name)?;
         Some(dims.iter().map(|(l, r)| (l - r).abs() as u32 + 1).product())
+    }
+
+    /// The declared ELEMENT width of a member of the element-access plan
+    /// set, from the mirrored plan fact (`coll_elem_widths`): fixed-array
+    /// members record it in `array_properties`, queues in
+    /// `queue_properties`, associative members in their property width.
+    /// `explicit_this` (a `this.m[i]` / `this.m` spelling) skips the
+    /// local-shadow guard — the spelling names the member unambiguously.
+    fn member_elem_plan_width(&self, name: &str, explicit_this: bool) -> Option<u32> {
+        if !self.coll_elem_member_names.contains(name) {
+            return None;
+        }
+        // A body-local declaration shadows the member (the same
+        // precedence `member_coll_elem_target` applies before lowering
+        // an element read): plain locals, local collections and local
+        // arrays all keep the member's width off their selects.
+        if !explicit_this
+            && (self.local_var_regs.contains_key(name)
+                || self.local_coll_names.contains(name)
+                || self.local_var_array.contains_key(name))
+        {
+            return None;
+        }
+        self.coll_elem_widths.get(name).copied().filter(|&w| w > 0)
+    }
+
+    /// `member_elem_plan_width` for a bare or `this.`-prefixed Ident base
+    /// of an element select.
+    fn member_elem_plan_width_of(
+        &self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<u32> {
+        if hier.root.is_some() {
+            return None;
+        }
+        match hier.path.as_slice() {
+            [seg] if seg.selects.is_empty() => self.member_elem_plan_width(&seg.name.name, false),
+            [this_seg, seg]
+                if this_seg.selects.is_empty()
+                    && seg.selects.is_empty()
+                    && this_seg.name.name == "this" =>
+            {
+                self.member_elem_plan_width(&seg.name.name, true)
+            }
+            _ => None,
+        }
     }
 
     /// Pure admission probe for member-collection ELEMENT access (Step
@@ -6909,6 +7460,44 @@ impl<'a> BytecodeCompiler<'a> {
         Some(dest)
     }
 
+    /// The `module.arrays_2d` entry of `hier`, as named or in the current
+    /// scope, with the key it was found under.
+    fn arrays_2d_entry(
+        &self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<(String, Array2dShape)> {
+        let raw = Self::hier_raw_name(hier);
+        let arrays_2d = self.arrays_2d?;
+        arrays_2d
+            .get(raw.as_str())
+            .map(|s| (raw.clone(), *s))
+            .or_else(|| {
+                self.scope_hint.as_ref().and_then(|sc| {
+                    let q = cat_dot(sc, &raw);
+                    arrays_2d.get(q.as_str()).map(|s| (q, *s))
+                })
+            })
+    }
+
+    /// Declared width of a fully indexed element of a multidimensional
+    /// unpacked array (§7.4.5): the materialized cell's width when the indices
+    /// are constant, the `arrays_2d` element width when they are not. Anything
+    /// else (a row, a select inside an element) answers None. A string
+    /// element answers 0: its value is self-determined, like a string signal.
+    fn multi_dim_unpacked_elem_width(&self, lhs: &Expression) -> Option<u32> {
+        if let Some(id) = self.const_multi_dim_array_elem_signal_id(lhs) {
+            return Some(self.signal_widths[id]);
+        }
+        let ExprKind::Index { expr, index } = &lhs.kind else {
+            return None;
+        };
+        let (hier, idxs) = self.flatten_index_chain_exprs(expr, index)?;
+        if idxs.len() != 2 {
+            return None;
+        }
+        self.arrays_2d_entry(hier).map(|(_, (_, _, w))| w)
+    }
+
     /// Shared row-major addressing for a DYNAMIC 2-D unpacked element
     /// (`a[i][j]`): returns the Dense operand and the register holding
     /// `flat = (i-lo1)*ncols + (j-lo2)`, with an out-of-range index in EITHER
@@ -6920,18 +7509,13 @@ impl<'a> BytecodeCompiler<'a> {
         i_expr: &Expression,
         j_expr: &Expression,
     ) -> Option<(Box<ArrayOperand>, RegId)> {
-        let raw = Self::hier_raw_name(hier);
-        let arrays_2d = self.arrays_2d?;
-        let (key, ((lo1, hi1), (lo2, hi2), _w)) = arrays_2d
-            .get(raw.as_str())
-            .map(|s| (raw.clone(), *s))
-            .or_else(|| {
-                self.scope_hint.as_ref().and_then(|sc| {
-                    let q = cat_dot(sc, &raw);
-                    arrays_2d.get(q.as_str()).map(|s| (q, *s))
-                })
-            })?;
+        let (key, ((lo1, hi1), (lo2, hi2), _w)) = self.arrays_2d_entry(hier)?;
         if lo1 < 0 || lo2 < 0 {
+            return None;
+        }
+        // A queue or dynamic array of rows: see `array_operand`.
+        if self.is_dynamic_collection(&key) {
+            self.bail("dynamic_collection_elem");
             return None;
         }
         let first_id = *self
@@ -7147,11 +7731,10 @@ impl<'a> BytecodeCompiler<'a> {
                         {
                             return true;
                         }
-                        // `fname.member` may arrive as TWO segments; it is
-                        // function-local when the head is bound (the return
-                        // variable or a formal).
-                        return h.path.len() == 2
-                            && bound.contains(&h.path[0].name.name)
+                        // `fname.member` (or a nested `c.p.hi`) may arrive as
+                        // segments; it is function-local when the head is
+                        // bound (the return variable or a formal).
+                        return bound.contains(&h.path[0].name.name)
                             && h.path
                                 .iter()
                                 .all(|seg| seg.selects.iter().all(|x| expr_ok(x, bound, me, ext)));
@@ -7721,6 +8304,7 @@ impl<'a> BytecodeCompiler<'a> {
                 .collect(),
             name,
             span: arg.span,
+            bound: Default::default(),
         };
         if self
             .typedef_entry(&self.typedef_coll_dims, &name, None)
@@ -7889,6 +8473,20 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         scoped_arrays::resolve_type_width(dt, self.params, self.typedefs, &view)
+    }
+
+    /// §7.4.1: is the outermost packed dimension of `dt` other than the
+    /// normalized `[N-1:0]` (`u8_t [0:3]`, `logic [1:4][7:0]`)? A
+    /// register-backed local's element select slices `[i*ew +: ew]`, which
+    /// addresses only that shape: an ascending local came back reversed.
+    fn decl_outer_dim_unnormalized(&self, dt: &crate::ast::types::DataType) -> bool {
+        let (Some(p), Some(tt)) = (self.params, self.typedef_types) else {
+            return false;
+        };
+        crate::compiler::elaborate::packed_full_dims_of(dt, p)
+            .or_else(|| crate::compiler::elaborate::packed_full_dims_chained(dt, p, tt))
+            .and_then(|d| d.first().copied())
+            .is_some_and(|(l, r)| l < r || l.min(r) != 0)
     }
 
     /// Packed ELEMENT width of a declared type, for register-backed locals:
@@ -8445,6 +9043,9 @@ impl<'a> BytecodeCompiler<'a> {
             patches.retain(|&pc| pc < len);
         }
         for patches in &mut self.loop_continue_patches {
+            patches.retain(|&pc| pc < len);
+        }
+        for patches in self.named_block_patches.values_mut() {
             patches.retain(|&pc| pc < len);
         }
     }
@@ -9751,8 +10352,9 @@ impl<'a> BytecodeCompiler<'a> {
             root: h.root.clone(),
             path: h.path[..h.path.len() - 1].to_vec(),
             span: h.span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         self.const_param_member_hier(&base, member)
     }
@@ -11279,7 +11881,7 @@ impl<'a> BytecodeCompiler<'a> {
         index: &Expression,
     ) -> Option<RegId> {
         let (hier, idx_exprs) = self.flatten_index_chain_exprs(base, index)?;
-        if idx_exprs.len() < 2 {
+        if idx_exprs.len() < 2 || self.is_unpacked_chain_root(hier) {
             return None;
         }
         let dims = self.chain_root_dims(hier)?;
@@ -11298,6 +11900,43 @@ impl<'a> BytecodeCompiler<'a> {
             idx_regs.push(self.compile_expr(e, 0)?);
         }
         let root_sig = self.lookup_signal_id(hier);
+        let lo_reg = self.emit_packed_chain_offset(&dims, idx_regs)?;
+        // A signal root is sliced IN PLACE. `compile_expr_root_of` copied
+        // the whole vector into a register first, so a loop reading one
+        // byte of a 512-bit table cloned all 512 bits on every iteration —
+        // the copy, not the select, was the cost.
+        if let Some(sig) = root_sig {
+            let dest = self.alloc_reg();
+            self.emit(Insn::LoadSignalRangeDyn(
+                dest,
+                as_sig_id(sig),
+                lo_reg,
+                width as u32,
+            ));
+            return Some(dest);
+        }
+        let root = self.compile_expr_root_of(base)?;
+        Some(self.emit_dyn_slice(root, lo_reg, width as u32))
+    }
+
+    /// `src[lo +: width]` with a run-time `lo`. §11.5.1: an x/z index reads
+    /// x at the element's width; a computed upper bound is x as well and
+    /// lost it (`00x` for `s.f0[i][j]` of 3-bit elements).
+    fn emit_dyn_slice(&mut self, src: RegId, lo_reg: RegId, width: u32) -> RegId {
+        let dest = self.alloc_reg();
+        self.emit(Insn::RangeSelectW(dest, src, lo_reg, width, true));
+        dest
+    }
+
+    /// Run-time bit offset of the packed element that `idx_regs` (outermost
+    /// first) select out of a vector with packed dimensions `dims`:
+    /// `off = Σ slot_k * (product of the counts below level k)`.
+    fn emit_packed_chain_offset(
+        &mut self,
+        dims: &[(i64, i64)],
+        idx_regs: Vec<RegId>,
+    ) -> Option<RegId> {
+        let counts: Vec<i64> = dims.iter().map(|(l, r)| (l - r).abs() + 1).collect();
         let mut off_reg: Option<RegId> = None;
         for (k, idx_reg) in idx_regs.into_iter().enumerate() {
             let (l, r) = dims[k];
@@ -11349,37 +11988,7 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             });
         }
-        let lo_reg = off_reg?;
-        // A signal root is sliced IN PLACE. `compile_expr_root_of` copied
-        // the whole vector into a register first, so a loop reading one
-        // byte of a 512-bit table cloned all 512 bits on every iteration —
-        // the copy, not the select, was the cost.
-        if let Some(sig) = root_sig {
-            let dest = self.alloc_reg();
-            self.emit(Insn::LoadSignalRangeDyn(
-                dest,
-                as_sig_id(sig),
-                lo_reg,
-                width as u32,
-            ));
-            return Some(dest);
-        }
-        let root = self.compile_expr_root_of(base)?;
-        let hi_reg = if width == 1 {
-            lo_reg
-        } else {
-            let wm1 = self.alloc_reg();
-            self.emit(Insn::LoadConst(
-                wm1,
-                Box::new(Value::from_u64((width - 1) as u64, 32)),
-            ));
-            let h = self.alloc_reg();
-            self.emit(Insn::Add(h, lo_reg, wm1));
-            h
-        };
-        let dest = self.alloc_reg();
-        self.emit(Insn::RangeSelect(dest, root, hi_reg, lo_reg));
-        Some(dest)
+        off_reg
     }
 
     /// `(lsb, width)` of a chained packed element select, from the root's
@@ -11388,13 +11997,20 @@ impl<'a> BytecodeCompiler<'a> {
     /// existing, separately-tested path.
     fn chained_packed_slice(&self, base: &Expression, index: &Expression) -> Option<(u32, u32)> {
         let (hier, idxs) = self.flatten_const_index_chain(base, index)?;
-        if idxs.len() < 2 {
+        if idxs.len() < 2 || self.is_unpacked_chain_root(hier) {
             return None;
         }
         let dims: Vec<(i64, i64)> = self.chain_root_dims(hier)?;
         if dims.len() < idxs.len() {
             return None;
         }
+        Self::packed_chain_offset(&dims, &idxs)
+    }
+
+    /// `(lsb, width)` of the packed element that the constant `idxs`
+    /// (outermost first) select out of a vector with packed dimensions
+    /// `dims`; None when an index is outside its declared range.
+    fn packed_chain_offset(dims: &[(i64, i64)], idxs: &[i64]) -> Option<(u32, u32)> {
         let counts: Vec<i64> = dims.iter().map(|(l, r)| (l - r).abs() + 1).collect();
         let mut off: i64 = 0;
         for (k, &d) in idxs.iter().enumerate() {
@@ -11422,6 +12038,176 @@ impl<'a> BytecodeCompiler<'a> {
         }
         let root = cur.clone();
         self.compile_expr(&root, 0)
+    }
+
+    /// True when a chain's root is an unpacked array (one-, two- or
+    /// more-dimensional): its first indices address elements, never the
+    /// packed dimensions `packed_full_dims` lists for the element.
+    fn is_unpacked_chain_root(&self, hier: &HierarchicalIdentifier) -> bool {
+        self.lookup_array_name(hier).is_some() || self.is_multi_dim_array(hier)
+    }
+
+    /// §7.4.1, §7.4.5: how many indices of the chain `base[index]` address
+    /// the root's UNPACKED dimensions, when the indices after them select into
+    /// a multi-dimensional packed element (`d[1][0]` on
+    /// `logic [1:0][7:0] d [2]`, `b[0][1]` on `le_t [1:0] b [2]` with `le_t`
+    /// a packed struct): 2 for a two-dimensional array, the length of the
+    /// constant prefix naming a stored element for a deeper one, 1 for a
+    /// one-dimensional array; with the element's packed dimensions. None for
+    /// any other chain. The flag is false when the element's packed range
+    /// labels are not known here (see `elem_packed_dims`).
+    fn unpacked_elem_select_depth(
+        &self,
+        base: &Expression,
+        index: &Expression,
+    ) -> Option<(usize, ElemPackedDims)> {
+        let (hier, idxs) = self.flatten_index_chain_exprs(base, index)?;
+        if self.is_assoc_target(hier) {
+            return None;
+        }
+        let n = idxs.len();
+        let (depth, elem_w) = if let Some((_, shape)) = self.arrays_2d_entry(hier) {
+            (2, Some(shape.2))
+        } else if self.is_multi_dim_array(hier) {
+            (1..n).find_map(|k| match Self::chain_prefix(base, n - 1 - k) {
+                Some(Expression {
+                    kind: ExprKind::Index { expr, index },
+                    ..
+                }) => self
+                    .multi_dim_elem_signal_id(expr, index)
+                    .map(|id| (k, self.signal_widths.get(id).copied())),
+                _ => None,
+            })?
+        } else {
+            let name = self.lookup_array_name(hier)?;
+            (1, self.arrays.get(&name).map(|&(_, _, w)| w))
+        };
+        let (dims, labelled) = self.elem_packed_dims(hier, elem_w)?;
+        (dims.len() >= 2 && n > depth && n - depth <= dims.len())
+            .then_some((depth, (dims, labelled)))
+    }
+
+    /// §7.4.1: the packed dimensions of an element of the unpacked array
+    /// `hier`, outermost first, down to single bits, and whether their range
+    /// labels are the declared ones. `packed_full_dims` lists the packed
+    /// ARRAY dimensions; a packed struct element adds none, so when the
+    /// element (`elem_w` bits) is wider than their product the rest is one
+    /// more dimension of that width. When no dimensions are recorded (a
+    /// single `[N-1:0]` range, or any range of a typedef-named struct type)
+    /// the packed element width still gives the shape, but not whether the
+    /// range is `[N-1:0]`, `[0:N-1]` or offset, so the labels are not known.
+    fn elem_packed_dims(
+        &self,
+        hier: &HierarchicalIdentifier,
+        elem_w: Option<u32>,
+    ) -> Option<ElemPackedDims> {
+        let (mut dims, labelled) = match self.packed_full_dims_of(hier) {
+            Some(d) => (d.clone(), true),
+            None => {
+                let (ew, w) = (self.packed_elem_width_of(hier)?, elem_w?);
+                if ew <= 1 || w <= ew || !w.is_multiple_of(ew) {
+                    return None;
+                }
+                (vec![(i64::from(w / ew) - 1, 0)], false)
+            }
+        };
+        if let Some(w) = elem_w.map(i64::from) {
+            let count: i64 = dims.iter().map(|(l, r)| (l - r).abs() + 1).product();
+            if count > 0 && w > count && w % count == 0 {
+                dims.push((w / count - 1, 0));
+            }
+        }
+        Some((dims, labelled))
+    }
+
+    /// True for a chain `base[index]` over an unpacked array of three or
+    /// more dimensions where no constant prefix of the indices names a
+    /// stored element (`a3[i][j][k]`, `a3[i][j][k][b]`): elements are
+    /// separate signals reached by their flat names, and a run-time index
+    /// has none.
+    fn nd_chain_names_no_element(&self, base: &Expression, index: &Expression) -> bool {
+        let Some((hier, idxs)) = self.flatten_index_chain_exprs(base, index) else {
+            return false;
+        };
+        let n = idxs.len();
+        if n < 2 || !self.is_multi_dim_array(hier) || self.arrays_2d_entry(hier).is_some() {
+            return false;
+        }
+        if self.multi_dim_elem_signal_id(base, index).is_some() {
+            return false;
+        }
+        !(1..n).any(|k| match Self::chain_prefix(base, n - 1 - k) {
+            Some(Expression {
+                kind: ExprKind::Index { expr, index },
+                ..
+            }) => self.multi_dim_elem_signal_id(expr, index).is_some(),
+            _ => false,
+        })
+    }
+
+    /// A literal with x or z bits (`'x`, `2'b1z`), possibly parenthesized.
+    fn is_xz_literal(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(n) => self.eval_number_static(n).is_some_and(|v| v.has_xz()),
+            ExprKind::Paren(i) => self.is_xz_literal(i),
+            _ => false,
+        }
+    }
+
+    /// The node `strip` `Index` levels below `e` (`e` itself for 0).
+    fn chain_prefix(e: &Expression, strip: usize) -> Option<&Expression> {
+        let mut cur = e;
+        for _ in 0..strip {
+            let ExprKind::Index { expr, .. } = &cur.kind else {
+                return None;
+            };
+            cur = expr;
+        }
+        Some(cur)
+    }
+
+    /// Read `base[index]` whose first `depth` indices name an unpacked
+    /// element and the rest select a packed element inside it: the element
+    /// through its own read path, then a constant or run-time slice of it.
+    fn compile_unpacked_elem_packed_select(
+        &mut self,
+        base: &Expression,
+        index: &Expression,
+        depth: usize,
+        dims: &[(i64, i64)],
+    ) -> Option<RegId> {
+        let (_, idxs) = self.flatten_index_chain_exprs(base, index)?;
+        let packed_idxs = &idxs[depth..];
+        let counts: Vec<i64> = dims.iter().map(|(l, r)| (l - r).abs() + 1).collect();
+        let width = u32::try_from(counts[packed_idxs.len()..].iter().product::<i64>()).ok()?;
+        let elem_expr = Self::chain_prefix(base, idxs.len() - depth - 1)?;
+        let elem = self.compile_expr(elem_expr, 0)?;
+        // §11.5.1: an x/z index reads x. `eval_const_expr` folds an x/z
+        // literal to 0, so such an index is never taken as a constant; the
+        // run-time path below carries the x through the offset.
+        let consts: Option<Vec<i64>> = packed_idxs
+            .iter()
+            .map(|e| {
+                (!self.is_xz_literal(e))
+                    .then(|| self.eval_const_expr(e).map(|v| v as i64))
+                    .flatten()
+            })
+            .collect();
+        if let Some(consts) = consts {
+            let dest = self.alloc_reg();
+            match Self::packed_chain_offset(dims, &consts) {
+                Some((lo, w)) => self.emit(Insn::RangeSelectConst(dest, elem, lo + w - 1, lo)),
+                // §11.5.1: an index outside the declared range reads x.
+                None => self.emit(Insn::LoadConst(dest, Box::new(Value::new(width)))),
+            }
+            return Some(dest);
+        }
+        let mut idx_regs = Vec::with_capacity(packed_idxs.len());
+        for e in packed_idxs {
+            idx_regs.push(self.compile_expr(e, 0)?);
+        }
+        let lo_reg = self.emit_packed_chain_offset(dims, idx_regs)?;
+        Some(self.emit_dyn_slice(elem, lo_reg, width))
     }
 
     /// The base's registered packed ELEMENT width (>1), if it is a
@@ -11572,6 +12358,9 @@ impl<'a> BytecodeCompiler<'a> {
             cur = inner;
             layers += 1;
         }
+        if let Some((_, m)) = self.formal_struct_member(cur) {
+            return if layers == 0 { m.dim } else { None };
+        }
         let ExprKind::Ident(h) = &cur.kind else {
             return None;
         };
@@ -11709,11 +12498,18 @@ impl<'a> BytecodeCompiler<'a> {
         if !matches!(outer_base.kind, ExprKind::Index { .. }) {
             return None;
         }
+        // §11.5.1: an x/z literal folds to 0 here; it names no element.
+        if self.is_xz_literal(last_index) {
+            return None;
+        }
         let mut subs: Vec<u32> = vec![self.eval_const_expr(last_index)?];
         let mut cur = outer_base;
         let hier = loop {
             match &cur.kind {
                 ExprKind::Index { expr: b, index: i } => {
+                    if self.is_xz_literal(i) {
+                        return None;
+                    }
                     subs.push(self.eval_const_expr(i)?);
                     cur = b;
                 }
@@ -12115,6 +12911,34 @@ impl<'a> BytecodeCompiler<'a> {
         Some(r)
     }
 
+    /// §6.21, §13.3.1: does a static subroutine body, or any block nested in
+    /// it, declare a variable whose value can carry from one call to the next?
+    fn stmts_carry_static(stmts: &[Statement]) -> bool {
+        fn nested(s: &Statement) -> bool {
+            match &s.kind {
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    BytecodeCompiler::stmts_carry_static(stmts)
+                }
+                StatementKind::If {
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => nested(then_stmt) || else_stmt.as_ref().is_some_and(|e| nested(e)),
+                StatementKind::Case { items, .. } => items.iter().any(|it| nested(&it.stmt)),
+                StatementKind::For { body, .. }
+                | StatementKind::Foreach { body, .. }
+                | StatementKind::While { body, .. }
+                | StatementKind::DoWhile { body, .. }
+                | StatementKind::Repeat { body, .. }
+                | StatementKind::Forever { body }
+                | StatementKind::TimingControl { stmt: body, .. }
+                | StatementKind::Wait { stmt: body, .. } => nested(body),
+                _ => false,
+            }
+        }
+        Self::block_has_carried_static(stmts) || stmts.iter().any(nested)
+    }
+
     /// §6.21: does a process block declare a static local whose value can
     /// carry from one activation to the next (see `static_local_carries`)?
     fn block_has_carried_static(stmts: &[Statement]) -> bool {
@@ -12501,8 +13325,9 @@ impl<'a> BytecodeCompiler<'a> {
                         selects: Vec::new(),
                     }],
                     span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 }),
                 span,
             )
@@ -12532,7 +13357,33 @@ impl<'a> BytecodeCompiler<'a> {
         Some(true)
     }
 
+    /// An assignment or increment whose target select holds `$`.
+    fn writes_through_dollar(stmt: &Statement) -> bool {
+        use crate::compiler::simulator::Simulator;
+        let target = match &stmt.kind {
+            StatementKind::BlockingAssign { lvalue, .. }
+            | StatementKind::NonblockingAssign { lvalue, .. } => lvalue,
+            StatementKind::Expr(e) => match &e.kind {
+                ExprKind::AssignExpr { lvalue, .. } => lvalue,
+                ExprKind::Unary {
+                    op: UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr,
+                    operand,
+                } => operand,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        Simulator::select_mentions_dollar(target)
+    }
+
     fn compile_stmt_strict(&mut self, stmt: &Statement) -> bool {
+        // §7.10: a target whose select holds `$` goes to the interpreter
+        // whole; `assign_value` binds each `$` to its own base before it
+        // stores.
+        if Self::writes_through_dollar(stmt) {
+            self.bail("dollar_lvalue");
+            return false;
+        }
         if let Some(done) = self.compile_unpacked_struct_copy(stmt) {
             if !done {
                 self.bail("Stmt_unpacked_struct_whole");
@@ -12606,6 +13457,24 @@ impl<'a> BytecodeCompiler<'a> {
                 };
                 let ctr = self.alloc_reg();
                 self.emit(Insn::Move(ctr, cnt));
+                // §12.7.2/§6.12.2: a signed-negative count (e.g. `repeat(-1)`)
+                // means ZERO iterations — mirrors the interpreter's
+                // `repeat_count`, which clamps signed values with `.max(0)`.
+                // Without this guard, `repeat(-1)` would read back as
+                // 0xFFFFFFFF (non-zero, non-XZ) and spin ~2^32 times.
+                let neg_test = self.alloc_reg();
+                let signed_zero = self.alloc_reg();
+                let mut zv = Value::from_u64(0, 32);
+                zv.is_signed = true;
+                self.emit(Insn::LoadConst(signed_zero, Box::new(zv)));
+                // Signed compare (both operands need is_signed for `Lt` to
+                // use signed semantics): neg = (signed ctr < 0).
+                self.emit(Insn::Lt(neg_test, ctr, signed_zero));
+                let neg_jump = self.insns.len();
+                // Skip the counted loop when the count is definitely negative
+                // (`BranchUnlessZero` jumps on a definite 1; an X count falls
+                // through to the BranchIfFalse below, which exits on X/Z).
+                self.emit(Insn::BranchUnlessZero(neg_test, 0));
                 let top = self.insns.len() as u32;
                 let branch_idx = self.insns.len();
                 // Exits when the counter is no longer definitely non-zero
@@ -12620,6 +13489,7 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit(Insn::Jump(top));
                 let end = self.insns.len() as u32;
                 self.insns[branch_idx] = Insn::BranchIfFalse(ctr, end);
+                self.insns[neg_jump] = Insn::BranchUnlessZero(neg_test, end);
                 return true;
             }
 
@@ -13078,6 +13948,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.local_var_is_string.remove(name);
                     }
                     self.local_var_regs.insert(name.clone(), (slot, width));
+                    self.record_local_packed_type(slot, data_type);
                     self.decl_local_regs.insert(name.clone());
                 }
                 true
@@ -13214,7 +14085,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit(Insn::AssignPendingColl(key.into_boxed_str(), val_reg));
                         return true;
                     }
-                    if width > 0 && !via_new {
+                    if width > 0 && !via_new && !self.expr_is_string_static(rvalue) {
                         self.emit(Insn::Resize(val_reg, width));
                     }
                     // class-perf P2: STRING member store (`m_leaf_name = name`)
@@ -13426,14 +14297,28 @@ impl<'a> BytecodeCompiler<'a> {
                 let saved_reals = self.local_var_is_real.clone();
                 let saved_strings = self.local_var_is_string.clone();
                 let m_depth = self.m_labels.len();
-                if let Some(n) = name {
+                let prev_block_patches = if let Some(n) = name {
                     self.m_labels.push(n.clone());
-                }
+                    self.named_block_patches.insert(n.name.clone(), Vec::new())
+                } else {
+                    None
+                };
                 let mut ok = true;
                 for s in stmts {
                     if !self.compile_stmt(s) {
                         ok = false;
                         break;
+                    }
+                }
+                if let Some(n) = name {
+                    if let Some(patches) = self.named_block_patches.remove(&n.name) {
+                        let end = self.insns.len() as u32;
+                        for idx in patches {
+                            self.insns[idx] = Insn::Jump(end);
+                        }
+                    }
+                    if let Some(prev) = prev_block_patches {
+                        self.named_block_patches.insert(n.name.clone(), prev);
                     }
                 }
                 self.m_labels.truncate(m_depth);
@@ -13722,7 +14607,7 @@ impl<'a> BytecodeCompiler<'a> {
                         if self.compile_expr(e, 0).is_some() {
                             return true;
                         }
-                        self.bail("Expr_Call");
+                        self.bail("Expr_Call_stmt");
                         return self.emit_fallback(stmt);
                     }
                     // class-perf Step 9c: `$cast(dest, src);` in statement
@@ -13838,7 +14723,7 @@ impl<'a> BytecodeCompiler<'a> {
                                     return false;
                                 }
                             };
-                            if width > 0 {
+                            if width > 0 && !self.expr_is_string_static(rvalue) {
                                 self.emit(Insn::Resize(val_reg, width));
                             }
                             if !self.compile_blocking_target(lvalue, val_reg, width) {
@@ -14151,7 +15036,7 @@ impl<'a> BytecodeCompiler<'a> {
                             return false;
                         }
                     };
-                    if width > 0 {
+                    if width > 0 && !self.expr_is_string_static(rhs) {
                         self.emit(Insn::Resize(val_reg, width));
                     }
                     if !self.compile_blocking_target(lhs, val_reg, width) {
@@ -14183,6 +15068,23 @@ impl<'a> BytecodeCompiler<'a> {
                     );
                 }
                 true
+            }
+            StatementKind::Disable(target) => {
+                // LRM §9.6.2: disable <named_block> terminates execution of that block.
+                // If the block is an active enclosing named block in this compiled unit,
+                // emit a forward Jump(0) and record the patch.
+                let name = crate::ast::stmt::disable_name(target);
+                // A path (`g1.blk`) may name another scope's block of the same
+                // label: the interpreter resolves it (§9.6.2).
+                if target.path.len() == 1 && self.named_block_patches.contains_key(name) {
+                    let idx = self.insns.len();
+                    self.emit(Insn::Jump(0));
+                    self.named_block_patches.get_mut(name).unwrap().push(idx);
+                    true
+                } else {
+                    self.bail("Disable");
+                    self.emit_fallback(stmt)
+                }
             }
             StatementKind::Break => {
                 // LRM §12.7 — exits innermost enclosing loop. Compiled as a
@@ -14274,6 +15176,107 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(patches) = self.loop_continue_patches.pop() {
                     for idx in patches {
                         self.insns[idx] = Insn::Jump(cond_at);
+                    }
+                }
+                if let Some(patches) = self.loop_break_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(end);
+                    }
+                }
+                true
+            }
+            StatementKind::Repeat { count, body } => {
+                // §12.7.5: repeat (count) body
+                // Lowered as an internal countdown loop to 0.
+                // §12.7.2: a real count rounds to an integer (ties away from
+                // zero). compile_expr(count,32) would ceiling the real to an
+                // int (10.4 -> 11), so let the interpreter's `repeat_count`
+                // handle real counts — mirrors the Process-FSM path's
+                // `bail("Repeat_real_count")` above.
+                if self.expr_may_be_real(count) {
+                    self.bail("Repeat_real_count");
+                    return false;
+                }
+                let Some(cnt_reg) = self.compile_expr(count, 32) else {
+                    self.bail("Repeat_count");
+                    return false;
+                };
+                let iter_reg = self.alloc_reg();
+                self.emit(Insn::Move(iter_reg, cnt_reg));
+                let zero_reg = self.alloc_reg();
+                self.emit(Insn::LoadConst(zero_reg, Box::new(Value::from_u64(0, 32))));
+                let one_reg = self.alloc_reg();
+                self.emit(Insn::LoadConst(one_reg, Box::new(Value::from_u64(1, 32))));
+
+                // §12.7.2/§6.12.2: a signed-negative count (e.g. `repeat(-1)`)
+                // means ZERO iterations — mirrors the interpreter's
+                // `repeat_count`, which clamps signed values with `.max(0)`.
+                // Without this, `repeat(-1)` reads back as 0xFFFFFFFF
+                // (non-zero) and the Gt-based loop below spins ~2^32 times.
+                let neg_rs = self.alloc_reg();
+                let signed_zero_reg = self.alloc_reg();
+                let mut zsv = Value::from_u64(0, 32);
+                zsv.is_signed = true;
+                self.emit(Insn::LoadConst(signed_zero_reg, Box::new(zsv)));
+                // Signed compare: `Lt` is signed only when BOTH operands are.
+                self.emit(Insn::Lt(neg_rs, iter_reg, signed_zero_reg));
+                let neg_jmp = self.insns.len();
+                // `BranchUnlessZero` jumps on a definite 1; an X count falls
+                // through to the Gt condition below, which already exits on X.
+                self.emit(Insn::BranchUnlessZero(neg_rs, 0));
+
+                self.loop_break_patches.push(Vec::new());
+                self.loop_continue_patches.push(Vec::new());
+
+                let top = self.insns.len() as u32;
+                let cond_reg = self.alloc_reg();
+                self.emit(Insn::Gt(cond_reg, iter_reg, zero_reg));
+                let br = self.insns.len();
+                self.emit(Insn::BranchIfFalse(cond_reg, 0));
+
+                if !self.compile_stmt(body) {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    return false;
+                }
+
+                let step_top = self.insns.len() as u32;
+                self.emit(Insn::Sub(iter_reg, iter_reg, one_reg));
+                self.emit(Insn::Jump(top));
+
+                let end = self.insns.len() as u32;
+                if let Insn::BranchIfFalse(reg, _) = self.insns[br] {
+                    self.insns[br] = Insn::BranchIfFalse(reg, end);
+                }
+                self.insns[neg_jmp] = Insn::BranchUnlessZero(neg_rs, end);
+                if let Some(patches) = self.loop_continue_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(step_top);
+                    }
+                }
+                if let Some(patches) = self.loop_break_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(end);
+                    }
+                }
+                true
+            }
+            StatementKind::Forever { body } => {
+                // §12.7.1: forever body
+                // Infinite loop: jumps to top at the end; break exits, continue loops.
+                self.loop_break_patches.push(Vec::new());
+                self.loop_continue_patches.push(Vec::new());
+                let top = self.insns.len() as u32;
+                if !self.compile_stmt(body) {
+                    self.loop_break_patches.pop();
+                    self.loop_continue_patches.pop();
+                    return false;
+                }
+                self.emit(Insn::Jump(top));
+                let end = self.insns.len() as u32;
+                if let Some(patches) = self.loop_continue_patches.pop() {
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(top);
                     }
                 }
                 if let Some(patches) = self.loop_break_patches.pop() {
@@ -14573,6 +15576,20 @@ impl<'a> BytecodeCompiler<'a> {
         ctx_width: u32,
         unsigned_context: bool,
     ) -> Option<RegId> {
+        // §7.10: `$` is the last index of the queue its select indexes. The
+        // interpreter evaluates a select chain holding one whole, binding each
+        // `$` to its own base.
+        if matches!(
+            expr.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
+        ) && crate::compiler::simulator::Simulator::select_mentions_dollar(expr)
+        {
+            let dest = self.emit_expr_fallback(expr, ctx_width, "dollar_select");
+            if dest.is_none() {
+                self.bail("dollar_select");
+            }
+            return dest;
+        }
         if let Some(id) = self.const_multi_dim_array_elem_signal_id(expr) {
             let dest = self.alloc_reg();
             if self.signal_signed[id] {
@@ -14639,6 +15656,9 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some((src, _)) = self.local_var_reg_of(hier) {
                     let r = self.alloc_reg();
                     self.emit(Insn::Move(r, src));
+                    return Some(r);
+                }
+                if let Some(r) = self.compile_formal_struct_member(expr) {
                     return Some(r);
                 }
                 // Element of a register-bound LOCAL ARRAY (`row[n]` parsed as
@@ -15215,8 +16235,7 @@ impl<'a> BytecodeCompiler<'a> {
                         // §11.8.1 signedness applies exactly as for +/-.
                         let opw = ctx_width
                             .max(self.lrm_self_width(left))
-                            .max(self.lrm_self_width(right))
-                            .max(1);
+                            .max(self.lrm_self_width(right));
                         let ls = self.expr_signedness(left);
                         let rs = self.expr_signedness(right);
                         if ls == Some(false) || rs == Some(false) {
@@ -15227,8 +16246,10 @@ impl<'a> BytecodeCompiler<'a> {
                                 self.emit(Insn::ClearSigned(r));
                             }
                         }
-                        self.emit(Insn::Resize(l, opw));
-                        self.emit(Insn::Resize(r, opw));
+                        if opw > 0 {
+                            self.emit(Insn::Resize(l, opw));
+                            self.emit(Insn::Resize(r, opw));
+                        }
                         if matches!(op, BinaryOp::Div) {
                             self.emit(Insn::Div(dest, l, r));
                         } else {
@@ -15315,8 +16336,12 @@ impl<'a> BytecodeCompiler<'a> {
                         // operation width — ctx joined with the operand's own
                         // LRM width (never the carry-aware estimate, which
                         // shifted dropped carries back into range).
-                        let opw = ctx_width.max(self.lrm_self_width(left)).max(1);
-                        self.emit(Insn::Resize(l, opw));
+                        // An operand of unknown width (0) in a self-determined
+                        // context keeps the width its load produced.
+                        let opw = ctx_width.max(self.lrm_self_width(left));
+                        if opw > 0 {
+                            self.emit(Insn::Resize(l, opw));
+                        }
                         self.emit(Insn::Shl(dest, l, r));
                     }
                     BinaryOp::ShiftRight | BinaryOp::ArithShiftRight => {
@@ -15326,8 +16351,10 @@ impl<'a> BytecodeCompiler<'a> {
                         // shifted at 8 bits then zero-extended (00000013 for
                         // 1ffffff3), and `(a+a) >> 1` shifted the carry back
                         // in (0xa3 for 0x23).
-                        let opw = ctx_width.max(self.lrm_self_width(left)).max(1);
-                        self.emit(Insn::Resize(l, opw));
+                        let opw = ctx_width.max(self.lrm_self_width(left));
+                        if opw > 0 {
+                            self.emit(Insn::Resize(l, opw));
+                        }
                         if matches!(op, BinaryOp::ShiftRight) {
                             self.emit(Insn::Shr(dest, l, r));
                         } else {
@@ -15365,8 +16392,10 @@ impl<'a> BytecodeCompiler<'a> {
                             // to the operation width first; `a ** 2` in a
                             // 32-bit context computed at 8 bits (0x90) and
                             // then bailed the whole block to the interpreter.
-                            let opw = sub_ctx.max(self.expr_max_width(left)).max(1);
-                            self.emit(Insn::Resize(l, opw));
+                            let opw = sub_ctx.max(self.expr_max_width(left));
+                            if opw > 0 {
+                                self.emit(Insn::Resize(l, opw));
+                            }
                             self.emit(Insn::Pow(dest, l, r));
                         }
                     }
@@ -15493,6 +16522,14 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Paren(inner) => self.compile_expr_typed(inner, ctx_width, unsigned_context),
             ExprKind::Index { expr, index } => {
+                // §13.4.1, §7.4.1: two or more indices into a packed-array
+                // member of a call result (`mk().f0[i][j]`) have no shape
+                // here: past the first, each was a bit select of the
+                // element. The AST path takes the member's dimensions.
+                if matches!(&expr.kind, ExprKind::Index { .. }) && chain_has_call_base(expr) {
+                    self.bail("call_member_index_chain");
+                    return None;
+                }
                 // Step 8 (string formals): a select on a string formal takes
                 // the interpreter's char-select path (`string_signals`
                 // registry, out-of-range → NUL byte, not X) — bail. An index
@@ -15626,7 +16663,17 @@ impl<'a> BytecodeCompiler<'a> {
                 // one bit instead of one packed element.
                 let member_start = self.insns.len();
                 let member_reg = self.next_reg;
+                if let Some(dest) = self.compile_typed_packed_chain(expr, index) {
+                    return Some(dest);
+                }
+                self.truncate_insns(member_start);
+                self.next_reg = member_reg;
                 if let Some(dest) = self.compile_packed_member_index(expr, index) {
+                    return Some(dest);
+                }
+                self.truncate_insns(member_start);
+                self.next_reg = member_reg;
+                if let Some(dest) = self.compile_packed_member_index_chain(expr, index) {
                     return Some(dest);
                 }
                 self.truncate_insns(member_start);
@@ -15645,6 +16692,29 @@ impl<'a> BytecodeCompiler<'a> {
                 // only ever sees one level. Constant indices only: that is the
                 // shape RTL uses (and what a genvar unrolls to), and it leaves
                 // the single-level dynamic path untouched.
+                // §7.4.1, §7.4.5: indices past an unpacked array's dimensions
+                // select into the element's packed dimensions — `d[1][0]` on
+                // `logic [1:0][7:0] d [2]` is a byte of element `d[1]`. The
+                // packed chain below would take `[1]` as a packed index of the
+                // root, and the bit select further down would take `[0]` as a
+                // bit. An element that does not compile keeps the read on the
+                // AST path, which walks the chain itself.
+                // Without the declared range labels the select would be
+                // placed by guess; the AST path reads it from the element's
+                // declaration.
+                if let Some((depth, (dims, labelled))) =
+                    self.unpacked_elem_select_depth(expr, index)
+                {
+                    let r = if labelled {
+                        self.compile_unpacked_elem_packed_select(expr, index, depth, &dims)
+                    } else {
+                        None
+                    };
+                    if r.is_none() {
+                        self.bail("unpacked_elem_packed_select");
+                    }
+                    return r;
+                }
                 if let Some((lo, w)) = self.chained_packed_slice(expr, index) {
                     let base = self.compile_expr_root_of(expr)?;
                     let dest = self.alloc_reg();
@@ -15723,6 +16793,15 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::LoadSignal(dest, as_sig_id(id)));
                     return Some(dest);
                 }
+                // §7.4.1, §7.4.5: the AST fallback the note above relies on
+                // was never reached for three or more dimensions: no arm
+                // below matches, and the bit select at the end took
+                // `a3[i][j][k]` as bits of the array's placeholder signal
+                // (`000X`), and `a3[i][j][k][b]` as one of them.
+                if self.nd_chain_names_no_element(expr, index) {
+                    self.bail("nd_unpacked_dyn_index");
+                    return None;
+                }
                 // Array element access
                 if let ExprKind::Ident(hier) = &expr.kind {
                     // An ASSOCIATIVE array element has no dense storage and no
@@ -15737,6 +16816,25 @@ impl<'a> BytecodeCompiler<'a> {
                     if let Some(name) = self.lookup_array_name(hier) {
                         let idx_reg = self.compile_expr(index, 0)?;
                         let dest = self.alloc_reg();
+                        // §7.5 / §7.10: a dynamic array or queue reads its
+                        // live collection (see `Insn::LoadDynElem`).
+                        if self.is_dynamic_collection(&name) {
+                            let cells = self
+                                .array_first_id
+                                .and_then(|m| m.get(name.as_str()).copied());
+                            let size_key = format!("{name}.size").into_boxed_str();
+                            self.emit(Insn::LoadDynElem(
+                                dest,
+                                Box::new(DynElemOp {
+                                    name: name.into_boxed_str(),
+                                    size_key,
+                                    cells,
+                                    ctx_width,
+                                }),
+                                idx_reg,
+                            ));
+                            return Some(dest);
+                        }
                         let array = self.array_operand(name)?;
                         self.emit(Insn::LoadArrayElem(dest, array, idx_reg));
                         return Some(dest);
@@ -15758,7 +16856,11 @@ impl<'a> BytecodeCompiler<'a> {
                         // write lands correctly. (This was the FlooNOC "router
                         // never forwards" root cause: the arbiter's selected
                         // index came out X.)
-                        if let Some(idx) = self.eval_const_expr(index) {
+                        // §11.5.1: an x/z literal index reads x; it folds to
+                        // 0 here, so the run-time path below takes it.
+                        if !self.is_xz_literal(index)
+                            && let Some(idx) = self.eval_const_expr(index)
+                        {
                             let base = self.compile_expr(expr, 0)?;
                             // §11.5.1: a constant index outside the declared
                             // range reads x. `eval_const_expr` folds in u32, so
@@ -15813,15 +16915,9 @@ impl<'a> BytecodeCompiler<'a> {
                             return Some(dest);
                         }
                         let base = self.compile_expr(expr, 0)?;
-                        let em1_reg = self.alloc_reg();
-                        self.emit(Insn::LoadConst(
-                            em1_reg,
-                            Box::new(Value::from_u64((elem_w - 1) as u64, 32)),
-                        ));
-                        let hi_reg = self.alloc_reg();
-                        self.emit(Insn::Add(hi_reg, lo_reg, em1_reg));
+                        // §11.5.1: an x/z index reads x at the element's width.
                         let dest = self.alloc_reg();
-                        self.emit(Insn::RangeSelect(dest, base, hi_reg, lo_reg));
+                        self.emit(Insn::RangeSelectW(dest, base, lo_reg, elem_w, true));
                         return Some(dest);
                     }
                 }
@@ -16720,6 +17816,20 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     return Some(r);
                 }
+                if let Some(dest) = self.compile_formal_struct_member(expr) {
+                    return Some(dest);
+                }
+                // §9.7: `p.status` / `p.status()` on a process handle
+                if member.name == "status"
+                    && self
+                        .method_handle_chain_class(base)
+                        .is_some_and(|cls| cls == "process")
+                {
+                    let handle_reg = self.compile_expr(base, 0)?;
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::LoadProcessStatus(dest, handle_reg));
+                    return Some(dest);
+                }
                 // class-perf method-mode: `this.<member>`/`<classlocal>.<member>`
                 // is an OBJECT-field read off the heap, not a hierarchical
                 // signal. Only the literal `this` keyword or a method-local
@@ -16754,6 +17864,19 @@ impl<'a> BytecodeCompiler<'a> {
                     };
                     if let Some(handle_reg) = base_reg {
                         if !self.method_instance_field_ok(base, &member.name) {
+                            if let Some(class) = self.method_handle_chain_class(base) {
+                                if self.static_member_names.contains(member.name.as_str()) {
+                                    let dest = self.alloc_reg();
+                                    self.emit(Insn::LoadClassStatic(
+                                        dest,
+                                        Box::new(NamePair(
+                                            class.into_boxed_str(),
+                                            member.name.clone().into_boxed_str(),
+                                        )),
+                                    ));
+                                    return Some(dest);
+                                }
+                            }
                             self.bail("method_receiver_field");
                             return None;
                         }
@@ -17168,6 +18291,16 @@ impl<'a> BytecodeCompiler<'a> {
                         // a subclass redeclares the method. Those calls start
                         // the hierarchy walk at the statically bound class.
                         let rc_decl = self.method_handle_chain_class(base);
+                        // §8.23: a STATIC method never dereferences the
+                        // receiver, so `h.m(...)` with `h == null` is legal and
+                        // resolves on the DECLARED class. CallMethod has only
+                        // the handle, so it dispatched on a live object's
+                        // class; with a null handle the runtime returned a
+                        // silent zero. Bake the declared class the same way a
+                        // class-scope static call does.
+                        let static_decl = rc_decl
+                            .as_deref()
+                            .and_then(|rc| self.declared_static_target(rc, member.name.as_str()));
                         let static_target = rc_decl.as_deref().and_then(|rc| {
                             self.method_admission.as_ref().and_then(|a| {
                                 a.nonvirtual_targets
@@ -17176,7 +18309,28 @@ impl<'a> BytecodeCompiler<'a> {
                                     .cloned()
                             })
                         });
-                        if let Some(target) = static_target {
+                        if let Some(target) = static_decl {
+                            // The receiver register rides along so a LIVE
+                            // handle still dispatches through the object (its
+                            // runtime class carries the specialization); a
+                            // NULL one falls back to the baked declared class.
+                            self.emit(Insn::CallScopedMethod(
+                                dest,
+                                handle_reg,
+                                Box::new(NamePair(
+                                    target.clone().into_boxed_str(),
+                                    member.name.clone().into_boxed_str(),
+                                )),
+                                arg_start,
+                                n,
+                            ));
+                            let wb_target = rc_decl.as_deref().unwrap_or(target.as_str());
+                            self.emit_arg_slot_writeback(
+                                args,
+                                arg_start,
+                                Some((wb_target, member.name.as_str())),
+                            )?;
+                        } else if let Some(target) = static_target {
                             self.emit(Insn::CallScopedMethod(
                                 dest,
                                 handle_reg,
@@ -17241,7 +18395,59 @@ impl<'a> BytecodeCompiler<'a> {
                         .class_method_names
                         .contains(h.path[0].name.name.as_str())
                 {
-                    let Some(this_reg) = self.method_this_reg else {
+                    let this_reg = if let Some(tr) = self.method_this_reg {
+                        tr
+                    } else if let Some(target) = self.static_bare_targets.get(h.path[0].name.name.as_str()).cloned() {
+                        // Static method in a static method body (where this_reg is None):
+                        // emit CallStaticScoped with this class target.
+                        let call_start = self.insns.len();
+                        let call_next = self.next_reg;
+                        let mut ok = true;
+                        let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+                        for a in args {
+                            match self.compile_expr(a, 0) {
+                                Some(r) => arg_values.push(r),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok {
+                            let dest = self.alloc_reg();
+                            let n = arg_values.len() as u32;
+                            let arg_start = self.alloc_reg();
+                            for _ in 1..arg_values.len() {
+                                self.alloc_reg();
+                            }
+                            for (i, &v) in arg_values.iter().enumerate() {
+                                let slot = (arg_start as usize + i) as RegId;
+                                if slot != v {
+                                    self.emit(Insn::Move(slot, v));
+                                }
+                            }
+                            self.emit(Insn::CallStaticScoped(
+                                dest,
+                                Box::new(NamePair(
+                                    target.into_boxed_str(),
+                                    h.path[0].name.name.clone().into_boxed_str(),
+                                )),
+                                arg_start,
+                                n,
+                            ));
+                            let wb_target = self.method_class.clone();
+                            self.emit_arg_slot_writeback(
+                                args,
+                                arg_start,
+                                wb_target.as_deref().map(|c| (c, h.path[0].name.name.as_str())),
+                            )?;
+                            return Some(dest);
+                        }
+                        self.truncate_insns(call_start);
+                        self.next_reg = call_next;
+                        self.bail("Expr_Call_bare_static");
+                        return None;
+                    } else {
                         self.bail("bare_call_no_this");
                         return None;
                     };
@@ -17434,10 +18640,10 @@ impl<'a> BytecodeCompiler<'a> {
                 // marshals register VALUES as constant actuals, so a
                 // write-back would be a no-op and the caller's lvalue would
                 // silently keep its pre-call value (uvm_config_db::get's
-                // inout `value` arg zeroed every config read). Formal
-                // directions are runtime state here (the receiver resolves
-                // through typedef/type-param chains at run time), so any
-                // potentially-assignable actual declines the whole method.
+                // inout `value` arg zeroed every config read).
+                // Register-backed locals are writable via emit_arg_slot_writeback,
+                // but other assignable actuals (heap members, static members,
+                // arrays) decline the compiled static method call.
                 let arg_could_be_ref_bound = |a: &Expression| -> bool {
                     match &a.kind {
                         ExprKind::Ident(h)
@@ -17449,8 +18655,10 @@ impl<'a> BytecodeCompiler<'a> {
                             if n == "this" {
                                 return false;
                             }
-                            self.local_var_regs.contains_key(n)
-                                || self.local_array_regs.contains_key(n)
+                            if self.local_var_reg_of(h).is_some() {
+                                return false;
+                            }
+                            self.local_array_regs.contains_key(n)
                                 || self.bare_member_names.contains(n)
                                 || self.static_member_names.contains(n)
                                 || self.string_member_names.contains(n)
@@ -17558,6 +18766,11 @@ impl<'a> BytecodeCompiler<'a> {
                 self.truncate_insns(start);
                 self.next_reg = first_reg;
                 self.emit_expr_fallback(expr, ctx_width, "Expr_Call_impure")
+            }
+            // `$` outside a select has no queue bound here (§7.10).
+            ExprKind::Dollar => {
+                self.bail("dollar_outside_select");
+                None
             }
             other => {
                 let n: &'static str = match other {
@@ -19879,7 +21092,10 @@ impl<'a> BytecodeCompiler<'a> {
                     // a wider element before the store ever saw it.
                     w
                 } else {
-                    32
+                    // §7.4.5, §11.6.1: `a[i][j] <= v` on a multidimensional
+                    // unpacked array. The 32-bit default below cut the value
+                    // before the store, whatever the element's type.
+                    self.multi_dim_unpacked_elem_width(lhs).unwrap_or(32)
                 }
             }
             ExprKind::RangeSelect {
@@ -20415,6 +21631,9 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn expr_signedness(&mut self, e: &Expression) -> Option<bool> {
+        if let Some((_, m)) = self.formal_struct_member(e) {
+            return Some(m.signed);
+        }
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer { signed, .. }) => Some(*signed),
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(false),
@@ -20699,6 +21918,9 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn expr_max_width(&self, expr: &Expression) -> u32 {
+        if let Some((_, m)) = self.formal_struct_member(expr) {
+            return m.width;
+        }
         match &expr.kind {
             ExprKind::Ident(hier) => self
                 .lookup_signal_id(hier)
@@ -20890,6 +22112,17 @@ impl<'a> BytecodeCompiler<'a> {
                             .and_then(|n| self.assoc_elem_widths.and_then(|m| m.get(&n).copied()))
                     })
                     .or_else(|| self.member_coll_elem_decl_width(hier))
+                    // A member of the element-access plan set whose element
+                    // is a plain vector (`int unsigned base[5]`, read as
+                    // `base[i]`): the read lowers to `LoadCollElem`, but
+                    // none of the tables above carries its element width
+                    // (packed dims: none recorded; module array tables:
+                    // module scope only), so the select sized at 1 bit —
+                    // and a self-determined context (`(base[i] < base[j])
+                    // ? …`) then resized both element reads to their LSBs,
+                    // comparing 0 < 0. The plan's element-width fact
+                    // (`coll_elem_widths`) is the missing table.
+                    .or_else(|| self.member_elem_plan_width_of(hier))
                     .unwrap_or(1),
                 // issue-301: a select INTO a member-collection element
                 // (`arr[i][2]` on `bit [8:0][7:0] arr[3]`) — the width is
@@ -20900,6 +22133,18 @@ impl<'a> BytecodeCompiler<'a> {
                 // store-backed shapes above were safe.
                 ExprKind::Index { expr: root, .. } => {
                     self.member_coll_elem_index_width(root).unwrap_or(1)
+                }
+                // `this.base[i]`: the same width sources as the bare
+                // spelling, in the same order — multi-dim packed dims
+                // first, then the plan element-width fact.
+                ExprKind::MemberAccess { expr: recv, member }
+                    if matches!(recv.kind, ExprKind::This) =>
+                {
+                    self.coll_elem_packed_dims
+                        .get(&member.name)
+                        .map(|dims| dims.iter().map(|(l, r)| (l - r).abs() as u32 + 1).product())
+                        .or_else(|| self.member_elem_plan_width(&member.name, true))
+                        .unwrap_or(1)
                 }
                 _ => 1,
             },
@@ -21499,6 +22744,9 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::Format(_, fs) => fs.args.iter().for_each(|&a| f(a)),
             Insn::StrOp(_, _, args) => args.iter().for_each(|&a| f(a)),
             Insn::BlockingAssignString(_, v) => f(*v),
+            Insn::LoadProcessStatus(_d, h) => {
+                f(*h);
+            }
             Insn::LoadSignalRangeDyn(_, _, lo, _) => f(*lo),
             Insn::LoadConst(..)
             | Insn::LoadSignal(..)
@@ -21673,7 +22921,7 @@ impl<'a> BytecodeCompiler<'a> {
                 f(*i);
                 f(*v);
             }
-            Insn::LoadArrayElem(_, _, i) => f(*i),
+            Insn::LoadArrayElem(_, _, i) | Insn::LoadDynElem(_, _, i) => f(*i),
             Insn::NbaAssignArray(_, i, v, _) | Insn::BlockingAssignArray(_, i, v, _) => {
                 f(*i);
                 f(*v);
@@ -22004,10 +23252,12 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::LoadSignal(d, _)
             | Insn::LoadSignalSigned(d, _)
             | Insn::LoadProcessLocal(d, _)
+            | Insn::LoadProcessStatus(d, _)
             | Insn::LoadSignalRange(d, _, _, _)
             | Insn::LoadSignalBit(d, _, _)
             | Insn::LoadSignalRangeDyn(d, _, _, _)
             | Insn::LoadArrayElem(d, _, _)
+            | Insn::LoadDynElem(d, _, _)
             | Insn::Pow(d, _, _)
             | Insn::Add(d, _, _)
             | Insn::Sub(d, _, _)
@@ -22079,6 +23329,14 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::Format(..)
                 | Insn::StrOp(..)
                 | Insn::BinOpConstAdd2(..)
+                | Insn::CallMethod(..)
+                | Insn::CallScopedMethod(..)
+                | Insn::CallStaticScoped(..)
+                | Insn::CallFreeFunction(..)
+                | Insn::CallCollMethod(..)
+                | Insn::ConstructObject(..)
+                | Insn::ForeachNext(..)
+                | Insn::Cast(..)
         )
     }
 
@@ -22141,6 +23399,7 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::BranchUnlessZero(a, _)
             | Insn::LoadSignalRangeDyn(_, _, a, _)
             | Insn::LoadArrayElem(_, _, a)
+            | Insn::LoadDynElem(_, _, a)
             | Insn::NbaAssign(_, a, _)
             | Insn::BlockingAssign(_, a, _)
             | Insn::NbaAssignRange(_, _, _, a)
@@ -22329,6 +23588,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::LoadSignalBit(d, _, _)
                 | Insn::LoadSignalRange(d, _, _, _)
                 | Insn::LoadArrayElem(d, _, _)
+                | Insn::LoadDynElem(d, _, _)
                 | Insn::Add(d, _, _)
                 | Insn::Sub(d, _, _)
                 | Insn::Mul(d, _, _)
@@ -22853,6 +24113,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::LoadSignal(d, _)
                 | Insn::LoadSignalSigned(d, _)
                 | Insn::LoadProcessLocal(d, _)
+                | Insn::LoadProcessStatus(d, _)
                 | Insn::Resize(d, _)
                 | Insn::Add(d, _, _)
                 | Insn::Sub(d, _, _)
@@ -22897,6 +24158,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::Replicate(d, _, _)
                 | Insn::Select(d, _, _, _)
                 | Insn::LoadArrayElem(d, _, _)
+                | Insn::LoadDynElem(d, _, _)
                 | Insn::Move(d, _)
                 | Insn::EvalExprFallback(_, d, _)
                 | Insn::SetSigned(d)
@@ -23392,19 +24654,36 @@ impl<'a> BytecodeCompiler<'a> {
                 // Class-member store defines nothing (only the heap object).
                 Insn::StoreClassMember(..) => {}
                 // Method call: dest width isn't statically known (callee
-                // return width follows its runtime type) — bare dest store.
-                Insn::CallMethod(d, ..) => store(&mut rw, *d, None),
-                Insn::CallScopedMethod(d, ..) => store(&mut rw, *d, None),
-                Insn::CallFreeFunction(d, ..) => store(&mut rw, *d, None),
+                // return width follows its runtime type) — bare dest store,
+                // and any writeback argument registers `a..a+n` may be
+                // overwritten in place by `vm_drain_arg_temps`.
+                Insn::CallMethod(d, _, _, a, n)
+                | Insn::CallScopedMethod(d, _, _, a, n) => {
+                    store(&mut rw, *d, None);
+                    for x in *a..*a + (*n as RegId) {
+                        store(&mut rw, x, None);
+                    }
+                }
+                Insn::CallFreeFunction(d, _, a, n)
+                | Insn::CallStaticScoped(d, _, a, n)
+                | Insn::ConstructObject(d, _, a, n) => {
+                    store(&mut rw, *d, None);
+                    for x in *a..*a + (*n as RegId) {
+                        store(&mut rw, x, None);
+                    }
+                }
                 Insn::LoadClassStatic(d, ..) => store(&mut rw, *d, None),
                 // Step 9g: static store defines no SSA value; a fresh
                 // object handle has runtime-determined width (bare store).
                 Insn::StoreClassStatic(..) => {}
-                Insn::ConstructObject(d, ..) => store(&mut rw, *d, None),
-                Insn::CallStaticScoped(d, ..) => store(&mut rw, *d, None),
                 // Collection builtin: dest width follows the runtime member
                 // (count / exists flag / popped element) — bare dest store.
-                Insn::CallCollMethod(d, ..) => store(&mut rw, *d, None),
+                Insn::CallCollMethod(d, _, _, a, n, _) => {
+                    store(&mut rw, *d, None);
+                    for x in *a..*a + (*n as RegId) {
+                        store(&mut rw, x, None);
+                    }
+                }
                 // Collection element read: width follows the runtime store —
                 // bare dest store (like LoadClassMember).
                 Insn::LoadCollElem(d, ..) => store(&mut rw, *d, None),
@@ -23483,6 +24762,7 @@ impl<'a> BytecodeCompiler<'a> {
                     store(&mut rw, *d, f);
                 }
                 Insn::LoadProcessLocal(d, _) => store(&mut rw, *d, None),
+                Insn::LoadProcessStatus(d, _) => store(&mut rw, *d, Some((32, true))),
                 // `Value::bit_select` is 1 bit on every path, including the
                 // §11.5.1 out-of-range read.
                 Insn::LoadSignalBit(d, _, _)
@@ -23669,7 +24949,8 @@ impl<'a> BytecodeCompiler<'a> {
                 // instead of the element.
                 Insn::RangeSelect(d, _, _, _)
                 | Insn::RangeSelectW(d, _, _, _, _)
-                | Insn::LoadArrayElem(d, _, _) => store(&mut rw, *d, None),
+                | Insn::LoadArrayElem(d, _, _)
+                | Insn::LoadDynElem(d, _, _) => store(&mut rw, *d, None),
 
                 // Stamp/clear `is_signed`; storage and width are untouched.
                 Insn::SetSigned(_) | Insn::ClearSigned(_) | Insn::DropXz(_) => {}
@@ -24111,6 +25392,7 @@ mod tests {
                     span,
                 },
                 span,
+                bound: Default::default(),
             },
             dimensions: vec![],
             type_args: vec![],
@@ -24656,7 +25938,7 @@ mod tests {
                             signed: false,
                             base: NumberBase::Decimal,
                             value: (index * stride).to_string(),
-                            cached_val: std::cell::Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         span,
                     )],
@@ -24755,8 +26037,9 @@ mod tests {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         )
@@ -24879,7 +26162,7 @@ mod tests {
                 signed: true,
                 base: crate::ast::expr::NumberBase::Decimal,
                 value: "1".into(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             sp,
         );
@@ -27315,6 +28598,61 @@ const _: () = assert!(
     "TsInsn grew past 24 bytes"
 );
 
+/// Calls `f` with every register `ins` defines, in place or as a destination.
+fn ts_for_each_reg_def(ins: &Insn, mut f: impl FnMut(RegId)) {
+    if let Some(d) = BytecodeCompiler::dest_reg(ins) {
+        f(d);
+    }
+    if let Some(a) = BytecodeCompiler::in_place_reg(ins) {
+        f(a);
+    }
+    match ins {
+        Insn::CmpBranchConst(_, _, _, tmp, _) => f(*tmp),
+        Insn::BinOpConstAdd2(a) => {
+            f(a.d1);
+            f(a.d2);
+        }
+        Insn::EvalExprFallback(_, d, _)
+        | Insn::LoadDynElem(d, _, _)
+        | Insn::Format(d, _)
+        | Insn::StrOp(d, _, _) => f(*d),
+        _ => {}
+    }
+}
+
+/// For each instruction index, the earliest forward branch that targets it.
+fn ts_earliest_forward_branch(insns: &[Insn]) -> Vec<Option<usize>> {
+    let mut earliest: Vec<Option<usize>> = vec![None; insns.len() + 1];
+    for (i, insn) in insns.iter().enumerate() {
+        let mut note = |t: u32| {
+            if let Some(slot) = earliest.get_mut(t as usize)
+                && t as usize > i
+                && slot.is_none()
+            {
+                *slot = Some(i);
+            }
+        };
+        match insn {
+            Insn::BranchIfFalse(_, t)
+            | Insn::BranchUnlessZero(_, t)
+            | Insn::BranchIfSignalFalse(_, t, _)
+            | Insn::CmpBranch(_, _, _, _, t)
+            | Insn::CmpBranchConst(_, _, _, _, t)
+            | Insn::Jump(t) => note(*t),
+            Insn::CaseJump(_, cj) => {
+                cj.table.iter().for_each(|&t| note(t));
+                note(cj.default);
+            }
+            Insn::CaseMaskJump(_, mj) => {
+                mj.table.iter().for_each(|&t| note(t));
+                note(mj.xz_path);
+            }
+            _ => {}
+        }
+    }
+    earliest
+}
+
 pub fn lower_two_state(
     cb: &CompiledBlock,
     signal_widths: &[u32],
@@ -27673,27 +29011,16 @@ pub fn lower_two_state(
     // the lowering handles but this table does not model.
     let mut last_def: Vec<usize> = vec![0; cb.num_regs as usize];
     for (j, ins) in insns.iter().enumerate() {
-        let mut note = |r: RegId| {
+        ts_for_each_reg_def(ins, |r| {
             if let Some(slot) = last_def.get_mut(r as usize) {
                 *slot = j;
             }
-        };
-        if let Some(d) = BytecodeCompiler::dest_reg(ins) {
-            note(d);
-        }
-        if let Some(a) = BytecodeCompiler::in_place_reg(ins) {
-            note(a);
-        }
-        match ins {
-            Insn::CmpBranchConst(_, _, _, tmp, _) => note(*tmp),
-            Insn::BinOpConstAdd2(a) => {
-                note(a.d1);
-                note(a.d2);
-            }
-            Insn::EvalExprFallback(_, d, _) | Insn::Format(d, _) | Insn::StrOp(d, _, _) => note(*d),
-            _ => {}
-        }
+        });
     }
+    let earliest_branch = ts_earliest_forward_branch(insns);
+    // Index of each register's latest definition in the forward walk, for the
+    // forward-join reset below.
+    let mut walk_def: Vec<usize> = vec![0; cb.num_regs as usize];
     for (ins_i, insn) in insns.iter().enumerate() {
         if track {
             TS_BAIL_AT.with(|c| c.set((ins_i, insn_opcode_name(insn))));
@@ -27715,6 +29042,26 @@ pub fn lower_two_state(
         if back_branch && is_tgt[ins_i] {
             for r in 0..rc.len() {
                 if last_def[r] >= ins_i {
+                    rc[r] = None;
+                    wfill[r] = None;
+                }
+            }
+        }
+        // A forward branch can skip a definition between it and its target,
+        // so a value the walk learned there is only one of the values that
+        // reach the target. The out-of-range arm of a 2-D element index
+        // (`flat = count`, see `compile_2d_flat_index`) read as a constant
+        // index here, and the store it guards was dropped as out of range.
+        if ins_i > 0 {
+            ts_for_each_reg_def(&insns[ins_i - 1], |r| {
+                if let Some(slot) = walk_def.get_mut(r as usize) {
+                    *slot = ins_i - 1;
+                }
+            });
+        }
+        if let Some(branch) = earliest_branch[ins_i] {
+            for r in 0..rc.len() {
+                if walk_def[r] > branch {
                     rc[r] = None;
                     wfill[r] = None;
                 }
@@ -29943,6 +31290,16 @@ pub(crate) fn system_function_is_real(name: &str) -> bool {
     )
 }
 
+/// Whether a member/select chain is rooted at a call (`mk().f0[1]`).
+fn chain_has_call_base(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {
+            matches!(expr.kind, ExprKind::Call { .. }) || chain_has_call_base(expr)
+        }
+        _ => false,
+    }
+}
+
 /// IEEE 1800-2017 §20/§21 result type of a system FUNCTION as (width,
 /// signed): `int`/`integer` → (32, true); unsigned int → (32, false);
 /// `bit` → (1, false); `time` / `$realtobits` → (64, false). Real- and
@@ -30101,6 +31458,7 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
                 span,
             },
             span,
+            bound: Default::default(),
         };
         self.0.typedef_type_entry(&tn, None).is_some()
     }
@@ -30123,14 +31481,22 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
         }
         let raw = BytecodeCompiler::hier_raw_name(h);
         let scoped = self.0.scope_hint.as_deref().map(|sc| cat_dot(sc, &raw));
-        let found = [self.0.var_decl_types, self.0.param_decl_types]
-            .into_iter()
-            .flatten()
-            .find_map(|types| {
+        let found = self
+            .0
+            .var_decl_types
+            .and_then(|types| {
                 [scoped.as_deref(), Some(raw.as_str())]
                     .into_iter()
                     .flatten()
                     .find_map(|n| types.get(n).cloned())
+            })
+            .or_else(|| {
+                self.0.param_decl_types.and_then(|types| {
+                    [scoped.as_deref(), Some(raw.as_str())]
+                        .into_iter()
+                        .flatten()
+                        .find_map(|n| types.get(n).cloned())
+                })
             });
         if found.is_some() {
             return found;

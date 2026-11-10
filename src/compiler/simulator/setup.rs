@@ -1664,10 +1664,7 @@ impl Simulator {
         // it into a process FSM instead when the whole tree compiles. Single-
         // wait bodies stay on their (native) edge/clock-gen fast paths.
         {
-            use std::sync::OnceLock;
-            static FSM_ON: OnceLock<bool> = OnceLock::new();
-            let fsm_on =
-                *FSM_ON.get_or_init(|| std::env::var("XEZIM_PROC_FSM").as_deref() == Ok("1"));
+            let fsm_on = self.proc_fsm_mode == 1;
             let tc = Self::count_timing_controls(&ab.stmt);
             if fsm_on
                 && (tc >= 2 || (tc >= 1 && Self::stmt_contains_call(&ab.stmt)))
@@ -1920,6 +1917,7 @@ impl Simulator {
                                 value_of: None,
                                 wake_rank: 0,
                                 cell: false,
+                                alias_t0: self.alias_t0_kind(&s.signal_name, id),
                             });
                         }
                         if let Some(stripped) = s.signal_name.strip_prefix(&top_prefix) {
@@ -1931,6 +1929,7 @@ impl Simulator {
                                     value_of: None,
                                     wake_rank: 0,
                                     cell: false,
+                                    alias_t0: self.alias_t0_kind(stripped, id),
                                 });
                             }
                         }
@@ -1947,6 +1946,7 @@ impl Simulator {
                                     value_of: None,
                                     wake_rank: 0,
                                     cell: false,
+                                    alias_t0: self.alias_t0_kind(&scoped, id),
                                 });
                             }
                         }
@@ -2247,10 +2247,7 @@ impl Simulator {
                 // becomes a bytecode FSM — resumes re-enter at a saved pc
                 // instead of re-walking the AST continuation chain.
                 {
-                    use std::sync::OnceLock;
-                    static ON: OnceLock<bool> = OnceLock::new();
-                    let fsm_on =
-                        *ON.get_or_init(|| std::env::var("XEZIM_PROC_FSM").as_deref() == Ok("1"));
+                    let fsm_on = self.proc_fsm_mode == 1;
                     if fsm_on
                         && self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block")
                     {
@@ -4045,7 +4042,9 @@ impl Simulator {
                         | Insn::BlockingAssignBitDyn(sg, _, _) => {
                             w.push((*sg as usize, 0, u32::MAX))
                         }
-                        Insn::StmtFallback(..) | Insn::EvalExprFallback(..) => ranged = false,
+                        Insn::StmtFallback(..)
+                        | Insn::EvalExprFallback(..)
+                        | Insn::LoadDynElem(..) => ranged = false,
                         _ => {}
                     }
                 }

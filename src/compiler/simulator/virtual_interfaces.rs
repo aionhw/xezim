@@ -130,6 +130,13 @@ impl Simulator {
                             .map(|v| v.0),
                     );
                 }
+                // §7.4.5: `v2[0][1]` — an element of a multi-dimensional vif
+                // array, classified like the member-read receiver.
+                if matches!(expr.kind, ExprKind::Index { .. })
+                    && let Some((inst, _)) = self.vif_recv_target(e)
+                {
+                    return Some(Some(inst));
+                }
                 self.nested_iface_operand(e)
             }
             ExprKind::Ident(h) if h.path.len() == 1 => {
@@ -349,6 +356,8 @@ impl Simulator {
     /// (`o.leaf`, `o.arr[1]`, #612): unless its head is a data object other
     /// than an interface instance, which makes it a member select.
     fn nested_iface_operand(&self, e: &Expression) -> Option<Option<String>> {
+        let rebased = self.vif_rebase_expr(e);
+        let e = rebased.as_ref().unwrap_or(e);
         let mut cur = e;
         let head = loop {
             match &cur.kind {
@@ -660,8 +669,9 @@ impl Simulator {
                     selects: Vec::new(),
                 }],
                 span: crate::ast::Span::dummy(),
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             crate::ast::Span::dummy(),
         );
@@ -1165,9 +1175,15 @@ impl Simulator {
                     }
                     // §7.6/§25.10: aggregate assignment copies the element
                     // stores; it must not take the scalar-null fallback.
-                    if self.module.arrays.contains_key(name)
-                        || self.module.dynamic_arrays.contains(name)
-                        || self.module.associative_arrays.contains_key(name)
+                    // A collection FORMAL or subroutine local lives under
+                    // its per-call store (`@f#7`): `f = new[2]` on a vif
+                    // array formal took the scalar path and the array
+                    // never grew (#925).
+                    let store = self.dyn_name_lookup(name).unwrap_or(name);
+                    if self.module.arrays.contains_key(store)
+                        || self.module.dynamic_arrays.contains(store)
+                        || self.module.associative_arrays.contains_key(store)
+                        || self.module.queue_vars.contains(store)
                     {
                         return false;
                     }
@@ -1394,7 +1410,18 @@ impl Simulator {
             // Parses as Index { expr: <obj.prop>, index: <idx_expr> }.
             // Encode the index into the binding's prop key.
             ExprKind::Index { expr: base, index } => {
-                let index_value = self.eval_expr(index);
+                // §7.4.5/§25.10: `v2[0][1] = bus` — one element of a
+                // multi-dimensional vif array arrives as nested selects down
+                // to the array; every index goes into the key (#925).
+                let mut idx_exprs: Vec<&Expression> = vec![index];
+                let mut base: &Expression = base;
+                while let ExprKind::Index { expr, index } = &base.kind {
+                    idx_exprs.push(index);
+                    base = expr;
+                }
+                idx_exprs.reverse();
+                let index_values: Vec<Value> =
+                    idx_exprs.iter().map(|ix| self.eval_expr(ix)).collect();
                 let (obj_handle, prop_base) = match &base.kind {
                     // d.vif_arr  (MemberAccess on a class handle)
                     ExprKind::MemberAccess {
@@ -1462,12 +1489,19 @@ impl Simulator {
                 } else {
                     format!("{}#{}", obj_handle, prop_base)
                 };
-                let idx = if self.is_string_keyed_array(&storage) {
-                    index_value.to_sv_string()
-                } else {
-                    index_value.to_i64().unwrap_or(0).to_string()
-                };
-                (obj_handle, format!("{}[{}]", prop_base, idx))
+                let string_keyed = self.is_string_keyed_array(&storage);
+                let mut key = prop_base.clone();
+                for (n, iv) in index_values.iter().enumerate() {
+                    let idx = if n == 0 && string_keyed {
+                        iv.to_sv_string()
+                    } else {
+                        iv.to_i64().unwrap_or(0).to_string()
+                    };
+                    key.push('[');
+                    key.push_str(&idx);
+                    key.push(']');
+                }
+                (obj_handle, key)
             }
             _ => return false,
         };
@@ -1513,8 +1547,11 @@ impl Simulator {
                 self.eval_expr(rvalue)
             };
             // §7.4.6/§7.10.1: evaluate the RHS even when a write is ignored;
-            // only a queue's next index may append a new element.
-            if !self.is_associative_array(&collection) {
+            // only a queue's next index may append a new element. An element
+            // of a multi-dimensional array (`v2[0][1]`, suffix `0][1`) has
+            // its slot already (#925): the single-index parse below took it
+            // for an out-of-range write and dropped it.
+            if !self.is_associative_array(&collection) && !index.contains("][") {
                 let Ok(index) = index.parse::<i64>() else {
                     return true;
                 };
@@ -1602,7 +1639,19 @@ impl Simulator {
                 };
                 Some(format!("{}[{}]", seg.name.name, i))
             }
-            _ => None,
+            // §7.4.5/§25.10: one element of a multi-dimensional vif array
+            // (`v2[0][1] = bus`) binds under `name[i][j]`; the single-index
+            // key left `v2[0][1].clk` unbound (#925).
+            sels => {
+                let mut key = seg.name.name.clone();
+                for ix in sels {
+                    let i = self.eval_expr(ix).to_index()?;
+                    key.push('[');
+                    key.push_str(&i.to_string());
+                    key.push(']');
+                }
+                Some(key)
+            }
         }
     }
 
@@ -1623,6 +1672,9 @@ impl Simulator {
         }
         if let Some(b) = self.static_vif_binding(rvalue) {
             return Some(b);
+        }
+        if let Some(rebased) = self.vif_rebase_expr(rvalue) {
+            return self.resolve_vif_rhs_name(&rebased);
         }
         // §25.9/§25.10: an ELEMENT of a vif array or collection held by an
         // object, a class scope or a frame (`o.vq[0]`, `S::pa[1]`, `vq[i]`)
@@ -2143,6 +2195,7 @@ impl Simulator {
     ) -> Value {
         if !Self::formal_may_carry_vif(&port.data_type)
             || !self.is_virtual_iface_type(&port.data_type)
+            || self.vif_collection_formal(port)
         {
             return value;
         }
@@ -2161,6 +2214,25 @@ impl Simulator {
             .unwrap_or(value)
     }
 
+    /// §13.5.1/§25.9: is `port` a COLLECTION of virtual interfaces (`virtual
+    /// X f[]`, `f[$]`, `f[2]`, a typedef'd `vif_arr_t f`)? Its elements hold
+    /// the handle tokens, bound by the collection binders; the scalar alias
+    /// machinery (`__vif_local__`, `local_iface_aliases`, the output
+    /// writeback) must leave it alone — treating it as one scalar vif
+    /// aliased the whole array to null (#925).
+    pub(super) fn vif_collection_formal(&self, port: &crate::ast::decl::FunctionPort) -> bool {
+        if !port.dimensions.is_empty() {
+            return true;
+        }
+        match &port.data_type {
+            crate::ast::types::DataType::TypeReference { name, .. } => self
+                .module
+                .typedef_unpacked_dims
+                .contains_key(&name.name.name),
+            _ => false,
+        }
+    }
+
     /// §25.9: dispatch through the identity captured while binding the formal.
     /// Only a supplied actual may fall back to its caller-scope name.
     pub(super) fn vif_formal_alias(
@@ -2169,7 +2241,7 @@ impl Simulator {
         arg: Option<&Expression>,
         locals: &HashMap<String, Value>,
     ) -> Option<(String, String)> {
-        if !self.is_virtual_iface_type(&port.data_type) {
+        if !self.is_virtual_iface_type(&port.data_type) || self.vif_collection_formal(port) {
             return None;
         }
         let formal = port.name.name.as_str();
@@ -2282,8 +2354,9 @@ impl Simulator {
                     })
                     .collect(),
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         ))
@@ -2316,9 +2389,13 @@ impl Simulator {
                     .map(String::as_str),
             ];
             for sc in scopes.into_iter().flatten().filter(|s| !s.is_empty()) {
-                let scoped = format!("{}.{}", sc, raw);
-                if self.clocking_meta.contains_key(&scoped) {
-                    return Some(scoped);
+                // §14.3: found in the block itself, or in an enclosing scope
+                // of the same instance.
+                for outer in self.scopes_to_instance(sc) {
+                    let scoped = format!("{}.{}", outer, raw);
+                    if self.clocking_meta.contains_key(&scoped) {
+                        return Some(scoped);
+                    }
                 }
             }
         }
@@ -2805,12 +2882,23 @@ impl Simulator {
         segs: &[crate::ast::expr::HierPathSegment],
     ) -> Option<(String, Option<String>)> {
         let (last, owner) = segs.split_last()?;
+        let name = last.name.name.as_str();
         let elem = match last.selects.as_slice() {
             [] => None,
             [sel] => Some(sel),
-            _ => return None,
+            // §7.4.5: an element of a multi-dimensional vif array.
+            sels => {
+                let sels: Vec<&Expression> = sels.iter().collect();
+                if owner.is_empty() {
+                    return self.vif_nd_elem_target(None, name, &sels);
+                }
+                if !self.vif_prop_name_possible(name) {
+                    return None;
+                }
+                let owner = self.vif_owner_of_path(owner)?;
+                return self.vif_nd_elem_target(Some(owner), name, &sels);
+            }
         };
-        let name = last.name.name.as_str();
         if owner.is_empty() {
             return self.vif_named_target(None, name, elem);
         }
@@ -2819,6 +2907,89 @@ impl Simulator {
         }
         let owner = self.vif_owner_of_path(owner)?;
         self.vif_named_target(Some(owner), name, elem)
+    }
+
+    /// §7.4.5/§25.10: the vif held by an element of a MULTI-DIMENSIONAL vif
+    /// array — `v2[0][1]`, `this.v2[i][j]`, `cfg.v2[0][1]`, a formal or
+    /// task-local `f[1][0]` — `name` on `owner` (none: a bare name, a frame
+    /// collection, a plain `virtual` variable or a property of `this`). The
+    /// element store keeps the handle token under `<store>[i][j]`, as the
+    /// one-dimensional collections do (`vif_elem_by_value`); a single-index
+    /// path never reached these, so `v2[0][1].clk` read null and
+    /// `@(posedge v2[0][1].clk)` never armed (#925).
+    pub(super) fn vif_nd_elem_target(
+        &self,
+        owner: Option<(&str, usize)>,
+        name: &str,
+        selects: &[&Expression],
+    ) -> Option<(String, Option<String>)> {
+        let mut suffix = String::new();
+        for ix in selects {
+            let i = self.eval_scalar_self(ix)?;
+            suffix.push('[');
+            suffix.push_str(&i.to_string());
+            suffix.push(']');
+        }
+        // A property element bound by name (`vif_elem_key`) first.
+        let bound = |me: &Self, cn: &str, oh: usize| {
+            me.vif_prop_target(cn, oh, &format!("{}{}", name, suffix))
+        };
+        let (store, modport): (String, Option<String>) = match owner {
+            Some((cn, 0)) => {
+                if let Some(hit) = bound(self, cn, 0) {
+                    return Some(hit);
+                }
+                let (_, (_, mp)) = self.class_vif_decl(cn, name)?;
+                (
+                    self.static_fixed_key_in(cn, name)
+                        .unwrap_or_else(|| self.spec_static_coll_key_in_class(name, cn)),
+                    mp.clone(),
+                )
+            }
+            Some((cn, oh)) => {
+                if let Some(hit) = bound(self, cn, oh) {
+                    return Some(hit);
+                }
+                let (_, (_, mp)) = self.class_vif_decl(cn, name)?;
+                (format!("{}#{}", oh, name), mp.clone())
+            }
+            None => {
+                if let Some(store) = self.vif_frame_collection(name) {
+                    (store.to_string(), None)
+                } else if self.vif_collection(name)
+                    // A fixed-size multi-dimensional formal (`virtual X f[2][2]`,
+                    // `bind_array_arg`) copies its elements under its own name.
+                    || (self
+                        .local_stack
+                        .last()
+                        .is_some_and(|l| l.contains_key(&format!("\u{1}array_formal:{}", name)))
+                        && (self.module.arrays_nd.contains_key(name)
+                            || self.module.arrays_2d.contains_key(name)))
+                {
+                    (name.to_string(), None)
+                } else {
+                    let th = self
+                        .this_stack
+                        .last()
+                        .copied()
+                        .flatten()
+                        .filter(|&h| h != 0)?;
+                    let cn = self.heap.get(th)?.as_ref()?.class_name.as_str();
+                    if let Some(hit) = bound(self, cn, th) {
+                        return Some(hit);
+                    }
+                    let (_, (_, mp)) = self.class_vif_decl(cn, name)?;
+                    (format!("{}#{}", th, name), mp.clone())
+                }
+            }
+        };
+        if !self.vif_tokens_stored {
+            return None;
+        }
+        let key = format!("{}{}", store, suffix);
+        let token = self.get_signal_value_by_name(&key)?.to_u64()?;
+        self.iface_by_token(token)
+            .map(|inst| (inst.to_string(), modport))
     }
 
     /// The vif named `name` — element `elem` of it for a §25.10 vif array or a
@@ -2844,6 +3015,7 @@ impl Simulator {
         if let Some(index) = elem
             && (owner.is_some()
                 || self.vif_collection(name)
+                || self.vif_frame_collection(name).is_some()
                 || self
                     .class_context_stack
                     .last()
@@ -2892,6 +3064,28 @@ impl Simulator {
         name: &str,
         index: &Expression,
     ) -> Option<(String, Option<String>)> {
+        // §13.5.1/§23.9/§25.9: a vif collection FORMAL or local of the
+        // running subroutine (`virtual X f[]`, `f[$]`, a task-local `lv[]`)
+        // holds its tokens under the frame's per-call store, and hides a
+        // same-named property of `this` (a constructor's `inputIntf[i]`
+        // formal copied into `this.inputIntf[i]`). Resolving the bare name
+        // against the property, or against the lexical name with no store
+        // behind it, read every element as null (#925).
+        if owner.is_none()
+            && let Some(store) = self.vif_frame_collection(name)
+        {
+            let store = store.to_string();
+            let index = self.eval_scalar_self(index)?;
+            if !self.is_associative_array(&store) && !self.vif_index_in_bounds(&store, index) {
+                return None;
+            }
+            let token = self
+                .get_signal_value_by_name(&format!("{}[{}]", store, index))?
+                .to_u64()?;
+            return self
+                .iface_by_token(token)
+                .map(|inst| (inst.to_string(), None));
+        }
         let owner = owner.or_else(|| {
             let th = self
                 .this_stack
@@ -2958,6 +3152,25 @@ impl Simulator {
         let token = self.coll_elem_handle(&coll, name, index)? as u64;
         self.iface_by_token(token)
             .map(|inst| (inst.to_string(), modport))
+    }
+
+    /// §13.5.1/§25.9: the per-call store of `name` when the running
+    /// subroutine's frame declares it as a collection of virtual interfaces
+    /// — a formal (`formal_dyn_key`) or a local (`declare_local_dyn`), whose
+    /// element type the binder filed under the bare name or the store key.
+    /// `None` for anything else, including a formal of another element type.
+    pub(super) fn vif_frame_collection(&self, name: &str) -> Option<&str> {
+        if self.module.interfaces.is_empty() {
+            return None;
+        }
+        let store = self.dyn_name_lookup_innermost(name)?;
+        let vif = |n: &str| {
+            self.module
+                .var_decl_types
+                .get(n)
+                .is_some_and(|dt| self.is_virtual_iface_type(dt))
+        };
+        (vif(store) || vif(name)).then_some(store)
     }
 
     /// §7.4/§7.5/§7.10: spare backing slots never denote live elements.
@@ -3065,6 +3278,45 @@ impl Simulator {
                         let owner = self.vif_owner_of_expr(owner)?;
                         self.vif_named_target(Some(owner), &member.name, Some(index))
                     }
+                    // §7.4.5: `v2[0][1]` as nested index nodes (the
+                    // method-scope parse): every index down to the array.
+                    ExprKind::Index { .. } => {
+                        let mut sels: Vec<&Expression> = vec![index];
+                        let mut cur = base.as_ref();
+                        while let ExprKind::Index { expr, index } = &cur.kind {
+                            sels.push(index);
+                            cur = expr;
+                        }
+                        sels.reverse();
+                        match &cur.kind {
+                            ExprKind::Ident(h)
+                                if h.root.is_none()
+                                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+                            {
+                                let (last, owner) = h.path.split_last()?;
+                                let name = last.name.name.as_str();
+                                if owner.is_empty() {
+                                    return self.vif_nd_elem_target(None, name, &sels);
+                                }
+                                if !self.vif_prop_name_possible(name) {
+                                    return None;
+                                }
+                                let owner = self.vif_owner_of_path(owner)?;
+                                self.vif_nd_elem_target(Some(owner), name, &sels)
+                            }
+                            ExprKind::MemberAccess {
+                                expr: owner,
+                                member,
+                            } => {
+                                if !self.vif_prop_name_possible(&member.name) {
+                                    return None;
+                                }
+                                let owner = self.vif_owner_of_expr(owner)?;
+                                self.vif_nd_elem_target(Some(owner), &member.name, &sels)
+                            }
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 }
             }
@@ -3089,8 +3341,9 @@ impl Simulator {
                 root: None,
                 path,
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         )
@@ -3797,6 +4050,55 @@ impl Simulator {
     /// definition `bus_if`)? Used to validate the RHS of a
     /// `vif = <instance>` alias assignment (LRM §25.9) so an unrelated
     /// value assignment never records a bogus alias.
+    /// Could `lv` be an element of a multi-dimensional vif array — two or
+    /// more index selects (nested or on one segment) down to a name some
+    /// class declares as a vif property? A cheap name gate, no evaluation.
+    pub(super) fn vif_nd_elem_lvalue(&self, lv: &Expression) -> bool {
+        if self.module.interfaces.is_empty() {
+            return false;
+        }
+        let mut depth = 0usize;
+        let mut cur = lv;
+        while let ExprKind::Index { expr, .. } = &cur.kind {
+            depth += 1;
+            cur = expr;
+        }
+        match &cur.kind {
+            ExprKind::MemberAccess { member, .. } => {
+                depth >= 2 && self.vif_prop_name_possible(&member.name)
+            }
+            ExprKind::Ident(h) => h.path.last().is_some_and(|s| {
+                depth + s.selects.len() >= 2 && self.vif_prop_name_possible(&s.name.name)
+            }),
+            _ => false,
+        }
+    }
+
+    /// §25.3: the instance paths of the interface instance ARRAY `base`
+    /// (`intf[0]`, `intf[1]`, …), in index order; `None` when no instance
+    /// `base[i]` exists.
+    pub(super) fn iface_instance_array(&self, base: &str) -> Option<Vec<String>> {
+        if self.module.interfaces.is_empty() || self.is_interface_instance(base) {
+            return None;
+        }
+        let mut found: Vec<(i64, String)> = self
+            .module
+            .instances
+            .iter()
+            .filter(|i| self.module.interfaces.contains(&i.def_name))
+            .filter_map(|i| {
+                let rest = i.path.strip_prefix(base)?.strip_prefix('[')?;
+                let idx: i64 = rest.strip_suffix(']')?.parse().ok()?;
+                Some((idx, i.path.clone()))
+            })
+            .collect();
+        if found.is_empty() {
+            return None;
+        }
+        found.sort_by_key(|(i, _)| *i);
+        Some(found.into_iter().map(|(_, p)| p).collect())
+    }
+
     pub(super) fn is_interface_instance(&self, path: &str) -> bool {
         // Built once: the instance list is fixed after elaboration, and this
         // is asked per virtual-interface operand at run time (a linear scan
@@ -3850,6 +4152,14 @@ impl Simulator {
             return false;
         }
         match coll.split_once('#') {
+            // §13.5.1/§25.9: the per-call store of a collection FORMAL or a
+            // subroutine-local collection (`@f#7`, `formal_dyn_key` /
+            // `declare_local_dyn`) carries the declared element type.
+            Some(_) if coll.starts_with('@') => self
+                .module
+                .var_decl_types
+                .get(coll)
+                .is_some_and(|dt| self.is_virtual_iface_type(dt)),
             Some((h, _)) if h.parse::<usize>().is_err() => self.static_vif_collection(coll),
             Some((h, prop)) => {
                 self.vif_prop_name_possible(prop)

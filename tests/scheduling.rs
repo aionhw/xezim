@@ -14,6 +14,9 @@
 #[path = "scheduling/concurrent_struct_formal_geometry.rs"]
 mod concurrent_struct_formal_geometry;
 
+#[path = "scheduling/finite_zero_delay_phase.rs"]
+mod finite_zero_delay_phase;
+
 #[path = "scheduling/named_branch_frames.rs"]
 mod named_branch_frames;
 
@@ -460,3 +463,20 @@ mod delay_always_constant_scaled_delay;
 
 #[path = "scheduling/packed_comb_sensitivity_844.rs"]
 mod packed_comb_sensitivity_844;
+
+#[path = "scheduling/review_fork_baseline_935.rs"]
+mod review_fork_baseline_935;
+
+#[path = "scheduling/review_watchdog_drivers_938.rs"]
+mod review_watchdog_drivers_938;
+
+#[path = "scheduling/fork_child_hidden_locals_943.rs"]
+mod fork_child_hidden_locals_943;
+
+#[path = "scheduling/unpacked_struct_copy_chain.rs"]
+mod unpacked_struct_copy_chain;
+#[path = "scheduling/unpacked_struct_array_sens.rs"]
+mod unpacked_struct_array_sens;
+
+#[path = "scheduling/clocking_edge_regressions.rs"]
+mod clocking_edge_regressions;

@@ -1710,6 +1710,7 @@ impl Simulator {
             // inline swallows the follow-up pass the old event-queue path gave,
             // so loop until no waiter fires. Bounded against #0 event ping-pong.
             let mut settle_guard = 0u32;
+            let mut settle_state = 0;
             loop {
                 let mut conts = self.drain_triggered_event_waiters();
                 if conts.is_empty() {
@@ -1734,7 +1735,10 @@ impl Simulator {
                 }
                 self.recycle_conts(conts);
                 settle_guard += 1;
-                if self.finished || settle_guard > 10_000 {
+                if self.finished
+                    || (settle_guard > 10_000
+                        && !self.fixpoint_window_progressed(&mut settle_guard, &mut settle_state))
+                {
                     break;
                 }
             }
@@ -2186,6 +2190,20 @@ impl Simulator {
             if woke_any && stats_on && sid < self.sensitivity_trigger_count.len() {
                 self.sensitivity_trigger_count[sid] += 1;
             }
+        }
+        // Blocks a time-0 input-port update wakes (`deliver_time0_port_edges`):
+        // the actual they watch did not itself change.
+        for bi in std::mem::take(&mut self.edge_forced_fire) {
+            if bi < triggered_bitmap.len() && !triggered_bitmap[bi] {
+                triggered_bitmap[bi] = true;
+                triggered.push(bi);
+            }
+        }
+        // A block a time-0 alias update woke that fires on its own in this
+        // pass (the actual was written at time 0 too) runs once.
+        if !self.edge_t0_pending.is_empty() {
+            self.edge_t0_pending
+                .retain(|&bi| bi >= triggered_bitmap.len() || !triggered_bitmap[bi]);
         }
         if let Some(t) = t0 {
             self.prof_edge_detect += t.elapsed().as_nanos() as u64;
@@ -3180,6 +3198,7 @@ impl Simulator {
             // slot). Drain-and-run inline, re-draining because a resumed
             // continuation may fire further events.
             let mut settle_guard = 0u32;
+            let mut settle_state = 0;
             loop {
                 let mut conts = self.drain_triggered_event_waiters();
                 if conts.is_empty() {
@@ -3200,7 +3219,10 @@ impl Simulator {
                 }
                 self.recycle_conts(conts);
                 settle_guard += 1;
-                if self.finished || settle_guard > 10_000 {
+                if self.finished
+                    || (settle_guard > 10_000
+                        && !self.fixpoint_window_progressed(&mut settle_guard, &mut settle_state))
+                {
                     if env_set_cached!("XEZIM_TRACE_SPIN") && !self.finished {
                         eprintln!(
                             "[DRAINGUARD] t={} exhausted; {} waiters:",

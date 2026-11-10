@@ -97,6 +97,7 @@ impl Simulator {
             clocking_snapshots,
             clocking_output_pending,
             clocking_cycle_pending,
+            clocking_edge_out_pending,
             clocking_preponed,
             clocking_hist,
             deferred_clocking_conts,

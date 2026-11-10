@@ -620,6 +620,38 @@ impl Simulator {
         Some(src)
     }
 
+    /// §13.5.1: a collection returned by an actual expression is evaluated
+    /// once in the caller and copied before the callee's frame is entered.
+    pub(super) fn collection_call_actual(&mut self, arg: &Expression) -> Option<String> {
+        let arg = Self::unparen(arg);
+        let ExprKind::Call { func, .. } = &arg.kind else {
+            return None;
+        };
+        if !self.call_returns_collection(func) {
+            return None;
+        }
+        let data_type = self.call_return_type(func)?;
+        let width = resolve_type_width(
+            &data_type,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        self.pending_ret_collection = None;
+        self.vm_ret_vals = None;
+        self.eval_expr(arg);
+        let name = self.take_pending_ret_collection()?;
+        if name == "__xz_ret_coll__" {
+            // A returned value has a zero-based sequence, even when its
+            // source was a fixed array with another declared range (§7.6).
+            // The return side channel supplies size and leaves; collection
+            // consumers also need its type and storage classification.
+            self.module.arrays.insert(name.clone(), (0, -1, width));
+            self.module.dynamic_arrays.insert(name.clone());
+            self.module.var_decl_types.insert(name.clone(), data_type);
+        }
+        Some(name)
+    }
+
     /// Resolve the whole-collection storage name that a collection-return
     /// assignment `q = f(..)` writes into, for the destination expression
     /// `lvalue`. This is the exact resolution shared by the historic
@@ -827,22 +859,6 @@ impl Simulator {
     /// when a segment is not a plain property, so the general paths decide.
     #[inline(never)]
     pub(super) fn frame_handle_path_read(&self, expr: &Expression) -> Option<Value> {
-        fn names<'a>(e: &'a Expression, out: &mut Vec<&'a str>) -> Option<()> {
-            match &e.kind {
-                ExprKind::Ident(h)
-                    if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
-                {
-                    out.extend(h.path.iter().map(|s| s.name.name.as_str()));
-                    Some(())
-                }
-                ExprKind::MemberAccess { expr, member } => {
-                    names(expr, out)?;
-                    out.push(member.name.as_str());
-                    Some(())
-                }
-                _ => None,
-            }
-        }
         let root = match &expr.kind {
             ExprKind::Ident(h) if h.path.len() >= 2 => h.path[0].name.name.as_str(),
             ExprKind::MemberAccess { .. } => {
@@ -874,15 +890,38 @@ impl Simulator {
                 return None;
             }
         }
-        let mut cls = cls.to_string();
-        let mut path = Vec::new();
-        names(expr, &mut path)?;
-        let segs = &path[1..];
+        let mut path: [&str; 8] = [""; 8];
+        let mut path_len = 0;
+        fn collect_names<'a>(e: &'a Expression, out: &mut [&'a str; 8], len: &mut usize) -> Option<()> {
+            match &e.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    for s in &h.path {
+                        if *len >= 8 { return None; }
+                        out[*len] = s.name.name.as_str();
+                        *len += 1;
+                    }
+                    Some(())
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    collect_names(expr, out, len)?;
+                    if *len >= 8 { return None; }
+                    out[*len] = member.name.as_str();
+                    *len += 1;
+                    Some(())
+                }
+                _ => None,
+            }
+        }
+        collect_names(expr, &mut path, &mut path_len)?;
+        let segs = &path[1..path_len];
+        let mut cur_cls: &str = cls;
         for (i, seg) in segs.iter().enumerate() {
             // §8.10 / §8.14: the member is the one the handle's DECLARED
             // class sees. A static, or a property the object's class
             // re-declares, is stored elsewhere — the general paths decide.
-            let decl = self.prop_owners(&cls);
+            let decl = self.prop_owners(cur_cls);
             let (owner, cd) = decl.get(*seg)?;
             if cd.static_properties.contains(*seg) {
                 return None;
@@ -895,9 +934,10 @@ impl Simulator {
             if i + 1 == segs.len() {
                 return Some(v.clone());
             }
-            cls = self
+            let next_cls = self
                 .class_prop_type_named(owner, seg)
                 .filter(|t| self.module.classes.contains_key(t))?;
+            cur_cls = self.module.classes.get_key_value(&next_cls)?.0.as_str();
             h = v.to_u64()? as usize;
         }
         None
@@ -1433,6 +1473,15 @@ impl Simulator {
         {
             return;
         }
+        // §7.4.5/§25.10: `v2[0][1] = bus` — one element of a MULTI-dimensional
+        // vif array binds by name, ahead of the collection-row store below,
+        // which took the write as a value copy and bound nothing (#925).
+        if self.vif_nd_elem_lvalue(lvalue)
+            && !Self::lvalue_has_incdec_index(lvalue)
+            && self.try_bind_virtual_iface(lvalue, rvalue)
+        {
+            return;
+        }
         // (A side-effecting lvalue index is folded first, below, and
         // comes back through here.)
         if self.indexed_colls_live()
@@ -1532,6 +1581,15 @@ impl Simulator {
                     }
                 }
             }
+        }
+        // §10.9.1, §7.6: a pattern written to a row of a multi-dimensional
+        // unpacked array spreads over the row's elements. Ahead of the
+        // packed-target store below, which took the row for one value.
+        if let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(rvalue).kind
+            && self.assign_unpacked_row_pattern(lvalue, items)
+        {
+            self.settle_after_proc_write();
+            return;
         }
         // §10.8, §10.9: a pattern written to a packed target takes the
         // target's declared type. The element-wise
@@ -1687,12 +1745,16 @@ impl Simulator {
             v
         };
         if let Some(dst) = &lflat {
-            let su_opt = self.module.var_decl_types.get(dst).cloned().and_then(|dt| {
-                match self.resolve_dt(&dt) {
-                    DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
-                    _ => None,
-                }
-            });
+            let su_opt = if !self.struct_root_possible(dst) {
+                None
+            } else {
+                self.module.var_decl_types.get(dst).cloned().and_then(|dt| {
+                    match self.resolve_dt(&dt) {
+                        DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
+                        _ => None,
+                    }
+                })
+            };
             if let Some(su) = su_opt {
                 let dst = dst.clone();
                 if let Some(src) = eval_rflat(self, &mut rflat_cache)
@@ -2012,7 +2074,7 @@ impl Simulator {
                     ExprKind::Ident(ih) if ih.path.len() >= 3 => {
                         let mut p = ih.clone();
                         let member = p.path.pop().unwrap().name.name.clone();
-                        p.cached_signal_id = std::cell::Cell::new(None);
+                        p.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                         Some((Expression::new(ExprKind::Ident(p), lvalue.span), member))
                     }
                     _ => None,
@@ -3604,6 +3666,24 @@ impl Simulator {
         // Resolve a whole constant array before scalar evaluation or the
         // generic collection resolver can treat a class constant as a property.
         if self.try_class_const_array_copy(lvalue, rvalue) {
+            self.settle_after_proc_write();
+            return;
+        }
+        // §10.10: `cfg.r = {…}` writes a queue member before the right side runs as a value.
+        if let ExprKind::MemberAccess { .. } = &lvalue.kind
+            && let ExprKind::Concatenation(_) = &rvalue.kind
+            && let Some(n) = self.expr_assoc_name(lvalue).filter(|n| self.class_queue_prop(n))
+            && self.assign_whole_coll(&n, None, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
+        // §10.10: consume typed elements before the scalar RHS evaluation,
+        // which would run each call operand once and discard its members.
+        if let ExprKind::Concatenation(parts) = &rvalue.kind
+            && let Some(name) = self.pending_coll_dst(lvalue)
+            && self.assign_struct_concat(&name, parts.iter().collect())
+        {
             self.settle_after_proc_write();
             return;
         }

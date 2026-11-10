@@ -1493,10 +1493,12 @@ impl Simulator {
             if self.expr_is_string_valued(a) {
                 result.push_str(&v.to_sv_string());
             } else {
+                // A real argument prints as a real under every default
+                // radix (`$displayh(r)`), as the reference simulator does.
                 result.push_str(&match r {
-                    'b' => v.to_bin_string(),
-                    'h' => v.to_hex_string(),
-                    'o' => Self::bin_to_oct_string(&v.to_bin_string()),
+                    'b' if !v.is_real => v.to_bin_string(),
+                    'h' if !v.is_real => v.to_hex_string(),
+                    'o' if !v.is_real => Self::bin_to_oct_string(&v.to_bin_string()),
                     // §21.2.1.2: an unconsumed argument prints in the task's
                     // default DECIMAL format — which has the type's default
                     // field width, space-padded (`$display("x=", v)` of a
@@ -2468,7 +2470,7 @@ impl Simulator {
                     .runtime_recv_class(&Expression {
                         kind: ExprKind::Ident(h.clone()),
                         span: h.span,
-                        cached_width: std::cell::Cell::new(None),
+                        cached_width: crate::ast::cache::WidthCache::new(None),
                     })
                     .or_else(|| self.var_class_types.get(first).cloned())
                     .or_else(|| Some(first.clone()));
@@ -3099,8 +3101,9 @@ impl Simulator {
                                                 selects: Vec::new(),
                                             }],
                                             span: arg.span,
-                                            cached_signal_id: std::cell::Cell::new(None),
-                                            cached_resolved_name: std::cell::OnceCell::new(),
+                                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                            bound: crate::ast::binding::Bound::UNSET,
                                         };
                                         let resolved = self.resolve_hier_name(&ident);
                                         if resolved != flat {
@@ -3326,6 +3329,27 @@ impl Simulator {
                             } else if ai < args.len() {
                                 let v = self.eval_expr(&args[ai]);
                                 ai += 1;
+                                // §6.12.2: an integral letter prints a real as
+                                // an integer (see `real_fmt_int`).
+                                let v = if v.is_real
+                                    && matches!(
+                                        spec,
+                                        'd' | 'D'
+                                            | 'b'
+                                            | 'B'
+                                            | 'o'
+                                            | 'O'
+                                            | 'h'
+                                            | 'H'
+                                            | 'x'
+                                            | 'X'
+                                            | 'c'
+                                            | 'C'
+                                    ) {
+                                    Self::real_fmt_int(&v)
+                                } else {
+                                    v
+                                };
                                 match spec {
                                     'd' | 'D' => {
                                         // §21.2.1.2: default field width is
@@ -3648,7 +3672,16 @@ impl Simulator {
             if !scope.is_empty() {
                 self.process_scope_hint.insert(pid, scope);
             }
-            self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
+            let saved = std::mem::replace(&mut self.in_reactive_drain, true);
+            // §9.3.2: route program-initial processes through the scheduled-
+            // process wrapper so a process that suspends inside a class task
+            // (`c.run()` with a `#delay`/`fork..join` in its body) parks its
+            // `this`/local context for the resume. A bare `run_process_stmts`
+            // call left that context on the simulator, the next process cleared
+            // it, and the resumed method body read every member through a null
+            // `this`.
+            self.run_scheduled_process(pid, &ProcCont::from_vec(stmts));
+            self.in_reactive_drain = saved;
             if !self.is_pid_suspended(pid) {
                 ended.push(pid);
             }
@@ -3667,6 +3700,7 @@ impl Simulator {
     #[inline(never)]
     pub(super) fn drain_reactive_conts(&mut self) {
         let mut guard = 0u32;
+        let mut guard_state = 0;
         while !self.reactive_conts.is_empty() && !self.finished {
             let conts = std::mem::take(&mut self.reactive_conts);
             self.late_resume_epoch += conts.len() as u64;
@@ -3685,7 +3719,7 @@ impl Simulator {
             }
             self.in_reactive_drain = saved;
             guard += 1;
-            if guard > 10_000 {
+            if guard > 10_000 && !self.fixpoint_window_progressed(&mut guard, &mut guard_state) {
                 break;
             }
         }

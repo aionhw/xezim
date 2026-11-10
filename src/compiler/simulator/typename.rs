@@ -183,6 +183,7 @@ impl Simulator {
                 .collect(),
             name: ident(leaf),
             span,
+            bound: Default::default(),
         }
     }
 
@@ -564,8 +565,8 @@ impl Simulator {
                             name: last.name.clone(),
                             selects: Vec::new(),
                         }];
-                        bare.cached_resolved_name = std::cell::OnceCell::new();
-                        bare.cached_signal_id = std::cell::Cell::new(None);
+                        bare.cached_resolved_name = crate::ast::cache::NameCache::new();
+                        bare.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                         self.tn_var_dims(&bare, &dt)
                     };
                     TnOperand {
