@@ -287,3 +287,23 @@ endmodule
 "#,
     );
 }
+
+#[test]
+fn wide_dynamic_array_sizes_remain_independent_of_element_values() {
+    check(
+        r#"
+class C;
+ rand bit [64:0] data[];
+ constraint c { data.size()==2; foreach(data[i]) data[i][7:0]==8'h42; }
+endclass
+module top;
+ initial begin
+ C c=new;
+ if(!c.randomize() || c.data.size()!=2) $fatal(1,"wide dynamic size");
+ foreach(c.data[i]) if(c.data[i][7:0]!==8'h42) $fatal(1,"wide dynamic slice");
+ $display("T|PASS");
+ end
+endmodule
+"#,
+    );
+}
