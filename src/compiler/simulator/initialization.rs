@@ -4721,8 +4721,8 @@ impl Simulator {
             zero_delay_defer_pending: false,
             stall_time: 0,
             stall_pid_hits: HashMap::default(),
-            stall_pid_epoch: HashMap::default(),
-            stall_epoch0: 0,
+            stall_pid_state: HashMap::default(),
+            stall_state0: 0,
             stall_limit_explicit: std::env::var("XEZIM_STALL_LIMIT")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())

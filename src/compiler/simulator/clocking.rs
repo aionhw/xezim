@@ -583,7 +583,7 @@ impl Simulator {
         self.table_modified = false;
         let store_writes_before = STORE_WRITE_MASK.with(|m| m.get());
         let mut guard = 0u32;
-        let mut guard_epoch = state_epoch();
+        let mut guard_state = 0;
         let mut ran_any = false;
         while !self.deferred_clocking_conts.is_empty() {
             let conts = std::mem::take(&mut self.deferred_clocking_conts);
@@ -607,7 +607,8 @@ impl Simulator {
             }
             guard += 1;
             if self.finished
-                || (guard > 10_000 && !self.fixpoint_window_progressed(&mut guard, &mut guard_epoch))
+                || (guard > 10_000
+                    && !self.fixpoint_window_progressed(&mut guard, &mut guard_state))
             {
                 break;
             }

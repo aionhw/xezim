@@ -1870,7 +1870,7 @@ impl Simulator {
         // queue, which the scheduler drains inside one delta, so the outer
         // loop's stall counter never sees `initial forever begin #0; ... end`
         // spin — the run_proc_fsm path hung the stall-report test.
-        if self.stall_limit > 0 && self.stall_pid_tripped(pid) {
+        if self.stall_limit > 0 && self.stall_pid_tripped(pid, None) {
             self.event_queue.schedule(self.time, pid, Vec::new().into());
             self.zero_delay_defer_pending = true;
             return;
@@ -2078,7 +2078,7 @@ impl Simulator {
         // Check BEFORE counting (inside `stall_pid_tripped`): the activation
         // that trips the guard is re-parked UNEXECUTED, so it must not inflate
         // the "ran N times" attribution in the stall report.
-        if self.stall_limit > 0 && self.stall_pid_tripped(pid) {
+        if self.stall_limit > 0 && self.stall_pid_tripped(pid, None) {
             self.event_queue.schedule(self.time, pid, Vec::new().into());
             self.zero_delay_defer_pending = true;
             return;
@@ -3065,7 +3065,7 @@ impl Simulator {
             // self-rescheduling process never reaches the outer event loop —
             // the check has to live here. The activation that trips the guard
             // is re-parked UNEXECUTED and must not inflate "ran N times".
-            if self.stall_pid_tripped(pid) {
+            if self.stall_pid_tripped(pid, Some(&pc)) {
                 // A single process re-arming like this is a zero-delay
                 // livelock (e.g. `always #(period) clk=~clk` whose real
                 // `period` momentarily glitched to 0). Rather than abort the

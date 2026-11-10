@@ -27,7 +27,7 @@ use serde::ser::{SerializeSeq, Serializer};
 
 /// File magic and format version; bump the last byte with any change to a
 /// state field's type.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x03";
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x04";
 
 #[derive(Default)]
 struct Session {
@@ -1528,9 +1528,9 @@ checkpoint_state!(
     spec_prop_is_dyn,
     spec_prop_width_cache,
     stall_edge_block_hits,
-    stall_epoch0,
+    stall_state0,
     stall_iters,
-    stall_pid_epoch,
+    stall_pid_state,
     stall_pid_hits,
     stall_time,
     static_block_decls,

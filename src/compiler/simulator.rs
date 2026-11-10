@@ -11,7 +11,6 @@
 // Compiler modules shared by the implementation submodules.
 #[cfg(feature = "jit")]
 use super::{aot, ts_jit};
-use super::soa::{bump_state_epoch, state_epoch};
 use super::{
     bytecode, dispatch, elaborate, fst_sink, interrupt, jit, sdf, stdout_sink, value, vcd_sink,
 };
@@ -954,9 +953,6 @@ macro_rules! write_sig {
         // EVERY signal write (measured ~2% of c906 memcpy cycles).
         if $self.forced_signals.is_empty() || !$self.forced_signals.contains_key(&__wsig_id) {
             let __wsig_changed = $self.signal_table[__wsig_id] != __wsig_val;
-            if __wsig_changed {
-                bump_state_epoch();
-            }
             if __wsig_id < $self.signal_has_xz.len() {
                 $self.signal_has_xz[__wsig_id] = if __wsig_val.raw_bits().1 != 0 {
                     1u8
@@ -2984,6 +2980,7 @@ mod coverage;
 mod dpi_imports;
 mod edges;
 mod event_loop;
+mod stall_progress;
 mod expression_types;
 mod expressions;
 mod file_io;
@@ -3713,7 +3710,6 @@ fn meta_key_bits(key: &str) -> u64 {
 #[inline]
 fn note_store_write(bits: u64) {
     STORE_WRITE_MASK.with(|m| m.set(m.get() | bits));
-    bump_state_epoch();
 }
 
 
@@ -5884,7 +5880,6 @@ impl PackedMem {
         if seg.xmask != 0 {
             self.data[xat..xat + 8].copy_from_slice(&((ox & !seg.pmask) | nx).to_le_bytes());
         }
-        bump_state_epoch();
         true
     }
 
@@ -10142,18 +10137,14 @@ pub struct Simulator {
     /// Process activations at the current timestamp — the accurate signal for
     /// "who is spinning" (the event queue's own pid_counts is reset per drain).
     stall_pid_hits: HashMap<usize, u64>,
-    /// `state_epoch()` at the start of each pid's current stall window (its
-    /// first activation at this timestamp, or the last time the progress-aware
-    /// guard found state had changed and reset its count).
-    stall_pid_epoch: HashMap<usize, u64>,
-    /// `state_epoch()` when the current timestamp's stall bookkeeping was
-    /// last cleared; the baseline for a pid with no entry in `stall_pid_epoch`
-    /// and for the outer delta-cycle counter.
-    stall_epoch0: u64,
+    /// Last sampled functional data/control state of each pid's guard window.
+    stall_pid_state: HashMap<usize, u64>,
+    /// Last outer-loop state sample; zero means no sample in this timestamp.
+    stall_state0: u64,
     /// True when `XEZIM_STALL_LIMIT` was set explicitly: the guard is then a
     /// hard per-process activation cap (opt-in strict mode). When unset, the
     /// guard is progress-aware and only trips when a full window of
-    /// activations changed no observable state.
+    /// activations recurred in the same functional data and control state.
     stall_limit_explicit: bool,
     /// Delta cycles allowed at one timestamp before the run is declared a
     /// zero-delay livelock. Generous by default (real designs settle in a

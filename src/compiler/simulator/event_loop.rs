@@ -306,20 +306,6 @@ impl Simulator {
         self.drain_edge_exec_rescan();
     }
 
-    /// Hash of every signal's current value, for cascade recurrence
-    /// detection. Only called once per `SAMPLE` generations and only after a
-    /// cascade has already outrun `cascade_limit`.
-    fn cascade_state_hash(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        for v in &self.signal_table {
-            let (a, b) = v.raw_bits();
-            a.hash(&mut h);
-            b.hash(&mut h);
-        }
-        h.finish()
-    }
-
     pub(super) fn drain_edge_cascade(&mut self, cascade_limit: u32) -> (u64, u64, u64, u64) {
         let (mut t_snap, mut t_nba, mut t_settle, mut t_edges) = (0u64, 0u64, 0u64, 0u64);
         let mut cascade_iter = 0u32;
@@ -338,7 +324,9 @@ impl Simulator {
                     break;
                 }
                 if (cascade_iter - cascade_limit) % SAMPLE == 0
-                    && !seen_states.insert(self.cascade_state_hash())
+                    && self
+                        .progress_state_hash(None)
+                        .is_some_and(|state| !seen_states.insert(state))
                 {
                     cycling = true;
                     break;
@@ -571,36 +559,21 @@ impl Simulator {
         line
     }
 
-    /// Per-process zero-delay stall check, run before each activation of
-    /// `pid`. Returns true when the activation must be re-parked unexecuted
-    /// and the outer loop asked to defer-and-advance.
-    ///
-    /// A count alone cannot tell a finite phase (`repeat (N) #0; n++;`,
-    /// request/ack relays, mailbox ping-pongs) from a livelock, and a
-    /// conforming simulator never splits the former across timestamps. So by
-    /// default a full window of `stall_limit` activations only trips the guard
-    /// when NO observable state changed during it (`state_epoch` unmoved since
-    /// the window began); if state did change, the phase is making progress
-    /// and the window restarts. Setting `XEZIM_STALL_LIMIT` explicitly opts in
-    /// to the strict mode: a hard per-process cap, no progress test.
-    pub(super) fn stall_pid_tripped(&mut self, pid: usize) -> bool {
-        let limit = self.stall_limit;
+    /// §4.4: sample data and suspended control only after a guard window.
+    /// A hidden repeat counter is progress even without signal writes; an
+    /// unchanged write is not progress. Explicit limits remain hard caps.
+    pub(super) fn stall_pid_tripped(&mut self, pid: usize, current: Option<&ProcCont>) -> bool {
         let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-        if *hits >= limit {
+        if *hits >= self.stall_limit {
             if self.stall_limit_explicit {
                 return true;
             }
-            let now = state_epoch();
-            let base = self
-                .stall_pid_epoch
-                .get(&pid)
-                .copied()
-                .unwrap_or(self.stall_epoch0);
-            if now == base {
+            let now = self.progress_state_hash(current).unwrap_or(0);
+            if now != 0 && self.stall_pid_state.get(&pid) == Some(&now) {
                 return true;
             }
-            *self.stall_pid_hits.entry(pid).or_insert(0) = 0;
-            self.stall_pid_epoch.insert(pid, now);
+            self.stall_pid_state.insert(pid, now);
+            self.stall_pid_hits.insert(pid, 0);
         }
         *self.stall_pid_hits.entry(pid).or_insert(0) += 1;
         false
@@ -610,9 +583,9 @@ impl Simulator {
     /// was broken by jumping ahead).
     pub(super) fn reset_stall_window(&mut self) {
         self.stall_pid_hits.clear();
-        self.stall_pid_epoch.clear();
+        self.stall_pid_state.clear();
         self.stall_edge_block_hits.clear();
-        self.stall_epoch0 = state_epoch();
+        self.stall_state0 = 0;
     }
 
     /// Outer-loop counterpart of `stall_pid_tripped`: true (and the delta
@@ -622,11 +595,11 @@ impl Simulator {
         if self.stall_limit_explicit {
             return false;
         }
-        let now = state_epoch();
-        if now == self.stall_epoch0 {
+        let now = self.progress_state_hash(None).unwrap_or(0);
+        if now != 0 && now == self.stall_state0 {
             return false;
         }
-        self.stall_epoch0 = now;
+        self.stall_state0 = now;
         self.stall_iters = 0;
         true
     }
@@ -1309,34 +1282,42 @@ impl Simulator {
 
     /// A same-timestamp fixpoint loop (condition-waiter drain, end-of-tick
     /// late re-pass) has run a full window of passes. Returns true — and
-    /// restarts the window — when observable state changed during it: a
+    /// restarts the window — when functional data or suspended control changed during it: a
     /// finite handshake relay with more rounds than the window is making
     /// progress and must finish inside its timestamp (§4.4). Returns false
-    /// when nothing changed (a genuine stall; stop and let the outer
+    /// when the sampled state recurs (stop and let the outer
     /// detectors report it) or when `XEZIM_STALL_LIMIT` was set explicitly,
     /// which keeps the window a hard cap.
-    pub(super) fn fixpoint_window_progressed_u64(&self, passes: &mut u64, window_epoch: &mut u64) -> bool {
+    pub(super) fn fixpoint_window_progressed_u64(
+        &self,
+        passes: &mut u64,
+        window_state: &mut u64,
+    ) -> bool {
         if self.stall_limit_explicit {
             return false;
         }
-        let now = state_epoch();
-        if now == *window_epoch {
+        let now = self.progress_state_hash(None).unwrap_or(0);
+        if now != 0 && now == *window_state {
             return false;
         }
-        *window_epoch = now;
+        *window_state = now;
         *passes = 0;
         true
     }
 
-    pub(super) fn fixpoint_window_progressed(&self, passes: &mut u32, window_epoch: &mut u64) -> bool {
+    pub(super) fn fixpoint_window_progressed(
+        &self,
+        passes: &mut u32,
+        window_state: &mut u64,
+    ) -> bool {
         if self.stall_limit_explicit {
             return false;
         }
-        let now = state_epoch();
-        if now == *window_epoch {
+        let now = self.progress_state_hash(None).unwrap_or(0);
+        if now != 0 && now == *window_state {
             return false;
         }
-        *window_epoch = now;
+        *window_state = now;
         *passes = 0;
         true
     }
@@ -1397,13 +1378,13 @@ impl Simulator {
     ///     region writes them.
     pub(super) fn drain_condition_waiters(&mut self, pre_inactive: bool, from_repass: bool) {
         let mut guard = 0u32;
-        let mut guard_epoch = state_epoch();
+        let mut guard_state = 0;
         while (!self.condition_waiters.is_empty() || !self.ready_condition_waiters.is_empty())
             && !self.finished
             && !self.zero_delay_defer_pending
         {
             guard += 1;
-            if guard > 10000 && !self.fixpoint_window_progressed(&mut guard, &mut guard_epoch) {
+            if guard > 10000 && !self.fixpoint_window_progressed(&mut guard, &mut guard_state) {
                 break;
             }
             let prog_before = self.cond_progress;
@@ -1870,7 +1851,7 @@ impl Simulator {
         // clocking input snapshots are refreshed, resume the clocking-event
         // waiters (`@(cb)` / `##N`) that fired this slot — in the Reactive
         // region — so they observe post-edge state and this cycle's samples.
-        let tick_late_epoch_start = self.late_resume_epoch;
+        let tick_late_state_start = self.late_resume_epoch;
         self.drain_deferred_clocking_conts();
         if let Some(t) = _t_cb {
             accum.t_clocking += t.elapsed().as_nanos() as u64;
@@ -1919,14 +1900,14 @@ impl Simulator {
         // backdoor mirrors read X otherwise. Loop while the re-pass itself
         // produces further late resumes; bounded like every fixpoint here.
         //
-        // Gated on tick_late_epoch_start so that ticks where no late-region
+        // Gated on tick_late_state_start so that ticks where no late-region
         // resumes ran avoid permanent extra scanning after the first late resume.
-        if self.late_resume_epoch != tick_late_epoch_start
+        if self.late_resume_epoch != tick_late_state_start
             && !self.finished
             && !self.zero_delay_defer_pending
         {
             let mut late_passes = 0u32;
-            let mut late_epoch = state_epoch();
+            let mut late_state = 0;
             loop {
                 let epoch_before = self.late_resume_epoch;
                 if self.dirty_any {
@@ -1972,7 +1953,7 @@ impl Simulator {
                     break;
                 }
                 if late_passes > 10_000
-                    && !self.fixpoint_window_progressed(&mut late_passes, &mut late_epoch)
+                    && !self.fixpoint_window_progressed(&mut late_passes, &mut late_state)
                 {
                     break;
                 }
