@@ -1208,3 +1208,6 @@ mod class_scoped_assoc_queue_element;
 
 #[path = "classes/rand_sub_object_back_handle.rs"]
 mod rand_sub_object_back_handle;
+
+#[path = "classes/rand_solver_sparse_1003.rs"]
+mod rand_solver_sparse_1003;
