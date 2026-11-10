@@ -458,3 +458,6 @@ mod instance_array_struct_ports;
 
 #[path = "hierarchy/struct_member_actuals.rs"]
 mod struct_member_actuals;
+
+#[path = "hierarchy/package_header_shadow_995.rs"]
+mod package_header_shadow_995;
