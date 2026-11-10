@@ -3613,6 +3613,15 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
+        // §10.10: `cfg.r = {…}` writes a queue member before the right side runs as a value.
+        if let ExprKind::MemberAccess { .. } = &lvalue.kind
+            && let ExprKind::Concatenation(_) = &rvalue.kind
+            && let Some(n) = self.expr_assoc_name(lvalue).filter(|n| self.class_queue_prop(n))
+            && self.assign_whole_coll(&n, None, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
         let val = if let ExprKind::Call { func, args } = &rvalue.kind {
             if let ExprKind::Ident(hier) = &func.kind {
                 let method_name = hier.path.last().unwrap().name.name.as_str();
