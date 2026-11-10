@@ -488,6 +488,9 @@ impl Simulator {
                 true
             }
             ExprKind::Concatenation(exprs) if !is_assoc => {
+                if self.assign_struct_concat(name, exprs.iter().collect()) {
+                    return true;
+                }
                 let mut flat: Vec<&Expression> = exprs.iter().collect();
                 while let Some(i) = flat
                     .iter()

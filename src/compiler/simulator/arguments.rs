@@ -2363,9 +2363,15 @@ impl Simulator {
                 Some(&self.module.typedefs),
             )
             .max(1);
-            let vals = self.unpacked_concat_operand_values(parts.iter().collect());
             let param = self.array_formal_key(port);
             self.module.arrays.insert(param.clone(), (lo, hi, w));
+            if descending {
+                self.module.descending_arrays.insert(param.clone());
+            }
+            if self.assign_struct_concat(&param, parts.iter().collect()) {
+                return Some((param, String::new(), lo, hi));
+            }
+            let vals = self.unpacked_concat_operand_values(parts.iter().collect());
             for (j, v) in vals.into_iter().take((hi - lo + 1) as usize).enumerate() {
                 let idx = if descending {
                     hi - j as i64

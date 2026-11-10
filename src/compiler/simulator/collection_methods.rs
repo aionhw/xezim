@@ -1919,6 +1919,9 @@ impl Simulator {
                     .iter()
                     .any(|p| matches!(p.kind, ExprKind::AssignmentPattern(_)))
             {
+                if self.assign_struct_concat(&key, parts.clone()) {
+                    return Some((key, String::new()));
+                }
                 let vals = self.unpacked_concat_operand_values(parts);
                 let n = vals.len() as u64;
                 for (j, v) in vals.into_iter().enumerate() {

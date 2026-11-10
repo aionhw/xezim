@@ -3654,6 +3654,15 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
+        // §10.10: consume typed elements before the scalar RHS evaluation,
+        // which would run each call operand once and discard its members.
+        if let ExprKind::Concatenation(parts) = &rvalue.kind
+            && let Some(name) = self.pending_coll_dst(lvalue)
+            && self.assign_struct_concat(&name, parts.iter().collect())
+        {
+            self.settle_after_proc_write();
+            return;
+        }
         let val = if let ExprKind::Call { func, args } = &rvalue.kind {
             if let ExprKind::Ident(hier) = &func.kind {
                 let method_name = hier.path.last().unwrap().name.name.as_str();
