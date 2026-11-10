@@ -161,6 +161,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   indexed record fields retain their own dependencies (§18.5, §11.4.3,
   #1003, reported by Ganesh-TNL).
 
+* A function inlined into an unrolled loop no longer reads the caller's loop
+  variable: a function whose own `for (int s ...)` loop shared the caller's
+  loop variable name hung at time zero or never looped, and a function reading
+  a module variable `s` read the caller's `s` (§13.4, #1041).
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
