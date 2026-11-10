@@ -25,6 +25,8 @@ impl Simulator {
             self.process_contexts.insert(waiter_pid, ctx);
             self.restore_process_context(saved);
             val
+        } else if self.process_context_is_default() {
+            self.wait_condition_true(cond)
         } else {
             let saved = self.snapshot_process_context();
             let val = self.wait_condition_true(cond);
@@ -138,8 +140,7 @@ impl Simulator {
                 i += 1;
                 continue;
             }
-            let cond_opt = self.cond_waiter_conditions.get(&pid).cloned();
-            let Some(cond) = cond_opt else {
+            let Some(cond) = self.cond_waiter_conditions.remove(&pid) else {
                 i += 1;
                 continue;
             };
@@ -150,9 +151,9 @@ impl Simulator {
                 self.cond_waiter_gate.remove(&wpid);
                 self.cond_waiter_reads.remove(&wpid);
                 self.cond_read_union_dirty = true;
-                self.cond_waiter_conditions.remove(&wpid);
                 self.ready_condition_waiters.push((wpid, wcont));
             } else {
+                self.cond_waiter_conditions.insert(pid, cond);
                 i += 1;
             }
         }
