@@ -45,6 +45,8 @@ mod begin_keywords_noconfig;
 mod bind_upward_refs;
 #[path = "misc/blocking_task_call.rs"]
 mod blocking_task_call;
+#[path = "misc/broken_pipe_exit_status.rs"]
+mod broken_pipe_exit_status;
 #[path = "misc/c910_create_en_cont_assign.rs"]
 mod c910_create_en_cont_assign;
 #[path = "misc/c910_create_en_full_path.rs"]
