@@ -9130,11 +9130,12 @@ impl Simulator {
             && let [x] = args.as_slice()
         {
             // §20.9: the ones of a concatenation are those of its parts.
-            let parts: &[Expression] = match &Self::unparen(x).kind {
-                ExprKind::Concatenation(parts) => parts,
-                _ => std::slice::from_ref(x),
-            };
-            for x in parts {
+            let mut parts = vec![x];
+            while let Some(x) = parts.pop() {
+                if let ExprKind::Concatenation(xs) = &Self::unparen(x).kind {
+                    parts.extend(xs.iter().rev());
+                    continue;
+                }
                 let Some((v, lo, w, whole)) = self.csp_slice_base_k(csp, x, &mut konst) else {
                     continue;
                 };
