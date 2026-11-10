@@ -3756,10 +3756,11 @@ impl Simulator {
         }
 
         // §10.9.1: a packed multi-D vector takes a pattern as one packed
-        // value, evaluated against its declared type by the caller.
-        if !self.module.arrays.contains_key(base)
-            && self.module.packed_signal_elem_widths.contains_key(base)
-        {
+        // value, evaluated against its declared type by the caller. An
+        // unpacked array of any rank whose element is packed multi-D also
+        // has an inner element width recorded, so test the fixed-array
+        // tables, not only the 1-D one.
+        if !registered_fixed && self.module.packed_signal_elem_widths.contains_key(base) {
             return false;
         }
 
