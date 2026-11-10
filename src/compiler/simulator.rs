@@ -7274,13 +7274,13 @@ pub struct Simulator {
     /// LRM §14.3: per-cb metadata. `(clock_signal_name, [(signal_name, is_input)])`.
     /// Populated at compile() from `module.clocking_blocks`.
     clocking_meta: HashMap<String, (String, Vec<(String, bool)>)>,
-    /// LRM §14.4: pending clocking-output drives. `cb_name → [(signal,
-    /// value)]`. `cb.<out_sig> <= val` queues here instead of driving
+    /// LRM §14.4: pending clocking-output drives. Each drive retains its
+    /// clockvar name, physical net and value. `cb.<out_sig> <= val` queues here instead of driving
     /// immediately; `tick_clocking_blocks` applies them at the next
     /// posedge of the cb's clock (output skew).
     /// A drive of a SELECT (`cb.v[2] <= 1`) carries its target: the net with
     /// the drive's indices frozen.
-    clocking_output_pending: HashMap<String, Vec<(String, Value, Option<Expression>)>>,
+    clocking_output_pending: HashMap<String, Vec<(String, String, Value, Option<Expression>)>>,
     /// Per-clocking-block previous clock bit (for edge detection).
     clocking_prev_clock: HashMap<String, u8>,
     /// Per-tick clock poll table for `tick_clocking_blocks` (see there).
@@ -7307,9 +7307,9 @@ pub struct Simulator {
     /// slot's edge detection, and its fan-out must still wake in this slot.
     clocking_edge_drive_dirty: bool,
     /// §14.16 `cb.out <= ##N v` drives awaiting N further clocking events:
-    /// cb → [(remaining_cycles, net, value)]. Decremented at each edge of that
+    /// cb → [(remaining_cycles, clockvar, net, value, target)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.
-    clocking_cycle_pending: HashMap<String, Vec<(u64, String, Value, Option<Expression>)>>,
+    clocking_cycle_pending: HashMap<String, Vec<(u64, String, String, Value, Option<Expression>)>>,
     /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
     /// resolved net). The snapshot/meta store the NET; reads and drives use
     /// the clocking name, so they translate through this first.

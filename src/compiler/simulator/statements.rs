@@ -4399,10 +4399,13 @@ impl Simulator {
                                 // §14.16 `##N`: wait N further clocking events.
                                 if let Some(n) = intra_cycles {
                                     if n > 0 {
-                                        self.clocking_cycle_pending
-                                            .entry(cb)
-                                            .or_default()
-                                            .push((n, net, val, target));
+                                        self.clocking_cycle_pending.entry(cb).or_default().push((
+                                            n,
+                                            raw_sig.to_string(),
+                                            net,
+                                            val,
+                                            target,
+                                        ));
                                         return;
                                     }
                                 }
@@ -4435,15 +4438,16 @@ impl Simulator {
                                         return;
                                     }
                                     if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
-                                        let w = self.signal_widths[id];
-                                        self.schedule_delayed_with_delay(id, val.resize(w), skew);
+                                        self.schedule_clocking_update(id, &val, skew);
                                         return;
                                     }
                                 }
-                                self.clocking_output_pending
-                                    .entry(cb)
-                                    .or_default()
-                                    .push((net, val, target));
+                                self.clocking_output_pending.entry(cb).or_default().push((
+                                    raw_sig.to_string(),
+                                    net,
+                                    val,
+                                    target,
+                                ));
                                 return;
                             }
                         }
