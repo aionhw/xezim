@@ -698,7 +698,12 @@ impl Simulator {
                     }
                     self.packed_array_copy_values.insert(ids, val.clone());
                 }
-                if delay > 0 {
+                if delay > 0
+                    || lhs_id.is_some_and(|id| {
+                        self.gate_fall_delay_by_id.contains_key(&id)
+                            || self.gate_off_delay_by_id.contains_key(&id)
+                    })
+                {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {
                             if !self.delayed_update_pending_is(id, &val) {

@@ -1644,7 +1644,8 @@ struct CombEntryCold {
 // member ids that the collapse left unused; those edges are stale. Reads of
 // an element of an unpacked array of structs, or of the whole array, now
 // depend on its members too.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB031";
+// §10.3.3: keep falling and turn-off delays when prepared tables are restored.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB032";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -1664,6 +1665,8 @@ struct PreparedCombCacheRef<'a> {
     time0_idx: &'a [usize],
     time0_deferred: &'a [CombEntry],
     cont_driven: &'a HashSet<usize>,
+    gate_fall_delay_by_id: &'a HashMap<usize, u64>,
+    gate_off_delay_by_id: &'a HashMap<usize, u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1676,6 +1679,8 @@ struct PreparedCombCache {
     time0_idx: Vec<usize>,
     time0_deferred: Vec<CombEntry>,
     cont_driven: HashSet<usize>,
+    gate_fall_delay_by_id: HashMap<usize, u64>,
+    gate_off_delay_by_id: HashMap<usize, u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
