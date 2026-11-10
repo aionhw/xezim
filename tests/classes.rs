@@ -1193,6 +1193,8 @@ mod rand_typedef_handle;
 #[path = "classes/randomize_countones_concat.rs"]
 mod randomize_countones_concat;
 
+#[path = "classes/collection_call_actual_1001.rs"]
+mod collection_call_actual_1001;
 #[path = "classes/constraint_inline_caller_foreach.rs"]
 mod constraint_inline_caller_foreach;
 #[path = "classes/rand_specialized_handle_1034.rs"]
