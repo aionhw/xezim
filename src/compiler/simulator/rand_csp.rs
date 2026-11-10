@@ -2871,7 +2871,15 @@ impl Simulator {
         }
         let aux = Self::csp_aux(csp);
         let mut budget = NODE_BUDGET;
-        let mut run_budget: u64 = (nvars as u64).max(1000);
+        // A large array needs a complete assignment before restarting.
+        // Auxiliary segments of a complex object graph retain the existing
+        // restart interval; their count does not represent independent draws.
+        let mut run_budget: u64 = csp
+            .arrays
+            .values()
+            .map(|a| a.elems.len() as u64)
+            .sum::<u64>()
+            .max(1000);
         let mut st = St {
             d: csp.dom0.clone(),
             trail: Vec::new(),
@@ -10487,8 +10495,17 @@ impl Simulator {
     }
 
     fn csp_wide_item_reads(it: &ConstraintItem, read: &mut HashSet<String>, opaque: &mut bool) {
+        Self::csp_wide_item_reads_with(it, read, opaque, &|_| false);
+    }
+
+    fn csp_wide_item_reads_with(
+        it: &ConstraintItem,
+        read: &mut HashSet<String>,
+        opaque: &mut bool,
+        skip_member: &dyn Fn(&Expression) -> bool,
+    ) {
         let ex = |e: &Expression, read: &mut HashSet<String>, opaque: &mut bool| {
-            Self::csp_wide_expr_reads(e, read, opaque)
+            Self::csp_wide_expr_reads_with(e, read, opaque, skip_member)
         };
         match it {
             ConstraintItem::Expr(e) => ex(e, read, opaque),
@@ -10520,7 +10537,7 @@ impl Simulator {
                 ..
             } => {
                 ex(condition, read, opaque);
-                Self::csp_wide_item_reads(constraint, read, opaque);
+                Self::csp_wide_item_reads_with(constraint, read, opaque, skip_member);
             }
             ConstraintItem::IfElse {
                 condition,
@@ -10529,22 +10546,22 @@ impl Simulator {
                 ..
             } => {
                 ex(condition, read, opaque);
-                Self::csp_wide_item_reads(then_item, read, opaque);
+                Self::csp_wide_item_reads_with(then_item, read, opaque, skip_member);
                 if let Some(e) = else_item {
-                    Self::csp_wide_item_reads(e, read, opaque);
+                    Self::csp_wide_item_reads_with(e, read, opaque, skip_member);
                 }
             }
             ConstraintItem::Foreach { array, item, .. } => {
                 ex(array, read, opaque);
-                Self::csp_wide_item_reads(item, read, opaque);
+                Self::csp_wide_item_reads_with(item, read, opaque, skip_member);
             }
             ConstraintItem::Solve { before, after, .. } => {
                 read.extend(before.iter().chain(after).map(|i| i.name.clone()));
             }
-            ConstraintItem::Soft(i) => Self::csp_wide_item_reads(i, read, opaque),
+            ConstraintItem::Soft(i) => Self::csp_wide_item_reads_with(i, read, opaque, skip_member),
             ConstraintItem::Block(items) => {
                 for i in items {
-                    Self::csp_wide_item_reads(i, read, opaque);
+                    Self::csp_wide_item_reads_with(i, read, opaque, skip_member);
                 }
             }
             ConstraintItem::Unique { exprs, .. } => {
@@ -10556,7 +10573,12 @@ impl Simulator {
     }
 
     /// Every name `e` mentions (conservatively: each segment of a path).
-    fn csp_wide_expr_reads(e: &Expression, read: &mut HashSet<String>, opaque: &mut bool) {
+    fn csp_wide_expr_reads_with(
+        e: &Expression,
+        read: &mut HashSet<String>,
+        opaque: &mut bool,
+        skip_member: &dyn Fn(&Expression) -> bool,
+    ) {
         const ARRAY_METHODS: &[&str] = &[
             "sum",
             "product",
@@ -10594,17 +10616,21 @@ impl Simulator {
             | ExprKind::Empty => {}
             ExprKind::Ident(h) => {
                 let mut sel = Vec::new();
-                for s in &h.path {
-                    read.insert(s.name.name.clone());
+                for (i, s) in h.path.iter().enumerate() {
+                    if i == 0 || !skip_member(e) {
+                        read.insert(s.name.name.clone());
+                    }
                     sel.extend(s.selects.iter());
                 }
                 for x in sel {
-                    Self::csp_wide_expr_reads(x, read, opaque);
+                    Self::csp_wide_expr_reads_with(x, read, opaque, skip_member);
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
-                read.insert(member.name.clone());
-                Self::csp_wide_expr_reads(expr, read, opaque);
+                if !skip_member(e) {
+                    read.insert(member.name.clone());
+                }
+                Self::csp_wide_expr_reads_with(expr, read, opaque, skip_member);
             }
             ExprKind::Call { func, args } => {
                 match &func.kind {
@@ -10616,7 +10642,7 @@ impl Simulator {
                             *opaque = true;
                             return;
                         }
-                        Self::csp_wide_expr_reads(expr, read, opaque);
+                        Self::csp_wide_expr_reads_with(expr, read, opaque, skip_member);
                     }
                     ExprKind::Ident(h)
                         if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
@@ -10639,7 +10665,7 @@ impl Simulator {
                     }
                 }
                 for a in args {
-                    Self::csp_wide_expr_reads(a, read, opaque);
+                    Self::csp_wide_expr_reads_with(a, read, opaque, skip_member);
                 }
             }
             ExprKind::SystemCall { name, args } => {
@@ -10647,54 +10673,54 @@ impl Simulator {
                     return;
                 }
                 for a in args {
-                    Self::csp_wide_expr_reads(a, read, opaque);
+                    Self::csp_wide_expr_reads_with(a, read, opaque, skip_member);
                 }
             }
             ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
-                Self::csp_wide_expr_reads(operand, read, opaque)
+                Self::csp_wide_expr_reads_with(operand, read, opaque, skip_member)
             }
             ExprKind::Binary { left, right, .. } | ExprKind::Range(left, right) => {
-                Self::csp_wide_expr_reads(left, read, opaque);
-                Self::csp_wide_expr_reads(right, read, opaque);
+                Self::csp_wide_expr_reads_with(left, read, opaque, skip_member);
+                Self::csp_wide_expr_reads_with(right, read, opaque, skip_member);
             }
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
-                Self::csp_wide_expr_reads(condition, read, opaque);
-                Self::csp_wide_expr_reads(then_expr, read, opaque);
-                Self::csp_wide_expr_reads(else_expr, read, opaque);
+                Self::csp_wide_expr_reads_with(condition, read, opaque, skip_member);
+                Self::csp_wide_expr_reads_with(then_expr, read, opaque, skip_member);
+                Self::csp_wide_expr_reads_with(else_expr, read, opaque, skip_member);
             }
             ExprKind::Concatenation(xs) => xs
                 .iter()
-                .for_each(|x| Self::csp_wide_expr_reads(x, read, opaque)),
+                .for_each(|x| Self::csp_wide_expr_reads_with(x, read, opaque, skip_member)),
             ExprKind::Replication { count, exprs } => {
-                Self::csp_wide_expr_reads(count, read, opaque);
+                Self::csp_wide_expr_reads_with(count, read, opaque, skip_member);
                 exprs
                     .iter()
-                    .for_each(|x| Self::csp_wide_expr_reads(x, read, opaque));
+                    .for_each(|x| Self::csp_wide_expr_reads_with(x, read, opaque, skip_member));
             }
             ExprKind::Inside { expr, ranges } => {
-                Self::csp_wide_expr_reads(expr, read, opaque);
+                Self::csp_wide_expr_reads_with(expr, read, opaque, skip_member);
                 ranges
                     .iter()
-                    .for_each(|x| Self::csp_wide_expr_reads(x, read, opaque));
+                    .for_each(|x| Self::csp_wide_expr_reads_with(x, read, opaque, skip_member));
             }
             ExprKind::Index { expr, index } => {
-                Self::csp_wide_expr_reads(expr, read, opaque);
-                Self::csp_wide_expr_reads(index, read, opaque);
+                Self::csp_wide_expr_reads_with(expr, read, opaque, skip_member);
+                Self::csp_wide_expr_reads_with(index, read, opaque, skip_member);
             }
             ExprKind::RangeSelect {
                 expr, left, right, ..
             } => {
-                Self::csp_wide_expr_reads(expr, read, opaque);
-                Self::csp_wide_expr_reads(left, read, opaque);
-                Self::csp_wide_expr_reads(right, read, opaque);
+                Self::csp_wide_expr_reads_with(expr, read, opaque, skip_member);
+                Self::csp_wide_expr_reads_with(left, read, opaque, skip_member);
+                Self::csp_wide_expr_reads_with(right, read, opaque, skip_member);
             }
             ExprKind::WithClause { expr, filter } => {
-                Self::csp_wide_expr_reads(expr, read, opaque);
-                Self::csp_wide_expr_reads(filter, read, opaque);
+                Self::csp_wide_expr_reads_with(expr, read, opaque, skip_member);
+                Self::csp_wide_expr_reads_with(filter, read, opaque, skip_member);
             }
             _ => *opaque = true,
         }
@@ -10714,7 +10740,6 @@ impl Simulator {
         for &v in &wides {
             let w = csp.vars[v].width;
             let mut cuts: std::collections::BTreeSet<u32> = [0, w].into_iter().collect();
-            cuts.extend((64..w).step_by(64));
             if csp.vars[v].signed {
                 cuts.insert(w - 1);
             }
@@ -10998,6 +11023,22 @@ impl Simulator {
             v.to_i64()
         };
         match op {
+            BinaryOp::Add | BinaryOp::Sub => {
+                // Word arithmetic needs 64-bit boundaries relative to each
+                // wide operand. Preserve narrower declared fields elsewhere:
+                // splitting those would detach their dist variables.
+                for x in [left, right] {
+                    let Some((v, lo, w, _)) = self.csp_slice_base_k(csp, x, &mut konst) else {
+                        continue;
+                    };
+                    if csp.wide.contains(&v) {
+                        uses.entry(v)
+                            .or_default()
+                            .0
+                            .extend((64..w).step_by(64).map(|k| (lo + k, 0)));
+                    }
+                }
+            }
             BinaryOp::ShiftRight
             | BinaryOp::ShiftLeft
             | BinaryOp::ArithShiftRight
@@ -11073,16 +11114,15 @@ impl Simulator {
     /// An item the dependency scan could not fully analyse may read a wide
     /// variable: it calls a method, or names one other than through
     /// `size()` (an array's size is fixed while it is solved).
-    fn csp_may_read_wide(&self, csp: &Csp, item: &SrcItem, env: &Env) -> bool {
-        let mut deps = Vec::new();
-        let complete = match item {
-            SrcItem::Expr(e) => self.csp_refs(csp, e, env, &mut deps),
-            SrcItem::Item(it) => self.csp_item_refs(csp, it, env, &mut deps),
-        };
-        !complete
-            || deps
-                .iter()
-                .any(|v| csp.wide.contains(v) || csp.wide_seg.contains(v))
+    fn csp_may_read_wide(&self, csp: &Csp, item: &SrcItem, _env: &Env) -> bool {
+        let mut read = HashSet::default();
+        let mut opaque = false;
+        let skip = |e: &Expression| self.csp_state_record_path(csp, e);
+        match item {
+            SrcItem::Expr(e) => Self::csp_wide_expr_reads_with(e, &mut read, &mut opaque, &skip),
+            SrcItem::Item(it) => Self::csp_wide_item_reads_with(it, &mut read, &mut opaque, &skip),
+        }
+        Self::csp_wide_named(csp, &read, opaque)
     }
 
     /// The variables `e` reads, when it reads wide variables only through
@@ -11177,15 +11217,36 @@ impl Simulator {
     }
 
     /// `e` may read a wide variable (see `csp_may_read_wide`).
-    fn csp_wide_touch(&self, csp: &Csp, e: &Expression, env: &Env) -> bool {
-        // §18.5: resolve dependencies, rather than matching every path
-        // segment's spelling. A non-rand record field named like a wide
-        // rand property (`records[index].addr`) does not read that property.
-        let mut deps = Vec::new();
-        !self.csp_refs(csp, e, env, &mut deps)
-            || deps
-                .iter()
-                .any(|v| csp.wide.contains(v) || csp.wide_seg.contains(v))
+    fn csp_wide_touch(&self, csp: &Csp, e: &Expression, _env: &Env) -> bool {
+        let mut read=HashSet::default();let mut opaque=false;
+        Self::csp_wide_expr_reads_with(e,&mut read,&mut opaque,&|x|self.csp_state_record_path(csp,x));
+        Self::csp_wide_named(csp,&read,opaque)
+    }
+
+    /// §18.5: a field of a non-rand packed-record collection is state,
+    /// even if its leaf name matches a separate wide rand property.
+    fn csp_state_record_path(&self, csp: &Csp, e: &Expression) -> bool {
+        let mut indexed=false;let mut x=e;
+        let root=loop {
+            match &Self::unparen(x).kind {
+                ExprKind::MemberAccess{expr,..}=>x=expr,
+                ExprKind::Index{expr,..}=>{indexed=true;x=expr;}
+                ExprKind::Ident(h) if h.root.is_none() && !h.path.is_empty()=>{
+                    indexed|=h.path.iter().any(|s|!s.selects.is_empty());
+                    break &h.path[0].name.name;
+                }
+                _=>return false,
+            }
+        };
+        if !indexed || csp.scope.is_some() || csp.scalars.contains_key(root)||csp.arrays.contains_key(root) {return false;}
+        let Some(dt)=self.csp_prop_decl_type(csp.handle,root) else {return false;};
+        matches!(super::elaborate::resolve_typedef_chain(&dt,&self.module.typedef_types),DataType::Struct(su) if su.packed)
+    }
+
+    fn csp_wide_named(csp: &Csp, read: &HashSet<String>, opaque: bool) -> bool {
+        fn leaf(n: &str) -> &str { n.rsplit_once('.').map_or(n,|p|p.1) }
+        opaque || csp.scalars.iter().any(|(n,v)|csp.wide.contains(v)&&read.contains(leaf(n)))
+            || csp.arrays.iter().any(|(n,a)|a.elems.first().is_some_and(|e|csp.wide.contains(&e.1))&&read.contains(n))
     }
 
     /// The wide variable and bit range `e` names: Some((v, lsb, width,
@@ -11350,6 +11411,12 @@ impl Simulator {
         s: bool,
         env: &Env,
     ) -> Option<WOp> {
+        // Narrow arithmetic on fields of a wide struct already has an
+        // affine model. Word carries there add artificial search decisions
+        // to large object graphs; reserve them for an actually wide context.
+        if w <= 64 {
+            return self.csp_wide_op(csp, e, w, s, env);
+        }
         if let Some(o) = self.csp_wide_sum_op(csp, e, w, s, env) {
             return Some(o);
         }
