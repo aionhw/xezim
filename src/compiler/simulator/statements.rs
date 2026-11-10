@@ -23,8 +23,12 @@ impl Simulator {
                     .filter(|cn| self.module.dynamic_arrays.contains(cn))
             });
             if let Some(ename) = qn {
-                let esize = self.get_queue_size(&ename) as usize;
-                for j in 0..esize {
+                let lo = self.module.arrays.get(&ename).map_or(0, |a| a.0);
+                let mut idx: Vec<i64> = (lo..lo + self.get_queue_size(&ename) as i64).collect();
+                if self.module.descending_arrays.contains(&ename) {
+                    idx.reverse();
+                }
+                for j in idx {
                     if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", ename, j)) {
                         all_vals.push(v);
                     }
