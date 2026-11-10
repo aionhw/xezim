@@ -422,13 +422,14 @@ impl Simulator {
                     .map(|p| p.materialize(&params_snapshot)),
             )
             .flat_map(|ca| {
-                crate::compiler::elaborate::whole_array_assign_parts_dir(
+                crate::compiler::elaborate::whole_array_assign_parts_dir_with_params(
                     &ca.lhs,
                     &ca.rhs,
                     ca.delay,
                     &arrays_snapshot,
                     Some(&descending_snapshot),
                     Some(&decl_dims_snapshot),
+                    Some(&params_snapshot),
                 )
                 .or_else(|| {
                     crate::compiler::elaborate::whole_array_row_assign_parts(
@@ -4991,13 +4992,14 @@ impl Simulator {
         // parts come back as `name[j]...`, and only their indices are kept.
         let row_dims: HashMap<String, Vec<(i64, i64)>> =
             std::iter::once((name.clone(), dims[k..].to_vec())).collect();
-        let parts = crate::compiler::elaborate::whole_array_assign_parts_dir(
+        let parts = crate::compiler::elaborate::whole_array_assign_parts_dir_with_params(
             cur,
             &ca.rhs,
             ca.delay,
             &HashMap::default(),
             None,
             Some(&row_dims),
+            Some(&self.module.parameters),
         )?;
         Some(
             parts
