@@ -189,32 +189,37 @@ endmodule
 
 #[test]
 fn loaded_struct_members_keep_generate_typedef_widths() {
-    for (definition, field, width) in [
-        ("struct {logic [$bits(W)-1:0] x;}", "x", 8),
-        ("struct packed {logic [$bits(W)-1:0] x;}", "x", 8),
-        (
-            "struct {struct {logic [$bits(W)-1:0] x;} inner;}",
-            "inner.x",
-            8,
-        ),
-        (
-            "union packed {logic [$bits(W)-1:0] x; logic [7:0] y;}",
-            "x",
-            8,
-        ),
-        ("struct {nibble_t [$bits(W)-1:0] x;}", "x", 32),
+    for (kind, width) in [
+        ("struct", 8),
+        ("struct", 17),
+        ("struct", 65),
+        ("struct packed", 194),
+        ("union packed", 8),
     ] {
+        let definition = if kind == "union packed" {
+            format!(
+                "union packed {{logic [$bits(W)-1:0] x; logic [{}:0] y;}}",
+                width - 1
+            )
+        } else {
+            format!("{kind} {{logic [$bits(W)-1:0] x;}}")
+        };
+        let field = "x";
+        let init = if kind == "union packed" {
+            format!("{{ {width} {{1'b1}} }}")
+        } else {
+            format!("'{{ {{ {width} {{1'b1}} }} }}")
+        };
         lifecycle(
             &format!(
                 r#"
 module top;
   if (1) begin : a
-    typedef logic [7:0] W;
-    typedef logic [3:0] nibble_t;
+    typedef logic [{hi}:0] W;
     typedef {definition} S;
     S v, w;
     initial begin
-      #1 v.{field} = '1;
+      #1 v = {init};
       w = v;
       #1;
       if (w.{field} !== {{{width}{{1'b1}}}}) $fatal(1,"FAIL truncated member");
@@ -222,7 +227,8 @@ module top;
     end
   end
 endmodule
-"#
+"#,
+                hi = width - 1
             ),
             false,
         );
