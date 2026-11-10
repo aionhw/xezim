@@ -1180,6 +1180,5 @@ mod review_979_modulo_bounds;
 mod static_shadow_write_944;
 #[path = "classes/vif_collection_formals_925.rs"]
 mod vif_collection_formals_925;
-
-#[path = "classes/randomize_scope_chunked_dist_bounds.rs"]
-mod randomize_scope_chunked_dist_bounds;
+#[path = "classes/concat_write_through_handle_member.rs"]
+mod concat_write_through_handle_member;
