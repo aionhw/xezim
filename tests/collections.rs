@@ -315,11 +315,5 @@ mod dyn_row_array_queries;
 #[path = "collections/dyn_row_sized_new_copy.rs"]
 mod dyn_row_sized_new_copy;
 
-#[path = "collections/assoc_elem_select_read.rs"]
-mod assoc_elem_select_read;
-#[path = "collections/assoc_packed_elem.rs"]
-mod assoc_packed_elem;
-#[path = "collections/unpacked_row_pattern_store.rs"]
-mod unpacked_row_pattern_store;
-#[path = "collections/unpacked_row_pattern_followups.rs"]
-mod unpacked_row_pattern_followups;
+#[path = "collections/concat_actual_queue_formal.rs"]
+mod concat_actual_queue_formal;
