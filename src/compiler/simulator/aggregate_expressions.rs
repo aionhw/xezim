@@ -2057,6 +2057,7 @@ impl Simulator {
             is_object_elem: false,
             nd_base,
             row_tail: None,
+            member: None,
         };
         Self::csp_size_solved(&c, &wrapper)
     }
@@ -2107,9 +2108,6 @@ impl Simulator {
                     && dims.len() >= 2
                 {
                     let w = w.max(1);
-                    if w > 64 {
-                        return Err(rand_csp::CspOutcome::NotApplicable);
-                    }
                     let written = if h.path.len() == 1 && h.path[0].name.name != nm {
                         h.path[0].name.name.clone()
                     } else {
@@ -2209,9 +2207,6 @@ impl Simulator {
                             .map(|t| t.2)
                             .unwrap_or(32)
                             .max(1);
-                        if w > 64 {
-                            return Err(rand_csp::CspOutcome::NotApplicable);
-                        }
                         let signed = self.signed_signals.contains(&nm)
                             || self.module.var_decl_types.get(&nm).is_some_and(|dt| {
                                 super::elaborate::is_type_signed_resolved(
@@ -2303,11 +2298,6 @@ impl Simulator {
                     .get(&nm)
                     .map(|t| t.2 as u32)
                     .unwrap_or(v0.width);
-                if w > 64 && !(empty && dynamic) {
-                    // Left as drawn: a constraint reading it is judged by the
-                    // final check.
-                    continue;
-                }
                 // The declared element type decides the signedness: an
                 // element value written by the per-item repair above may
                 // carry a literal's (`bc[i] == 1` left a `bit` element

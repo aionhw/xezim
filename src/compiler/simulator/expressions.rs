@@ -5947,7 +5947,14 @@ impl Simulator {
                 // call result (`mk().f0[i]`, `set(a).f0[i][j][k]`). The
                 // name-keyed shapes below know no call value, so each index
                 // was a bit select of the member.
-                if Self::chain_has_call_base(expr)
+                let indexed_struct_member = {
+                    let mut base = &**expr;
+                    while let ExprKind::Index { expr, .. } = &base.kind {
+                        base = expr;
+                    }
+                    matches!(&base.kind, ExprKind::MemberAccess { expr, .. } if matches!(expr.kind, ExprKind::Index { .. }))
+                };
+                if (Self::chain_has_call_base(expr) || indexed_struct_member)
                     && let Some(v) = self.call_member_elem_select(expr, index)
                 {
                     return v;

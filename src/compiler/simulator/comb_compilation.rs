@@ -213,6 +213,11 @@ impl Simulator {
                         .all(|&id| id < signal_count)
                 })
             && cache.cont_driven.iter().all(|&id| id < signal_count)
+            && cache
+                .gate_fall_delay_by_id
+                .keys()
+                .chain(cache.gate_off_delay_by_id.keys())
+                .all(|&id| id < signal_count)
     }
 
     pub(super) fn try_load_prepared_comb_cache(&mut self) -> bool {
@@ -285,6 +290,9 @@ impl Simulator {
         self.comb_time0_idx = cache.time0_idx;
         self.comb_time0_deferred = cache.time0_deferred;
         self.cont_driven = cache.cont_driven;
+        self.gate_fall_delay_by_id
+            .extend(cache.gate_fall_delay_by_id);
+        self.gate_off_delay_by_id.extend(cache.gate_off_delay_by_id);
         self.drop_comb_source_ast();
         eprintln!(
             "[CACHE] prepared-comb hit: {} entries from {}",
@@ -322,6 +330,8 @@ impl Simulator {
                 time0_idx: &self.comb_time0_idx,
                 time0_deferred: &self.comb_time0_deferred,
                 cont_driven: &self.cont_driven,
+                gate_fall_delay_by_id: &self.gate_fall_delay_by_id,
+                gate_off_delay_by_id: &self.gate_off_delay_by_id,
             };
             bincode::serde::encode_into_std_write(
                 &payload,
@@ -422,13 +432,14 @@ impl Simulator {
                     .map(|p| p.materialize(&params_snapshot)),
             )
             .flat_map(|ca| {
-                crate::compiler::elaborate::whole_array_assign_parts_dir(
+                crate::compiler::elaborate::whole_array_assign_parts_dir_with_params(
                     &ca.lhs,
                     &ca.rhs,
                     ca.delay,
                     &arrays_snapshot,
                     Some(&descending_snapshot),
                     Some(&decl_dims_snapshot),
+                    Some(&params_snapshot),
                 )
                 .or_else(|| {
                     crate::compiler::elaborate::whole_array_row_assign_parts(
@@ -827,7 +838,10 @@ impl Simulator {
             // Try fused-gate fast path first: recognizes yosys patterns like
             // `assign d[0] = a & b` or `assign d[0] = ~(a & b)` — executes
             // without VM dispatch, just bit reads + 4-state combinator + set_bit.
-            let fused = if explicit_delay == 0 && cov_counter.is_none() {
+            let has_transition_delay = explicit_delay > 0
+                || ca.delay_fall.is_some_and(|d| d > 0)
+                || ca.delay_off.is_some_and(|d| d > 0);
+            let fused = if !has_transition_delay && cov_counter.is_none() {
                 self.try_build_fused_gate(&ca.lhs, &ca.rhs, scope_hint.as_deref())
             } else {
                 None
@@ -837,7 +851,7 @@ impl Simulator {
             // the per-net maps consulted by `schedule_delayed_with_delay`,
             // the one point where both the target and the new value are
             // known. Whole-net targets only, like the gate form (§28.11).
-            if explicit_delay > 0 && wids.len() == 1 && lhs_is_bare_ident {
+            if has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
                 if let Some(f) = ca.delay_fall {
                     if f != explicit_delay {
                         self.gate_fall_delay_by_id.insert(wids[0], f);
@@ -856,7 +870,7 @@ impl Simulator {
                 && Self::const_elem_ref(&ca.rhs, &self.module)
                     .and_then(|(base, idx)| self.elem_cell(&base, &idx))
                     .is_some_and(is_packed_id);
-            let item = if explicit_delay > 0 || packed_array_copy {
+            let item = if has_transition_delay || packed_array_copy {
                 CombItem::ContAssign {
                     lhs: Box::new(ca.lhs.clone()),
                     rhs: Box::new(ca.rhs.clone()),
@@ -4991,13 +5005,14 @@ impl Simulator {
         // parts come back as `name[j]...`, and only their indices are kept.
         let row_dims: HashMap<String, Vec<(i64, i64)>> =
             std::iter::once((name.clone(), dims[k..].to_vec())).collect();
-        let parts = crate::compiler::elaborate::whole_array_assign_parts_dir(
+        let parts = crate::compiler::elaborate::whole_array_assign_parts_dir_with_params(
             cur,
             &ca.rhs,
             ca.delay,
             &HashMap::default(),
             None,
             Some(&row_dims),
+            Some(params),
         )?;
         Some(
             parts

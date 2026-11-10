@@ -347,7 +347,8 @@ fn method_boost_enabled() -> bool {
 // §11.5.1: an x/z literal index into a packed element reads x.
 // §7.4.1: a run-time index into an unpacked array of three or more dimensions declines.
 // §7.4.1: `a[i].m[j][k]` selects elements of a multi-dimensional packed member.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_306d;
+// §7.4.1: local packed typedefs and selected struct-array members keep their dimensions.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_306e;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1644,7 +1645,8 @@ struct CombEntryCold {
 // member ids that the collapse left unused; those edges are stale. Reads of
 // an element of an unpacked array of structs, or of the whole array, now
 // depend on its members too.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB031";
+// §10.3.3: keep falling and turn-off delays when prepared tables are restored.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB032";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -1664,6 +1666,8 @@ struct PreparedCombCacheRef<'a> {
     time0_idx: &'a [usize],
     time0_deferred: &'a [CombEntry],
     cont_driven: &'a HashSet<usize>,
+    gate_fall_delay_by_id: &'a HashMap<usize, u64>,
+    gate_off_delay_by_id: &'a HashMap<usize, u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1676,6 +1680,8 @@ struct PreparedCombCache {
     time0_idx: Vec<usize>,
     time0_deferred: Vec<CombEntry>,
     cont_driven: HashSet<usize>,
+    gate_fall_delay_by_id: HashMap<usize, u64>,
+    gate_off_delay_by_id: HashMap<usize, u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2974,6 +2980,7 @@ mod coverage;
 mod dpi_imports;
 mod edges;
 mod event_loop;
+mod stall_progress;
 mod expression_types;
 mod expressions;
 mod file_io;
@@ -3704,6 +3711,7 @@ fn meta_key_bits(key: &str) -> u64 {
 fn note_store_write(bits: u64) {
     STORE_WRITE_MASK.with(|m| m.set(m.get() | bits));
 }
+
 
 /// An event was triggered or re-bound, so every `<event>.triggered` read may
 /// have changed. A stamp is not a property write, so without this a gated
@@ -4792,6 +4800,10 @@ enum FsmWait {
     /// Index into the frame's `waits` table.
     Edge(u32),
 }
+
+type ClockingOutputDrive = (String, String, Value, Option<Expression>);
+type ClockingCycleDrive = (u64, String, String, Value, Option<Expression>);
+type ClockingEdgeDrive = (String, Value, EdgeKind, u64, Option<Expression>);
 
 /// One clocking block's per-tick poll state: its clock resolved to a
 /// signal-table id once (None: fall back to the by-name read), the edge it
@@ -7269,13 +7281,13 @@ pub struct Simulator {
     /// LRM §14.3: per-cb metadata. `(clock_signal_name, [(signal_name, is_input)])`.
     /// Populated at compile() from `module.clocking_blocks`.
     clocking_meta: HashMap<String, (String, Vec<(String, bool)>)>,
-    /// LRM §14.4: pending clocking-output drives. `cb_name → [(signal,
-    /// value)]`. `cb.<out_sig> <= val` queues here instead of driving
+    /// LRM §14.4: pending clocking-output drives. Each drive retains its
+    /// clockvar name, physical net and value. `cb.<out_sig> <= val` queues here instead of driving
     /// immediately; `tick_clocking_blocks` applies them at the next
     /// posedge of the cb's clock (output skew).
     /// A drive of a SELECT (`cb.v[2] <= 1`) carries its target: the net with
     /// the drive's indices frozen.
-    clocking_output_pending: HashMap<String, Vec<(String, Value, Option<Expression>)>>,
+    clocking_output_pending: HashMap<String, Vec<ClockingOutputDrive>>,
     /// Per-clocking-block previous clock bit (for edge detection).
     clocking_prev_clock: HashMap<String, u8>,
     /// Per-tick clock poll table for `tick_clocking_blocks` (see there).
@@ -7297,10 +7309,14 @@ pub struct Simulator {
     /// slot's edge detection, and the next iteration's snapshot would
     /// otherwise absorb the change and swallow the `@(cb.sig)` event.
     clocking_mirror_dirty: bool,
+    /// Set when `tick_clocking_blocks` drove an edge-skew output, so the
+    /// caller settles and runs one more edge pass: the drive lands after this
+    /// slot's edge detection, and its fan-out must still wake in this slot.
+    clocking_edge_drive_dirty: bool,
     /// §14.16 `cb.out <= ##N v` drives awaiting N further clocking events:
-    /// cb → [(remaining_cycles, net, value)]. Decremented at each edge of that
+    /// cb → [(remaining_cycles, clockvar, net, value, target)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.
-    clocking_cycle_pending: HashMap<String, Vec<(u64, String, Value, Option<Expression>)>>,
+    clocking_cycle_pending: HashMap<String, Vec<ClockingCycleDrive>>,
     /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
     /// resolved net). The snapshot/meta store the NET; reads and drives use
     /// the clocking name, so they translate through this first.
@@ -7314,6 +7330,15 @@ pub struct Simulator {
     clocking_out_skew: HashMap<String, u64>,
     /// §14.4 per-signal output-skew overrides: cb → (resolved net → ticks).
     clocking_sig_out_skew: HashMap<String, HashMap<String, u64>>,
+    /// §14.3 edge of a block's `default output negedge` skew.
+    clocking_out_edge: HashMap<String, EdgeKind>,
+    /// §14.3 per-signal skews: cb → (net → edge, or None for a delay-only
+    /// skew that overrides the block's default edge).
+    clocking_sig_out_edge: HashMap<String, HashMap<String, Option<EdgeKind>>>,
+    /// Drives through an edge-skew output, waiting for that edge of the
+    /// block's clock: cb → [(net, value, edge, post-edge delay, select target)]
+    /// in issue order.
+    clocking_edge_out_pending: HashMap<String, Vec<ClockingEdgeDrive>>,
     /// §14.4 per-cb default INPUT skew in ticks (absent = #0).
     clocking_in_skew: HashMap<String, u64>,
     /// §14.4 per-signal input-skew overrides: cb → (resolved net → ticks).
@@ -7483,6 +7508,11 @@ pub struct Simulator {
     /// iter (see drain_edge_cascade). Cached at sim init; override via
     /// XEZIM_CASCADE_LIMIT env var.
     cascade_limit: u32,
+    /// True when `XEZIM_CASCADE_LIMIT` was set explicitly: the cascade is then
+    /// cut off at that many generations (opt-in strict mode). When unset, the
+    /// cascade may run past `cascade_limit` generations and is only declared a
+    /// livelock when the signal state recurs (it is cycling, not progressing).
+    cascade_limit_explicit: bool,
     /// SDF delay annotation (None if no SDF loaded).
     #[serde(skip)]
     pub sdf_annotation: Option<super::sdf::SdfAnnotation>,
@@ -10110,6 +10140,15 @@ pub struct Simulator {
     /// Process activations at the current timestamp — the accurate signal for
     /// "who is spinning" (the event queue's own pid_counts is reset per drain).
     stall_pid_hits: HashMap<usize, u64>,
+    /// Last sampled functional data/control state of each pid's guard window.
+    stall_pid_state: HashMap<usize, u64>,
+    /// Last outer-loop state sample; zero means no sample in this timestamp.
+    stall_state0: u64,
+    /// True when `XEZIM_STALL_LIMIT` was set explicitly: the guard is then a
+    /// hard per-process activation cap (opt-in strict mode). When unset, the
+    /// guard is progress-aware and only trips when a full window of
+    /// activations recurred in the same functional data and control state.
+    stall_limit_explicit: bool,
     /// Delta cycles allowed at one timestamp before the run is declared a
     /// zero-delay livelock. Generous by default (real designs settle in a
     /// handful); tune with XEZIM_STALL_LIMIT, 0 disables the check.
@@ -13619,6 +13658,9 @@ struct RandColl {
     /// elements are the rows; the joint solver keys each row like a row of
     /// a multi-dimensional array (`nd_base`) once the outer size is known.
     row_tail: Option<RowTail>,
+    /// §18.4: one rand member of an array of unpacked structs, solved as a
+    /// collection of its own (`prop` is `arr.m`, elements `arr[i].m`).
+    member: Option<StructElemMember>,
 }
 
 /// The rows of a dynamic outer dimension (`RandColl::row_tail`).
@@ -13628,6 +13670,23 @@ enum RowTail {
     Fixed(Vec<(i64, i64)>),
     /// `T a[][]`: every row is a dynamic array with its own size.
     Dyn,
+}
+
+#[derive(Clone, Debug)]
+struct StructElemMember {
+    name: String,
+    signed: bool,
+    enum_type: Option<String>,
+}
+
+impl RandColl {
+    /// Storage key of element `i` (`<h>#arr[i]`, or `<h>#arr[i].m`).
+    fn elem_key(&self, i: impl std::fmt::Display) -> String {
+        match &self.member {
+            Some(m) => format!("{}[{}].{}", self.scoped, i, m.name),
+            None => format!("{}[{}]", self.scoped, i),
+        }
+    }
 }
 
 /// A `.size()` constraint on a rand dynamic array (§18.4): the array must be

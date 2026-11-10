@@ -488,12 +488,24 @@ impl Simulator {
                 true
             }
             ExprKind::Concatenation(exprs) if !is_assoc => {
-                let vals = self.unpacked_concat_operand_values(exprs.iter().collect());
-                let n = vals.len() as u64;
+                if self.assign_struct_concat(name, exprs.iter().collect()) {
+                    return true;
+                }
+                let mut flat: Vec<&Expression> = exprs.iter().collect();
+                while let Some(i) = flat
+                    .iter()
+                    .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
+                {
+                    if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
+                        flat.splice(i..i, c);
+                    }
+                }
+                let vals = self.unpacked_concat_operand_values(flat);
+                self.set_queue_size(name, vals.len() as u64);
                 for (i, v) in vals.into_iter().enumerate() {
+                    let v = self.fit_queue_push_elem(name, v);
                     self.set_signal_value_by_name(&format!("{}[{}]", name, i), v);
                 }
-                self.set_queue_size(name, n);
                 true
             }
             ExprKind::Call { .. } => {
@@ -3747,10 +3759,11 @@ impl Simulator {
         }
 
         // §10.9.1: a packed multi-D vector takes a pattern as one packed
-        // value, evaluated against its declared type by the caller.
-        if !self.module.arrays.contains_key(base)
-            && self.module.packed_signal_elem_widths.contains_key(base)
-        {
+        // value, evaluated against its declared type by the caller. An
+        // unpacked array of any rank whose element is packed multi-D also
+        // has an inner element width recorded, so test the fixed-array
+        // tables, not only the 1-D one.
+        if !registered_fixed && self.module.packed_signal_elem_widths.contains_key(base) {
             return false;
         }
 

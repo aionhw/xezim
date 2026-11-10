@@ -99,3 +99,23 @@ fn c19_coverage_options() {
         &[],
     );
 }
+
+// §19.6, §23.8: each interface instance, instantiated or bound, samples its own
+// upward hierarchical coverpoint and the implicit coverpoints of a cross
+#[test]
+fn c19_6_covergroup_instance_scope() {
+    // The instances print from their own initial blocks at time 10; IEEE 1800 §4.7 leaves their order open.
+    check(
+        "19.6_covergroup_instance_scope",
+        include_str!("sv/19.6_covergroup_instance_scope.sv"),
+        "cgis",
+        Order::Multiset,
+        &[
+            "T|19.6|cgis.d0.ci ha=100.00 x=75.00",
+            "T|19.6|cgis.d1.ci ha=50.00 x=25.00",
+            "T|19.6|cgis.b0i.ci ha=100.00 x=75.00",
+            "T|19.6|cgis.b1i.ci ha=50.00 x=25.00",
+        ],
+        &[],
+    );
+}

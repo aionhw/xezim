@@ -180,3 +180,97 @@ fn c14_clocking_blocks() {
         &[],
     );
 }
+
+// §14.3, §14.4: an edge output skew drives on that edge of the clock after the
+// clocking event.
+#[test]
+fn c14_4_clocking_edge_output_skew() {
+    check(
+        "c14_edge_skew",
+        include_str!("sv/c14_edge_skew.sv"),
+        "c14e",
+        Order::Exact,
+        &[
+            "T|edge|t=14000 u=0 d=0",
+            "T|edge|t=18000 u=0 d=1",
+            "T|edge|uz rose t=20000",
+            "T|edge|t=21000 u=1 d=1",
+        ],
+        &[],
+    );
+}
+
+// §14.16: drives at, after `##1`, and between clocking events through a
+// negedge skew, a renamed posedge-skew output and a two-state output.
+#[test]
+fn c14_16_clocking_negedge_skew_timing() {
+    check(
+        "c14_negedge_timing",
+        include_str!("sv/c14_negedge_timing.sv"),
+        "c14nt",
+        Order::Multiset,
+        &[
+            "T|chg|t=20000 u=1",
+            "T|chg|t=30000 w=1",
+            "T|chg|t=30000 v=1",
+            "T|chg|t=35000 qn=1",
+            "T|chg|t=25000 b=0",
+        ],
+        &[],
+    );
+}
+
+// §14.16 / §14.16.2: a between-event drive and the next event's drive mature
+// together and the last one wins.
+#[test]
+fn c14_16_2_clocking_offedge_negedge_last_wins() {
+    check(
+        "c14_offedge_negedge",
+        include_str!("sv/c14_offedge_negedge.sv"),
+        "c14on",
+        Order::Exact,
+        &[
+            "T|pos|t=5000 branch=0",
+            "T|pos|t=15000 branch=0",
+            "T|pos|t=25000 branch=0",
+            "T|pos|t=35000 branch=0",
+        ],
+        &[],
+    );
+}
+
+// §14.16.2: of two drives maturing together, only the last reaches the
+// output, so a 1-then-0 pair never wakes the output's waiters. Held,
+// `##1`-matured and `#0`-skew drives alike.
+#[test]
+fn c14_16_2_clocking_last_wins_no_glitch() {
+    check(
+        "c14_lastwins_glitch",
+        include_str!("sv/c14_lastwins_glitch.sv"),
+        "c14lg",
+        Order::Multiset,
+        &["T|end a=0 b=0 c=0 d=0"],
+        &[],
+    );
+}
+
+// §14.4, §14.16: an edge skew applies to a selected output and to an output
+// whose net another clockvar names, and edge-plus-delay drives made a cycle
+// apart each reach the net.
+#[test]
+fn c14_4_clocking_edge_skew_select_alias_and_delay() {
+    check(
+        "c14_edge_select_alias",
+        include_str!("sv/c14_edge_select_alias.sv"),
+        "c14es",
+        Order::Multiset,
+        &[
+            "T|chg|t=20000 q=1",
+            "T|chg|t=20000 sel=01",
+            "T|chg|t=25000 t=1",
+            "T|chg|t=25000 w=01",
+            "T|chg|t=35000 t=0",
+        ],
+        &[],
+    );
+}

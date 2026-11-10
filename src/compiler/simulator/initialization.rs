@@ -3856,11 +3856,15 @@ impl Simulator {
             packed_array_copy_values: HashMap::default(),
             clocking_edge: HashMap::default(),
             clocking_mirror_dirty: false,
+            clocking_edge_drive_dirty: false,
             clocking_cycle_pending: HashMap::default(),
             clocking_sig_alias: HashMap::default(),
             clocking_sig_bound_sel: HashMap::default(),
             clocking_out_skew: HashMap::default(),
             clocking_sig_out_skew: HashMap::default(),
+            clocking_out_edge: HashMap::default(),
+            clocking_sig_out_edge: HashMap::default(),
+            clocking_edge_out_pending: HashMap::default(),
             clocking_in_skew: HashMap::default(),
             clocking_sig_in_skew: HashMap::default(),
             clocking_last_edge: HashMap::default(),
@@ -3911,6 +3915,10 @@ impl Simulator {
             rand_scope_row_owners: HashMap::default(),
             p_top_level: false,
             null_call_reported: Default::default(),
+            cascade_limit_explicit: std::env::var("XEZIM_CASCADE_LIMIT")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .is_some(),
             cascade_limit: std::env::var("XEZIM_CASCADE_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -4713,6 +4721,12 @@ impl Simulator {
             zero_delay_defer_pending: false,
             stall_time: 0,
             stall_pid_hits: HashMap::default(),
+            stall_pid_state: HashMap::default(),
+            stall_state0: 0,
+            stall_limit_explicit: std::env::var("XEZIM_STALL_LIMIT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some(),
             stall_limit: std::env::var("XEZIM_STALL_LIMIT")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())

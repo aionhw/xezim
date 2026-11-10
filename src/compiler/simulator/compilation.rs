@@ -161,6 +161,37 @@ impl Simulator {
                         .insert("__xz_default_clocking0".to_string(), edge);
                     self.default_clocking_cb = Some(cb_name.clone());
                 }
+                // §14.3 `clocking_skew ::= edge_identifier [delay_control]`
+                // on outputs. A per-signal skew replaces the block default,
+                // edge included.
+                let skew_edge = |e: crate::ast::stmt::Edge| match e {
+                    crate::ast::stmt::Edge::Posedge => EdgeKind::Posedge,
+                    crate::ast::stmt::Edge::Negedge => EdgeKind::Negedge,
+                    crate::ast::stmt::Edge::Edge => EdgeKind::LsbEdge,
+                };
+                if let Some(e) = cd.default_output_edge {
+                    if cd.is_default {
+                        self.clocking_out_edge
+                            .insert("__xz_default_clocking".to_string(), skew_edge(e));
+                    }
+                    self.clocking_out_edge.insert(cb_name.clone(), skew_edge(e));
+                }
+                let sig_edges: HashMap<String, Option<EdgeKind>> = cd
+                    .signals
+                    .iter()
+                    .filter(|s| {
+                        !matches!(
+                            s.direction,
+                            crate::ast::types::PortDirection::Input
+                                | crate::ast::types::PortDirection::Inout
+                        )
+                    })
+                    .filter(|s| s.skew.is_some() || s.skew_edge.is_some())
+                    .map(|s| (s.name.name.clone(), s.skew_edge.map(skew_edge)))
+                    .collect();
+                if !sig_edges.is_empty() {
+                    self.clocking_sig_out_edge.insert(cb_name.clone(), sig_edges);
+                }
                 self.clocking_meta.insert(cb_name.clone(), (clk, sigs));
                 self.clocking_edge.insert(cb_name.clone(), edge);
                 self.clocking_prev_clock.insert(cb_name.clone(), 2);

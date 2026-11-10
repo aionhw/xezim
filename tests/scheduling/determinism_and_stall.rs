@@ -122,78 +122,48 @@ endmodule
     );
 }
 
-/// A zero-delay loop (`forever #0`) re-arms at the same timestamp forever. The
-/// run must TERMINATE with a diagnostic rather than spin until the user kills
-/// it — `simulate` returning at all is the assertion here.
+/// Zero-delay livelocks (`forever #0`, `wait` on an already-true condition, and
+/// a null-receiver task call) must each TERMINATE with a diagnostic rather than
+/// spin until the user kills the process — `simulate` returning at all is the
+/// assertion. The three are run inside ONE `#[test]` so `XEZIM_STALL_LIMIT` is
+/// set on the shared process environment exactly once for their span: setting it
+/// from several parallel tests would race on the global env and one of them
+/// could run with the default (progress-aware) guard, which treats `n++` as
+/// progress and never trips — turning a now-racy-limit into an unbounded spin.
 #[test]
 fn zero_delay_livelock_terminates_instead_of_hanging() {
-    const SRC: &str = r#"
-module tb;
-  int n = 0;
-  initial forever begin
-    #0;
-    n++;
-  end
-endmodule
-"#;
-    // TODO: Audit that the environment access only happens in single-threaded code.
+    // Three livelocks under one strict cap, set once for their whole span.
     unsafe { std::env::set_var("XEZIM_STALL_LIMIT", "2000") };
-    let sim = run(SRC, &[]);
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::remove_var("XEZIM_STALL_LIMIT") };
 
-    // It stalled at time 0 — it must not have silently "finished" at some later
-    // time, and it must not have hung (reaching this line proves that).
-    assert_eq!(sim.time, 0, "a #0 livelock cannot advance time");
-    let n = sim
+    let sim0 = run(
+        "module tb; int n = 0; initial forever begin #0; n++; end endmodule",
+        &[],
+    );
+    assert_eq!(sim0.time, 0, "a #0 livelock cannot advance time");
+    let n = sim0
         .get_signal("tb.n")
-        .or_else(|| sim.get_signal("n"))
+        .or_else(|| sim0.get_signal("n"))
         .and_then(|v| v.to_u64())
         .expect("n not readable");
-    // The final delta cycle is cut off before the body completes, so the count
-    // lands one short of the limit.
     assert!(
         n >= 1990,
         "the loop should have spun up to the stall limit before being cut off, got {}",
         n
     );
-}
 
-/// The same livelock reached through `wait` on an already-true condition — the
-/// shape that used to blow the stack instead of hanging.
-#[test]
-fn wait_on_true_condition_in_forever_terminates() {
-    const SRC: &str = r#"
-module tb;
-  bit ready = 1;
-  int n = 0;
-  initial forever begin
-    wait (ready);
-    n++;
-  end
-endmodule
-"#;
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("XEZIM_STALL_LIMIT", "2000") };
-    let sim = run(SRC, &[]);
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::remove_var("XEZIM_STALL_LIMIT") };
-    assert_eq!(sim.time, 0, "wait-on-true livelock cannot advance time");
-}
+    // `wait` on an already-true condition: the shape that used to blow the stack.
+    let sim1 = run(
+        "module tb; bit ready = 1; int n = 0; initial forever begin wait (ready); n++; end endmodule",
+        &[],
+    );
+    assert_eq!(sim1.time, 0, "wait-on-true livelock cannot advance time");
 
-/// The same livelock shape reached through a TASK call on a NULL (unassigned)
-/// class handle: `w.wait_ev()` on null runs no body and cannot suspend, so the
-/// forever is a zero-delay loop. This used to livelock the synchronous path
-/// (a blocking-task-call recursion that never hit the stall cap) and spin at
-/// 100%% CPU forever. The reference simulator treats a null deref ("Null
-/// instance ... dereferencing 'this'") as a fatal and aborts; we mirror that
-/// with an explicit null-receiver error terminating the run at time 0.
-/// `simulate_multi` returning at all, with no `T|after-fork`, is the
-/// no-spin assertion.
-#[test]
-fn task_call_on_null_receiver_in_forever_terminates() {
-    const SRC: &str = r#"
-class waiter;
+    // The same shape reached through a TASK call on a NULL (unassigned) class
+    // handle: `w.wait_ev()` on null runs no body and cannot suspend. Reference
+    // mirrors a null deref as a fatal; we emit an explicit null-receiver error
+    // terminating at time 0, not a 100% CPU spin.
+    let sim2 = run(
+        r#"class waiter;
   event ev;
   int count = 0;
   task wait_ev();
@@ -206,26 +176,16 @@ module tb;
   int n = 0;
   initial begin
     fork
-      forever begin
-        w.wait_ev();
-        n++;
-      end
+      forever begin w.wait_ev(); n++; end
     join_none
     #1;
     $display("T|after-fork");
   end
-endmodule
-"#;
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("XEZIM_STALL_LIMIT", "2000") };
-    let sim = run(SRC, &[]);
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::remove_var("XEZIM_STALL_LIMIT") };
-    // The null call must terminate the run at time 0 with an explicit
-    // null-receiver diagnostic (mirroring the reference's null-deref abort), NOT
-    // hang at 100%% CPU and NOT resume past the fork.
-    assert_eq!(sim.time, 0, "null-receiver livelock cannot advance time");
-    let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+endmodule"#,
+        &[],
+    );
+    assert_eq!(sim2.time, 0, "null-receiver livelock cannot advance time");
+    let msgs: Vec<String> = sim2.output.iter().map(|o| o.message.clone()).collect();
     assert!(
         msgs.iter().any(|m| m.contains("null receiver")),
         "must report a null-receiver error, got: {msgs:?}"
@@ -234,7 +194,10 @@ endmodule
         !msgs.iter().any(|m| m.contains("T|after-fork")),
         "the run must abort at the null call, not resume past the fork"
     );
+
+    unsafe { std::env::remove_var("XEZIM_STALL_LIMIT") };
 }
+
 
 /// The stall report must name the RTL behind each spinner, not just a bare
 /// pid: the creating construct's kind + file:line, the instance path, and the

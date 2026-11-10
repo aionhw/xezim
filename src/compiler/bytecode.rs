@@ -2121,6 +2121,8 @@ pub struct BytecodeCompiler<'a> {
     /// `local_var_regs`, and honored only while the name still resolves to
     /// that register.
     local_var_struct: HashMap<String, (RegId, Vec<(String, FormalMember)>)>,
+    /// Packed geometry follows a local's register through inlined frames.
+    local_packed_types: HashMap<RegId, crate::ast::types::DataType>,
     /// Loop variables bound to COMPILE-TIME constants by the unroller. Read
     /// before every other name source, so `state[col*4]` folds to a constant
     /// index while `col` is unrolled.
@@ -2387,6 +2389,7 @@ impl<'a> BytecodeCompiler<'a> {
             unresolved_type_names: HashSet::default(),
             local_var_elem: std::collections::HashMap::new(),
             local_var_struct: HashMap::default(),
+            local_packed_types: HashMap::default(),
             cast_widths: None,
             pattern_ctx: None,
             inline_ret_ty: None,
@@ -3209,6 +3212,118 @@ impl<'a> BytecodeCompiler<'a> {
             .and_then(|d| d.first().copied())
     }
 
+    fn record_local_packed_type(&mut self, reg: RegId, dt: &crate::ast::types::DataType) {
+        let (Some(params), Some(types)) = (self.params, self.typedef_types) else {
+            return;
+        };
+        if crate::compiler::elaborate::packed_full_dims_chained(dt, params, types)
+            .is_some_and(|dims| dims.len() > 1)
+        {
+            self.local_packed_types.insert(reg, dt.clone());
+        }
+    }
+
+    /// §7.4.1/§11.5.1: register-backed packed typedefs retain every
+    /// dimension, including the bounds checked for each chained index.
+    fn compile_typed_packed_chain(
+        &mut self,
+        base: &Expression,
+        last: &Expression,
+    ) -> Option<RegId> {
+        let mut indices = vec![last];
+        let mut root = base;
+        while let ExprKind::Index { expr, index } = &root.kind {
+            indices.push(index);
+            root = expr;
+        }
+        if indices.len() < 2 {
+            return None;
+        }
+        let ExprKind::Ident(h) = &root.kind else {
+            return None;
+        };
+        let (reg, _) = self.local_var_reg_of(h)?;
+        let dt = self.local_packed_types.get(&reg)?.clone();
+        let dims = crate::compiler::elaborate::packed_full_dims_chained(
+            &dt,
+            self.params?,
+            self.typedef_types?,
+        )?;
+        if dims.len() < indices.len() || dims.len() < 2 {
+            return None;
+        }
+        let width = dims[indices.len()..]
+            .iter()
+            .try_fold(1u64, |n, (l, r)| n.checked_mul(l.abs_diff(*r) + 1))?;
+        let width = u32::try_from(width).ok()?;
+        let default =
+            if crate::compiler::elaborate::is_type_two_state_resolved(&dt, self.typedef_types?) {
+                Value::zero(width)
+            } else {
+                Value::new(width)
+            };
+        indices.reverse();
+        let value = self.compile_expr(root, 0)?;
+        let consts: Option<Vec<i64>> = indices
+            .iter()
+            .map(|e| {
+                (!self.is_xz_literal(e))
+                    .then(|| self.fold_const(e).and_then(|v| v.to_i64()))
+                    .flatten()
+            })
+            .collect();
+        let dest = self.alloc_reg();
+        if let Some(consts) = consts {
+            match Self::packed_chain_offset(&dims, &consts) {
+                Some((lo, w)) => self.emit(Insn::RangeSelectConst(dest, value, lo + w - 1, lo)),
+                None => self.emit(Insn::LoadConst(dest, Box::new(default))),
+            }
+            return Some(dest);
+        }
+        let mut regs = Vec::new();
+        for index in &indices {
+            if self.expr_max_width(index) > 64 {
+                return None;
+            }
+            regs.push(self.compile_expr(index, 0)?);
+        }
+        self.emit(Insn::LoadConst(dest, Box::new(default)));
+        let mut guards = Vec::new();
+        for ((expr, reg), &(left, right)) in indices.iter().zip(&regs).zip(&dims) {
+            let iw = if self.expr_max_width(expr) >= 64 {
+                65
+            } else {
+                64
+            };
+            let idx = self.alloc_reg();
+            self.emit(Insn::Move(idx, *reg));
+            self.emit(Insn::Resize(idx, iw));
+            self.emit(Insn::SetSigned(idx));
+            for (kind, bound) in [
+                (CmpKind::Geq, left.min(right)),
+                (CmpKind::Leq, left.max(right)),
+            ] {
+                let mut v = Value::from_u64(bound as u64, 64);
+                v.is_signed = true;
+                let constant = self.alloc_reg();
+                self.emit(Insn::LoadConst(constant, Box::new(v.resize(iw))));
+                let tmp = self.alloc_reg();
+                guards.push(self.insns.len());
+                self.emit(Insn::CmpBranch(kind, idx, constant, tmp, 0));
+            }
+        }
+        let offset = self.emit_packed_chain_offset(&dims, regs)?;
+        let selected = self.emit_dyn_slice(value, offset, width);
+        self.emit(Insn::Move(dest, selected));
+        let end = self.insns.len() as u32;
+        for guard in guards {
+            if let Insn::CmpBranch(_, _, _, _, target) = &mut self.insns[guard] {
+                *target = end;
+            }
+        }
+        Some(dest)
+    }
+
     /// Declared packed dimensions of `hier`: exact name, then the name under
     /// the current instance scope, then — for a SINGLE-segment name only —
     /// the bare leaf. A multi-segment name (a struct member, a hierarchical
@@ -3971,6 +4086,7 @@ impl<'a> BytecodeCompiler<'a> {
             };
             let formal_is_real = self.decl_is_real(&p.data_type, Some(&name));
             let slot = self.alloc_reg();
+            self.record_local_packed_type(slot, &p.data_type);
             if matches!(p.direction, PortDirection::Output) {
                 // §13.5.3: an output formal does NOT read the actual; it
                 // starts at its type's default and is copied out on return.
@@ -4275,6 +4391,7 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit_local_fit(slot);
                         }
                         self.local_var_regs.insert(d.name.name.clone(), (slot, w));
+                        self.record_local_packed_type(slot, data_type);
                     }
                 }
                 // `return` — early or final — compiles via compile_stmt's
@@ -13586,6 +13703,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.local_var_is_string.remove(name);
                     }
                     self.local_var_regs.insert(name.clone(), (slot, width));
+                    self.record_local_packed_type(slot, data_type);
                     self.decl_local_regs.insert(name.clone());
                 }
                 true
@@ -16279,6 +16397,11 @@ impl<'a> BytecodeCompiler<'a> {
                 // one bit instead of one packed element.
                 let member_start = self.insns.len();
                 let member_reg = self.next_reg;
+                if let Some(dest) = self.compile_typed_packed_chain(expr, index) {
+                    return Some(dest);
+                }
+                self.truncate_insns(member_start);
+                self.next_reg = member_reg;
                 if let Some(dest) = self.compile_packed_member_index(expr, index) {
                     return Some(dest);
                 }

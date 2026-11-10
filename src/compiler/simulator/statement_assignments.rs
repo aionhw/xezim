@@ -620,6 +620,38 @@ impl Simulator {
         Some(src)
     }
 
+    /// §13.5.1: a collection returned by an actual expression is evaluated
+    /// once in the caller and copied before the callee's frame is entered.
+    pub(super) fn collection_call_actual(&mut self, arg: &Expression) -> Option<String> {
+        let arg = Self::unparen(arg);
+        let ExprKind::Call { func, .. } = &arg.kind else {
+            return None;
+        };
+        if !self.call_returns_collection(func) {
+            return None;
+        }
+        let data_type = self.call_return_type(func)?;
+        let width = resolve_type_width(
+            &data_type,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        self.pending_ret_collection = None;
+        self.vm_ret_vals = None;
+        self.eval_expr(arg);
+        let name = self.take_pending_ret_collection()?;
+        if name == "__xz_ret_coll__" {
+            // A returned value has a zero-based sequence, even when its
+            // source was a fixed array with another declared range (§7.6).
+            // The return side channel supplies size and leaves; collection
+            // consumers also need its type and storage classification.
+            self.module.arrays.insert(name.clone(), (0, -1, width));
+            self.module.dynamic_arrays.insert(name.clone());
+            self.module.var_decl_types.insert(name.clone(), data_type);
+        }
+        Some(name)
+    }
+
     /// Resolve the whole-collection storage name that a collection-return
     /// assignment `q = f(..)` writes into, for the destination expression
     /// `lvalue`. This is the exact resolution shared by the historic
@@ -3610,6 +3642,24 @@ impl Simulator {
         // Resolve a whole constant array before scalar evaluation or the
         // generic collection resolver can treat a class constant as a property.
         if self.try_class_const_array_copy(lvalue, rvalue) {
+            self.settle_after_proc_write();
+            return;
+        }
+        // §10.10: `cfg.r = {…}` writes a queue member before the right side runs as a value.
+        if let ExprKind::MemberAccess { .. } = &lvalue.kind
+            && let ExprKind::Concatenation(_) = &rvalue.kind
+            && let Some(n) = self.expr_assoc_name(lvalue).filter(|n| self.class_queue_prop(n))
+            && self.assign_whole_coll(&n, None, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
+        // §10.10: consume typed elements before the scalar RHS evaluation,
+        // which would run each call operand once and discard its members.
+        if let ExprKind::Concatenation(parts) = &rvalue.kind
+            && let Some(name) = self.pending_coll_dst(lvalue)
+            && self.assign_struct_concat(&name, parts.iter().collect())
+        {
             self.settle_after_proc_write();
             return;
         }

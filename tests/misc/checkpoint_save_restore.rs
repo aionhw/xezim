@@ -57,6 +57,51 @@ const DESIGN: &str = r#"module tb;
 endmodule
 "#;
 
+/// §14.3/§14.16: queued clockvar drives, cycle counts and edge-skew waits
+/// belong to the saved simulation state, including their original alias.
+#[test]
+fn clocking_drives_survive_checkpoints_before_and_after_the_event() {
+    let d = dir("clocking_pending");
+    let f = d.join("tb.sv");
+    std::fs::write(
+        &f,
+        r#"
+`timescale 1ns/1ps
+module tb;
+ logic clk=0;
+ logic [3:0] q=0;
+ always #5 clk=~clk;
+ clocking cb @(posedge clk); output negedge q; endclocking
+ initial begin #1 cb.q<=3; @(cb); cb.q<=##2 7; end
+ initial begin
+   #11 $display("R first=%0d",q);
+   #20 $display("R second=%0d",q);
+   $finish;
+ end
+endmodule
+"#,
+    )
+    .unwrap();
+    let (full, err) = run(&f, &[], &[]);
+    assert_eq!(full, ["R first=3", "R second=7"], "{err}");
+    for time in [2, 6, 16] {
+        let ck = d.join(format!("c{time}.ckpt"));
+        let spec = format!("{time}ns,{}", ck.display());
+        let (saved, err) = run(&f, &["--save-at", &spec], &[]);
+        assert_eq!(saved, full, "{err}");
+        assert!(err.contains("saved"), "{err}");
+        let (restored, err) = run(&f, &["--restore", ck.to_str().unwrap()], &[]);
+        assert!(err.contains("restored"), "{err}");
+        let expected: Vec<_> = full
+            .iter()
+            .filter(|line| time < 11 || !line.contains("first="))
+            .cloned()
+            .collect();
+        assert_eq!(restored, expected, "{err}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn a_restored_run_continues_where_the_saved_one_was() {
     let d = dir("restore");

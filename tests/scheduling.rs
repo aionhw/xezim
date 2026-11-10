@@ -14,6 +14,9 @@
 #[path = "scheduling/concurrent_struct_formal_geometry.rs"]
 mod concurrent_struct_formal_geometry;
 
+#[path = "scheduling/finite_zero_delay_phase.rs"]
+mod finite_zero_delay_phase;
+
 #[path = "scheduling/named_branch_frames.rs"]
 mod named_branch_frames;
 
@@ -466,3 +469,6 @@ mod fork_child_hidden_locals_943;
 mod unpacked_struct_copy_chain;
 #[path = "scheduling/unpacked_struct_array_sens.rs"]
 mod unpacked_struct_array_sens;
+
+#[path = "scheduling/clocking_edge_regressions.rs"]
+mod clocking_edge_regressions;

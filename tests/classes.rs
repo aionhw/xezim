@@ -1183,3 +1183,31 @@ mod vif_collection_formals_925;
 
 #[path = "classes/randomize_scope_chunked_dist_bounds.rs"]
 mod randomize_scope_chunked_dist_bounds;
+
+#[path = "classes/concat_write_through_handle_member.rs"]
+mod concat_write_through_handle_member;
+
+#[path = "classes/rand_typedef_handle.rs"]
+mod rand_typedef_handle;
+
+#[path = "classes/randomize_countones_concat.rs"]
+mod randomize_countones_concat;
+
+#[path = "classes/collection_call_actual_1001.rs"]
+mod collection_call_actual_1001;
+#[path = "classes/constraint_inline_caller_foreach.rs"]
+mod constraint_inline_caller_foreach;
+#[path = "classes/rand_specialized_handle_1034.rs"]
+mod rand_specialized_handle_1034;
+
+#[path = "classes/rand_dyn_array_of_unpacked_structs.rs"]
+mod rand_dyn_array_of_unpacked_structs;
+
+#[path = "classes/class_scoped_assoc_queue_element.rs"]
+mod class_scoped_assoc_queue_element;
+
+#[path = "classes/rand_sub_object_back_handle.rs"]
+mod rand_sub_object_back_handle;
+
+#[path = "classes/rand_solver_sparse_1003.rs"]
+mod rand_solver_sparse_1003;

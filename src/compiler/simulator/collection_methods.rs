@@ -1907,8 +1907,29 @@ impl Simulator {
         }
         if let Some(parts) = literal_elems {
             let key = self.formal_dyn_key(pname, queue_data_type);
-            self.module.arrays.insert(key.clone(), (0, -1, 32));
+            let width = self
+                .declared_collection_elem_width(queue_data_type)
+                .unwrap_or(32);
+            self.module.arrays.insert(key.clone(), (0, -1, width));
             self.module.dynamic_arrays.insert(key.clone());
+            // §10.10: a queue or array operand of `{..}` contributes all of
+            // its elements (`{jal}`, `{q, X}`).
+            if matches!(arg.kind, ExprKind::Concatenation(_))
+                && !parts
+                    .iter()
+                    .any(|p| matches!(p.kind, ExprKind::AssignmentPattern(_)))
+            {
+                if self.assign_struct_concat(&key, parts.clone()) {
+                    return Some((key, String::new()));
+                }
+                let vals = self.unpacked_concat_operand_values(parts);
+                let n = vals.len() as u64;
+                for (j, v) in vals.into_iter().enumerate() {
+                    self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
+                }
+                self.set_queue_size(&key, n);
+                return Some((key, String::new()));
+            }
             // An element that is itself a `'{..}` pattern (a dynamic array of
             // UNPACKED structs) is scattered member-wise, not evaluated.
             for (j, part) in parts.iter().enumerate() {
@@ -1927,6 +1948,9 @@ impl Simulator {
         }
         if let Some((vals, w)) = self.collection_slice_values(arg) {
             let key = self.formal_dyn_key(pname, queue_data_type);
+            let w = self
+                .declared_collection_elem_width(queue_data_type)
+                .unwrap_or(w);
             self.module.arrays.insert(key.clone(), (0, -1, w));
             self.module.dynamic_arrays.insert(key.clone());
             let n = vals.len() as u64;
@@ -1975,6 +1999,9 @@ impl Simulator {
             self.get_queue_size(&cname)
         };
         let w = self.module.arrays.get(&*cname).map(|t| t.2).unwrap_or(32);
+        let w = self
+            .declared_collection_elem_width(queue_data_type)
+            .unwrap_or(w);
         let key = self.formal_dyn_key(pname, queue_data_type);
         self.register_formal_shape(&key, dims);
         // A queue of unpacked structs keeps its members as separate leaves
@@ -2017,6 +2044,22 @@ impl Simulator {
         }
         self.set_queue_size(&key, size);
         Some((key, cname))
+    }
+
+    /// §13.5.1: use the formal's complete element width, not a packed array's
+    /// inner stride or the previous 32-bit placeholder for literal actuals.
+    fn declared_collection_elem_width(&self, dt: &DataType) -> Option<u32> {
+        if let DataType::TypeReference { name, .. } = dt
+            && (self.local_type_param_concrete(dt).is_some()
+                || super::elaborate::lookup_scoped_type(name, &self.module.typedefs).is_none())
+        {
+            return None;
+        }
+        Some(resolve_type_width(
+            dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        ))
     }
 
     /// The per-call storage key of a queue / dynamic-array / associative
@@ -2101,11 +2144,44 @@ impl Simulator {
         self.formal_dyn.push(formals);
     }
 
+    /// §13.5.3: a default may read an EARLIER array formal. Show the call's
+    /// formals queued so far, as `commit_formal_dyn` will enter them, in a
+    /// scratch callee frame while a default is evaluated; supplied actuals
+    /// are bound before it and never see it.
+    pub(super) fn push_pending_formal_dyn(&mut self, (base, names, formals): &FormalDynSetup) {
+        let mut names = names.clone();
+        let mut formals = formals.clone();
+        for (pname, target) in &self.pending_formal_dyn[*base..] {
+            match names.iter_mut().find(|(k, _)| k == pname) {
+                Some(slot) => slot.1 = pname.clone(),
+                None => names.push((pname.clone(), pname.clone())),
+            }
+            match formals.iter_mut().find(|(k, _)| k == pname) {
+                Some(slot) => slot.1 = target.clone(),
+                None => formals.push((pname.clone(), target.clone())),
+            }
+        }
+        self.local_dyn.push(names);
+        self.formal_dyn.push(formals);
+    }
+
+    /// Drop the scratch frame `push_pending_formal_dyn` entered.
+    pub(super) fn pop_pending_formal_dyn(&mut self) {
+        self.local_dyn.pop();
+        self.formal_dyn.pop();
+    }
+
     /// The storage key of a queue / dynamic-array (or fixed unpacked array)
     /// ACTUAL: a plain name (a caller-local one under its per-process rename
     /// `@q#7`), or a member chain `obj.q` / `a.b.q` mapped to the owning
     /// object's `<handle>#q` storage. `None` when `arg` names no collection.
     pub(super) fn queue_actual_storage(&mut self, arg: &Expression) -> Option<String> {
+        let arg = Self::unparen(arg);
+        if matches!(arg.kind, ExprKind::Call { .. }) {
+            return self.collection_call_actual(arg).filter(|name| {
+                self.module.arrays.contains_key(name) || self.module.dynamic_arrays.contains(name)
+            });
+        }
         // §13.5.2 (#854): resolve selected rows through one path, which
         // captures side-effectful receivers and evaluates selectors once.
         // Repeated probes would consume an actual's selectors again.

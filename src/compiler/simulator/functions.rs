@@ -380,32 +380,29 @@ impl Simulator {
             }
             // Unpacked ARRAY formal: functions never bound one, so the body read
             // X and a `ref` write never reached the caller (§13.5.2).
-            if let Some(actual) = actual {
-                let prior = self.module.arrays.contains_key(&port.name.name)
-                    || self.module.arrays_2d.contains_key(&port.name.name)
-                    || self.module.arrays_nd.contains_key(&port.name.name);
-                if let Some(info) = self.bind_array_arg(port, actual) {
-                    // Keep fixed-array formals visible to class-scope lookup (§13.5).
-                    locals.insert(
-                        format!("\u{1}array_formal:{}", port.name.name),
-                        Value::zero(1),
-                    );
-                    // §7.4.1 / §13.5 / §21.2.1.7: every unpacked formal
-                    // retains its element type, including packed geometry.
-                    self.register_formal_type_metadata(&port.name.name, &port.data_type, false);
-                    if is_out {
-                        if !info.1.is_empty() {
-                            array_writebacks.push(info);
-                        }
-                    } else if !prior {
-                        // An INPUT array formal is dropped on return too: left
-                        // registered, a later call whose same-named formal
-                        // took the scalar path found it and behaved
-                        // differently (#327's "warming").
-                        array_inputs.push(info);
+            if let Some(actual) = actual
+                && let Some(info) = self.bind_array_arg(port, actual)
+            {
+                // Keep fixed-array formals visible to class-scope lookup (§13.5).
+                locals.insert(
+                    format!("\u{1}array_formal:{}", port.name.name),
+                    Value::zero(1),
+                );
+                // §7.4.1 / §13.5 / §21.2.1.7: every unpacked formal
+                // retains its element type, including packed geometry.
+                self.register_formal_type_metadata(&port.name.name, &port.data_type, false);
+                if is_out {
+                    if !info.1.is_empty() {
+                        array_writebacks.push(info);
                     }
-                    continue;
+                } else {
+                    // An INPUT array formal is dropped on return too: left
+                    // registered, a later call whose same-named formal
+                    // took the scalar path found it and behaved
+                    // differently (#327's "warming").
+                    array_inputs.push(info);
                 }
+                continue;
             }
             // §13.5.3 (1800-2023): an omitted `output`/`inout` argument with a
             // default binds the default as its actual, so `output o = a`
@@ -441,8 +438,10 @@ impl Simulator {
                 // evaluated bare, `a` was unknown and the default was x.
                 self.in_subroutine_default_scope(None, None, |sim| {
                     sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                    sim.push_pending_formal_dyn(&formal_dyn);
                     let value = sim.eval_formal_default(port, def);
                     let value = sim.vif_argument_value(port, def, value);
+                    sim.pop_pending_formal_dyn();
                     sim.pop_local_frame();
                     value
                 })
@@ -927,6 +926,7 @@ impl Simulator {
         // actual would otherwise let the restore wipe the output writeback.
         let assoc_params = std::mem::take(&mut assoc_params);
         let array_writebacks = std::mem::take(&mut array_writebacks);
+        let staged_arrays = self.stage_array_writebacks(&array_writebacks);
         // Capture the callee's queue formals now; the caller's shadowed
         // storage is restored below, and only then is the writeback
         // applied — see `stage_queue_param`.
@@ -1023,7 +1023,8 @@ impl Simulator {
             }
             self.purge_assoc_param(&param, prior);
         }
-        self.writeback_array_args(&array_writebacks);
+        self.writeback_array_args(&staged_arrays);
+        self.purge_array_formals(&staged_arrays);
         self.purge_array_formals(&array_writebacks);
         self.purge_array_formals(&array_inputs);
         for (tmp, caller) in staged_wb {
@@ -1207,22 +1208,17 @@ impl Simulator {
         // caller's actual, the restore (`pop_and_restore_queue_frame`) wipes
         // the caller's bare-name elements — destroying an output/inout/ref
         // writeback done now. Mirror the function path (and the queue staging
-        // above). An assoc formal's per-call key is torn down by the restore,
-        // so its element data is staged onto a temp key; fixed-array formals
-        // keep bare keys that survive.
+        // above). An assoc or fixed-array formal's per-call key is torn down
+        // by the restore, so its element data is staged onto a temp key.
         let assoc_params = std::mem::take(&mut c.assoc_params);
         let wb = c.array_writebacks.clone();
+        let staged_arrays = self.stage_array_writebacks(&wb);
         let array_params = std::mem::take(&mut c.array_params);
         let assoc_wb = self.stage_assoc_writebacks(
             assoc_params
                 .iter()
                 .map(|(p, c, out)| (p.as_str(), c.as_str(), *out)),
         );
-        let identity_params: std::collections::HashSet<&String> = wb
-            .iter()
-            .filter(|(p, c2, ..)| p == c2)
-            .map(|(p, ..)| p)
-            .collect();
         self.break_flag = c.saved_break || self.dpi_unwinding;
         self.return_flag = c.saved_return || self.dpi_unwinding;
         self.pop_and_restore_queue_frame();
@@ -1248,13 +1244,9 @@ impl Simulator {
                 self.module.assoc_defaults.remove(&param_name);
             }
         }
-        self.writeback_array_args(&wb);
+        self.writeback_array_args(&staged_arrays);
+        self.purge_array_formals(&staged_arrays);
         for param_name in &array_params {
-            // Identity-bound formals share the caller's storage — see the
-            // function-path twin above (audit46 a10).
-            if identity_params.contains(param_name) {
-                continue;
-            }
             let prefix = format!("{}[", param_name);
             let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
             for k in keys {
@@ -2374,23 +2366,26 @@ impl Simulator {
             }
             // Unpacked array formal (`int a[2:0]` or `int a[3]`): copy the
             // caller's elements in, and copy them back for an out/inout/ref.
-            if let Some(actual) = actual {
-                if let Some(info) = self.bind_array_arg(port, actual) {
-                    // Keep fixed-array formals visible to class-scope lookup (§13.5).
-                    locals.insert(
-                        format!("\u{1}array_formal:{}", port.name.name),
-                        Value::zero(1),
-                    );
-                    if matches!(
-                        port.direction,
-                        PortDirection::Output | PortDirection::Inout | PortDirection::Ref
-                    ) && !info.1.is_empty()
-                    {
-                        array_writebacks.push(info.clone());
-                    }
-                    array_params.push(info.0);
-                    continue;
+            if let Some(actual) = actual
+                && let Some(info) = self.bind_array_arg(port, actual)
+            {
+                // Keep fixed-array formals visible to class-scope lookup (§13.5).
+                locals.insert(
+                    format!("\u{1}array_formal:{}", port.name.name),
+                    Value::zero(1),
+                );
+                if matches!(
+                    port.direction,
+                    PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+                ) && !info.1.is_empty()
+                {
+                    array_writebacks.push(info.clone());
                 }
+                // A `ref` alias names the caller's own storage.
+                if !(matches!(port.direction, PortDirection::Ref) && info.1.is_empty()) {
+                    array_params.push(info.0);
+                }
+                continue;
             }
             // §7.10 / §13.5.2: a QUEUE or DYNAMIC-ARRAY formal. Only functions
             // bound one; a task bound nothing, so the body operated on storage
@@ -2475,8 +2470,10 @@ impl Simulator {
                                 default_spec.clone(),
                                 |sim| {
                                     sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                                    sim.push_pending_formal_dyn(&formal_dyn);
                                     let value = sim.eval_expr(default);
                                     let value = sim.vif_argument_value(port, default, value);
+                                    sim.pop_pending_formal_dyn();
                                     sim.pop_local_frame();
                                     value
                                 },
@@ -2558,8 +2555,10 @@ impl Simulator {
                             default_spec.clone(),
                             |sim| {
                                 sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                                sim.push_pending_formal_dyn(&formal_dyn);
                                 let value = sim.eval_formal_default(port, def);
                                 let value = sim.vif_argument_value(port, def, value);
+                                sim.pop_pending_formal_dyn();
                                 sim.pop_local_frame();
                                 value
                             },

@@ -1870,14 +1870,10 @@ impl Simulator {
         // queue, which the scheduler drains inside one delta, so the outer
         // loop's stall counter never sees `initial forever begin #0; ... end`
         // spin — the run_proc_fsm path hung the stall-report test.
-        if self.stall_limit > 0 {
-            let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-            if *hits >= self.stall_limit {
-                self.event_queue.schedule(self.time, pid, Vec::new().into());
-                self.zero_delay_defer_pending = true;
-                return;
-            }
-            *hits += 1;
+        if self.stall_limit > 0 && self.stall_pid_tripped(pid, None) {
+            self.event_queue.schedule(self.time, pid, Vec::new().into());
+            self.zero_delay_defer_pending = true;
+            return;
         }
         let Some(mut f) = self.proc_fsm.remove(&pid) else {
             return;
@@ -2079,17 +2075,13 @@ impl Simulator {
         // Match run_process_stmts' per-process zero-delay protection. The
         // marker was removed from the timing wheel before dispatch, so park it
         // again before asking the outer loop to seek a future event.
-        if self.stall_limit > 0 {
-            let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-            // Check BEFORE counting: the activation that trips the guard is
-            // re-parked UNEXECUTED, so it must not inflate the "ran N times"
-            // attribution in the stall report.
-            if *hits >= self.stall_limit {
-                self.event_queue.schedule(self.time, pid, Vec::new().into());
-                self.zero_delay_defer_pending = true;
-                return;
-            }
-            *hits += 1;
+        // Check BEFORE counting (inside `stall_pid_tripped`): the activation
+        // that trips the guard is re-parked UNEXECUTED, so it must not inflate
+        // the "ran N times" attribution in the stall report.
+        if self.stall_limit > 0 && self.stall_pid_tripped(pid, None) {
+            self.event_queue.schedule(self.time, pid, Vec::new().into());
+            self.zero_delay_defer_pending = true;
+            return;
         }
 
         // Temporarily own the entry so evaluation and assignment can mutably
@@ -3061,32 +3053,32 @@ impl Simulator {
         // dispatch, so the guard stays accurate while re-entrant work is free
         // to recurse up to the trampoline/stack limits above.
         if self.stall_limit > 0 && depth == 0 {
-            let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-            // One process re-activated this many times at a SINGLE timestamp is
-            // not a busy design, it is a livelock: it keeps re-arming itself and
-            // time can never advance. (Counting per-process, rather than
-            // counting activations at the timestamp, is what makes this safe for
-            // a wide design that legitimately wakes thousands of DISTINCT
-            // processes at time 0.) run_one_tick's inner drain loop re-reads the
-            // queue at the current time, so a self-rescheduling process never
-            // reaches the outer event loop — the check has to live here.
-            // Check BEFORE counting: the activation that trips the guard is
-            // re-parked UNEXECUTED and must not inflate "ran N times".
-            if *hits >= self.stall_limit {
-                // A single process re-arming this many times at one timestamp is
-                // a zero-delay livelock (e.g. `always #(period) clk=~clk` whose
-                // real `period` momentarily glitched to 0). Rather than abort the
+            // One process re-activated `stall_limit` times at a SINGLE
+            // timestamp with NO observable state change in between is not a
+            // busy design, it is a livelock: it keeps re-arming itself and
+            // time can never advance (`stall_pid_tripped` is progress-aware
+            // unless XEZIM_STALL_LIMIT was set explicitly). Counting
+            // per-process, rather than counting activations at the timestamp,
+            // keeps a wide design that legitimately wakes thousands of
+            // DISTINCT processes at time 0 safe. run_one_tick's inner drain
+            // loop re-reads the queue at the current time, so a
+            // self-rescheduling process never reaches the outer event loop —
+            // the check has to live here. The activation that trips the guard
+            // is re-parked UNEXECUTED and must not inflate "ran N times".
+            if self.stall_pid_tripped(pid, Some(pc)) {
+                // A single process re-arming like this is a zero-delay
+                // livelock (e.g. `always #(period) clk=~clk` whose real
+                // `period` momentarily glitched to 0). Rather than abort the
                 // whole run here, RE-PARK this un-executed activation at the
-                // current time and ask the outer event loop to defer-and-advance
-                // to the next scheduled event — a commercial simulator lets time
-                // move past a #0 spinner once its driving value recovers (here,
-                // once a reference-clock edge updates the measured period). The outer
-                // loop declares it fatal only if nothing is scheduled ahead.
+                // current time and ask the outer event loop to
+                // defer-and-advance to the next scheduled event — a
+                // commercial simulator lets time move past a #0 spinner once
+                // its driving value recovers. The outer loop declares it
+                // fatal only if nothing is scheduled ahead.
                 self.event_queue.schedule(self.time, pid, pc.clone());
                 self.zero_delay_defer_pending = true;
                 return;
             }
-            *hits += 1;
         }
         sim_dbg_eprintln!(
             "[DEBUG] running process {} ({} stmts) at time {}",

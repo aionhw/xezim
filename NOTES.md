@@ -113,6 +113,54 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the same select in compiled code took one bit (§7.4.1, §7.2, §10.4.2,
   #984).
 
+* An assignment pattern on a whole multi-dimensional unpacked array whose
+  element is a multi-dimensional packed type assigns every element: `n =
+  '{default: 80'h0}` on `logic [1:0][39:0] n [2][2]`, the same declaration
+  initializer, and positional, keyed, nested and nonblocking patterns left
+  every element x (§10.9.1, §7.4, §6.8, #1013, contributed by chuanseng-ng).
+
+* Header parameters and ports hide wildcard-imported names throughout the
+  module body; package functions and classes retain their own parameter values
+  (§26.3, #995, reported by ds54e).
+* Finite zero-delay phases stay in their timestamp through deferred events,
+  mailboxes, semaphores and edge relays. Stall checks include local data and
+  suspended loop control, while explicit limits retain their strict behavior
+  (§4.4, #996, reported by Ganesh-TNL, contributed by Thomasb81).
+* Collection call results and concatenations bind element by element to fixed
+  array and queue formals, with per-call storage, reference aliases and staged
+  output writeback. Handle members, package arrays and class-scoped associative
+  queue elements preserve their collection contents (§10.10, §13.5,
+  #1001, #1004, #1006, #1008, #1018, #1028, reported by Ganesh-TNL and
+  auty1395, contributed by auty1395).
+* Unpacked struct concatenations retain nested members, strings, real values
+  and collection fields, including when the destination also appears in the
+  concatenation (§10.10, #1035, reported by auty1395).
+* Chained packed typedef indices retain their declared dimensions in compiled
+  locals and members of selected unpacked-array elements (§7.4.1, #1002,
+  reported by Ganesh-TNL).
+* Whole multidimensional unpacked-array patterns spread across packed-array
+  elements. Loaded artifacts retain parameter-keyed patterns and lexical struct
+  widths, and prepared continuous assignments retain falling and turn-off delays
+  (§10.9.1, §20.6.2, §10.3.3, #1013, #1014, #1015, #1016, reported by
+  chuanseng-ng and ds54e, contributed by chuanseng-ng).
+* Randomization preserves class typedef and specialization handles, solves
+  sub-object back references jointly, and draws rand members of dynamic unpacked
+  struct arrays. Concatenated `$countones` operands and inline caller-scope
+  `foreach` constraints participate in the solve (§18.4, §18.5.9, §18.7,
+  §20.9, #1010, #1020, #1022, #1024, #1030, #1034, reported and contributed
+  by auty1395).
+* Covergroups sample implicit cross operands in their owning instance's scope
+  (§19.6, #1026, reported and contributed by auty1395).
+* Clocking output edge skews drive on the declared edge. Aliases keep their
+  clockvar identity and distinct pending drives survive checkpoint restart
+  (§14.3, §14.16.2, #1032, core #186, reported and contributed by auty1395).
+
+* Sparse integral constraints propagate through packed concatenations, squares,
+  constant division and remainders, split packed fields and wide arithmetic.
+  Wide array reductions and arrays beyond 8,192 elements join the solve, and
+  indexed record fields retain their own dependencies (§18.5, §11.4.3,
+  #1003, reported by Ganesh-TNL).
+
 * A run whose output reader goes away early (`xezim run.sv | head -1`) ends
   with its own exit status: the `Simulation finished` line, the stats footer
   and diagnostics no longer abort the process (exit 134) when their write

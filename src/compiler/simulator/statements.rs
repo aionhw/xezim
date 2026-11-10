@@ -23,8 +23,12 @@ impl Simulator {
                     .filter(|cn| self.module.dynamic_arrays.contains(cn))
             });
             if let Some(ename) = qn {
-                let esize = self.get_queue_size(&ename) as usize;
-                for j in 0..esize {
+                let lo = self.module.arrays.get(&ename).map_or(0, |a| a.0);
+                let mut idx: Vec<i64> = (lo..lo + self.get_queue_size(&ename) as i64).collect();
+                if self.module.descending_arrays.contains(&ename) {
+                    idx.reverse();
+                }
+                for j in idx {
                     if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", ename, j)) {
                         all_vals.push(v);
                     }
@@ -4312,8 +4316,8 @@ impl Simulator {
                     cb_base_flat = f;
                     cb_base = &cb_base_flat;
                 }
-                if let ExprKind::Ident(hier) = &cb_base.kind {
-                    if hier.path.len() >= 2 {
+                if let ExprKind::Ident(hier) = &cb_base.kind
+                    && hier.path.len() >= 2 {
                         let cb_segs: Vec<&str> = hier
                             .path
                             .iter()
@@ -4393,15 +4397,17 @@ impl Simulator {
                                     Some(self.freeze_lvalue_indices(&t))
                                 };
                                 // §14.16 `##N`: wait N further clocking events.
-                                if let Some(n) = intra_cycles {
-                                    if n > 0 {
-                                        self.clocking_cycle_pending
-                                            .entry(cb)
-                                            .or_default()
-                                            .push((n, net, val, target));
+                                if let Some(n) = intra_cycles
+                                    && n > 0 {
+                                        self.clocking_cycle_pending.entry(cb).or_default().push((
+                                            n,
+                                            raw_sig.to_string(),
+                                            net,
+                                            val,
+                                            target,
+                                        ));
                                         return;
                                     }
-                                }
                                 // §14.16.1: a drive executed AT the clocking
                                 // event matures at edge + OUTPUT SKEW (per-sig
                                 // override, else block default, else #0 =
@@ -4415,25 +4421,36 @@ impl Simulator {
                                     .or_else(|| self.clocking_out_skew.get(&cb).copied())
                                     .unwrap_or(0);
                                 if self.clocking_last_edge.get(&cb).copied() == Some(self.time) {
+                                    // §14.3: an edge skew drives on the next
+                                    // such edge of the clock after the event.
+                                    if let Some((edge, d)) =
+                                        self.clocking_drive_edge(&cb, raw_sig, &net)
+                                    {
+                                        self.clocking_edge_out_pending
+                                            .entry(cb)
+                                            .or_default()
+                                            .push((net, val, edge, d, target));
+                                        return;
+                                    }
                                     if let Some(t) = &target {
                                         self.drive_clocking_select(t, val, skew);
                                         return;
                                     }
                                     if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
-                                        let w = self.signal_widths[id];
-                                        self.schedule_delayed_with_delay(id, val.resize(w), skew);
+                                        self.schedule_clocking_update(id, &val, skew);
                                         return;
                                     }
                                 }
-                                self.clocking_output_pending
-                                    .entry(cb)
-                                    .or_default()
-                                    .push((net, val, target));
+                                self.clocking_output_pending.entry(cb).or_default().push((
+                                    raw_sig.to_string(),
+                                    net,
+                                    val,
+                                    target,
+                                ));
                                 return;
                             }
                         }
                     }
-                }
                 // SV-2023: NBA to a ref formal redirects to the caller's
                 // actual lvalue (IEEE 1800-2023 §13.5.2).
                 let written = lvalue;

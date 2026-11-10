@@ -13,6 +13,8 @@
 
 #[path = "misc/always_timing_lint_forms.rs"]
 mod always_timing_lint_forms;
+#[path = "misc/cache_scope_regressions.rs"]
+mod cache_scope_regressions;
 #[path = "misc/ansi_net_port_procedural_assign.rs"]
 mod ansi_net_port_procedural_assign;
 #[path = "misc/argument_binding.rs"]

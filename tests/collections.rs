@@ -323,3 +323,18 @@ mod assoc_packed_elem;
 mod unpacked_row_pattern_store;
 #[path = "collections/unpacked_row_pattern_followups.rs"]
 mod unpacked_row_pattern_followups;
+
+#[path = "collections/concat_actual_queue_formal.rs"]
+mod concat_actual_queue_formal;
+
+#[path = "collections/concat_actual_fixed_array_formal.rs"]
+mod concat_actual_fixed_array_formal;
+
+#[path = "collections/unpacked_packed_elem_pattern.rs"]
+mod unpacked_packed_elem_pattern;
+
+#[path = "collections/package_array_operand_in_method.rs"]
+mod package_array_operand_in_method;
+
+#[path = "collections/unpacked_struct_concat_1035.rs"]
+mod unpacked_struct_concat_1035;

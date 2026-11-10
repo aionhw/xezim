@@ -2568,9 +2568,14 @@ impl Simulator {
             10_000
         };
         let mut safety: u64 = 0;
+        let mut window_state = 0;
         let mut broke = false;
-        while !self.finished && safety < cap {
+        while !self.finished {
             safety += 1;
+            if safety >= cap && !self.fixpoint_window_progressed_u64(&mut safety, &mut window_state)
+            {
+                break;
+            }
             if safety & LOOP_INTERRUPT_POLL_MASK == 0 && loop_stop_requested() {
                 self.take_interrupt();
                 break;
@@ -3908,7 +3913,8 @@ impl Simulator {
         // Scalar gate outputs are the case that matters; "to 0" is judged on
         // the whole value so a vector net keeps using the rise delay unless it
         // goes fully zero.
-        let delay = if self.gate_fall_delay_by_id.is_empty() {
+        let delay = if self.gate_fall_delay_by_id.is_empty() && self.gate_off_delay_by_id.is_empty()
+        {
             delay
         } else {
             // NB: `to_u64()` MASKS x/z to 0 rather than returning None, so it
@@ -4287,6 +4293,7 @@ impl Simulator {
             return;
         }
         let mut passes: u64 = 0;
+        let mut window_state = 0;
         self.edge_rescan_block_hits.clear();
         self.in_edge_rescan = true;
         let prev_phase = self.edge_dispatch_phase;
@@ -4301,7 +4308,10 @@ impl Simulator {
                 }
             }
             passes += 1;
-            if self.stall_limit > 0 && passes > self.stall_limit {
+            if self.stall_limit > 0
+                && passes > self.stall_limit
+                && !self.fixpoint_window_progressed_u64(&mut passes, &mut window_state)
+            {
                 self.report_edge_rescan_stall(passes);
                 self.abort_run();
                 break;

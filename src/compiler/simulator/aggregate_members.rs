@@ -1353,6 +1353,29 @@ impl Simulator {
                 let ret = self.call_return_type(func)?;
                 Self::resolve_type_ref(&ret, &self.module.typedef_types)
             }
+            ExprKind::Index { .. } => {
+                // §7.4.5: selecting every unpacked dimension leaves the
+                // declared packed element type. Query it without executing
+                // the selectors; the subsequent value read evaluates them.
+                let mut base = e;
+                let mut rank = 0;
+                while let ExprKind::Index { expr, .. } = &base.kind {
+                    rank += 1;
+                    base = expr;
+                }
+                let ExprKind::Ident(h) = &base.kind else {
+                    return None;
+                };
+                if h.path.iter().any(|s| !s.selects.is_empty()) {
+                    return None;
+                }
+                let name = self.resolve_hier_name(h).into_owned();
+                if self.foreach_dims(&name)?.len() != rank {
+                    return None;
+                }
+                let dt = self.p_elem_type(&name)?;
+                Self::resolve_type_ref(&dt, &self.module.typedef_types)
+            }
             ExprKind::MemberAccess { expr, member } => {
                 let Some(su) = self.chain_base_packed_struct(expr) else {
                     // §8.4/§7.2.1: a packed-struct property of a class
