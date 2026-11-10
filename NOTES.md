@@ -113,6 +113,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the same select in compiled code took one bit (§7.4.1, §7.2, §10.4.2,
   #984).
 
+* A run whose output reader goes away early (`xezim run.sv | head -1`) ends
+  with its own exit status: the `Simulation finished` line, the stats footer
+  and diagnostics no longer abort the process (exit 134) when their write
+  fails, so `$fatal` and `--error-exit` keep status 1 and a passing run 0
+  (§20.10, #1037).
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
