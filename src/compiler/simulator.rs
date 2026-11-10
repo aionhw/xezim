@@ -347,7 +347,8 @@ fn method_boost_enabled() -> bool {
 // §11.5.1: an x/z literal index into a packed element reads x.
 // §7.4.1: a run-time index into an unpacked array of three or more dimensions declines.
 // §7.4.1: `a[i].m[j][k]` selects elements of a multi-dimensional packed member.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_306d;
+// §7.4.1: local packed typedefs and selected struct-array members keep their dimensions.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_306e;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
