@@ -3693,6 +3693,7 @@ impl Simulator {
     #[inline(never)]
     pub(super) fn drain_reactive_conts(&mut self) {
         let mut guard = 0u32;
+        let mut guard_epoch = state_epoch();
         while !self.reactive_conts.is_empty() && !self.finished {
             let conts = std::mem::take(&mut self.reactive_conts);
             self.late_resume_epoch += conts.len() as u64;
@@ -3711,7 +3712,7 @@ impl Simulator {
             }
             self.in_reactive_drain = saved;
             guard += 1;
-            if guard > 10_000 {
+            if guard > 10_000 && !self.fixpoint_window_progressed(&mut guard, &mut guard_epoch) {
                 break;
             }
         }

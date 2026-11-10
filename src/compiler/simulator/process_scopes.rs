@@ -2568,9 +2568,15 @@ impl Simulator {
             10_000
         };
         let mut safety: u64 = 0;
+        let mut window_epoch = state_epoch();
         let mut broke = false;
-        while !self.finished && safety < cap {
+        while !self.finished {
             safety += 1;
+            if safety >= cap {
+                if !self.fixpoint_window_progressed_u64(&mut safety, &mut window_epoch) {
+                    break;
+                }
+            }
             if safety & LOOP_INTERRUPT_POLL_MASK == 0 && loop_stop_requested() {
                 self.take_interrupt();
                 break;
@@ -4288,6 +4294,7 @@ impl Simulator {
             return;
         }
         let mut passes: u64 = 0;
+        let mut window_epoch = state_epoch();
         self.edge_rescan_block_hits.clear();
         self.in_edge_rescan = true;
         let prev_phase = self.edge_dispatch_phase;
@@ -4303,9 +4310,11 @@ impl Simulator {
             }
             passes += 1;
             if self.stall_limit > 0 && passes > self.stall_limit {
-                self.report_edge_rescan_stall(passes);
-                self.abort_run();
-                break;
+                if !self.fixpoint_window_progressed_u64(&mut passes, &mut window_epoch) {
+                    self.report_edge_rescan_stall(passes);
+                    self.abort_run();
+                    break;
+                }
             }
             self.check_edges_inner(Some(&subset), false);
         }
