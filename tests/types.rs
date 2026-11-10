@@ -696,3 +696,6 @@ mod unpacked_elem_packed_select_read;
 mod unpacked_elem_select_followups;
 #[path = "types/struct_array_member_elem_select.rs"]
 mod struct_array_member_elem_select;
+
+#[path = "types/packed_select_geometry_1002.rs"]
+mod packed_select_geometry_1002;
