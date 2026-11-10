@@ -1295,6 +1295,7 @@ impl Simulator {
                             is_object_elem: c.is_object_elem,
                             nd_base: Some((c.prop.clone(), shape.clone())),
                             row_tail: None,
+                            member: None,
                         });
                     }
                 }
@@ -1311,6 +1312,7 @@ impl Simulator {
                             is_object_elem: c.is_object_elem,
                             nd_base: Some((c.prop.clone(), shape.clone())),
                             row_tail: None,
+                            member: None,
                         });
                     }
                 }
@@ -2542,20 +2544,23 @@ impl Simulator {
             if wide && unread_wide.contains(&c.prop) {
                 csp.wide_free.extend(
                     idx.iter()
-                        .map(|i| (VarKey::Elem(format!("{}[{}]", c.scoped, i)), c.width)),
+                        .map(|i| (VarKey::Elem(c.elem_key(i)), c.width)),
                 );
                 continue;
             }
-            if wide && array_enums.contains_key(&c.prop) {
+            let enum_type = array_enums.get(&c.prop);
+            if wide && enum_type.is_some() {
                 return None;
             }
-            let signed = self.class_prop_signed_of(handle, &c.prop);
+            let signed = match &c.member {
+                Some(m) => m.signed,
+                None => self.class_prop_signed_of(handle, &c.prop),
+            };
             let dom = if wide {
                 // A placeholder: the elements are solved as segments.
                 vec![(0, 0)]
             } else {
-                array_enums
-                    .get(&c.prop)
+                enum_type
                     .and_then(|tn| enum_dom(self, tn))
                     .unwrap_or_else(|| {
                         let (lo, hi) = ws_range(c.width, signed);
@@ -2569,7 +2574,7 @@ impl Simulator {
                 }
                 elems.push((i, csp.vars.len()));
                 csp.vars.push(CspVar {
-                    key: VarKey::Elem(format!("{}[{}]", c.scoped, i)),
+                    key: VarKey::Elem(c.elem_key(i)),
                     width: c.width,
                     signed,
                 });
@@ -4768,6 +4773,9 @@ impl Simulator {
             let enums: HashMap<String, String> = colls
                 .iter()
                 .filter_map(|c| {
+                    if let Some(m) = &c.member {
+                        return m.enum_type.clone().map(|tn| (c.prop.clone(), tn));
+                    }
                     let p = c.nd_base.as_ref().map_or(c.prop.as_str(), |(p, _)| p);
                     let tn = self.class_prop_type_name(sub, p)?;
                     self.module
@@ -7173,6 +7181,10 @@ impl Simulator {
                 }
             }
         };
+        if let Some((n, idx)) = Self::csp_struct_elem(csp, e) {
+            push_name(&n, out);
+            return self.csp_refs(csp, &idx, env, out);
+        }
         match &e.kind {
             ExprKind::Ident(h) => {
                 if h.path.len() == 1 {
@@ -7504,6 +7516,17 @@ impl Simulator {
                 }
                 _ => {}
             }
+        }
+        if let Some((n, idx)) = Self::csp_struct_elem(csp, e) {
+            if !self.csp_free(csp, &idx, env) {
+                return None;
+            }
+            let i = self.csp_const(&idx, env)?.to_i64()?;
+            return csp.arrays[&n]
+                .elems
+                .iter()
+                .find(|x| x.0 == i)
+                .map(|x| Self::csp_var_ae(csp, x.1));
         }
         if matches!(
             e.kind,
@@ -9507,6 +9530,15 @@ impl Simulator {
         if csp.arrays.is_empty() {
             return None;
         }
+        if let Some((n, idx)) = Self::csp_struct_elem(csp, e) {
+            let a = csp.arrays.get(&n)?;
+            let v = match konst(self, &idx) {
+                Some(i) => a.elems.iter().find(|x| x.0 == i)?.1,
+                None if CSP_SCAN_ANY.with(|c| c.get()) => a.elems.first()?.1,
+                None => return None,
+            };
+            return (!self.csp_var_no_slices(csp, v)).then_some(v);
+        }
         let mut elem = |me: &mut Self, base: &Expression, idx: &Expression| -> Option<usize> {
             let n = me
                 .csp_member(csp, base)
@@ -9685,6 +9717,62 @@ impl Simulator {
                 .and_then(|b| b.1.to_i64()),
             _ => None,
         }
+    }
+
+    /// §18.4: `a[k].m` (a flat path or a member of an element select) where
+    /// the solve holds member `m` of the unpacked-struct elements of `a` as
+    /// the array `a.m`: that name and the index `k`.
+    fn csp_struct_elem(csp: &Csp, e: &Expression) -> Option<(String, Expression)> {
+        let strip_this = |path: &[crate::ast::expr::HierPathSegment]| -> Vec<crate::ast::expr::HierPathSegment> {
+            match path.split_first() {
+                Some((t, rest)) if t.name.name == "this" && t.selects.is_empty() => rest.to_vec(),
+                _ => path.to_vec(),
+            }
+        };
+        let (base, idx, member) = match &e.kind {
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Index { expr: b, index } => {
+                    let ExprKind::Ident(h) = &b.kind else {
+                        return None;
+                    };
+                    let segs = strip_this(&h.path);
+                    let [a] = segs.as_slice() else {
+                        return None;
+                    };
+                    if h.root.is_some() || !a.selects.is_empty() {
+                        return None;
+                    }
+                    (a.name.name.clone(), (**index).clone(), member.name.clone())
+                }
+                ExprKind::Ident(h) if h.root.is_none() => {
+                    let segs = strip_this(&h.path);
+                    let [a] = segs.as_slice() else {
+                        return None;
+                    };
+                    let [k] = a.selects.as_slice() else {
+                        return None;
+                    };
+                    (a.name.name.clone(), k.clone(), member.name.clone())
+                }
+                _ => return None,
+            },
+            ExprKind::Ident(h) if h.root.is_none() => {
+                let segs = strip_this(&h.path);
+                let [a, m] = segs.as_slice() else {
+                    return None;
+                };
+                let [k] = a.selects.as_slice() else {
+                    return None;
+                };
+                if !m.selects.is_empty() {
+                    return None;
+                }
+                (a.name.name.clone(), k.clone(), m.name.name.clone())
+            }
+            _ => return None,
+        };
+        let n = format!("{}.{}", base, member);
+        csp.arrays.contains_key(&n).then_some((n, idx))
     }
 
     /// A scalar that is not split (no select arithmetic for its shape).

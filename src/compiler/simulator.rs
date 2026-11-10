@@ -13619,6 +13619,9 @@ struct RandColl {
     /// elements are the rows; the joint solver keys each row like a row of
     /// a multi-dimensional array (`nd_base`) once the outer size is known.
     row_tail: Option<RowTail>,
+    /// §18.4: one rand member of an array of unpacked structs, solved as a
+    /// collection of its own (`prop` is `arr.m`, elements `arr[i].m`).
+    member: Option<StructElemMember>,
 }
 
 /// The rows of a dynamic outer dimension (`RandColl::row_tail`).
@@ -13628,6 +13631,23 @@ enum RowTail {
     Fixed(Vec<(i64, i64)>),
     /// `T a[][]`: every row is a dynamic array with its own size.
     Dyn,
+}
+
+#[derive(Clone, Debug)]
+struct StructElemMember {
+    name: String,
+    signed: bool,
+    enum_type: Option<String>,
+}
+
+impl RandColl {
+    /// Storage key of element `i` (`<h>#arr[i]`, or `<h>#arr[i].m`).
+    fn elem_key(&self, i: impl std::fmt::Display) -> String {
+        match &self.member {
+            Some(m) => format!("{}[{}].{}", self.scoped, i, m.name),
+            None => format!("{}[{}]", self.scoped, i),
+        }
+    }
 }
 
 /// A `.size()` constraint on a rand dynamic array (§18.4): the array must be

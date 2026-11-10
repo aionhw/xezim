@@ -633,12 +633,53 @@ impl Simulator {
                                 is_object_elem,
                                 nd_base: Some((prop.clone(), dims.clone())),
                                 row_tail: None,
+                                member: None,
                             });
                         }
                     }
                     continue;
                 }
-                if let Some(&(lo, hi, w)) = cd.array_properties.get(prop) {
+                // A dynamic array of unpacked structs whose size no constraint
+                // reads: each rand member is a collection of its own. (Fixed
+                // arrays keep their member cells in the instance map.)
+                let struct_members = cd
+                    .queue_properties
+                    .contains_key(prop)
+                    .then(|| self.unpacked_struct_elem_members(cd, prop))
+                    .flatten()
+                    .filter(|_| {
+                        let whole = RandColl {
+                            prop: prop.clone(),
+                            scoped: scoped.clone(),
+                            kind: CollKind::Dyn,
+                            width: 1,
+                            lo: 0,
+                            hi: 0,
+                            nested: false,
+                            is_object_elem: false,
+                            nd_base: None,
+                            row_tail: None,
+                            member: None,
+                        };
+                        !Self::csp_size_solved(&whole, constraints)
+                    });
+                if let Some(members) = struct_members {
+                    for (m, w) in members {
+                        out.push(RandColl {
+                            prop: format!("{}.{}", prop, m.name),
+                            scoped: scoped.clone(),
+                            kind: CollKind::Dyn,
+                            width: w,
+                            lo: 0,
+                            hi: 0,
+                            nested: false,
+                            is_object_elem: false,
+                            nd_base: None,
+                            row_tail: None,
+                            member: Some(m),
+                        });
+                    }
+                } else if let Some(&(lo, hi, w)) = cd.array_properties.get(prop) {
                     let (lo, hi) = self.inst_fixed_bounds(cd, handle, prop, (lo, hi));
                     out.push(RandColl {
                         prop: prop.clone(),
@@ -651,6 +692,7 @@ impl Simulator {
                         is_object_elem,
                         nd_base: None,
                         row_tail: None,
+                        member: None,
                     });
                 } else if cd.assoc_properties.contains_key(prop) {
                     let w = spec_w
@@ -668,6 +710,7 @@ impl Simulator {
                         is_object_elem,
                         nd_base: None,
                         row_tail: None,
+                        member: None,
                     });
                 } else if let Some(&(w, _cap)) = cd.queue_properties.get(prop) {
                     // §7.4.5: dynamic rows are sized row by row (`nested`).
@@ -685,12 +728,55 @@ impl Simulator {
                         is_object_elem,
                         nd_base: None,
                         row_tail,
+                        member: None,
                     });
                 }
             }
             cur = cd.extends.clone();
         }
         out
+    }
+
+    /// §18.4: the rand members (with their widths) of the element type of
+    /// collection `prop` when that is an unpacked struct, else None.
+    fn unpacked_struct_elem_members(
+        &self,
+        cd: &crate::compiler::elaborate::ElaboratedClass,
+        prop: &str,
+    ) -> Option<Vec<(StructElemMember, u32)>> {
+        let tn = cd.properties.get(prop)?.type_name.as_ref()?;
+        let dt = self.module.typedef_types.get(tn.as_str())?;
+        let DataType::Struct(su) = Self::resolve_type_ref(dt, &self.module.typedef_types) else {
+            return None;
+        };
+        if !Self::spreads_member_wise(&su)
+            || su.members.iter().any(|m| {
+                matches!(m.rand_qualifier, Some(crate::ast::types::RandQualifier::Randc))
+            })
+        {
+            return None;
+        }
+        let mut out = Vec::new();
+        for m in su.members.iter().filter(|m| m.rand_qualifier.is_some()) {
+            let w = resolve_type_width(
+                &m.data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+            .max(1);
+            let enum_type = self.struct_member_enum_key(&m.data_type);
+            let signed =
+                super::elaborate::is_type_signed_resolved(&m.data_type, &self.module.typedef_types);
+            for d in &m.declarators {
+                let member = StructElemMember {
+                    name: d.name.name.clone(),
+                    signed,
+                    enum_type: enum_type.clone(),
+                };
+                out.push((member, w));
+            }
+        }
+        Some(out)
     }
 
     /// A dynamic array is 2-D (`bit [7:0] m[][]`) when the constraints iterate
@@ -807,12 +893,12 @@ impl Simulator {
     pub(super) fn coll_elem_keys(&self, c: &RandColl) -> Vec<String> {
         match c.kind {
             CollKind::Fixed => (c.lo..=c.hi)
-                .map(|i| format!("{}[{}]", c.scoped, i))
+                .map(|i| c.elem_key(i))
                 .collect(),
             CollKind::Assoc => self
                 .assoc_key_strs(&c.scoped)
                 .into_iter()
-                .map(|k| format!("{}[{}]", c.scoped, k))
+                .map(|k| c.elem_key(k))
                 .collect(),
             CollKind::Dyn => {
                 let n = self.get_queue_size(&c.scoped);
@@ -829,7 +915,7 @@ impl Simulator {
                     return keys;
                 }
                 if !c.nested {
-                    return (0..n).map(|i| format!("{}[{}]", c.scoped, i)).collect();
+                    return (0..n).map(|i| c.elem_key(i)).collect();
                 }
                 let mut out = Vec::new();
                 for i in 0..n {
@@ -1830,7 +1916,7 @@ impl Simulator {
                             frame.insert(n.clone(), kv);
                         }
                         self.push_local_frame(frame);
-                        let ek = format!("{}[{}]", c.scoped, key);
+                        let ek = c.elem_key(&key);
                         if self.solve_one_elem(handle, &body, &ek, c.width, &c.prop, constraints) {
                             pinned.insert(ek);
                         }
@@ -1875,7 +1961,7 @@ impl Simulator {
                         // A 1-var foreach over a 2-D array constrains the ROW
                         // (its `.size()`), already handled by the sizing pass.
                         if !c.nested {
-                            let ek = format!("{}[{}]", c.scoped, i);
+                            let ek = c.elem_key(i);
                             if self.solve_one_elem(
                                 handle,
                                 &body,
@@ -2555,7 +2641,7 @@ impl Simulator {
                 };
                 let keys: Vec<String> = idxs
                     .iter()
-                    .map(|i| format!("{}[{}]", c.scoped, i))
+                    .map(|i| c.elem_key(i))
                     .collect();
                 self.distribute_sum_over(&keys, k, lo, hi, c.width, pinned);
             } else if let Some((c, method, view, k)) = self.reduce_eq_target(it, colls, rand_names)
