@@ -2116,6 +2116,33 @@ impl Simulator {
         self.formal_dyn.push(formals);
     }
 
+    /// §13.5.3: a default may read an EARLIER array formal. Show the call's
+    /// formals queued so far, as `commit_formal_dyn` will enter them, in a
+    /// scratch callee frame while a default is evaluated; supplied actuals
+    /// are bound before it and never see it.
+    pub(super) fn push_pending_formal_dyn(&mut self, (base, names, formals): &FormalDynSetup) {
+        let mut names = names.clone();
+        let mut formals = formals.clone();
+        for (pname, target) in &self.pending_formal_dyn[*base..] {
+            match names.iter_mut().find(|(k, _)| k == pname) {
+                Some(slot) => slot.1 = pname.clone(),
+                None => names.push((pname.clone(), pname.clone())),
+            }
+            match formals.iter_mut().find(|(k, _)| k == pname) {
+                Some(slot) => slot.1 = target.clone(),
+                None => formals.push((pname.clone(), target.clone())),
+            }
+        }
+        self.local_dyn.push(names);
+        self.formal_dyn.push(formals);
+    }
+
+    /// Drop the scratch frame `push_pending_formal_dyn` entered.
+    pub(super) fn pop_pending_formal_dyn(&mut self) {
+        self.local_dyn.pop();
+        self.formal_dyn.pop();
+    }
+
     /// The storage key of a queue / dynamic-array (or fixed unpacked array)
     /// ACTUAL: a plain name (a caller-local one under its per-process rename
     /// `@q#7`), or a member chain `obj.q` / `a.b.q` mapped to the owning
