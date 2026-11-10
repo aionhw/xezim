@@ -5012,7 +5012,7 @@ impl Simulator {
             &HashMap::default(),
             None,
             Some(&row_dims),
-            Some(&self.module.parameters),
+            Some(params),
         )?;
         Some(
             parts
