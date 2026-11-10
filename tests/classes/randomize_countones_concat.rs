@@ -46,3 +46,30 @@ fn countones_of_concatenation_meets_a_fixed_count() {
         .collect();
     assert_eq!(got, ["ok=20 20 20 20"]);
 }
+
+/// §20.9: nested concatenations register every leaf operand for propagation.
+#[test]
+fn nested_concatenation_counts_its_leaf_variables() {
+    let sim = simulate(
+        r#"
+class C;
+ rand bit [15:0] a,b,c,d;
+ constraint k { $countones({{a,b},{c,d}})==1; }
+endclass
+module top;
+ initial begin
+ C c=new;
+ if(!c.randomize() || $countones({{c.a,c.b},{c.c,c.d}})!=1) $fatal(1,"nested count");
+ $display("T|PASS");
+ end
+endmodule
+"#,
+        1000,
+    )
+    .expect("simulate");
+    assert!(
+        sim.output.iter().any(|o| o.message == "T|PASS"),
+        "{:?}",
+        sim.output
+    );
+}
