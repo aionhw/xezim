@@ -3519,6 +3519,20 @@ impl Simulator {
         cur.to_string()
     }
 
+    /// Class key for a property's declared type, through a typedef such as
+    /// `typedef inner#(.W(194)) inner_t`, which is not itself a key in
+    /// `classes`. A specialization (`P#(7)`) is not a typedef: it gets no key.
+    pub(super) fn resolved_class_key(&self, tn: &str) -> Option<String> {
+        if self.module.classes.contains_key(tn) {
+            return Some(tn.to_string());
+        }
+        if !self.module.typedef_types.contains_key(tn) {
+            return None;
+        }
+        let unrolled = self.typedef_unroll(tn);
+        self.module.classes.contains_key(&unrolled).then_some(unrolled)
+    }
+
     pub(super) fn class_is_a(&self, derived: &str, base: &str) -> bool {
         if derived == base {
             return true;
