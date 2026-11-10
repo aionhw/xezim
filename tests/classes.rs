@@ -127,8 +127,6 @@ mod rand_array_elem_signedness;
 mod rand_obj_array_elem_constraints;
 #[path = "classes/rand_package_struct_enum_member.rs"]
 mod rand_package_struct_enum_member;
-#[path = "classes/rand_sub_object_back_handle.rs"]
-mod rand_sub_object_back_handle;
 #[path = "classes/randomize_args_name_object_members.rs"]
 mod randomize_args_name_object_members;
 #[path = "classes/randomize_assoc_joint_solve.rs"]
@@ -316,8 +314,6 @@ mod constraint_funcs_aggregates;
 mod constraint_inline_caller_scope;
 #[path = "classes/constraint_inline_enclosing_scope.rs"]
 mod constraint_inline_enclosing_scope;
-#[path = "classes/constraint_inline_caller_foreach.rs"]
-mod constraint_inline_caller_foreach;
 #[path = "classes/constraint_inside_rand_bound.rs"]
 mod constraint_inside_rand_bound;
 #[path = "classes/constraint_logical_or.rs"]
@@ -420,8 +416,6 @@ mod pure_sv_phase_objection;
 mod randomize_countones_count;
 #[path = "classes/randomize_countones_wide.rs"]
 mod randomize_countones_wide;
-#[path = "classes/randomize_countones_concat.rs"]
-mod randomize_countones_concat;
 #[path = "classes/randomize_dist_weights.rs"]
 mod randomize_dist_weights;
 #[path = "classes/randomize_foreach_accept.rs"]
@@ -754,8 +748,6 @@ mod implication_joint_distribution;
 mod interface_class_extends_type_param;
 #[path = "classes/issue_246_struct_member_randomize.rs"]
 mod issue_246_struct_member_randomize;
-#[path = "classes/rand_dyn_array_of_unpacked_structs.rs"]
-mod rand_dyn_array_of_unpacked_structs;
 #[path = "classes/issue_249_rand_mode_receiver.rs"]
 mod issue_249_rand_mode_receiver;
 #[path = "classes/rand_mode_element_769.rs"]
@@ -1188,5 +1180,27 @@ mod review_979_modulo_bounds;
 mod static_shadow_write_944;
 #[path = "classes/vif_collection_formals_925.rs"]
 mod vif_collection_formals_925;
+
+#[path = "classes/randomize_scope_chunked_dist_bounds.rs"]
+mod randomize_scope_chunked_dist_bounds;
+
+#[path = "classes/concat_write_through_handle_member.rs"]
+mod concat_write_through_handle_member;
+
+#[path = "classes/rand_typedef_handle.rs"]
+mod rand_typedef_handle;
+
+#[path = "classes/randomize_countones_concat.rs"]
+mod randomize_countones_concat;
+
+#[path = "classes/constraint_inline_caller_foreach.rs"]
+mod constraint_inline_caller_foreach;
+
+#[path = "classes/rand_dyn_array_of_unpacked_structs.rs"]
+mod rand_dyn_array_of_unpacked_structs;
+
 #[path = "classes/class_scoped_assoc_queue_element.rs"]
 mod class_scoped_assoc_queue_element;
+
+#[path = "classes/rand_sub_object_back_handle.rs"]
+mod rand_sub_object_back_handle;
