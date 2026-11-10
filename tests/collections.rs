@@ -315,5 +315,5 @@ mod dyn_row_array_queries;
 #[path = "collections/dyn_row_sized_new_copy.rs"]
 mod dyn_row_sized_new_copy;
 
-#[path = "collections/concat_actual_queue_formal.rs"]
-mod concat_actual_queue_formal;
+#[path = "collections/concat_actual_fixed_array_formal.rs"]
+mod concat_actual_fixed_array_formal;
