@@ -1,0 +1,9 @@
+record_vector_drivers.vhd:73:7:@20ns:(report note): a=0008 '1' 01 b=01FE '1' 81
+record_vector_drivers.vhd:73:7:@30ns:(report note): a=0008 '0' 02 b=03FD '1' 82
+record_vector_drivers.vhd:73:7:@40ns:(report note): a=0008 '1' 03 b=07FA '1' F0
+record_vector_drivers.vhd:73:7:@50ns:(report note): a=FFFF '0' 04 b=0FF5 '1' 5F
+record_vector_drivers.vhd:73:7:@60ns:(report note): a=FFFF '1' 05 b=1FEA '1' 60
+record_vector_drivers.vhd:73:7:@70ns:(report note): a=FFFF '0' 06 b=3FD5 '1' 61
+record_vector_drivers.vhd:73:7:@80ns:(report note): a=ZZZX '1' 07 b=7FAA '1' 62
+record_vector_drivers.vhd:73:7:@90ns:(report note): a=ZZZX '0' 08 b=FF55 '1' 63
+simulation finished @90ns

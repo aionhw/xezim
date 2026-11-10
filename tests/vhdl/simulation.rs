@@ -280,6 +280,15 @@ fn element_drivers() {
     check("element_drivers");
 }
 
+/// Whole-vector and element assignments to the fields of a record signal
+/// in one cycle, the later one winning (§10.5.2.2), with a delayed
+/// transaction between them; `(others => x)` aggregates (§9.3.3.3)
+/// (xezim-core #155).
+#[test]
+fn record_vector_drivers() {
+    check("record_vector_drivers");
+}
+
 /// SHIFT_LEFT and SHIFT_RIGHT of numeric_std and numeric_bit for UNSIGNED
 /// and SIGNED, counts past the length and metavalues (§16.8.5), computed
 /// natively.
