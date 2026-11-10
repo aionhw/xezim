@@ -416,6 +416,8 @@ mod pure_sv_phase_objection;
 mod randomize_countones_count;
 #[path = "classes/randomize_countones_wide.rs"]
 mod randomize_countones_wide;
+#[path = "classes/randomize_countones_concat.rs"]
+mod randomize_countones_concat;
 #[path = "classes/randomize_dist_weights.rs"]
 mod randomize_dist_weights;
 #[path = "classes/randomize_foreach_accept.rs"]
