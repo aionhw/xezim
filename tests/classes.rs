@@ -1186,5 +1186,5 @@ mod review_979_modulo_bounds;
 mod static_shadow_write_944;
 #[path = "classes/vif_collection_formals_925.rs"]
 mod vif_collection_formals_925;
-#[path = "classes/rand_typedef_handle.rs"]
-mod rand_typedef_handle;
+#[path = "classes/class_scoped_assoc_queue_element.rs"]
+mod class_scoped_assoc_queue_element;
