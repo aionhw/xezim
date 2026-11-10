@@ -155,6 +155,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   clockvar identity and distinct pending drives survive checkpoint restart
   (§14.3, §14.16.2, #1032, core #186, reported and contributed by auty1395).
 
+* Sparse integral constraints propagate through packed concatenations, squares,
+  constant division and remainders, split packed fields and wide arithmetic.
+  Wide array reductions and arrays beyond 8,192 elements join the solve, and
+  indexed record fields retain their own dependencies (§18.5, §11.4.3,
+  #1003, reported by Ganesh-TNL).
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
