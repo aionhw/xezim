@@ -321,6 +321,8 @@ mod dyn_row_sized_new_copy;
 mod assoc_elem_select_read;
 #[path = "collections/assoc_packed_elem.rs"]
 mod assoc_packed_elem;
+#[path = "collections/packed_struct_member_idx_select.rs"]
+mod packed_struct_member_idx_select;
 #[path = "collections/unpacked_case_compare.rs"]
 mod unpacked_case_compare;
 #[path = "collections/unpacked_row_pattern_store.rs"]
