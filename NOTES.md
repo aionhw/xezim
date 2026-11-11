@@ -204,6 +204,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   dynamic arrays and class properties. Each item takes the element type, and
   all source values are read before the selected elements are overwritten
   (§7.4.5, §10.9.1, #1045, reported by Ganesh-TNL).
+* `wait fork` no longer waits for a grandchild whose parent finished before
+  it, including in DPI-exported tasks; `disable fork` still terminates it
+  (§9.6.1, §9.6.3, #1072, reported and contributed by chuanseng-ng).
 
 **Performance**
 
