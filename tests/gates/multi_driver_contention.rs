@@ -364,6 +364,39 @@ endmodule
     assert_eq!(got, ["T|weak1_alone n=ff", "T|strong_c3 n=c3"]);
 }
 
+/// #1062: several assigns to the SAME bit of a net, some in a sub-module,
+/// must all resolve together (0 against 1 -> x, z yields) — not only the
+/// first of each bit count when another driver sits in a lazy sub-module.
+#[test]
+fn same_bit_submodule_select_drivers_resolve_per_bit() {
+    let got = lines(
+        "sameselect",
+        r#"
+module sub;
+  wire [1:0] n;
+  assign n[0] = 1'b1;
+  assign n[0] = 1'bz;
+  assign n[1] = 1'bz;
+  assign n[1] = 1'b1;
+endmodule
+module t;
+  wire [1:0] n;
+  sub u ();
+  assign n[0] = 1'b1;
+  assign n[0] = 1'bz;
+  assign n[1] = 1'bz;
+  assign n[1] = 1'b1;
+  initial begin
+    #1 $display("T|top_sub n=%b u.n=%b", n, u.n);
+    $finish;
+  end
+endmodule
+"#,
+        "t",
+    );
+    assert_eq!(got, ["T|top_sub n=11 u.n=11"]);
+}
+
 /// The VALUE side of every strength level (supply over strong over pull
 /// over weak), compared with `%b` only; the `%v` strength names are pinned
 /// by the ignored test below.
