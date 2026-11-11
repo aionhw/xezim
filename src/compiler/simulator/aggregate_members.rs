@@ -2740,32 +2740,31 @@ impl Simulator {
                     d += 1;
                     i += 1;
                 }
+                MemberSel::Range { kind, l, r } if d < dims.len() => {
+                    // §7.4.1, §11.5.1: a part-select of a packed dimension
+                    // addresses that dimension's ELEMENTS in its declared
+                    // index order — `lanes[1:2]` and `lanes[0 +: 1]` of a
+                    // `lane_t [0:3] lanes` member select whole lanes, not
+                    // bits. The innermost dimension's elements are bits.
+                    let (dl, dr) = dims[d];
+                    let ew = span.checked_div(counts[d].max(1))?;
+                    let (a, b) = match kind {
+                        RangeKind::Constant => (*l, *r),
+                        RangeKind::IndexedUp if *r > 0 => (*l, l.checked_add(*r - 1)?),
+                        RangeKind::IndexedDown if *r > 0 => (*l, l.checked_sub(*r - 1)?),
+                        _ => return None,
+                    };
+                    let slot = |e: i64| {
+                        (dl.min(dr)..=dl.max(dr))
+                            .contains(&e)
+                            .then(|| if dl >= dr { e - dr } else { dr - e })
+                    };
+                    let (sa, sb) = (slot(a)?, slot(b)?);
+                    let lo = u32::try_from(sa.min(sb)).ok()?.checked_mul(ew)?;
+                    let n = u32::try_from(sa.abs_diff(sb) + 1).ok()?;
+                    return Some((off.checked_add(lo)?, n.checked_mul(ew)?));
+                }
                 MemberSel::Range { kind, l, r } => {
-                    // Indexed part-selects (`+:` / `-:`) directed at a still-
-                    // packed ARRAY dimension address ELEMENTS, not bits
-                    // (§11.5.1): `lanes[0 +: 1]` is element 0, not bit 0, of
-                    // the whole member. Rebase the element index to a
-                    // physical offset exactly as a plain Index would, then
-                    // scale the width by the element size.
-                    if matches!(kind, RangeKind::IndexedUp | RangeKind::IndexedDown)
-                        && d < dims.len()
-                    {
-                        let &(L, R) = dims.get(d)?;
-                        let count = counts.get(d).copied().unwrap_or(1).max(1);
-                        let ew = span.checked_div(count)?;
-                        let elem_off = |E: i64| -> Option<u32> {
-                            let slot = if L >= R { E - R } else { R - E };
-                            (slot >= 0).then(|| (slot as u32).checked_mul(ew)).flatten()
-                        };
-                        let end_e = if matches!(kind, RangeKind::IndexedUp) {
-                            l + r - 1
-                        } else {
-                            l - r + 1
-                        };
-                        let lo = elem_off(*l)?.min(elem_off(end_e)?);
-                        let w = u32::try_from(*r).ok()?.max(1);
-                        return Some((off.checked_add(lo)?, w * ew));
-                    }
                     let (o, w) = Self::range_within(span, *kind, *l, *r)?;
                     return Some((off.checked_add(o)?, w));
                 }
@@ -2786,49 +2785,26 @@ impl Simulator {
         dt: &DataType,
         params: &HashMap<String, Value>,
     ) -> Option<Vec<(i64, i64)>> {
-        use crate::ast::types::{DataType as DT, PackedDimension};
+        use crate::ast::types::DataType as DT;
+        // Follow a typedef chain, collecting each level's PACKED dimensions
+        // outermost-first, so a member typed through a typedef (`lane_t
+        // [0:3]` with `typedef logic [7:0] lane_t;`) gets its array shape as
+        // well as a bare vector would.
         let mut out: Vec<(i64, i64)> = Vec::new();
-        let mut cur = dt.clone();
-        // Follow a typedef/type-parameter chain, collecting each level's
-        // PACKED dimensions outermost-first so a member typed via a typedef
-        // (`lane_t [0:3]`, `typedef logic[7:0] lane_t;`) gets its array shape
-        // as well as a bare vector would.
-        loop {
-            match &cur {
-                DT::TypeReference {
-                    name,
-                    dimensions,
-                    ..
-                } => {
-                    for d in dimensions {
-                        let PackedDimension::Range { left, right, .. } = d else {
-                            return None;
-                        };
-                        out.push((
-                            super::elaborate::const_eval_i64_with_params(left, Some(params))?,
-                            super::elaborate::const_eval_i64_with_params(right, Some(params))?,
-                        ));
-                    }
-                    let next = self.module.typedef_types.get(&name.name.name)?.clone();
-                    cur = next;
-                }
-                _ => break,
-            }
-            if out.len() > 64 {
-                return None;
-            }
+        let mut cur = dt;
+        for _ in 0..64 {
+            let DT::TypeReference {
+                name, dimensions, ..
+            } = cur
+            else {
+                break;
+            };
+            out.extend(Self::packed_range_bounds(dimensions, params)?);
+            cur = self.module.typedef_types.get(&name.name.name)?;
         }
-        match &cur {
+        match cur {
             DT::IntegerVector { dimensions, .. } | DT::Implicit { dimensions, .. } => {
-                for d in dimensions {
-                    let PackedDimension::Range { left, right, .. } = d else {
-                        return None;
-                    };
-                    out.push((
-                        super::elaborate::const_eval_i64_with_params(left, Some(params))?,
-                        super::elaborate::const_eval_i64_with_params(right, Some(params))?,
-                    ));
-                }
+                out.extend(Self::packed_range_bounds(dimensions, params)?);
             }
             DT::IntegerAtom { kind, .. } => {
                 let w = match kind {
@@ -2842,22 +2818,11 @@ impl Simulator {
                 out.push((w as i64 - 1, 0));
             }
             DT::Struct(su) if !su.dimensions.is_empty() => {
-                for d in &su.dimensions {
-                    let PackedDimension::Range { left, right, .. } = d else {
-                        return None;
-                    };
-                    out.push((
-                        super::elaborate::const_eval_i64_with_params(left, Some(params))?,
-                        super::elaborate::const_eval_i64_with_params(right, Some(params))?,
-                    ));
-                }
+                out.extend(Self::packed_range_bounds(&su.dimensions, params)?);
             }
             _ => return None,
         }
-        if out.is_empty() {
-            return None;
-        }
-        Some(out)
+        (!out.is_empty()).then_some(out)
     }
 
     /// Const-resolved `(left, right)` of each of `dims`, in order; `None` for
