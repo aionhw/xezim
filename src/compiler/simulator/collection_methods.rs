@@ -361,20 +361,18 @@ impl Simulator {
             // a single segment (or flattened hierarchical name) that is a
             // registered signal assoc array resolves to itself, shadowed by
             // `this`-scoped members only when it isn't a plain collection.
-            let registered = if self.ident_shadowed_by_non_collection(h) {
-                false
-            } else {
-                match h.path.as_slice() {
-                    [seg] => self
-                        .module
-                        .associative_arrays
-                        .contains_key(seg.name.name.as_str()),
-                    _ => {
-                        let n = Self::resolve_hier_name_static(h, &self.module);
-                        self.module.associative_arrays.contains_key(&n)
-                    }
+            // The registration test is a lookup; the shadowing probe runs
+            // only for a registered name.
+            let registered = match h.path.as_slice() {
+                [seg] => self
+                    .module
+                    .associative_arrays
+                    .contains_key(seg.name.name.as_str()),
+                _ => {
+                    let n = Self::resolve_hier_name_static(h, &self.module);
+                    self.module.associative_arrays.contains_key(&n)
                 }
-            };
+            } && !self.ident_shadowed_by_non_collection(h);
             if registered {
                 let n = Self::resolve_hier_name_static(h, &self.module);
                 if let Some(m) = self.instance_assoc_member(&n) {
