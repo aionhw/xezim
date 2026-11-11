@@ -53,6 +53,8 @@ mod opt_pass_equivalence;
 mod packed_member_nba_compiles;
 #[path = "gates/packed_member_nesting_compiles.rs"]
 mod packed_member_nesting_compiles;
+#[path = "gates/review_instance_strengths_and_selects.rs"]
+mod review_instance_strengths_and_selects;
 #[path = "gates/specify_flags.rs"]
 mod specify_flags;
 #[path = "gates/specify_path_delays.rs"]
