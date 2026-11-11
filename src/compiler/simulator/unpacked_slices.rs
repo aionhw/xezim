@@ -49,10 +49,69 @@ impl Simulator {
     }
 
     /// The declared `(left, right)` of every unpacked dimension of the fixed
-    /// array `name`, outermost first, and its element width. `None` for a
-    /// dynamic, queue or associative array, or anything else.
+    /// array `name`, outermost first, and its element width. Dynamic arrays
+    /// and queues use their live extent; class properties use their receiver's
+    /// specialization. Associative arrays have no slice range.
     pub(super) fn unpacked_decl_shape(&self, name: &str) -> Option<(Vec<(i64, i64)>, u32)> {
-        if self.module.dynamic_arrays.contains(name) || self.is_associative_array(name) {
+        if self.is_associative_array(name) {
+            return None;
+        }
+        if let Some(size) = self.live_coll_size(name) {
+            if size == 0
+                || size > 1 << 20
+                || self
+                    .coll_shape_at(name)
+                    .is_some_and(|(shape, depth)| shape.dims.len() - depth != 1)
+            {
+                return None;
+            }
+            let ew = self
+                .lookup_signal_width(&format!("{name}[0]"))
+                .or_else(|| {
+                    self.get_signal_value_by_name(&format!("{name}[0]"))
+                        .map(|v| v.width)
+                })
+                .or_else(|| self.module.arrays.get(name).map(|a| a.2))
+                .unwrap_or(32);
+            return Some((vec![(0, size as i64 - 1)], ew));
+        }
+        if let Some((h, member)) = name.split_once('#')
+            && let Ok(handle) = h.parse::<usize>()
+        {
+            let mut class = self.heap.get(handle)?.as_ref()?.class_name.as_str();
+            for _ in 0..64 {
+                let cd = self.module.classes.get(class)?;
+                let layout = if let Some((dims, ew)) = cd.array_nd_properties.get(member) {
+                    Some((
+                        self.inst_nd_shape(cd, handle, member)
+                            .unwrap_or_else(|| dims.clone()),
+                        *ew,
+                    ))
+                } else if let Some(&(lo, hi, ew)) = cd.array_properties.get(member) {
+                    let bounds = self.inst_fixed_bounds(cd, handle, member, (lo, hi));
+                    Some((vec![bounds], ew))
+                } else {
+                    None
+                };
+                if let Some((mut dims, ew)) = layout {
+                    if let Some(declared) = cd.array_prop_decl_dims.get(member) {
+                        for (dim, &(l, r)) in dims.iter_mut().zip(declared) {
+                            if l > r {
+                                *dim = (dim.1, dim.0);
+                            }
+                        }
+                    }
+                    let first = dims
+                        .iter()
+                        .map(|d| format!("[{}]", d.0))
+                        .collect::<String>();
+                    let ew = self
+                        .get_signal_value_by_name(&format!("{name}{first}"))
+                        .map_or(ew, |v| v.width);
+                    return Some((dims, ew));
+                }
+                class = cd.extends.as_deref()?;
+            }
             return None;
         }
         if let Some(&(lo, hi, ew)) = self.module.arrays.get(name) {
@@ -145,13 +204,34 @@ impl Simulator {
             }
         }
         steps.reverse();
-        let ExprKind::Ident(h) = &cur.kind else {
-            return None;
-        };
-        if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
-            return None;
-        }
-        let root_name = self.resolve_hier_name(h).into_owned();
+        let root_name = self.expr_assoc_name(cur).or_else(|| {
+            // A hierarchical aggregate has element storage but no scalar
+            // signal of its own. Preserve its registered full path before
+            // resolving a same-named local in the active subroutine.
+            if (matches!(cur.kind, ExprKind::MemberAccess { .. })
+                || matches!(&cur.kind, ExprKind::Ident(h) if h.path.len() > 1))
+                && let Some(name) = self
+                    .flat_member_name(cur)
+                    .filter(|name| self.unpacked_decl_shape(name).is_some())
+            {
+                return Some(name);
+            }
+            let ExprKind::Ident(h) = &cur.kind else {
+                return None;
+            };
+            if h.path.iter().any(|s| !s.selects.is_empty()) {
+                return None;
+            }
+            let bare = h.path.last()?.name.name.as_str();
+            let local = (h.root.is_none() && h.path.len() == 1)
+                .then(|| self.dyn_name_lookup(bare))
+                .flatten();
+            Some(
+                local
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.resolve_hier_name(h).into_owned()),
+            )
+        })?;
         let (dims, ew) = self.unpacked_decl_shape(&root_name)?;
         // Every select must address an unpacked dimension, and only the last
         // one may be a range: a slice has no element select of its own.
@@ -268,6 +348,16 @@ impl Simulator {
         let Some(dst) = self.unpacked_value_elems(lvalue) else {
             return false;
         };
+        // §10.9.1: a slice is an unpacked target, so a pattern supplies one
+        // item per selected element in left-to-right order, not packed bits.
+        if let Some(values) = self.unpacked_slice_pattern_values(&dst, rvalue) {
+            for (name, value) in dst.names.iter().zip(values) {
+                if let Some(name) = name {
+                    self.set_signal_value_by_name(name, value);
+                }
+            }
+            return true;
+        }
         let Some(src) = self.unpacked_value_elems(rvalue) else {
             return false;
         };
@@ -285,6 +375,50 @@ impl Simulator {
         true
     }
 
+    /// Snapshot every pattern item before storing a slice: an item can read
+    /// another selected element, and the two sides may overlap (§10.9.1).
+    fn unpacked_slice_pattern_values(
+        &mut self,
+        dst: &UnpackedElems,
+        rvalue: &Expression,
+    ) -> Option<Vec<Value>> {
+        let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(rvalue).kind else {
+            return None;
+        };
+        if !dst.sliced {
+            return None;
+        }
+        let indices: Vec<i64> = dst
+            .names
+            .iter()
+            .map(|n| {
+                n.as_ref()
+                    .and_then(|n| n.rsplit_once('['))
+                    .and_then(|(_, n)| n.strip_suffix(']'))
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(i64::MIN)
+            })
+            .collect();
+        let elems = self.pattern_elems(items, &indices);
+        let dt = self
+            .class_member_coll_type(&dst.root_name)
+            .cloned()
+            .or_else(|| self.p_elem_type(&dst.root_name));
+        Some(
+            elems
+                .into_iter()
+                .map(|e| match (e, dt.as_ref()) {
+                    (Some(e), Some(dt)) => self.eval_pattern_leaf_value(dt, e, Some(dst.ew)),
+                    (Some(e), None) => {
+                        let v = self.eval_expr_ctx(e, dst.ew);
+                        self.fit_pattern_item_value(v, dst.ew)
+                    }
+                    _ => Value::new(dst.ew),
+                })
+                .collect(),
+        )
+    }
+
     /// §10.4.2: the per-element updates of `lhs <= rhs` when either side is
     /// a slice of an unpacked array, every source element read now.
     pub(super) fn unpacked_slice_nba_leaves(
@@ -296,6 +430,18 @@ impl Simulator {
             return None;
         }
         let dst = self.unpacked_value_elems(lvalue)?;
+        if let Some(values) = self.unpacked_slice_pattern_values(&dst, rvalue) {
+            return Some(
+                dst.names
+                    .iter()
+                    .zip(values)
+                    .filter_map(|(name, v)| {
+                        let suffix = name.as_ref()?.strip_prefix(&dst.root_name)?;
+                        Some((Self::append_leaf_path(&dst.root, suffix), v))
+                    })
+                    .collect(),
+            );
+        }
         let src = self.unpacked_value_elems(rvalue)?;
         if !(dst.sliced || src.sliced) || dst.names.len() != src.names.len() {
             return None;

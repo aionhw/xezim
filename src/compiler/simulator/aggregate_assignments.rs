@@ -357,6 +357,22 @@ impl Simulator {
                 return;
             }
         }
+        let value = self.eval_pattern_leaf_value(dt, e, None);
+        if value.is_real || Self::is_string_data_type(self.resolve_dt_ref(dt)) {
+            self.set_signal_value_by_name(target, value);
+        } else {
+            self.write_leaf_by_name(target, value);
+        }
+    }
+
+    /// Evaluate one scalar pattern item in its declared element type.
+    /// Shared by whole-array writes and slices, which snapshot the items.
+    pub(super) fn eval_pattern_leaf_value(
+        &mut self,
+        dt: &DataType,
+        e: &Expression,
+        width: Option<u32>,
+    ) -> Value {
         // A `string` leaf is stored as-is: the width resize below padded the
         // text with NULs to the element's nominal width, so a 2-D string
         // local's `'{'{"a","bb"},…}` read back as a run of blanks before
@@ -368,19 +384,19 @@ impl Simulator {
                 ..
             }
         ) {
-            let v = self.eval_expr(e);
-            self.set_signal_value_by_name(target, v);
-            return;
+            return self.eval_expr(e);
         }
         // §10.9.2: each item is evaluated in the context of the ELEMENT type —
         // `int d[]; d = '{1'b1 + 1'b1}` is 2, not a 1-bit wrap to 0, and a
         // signed narrower item sign-extends. Self-determined evaluation gave
         // the wrapped/zero-extended value.
-        let elem_w = super::elaborate::resolve_type_width(
-            dt,
-            Some(&self.module.parameters),
-            Some(&self.module.typedefs),
-        );
+        let elem_w = width.unwrap_or_else(|| {
+            super::elaborate::resolve_type_width(
+                dt,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+        });
         // §10.8: a pattern item takes the packed element type.
         let mut v = if let Some(v) = self.eval_in_packed_type(e, dt) {
             v
@@ -411,15 +427,13 @@ impl Simulator {
         // never flagged real (array elements are synthesized without the flag);
         // otherwise `real m[3] = '{1.5, ...}` truncates to integers.
         if matches!(self.resolve_dt(dt), DataType::Real { .. }) {
-            let rv = if v.is_real {
+            return if v.is_real {
                 v
             } else {
                 Value::from_f64(v.to_f64())
             };
-            self.set_signal_value_by_name(target, rv);
-            return;
         }
-        self.write_leaf_by_name(target, v);
+        v
     }
 
     /// §7.5/§7.8/§7.10: assign the collection-valued expression `e` to the
