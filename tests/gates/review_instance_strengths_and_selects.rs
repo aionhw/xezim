@@ -223,3 +223,26 @@ endmodule
         ]
     );
 }
+
+/// §7.4.2: the first select of an unpacked array of nets names an element,
+/// a net of its own. Two drivers of one element were folded as drivers of
+/// one bit of a vector, and the element read z.
+#[test]
+fn an_element_driver_of_an_unpacked_net_array_is_not_a_bit_select() {
+    let got = t_lines(
+        r#"
+module t;
+  logic en = 0;
+  wire [7:0] a8 [0:3];
+  assign a8[2] = 8'h11;
+  assign a8[2] = en ? 8'h22 : 'z;
+  assign a8[3] = en ? 8'h33 : 'z;
+  initial begin
+    #1 $display("T|a8[2]=%h a8[3]=%h", a8[2], a8[3]);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert_eq!(got, ["T|a8[2]=11 a8[3]=zz"]);
+}
