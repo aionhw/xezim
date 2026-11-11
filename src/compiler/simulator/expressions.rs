@@ -5124,7 +5124,14 @@ impl Simulator {
                         || (matches!(&sb.kind, ExprKind::Ident(bh)
                                 if bh.path.len() == 1
                                     && self.struct_prop_name_possible(&bh.path[0].name.name))
-                            && self.this_stack.last().copied().flatten().is_some()))
+                            && self.this_stack.last().copied().flatten().is_some())
+                        // `arr[i].lanes[k]`: an element of an unpacked-array
+                        // property of the struct (§7.4.1).
+                        || matches!(&sb.kind, ExprKind::Index { expr: ab, .. }
+                            if matches!(&ab.kind, ExprKind::Ident(ah)
+                                if ah.path.len() <= 2
+                                    && self.struct_prop_name_possible(
+                                        &ah.path[ah.path.len() - 1].name.name))))
                     && let Some(v) = self.struct_field_elem_read(sb, member, index)
                 {
                     return v;

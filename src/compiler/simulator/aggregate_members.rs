@@ -1417,7 +1417,13 @@ impl Simulator {
                     return None;
                 }
                 let name = self.resolve_hier_name(h).into_owned();
-                if self.foreach_dims(&name)?.len() != rank {
+                let Some(dims) = self.foreach_dims(&name) else {
+                    // §7.4.1, §8.4: an element of an unpacked-array class
+                    // property whose elements are the struct (`arr[i]` in a
+                    // method, `o.arr[i]`).
+                    return self.packed_struct_elem_type(e);
+                };
+                if dims.len() != rank {
                     return None;
                 }
                 let dt = self.p_elem_type(&name)?;
