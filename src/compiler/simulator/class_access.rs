@@ -734,6 +734,40 @@ impl Simulator {
             .map(|pos| &self.module.instances[self.instance_path_order[pos]])
     }
 
+    /// LRM §25.5.2: a modport-qualified hierarchical reference
+    /// (`inst.mp.var`) names the instance's own variable — the modport view
+    /// only restricts directions. Drop a path segment that names a modport
+    /// of the interface instance the preceding prefix resolves to, so the
+    /// name lands on the real variable instead of a phantom `inst.mp.var`
+    /// copy that only the writing path ever populated.
+    pub(super) fn strip_modport_segments(&self, raw: &str) -> String {
+        let mut segs: Vec<&str> = raw.split('.').collect();
+        if segs.len() < 3 {
+            return raw.to_string();
+        }
+        let mut changed = false;
+        let mut i = 1;
+        while i + 1 < segs.len() {
+            let prefix = segs[..i].join(".");
+            let is_modport = self.instance_by_path(&prefix).is_some_and(|inst| {
+                self.module
+                    .modport_member_dirs
+                    .contains_key(&(inst.def_name.clone(), segs[i].to_string()))
+            });
+            if is_modport {
+                segs.remove(i);
+                changed = true;
+            } else {
+                i += 1;
+            }
+        }
+        if changed {
+            segs.join(".")
+        } else {
+            raw.to_string()
+        }
+    }
+
     /// §23.9: `scope` and its enclosing generate blocks, ending at the nearest
     /// enclosing instance, or at the outermost block of the top module.
     pub(super) fn scopes_to_instance<'s>(&self, scope: &'s str) -> impl Iterator<Item = &'s str> {
@@ -860,6 +894,15 @@ impl Simulator {
             .map(|s| s.name.name.as_str())
             .collect::<Vec<_>>()
             .join(".");
+        // LRM §25.5.2: a modport-qualified reference names the instance's
+        // own variable; strip modport segments before any lookup. Gated on
+        // the design declaring modports at all, so modport-free designs pay
+        // nothing on this cold path.
+        let raw = if self.module.modport_member_dirs.is_empty() {
+            raw
+        } else {
+            self.strip_modport_segments(&raw)
+        };
         // §8/§23.9: in a method of a class declared inside a module, a
         // dotted name headed by an item of the object's instance (an
         // unpacked struct, an interface or module instance) is that

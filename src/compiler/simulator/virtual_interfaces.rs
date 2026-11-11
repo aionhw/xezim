@@ -3439,12 +3439,101 @@ impl Simulator {
     /// `Ident`; at module scope the same source is one flat `Ident`. `None`
     /// when no receiver in the chain is a bound vif — the common case, gated
     /// to a few emptiness and name checks.
+    /// LRM §25.5.2: a modport-qualified reference spelled as a MEMBER CHAIN
+    /// (`(ci.drv).bus_a` — how a task body parses the text; module level
+    /// parses the same text as one flat ident) names the instance's own
+    /// variable; the modport view only restricts directions. Rewrite the
+    /// chain to the stripped FLAT ident so every consumer — reads, writes,
+    /// NBAs — resolves the real signal, exactly as `strip_modport_segments`
+    /// does inside `resolve_hier_name` for the flat spelling. None when no
+    /// segment names a modport of the interface instance the preceding
+    /// prefix resolves to.
+    fn modport_strip_chain(&self, e: &Expression) -> Option<Expression> {
+        // Only a pure `.name` chain (or a flat multi-segment ident) has a
+        // well-defined dotted spelling to strip; selects, calls and indices
+        // keep their shape and stay with the machinery that owns them.
+        let (root, names, span): (Option<String>, Vec<String>, crate::ast::Span) = match &e.kind {
+            ExprKind::Ident(h)
+                if h.path.len() >= 3 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                (
+                    h.root.clone(),
+                    h.path.iter().map(|s| s.name.name.clone()).collect(),
+                    h.span,
+                )
+            }
+            ExprKind::MemberAccess { .. } => {
+                let mut names: Vec<String> = Vec::new();
+                let mut cur = e;
+                loop {
+                    match &cur.kind {
+                        ExprKind::MemberAccess { expr, member } => {
+                            names.push(member.name.clone());
+                            cur = expr;
+                        }
+                        _ => break,
+                    }
+                }
+                let ExprKind::Ident(h) = &cur.kind else {
+                    return None;
+                };
+                if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    return None;
+                }
+                names.push(h.path[0].name.name.clone());
+                names.reverse();
+                if names.len() < 3 {
+                    return None;
+                }
+                (h.root.clone(), names, e.span)
+            }
+            _ => return None,
+        };
+        let raw = names.join(".");
+        let stripped = self.strip_modport_segments(&raw);
+        if stripped == raw {
+            return None;
+        }
+        let path: Vec<crate::ast::expr::HierPathSegment> = stripped
+            .split('.')
+            .map(|part| crate::ast::expr::HierPathSegment {
+                name: crate::ast::Identifier {
+                    name: part.to_string(),
+                    span,
+                },
+                selects: Vec::new(),
+            })
+            .collect();
+        Some(Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root,
+                path,
+                span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            }),
+            span,
+        ))
+    }
+
     pub(super) fn vif_rebase_expr(&self, e: &Expression) -> Option<Expression> {
         // A definition-qualified self reference is an instance access even
         // without a virtual handle. Normalize the whole selected chain so
         // writes, reads and calls use the same instance as vif returns do.
         if let Some(local) = self.strip_own_definition_name(e) {
             return Some(local);
+        }
+        // LRM §25.5.2: a modport-qualified chain (`(ci.drv).bus_a`, or the
+        // flat `ci.drv.bus_a`) names the instance's own variable. Normalize
+        // it to the stripped flat ident BEFORE the vif gates below — a
+        // design with modports but no virtual interfaces never reaches
+        // them, and the class-aggregate arms of the read/write paths would
+        // otherwise claim the chain for heap storage.
+        if !self.module.modport_member_dirs.is_empty()
+            && let Some(stripped) = self.modport_strip_chain(e)
+        {
+            return Some(stripped);
         }
         let alias_possible = self.iface_alias_possible();
         // Returned handles live in the current receiver memo. They must not
