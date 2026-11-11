@@ -7594,6 +7594,7 @@ pub struct Simulator {
     class_gc_survivors: Vec<usize>,
     class_gc_scan_from: usize,
     class_gc_live: usize,
+    class_gc_live_signals: usize,
     class_gc_released: usize,
     class_gc_runs: usize,
     /// LRM §25.8 virtual-interface bindings.

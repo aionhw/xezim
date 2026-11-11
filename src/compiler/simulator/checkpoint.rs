@@ -1149,6 +1149,7 @@ checkpoint_state!(
     class_event_prop_names,
     class_gc_heap_len,
     class_gc_live,
+    class_gc_live_signals,
     class_gc_released,
     class_gc_runs,
     class_gc_scan_from,
