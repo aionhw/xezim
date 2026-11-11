@@ -714,3 +714,12 @@ fn class_property_nba_shapes_1050() {
     let (got, want) = nba_shapes_1050(&ids);
     assert_eq!(got, want);
 }
+
+/// §25.5: a reference through a modport of an interface instance
+/// (`ci.drv.bus_a`) names the instance's own variable, for a blocking write
+/// and for nonblocking updates (#1050).
+#[test]
+fn modport_qualified_reference_shapes_1050() {
+    let (got, want) = nba_shapes_1050(&["s58", "s59"]);
+    assert_eq!(got, want);
+}
