@@ -10,6 +10,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* Hierarchical references reach static task/function locals before their first
+  call and preserve instance-specific storage (§6.21, §23.6).
+* Preprocessor warnings preserve the run's exit status when stderr closes
+  (§20.10, #1037).
+* Typed constructor arguments use the caller's parameters; defaults and
+  initializers use the constructed class's parameters (§8.8, §13.5).
+
 * Typed constructor calls build the named class, including type parameters
   and specializations (§8.8, #1051).
 
@@ -199,6 +206,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§7.4.5, §10.9.1, #1045, reported by Ganesh-TNL).
 
 **Performance**
+
+* Callable locals with literal or name-free dimensions stay shared during
+  elaboration, avoiding copies for unrelated parameters (§6.20.2, #721).
 
 * Preparing parameterized modules preserves shared function/task bodies when
   local declarations need no dimension or type folding. The public core #192
