@@ -5,12 +5,11 @@ use crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
-/// How an element of an aggregate-vs-pattern comparison is tested.
-/// `Logical` is `==`/`!=` (x/z → x, resolved to 0 here), `Case` is
-/// `===`/`!==` (bit-exact, must never be x), `Wildcard` is `==?`/`!=?`
-/// (x/z in the pattern item are don't-cares, an x/z in the element makes
-/// the element comparison unknown unless another element mismatches,
-/// §11.4.6).
+/// How an element of an aggregate comparison is tested (§11.4.5,
+/// §11.4.6). `Logical` is `==`/`!=`: x where an x/z bit leaves the relation
+/// open. `Case` is `===`/`!==`: the 4-state bits match exactly, never x.
+/// `Wildcard` is `==?`/`!=?`: x/z bits of the right operand match anything,
+/// x/z bits of the left one leave the relation open.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum PatternCmpMode {
     Logical,
@@ -18,12 +17,30 @@ pub(super) enum PatternCmpMode {
     Wildcard,
 }
 
-/// Bit-exact (`===`/`!==`) element equality at a declared element width: the
-/// 4-state case-equality of `a` and `b` resized to `width` bits. Used for the
-/// case-comparison path through the collection comparators, where an x/z
-/// element matches an identical x/z element and never matches a known one.
-pub(crate) fn a_resized_case_eq(a: &Value, b: &Value, width: u32) -> bool {
-    a.resize(width).case_eq(&b.resize(width)).to_u64() == Some(1)
+impl PatternCmpMode {
+    /// The mode of an equality operator and whether it asks for equality
+    /// (`==`, `===`, `==?`) rather than inequality; `None` for any other
+    /// operator.
+    pub(super) fn of(op: BinaryOp) -> Option<(Self, bool)> {
+        Some(match op {
+            BinaryOp::Eq => (Self::Logical, true),
+            BinaryOp::Neq => (Self::Logical, false),
+            BinaryOp::CaseEq => (Self::Case, true),
+            BinaryOp::CaseNeq => (Self::Case, false),
+            BinaryOp::WildcardEq => (Self::Wildcard, true),
+            BinaryOp::WildcardNeq => (Self::Wildcard, false),
+            _ => return None,
+        })
+    }
+
+    /// The 1-bit equality of the integral pair `a`, `b` under this mode.
+    pub(super) fn eq(self, a: &Value, b: &Value) -> Value {
+        match self {
+            Self::Logical => a.is_equal(b),
+            Self::Case => a.case_eq(b),
+            Self::Wildcard => a.wildcard_eq(b),
+        }
+    }
 }
 
 /// An associative array's index type, for `item.index` (§7.12.4) and
@@ -184,70 +201,70 @@ impl Simulator {
         self.module.arrays.get(name).map(|t| t.2)
     }
 
-    /// True when two stored collection elements compare equal as VALUES of
-    /// the collection's declared element type. The stored slots may differ in
-    /// width/signedness (a 32-bit sign-extended push_back slot vs an 8-bit
-    /// pattern slot, a value stored from an unsigned `logic [15:0]` local vs
-    /// the solver-drawn signed element): the storage metadata is not part of
-    /// the LRM value. Both sides are truncated/resized to the declared element
-    /// width (so a wide slot's clean extension is masked away) and compared by
-    /// `Value::is_equal` (bit equality at equal width, independent of the
-    /// `is_signed` flag). The caller has already drained x/z (which must make
-    /// the whole comparison neither equal nor unequal); a `None` width falls
-    /// back to the raw `Value` equality.
-    pub(super) fn coll_values_eq(&self, a: &Value, b: &Value, ew: Option<u32>) -> bool {
-        let Some(ew) = ew else {
-            return a == b;
-        };
-        if ew == 0 {
-            return true;
-        }
-        if a.has_unknown() || b.has_unknown() {
-            // 4-state element content at the declared width: preserve the
-            // caller's x/z handling (both `==` and `!=` → 0).
-            return false;
-        }
-        a.resize(ew).is_equal(&b.resize(ew)).to_u64() == Some(1)
-    }
-
-    /// [`Self::coll_values_eq`] over `Option<Value>` operands (an element key
-    /// may be unset). Missing either side makes the pair unequal; an unknown
-    /// element is treated as unequal (multi-dimensional-array reference
-    /// semantics collapse an x element to a non-match).
-    pub(super) fn coll_values_opt_eq(
-        &self,
-        a: &Option<Value>,
-        b: &Option<Value>,
+    /// One element pair of an unpacked-array comparison, compared as VALUES
+    /// of the collection's declared element type under `mode`. The stored
+    /// slots may differ in width/signedness (a 32-bit sign-extended
+    /// push_back slot vs an 8-bit pattern slot, a value stored from an
+    /// unsigned `logic [15:0]` local vs the solver-drawn signed element): the
+    /// storage metadata is not part of the LRM value, so both sides are
+    /// resized to the declared element width `ew` first. A `None` width
+    /// compares the stored values as they are.
+    pub(super) fn coll_elem_cmp(
+        a: &Value,
+        b: &Value,
         ew: Option<u32>,
-    ) -> bool {
-        match (a.as_ref(), b.as_ref()) {
-            (Some(av), Some(bv)) => self.coll_values_eq(av, bv, ew),
-            _ => false,
-        }
+        mode: PatternCmpMode,
+    ) -> PatCmp {
+        let r = match ew {
+            Some(0) => return PatCmp::Equal,
+            Some(w) => mode.eq(&a.resize(w), &b.resize(w)),
+            None if mode == PatternCmpMode::Logical && !a.has_unknown() && !b.has_unknown() => {
+                return if a == b {
+                    PatCmp::Equal
+                } else {
+                    PatCmp::Unequal
+                };
+            }
+            None => mode.eq(a, b),
+        };
+        Self::pat_cmp_of(&r)
     }
 
-    /// IEEE 1800-2017 §7.2 / §11.8.1: `==`/`!=` on two dynamic-array / queue
-    /// operands compares element-by-element (after a length check). Each
-    /// operand is resolved to its storage name — a bare dyn-array formal /
-    /// local, or a `<handle>#member` collection property — and every element
-    /// is compared. Returns `None` when neither operand is a dynamic
-    /// array / queue (caller falls through to the packed-scalar path).
+    /// One member or leaf pair of an unpacked-struct comparison under
+    /// `mode`; known values compare as stored.
+    fn struct_leaf_cmp(a: &Value, b: &Value, mode: PatternCmpMode) -> PatCmp {
+        if mode == PatternCmpMode::Logical && !a.has_unknown() && !b.has_unknown() {
+            return if a == b {
+                PatCmp::Equal
+            } else {
+                PatCmp::Unequal
+            };
+        }
+        Self::pat_cmp_of(&mode.eq(a, b))
+    }
+
+    /// IEEE 1800-2017 §7.2 / §11.8.1: the equality operators on two
+    /// dynamic-array / queue operands compare element by element (after a
+    /// length check). Each operand is resolved to its storage name — a bare
+    /// dyn-array formal / local, or a `<handle>#member` collection property —
+    /// and every element is compared. Returns `None` when neither operand is
+    /// a dynamic array / queue (caller falls through to the packed-scalar
+    /// path).
     pub(super) fn compare_dyn_arrays(
         &mut self,
         left: &Expression,
         right: &Expression,
-        want_eq: bool,
-        case: bool,
-    ) -> Option<Value> {
+        mode: PatternCmpMode,
+    ) -> Option<PatCmp> {
         let ln = self.dyn_cmp_operand_name(left)?;
         let rn = self.dyn_cmp_operand_name(right)?;
-        // NO same-storage shortcut: a queue holding an x element makes BOTH
-        // `q == q` and `q != q` come out 0 on the reference simulator, so
-        // self-comparison must run the element walk like any other pair.
+        // NO same-storage shortcut: a queue holding an x element makes
+        // `q == q` x (§11.4.5), so self-comparison runs the element walk
+        // like any other pair.
         let ls = self.get_queue_size(&ln);
         let rs = self.get_queue_size(&rn);
         if ls != rs {
-            return Some(Value::from_u64(if want_eq { 0 } else { 1 }, 1));
+            return Some(PatCmp::Unequal);
         }
         // Width for default values when an element is unset.
         let w = self
@@ -260,7 +277,7 @@ impl Simulator {
         let ew = self
             .coll_elem_width(&ln)
             .or_else(|| self.coll_elem_width(&rn));
-        let mut equal = true;
+        let mut acc = PatCmp::Equal;
         for i in 0..ls {
             let lv = self
                 .get_signal_value_by_name(&format!("{}[{}]", ln, i))
@@ -268,39 +285,12 @@ impl Simulator {
             let rv = self
                 .get_signal_value_by_name(&format!("{}[{}]", rn, i))
                 .unwrap_or_else(|| Value::zero(w));
-            if case {
-                // `===`/`!==`: bit-exact element compare. An x/z element is
-                // compared for equality with its exact 4-state bits (so an x
-                // element matches an x element, and never matches a known one),
-                // and no element makes the whole result unknown.
-                let eq = if let Some(e) = ew {
-                    a_resized_case_eq(&lv, &rv, e)
-                } else {
-                    lv.case_eq(&rv).to_u64() == Some(1)
-                };
-                if !eq {
-                    equal = false;
-                    break;
-                }
-            } else {
-                if lv.has_unknown() || rv.has_unknown() {
-                    // Reference behavior: an x/z element makes the comparison
-                    // neither equal NOR unequal — both `==` and `!=` yield 0
-                    // (verified: `q1 == q1` and `q1 != q1` with an 8'hxx element
-                    // both print 0 there; returning x instead rendered `%b` as x).
-                    return Some(Value::from_u64(0, 1));
-                }
-                // Compare at the declared element width so a differing storage
-                // slot (width/signedness) does not decide the pair (the packed/
-                // unpacked element-table family) — bits are what matter.
-                if !self.coll_values_eq(&lv, &rv, ew) {
-                    equal = false;
-                    break;
-                }
+            acc = acc.and(Self::coll_elem_cmp(&lv, &rv, ew, mode));
+            if acc == PatCmp::Unequal {
+                break;
             }
         }
-        let res = if want_eq { equal } else { !equal };
-        Some(Value::from_u64(if res { 1 } else { 0 }, 1))
+        Some(acc)
     }
 
     /// Resolve an expression to a dynamic-array / queue storage name, or None
@@ -400,80 +390,178 @@ impl Simulator {
         Some(an)
     }
 
-    /// IEEE 1800-2017 §7.12 / §11.4.5: `==`/`!=` on two associative arrays
-    /// compares them as order-independent sets of equal (key, value) pairs:
-    /// same element count, then every key of the left must exist on the right
-    /// with a value equal at the declared element width (4-state element
-    /// values run the caller-style x/z ambiguity). Returns `None` when neither
-    /// operand is an associative array (caller falls through to the packed
-    /// scalar path). A class-property associative array previously fell
-    /// through to the packed-scalar path and always evaluated to x.
+    /// IEEE 1800-2017 §7.12 / §11.4.5: the equality operators on two
+    /// associative arrays compare them as order-independent sets of (key,
+    /// value) pairs: same element count, then every key of the left must
+    /// exist on the right with a value equal at the declared element width.
+    /// Returns `None` when neither operand is an associative array (caller
+    /// falls through to the packed scalar path). A class-property
+    /// associative array previously fell through to the packed-scalar path
+    /// and always evaluated to x.
     pub(super) fn compare_assoc_arrays(
         &mut self,
         left: &Expression,
         right: &Expression,
-        want_eq: bool,
-        case: bool,
-    ) -> Option<Value> {
+        mode: PatternCmpMode,
+    ) -> Option<PatCmp> {
         let ln = self.assoc_cmp_operand_name(left)?;
         let rn = self.assoc_cmp_operand_name(right)?;
         let lkeys = self.assoc_key_strs(&ln);
         let rkeys = self.assoc_key_strs(&rn);
-        let size_eq = lkeys.len() == rkeys.len();
-        let mut equal = size_eq;
-        if equal {
-            let rset: std::collections::HashSet<&String> = rkeys.iter().collect();
-            let ew = self
-                .coll_elem_width(&ln)
-                .or_else(|| self.coll_elem_width(&rn));
-            for k in &lkeys {
-                if !rset.contains(k) {
-                    equal = false;
-                    break;
-                }
-                let lv = self
-                    .get_signal_value_by_name(&format!("{}[{}]", ln, k))
-                    .unwrap_or_else(|| Value::zero(ew.unwrap_or(32)));
-                let rv = self
-                    .get_signal_value_by_name(&format!("{}[{}]", rn, k))
-                    .unwrap_or_else(|| Value::zero(ew.unwrap_or(32)));
-                if case {
-                    let eq = if let Some(e) = ew {
-                        a_resized_case_eq(&lv, &rv, e)
-                    } else {
-                        lv.case_eq(&rv).to_u64() == Some(1)
-                    };
-                    if !eq {
-                        equal = false;
-                        break;
-                    }
-                } else {
-                    if lv.has_unknown() || rv.has_unknown() {
-                        // An unknown element makes the comparison ambiguous: both
-                        // `==` and `!=` come out 0.
-                        return Some(Value::from_u64(0, 1));
-                    }
-                    if !self.coll_values_eq(&lv, &rv, ew) {
-                        equal = false;
-                        break;
-                    }
-                }
+        if lkeys.len() != rkeys.len() {
+            return Some(PatCmp::Unequal);
+        }
+        let rset: std::collections::HashSet<&String> = rkeys.iter().collect();
+        let ew = self
+            .coll_elem_width(&ln)
+            .or_else(|| self.coll_elem_width(&rn));
+        let mut acc = PatCmp::Equal;
+        for k in &lkeys {
+            if !rset.contains(k) {
+                return Some(PatCmp::Unequal);
+            }
+            let lv = self
+                .get_signal_value_by_name(&format!("{}[{}]", ln, k))
+                .unwrap_or_else(|| Value::zero(ew.unwrap_or(32)));
+            let rv = self
+                .get_signal_value_by_name(&format!("{}[{}]", rn, k))
+                .unwrap_or_else(|| Value::zero(ew.unwrap_or(32)));
+            acc = acc.and(Self::coll_elem_cmp(&lv, &rv, ew, mode));
+            if acc == PatCmp::Unequal {
+                break;
             }
         }
-        let res = if want_eq { equal } else { !equal };
-        Some(Value::from_u64(if res { 1 } else { 0 }, 1))
+        Some(acc)
+    }
+
+    /// §7.4.3, §11.4.5: the equality operators on two fixed-size unpacked
+    /// arrays — module-level OR class-property, accessed as bare `a`,
+    /// `this.a`, or `obj.a` (`rhs_.sa == lhs.sa` in a class method's
+    /// `compare`/`do_compare` is the common case) — compare element by
+    /// element, left bound against left bound.
+    fn compare_fixed_arrays(
+        &mut self,
+        left: &Expression,
+        right: &Expression,
+        mode: PatternCmpMode,
+    ) -> Option<PatCmp> {
+        let (Some((ln, llo, lhi)), Some((rn, rlo, rhi))) = (
+            self.fixed_array_operand(left),
+            self.fixed_array_operand(right),
+        ) else {
+            return None;
+        };
+        let lsize = (lhi - llo + 1) as usize;
+        let rsize = (rhi - rlo + 1) as usize;
+        if lsize != rsize {
+            return Some(PatCmp::Unequal);
+        }
+        let l_desc = self.module.descending_arrays.contains(&ln);
+        let r_desc = self.module.descending_arrays.contains(&rn);
+        let ew = self
+            .coll_elem_width(&ln)
+            .or_else(|| self.coll_elem_width(&rn));
+        let mut acc = PatCmp::Equal;
+        for i in 0..lsize {
+            let lidx = if l_desc {
+                lhi - i as i64
+            } else {
+                llo + i as i64
+            };
+            let ridx = if r_desc {
+                rhi - i as i64
+            } else {
+                rlo + i as i64
+            };
+            let lv = self
+                .get_signal_value_by_name(&format!("{}[{}]", ln, lidx))
+                .unwrap_or(Value::zero(1));
+            let rv = self
+                .get_signal_value_by_name(&format!("{}[{}]", rn, ridx))
+                .unwrap_or(Value::zero(1));
+            acc = acc.and(Self::coll_elem_cmp(&lv, &rv, ew, mode));
+            if acc == PatCmp::Unequal {
+                break;
+            }
+        }
+        Some(acc)
+    }
+
+    /// §7.4.5, §11.4.5: the equality operators on multi-dimensional unpacked
+    /// arrays (or a row of one) compare element by element by suffix; a
+    /// missing element makes the pair unequal. `None` unless an operand is
+    /// multi-dimensional (the 1-D comparators see no shape).
+    fn compare_nd_arrays(
+        &mut self,
+        left: &Expression,
+        right: &Expression,
+        mode: PatternCmpMode,
+    ) -> Option<PatCmp> {
+        if self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty() {
+            return None;
+        }
+        let (Some((lb, ls, l_nd)), Some((rb, rs, r_nd))) =
+            (self.nd_array_operand(left), self.nd_array_operand(right))
+        else {
+            return None;
+        };
+        if !(l_nd || r_nd) {
+            return None;
+        }
+        if ls.len() != rs.len() {
+            return Some(PatCmp::Unequal);
+        }
+        let ew = self
+            .coll_elem_width(&lb)
+            .or_else(|| self.coll_elem_width(&rb));
+        let mut acc = PatCmp::Equal;
+        for (a, b) in ls.iter().zip(rs.iter()) {
+            let lv = self.get_signal_value_by_name(&format!("{}{}", lb, a));
+            let rv = self.get_signal_value_by_name(&format!("{}{}", rb, b));
+            let (Some(lv), Some(rv)) = (lv, rv) else {
+                return Some(PatCmp::Unequal);
+            };
+            acc = acc.and(Self::coll_elem_cmp(&lv, &rv, ew, mode));
+            if acc == PatCmp::Unequal {
+                break;
+            }
+        }
+        Some(acc)
+    }
+
+    /// The element-wise comparison of two unpacked arrays — fixed,
+    /// multi-dimensional, associative, dynamic or queue — under `mode`;
+    /// `None` unless both operands are one (§7.4.3, §11.4.5).
+    pub(super) fn compare_unpacked_arrays(
+        &mut self,
+        left: &Expression,
+        right: &Expression,
+        mode: PatternCmpMode,
+    ) -> Option<PatCmp> {
+        if let Some(c) = self.compare_nd_arrays(left, right, mode) {
+            return Some(c);
+        }
+        if let Some(c) = self.compare_fixed_arrays(left, right, mode) {
+            return Some(c);
+        }
+        if let Some(c) = self.compare_assoc_arrays(left, right, mode) {
+            return Some(c);
+        }
+        self.compare_dyn_arrays(left, right, mode)
     }
 
     /// IEEE 1800-2017 §11.4.5 / §7.2: `==` and `!=` on unpacked structs compare
     /// them member by member. Their leaves live in separate signals, so the
     /// packed-value path compared two container signals that do not exist and
-    /// always yielded X. An X in any leaf makes the result X, as for vectors.
-    /// `None` when either side is not an unpacked struct with storage.
+    /// always yielded X. A differing member decides; otherwise an x/z leaf
+    /// makes the result x, as for vectors. `None` when either side is not an
+    /// unpacked struct with storage.
     pub(super) fn compare_unpacked_structs(
         &mut self,
         lhs: &Expression,
         rhs: &Expression,
-    ) -> Option<Value> {
+        mode: PatternCmpMode,
+    ) -> Option<PatCmp> {
         // An ELEMENT of a class-property collection (`q[i] == q[j]`) keeps its
         // leaves under the instance: compare leaf by leaf through the read path.
         if let Some(su) = self
@@ -483,18 +571,13 @@ impl Simulator {
             let (mut ll, mut rl) = (Vec::new(), Vec::new());
             self.unpacked_struct_leaves("X", lhs, &su, 0, &mut ll);
             self.unpacked_struct_leaves("X", rhs, &su, 0, &mut rl);
-            let mut equal = true;
+            let mut acc = PatCmp::Equal;
             for ((_, le, ..), (_, re, ..)) in ll.iter().zip(rl.iter()) {
                 let lv = self.eval_expr(le);
                 let rv = self.eval_expr(re);
-                if lv.has_unknown() || rv.has_unknown() {
-                    return Some(Value::new(1));
-                }
-                if lv.is_equal(&rv).to_u64() != Some(1) {
-                    equal = false;
-                }
+                acc = acc.and(Self::pat_cmp_of(&mode.eq(&lv, &rv)));
             }
-            return Some(Value::from_u64(u64::from(equal), 1));
+            return Some(acc);
         }
         // If EITHER operand is a class-property unpacked struct (members in
         // the heap, not the signal namespace), compare member-wise by
@@ -505,31 +588,22 @@ impl Simulator {
         let r_cp = self.class_prop_struct_of(rhs);
         if l_cp.is_some() || r_cp.is_some() {
             let su = l_cp.or(r_cp)?;
-            let mut equal = true;
+            let mut acc = PatCmp::Equal;
             for m in &su.members {
                 for md in &m.declarators {
                     let lf = Self::append_member_expr(lhs, &md.name.name);
                     let rf = Self::append_member_expr(rhs, &md.name.name);
                     let lv = self.eval_expr(&lf);
                     let rv = self.eval_expr(&rf);
-                    if lv.has_unknown() || rv.has_unknown() {
-                        return Some(Value::new(1)); // X
-                    }
-                    if lv != rv {
-                        equal = false;
-                    }
+                    acc = acc.and(Self::struct_leaf_cmp(&lv, &rv, mode));
                 }
             }
-            return Some(if equal {
-                Value::ones(1)
-            } else {
-                Value::zero(1)
-            });
+            return Some(acc);
         }
         // Signal-namespace unpacked structs (members are separate signals):
         // flatten to leaves and compare each, so a nested struct / string
         // member is read by its own leaf signal rather than a whole-struct
-        // container that does not exist. An X in any leaf makes the result X.
+        // container that does not exist.
         let (a, b) = (self.flat_member_name(lhs)?, self.flat_member_name(rhs)?);
         // Only a member-wise struct needs its type owned.
         let su = {
@@ -542,36 +616,24 @@ impl Simulator {
         if !self.struct_storage_exists(&a, &su) || !self.struct_storage_exists(&b, &su) {
             return None;
         }
-        let mut equal = true;
+        let mut acc = PatCmp::Equal;
         for sfx in self.struct_leaf_suffixes(&su) {
             let av = self.get_signal_value_by_name(&format!("{}.{}", a, sfx));
             let bv = self.get_signal_value_by_name(&format!("{}.{}", b, sfx));
-            match (av, bv) {
-                (Some(x), Some(y)) => {
-                    if x.has_unknown() || y.has_unknown() {
-                        return Some(Value::new(1)); // X
-                    }
-                    if x != y {
-                        equal = false;
-                    }
-                }
-                _ => return Some(Value::new(1)),
-            }
+            acc = acc.and(match (av, bv) {
+                (Some(x), Some(y)) => Self::struct_leaf_cmp(&x, &y, mode),
+                _ if mode == PatternCmpMode::Logical => PatCmp::Unknown,
+                _ => PatCmp::Unequal,
+            });
         }
         // §7.2.1/§11.4.5: a DYNAMIC member compares as the collection it is —
         // same size (same keys) and equal elements.
         for sfx in self.struct_coll_suffixes(&su) {
-            match self.coll_contents_eq(&format!("{}.{}", a, sfx), &format!("{}.{}", b, sfx)) {
-                Some(true) => {}
-                Some(false) => equal = false,
-                None => return Some(Value::new(1)),
-            }
+            let c =
+                self.coll_contents_cmp(&format!("{}.{}", a, sfx), &format!("{}.{}", b, sfx), mode);
+            acc = acc.and(c);
         }
-        Some(if equal {
-            Value::ones(1)
-        } else {
-            Value::zero(1)
-        })
+        Some(acc)
     }
 
     /// IEEE 1800-2017 §11.4.5 / §10.9: `==`, `!=`, `===`, `!==` between an
@@ -598,22 +660,8 @@ impl Simulator {
         if let Some(v) = self.compare_packed_with_pattern(op, left, right, x) {
             return Some(v);
         }
-        let mode = if matches!(op, BinaryOp::WildcardEq | BinaryOp::WildcardNeq) {
-            PatternCmpMode::Wildcard
-        } else if matches!(op, BinaryOp::CaseEq | BinaryOp::CaseNeq) {
-            PatternCmpMode::Case
-        } else {
-            PatternCmpMode::Logical
-        };
-        let want_eq = matches!(op, BinaryOp::Eq | BinaryOp::CaseEq | BinaryOp::WildcardEq);
-        Some(match self.pattern_cmp(x, items, mode)? {
-            PatCmp::Equal => Value::from_u64(want_eq as u64, 1),
-            PatCmp::Unequal => Value::from_u64(!want_eq as u64, 1),
-            PatCmp::Unknown => Value::new(1),
-            // An x/z array element: neither equal nor unequal, as for an
-            // array-to-array comparison.
-            PatCmp::Neither => Value::zero(1),
-        })
+        let (mode, want_eq) = PatternCmpMode::of(op)?;
+        Some(self.pattern_cmp(x, items, mode)?.value(want_eq))
     }
 
     /// §10.9: a bare pattern compared with a PACKED operand `x` takes `x`'s
@@ -632,6 +680,7 @@ impl Simulator {
         right: &Expression,
         x: &Expression,
     ) -> Option<Value> {
+        let (mode, want_eq) = PatternCmpMode::of(op)?;
         let dt = self.expr_type(x)?;
         let (l, r) = if std::ptr::eq(x, left) {
             let pv = self.eval_in_packed_type(right, &dt)?;
@@ -643,15 +692,7 @@ impl Simulator {
         if l.is_real || r.is_real {
             return None;
         }
-        Some(match op {
-            BinaryOp::Eq => l.is_equal(&r),
-            BinaryOp::Neq => l.is_not_equal(&r),
-            BinaryOp::CaseEq => l.case_eq(&r),
-            BinaryOp::CaseNeq => l.case_neq(&r),
-            BinaryOp::WildcardEq => l.wildcard_eq(&r),
-            BinaryOp::WildcardNeq => l.wildcard_ne(&r),
-            _ => return None,
-        })
+        Some(Self::pat_cmp_of(&mode.eq(&l, &r)).value(want_eq))
     }
 
     /// The element-wise comparison of `x` with the pattern `items`; `None`
@@ -719,7 +760,7 @@ impl Simulator {
                 return Some(PatCmp::Unequal);
             };
             let member = Self::append_member_expr(x, &name);
-            acc = acc.and(self.pattern_elem_cmp(member, item, mode), true);
+            acc = acc.and(self.pattern_elem_cmp(member, item, mode));
             if acc == PatCmp::Unequal {
                 break;
             }
@@ -782,7 +823,7 @@ impl Simulator {
             } else {
                 self.pattern_elem_cmp(elem, e, mode)
             };
-            acc = acc.and(r, false);
+            acc = acc.and(r);
             if acc == PatCmp::Unequal {
                 break;
             }
@@ -812,12 +853,7 @@ impl Simulator {
                 let iv = self.eval_expr_ctx(item, ev.width);
                 if !iv.is_real {
                     let iv = iv.resize_for_assign(ev.width);
-                    let r = match mode {
-                        PatternCmpMode::Case => ev.case_eq(&iv),
-                        PatternCmpMode::Wildcard => ev.wildcard_eq(&iv),
-                        PatternCmpMode::Logical => ev.is_equal(&iv),
-                    };
-                    return Self::pat_cmp_of(&r);
+                    return Self::pat_cmp_of(&mode.eq(&ev, &iv));
                 }
             }
         }

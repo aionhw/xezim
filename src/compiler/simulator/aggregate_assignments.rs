@@ -2945,15 +2945,20 @@ impl Simulator {
         }
     }
 
-    /// Whether the collections `a` and `b` hold the same elements (§7.2.1):
-    /// the same size and equal elements for a queue / dynamic array, the
-    /// same keys with equal values for an associative array. `None` when an
-    /// element carries x/z (the comparison is then unknown).
-    pub(super) fn coll_contents_eq(&mut self, a: &str, b: &str) -> Option<bool> {
+    /// Whether the collections `a` and `b` hold the same elements under
+    /// `mode` (§7.2.1, §11.4.5): the same size and equal elements for a
+    /// queue / dynamic array, the same keys with equal values for an
+    /// associative array.
+    pub(super) fn coll_contents_cmp(
+        &mut self,
+        a: &str,
+        b: &str,
+        mode: super::collection_methods::PatternCmpMode,
+    ) -> PatCmp {
         let a_ok = self.ensure_struct_member_coll(a);
         let b_ok = self.ensure_struct_member_coll(b);
         if !(a_ok && b_ok) {
-            return Some(true);
+            return PatCmp::Equal;
         }
         let pairs: Vec<(Option<Value>, Option<Value>)> = if self.is_associative_array(a) {
             let mut ka = self.assoc_key_strs(a);
@@ -2961,7 +2966,7 @@ impl Simulator {
             ka.sort();
             kb.sort();
             if ka != kb {
-                return Some(false);
+                return PatCmp::Unequal;
             }
             ka.iter()
                 .map(|k| {
@@ -2974,7 +2979,7 @@ impl Simulator {
         } else {
             let (na, nb) = (self.get_queue_size(a), self.get_queue_size(b));
             if na != nb {
-                return Some(false);
+                return PatCmp::Unequal;
             }
             (0..na)
                 .map(|i| {
@@ -2985,22 +2990,15 @@ impl Simulator {
                 })
                 .collect()
         };
-        let mut equal = true;
+        let mut acc = PatCmp::Equal;
         for (x, y) in pairs {
-            match (x, y) {
-                (Some(x), Some(y)) => {
-                    if x.has_unknown() || y.has_unknown() {
-                        return None;
-                    }
-                    if x != y {
-                        equal = false;
-                    }
-                }
-                (None, None) => {}
-                _ => equal = false,
-            }
+            acc = acc.and(match (x, y) {
+                (Some(x), Some(y)) => Self::coll_elem_cmp(&x, &y, None, mode),
+                (None, None) => PatCmp::Equal,
+                _ => PatCmp::Unequal,
+            });
         }
-        Some(equal)
+        acc
     }
 
     /// Rearrange a queue so that position `i` holds what used to be at

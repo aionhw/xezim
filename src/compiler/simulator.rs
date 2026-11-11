@@ -14565,28 +14565,34 @@ mod dpi_trampoline_cc_tests {
     }
 }
 
-/// The outcome of comparing an aggregate with an assignment pattern
-/// (`Simulator::pattern_cmp`, IEEE 1800-2017 §11.4.5).
+/// The outcome of comparing an aggregate element by element, with another
+/// aggregate or with an assignment pattern (IEEE 1800-2023 §11.4.5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PatCmp {
     Equal,
     Unequal,
-    /// An x/z struct member: the comparison is x.
+    /// An x/z element or member leaves the relation open: `==` and `!=`
+    /// are x (§11.4.5).
     Unknown,
-    /// An x/z array element: neither `==` nor `!=` holds.
-    Neither,
 }
 
 impl PatCmp {
     /// Fold the next element's outcome in: any unequal element decides;
-    /// otherwise an unknown one makes the result unknown (x for a struct
-    /// member, `Neither` for an array element).
-    fn and(self, next: PatCmp, member: bool) -> PatCmp {
+    /// otherwise an unknown one makes the result unknown.
+    fn and(self, next: PatCmp) -> PatCmp {
         match (self, next) {
             (PatCmp::Unequal, _) | (_, PatCmp::Unequal) => PatCmp::Unequal,
-            (PatCmp::Equal, PatCmp::Equal) => PatCmp::Equal,
-            (PatCmp::Unknown, _) | (_, PatCmp::Unknown) if member => PatCmp::Unknown,
-            _ => PatCmp::Neither,
+            (PatCmp::Unknown, _) | (_, PatCmp::Unknown) => PatCmp::Unknown,
+            _ => PatCmp::Equal,
+        }
+    }
+
+    /// The 1-bit result of an equality (`want_eq`) or inequality operator.
+    fn value(self, want_eq: bool) -> Value {
+        match self {
+            PatCmp::Equal => Value::from_u64(want_eq as u64, 1),
+            PatCmp::Unequal => Value::from_u64(!want_eq as u64, 1),
+            PatCmp::Unknown => Value::new(1),
         }
     }
 }
