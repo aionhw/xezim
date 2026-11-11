@@ -1489,6 +1489,19 @@ impl Simulator {
                     }
                 }
             }
+            // §12.7.3, §7.2.1: `foreach (frame.lanes[k])` over a packed-array
+            // member of a packed-struct class property iterates the member's
+            // packed dimensions.
+            if prop_packed_dims.is_none()
+                && hier.path.len() >= 2
+                && hier.path[..hier.path.len() - 1]
+                    .iter()
+                    .any(|s| self.struct_prop_name_possible(&s.name.name))
+                && let Some(pd) = self.struct_member_packed_dims(array)
+                && pd.len() >= vars.len()
+            {
+                prop_packed_dims = Some(pd);
+            }
             // A bare array name inside a SUBMODULE process resolves
             // under the process's instance scope ("u_s.mem"), like
             // reads/writes already do — otherwise the collection

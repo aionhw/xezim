@@ -1335,6 +1335,27 @@ impl Simulator {
         acc
     }
 
+    /// The packed dimensions, outermost first, of the member the flattened
+    /// chain `e` (`h.frame.lanes`, `frame.lanes` in a method) names when its
+    /// receiver is a packed-struct class property; `None` otherwise.
+    pub(super) fn struct_member_packed_dims(&mut self, e: &Expression) -> Option<Vec<(i64, i64)>> {
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        let last = h.path.len().checked_sub(1).filter(|&l| l > 0)?;
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let sb = Self::ident_prefix_member_access(e, last);
+        let su = self.chain_base_packed_struct(&sb)?;
+        let member = &h.path[last].name.name;
+        let m = su
+            .members
+            .iter()
+            .find(|m| m.declarators.iter().any(|d| &d.name.name == member))?;
+        self.packed_dim_bounds(&m.data_type, &self.module.parameters)
+    }
+
     /// `sb.member[index]` with `member` a packed-array field (two or more
     /// packed dimensions) of the packed struct `sb` names: the element.
     #[inline(never)]
