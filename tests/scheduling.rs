@@ -105,6 +105,8 @@ mod delay_spike_warning;
 mod determinism_and_stall;
 #[path = "scheduling/disable_loop_label.rs"]
 mod disable_loop_label;
+#[path = "scheduling/disable_own_block_and_loop_jumps.rs"]
+mod disable_own_block_and_loop_jumps;
 #[path = "scheduling/edge_delivery.rs"]
 mod edge_delivery;
 #[path = "scheduling/edge_event_lsb.rs"]
