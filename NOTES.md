@@ -10,6 +10,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A static variable of a task or void function called from a clocked block
+  keeps its value between calls: `function void bump(); int k; k = k + 1;
+  n = k; endfunction` under `always @(posedge clk)` counted to 1 on every
+  call. The same holds for a `static` variable of an automatic subroutine
+  (§6.21, §13.3.1).
 * An index naming a class property selects the virtual interface it names:
   `dst[j] = src[j]` with `j` a property, `@(posedge vifs[idx].clk)`,
   `vifs[n-1]`, `vifs[cfg.idx]` and a static index copied a null handle or
