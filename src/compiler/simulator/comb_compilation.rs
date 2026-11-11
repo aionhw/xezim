@@ -835,6 +835,20 @@ impl Simulator {
             } else {
                 wids
             };
+            // §28.16: primitive fall delays have already had the structural
+            // delay-mode override applied. Keep that value when recording the
+            // assignment's per-driver transition delays below.
+            if ca.gate_delay_fall.is_some()
+                && ca.delay_fall.is_some()
+                && wids.len() == 1
+                && lhs_is_bare_ident
+                && self
+                    .module
+                    .gate_fall_delays
+                    .contains_key(self.name_for_id(wids[0]))
+            {
+                ca.delay_fall = self.gate_fall_delay_by_id.get(&wids[0]).copied();
+            }
             // Try fused-gate fast path first: recognizes yosys patterns like
             // `assign d[0] = a & b` or `assign d[0] = ~(a & b)` — executes
             // without VM dispatch, just bit reads + 4-state combinator + set_bit.
@@ -848,7 +862,7 @@ impl Simulator {
             };
             // `assign #(rise, fall[, turnoff]) net = …` (§10.3.3): the lowered
             // item carries the rise delay; the fall / turn-off values go to
-            // the per-net maps consulted by `schedule_delayed_with_delay`,
+            // the per-driver maps consulted by `schedule_delayed_with_delay`,
             // the one point where both the target and the new value are
             // known. Whole-net targets only, like the gate form (§28.11).
             if has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {

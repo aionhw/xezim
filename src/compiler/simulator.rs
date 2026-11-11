@@ -7739,11 +7739,10 @@ pub struct Simulator {
     /// the CALLER specializations alive so value-param resolution can walk up
     /// to them (§13.5.1: args evaluate in the caller's scope).
     spec_scope_stack: Vec<(String, String)>,
-    /// §28.11 gate FALL delays by signal id, from
-    /// `ElaboratedModule::gate_fall_delays`. Empty unless some gate used the
-    /// two-delay `#(rise, fall)` form with differing values.
+    /// §28.16 / §10.3.3 fall delays by driven signal id: a private driver
+    /// stage for a resolved net, otherwise the net itself.
     gate_fall_delay_by_id: HashMap<usize, u64>,
-    /// `assign #(rise, fall, turnoff)` (§10.3.3): per-net turn-off delay,
+    /// `assign #(rise, fall, turnoff)` (§10.3.3): per-driver turn-off delay,
     /// used for a transition to z. Empty unless some assign used the
     /// three-delay form.
     gate_off_delay_by_id: HashMap<usize, u64>,
