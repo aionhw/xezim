@@ -723,3 +723,11 @@ fn modport_qualified_reference_shapes_1050() {
     let (got, want) = nba_shapes_1050(&["s58", "s59"]);
     assert_eq!(got, want);
 }
+
+/// §8.9, §7.2.1: a member of a packed-struct static class property reads the
+/// static cell the whole property is written to (#1050).
+#[test]
+fn static_packed_member_read_shapes_1050() {
+    let (got, want) = nba_shapes_1050(&["s60"]);
+    assert_eq!(got, want);
+}
