@@ -397,6 +397,37 @@ endmodule
     assert_eq!(got, ["T|top_sub n=11 u.n=11"]);
 }
 
+/// #1063: a `(weak0, weak1)` continuous assign in a NON-top module must pull
+/// its net low/off the same way a top-module pull does: as a weak driver
+/// that loses to the net's real (strong) driver but holds the net where it is
+/// z. Strength was dropped on the inlined path and folded as STRONG.
+#[test]
+fn submodule_weak_pull_loses_to_real_driver() {
+    let got = lines(
+        "subweak",
+        r#"
+module sub;
+  wire [7:0] n;
+  logic      en = 1'b0;
+  assign n = en ? 8'hc3 : 'z;
+  assign (weak0, weak1) n = 8'hff;
+endmodule
+module t;
+  wire [7:0] n;
+  sub u ();
+  initial begin
+    #1 $display("T|weak_sub u.n=%h", u.n);
+    u.en = 1'b1;
+    #1 $display("T|strong_sub u.n=%h", u.n);
+    $finish;
+  end
+endmodule
+"#,
+        "t",
+    );
+    assert_eq!(got, ["T|weak_sub u.n=ff", "T|strong_sub u.n=c3"]);
+}
+
 /// The VALUE side of every strength level (supply over strong over pull
 /// over weak), compared with `%b` only; the `%v` strength names are pinned
 /// by the ignored test below.
