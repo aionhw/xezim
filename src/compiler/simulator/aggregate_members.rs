@@ -2718,7 +2718,7 @@ impl Simulator {
         if rest.is_empty() {
             return Some((0, total_w));
         }
-        let dims = Self::packed_dim_bounds(dt, params)?;
+        let dims = self.packed_dim_bounds(dt, params)?;
         let counts: Vec<u32> = dims
             .iter()
             .map(|&(l, r)| u32::try_from((l - r).unsigned_abs() + 1).ok().unwrap_or(0))
@@ -2757,13 +2757,53 @@ impl Simulator {
     /// contributes its own width as one range so bit-selects on it still
     /// resolve; a `real` never does).
     pub(super) fn packed_dim_bounds(
+        &self,
         dt: &DataType,
         params: &HashMap<String, Value>,
     ) -> Option<Vec<(i64, i64)>> {
         use crate::ast::types::{DataType as DT, PackedDimension};
-        let dims: Vec<PackedDimension> = match dt {
+        let mut out: Vec<(i64, i64)> = Vec::new();
+        let mut cur = dt.clone();
+        // Follow a typedef/type-parameter chain, collecting each level's
+        // PACKED dimensions outermost-first so a member typed via a typedef
+        // (`lane_t [0:3]`, `typedef logic[7:0] lane_t;`) gets its array shape
+        // as well as a bare vector would.
+        loop {
+            match &cur {
+                DT::TypeReference {
+                    name,
+                    dimensions,
+                    ..
+                } => {
+                    for d in dimensions {
+                        let PackedDimension::Range { left, right, .. } = d else {
+                            return None;
+                        };
+                        out.push((
+                            super::elaborate::const_eval_i64_with_params(left, Some(params))?,
+                            super::elaborate::const_eval_i64_with_params(right, Some(params))?,
+                        ));
+                    }
+                    let next = self.module.typedef_types.get(&name.name.name)?.clone();
+                    cur = next;
+                }
+                _ => break,
+            }
+            if out.len() > 64 {
+                return None;
+            }
+        }
+        match &cur {
             DT::IntegerVector { dimensions, .. } | DT::Implicit { dimensions, .. } => {
-                dimensions.clone()
+                for d in dimensions {
+                    let PackedDimension::Range { left, right, .. } = d else {
+                        return None;
+                    };
+                    out.push((
+                        super::elaborate::const_eval_i64_with_params(left, Some(params))?,
+                        super::elaborate::const_eval_i64_with_params(right, Some(params))?,
+                    ));
+                }
             }
             DT::IntegerAtom { kind, .. } => {
                 let w = match kind {
@@ -2774,15 +2814,25 @@ impl Simulator {
                     crate::ast::types::IntegerAtomType::LongInt
                     | crate::ast::types::IntegerAtomType::Time => 64,
                 };
-                return Some(vec![(w as i64 - 1, 0)]);
+                out.push((w as i64 - 1, 0));
             }
-            DT::Struct(su) if !su.dimensions.is_empty() => su.dimensions.clone(),
+            DT::Struct(su) if !su.dimensions.is_empty() => {
+                for d in &su.dimensions {
+                    let PackedDimension::Range { left, right, .. } = d else {
+                        return None;
+                    };
+                    out.push((
+                        super::elaborate::const_eval_i64_with_params(left, Some(params))?,
+                        super::elaborate::const_eval_i64_with_params(right, Some(params))?,
+                    ));
+                }
+            }
             _ => return None,
-        };
-        if dims.is_empty() {
+        }
+        if out.is_empty() {
             return None;
         }
-        Self::packed_range_bounds(&dims, params)
+        Some(out)
     }
 
     /// Const-resolved `(left, right)` of each of `dims`, in order; `None` for

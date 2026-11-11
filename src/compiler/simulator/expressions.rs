@@ -55,7 +55,7 @@ impl Simulator {
             &self.module.typedef_types,
         )
         .1
-        .or_else(|| Self::packed_dim_bounds(&m_dt, params))?;
+        .or_else(|| self.packed_dim_bounds(&m_dt, params))?;
         if dims.len() < idx.len() {
             return None;
         }
