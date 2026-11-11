@@ -627,3 +627,6 @@ mod review_interconnect_element_types;
 
 #[path = "misc/cli_worker_stack_1055.rs"]
 mod cli_worker_stack_1055;
+
+#[path = "misc/prepared_cache_driven_init.rs"]
+mod prepared_cache_driven_init;
