@@ -319,6 +319,8 @@ mod dyn_row_sized_new_copy;
 mod assoc_elem_select_read;
 #[path = "collections/assoc_packed_elem.rs"]
 mod assoc_packed_elem;
+#[path = "collections/unpacked_case_compare.rs"]
+mod unpacked_case_compare;
 #[path = "collections/unpacked_row_pattern_store.rs"]
 mod unpacked_row_pattern_store;
 #[path = "collections/unpacked_row_pattern_followups.rs"]
