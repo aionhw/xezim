@@ -2555,6 +2555,16 @@ impl Simulator {
                 return self.read_class_agg(&r);
             }
         }
+        // §8.9/§7.8: a member of a class STATIC property whose type is a
+        // packed struct (`Cls::sp.member`, either parse shape) slices the
+        // shared static cell by the struct layout. It is not a class
+        // aggregate (no object exists), so the arm above declines it and
+        // every later arm read a 32-bit 0.
+        if !self.no_class_objects() {
+            if let Some(v) = self.static_packed_member_value(expr) {
+                return v;
+            }
+        }
         // §7.2/§18.4: a WHOLE unpacked-struct class property read as a value —
         // `return s;` from a method, `v = obj.s;`. Its members are per-instance
         // cells with no container, so the lookups further down returned the

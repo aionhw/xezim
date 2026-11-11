@@ -2968,6 +2968,111 @@ impl Simulator {
         v
     }
 
+    /// §8.9/§7.8: a member of a class STATIC property whose declared type is
+    /// a PACKED struct — `Cls::sp.member`, in either parse shape (the flat
+    /// 3-segment ident, or `MemberAccess(Ident([Cls, sp]), member)` inside a
+    /// subroutine body). The whole-property reference resolves through
+    /// `class_static_get`; the member must slice that shared cell by the
+    /// struct's packed layout. Without this the reference fell through every
+    /// read arm and returned a 32-bit 0 while the whole-property read was
+    /// correct. Unpacked-struct statics keep their holder-object storage
+    /// (`static_struct_names`) and are not claimed here.
+    pub(super) fn static_packed_member_value(&mut self, e: &Expression) -> Option<Value> {
+        if self.no_class_objects() {
+            return None;
+        }
+        let (cls, prop, member): (String, String, String) = match &e.kind {
+            ExprKind::Ident(h)
+                if h.path.len() == 3 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                (
+                    h.path[0].name.name.clone(),
+                    h.path[1].name.name.clone(),
+                    h.path[2].name.name.clone(),
+                )
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                // Inside a subroutine body `Cls::sp` itself parses as
+                // `MemberAccess(Ident([Cls]), sp)` (see the class-scoped
+                // const arm of the member read path).
+                if let ExprKind::MemberAccess {
+                    expr: inner,
+                    member: prop_m,
+                } = &expr.kind
+                {
+                    let ExprKind::Ident(h) = &inner.kind else {
+                        return None;
+                    };
+                    if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                        return None;
+                    }
+                    (
+                        h.path[0].name.name.clone(),
+                        prop_m.name.clone(),
+                        member.name.clone(),
+                    )
+                } else {
+                    let ExprKind::Ident(h) = &expr.kind else {
+                        return None;
+                    };
+                    if h.path.len() != 2 || !h.path.iter().all(|s| s.selects.is_empty()) {
+                        return None;
+                    }
+                    (
+                        h.path[0].name.name.clone(),
+                        h.path[1].name.name.clone(),
+                        member.name.clone(),
+                    )
+                }
+            }
+            _ => return None,
+        };
+        // The head must name the class itself, not a same-named signal or a
+        // frame local that shadows it.
+        if !self.module.classes.contains_key(&cls)
+            || self.signal_name_to_id.contains_key(cls.as_str())
+            || self.local_stack.last().is_some_and(|l| l.contains_key(&cls))
+        {
+            return None;
+        }
+        // Only a STATIC property of that class (or an ancestor).
+        self.static_prop_key(&cls, &prop)?;
+        // The declaring class on the chain owns the property's type (an
+        // inherited static's declaration lives there); it must be a PACKED
+        // struct.
+        let su = {
+            let mut cur = self.module.classes.get(&cls);
+            let mut found: Option<std::rc::Rc<crate::ast::types::StructUnionType>> = None;
+            for _ in 0..64 {
+                let Some(c) = cur else { break };
+                if let Some(dt) = self.class_prop_decl_type(c, &prop) {
+                    if let DataType::Struct(su) = self.resolve_dt(dt)
+                        && !Self::spreads_member_wise(&su)
+                    {
+                        found = Some(std::rc::Rc::new(su));
+                    }
+                    break;
+                }
+                cur = c
+                    .extends
+                    .as_deref()
+                    .and_then(|x| self.module.classes.get(x));
+            }
+            found?
+        };
+        let (off, w) = {
+            let layout = self.class_packed_layout(&su, &[]);
+            let &(_, off, w) = layout.0.iter().find(|(n, _, _)| *n == member)?;
+            (off, w)
+        };
+        let whole = self.class_static_get(&cls, &prop)?;
+        let mut out = Value::zero(w.max(1));
+        for i in 0..w {
+            out.set_bit(i as usize, whole.get_bit((off + i) as usize));
+        }
+        Some(out)
+    }
+
     /// §8.9: the class and specialization of the static `member` reached
     /// through property `prop` of object `owner` when that property holds
     /// null: the property's declared type decides.
