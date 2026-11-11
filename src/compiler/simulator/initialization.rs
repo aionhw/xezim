@@ -3707,8 +3707,9 @@ impl Simulator {
             }
             m
         };
+        let addressed_statics = Self::addressed_subroutine_statics(&module, &deferred_always);
         let (hoisted_sub_static_names, hoisted_static_subroutines) =
-            Self::hoist_subroutine_statics(&mut module);
+            Self::hoist_subroutine_statics(&mut module, &addressed_statics);
         let port_formal_two_state: HashMap<String, bool> = {
             let top = format!("{}.", module.name);
             module

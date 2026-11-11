@@ -354,7 +354,8 @@ fn method_boost_enabled() -> bool {
 // §13.4.1: returns inside nested inline calls exit only the innermost callee.
 // §13.5.1 / §8.25: packed method arguments and results retain specialized widths.
 // §8.8: typed constructors compile the named class scope.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3073;
+// §6.21: addressed static locals retain shared storage.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3074;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never

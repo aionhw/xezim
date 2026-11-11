@@ -12781,9 +12781,14 @@ impl<'a> BytecodeCompiler<'a> {
                 let explicit = matches!(lifetime, Some(Lifetime::Static));
                 let is_static = explicit || (!auto && lifetime.is_none());
                 is_static
-                    && declarators.iter().any(|d| match &d.init {
-                        Some(_) => explicit,
-                        None => Self::static_local_carries(&d.name.name, &stmts[i + 1..]),
+                    && declarators.iter().any(|d| {
+                        // Hoisted static cells are hierarchically observable
+                        // even when this call writes them before reading.
+                        (explicit && d.name.name.contains('.'))
+                            || match &d.init {
+                                Some(_) => explicit,
+                                None => Self::static_local_carries(&d.name.name, &stmts[i + 1..]),
+                            }
                     })
             }
             _ => nested(s, auto),

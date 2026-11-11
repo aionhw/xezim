@@ -631,11 +631,423 @@ impl Simulator {
         }
     }
 
+    /// §23.6: find addressed subroutine storage without expanding lazy bodies
+    /// or enumerating array elements. Qualify paths against their source scope.
+    pub(super) fn addressed_subroutine_statics(
+        module: &ElaboratedModule,
+        deferred: &[DeferredAlways],
+    ) -> HashSet<String> {
+        let routines: HashSet<&str> = module
+            .tasks
+            .values()
+            .filter(|t| t.name.scopes.is_empty())
+            .map(|t| t.name.name.name.as_str())
+            .chain(
+                module
+                    .functions
+                    .values()
+                    .filter(|f| f.name.scopes.is_empty())
+                    .map(|f| f.name.name.name.as_str()),
+            )
+            .collect();
+        let routine_leaves: HashSet<&str> = routines
+            .iter()
+            .map(|name| name.rsplit('.').next().unwrap_or(name))
+            .collect();
+        let mut addressed = HashSet::default();
+        if routines.is_empty() {
+            return addressed;
+        }
+        fn constraint_exprs(item: &ConstraintItem, f: &mut dyn FnMut(&Expression)) {
+            use crate::ast::decl::{ConstraintRange, DistWeight};
+            match item {
+                ConstraintItem::Expr(e) => f(e),
+                ConstraintItem::Inside {
+                    expr,
+                    range,
+                    dist_weights,
+                    ..
+                } => {
+                    f(expr);
+                    for range in range {
+                        match range {
+                            ConstraintRange::Value(e) => f(e),
+                            ConstraintRange::Range { lo, hi } => {
+                                f(lo);
+                                f(hi);
+                            }
+                        }
+                    }
+                    for weight in dist_weights.iter().flatten() {
+                        match weight {
+                            DistWeight::Each(e) | DistWeight::Total(e) => f(e),
+                        }
+                    }
+                }
+                ConstraintItem::Implication {
+                    condition,
+                    constraint,
+                    ..
+                } => {
+                    f(condition);
+                    constraint_exprs(constraint, f);
+                }
+                ConstraintItem::IfElse {
+                    condition,
+                    then_item,
+                    else_item,
+                    ..
+                } => {
+                    f(condition);
+                    constraint_exprs(then_item, f);
+                    if let Some(item) = else_item {
+                        constraint_exprs(item, f);
+                    }
+                }
+                ConstraintItem::Foreach { array, item, .. } => {
+                    f(array);
+                    constraint_exprs(item, f);
+                }
+                ConstraintItem::Soft(item) => constraint_exprs(item, f),
+                ConstraintItem::Block(items) => {
+                    for item in items {
+                        constraint_exprs(item, f);
+                    }
+                }
+                ConstraintItem::Unique { exprs, .. } => {
+                    for expr in exprs {
+                        f(expr);
+                    }
+                }
+                ConstraintItem::Solve {
+                    before_paths,
+                    after_paths,
+                    ..
+                } => {
+                    for expr in before_paths.iter().chain(after_paths) {
+                        f(expr);
+                    }
+                }
+            }
+        }
+        fn pattern_exprs(pattern: &crate::ast::stmt::Pattern, f: &mut dyn FnMut(&Expression)) {
+            use crate::ast::stmt::Pattern;
+            match pattern {
+                Pattern::Expr(e) => f(e),
+                Pattern::Tagged { inner: Some(p), .. } => pattern_exprs(p, f),
+                Pattern::Struct(items) => {
+                    for (_, p) in items {
+                        pattern_exprs(p, f);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let top = format!("{}.", module.name);
+        fn collect_expr_names(
+            expr: &Expression,
+            module: &ElaboratedModule,
+            routine_leaves: &HashSet<&str>,
+            names: &mut HashSet<String>,
+        ) {
+            super::elaborate::for_each_sub_expr(expr, &mut |e| {
+                // Constraint/pattern binders stay out of the shared validator
+                // visitor; only their expression payloads enter this census.
+                match &e.kind {
+                    ExprKind::RandomizeWith { constraints, .. } => {
+                        for item in constraints {
+                            constraint_exprs(item, &mut |e| {
+                                collect_expr_names(e, module, routine_leaves, names)
+                            });
+                        }
+                    }
+                    ExprKind::Matches { pattern, .. } => {
+                        pattern_exprs(pattern, &mut |e| {
+                            collect_expr_names(e, module, routine_leaves, names)
+                        });
+                    }
+                    _ => {}
+                }
+                let name = match &e.kind {
+                    ExprKind::Ident(h) => Simulator::resolve_hier_name_static(h, module),
+                    ExprKind::MemberAccess { .. } => {
+                        let Some(parts) = Simulator::flatten_member_path(e) else {
+                            return;
+                        };
+                        parts.join(".")
+                    }
+                    _ => return,
+                };
+                if let Some((prefix, leaf)) = name.rsplit_once('.') {
+                    if !prefix.split('.').any(|part| routine_leaves.contains(part)) {
+                        return;
+                    }
+                    let leaf = leaf.split('[').next().unwrap_or(leaf);
+                    names.insert(format!("{prefix}.{leaf}"));
+                }
+            });
+        }
+        let expr_names = |e: &Expression, names: &mut HashSet<String>| {
+            collect_expr_names(e, module, &routine_leaves, names);
+        };
+        let mut insert = |names: &[String], scope: &str| {
+            for name in names {
+                let mut scope = if name.starts_with(top.as_str()) {
+                    ""
+                } else {
+                    scope.trim_end_matches('.')
+                };
+                'scopes: loop {
+                    let candidate = if scope.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{scope}.{name}")
+                    };
+                    let candidate = candidate.strip_prefix(top.as_str()).unwrap_or(&candidate);
+                    let mut prefix = candidate;
+                    while let Some((parent, _)) = prefix.rsplit_once('.') {
+                        if routines.contains(parent) {
+                            addressed.insert(candidate.to_string());
+                            break 'scopes;
+                        }
+                        prefix = parent;
+                    }
+                    if scope.is_empty() {
+                        break;
+                    }
+                    scope = scope.rsplit_once('.').map_or("", |(p, _)| p);
+                }
+            }
+        };
+        let mut raw_cache: HashMap<usize, Vec<String>> = HashMap::default();
+        let mut scan = |stmt: &Statement, scope: &str| {
+            let raw = raw_cache
+                .entry(stmt as *const Statement as usize)
+                .or_insert_with(|| {
+                    let mut names = HashSet::default();
+                    super::elaborate::for_each_stmt_expr(stmt, &mut |e| expr_names(e, &mut names));
+                    names.into_iter().collect()
+                });
+            insert(raw, scope);
+        };
+        for block in module
+            .initial_blocks
+            .iter()
+            .chain(&module.final_blocks)
+            .chain(&module.static_init_blocks)
+            .chain(&module.program_initial_blocks)
+        {
+            scan(&block.stmt, &block.scope);
+        }
+        for block in &module.always_blocks {
+            scan(&block.stmt, &block.scope);
+        }
+        for block in &module.pending_initial {
+            let scope = format!("{}{}", block.ctx.prefix, block.gen_scope);
+            scan(&block.source, &scope);
+        }
+        for block in deferred {
+            match block {
+                DeferredAlways::Eager(block) => scan(&block.stmt, &block.scope),
+                DeferredAlways::Lazy { lazy, .. } => scan(&lazy.src.source, &lazy.src.scope()),
+            }
+        }
+        for routine in module.tasks.values() {
+            for stmt in &routine.items {
+                scan(stmt, &routine.name.name.name);
+            }
+        }
+        for routine in module.functions.values() {
+            for stmt in &routine.items {
+                scan(stmt, &routine.name.name.name);
+            }
+        }
+        for class in module.classes.values() {
+            for method in class.methods.values() {
+                use crate::ast::decl::ClassMethodKind as M;
+                let items = match &method.kind {
+                    M::Function(f) | M::Extern(f) | M::PureVirtual(f) => &f.items,
+                    M::Task(t) => &t.items,
+                };
+                for stmt in items {
+                    scan(stmt, "");
+                }
+            }
+        }
+        drop(scan);
+        for class in module.classes.values() {
+            for constraint in class.constraints.values() {
+                let mut names = HashSet::default();
+                for item in &constraint.items {
+                    constraint_exprs(item, &mut |e| expr_names(e, &mut names));
+                }
+                insert(&names.into_iter().collect::<Vec<_>>(), "");
+            }
+        }
+        for assign in &module.continuous_assigns {
+            let mut names = HashSet::default();
+            expr_names(&assign.lhs, &mut names);
+            expr_names(&assign.rhs, &mut names);
+            insert(&names.into_iter().collect::<Vec<_>>(), "");
+        }
+        for assign in &module.pending_cont_assign {
+            let mut names = HashSet::default();
+            expr_names(&assign.lhs_source, &mut names);
+            expr_names(&assign.rhs_source, &mut names);
+            insert(&names.into_iter().collect::<Vec<_>>(), &assign.ctx.prefix);
+        }
+        addressed
+    }
+
+    /// Mark only declaration-owned static locals; automatic frames must
+    /// never become addressable because another routine reuses a name.
+    fn has_addressed_statics(
+        stmt: &Statement,
+        scope: &str,
+        automatic: bool,
+        addressed: &HashSet<String>,
+    ) -> bool {
+        use crate::ast::types::Lifetime;
+        match &stmt.kind {
+            StatementKind::VarDecl {
+                lifetime,
+                declarators,
+                ..
+            } => {
+                if *lifetime == Some(Lifetime::Automatic) || (lifetime.is_none() && automatic) {
+                    return false;
+                }
+                let found = declarators.iter().any(|d| {
+                    let path = if d.name.name.contains('.') {
+                        d.name.name.clone()
+                    } else {
+                        format!("{scope}.{}", d.name.name)
+                    };
+                    addressed.contains(&path)
+                });
+                found
+            }
+            StatementKind::SeqBlock { name, stmts }
+            | StatementKind::ParBlock { name, stmts, .. } => {
+                let nested = name.as_ref().map(|n| format!("{scope}.{}", n.name));
+                let scope = nested.as_deref().unwrap_or(scope);
+                let mut found = false;
+                for stmt in stmts {
+                    found |= Self::has_addressed_statics(stmt, scope, automatic, addressed);
+                }
+                found
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                let mut found = Self::has_addressed_statics(then_stmt, scope, automatic, addressed);
+                if let Some(stmt) = else_stmt {
+                    found |= Self::has_addressed_statics(stmt, scope, automatic, addressed);
+                }
+                found
+            }
+            StatementKind::Case { items, .. } => {
+                let mut found = false;
+                for item in items {
+                    found |= Self::has_addressed_statics(&item.stmt, scope, automatic, addressed);
+                }
+                found
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => {
+                Self::has_addressed_statics(body, scope, automatic, addressed)
+            }
+            _ => false,
+        }
+    }
+
+    fn mark_addressed_statics(
+        stmt: &mut Statement,
+        scope: &str,
+        automatic: bool,
+        addressed: &HashSet<String>,
+    ) -> bool {
+        use crate::ast::types::Lifetime;
+        match &mut stmt.kind {
+            StatementKind::VarDecl {
+                lifetime,
+                declarators,
+                ..
+            } => {
+                if *lifetime == Some(Lifetime::Automatic) || (lifetime.is_none() && automatic) {
+                    return false;
+                }
+                let found = declarators.iter().any(|d| {
+                    let path = if d.name.name.contains('.') {
+                        d.name.name.clone()
+                    } else {
+                        format!("{scope}.{}", d.name.name)
+                    };
+                    addressed.contains(&path)
+                });
+                if found {
+                    *lifetime = Some(Lifetime::Static);
+                }
+                found
+            }
+            StatementKind::SeqBlock { name, stmts }
+            | StatementKind::ParBlock { name, stmts, .. } => {
+                let nested = name.as_ref().map(|n| format!("{scope}.{}", n.name));
+                let scope = nested.as_deref().unwrap_or(scope);
+                let mut found = false;
+                for stmt in stmts {
+                    found |= Self::mark_addressed_statics(stmt, scope, automatic, addressed);
+                }
+                found
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                let mut found =
+                    Self::mark_addressed_statics(then_stmt, scope, automatic, addressed);
+                if let Some(stmt) = else_stmt {
+                    found |= Self::mark_addressed_statics(stmt, scope, automatic, addressed);
+                }
+                found
+            }
+            StatementKind::Case { items, .. } => {
+                let mut found = false;
+                for item in items {
+                    found |=
+                        Self::mark_addressed_statics(&mut item.stmt, scope, automatic, addressed);
+                }
+                found
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => {
+                Self::mark_addressed_statics(body, scope, automatic, addressed)
+            }
+            _ => false,
+        }
+    }
+
     /// §6.21 / §13.3 / §13.4: module subroutine statics have one
     /// declaration-owned store, shared by recursion and allocated before
     /// time zero. Allocate all cells first, then evaluate their initializers.
     pub(super) fn hoist_subroutine_statics(
         module: &mut ElaboratedModule,
+        addressed: &HashSet<String>,
     ) -> (HashSet<String>, HashSet<String>) {
         fn selected(s: &Statement, nba_names: &HashSet<String>) -> bool {
             match &s.kind {
@@ -679,6 +1091,7 @@ impl Simulator {
             initialize: &mut Vec<Statement>,
             names: &mut HashSet<String>,
             nba_names: &HashSet<String>,
+            addressed: &HashSet<String>,
         ) {
             match &s.kind {
                 StatementKind::VarDecl {
@@ -690,6 +1103,7 @@ impl Simulator {
                         if d.init.is_none()
                             && d.dimensions.is_empty()
                             && !nba_names.contains(&d.name.name)
+                            && !addressed.contains(&d.name.name)
                         {
                             continue;
                         }
@@ -739,7 +1153,9 @@ impl Simulator {
                 }
                 StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                     for st in stmts {
-                        collect(st, module, formals, allocate, initialize, names, nba_names);
+                        collect(
+                            st, module, formals, allocate, initialize, names, nba_names, addressed,
+                        );
                     }
                 }
                 StatementKind::If {
@@ -749,15 +1165,19 @@ impl Simulator {
                 } => {
                     collect(
                         then_stmt, module, formals, allocate, initialize, names, nba_names,
+                        addressed,
                     );
                     if let Some(st) = else_stmt {
-                        collect(st, module, formals, allocate, initialize, names, nba_names);
+                        collect(
+                            st, module, formals, allocate, initialize, names, nba_names, addressed,
+                        );
                     }
                 }
                 StatementKind::Case { items, .. } => {
                     for i in items {
                         collect(
                             &i.stmt, module, formals, allocate, initialize, names, nba_names,
+                            addressed,
                         );
                     }
                 }
@@ -769,27 +1189,38 @@ impl Simulator {
                 | StatementKind::Foreach { body, .. }
                 | StatementKind::TimingControl { stmt: body, .. }
                 | StatementKind::Wait { stmt: body, .. } => collect(
-                    body, module, formals, allocate, initialize, names, nba_names,
+                    body, module, formals, allocate, initialize, names, nba_names, addressed,
                 ),
                 _ => {}
             }
         }
         fn prepare(
             module: &ElaboratedModule,
-            items: &mut Vec<Statement>,
+            items: &mut crate::ast::shared_vec::SharedVec<Statement>,
             ports: &[crate::ast::decl::FunctionPort],
             routine: &str,
             ordinal: usize,
             allocate: &mut Vec<Statement>,
             initialize: &mut Vec<Statement>,
             names: &mut HashSet<String>,
+            addressed: &HashSet<String>,
+            automatic: bool,
         ) -> bool {
+            let addressable = !addressed.is_empty()
+                && items.iter().any(|stmt| {
+                    Simulator::has_addressed_statics(stmt, routine, automatic, addressed)
+                });
             let mut nba_names = HashSet::default();
             for stmt in items.iter() {
                 Simulator::collect_nba_roots(stmt, &mut nba_names);
             }
-            if !items.iter().any(|s| selected(s, &nba_names)) {
+            if !addressable && !items.iter().any(|s| selected(s, &nba_names)) {
                 return false;
+            }
+            if addressable {
+                for stmt in items.iter_mut() {
+                    Simulator::mark_addressed_statics(stmt, routine, automatic, addressed);
+                }
             }
             let span = items
                 .first()
@@ -801,7 +1232,7 @@ impl Simulator {
                         name: routine.to_string(),
                         span,
                     }),
-                    stmts: std::mem::take(items),
+                    stmts: std::mem::take(items).into_vec(),
                 },
                 span,
             );
@@ -866,10 +1297,10 @@ impl Simulator {
             nba_names.clear();
             Simulator::collect_nba_roots(&body, &mut nba_names);
             collect(
-                &body, module, &formals, allocate, initialize, names, &nba_names,
+                &body, module, &formals, allocate, initialize, names, &nba_names, addressed,
             );
             if let StatementKind::SeqBlock { stmts, .. } = body.kind {
-                *items = stmts;
+                *items = stmts.into();
             }
             true
         }
@@ -880,7 +1311,8 @@ impl Simulator {
         let mut ordinal = 0usize;
         let mut functions: Vec<_> = module.functions.keys().cloned().collect();
         functions.sort();
-        let mut rewritten: HashMap<String, crate::ast::shared_vec::SharedVec<Statement>> = HashMap::default();
+        let mut rewritten: HashMap<String, crate::ast::shared_vec::SharedVec<Statement>> =
+            HashMap::default();
         for key in functions {
             let Some(original) = module.functions.get(&key) else {
                 continue;
@@ -902,6 +1334,8 @@ impl Simulator {
                     &mut allocate,
                     &mut initialize,
                     &mut names,
+                    addressed,
+                    fd.lifetime == Some(crate::ast::types::Lifetime::Automatic),
                 ) {
                     continue;
                 }
@@ -927,6 +1361,8 @@ impl Simulator {
                     &mut allocate,
                     &mut initialize,
                     &mut names,
+                    addressed,
+                    td.lifetime == Some(crate::ast::types::Lifetime::Automatic),
                 ) {
                     routines.insert(td.name.name.name.clone());
                 }
