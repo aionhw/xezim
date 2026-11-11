@@ -1228,3 +1228,5 @@ mod typed_constructor_scope;
 
 #[path = "classes/gc_large_payload_reclamation_1054.rs"]
 mod gc_large_payload_reclamation_1054;
+#[path = "classes/class_property_nba_real_targets.rs"]
+mod class_property_nba_real_targets;
