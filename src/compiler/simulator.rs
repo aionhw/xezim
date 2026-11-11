@@ -8512,6 +8512,9 @@ pub struct Simulator {
     /// at setup: a dotted name with no inner segment among them is not
     /// modport-qualified (§25.5).
     modport_names: HashSet<String>,
+    /// The static class properties a packed-struct member read can name
+    /// (`collect_static_struct_props`), built at setup.
+    static_struct_props: HashSet<String>,
     /// The class properties that can hold a `real`
     /// (`collect_class_real_props`), built at setup.
     class_real_props: HashSet<String>,

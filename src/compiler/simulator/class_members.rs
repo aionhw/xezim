@@ -2968,92 +2968,113 @@ impl Simulator {
         v
     }
 
-    /// §8.9/§7.8: a member of a class STATIC property whose declared type is
-    /// a PACKED struct — `Cls::sp.member`, in either parse shape (the flat
-    /// 3-segment ident, or `MemberAccess(Ident([Cls, sp]), member)` inside a
-    /// subroutine body). The whole-property reference resolves through
-    /// `class_static_get`; the member must slice that shared cell by the
-    /// struct's packed layout. Without this the reference fell through every
-    /// read arm and returned a 32-bit 0 while the whole-property read was
-    /// correct. Unpacked-struct statics keep their holder-object storage
+    /// §8.9, §7.2.1: a member of a class STATIC property whose declared type
+    /// is a PACKED struct — `Cls::sp.m`, `h.sp.m` through a handle of the
+    /// class, or `sp.m` inside the class, at any member depth, in either parse
+    /// shape (a flat dotted identifier, or the `MemberAccess` chain inside a
+    /// subroutine body). The whole property resolves through
+    /// `class_static_get`; the member slices that shared cell by the packed
+    /// layout. Without this the reference fell through every read arm and
+    /// returned a 32-bit 0 while the whole-property read was correct.
+    /// Unpacked-struct statics keep their holder-object storage
     /// (`static_struct_names`) and are not claimed here.
     pub(super) fn static_packed_member_value(&mut self, e: &Expression) -> Option<Value> {
-        if self.no_class_objects() {
+        // Cheap gate: some name before the last must be a static property
+        // that can be a struct (`static_struct_props`).
+        if self.static_struct_props.is_empty() {
             return None;
         }
-        let (cls, prop, member): (String, String, String) = match &e.kind {
-            ExprKind::Ident(h)
-                if h.path.len() == 3 && h.path.iter().all(|s| s.selects.is_empty()) =>
-            {
-                (
-                    h.path[0].name.name.clone(),
-                    h.path[1].name.name.clone(),
-                    h.path[2].name.name.clone(),
-                )
+        let statics = &self.static_struct_props;
+        let candidate = match &e.kind {
+            ExprKind::Ident(h) if h.root.is_none() && h.path.len() >= 2 => {
+                h.path.iter().all(|s| s.selects.is_empty())
+                    && h.path[..h.path.len() - 1]
+                        .iter()
+                        .any(|s| statics.contains(s.name.name.as_str()))
             }
-            ExprKind::MemberAccess { expr, member } => {
-                // Inside a subroutine body `Cls::sp` itself parses as
-                // `MemberAccess(Ident([Cls]), sp)` (see the class-scoped
-                // const arm of the member read path).
-                if let ExprKind::MemberAccess {
-                    expr: inner,
-                    member: prop_m,
-                } = &expr.kind
-                {
-                    let ExprKind::Ident(h) = &inner.kind else {
-                        return None;
-                    };
-                    if h.path.len() != 1 || !h.path[0].selects.is_empty() {
-                        return None;
+            ExprKind::MemberAccess { expr, .. } => {
+                let mut cur: &Expression = expr;
+                let mut hit = false;
+                loop {
+                    match &cur.kind {
+                        ExprKind::MemberAccess { expr, member } => {
+                            hit |= statics.contains(member.name.as_str());
+                            cur = expr;
+                        }
+                        ExprKind::Ident(h) if h.root.is_none() => {
+                            break hit
+                                || (h.path.iter().all(|s| s.selects.is_empty())
+                                    && h.path
+                                        .iter()
+                                        .any(|s| statics.contains(s.name.name.as_str())));
+                        }
+                        _ => return None,
                     }
-                    (
-                        h.path[0].name.name.clone(),
-                        prop_m.name.clone(),
-                        member.name.clone(),
-                    )
-                } else {
-                    let ExprKind::Ident(h) = &expr.kind else {
-                        return None;
-                    };
-                    if h.path.len() != 2 || !h.path.iter().all(|s| s.selects.is_empty()) {
-                        return None;
-                    }
-                    (
-                        h.path[0].name.name.clone(),
-                        h.path[1].name.name.clone(),
-                        member.name.clone(),
-                    )
                 }
             }
-            _ => return None,
+            _ => false,
         };
-        // The head must name the class itself, not a same-named signal or a
-        // frame local that shadows it.
-        if !self.module.classes.contains_key(&cls)
-            || self.signal_name_to_id.contains_key(cls.as_str())
-            || self
-                .local_stack
-                .last()
-                .is_some_and(|l| l.contains_key(&cls))
-        {
+        if !candidate {
             return None;
         }
-        // Only a STATIC property of that class (or an ancestor).
-        self.static_prop_key(&cls, &prop)?;
+        // The dotted spelling, outermost name first.
+        let mut names: Vec<&str> = Vec::new();
+        match &e.kind {
+            ExprKind::Ident(h) => names.extend(h.path.iter().map(|s| s.name.name.as_str())),
+            _ => {
+                let mut cur = e;
+                while let ExprKind::MemberAccess { expr, member } = &cur.kind {
+                    names.push(member.name.as_str());
+                    cur = expr;
+                }
+                let ExprKind::Ident(h) = &cur.kind else {
+                    return None;
+                };
+                names.extend(h.path.iter().rev().map(|s| s.name.name.as_str()));
+                names.reverse();
+            }
+        }
+        let shadowed = |sim: &Self, n: &str| {
+            sim.signal_name_to_id.contains_key(n)
+                || sim.local_stack.last().is_some_and(|l| l.contains_key(n))
+        };
+        // The class whose static `prop` is named, and the member path below it.
+        let (cls, prop, members): (String, &str, &[&str]) = if names.len() >= 3
+            && let Some(cls) =
+                (if self.module.classes.contains_key(names[0]) && !shadowed(self, names[0]) {
+                    Some(names[0].to_string())
+                } else {
+                    self.class_of_var(names[0])
+                })
+            && self.static_prop_key(&cls, names[1]).is_some()
+        {
+            // `Cls::sp.m`, or `h.sp.m` through a handle of the class.
+            (cls, names[1], &names[2..])
+        } else if !shadowed(self, names[0])
+            && let Some(cls) = self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+                .map(|o| o.class_name.clone())
+                .or_else(|| self.class_context_stack.last().cloned().flatten())
+            && self.static_prop_key(&cls, names[0]).is_some()
+        {
+            // `sp.m` inside a method of the class.
+            (cls, names[0], &names[1..])
+        } else {
+            return None;
+        };
         // The declaring class on the chain owns the property's type (an
-        // inherited static's declaration lives there); it must be a PACKED
-        // struct.
-        let su = {
+        // inherited static's declaration lives there).
+        let mut dt = {
             let mut cur = self.module.classes.get(&cls);
-            let mut found: Option<std::rc::Rc<crate::ast::types::StructUnionType>> = None;
+            let mut found = None;
             for _ in 0..64 {
                 let Some(c) = cur else { break };
-                if let Some(dt) = self.class_prop_decl_type(c, &prop) {
-                    if let DataType::Struct(su) = self.resolve_dt(dt)
-                        && !Self::spreads_member_wise(&su)
-                    {
-                        found = Some(std::rc::Rc::new(su));
-                    }
+                if let Some(dt) = self.class_prop_decl_type(c, prop) {
+                    found = Some(dt.clone());
                     break;
                 }
                 cur = c
@@ -3063,17 +3084,50 @@ impl Simulator {
             }
             found?
         };
-        let (off, w) = {
-            let layout = self.class_packed_layout(&su, &[]);
-            let &(_, off, w) = layout.0.iter().find(|(n, _, _)| *n == member)?;
-            (off, w)
-        };
-        let whole = self.class_static_get(&cls, &prop)?;
-        let mut out = Value::zero(w.max(1));
-        for i in 0..w {
-            out.set_bit(i as usize, whole.get_bit((off + i) as usize));
+        // Walk the member path through the packed layouts: each level's
+        // offset is relative to the enclosing member's least significant bit.
+        let (mut off, mut w) = (0u32, 0u32);
+        for m in members {
+            let DataType::Struct(su) = self.resolve_dt(&dt) else {
+                return None;
+            };
+            if Self::spreads_member_wise(&su) {
+                return None;
+            }
+            let (fields, _) = self.packed_agg_layout_with(&su, &self.module.parameters);
+            let &(_, o, fw) = fields.iter().find(|(n, _, _)| n == m)?;
+            off += o;
+            w = fw;
+            dt = su
+                .members
+                .iter()
+                .find(|sm| sm.declarators.iter().any(|d| d.name.name == *m))?
+                .data_type
+                .clone();
         }
-        Some(out)
+        let whole = self.class_static_get(&cls, prop)?;
+        if w == 0 || (off + w) as usize > whole.width as usize {
+            return None;
+        }
+        Some(whole.range_select((off + w - 1) as usize, off as usize))
+    }
+
+    /// The static class properties declared with a struct or a named type
+    /// (a typedef can name a packed struct): the names
+    /// `static_packed_member_value` can claim.
+    pub(super) fn collect_static_struct_props(module: &ElaboratedModule) -> HashSet<String> {
+        let mut out = HashSet::default();
+        for cd in module.classes.values() {
+            for name in &cd.static_properties {
+                if matches!(
+                    cd.property_types.get(name),
+                    Some(DataType::Struct(_) | DataType::TypeReference { .. })
+                ) {
+                    out.insert(name.clone());
+                }
+            }
+        }
+        out
     }
 
     /// §8.9: the class and specialization of the static `member` reached

@@ -2524,7 +2524,7 @@ impl Simulator {
     /// Cache layouts only for shared class declarations. The key includes the
     /// current value parameters, including four-state bits; runtime object
     /// fields, captures and randomization modes are never cached.
-    pub(super) fn class_packed_layout(
+    fn class_packed_layout(
         &self,
         su: &Rc<crate::ast::types::StructUnionType>,
         value_params: &[(String, Value)],

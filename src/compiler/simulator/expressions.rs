@@ -2546,6 +2546,16 @@ impl Simulator {
                 }
             }
         }
+        // §8.9/§7.2.1: a member of a class STATIC property whose type is a
+        // packed struct (`Cls::sp.m`, `h.sp.m`, `sp.m` in the class) slices
+        // the shared static cell by the struct layout. It is not a class
+        // aggregate (no object holds it): the aggregate arm below read the
+        // object's own cell, and the later arms a 32-bit 0.
+        if !self.no_class_objects()
+            && let Some(v) = self.static_packed_member_value(expr)
+        {
+            return v;
+        }
         // §7.2/§18.4: a leaf of an unpacked-struct CLASS PROPERTY at any
         // depth — `o.n.inner.a`, `o.s.arr[1]`, `o.arr[0].a`. The member-access
         // read arm resolves only ONE level below the property, and the ident
@@ -2564,16 +2574,6 @@ impl Simulator {
         {
             if let Some(r) = self.class_agg_member(expr) {
                 return self.read_class_agg(&r);
-            }
-        }
-        // §8.9/§7.8: a member of a class STATIC property whose type is a
-        // packed struct (`Cls::sp.member`, either parse shape) slices the
-        // shared static cell by the struct layout. It is not a class
-        // aggregate (no object exists), so the arm above declines it and
-        // every later arm read a 32-bit 0.
-        if !self.no_class_objects() {
-            if let Some(v) = self.static_packed_member_value(expr) {
-                return v;
             }
         }
         // §7.2/§18.4: a WHOLE unpacked-struct class property read as a value —
