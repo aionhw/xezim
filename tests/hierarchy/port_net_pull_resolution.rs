@@ -172,3 +172,74 @@ endmodule
     .expect("simulate failed");
     assert_eq!(failures(&sim), 0);
 }
+
+/// #1060, part 1: an `inout tri1` port bound to a top-level `wire` — when the
+/// driver releases, the pull must be visible BOTH through the port formal
+/// (`node0.p`) and on the outside wire (`w`). §23.3.3.7/§23.3.3.7.1 make them
+/// one net, so after port substitution the pull (which §6.6.3 attaches to the
+/// merged tri1 net) cannot live only on the leftover formal.
+#[test]
+fn inout_tri1_pull_propagates_to_actual_wire() {
+    let sim = simulate(
+        r#"
+module sub (inout tri1 p);
+    logic en = 1'b0;
+    assign p = en ? 1'b0 : 1'bz;
+endmodule
+module top;
+    wire w;
+    int failures = 0;
+    sub node0 (.p(w));
+    initial begin
+        #1;
+        if (w       !== 1'b1) failures++;   // outside, undriven -> tri1 pulls high
+        if (node0.p !== 1'b1) failures++;   // through the port
+        node0.en = 1'b1;
+        #1;
+        if (w       !== 1'b0) failures++;   // driven low
+        if (node0.p !== 1'b0) failures++;
+    end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate failed");
+    assert_eq!(failures(&sim), 0);
+}
+
+/// #1060, part 2: when the actual and the inout port formal share a name
+/// (`sub u (.p(p))`), the leftover formal is the same physical net and must
+/// not fold a SECOND, circular reader that settles to x — the merged net
+/// keeps the pull, and @(p) inside the instance wakes when the common net
+/// toggles.
+#[test]
+fn same_named_inout_tri1_pull_keeps_net_alive_inside() {
+    let sim = simulate(
+        r#"
+module sub (inout tri1 p);
+    logic en = 1'b0;
+    int   wakeups = 0;
+    assign p = en ? 1'b0 : 1'bz;
+    always @(p) wakeups++;
+endmodule
+module top;
+    wire p;
+    int failures = 0;
+    sub node0 (.p(p));
+    initial begin
+        #1;
+        if (p       !== 1'b1) failures++;   // outside, undriven -> pull
+        if (node0.p !== 1'b1) failures++;
+        node0.en = 1'b1;
+        #1;
+        if (p       !== 1'b0) failures++;   // driven low
+        if (node0.p !== 1'b0) failures++;
+        if (node0.wakeups == 0) failures++; // @(p) inside woke up
+    end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate failed");
+    assert_eq!(failures(&sim), 0);
+}

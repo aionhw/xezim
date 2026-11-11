@@ -597,11 +597,12 @@ impl Simulator {
     pub(super) fn strength_bit(ds: &[(i8, i8, Option<bool>, Value)], i: usize) -> Option<(i8, i8)> {
         let mut acc: Option<(i8, i8)> = None;
         for (s0, s1, on, v) in ds {
-            let b = if i < v.width as usize {
-                v.get_bit(i)
-            } else {
-                LogicBit::Zero
-            };
+            // §5.7: an unsized `'1`/`'z`/`'x`/`'0` driver value is a FILL —
+            // `get_bit` replicates it into the wider context. The old
+            // bounds guard (`i < v.width else Zero`) instead clamped the
+            // fill's value to bit 0, so `assign (weak0,weak1) n = '1;` on an
+            // 8-bit net pulled only `n[0]` up (#1061).
+            let b = v.get_bit(i);
             let mut r = match b {
                 LogicBit::Zero => (-*s0, -*s0),
                 LogicBit::One => (*s1, *s1),
