@@ -1,6 +1,7 @@
 //! Simulator expressions.
 
 use super::*;
+use super::collection_methods::a_resized_case_eq;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
@@ -1768,7 +1769,8 @@ impl Simulator {
         let r = self.resolve_hier_name(h);
         !(self.module.arrays.contains_key(&*r)
             || self.module.arrays_2d.contains_key(&*r)
-            || self.module.arrays_nd.contains_key(&*r))
+            || self.module.arrays_nd.contains_key(&*r)
+            || self.module.associative_arrays.contains_key(&*r))
     }
 
     /// A relational or (in)equality comparison of literal-like operands,
@@ -4038,7 +4040,12 @@ impl Simulator {
                 // against another pattern it is a value of its type.
                 if matches!(
                     op,
-                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
+                    BinaryOp::Eq
+                        | BinaryOp::Neq
+                        | BinaryOp::CaseEq
+                        | BinaryOp::CaseNeq
+                        | BinaryOp::WildcardEq
+                        | BinaryOp::WildcardNeq
                 ) {
                     let (lt, rt) = (
                         self.unpacked_typed_pattern(left),
@@ -4175,13 +4182,16 @@ impl Simulator {
                 // method (`compare`/`do_compare`) is the common case.
                 // Multi-dimensional unpacked arrays (or a row of one) compare
                 // element-wise by suffix; the 1-D arm below sees no shape.
-                if matches!(op, BinaryOp::Eq | BinaryOp::Neq)
-                    && !(self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty())
+                if matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
+                ) && !(self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty())
                 {
                     if let (Some((lb, ls, l_nd)), Some((rb, rs, r_nd))) =
                         (self.nd_array_operand(left), self.nd_array_operand(right))
                     {
                         if l_nd || r_nd {
+                            let case = matches!(op, BinaryOp::CaseEq | BinaryOp::CaseNeq);
                             let mut equal = ls.len() == rs.len();
                             let ew = self
                                 .coll_elem_width(&lb)
@@ -4190,7 +4200,22 @@ impl Simulator {
                                 for (a, b) in ls.iter().zip(rs.iter()) {
                                     let lv = self.get_signal_value_by_name(&format!("{}{}", lb, a));
                                     let rv = self.get_signal_value_by_name(&format!("{}{}", rb, b));
-                                    if lv.is_none()
+                                    if case {
+                                        let eq = match (&lv, &rv) {
+                                            (Some(x), Some(y)) => {
+                                                if let Some(e) = ew {
+                                                    a_resized_case_eq(x, y, e)
+                                                } else {
+                                                    x.case_eq(y).to_u64() == Some(1)
+                                                }
+                                            }
+                                            _ => false,
+                                        };
+                                        if !eq {
+                                            equal = false;
+                                            break;
+                                        }
+                                    } else if lv.is_none()
                                         || rv.is_none()
                                         || self.coll_values_opt_eq(&lv, &rv, ew) == false
                                     {
@@ -4199,7 +4224,7 @@ impl Simulator {
                                     }
                                 }
                             }
-                            let bit = if matches!(op, BinaryOp::Eq) {
+                            let bit = if matches!(op, BinaryOp::Eq | BinaryOp::CaseEq) {
                                 equal
                             } else {
                                 !equal
@@ -4208,21 +4233,28 @@ impl Simulator {
                         }
                     }
                 }
-                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
+                if matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
+                ) {
                     if let (Some((ln, llo, lhi)), Some((rn, rlo, rhi))) = (
                         self.fixed_array_operand(left),
                         self.fixed_array_operand(right),
                     ) {
+                        let case = matches!(op, BinaryOp::CaseEq | BinaryOp::CaseNeq);
                         let lsize = (lhi - llo + 1) as usize;
                         let rsize = (rhi - rlo + 1) as usize;
                         if lsize != rsize {
                             return Value::from_u64(
-                                if matches!(op, BinaryOp::Eq) { 0 } else { 1 },
+                                if matches!(op, BinaryOp::Eq | BinaryOp::CaseEq) { 0 } else { 1 },
                                 1,
                             );
                         }
                         let l_desc = self.module.descending_arrays.contains(&ln);
                         let r_desc = self.module.descending_arrays.contains(&rn);
+                        let ew = self
+                            .coll_elem_width(&ln)
+                            .or_else(|| self.coll_elem_width(&rn));
                         let mut equal = true;
                         for i in 0..lsize {
                             let lidx = if l_desc {
@@ -4241,23 +4273,36 @@ impl Simulator {
                             let rv = self
                                 .get_signal_value_by_name(&format!("{}[{}]", rn, ridx))
                                 .unwrap_or(Value::zero(1));
-                            if lv.has_unknown() || rv.has_unknown() {
-                                // An x/z element makes the comparison neither
-                                // equal nor unequal (both `==` and `!=` come
-                                // out 0), as for dynamic arrays/queues.
-                                return Value::from_u64(0, 1);
-                            }
-                            // Compare at the declared element width (differing
-                            // storage slots must not decide the pair).
-                            let ew = self
-                                .coll_elem_width(&ln)
-                                .or_else(|| self.coll_elem_width(&rn));
-                            if !self.coll_values_eq(&lv, &rv, ew) {
-                                equal = false;
-                                break;
+                            if case {
+                                // `===`/`!==`: bit-exact element compare —
+                                // an x/z element matches the identical x/z
+                                // element and never matches a known one, and
+                                // no element makes the result unknown.
+                                let eq = if let Some(e) = ew {
+                                    a_resized_case_eq(&lv, &rv, e)
+                                } else {
+                                    lv.case_eq(&rv).to_u64() == Some(1)
+                                };
+                                if !eq {
+                                    equal = false;
+                                    break;
+                                }
+                            } else {
+                                if lv.has_unknown() || rv.has_unknown() {
+                                    // An x/z element makes the comparison neither
+                                    // equal nor unequal (both `==` and `!=` come
+                                    // out 0), as for dynamic arrays/queues.
+                                    return Value::from_u64(0, 1);
+                                }
+                                // Compare at the declared element width (differing
+                                // storage slots must not decide the pair).
+                                if !self.coll_values_eq(&lv, &rv, ew) {
+                                    equal = false;
+                                    break;
+                                }
                             }
                         }
-                        let r = if matches!(op, BinaryOp::Eq) {
+                        let r = if matches!(op, BinaryOp::Eq | BinaryOp::CaseEq) {
                             equal
                         } else {
                             !equal
@@ -4274,12 +4319,13 @@ impl Simulator {
                 // Associative arrays compare as equal key/value sets (§7.12) —
                 // without this a class-property assoc `==` fell through to the
                 // packed-scalar path and always yielded x.
-                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
-                    let want_eq = matches!(op, BinaryOp::Eq);
-                    if let Some(res) = self.compare_assoc_arrays(left, right, want_eq) {
+                if matches!(op, BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq) {
+                    let want_eq = matches!(op, BinaryOp::Eq | BinaryOp::CaseEq);
+                    let case = matches!(op, BinaryOp::CaseEq | BinaryOp::CaseNeq);
+                    if let Some(res) = self.compare_assoc_arrays(left, right, want_eq, case) {
                         return res;
                     }
-                    if let Some(res) = self.compare_dyn_arrays(left, right, want_eq) {
+                    if let Some(res) = self.compare_dyn_arrays(left, right, want_eq, case) {
                         return res;
                     }
                 }

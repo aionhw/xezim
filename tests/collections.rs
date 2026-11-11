@@ -94,6 +94,8 @@ mod nested_assoc_under_outer_dim;
 mod noparen_array_methods;
 #[path = "collections/pp_queue_slice.rs"]
 mod pp_queue_slice;
+#[path = "collections/packed_pattern_compare.rs"]
+mod packed_pattern_compare;
 #[path = "collections/property_queue_and_context.rs"]
 mod property_queue_and_context;
 #[path = "collections/queue_eq_unknown_elems.rs"]
@@ -319,6 +321,8 @@ mod dyn_row_sized_new_copy;
 mod assoc_elem_select_read;
 #[path = "collections/assoc_packed_elem.rs"]
 mod assoc_packed_elem;
+#[path = "collections/unpacked_case_compare.rs"]
+mod unpacked_case_compare;
 #[path = "collections/unpacked_row_pattern_store.rs"]
 mod unpacked_row_pattern_store;
 #[path = "collections/unpacked_row_pattern_followups.rs"]

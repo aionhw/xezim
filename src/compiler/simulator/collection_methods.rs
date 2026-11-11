@@ -4,6 +4,27 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// How an element of an aggregate-vs-pattern comparison is tested.
+/// `Logical` is `==`/`!=` (x/z → x, resolved to 0 here), `Case` is
+/// `===`/`!==` (bit-exact, must never be x), `Wildcard` is `==?`/`!=?`
+/// (x/z in the pattern item are don't-cares, an x/z in the element makes
+/// the element comparison unknown unless another element mismatches,
+/// §11.4.6).
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum PatternCmpMode {
+    Logical,
+    Case,
+    Wildcard,
+}
+
+/// Bit-exact (`===`/`!==`) element equality at a declared element width: the
+/// 4-state case-equality of `a` and `b` resized to `width` bits. Used for the
+/// case-comparison path through the collection comparators, where an x/z
+/// element matches an identical x/z element and never matches a known one.
+pub(crate) fn a_resized_case_eq(a: &Value, b: &Value, width: u32) -> bool {
+    a.resize(width).case_eq(&b.resize(width)).to_u64() == Some(1)
+}
+
 /// An associative array's index type, for `item.index` (§7.12.4) and
 /// `_index` locator results (§7.12.1).
 #[derive(Clone, Copy)]
@@ -215,6 +236,7 @@ impl Simulator {
         left: &Expression,
         right: &Expression,
         want_eq: bool,
+        case: bool,
     ) -> Option<Value> {
         let ln = self.dyn_cmp_operand_name(left)?;
         let rn = self.dyn_cmp_operand_name(right)?;
@@ -234,6 +256,9 @@ impl Simulator {
             .map(|t| t.2)
             .or_else(|| self.module.arrays.get(&rn).map(|t| t.2))
             .unwrap_or(32);
+        let ew = self
+            .coll_elem_width(&ln)
+            .or_else(|| self.coll_elem_width(&rn));
         let mut equal = true;
         for i in 0..ls {
             let lv = self
@@ -242,21 +267,35 @@ impl Simulator {
             let rv = self
                 .get_signal_value_by_name(&format!("{}[{}]", rn, i))
                 .unwrap_or_else(|| Value::zero(w));
-            if lv.has_unknown() || rv.has_unknown() {
-                // Reference behavior: an x/z element makes the comparison
-                // neither equal NOR unequal — both `==` and `!=` yield 0
-                // (verified: `q1 == q1` and `q1 != q1` with an 8'hxx element
-                // both print 0 there; returning x instead rendered `%b` as x).
-                return Some(Value::from_u64(0, 1));
-            }
-            // Compare at the declared element width so a differing storage
-            // slot (width/signedness) does not decide the pair (the packed/
-            // unpacked element-table family) — bits are what matter.
-            let ew = self
-                .coll_elem_width(&ln)
-                .or_else(|| self.coll_elem_width(&rn));
-            if !self.coll_values_eq(&lv, &rv, ew) {
-                equal = false;
+            if case {
+                // `===`/`!==`: bit-exact element compare. An x/z element is
+                // compared for equality with its exact 4-state bits (so an x
+                // element matches an x element, and never matches a known one),
+                // and no element makes the whole result unknown.
+                let eq = if let Some(e) = ew {
+                    a_resized_case_eq(&lv, &rv, e)
+                } else {
+                    lv.case_eq(&rv).to_u64() == Some(1)
+                };
+                if !eq {
+                    equal = false;
+                    break;
+                }
+            } else {
+                if lv.has_unknown() || rv.has_unknown() {
+                    // Reference behavior: an x/z element makes the comparison
+                    // neither equal NOR unequal — both `==` and `!=` yield 0
+                    // (verified: `q1 == q1` and `q1 != q1` with an 8'hxx element
+                    // both print 0 there; returning x instead rendered `%b` as x).
+                    return Some(Value::from_u64(0, 1));
+                }
+                // Compare at the declared element width so a differing storage
+                // slot (width/signedness) does not decide the pair (the packed/
+                // unpacked element-table family) — bits are what matter.
+                if !self.coll_values_eq(&lv, &rv, ew) {
+                    equal = false;
+                    break;
+                }
             }
         }
         let res = if want_eq { equal } else { !equal };
@@ -315,21 +354,44 @@ impl Simulator {
     /// if it does not name one (the caller then falls through). Mirrors
     /// [`Self::dyn_cmp_operand_name`] but for associative arrays.
     pub(super) fn assoc_cmp_operand_name(&mut self, e: &Expression) -> Option<String> {
+        if let ExprKind::Ident(h) = &e.kind {
+            // A method-local associative array under its per-call storage key.
+            if let [seg] = h.path.as_slice()
+                && seg.selects.is_empty()
+                && let Some(uq) = self
+                    .dyn_name_lookup(seg.name.name.as_str())
+                    .filter(|uq| *uq != seg.name.name.as_str())
+                && self.module.associative_arrays.contains_key(uq)
+            {
+                return Some(uq.to_string());
+            }
+            // A bare-identifier associative-array formal or local/signal
+            // registered in `associative_arrays`. Mirror the dyn-array path:
+            // a single segment (or flattened hierarchical name) that is a
+            // registered signal assoc array resolves to itself, shadowed by
+            // `this`-scoped members only when it isn't a plain collection.
+            let registered = if self.ident_shadowed_by_non_collection(h) {
+                false
+            } else {
+                match h.path.as_slice() {
+                    [seg] => self.module.associative_arrays.contains_key(seg.name.name.as_str()),
+                    _ => {
+                        let n = Self::resolve_hier_name_static(h, &self.module);
+                        self.module.associative_arrays.contains_key(&n)
+                    }
+                }
+            };
+            if registered {
+                let n = Self::resolve_hier_name_static(h, &self.module);
+                if let Some(m) = self.instance_assoc_member(&n) {
+                    return Some(m);
+                }
+                return Some(n);
+            }
+        }
         let an = self.expr_assoc_name(e)?;
         if !self.is_associative_array(&an) {
             return None;
-        }
-        // A bare associative-array local may live under a per-call storage
-        // key shadow; follow the same lookup as the dyn path.
-        if let ExprKind::Ident(h) = &e.kind {
-            if let [seg] = h.path.as_slice() {
-                let bare = seg.name.name.as_str();
-                if seg.selects.is_empty() {
-                    if let Some(uq) = self.dyn_name_lookup(bare) {
-                        return Some(uq.to_string());
-                    }
-                }
-            }
         }
         Some(an)
     }
@@ -347,6 +409,7 @@ impl Simulator {
         left: &Expression,
         right: &Expression,
         want_eq: bool,
+        case: bool,
     ) -> Option<Value> {
         let ln = self.assoc_cmp_operand_name(left)?;
         let rn = self.assoc_cmp_operand_name(right)?;
@@ -370,14 +433,26 @@ impl Simulator {
                 let rv = self
                     .get_signal_value_by_name(&format!("{}[{}]", rn, k))
                     .unwrap_or_else(|| Value::zero(ew.unwrap_or(32)));
-                if lv.has_unknown() || rv.has_unknown() {
-                    // An unknown element makes the comparison ambiguous: both
-                    // `==` and `!=` come out 0.
-                    return Some(Value::from_u64(0, 1));
-                }
-                if !self.coll_values_eq(&lv, &rv, ew) {
-                    equal = false;
-                    break;
+                if case {
+                    let eq = if let Some(e) = ew {
+                        a_resized_case_eq(&lv, &rv, e)
+                    } else {
+                        lv.case_eq(&rv).to_u64() == Some(1)
+                    };
+                    if !eq {
+                        equal = false;
+                        break;
+                    }
+                } else {
+                    if lv.has_unknown() || rv.has_unknown() {
+                        // An unknown element makes the comparison ambiguous: both
+                        // `==` and `!=` come out 0.
+                        return Some(Value::from_u64(0, 1));
+                    }
+                    if !self.coll_values_eq(&lv, &rv, ew) {
+                        equal = false;
+                        break;
+                    }
                 }
             }
         }
@@ -504,6 +579,17 @@ impl Simulator {
     /// The packed-concatenation value of the pattern compared against the
     /// array's (nonexistent) container signal and always came out 0.
     /// `None` when the other operand is not an unpacked aggregate.
+    ///
+    /// §11.4.5 precision: `==`/`!=` on an x/z operand "may result in 1'bx"
+    /// — the word is permissive, not mandatory, so a simulator that resolves
+    /// the unknown to a definite `0` (or `1`) is not violating the spec. This
+    /// build returns `0` for an x/z element in a `==`/`!=` aggregate compare,
+    /// which matches the reference simulators verified here (the same
+    /// behavior the `queue_eq_unknown_elems` regression pins down); a newer
+    /// reference may return `1'bx` instead, and that too is conformant. By
+    /// contrast `===`/`!==` "shall" always resolve to a match/mismatch and
+    /// "never result in 1'bx" — so the case path below does a bit-exact
+    /// `case_eq` element compare and must never yield an x.
     pub(super) fn compare_with_pattern(
         &mut self,
         op: BinaryOp,
@@ -516,9 +602,18 @@ impl Simulator {
             (ExprKind::AssignmentPattern(it), _) => (right, it),
             _ => return None,
         };
-        let case = matches!(op, BinaryOp::CaseEq | BinaryOp::CaseNeq);
-        let want_eq = matches!(op, BinaryOp::Eq | BinaryOp::CaseEq);
-        Some(match self.pattern_cmp(x, items, case)? {
+        let mode = if matches!(op, BinaryOp::WildcardEq | BinaryOp::WildcardNeq) {
+            PatternCmpMode::Wildcard
+        } else if matches!(op, BinaryOp::CaseEq | BinaryOp::CaseNeq) {
+            PatternCmpMode::Case
+        } else {
+            PatternCmpMode::Logical
+        };
+        let want_eq = matches!(
+            op,
+            BinaryOp::Eq | BinaryOp::CaseEq | BinaryOp::WildcardEq
+        );
+        Some(match self.pattern_cmp(x, items, mode)? {
             PatCmp::Equal => Value::from_u64(want_eq as u64, 1),
             PatCmp::Unequal => Value::from_u64(!want_eq as u64, 1),
             PatCmp::Unknown => Value::new(1),
@@ -534,7 +629,7 @@ impl Simulator {
         &mut self,
         x: &Expression,
         items: &[AssignmentPatternItem],
-        case: bool,
+        mode: PatternCmpMode,
     ) -> Option<PatCmp> {
         // Fixed unpacked array of any rank: the declared dimensions, each
         // positional item filling the LEFT bound first (§10.10).
@@ -566,7 +661,7 @@ impl Simulator {
                     .map(|k| k == 0 && self.module.descending_arrays.contains(&name))
                     .collect(),
             };
-            return Some(self.pattern_cmp_dims(x, &dims, &descending, items, case));
+            return Some(self.pattern_cmp_dims(x, &dims, &descending, items, mode));
         }
         // Queue / dynamic array: as many elements as the pattern has items.
         if !matches!(x.kind, ExprKind::Index { .. }) {
@@ -582,8 +677,65 @@ impl Simulator {
                 if n == 0 {
                     return Some(PatCmp::Equal);
                 }
-                return Some(self.pattern_cmp_dims(x, &[(0, n - 1)], &[false], items, case));
+                return Some(self.pattern_cmp_dims(x, &[(0, n - 1)], &[false], items, mode));
             }
+        }
+        // PACKED array: an integral aggregate the pattern binds element-wise.
+        // `packed_full_dims` stores every packed dim PLUS a trailing leaf bit-
+        // range (`[(0,3),(2,0)]` for `u3_t [0:3] a`), so the ELEMENT index
+        // dims are all but the last entry — the same dims `pattern_cmp_dims`
+        // iterates for a fixed unpacked array. Each `x[i]` element read slices
+        // the packed operand at the right leaf width.
+        if let Some((pname, pdims, pdesc)) = self.packed_array_elem_geometry(x) {
+            let _ = pname;
+            return Some(self.pattern_cmp_dims(x, &pdims, &pdesc, items, mode));
+        }
+        // PACKED struct: the pattern binds member-by-member (§10.9.2) but the
+        // packed value is one integral, so slice it member-wise. The bit-offset
+        // layout is LSB-first, so reverse it to MSB-first fill order (the first
+        // pattern item is the most-significant member).
+        if let Some(pfields) = self.packed_struct_fields_of(x) {
+            let msb_first: Vec<(String, u32, u32)> = pfields.into_iter().rev().collect();
+            let mut by_member: Vec<Option<&Expression>> = vec![None; msb_first.len()];
+            let mut ordered: Vec<&Expression> = Vec::new();
+            let mut default: Option<&Expression> = None;
+            for item in items {
+                match item {
+                    AssignmentPatternItem::Named(id, e) => {
+                        if let Some(i) =
+                            msb_first.iter().position(|(n, _, _)| n == &id.name)
+                        {
+                            by_member[i] = Some(e);
+                        }
+                    }
+                    AssignmentPatternItem::Default(e) => default = Some(e),
+                    AssignmentPatternItem::Ordered(e) => ordered.push(e),
+                    AssignmentPatternItem::Typed(_, e) => default = Some(e),
+                    _ => {}
+                }
+            }
+            let mut acc = PatCmp::Equal;
+            let mut oi = 0usize;
+            for (i, member) in msb_first.iter().enumerate() {
+                let item = match by_member[i] {
+                    Some(e) => Some(e),
+                    None if oi < ordered.len() => {
+                        let e = ordered[oi];
+                        oi += 1;
+                        Some(e)
+                    }
+                    None => default,
+                };
+                let Some(item) = item else {
+                    return Some(PatCmp::Unequal);
+                };
+                let member_expr = Self::append_member_expr(x, &member.0);
+                acc = acc.and(self.pattern_elem_cmp(member_expr, item, mode), true);
+                if acc == PatCmp::Unequal {
+                    break;
+                }
+            }
+            return Some(acc);
         }
         // Unpacked struct: member by member (§10.9.2 binding rules).
         let su = self.unpacked_struct_type_of(x)?;
@@ -593,12 +745,80 @@ impl Simulator {
                 return Some(PatCmp::Unequal);
             };
             let member = Self::append_member_expr(x, &name);
-            acc = acc.and(self.pattern_elem_cmp(member, item, case), true);
+            acc = acc.and(self.pattern_elem_cmp(member, item, mode), true);
             if acc == PatCmp::Unequal {
                 break;
             }
         }
         Some(acc)
+    }
+
+    /// The packed ELEMENT index dims of a packed-array operand `x` (the part
+    /// of `packed_full_dims` before its trailing leaf bit-range — for
+    /// `u3_t [0:3] a` the dims `[(0,3),(2,0)]` map to the element dim `(0,3)`)
+    /// and the flattened operand name. `None` when `x` is not a packed array
+    /// (plain packed vector, packed struct, unpacked aggregate). Only a
+    /// genuine multi-element packed aggregate returns here (≥1 element dim
+    /// plus a leaf-width dim), so a plain `logic [11:0] v == '{..}` integral
+    /// stays on the leaf-compare path it already serves.
+    ///
+    /// Scope note: matches a bare packed VARIABLE (or a packed SLICE like
+    /// `d2[0]`, which unwraps to its packed base and drops the consumed outer
+    /// dims) against a pattern — the issue-1043 family.
+    fn packed_array_elem_geometry(
+        &self,
+        x: &Expression,
+    ) -> Option<(String, Vec<(i64, i64)>, Vec<bool>)> {
+        // Unwrap index/slice wrappers to find the packed base and how many
+        // outer element dims the expression already consumed. `d2[0]` is a
+        // packed sub-array whose OWN pattern dims are the base's element dims
+        // minus the consumed outer one — comparing `d2[0] == '{..}` routes its
+        // rows element-wise just like the whole array.
+        let mut base = x;
+        let mut consumed = 0usize;
+        while let ExprKind::Index { expr: inner, .. } = &base.kind {
+            base = inner;
+            consumed += 1;
+        }
+        let name = match &base.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                self.resolve_hier_name(h).into_owned()
+            }
+            _ => return None,
+        };
+        let full = self.module.packed_full_dims.get(&name)?;
+        // Every remaining dim (all consumed outer dims are gone, take the leaf
+        // off) must leave at least one element dim above the leaf bit-range.
+        let sub_full = &full[consumed..full.len()];
+        if sub_full.len() < 2 {
+            return None;
+        }
+        // `packed_full_dims` stores RAW (left, right) bounds in their declared
+        // orientation (`(1,0)` for a descending `[1:0]` dim). Normalize each to
+        // ascending `(min, max)` so `pattern_cmp_dims`'s index iteration works
+        // (its `descending` flag then re-reverses the range the right way).
+        let descending: Vec<bool> = sub_full[..sub_full.len() - 1]
+            .iter()
+            .map(|&(l, r)| l > r)
+            .collect();
+        let elem: Vec<(i64, i64)> = sub_full[..sub_full.len() - 1]
+            .iter()
+            .map(|&(l, r)| (l.min(r), l.max(r)))
+            .collect();
+        Some((name, elem, descending))
+    }
+
+    /// The packed-struct member layout `(name, lsb, width)` (LSB-first) of a
+    /// packed-struct operand `x`, via [`Self::coll_packed_elem_fields`].
+    /// `None` when `x` is not (or does not resolve to) a packed struct.
+    fn packed_struct_fields_of(&mut self, x: &Expression) -> Option<Vec<(String, u32, u32)>> {
+        let name = match &x.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                self.resolve_hier_name(h).into_owned()
+            }
+            _ => self.flat_member_name(x)?,
+        };
+        self.coll_packed_elem_fields(&name)
     }
 
     /// One dimension of [`Self::pattern_cmp`]: `x[i]` for every index of
@@ -610,7 +830,7 @@ impl Simulator {
         dims: &[(i64, i64)],
         descending: &[bool],
         items: &[AssignmentPatternItem],
-        case: bool,
+        mode: PatternCmpMode,
     ) -> PatCmp {
         let (lo, hi) = dims[0];
         let indices: Vec<i64> = if descending.first().copied().unwrap_or(false) {
@@ -646,15 +866,15 @@ impl Simulator {
                 let inner = descending.get(1..).unwrap_or(&[]);
                 match &self.unpacked_pattern(e).kind {
                     ExprKind::AssignmentPattern(sub) => {
-                        self.pattern_cmp_dims(&elem, &dims[1..], inner, sub, case)
+                        self.pattern_cmp_dims(&elem, &dims[1..], inner, sub, mode)
                     }
                     _ => {
                         let fill = [AssignmentPatternItem::Default(e.clone())];
-                        self.pattern_cmp_dims(&elem, &dims[1..], inner, &fill, case)
+                        self.pattern_cmp_dims(&elem, &dims[1..], inner, &fill, mode)
                     }
                 }
             } else {
-                self.pattern_elem_cmp(elem, e, case)
+                self.pattern_elem_cmp(elem, e, mode)
             };
             acc = acc.and(r, false);
             if acc == PatCmp::Unequal {
@@ -671,7 +891,7 @@ impl Simulator {
         &mut self,
         elem: Expression,
         item: &Expression,
-        case: bool,
+        mode: PatternCmpMode,
     ) -> PatCmp {
         // §10.9: an item is assignment-like to its ELEMENT — an integral
         // item converts to the element type first, so `-1` matches a
@@ -685,20 +905,25 @@ impl Simulator {
             if !ev.is_real && ev.width > 0 {
                 let iv = self.eval_expr_ctx(item, ev.width);
                 if !iv.is_real {
-                    let iv = iv.resize_for_assign(ev.width);
-                    let r = if case {
-                        ev.case_eq(&iv)
-                    } else {
-                        ev.is_equal(&iv)
+                        let iv = iv.resize_for_assign(ev.width);
+                    let r = match mode {
+                        PatternCmpMode::Case => ev.case_eq(&iv),
+                        PatternCmpMode::Wildcard => ev.wildcard_eq(&iv),
+                        PatternCmpMode::Logical => ev.is_equal(&iv),
                     };
                     return Self::pat_cmp_of(&r);
                 }
             }
         }
         let span = elem.span;
+        let op = match mode {
+            PatternCmpMode::Case => BinaryOp::CaseEq,
+            PatternCmpMode::Wildcard => BinaryOp::WildcardEq,
+            PatternCmpMode::Logical => BinaryOp::Eq,
+        };
         let cmp = Expression::new(
             ExprKind::Binary {
-                op: if case { BinaryOp::CaseEq } else { BinaryOp::Eq },
+                op,
                 left: Box::new(elem),
                 right: Box::new(item.clone()),
             },
