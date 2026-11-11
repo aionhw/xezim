@@ -336,10 +336,101 @@ endmodule
     assert_eq!(got, want);
 }
 
+/// #1061: an UNSIZED `'1` fill used as a drive-strength value must replicate
+/// across the whole net. `strength_bit` used to clamp `i >= width` to `0`
+/// before consulting the fill, so an unsized `'1` (a 1-bit fill, §5.7.1)
+/// set only bit 0 while the rest read the fill default zero (#1061). Sized
+/// literals always worked.
+#[test]
+fn unsized_fill_drive_strength_replicates_wide() {
+    let got = lines(
+        "fill",
+        r#"
+module t;
+  wire [7:0] n;
+  logic      en = 1'b0;
+  assign n = en ? 8'hc3 : 'z;
+  assign (weak0, weak1) n = '1;    // unsized fill under weak strength
+  initial begin
+    #1 $display("T|weak1_alone n=%h", n);
+    en = 1'b1;
+    #1 $display("T|strong_c3 n=%h", n);
+    $finish;
+  end
+endmodule
+"#,
+        "t",
+    );
+    assert_eq!(got, ["T|weak1_alone n=ff", "T|strong_c3 n=c3"]);
+}
+
+/// #1062: several assigns to the SAME bit of a net, some in a sub-module,
+/// must all resolve together (0 against 1 -> x, z yields) — not only the
+/// first of each bit count when another driver sits in a lazy sub-module.
+#[test]
+fn same_bit_submodule_select_drivers_resolve_per_bit() {
+    let got = lines(
+        "sameselect",
+        r#"
+module sub;
+  wire [1:0] n;
+  assign n[0] = 1'b1;
+  assign n[0] = 1'bz;
+  assign n[1] = 1'bz;
+  assign n[1] = 1'b1;
+endmodule
+module t;
+  wire [1:0] n;
+  sub u ();
+  assign n[0] = 1'b1;
+  assign n[0] = 1'bz;
+  assign n[1] = 1'bz;
+  assign n[1] = 1'b1;
+  initial begin
+    #1 $display("T|top_sub n=%b u.n=%b", n, u.n);
+    $finish;
+  end
+endmodule
+"#,
+        "t",
+    );
+    assert_eq!(got, ["T|top_sub n=11 u.n=11"]);
+}
+
+/// #1063: a `(weak0, weak1)` continuous assign in a NON-top module must pull
+/// its net low/off the same way a top-module pull does: as a weak driver
+/// that loses to the net's real (strong) driver but holds the net where it is
+/// z. Strength was dropped on the inlined path and folded as STRONG.
+#[test]
+fn submodule_weak_pull_loses_to_real_driver() {
+    let got = lines(
+        "subweak",
+        r#"
+module sub;
+  wire [7:0] n;
+  logic      en = 1'b0;
+  assign n = en ? 8'hc3 : 'z;
+  assign (weak0, weak1) n = 8'hff;
+endmodule
+module t;
+  wire [7:0] n;
+  sub u ();
+  initial begin
+    #1 $display("T|weak_sub u.n=%h", u.n);
+    u.en = 1'b1;
+    #1 $display("T|strong_sub u.n=%h", u.n);
+    $finish;
+  end
+endmodule
+"#,
+        "t",
+    );
+    assert_eq!(got, ["T|weak_sub u.n=ff", "T|strong_sub u.n=c3"]);
+}
+
 /// The VALUE side of every strength level (supply over strong over pull
 /// over weak), compared with `%b` only; the `%v` strength names are pinned
-/// by the ignored test below.
-#[test]
+/// by the ignored test below.#[test]
 fn drive_strength_levels_resolve_values() {
     let got = lines(
         "levels",
