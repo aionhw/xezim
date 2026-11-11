@@ -205,6 +205,50 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   all source values are read before the selected elements are overwritten
   (§7.4.5, §10.9.1, #1045, reported by Ganesh-TNL).
 
+* Nets inside module instances resolve their drivers as top-level nets do: a
+  drive strength on a continuous assignment or a net declaration assignment is
+  kept, `%v` reports it, and several bit or part-select drivers of the same
+  bits are all resolved (§6.5, §6.7, §10.3.4, §28.12, #1062 / #1063, reported
+  by philipaxer, contributed by Thomasb81).
+
+* An unsized `'0`, `'1`, `'x` or `'z` fills every bit of a net resolved by
+  strength, as a weak or pull driver and as the released value of a strong
+  one, on nets wider than 64 bits too (§5.7.1, §28.12, #1061, reported by
+  philipaxer, contributed by Thomasb81).
+
+* A tri0, tri1 or supply port merges with the net connected to it: the net
+  outside pulls as the port does, with or without a driver, also on a bit or
+  part select, across an instance array and when the net has the port's name.
+  A tri0 or tri1 net driven only through selects pulls the bits they release
+  (§6.6.5, §23.3.3.7, #1060, reported by philipaxer, contributed by
+  Thomasb81).
+
+* An `interconnect` array takes the types of the ports bound to its elements,
+  so a `real` nettype element carries its value, and an interconnect bound to
+  a struct nettype port, whole or as an array element, keeps the struct's
+  members (§6.6.7, §6.6.8, §23.3.3.7.1, #1039 / #1040, reported by ds54e,
+  contributed by Thomasb81).
+
+* A `disable`, `break` or `continue` run in a `forever` body before the body's
+  delay ends the iteration there. `disable` of a process's own top-level
+  block, an `always` body or a named `forever` body stops that block, and `%m`
+  in such a body names it (§9.6.2, §12.8, #1068, reported and contributed by
+  chuanseng-ng).
+
+* Each driver of a net applies its own rise, fall and turn-off delays before
+  the net resolves them. A primitive's fall delay used to delay the whole net,
+  so `buf #(1,5) g(w,a); assign #(1,1) w=a;` read 1 where the drivers
+  disagreed (§28.16, §28.12, #1065, contributed by ds54e).
+
+* Delayed tristate and MOS primitives that share a net are resolved with the
+  net's other drivers; the net read as the last such primitive alone,
+  undelayed. A primitive with a zero rise delay (`buf #(0,5)`) falls after its
+  fall delay (§28.6, §28.7, §28.16, #1065).
+
+* A UDP output that shares its net with a continuous assignment or another UDP
+  is one driver of the resolved net; the last writer used to win (§29.3,
+  §28.12).
+
 **Performance**
 
 * Callable locals with literal or name-free dimensions stay shared during
@@ -215,6 +259,23 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   reproducer's peak requested heap falls from 150.3 MB to 9.7 MB; genuinely
   instance-specific rewritten bodies still retain their own storage (§13.3,
   §13.4, #721).
+
+* The class collector also runs when the name-keyed store has grown by 100,000
+  values, so objects with large array members are reclaimed before 20,000 of
+  them exist: 16,384 objects with a 256-byte array peak at 156 MB instead of
+  1.5 GB (§8.7, #1054, contributed by Thomasb81).
+
+* The command line simulates on the large-stack worker it already runs on
+  instead of reserving a second stack; a run under a 4 GiB address-space limit
+  no longer fails at the default stack size (#1055, contributed by Thomasb81).
+
+* An instance's initial block is materialized when its process starts, not at
+  setup: 512 instances of a 512-statement block take 47 MB instead of 349 MB
+  after scheduling, and 4 ms instead of 254 ms (§9.2.1, #1056, contributed by
+  Thomasb81).
+
+* The reference census of dotted names is released when the last compilation
+  session ends (xezim-core #191, contributed by Thomasb81).
 
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
