@@ -3658,6 +3658,23 @@ impl Simulator {
                     }
                 }
                 let name = self.resolve_hier_name(hier);
+                // §10.4.2/§6.12.2: a MULTI-SEGMENT path rooted at a class
+                // object (`h.prop`, `C::prop`) targets a heap property or
+                // a static cell. When the resolver cannot bind the full
+                // dotted name, its last-resort fallback returns the LEAF,
+                // and a module-scope signal of that leaf name then
+                // captured the NBA — the property never saw the write
+                // (`hdl2.vec <= v` landed in a module `vec`). Divert only
+                // that leaf-capture shape: a resolution that kept the full
+                // name (a real flattened signal, a virtual-interface
+                // rewrite) still takes the fast path below.
+                if hier.path.len() > 1
+                    && !self.no_class_objects()
+                    && self.head_denotes_class_object(hier)
+                    && name.as_ref() == hier.path[hier.path.len() - 1].name.name
+                {
+                    return None;
+                }
                 if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                     hier.cached_signal_id.set(Some(id));
                     return Some(id);
@@ -3989,6 +4006,336 @@ impl Simulator {
             self.prof_nba_elided += 1;
         }
         true
+    }
+
+    /// §10.4.1/§4.7: NBAs to the same variable commit in scheduling order, so
+    /// a partial-region NBA (a struct member, bit-/part-select, or concat
+    /// piece) scheduled BEFORE a whole-variable NBA to the same signal must
+    /// not stick over the later whole write. The generic `nba_queue`
+    /// commits AFTER `nba_fast` (where `resolve_nba_target` routes
+    /// whole-signal NBAs), so scheduling a partial there inverted the order:
+    /// `bus.vld <= 1'b0; bus <= PKT;` left vld deasserted. When the partial
+    /// resolves to a slice of a packed SIGNAL, merge it into the same
+    /// `nba_fast` stream instead — splice the slice into the pending entry
+    /// for that signal (seeding one from `signal_table` when none is
+    /// pending), the same read-modify-write the blocking member path (§7.8)
+    /// performs, applied to the pending NBA value. Class properties,
+    /// statics, locals and collections keep the queued path: their
+    /// whole-form NBAs queue too, so ordering there is already consistent.
+    pub(super) fn try_schedule_packed_slice_nba(&mut self, lhs: &Expression, val: &Value) -> bool {
+        let Some(pieces) = self.packed_nba_slice_pieces(lhs, val) else {
+            return false;
+        };
+        for (id, lsb, w, piece_val) in pieces {
+            let piece = piece_val.resize_for_assign(w);
+            if let Some(entry_index) = self.nba_fast_index.get(id) {
+                self.nba_fast[entry_index].value.copy_bits_from(
+                    lsb as usize,
+                    &piece,
+                    0,
+                    w as usize,
+                );
+            } else {
+                let mut pending = self.signal_table[id].clone();
+                if pending.copy_bits_from(lsb as usize, &piece, 0, w as usize) {
+                    self.nba_fast_index.insert(id, self.nba_fast.len());
+                    self.nba_fast.push(NbaFast {
+                        block_index: 0,
+                        signal_id: id,
+                        value: pending,
+                    });
+                } else {
+                    self.prof_nba_elided += 1;
+                }
+            }
+        }
+        true
+    }
+
+    /// The `(signal_id, lsb, width, value)` pieces a partial-NBA lvalue
+    /// writes, in lvalue order. `None` declines the shape (the generic
+    /// queued path takes it). All selects are evaluated NOW — §10.4.1
+    /// samples an NBA lvalue's indices at schedule time, the same instant
+    /// `freeze_lvalue_indices` would.
+    fn packed_nba_slice_pieces(
+        &mut self,
+        lhs: &Expression,
+        val: &Value,
+    ) -> Option<Vec<(usize, u32, u32, Value)>> {
+        // The queued fallback re-evaluates the selects via
+        // `freeze_lvalue_indices`, so only effect-free shapes may probe
+        // here without double-firing a side effect in a declined index.
+        if !Self::cond_expr_is_effect_free(lhs, false) {
+            return None;
+        }
+        let slices = self.packed_nba_slices(lhs)?;
+        let total: u32 = slices.iter().try_fold(0u32, |a, s| a.checked_add(s.2))?;
+        if total == 0 {
+            return None;
+        }
+        // §10.4.1: size the RHS to the lvalue (zero-extend / truncate), then
+        // split it across the slices — the LEFTMOST concat element takes
+        // the most-significant bits.
+        let whole = val.resize_for_assign(total);
+        let mut out = Vec::with_capacity(slices.len());
+        let mut off = 0u32;
+        for &(id, lsb, w) in slices.iter().rev() {
+            let piece = whole.range_select((off + w - 1) as usize, off as usize);
+            out.push((id, lsb, w, piece));
+            off += w;
+        }
+        out.reverse();
+        Some(out)
+    }
+
+    /// The `(signal_id, lsb, width)` slices a partial-NBA lvalue writes, in
+    /// lvalue order: a concatenation decomposes into its elements, a
+    /// part-select narrows its base's slice, anything else resolves through
+    /// [`Self::packed_nba_base_slice`].
+    fn packed_nba_slices(&mut self, lhs: &Expression) -> Option<Vec<(usize, u32, u32)>> {
+        match &lhs.kind {
+            // A collapsed multi-segment identifier carrying selects
+            // (`cia[0].bus_a.vld` in always/initial code) re-spells as an
+            // Index/MemberAccess chain the arms below already walk.
+            ExprKind::Ident(h) if h.path.iter().any(|s| !s.selects.is_empty()) => {
+                let chain = Self::hier_select_chain(h, lhs.span);
+                self.packed_nba_slices(&chain)
+            }
+            ExprKind::Paren(inner) => self.packed_nba_slices(inner),
+            ExprKind::Concatenation(elements) => {
+                let mut out = Vec::with_capacity(elements.len());
+                for e in elements {
+                    out.extend(self.packed_nba_slices(e)?);
+                }
+                Some(out)
+            }
+            ExprKind::RangeSelect {
+                expr: base,
+                left,
+                right,
+                kind,
+            } => {
+                let (id, lsb, w) = self.packed_nba_base_slice(base)?;
+                // Part-select labels map through the base's declared range
+                // (§7.4.1: an ascending range puts its left index at the MS
+                // end). A multi-dimensional packed base (element strides)
+                // keeps the queued path.
+                let dims_key = self.flat_member_name(base).unwrap_or_default();
+                let dims = self.module.packed_full_dims.get(&dims_key);
+                if dims.is_some_and(|d| d.len() > 1) {
+                    return None;
+                }
+                let (dl, dr) = dims
+                    .and_then(|d| d.first().copied())
+                    .unwrap_or((w as i64 - 1, 0));
+                let a = self.eval_expr(left).to_index()?;
+                let b = self.eval_expr(right).to_index()?;
+                let (l, r) = match kind {
+                    RangeKind::Constant => (a, b),
+                    RangeKind::IndexedUp if b > 0 => {
+                        if dl >= dr {
+                            (a.checked_add(b - 1)?, a)
+                        } else {
+                            (a, a.checked_add(b - 1)?)
+                        }
+                    }
+                    RangeKind::IndexedDown if b > 0 => {
+                        if dl >= dr {
+                            (a, a.checked_sub(b - 1)?)
+                        } else {
+                            (a.checked_sub(b - 1)?, a)
+                        }
+                    }
+                    _ => return None,
+                };
+                // Bit position of a label within the base slice.
+                let pos = |lab: i64| -> Option<i64> {
+                    let (lo_b, hi_b) = (dl.min(dr), dl.max(dr));
+                    if lab < lo_b || lab > hi_b {
+                        return None;
+                    }
+                    let count = hi_b - lo_b + 1;
+                    let off = lab - lo_b;
+                    Some(if dl >= dr { off } else { count - 1 - off })
+                };
+                let lo_pos = pos(l)?.min(pos(r)?);
+                let width = u32::try_from(l.abs_diff(r) + 1).ok()?;
+                let new_lsb = lsb.checked_add(u32::try_from(lo_pos).ok()?)?;
+                if new_lsb.checked_add(width)? > lsb + w {
+                    return None;
+                }
+                Some(vec![(id, new_lsb, width)])
+            }
+            _ => {
+                let (id, lsb, w) = self.packed_nba_base_slice(lhs)?;
+                Some(vec![(id, lsb, w)])
+            }
+        }
+    }
+
+    /// The backing signal slice a partial-NBA lvalue selects within:
+    /// `(signal_id, lsb, width)`.
+    ///
+    /// Mirrors the blocking member path (`packed_struct_member_slice` +
+    /// `get_local_or_signal`): the flat member name's longest registered
+    /// packed-struct base names the storage signal and the layout supplies
+    /// the member's offset/width. A head bound to a virtual interface
+    /// rewrites to the bound instance first (§25.9) so interface variables
+    /// resolve as well. A whole-signal base (a plain vector) resolves
+    /// directly. Everything else — locals, class properties, statics,
+    /// collections — declines, keeping the queued path.
+    fn packed_nba_base_slice(&mut self, base: &Expression) -> Option<(usize, u32, u32)> {
+        // Root guards: walk to the chain's root identifier.
+        let mut root = base;
+        loop {
+            root = match &root.kind {
+                ExprKind::Paren(i) => i,
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => expr,
+                _ => break,
+            };
+        }
+        let ExprKind::Ident(h) = &root.kind else {
+            return None;
+        };
+        if h.path.len() == 1 && h.path[0].selects.is_empty() {
+            let name = h.path[0].name.name.as_str();
+            if self
+                .local_stack
+                .last()
+                .is_some_and(|f| f.contains_key(name))
+                || self
+                    .ref_alias_stack
+                    .last()
+                    .is_some_and(|m| m.contains_key(name))
+                || self
+                    .ref_binding_stack
+                    .last()
+                    .is_some_and(|m| m.contains_key(name))
+                || self.bare_selected_storage_shadows_signal(h)
+            {
+                return None;
+            }
+        }
+        // In a method a RELATIVE receiver can name a class property; only an
+        // absolute name ($root-anchored — e.g. a virtual-interface target
+        // rebased upstream) or one rewritten through a vif binding (which
+        // then names the bound instance's own variable) may take the signal
+        // path.
+        let in_method = matches!(self.this_stack.last(), Some(Some(_)));
+        let mut flat = self.flat_member_name(base)?;
+        // §25.5.2: a modport-qualified member path names the instance's own
+        // variable — strip the modport segment so the layout walk below
+        // lands on the real base.
+        if !self.module.modport_member_dirs.is_empty() {
+            flat = self.strip_modport_segments(&flat);
+        }
+        let mut slice = self.packed_nba_flat_slice(&flat);
+        let mut rewritten = false;
+        if slice.is_none() {
+            if let Some((head, rest)) = flat.split_once('.') {
+                if let Some(bound) = self.nba_vif_bound_instance(head) {
+                    let cand = format!("{}.{}", bound, rest);
+                    if let Some(s) = self.packed_nba_flat_slice(&cand) {
+                        flat = cand;
+                        slice = Some(s);
+                        rewritten = true;
+                    }
+                }
+            }
+        }
+        // An unpacked-array element (`arr[0].vld`, `arr30[i].vld`) keeps its
+        // own per-element signal while the struct layout stays keyed by the
+        // ARRAY's base name — resolve through the storage/steps walk.
+        let mut arr_slice = None;
+        if slice.is_none() && h.root.is_none() {
+            if let Some((root, steps)) = self.packed_path_steps(base) {
+                arr_slice = self.packed_path_slice(&root, &steps);
+            }
+        }
+        if in_method && h.root.is_none() && !rewritten {
+            return None;
+        }
+        let (base_name, member_ow) = if let Some((b, o, w)) = slice {
+            (b, Some((o, w)))
+        } else if let Some((storage, o, w)) = arr_slice {
+            (storage, Some((o, w)))
+        } else {
+            // Whole-signal base: a plain vector with no member part.
+            if flat.contains('.') || flat.contains('[') {
+                return None;
+            }
+            (flat, None)
+        };
+        let id = match self.signal_name_to_id.get(base_name.as_str()) {
+            Some(&id) => id,
+            None => self
+                .hint_scoped(&base_name)
+                .and_then(|s| self.signal_name_to_id.get(s.as_str()).copied())?,
+        };
+        if is_packed_id(id) {
+            // Packed-arena cells keep the queued path (`queue_packed_nba`).
+            return None;
+        }
+        let sig_w = self.signal_widths[id];
+        let (off, w) = member_ow.unwrap_or((0, sig_w));
+        if off.checked_add(w)? > sig_w {
+            return None;
+        }
+        Some((id, off, w))
+    }
+
+    /// The longest registered packed-struct base of a flat member name, as
+    /// `(base_name, bit_offset, width)` of the selected member within it —
+    /// the same longest-base-first walk `packed_struct_member_slice` uses
+    /// (a nested member is a flattened key of its own, so the split points
+    /// are tried from the longest base down).
+    fn packed_nba_flat_slice(&self, flat: &str) -> Option<(String, u32, u32)> {
+        for (i, _) in flat
+            .match_indices('.')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            let (b, prefix) = (&flat[..i], &flat[i + 1..]);
+            let Some(layout) = self.module.packed_struct_fields.get(b) else {
+                continue;
+            };
+            if let Some(&(_, o, w)) = layout.iter().find(|(k, _, _)| k.as_str() == prefix) {
+                return Some((b.to_string(), o, w));
+            }
+        }
+        None
+    }
+
+    /// §25.9: the interface instance a virtual-interface head is bound to —
+    /// a task formal (`local_iface_aliases`) or a class property of the
+    /// running method's `this` (`virtual_iface_bindings`).
+    fn nba_vif_bound_instance(&self, head: &str) -> Option<String> {
+        if let Some(frame) = self.local_iface_aliases.last() {
+            if let Some(bound) = frame.get(head) {
+                return Some(bound.clone());
+            }
+        }
+        if let Some(Some(this_h)) = self.this_stack.last().copied() {
+            let cls_name = self
+                .heap
+                .get(this_h)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.class_name.clone());
+            if cls_name
+                .as_ref()
+                .is_some_and(|cn| self.class_vif_decl(cn, head).is_some())
+            {
+                if let Some((bound, _)) =
+                    self.virtual_iface_bindings.get(&(this_h, head.to_string()))
+                {
+                    return Some(bound.clone());
+                }
+            }
+        }
+        None
     }
 
     /// JIT Stage 4 Tier C Path C1: drain the side queue populated by
