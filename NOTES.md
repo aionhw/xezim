@@ -168,8 +168,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   chuanseng-ng).
 * An inlined function hides its caller's loop constants while executing its
   body, then restores the caller's bindings before copying output arguments
-  back to local variables or indexed destinations (§13.4, §13.5.3, #1041 /
-  #1042, reported and contributed by chuanseng-ng).
+  back to local variables or indexed destinations. Nested returns resume the
+  innermost caller before output writeback (§13.4, §13.5.3, #1041 / #1042,
+  reported and contributed by chuanseng-ng).
 * Explicit static locals of automatic tasks and void functions retain shared
   state across clocked calls, nested blocks and conditional updates. Automatic
   and write-first locals keep their ordinary behavior (§6.21, #1049).
