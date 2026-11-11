@@ -700,3 +700,17 @@ fn nba_partial_then_whole_shapes_1050() {
     let (got, want) = nba_shapes_1050(&ids);
     assert_eq!(got, want);
 }
+
+/// §10.4.2, §8.5: a nonblocking update of a class property is sized by the
+/// property's declared type — through a handle, `this`, `super` or the class
+/// name, wider than 32 bits or `real` — and lands in the property, not in a
+/// module signal of the same name (#1050).
+#[test]
+fn class_property_nba_shapes_1050() {
+    let ids = [
+        "s25", "s40", "s41", "s42", "s43", "s47", "s48", "s49", "s50", "s51", "s52", "s53", "s54",
+        "s55", "s56", "s57", "s61",
+    ];
+    let (got, want) = nba_shapes_1050(&ids);
+    assert_eq!(got, want);
+}
