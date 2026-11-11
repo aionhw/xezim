@@ -4082,9 +4082,8 @@ impl Simulator {
                         return v;
                     }
                 }
-                // §11.4.5: equality on unpacked structs is member-wise.
-                if matches!(op, BinaryOp::Eq | BinaryOp::Neq)
-                    && let Some((mode, want_eq)) = PatternCmpMode::of(*op)
+                // §11.4.5, §11.4.6: equality on unpacked structs is member-wise.
+                if let Some((mode, want_eq)) = PatternCmpMode::of(*op)
                     && let Some(c) = self.compare_unpacked_structs(left, right, mode)
                 {
                     return c.value(want_eq);
@@ -4179,8 +4178,7 @@ impl Simulator {
                 // element, not as the container's packed scalar. UVM's
                 // `uvm_resource#(T)::do_write` guards on `val == t` for a
                 // `T`-typed queue.
-                if let Some((mode, want_eq)) =
-                    PatternCmpMode::of(*op).filter(|&(m, _)| m != PatternCmpMode::Wildcard)
+                if let Some((mode, want_eq)) = PatternCmpMode::of(*op)
                     && let Some(c) = self.compare_unpacked_arrays(left, right, mode)
                 {
                     return c.value(want_eq);
