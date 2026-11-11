@@ -484,3 +484,5 @@ mod hierarchical_subroutine_static;
 mod review_loop_jumps_and_block_disables;
 #[path = "scheduling/nba_partial_commit_order.rs"]
 mod nba_partial_commit_order;
+#[path = "scheduling/cont_assign_struct_array_argument.rs"]
+mod cont_assign_struct_array_argument;
