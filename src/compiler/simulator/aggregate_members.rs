@@ -1288,6 +1288,53 @@ impl Simulator {
         None
     }
 
+    /// Build the leading `count` segments of the flattened Ident chain `e` as
+    /// a nested `MemberAccess` expression — `h.frame.lanes` with `count=2`
+    /// → `(h).frame`. Used to hand a real Expression shape to
+    /// [`Self::struct_field_elem_read`], whose receiver/type probes walk
+    /// `MemberAccess` chains (the resolver flattened the same chain to a
+    /// bare `Ident`).
+    pub(super) fn ident_prefix_member_access(e: &Expression, count: usize) -> Expression {
+        let ExprKind::Ident(h) = &e.kind else {
+            return e.clone();
+        };
+        let count = count.min(h.path.len());
+        if count == 0 {
+            return e.clone();
+        }
+        let span = e.span;
+        let mut acc = Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: h.root.clone(),
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: h.path[0].name.name.clone(),
+                        span,
+                    },
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            }),
+            span,
+        );
+        for seg in h.path.iter().take(count).skip(1) {
+            acc = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(acc),
+                    member: crate::ast::Identifier {
+                        name: seg.name.name.clone(),
+                        span,
+                    },
+                },
+                span,
+            );
+        }
+        acc
+    }
+
     /// `sb.member[index]` with `member` a packed-array field (two or more
     /// packed dimensions) of the packed struct `sb` names: the element.
     #[inline(never)]
@@ -1393,6 +1440,20 @@ impl Simulator {
                     .find(|m| m.declarators.iter().any(|d| d.name.name == member.name))
                     .map(|m| m.data_type.clone())?;
                 Self::resolve_type_ref(&m_dt, &self.module.typedef_types)
+            }
+            ExprKind::Ident(h) => {
+                // §7.4.5 implicit-`this` receiver: `frame.lanes[0]` inside a
+                // method flattens to `MemberAccess{ Ident[frame], lanes }`,
+                // so the struct-side base is the bare property `frame` held
+                // by the current `this` object. (A module-scope struct
+                // variable receiver, or a bare name with no `this`, is not a
+                // class property and falls through to None.)
+                if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    return None;
+                }
+                let obj = self.this_stack.last().copied().flatten()?;
+                let su = self.class_prop_struct(obj, &h.path[0].name.name)?;
+                DataType::Struct((*su).clone())
             }
             _ => return None,
         };
@@ -2657,7 +2718,7 @@ impl Simulator {
         if rest.is_empty() {
             return Some((0, total_w));
         }
-        let dims = Self::packed_dim_bounds(dt, params)?;
+        let dims = self.packed_dim_bounds(dt, params)?;
         let counts: Vec<u32> = dims
             .iter()
             .map(|&(l, r)| u32::try_from((l - r).unsigned_abs() + 1).ok().unwrap_or(0))
@@ -2680,6 +2741,33 @@ impl Simulator {
                     i += 1;
                 }
                 MemberSel::Range { kind, l, r } => {
+                    // Indexed part-selects (`+:` / `-:`) directed at a still-
+                    // packed ARRAY dimension address ELEMENTS, not bits
+                    // (§11.5.1): `lanes[0 +: 1]` is element 0, not bit 0, of
+                    // the whole member. Rebase the element index to a
+                    // physical offset exactly as a plain Index would, then
+                    // scale the width by the element size.
+                    if matches!(kind, RangeKind::IndexedUp | RangeKind::IndexedDown)
+                        && d < dims.len()
+                    {
+                        let &(L, R) = dims.get(d)?;
+                        let count = counts.get(d).copied().unwrap_or(1).max(1);
+                        let ew = span.checked_div(count)?;
+                        let elem_off = |E: i64| -> Option<u32> {
+                            let slot = if L >= R { E - R } else { R - E };
+                            (slot >= 0)
+                                .then(|| (slot as u32).checked_mul(ew))
+                                .flatten()
+                        };
+                        let end_e = if matches!(kind, RangeKind::IndexedUp) {
+                            l + r - 1
+                        } else {
+                            l - r + 1
+                        };
+                        let lo = elem_off(*l)?.min(elem_off(end_e)?);
+                        let w = u32::try_from(*r).ok()?.max(1);
+                        return Some((off.checked_add(lo)?, w * ew));
+                    }
                     let (o, w) = Self::range_within(span, *kind, *l, *r)?;
                     return Some((off.checked_add(o)?, w));
                 }
@@ -2696,13 +2784,53 @@ impl Simulator {
     /// contributes its own width as one range so bit-selects on it still
     /// resolve; a `real` never does).
     pub(super) fn packed_dim_bounds(
+        &self,
         dt: &DataType,
         params: &HashMap<String, Value>,
     ) -> Option<Vec<(i64, i64)>> {
         use crate::ast::types::{DataType as DT, PackedDimension};
-        let dims: Vec<PackedDimension> = match dt {
+        let mut out: Vec<(i64, i64)> = Vec::new();
+        let mut cur = dt.clone();
+        // Follow a typedef/type-parameter chain, collecting each level's
+        // PACKED dimensions outermost-first so a member typed via a typedef
+        // (`lane_t [0:3]`, `typedef logic[7:0] lane_t;`) gets its array shape
+        // as well as a bare vector would.
+        loop {
+            match &cur {
+                DT::TypeReference {
+                    name,
+                    dimensions,
+                    ..
+                } => {
+                    for d in dimensions {
+                        let PackedDimension::Range { left, right, .. } = d else {
+                            return None;
+                        };
+                        out.push((
+                            super::elaborate::const_eval_i64_with_params(left, Some(params))?,
+                            super::elaborate::const_eval_i64_with_params(right, Some(params))?,
+                        ));
+                    }
+                    let next = self.module.typedef_types.get(&name.name.name)?.clone();
+                    cur = next;
+                }
+                _ => break,
+            }
+            if out.len() > 64 {
+                return None;
+            }
+        }
+        match &cur {
             DT::IntegerVector { dimensions, .. } | DT::Implicit { dimensions, .. } => {
-                dimensions.clone()
+                for d in dimensions {
+                    let PackedDimension::Range { left, right, .. } = d else {
+                        return None;
+                    };
+                    out.push((
+                        super::elaborate::const_eval_i64_with_params(left, Some(params))?,
+                        super::elaborate::const_eval_i64_with_params(right, Some(params))?,
+                    ));
+                }
             }
             DT::IntegerAtom { kind, .. } => {
                 let w = match kind {
@@ -2713,15 +2841,25 @@ impl Simulator {
                     crate::ast::types::IntegerAtomType::LongInt
                     | crate::ast::types::IntegerAtomType::Time => 64,
                 };
-                return Some(vec![(w as i64 - 1, 0)]);
+                out.push((w as i64 - 1, 0));
             }
-            DT::Struct(su) if !su.dimensions.is_empty() => su.dimensions.clone(),
+            DT::Struct(su) if !su.dimensions.is_empty() => {
+                for d in &su.dimensions {
+                    let PackedDimension::Range { left, right, .. } = d else {
+                        return None;
+                    };
+                    out.push((
+                        super::elaborate::const_eval_i64_with_params(left, Some(params))?,
+                        super::elaborate::const_eval_i64_with_params(right, Some(params))?,
+                    ));
+                }
+            }
             _ => return None,
-        };
-        if dims.is_empty() {
+        }
+        if out.is_empty() {
             return None;
         }
-        Self::packed_range_bounds(&dims, params)
+        Some(out)
     }
 
     /// Const-resolved `(left, right)` of each of `dims`, in order; `None` for
