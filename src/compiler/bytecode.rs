@@ -4481,6 +4481,16 @@ impl<'a> BytecodeCompiler<'a> {
         {
             return false;
         }
+        // §6.21: so does a static variable of any subroutine — a local of a
+        // subroutine with the default (static) lifetime, or one declared
+        // `static` in an automatic subroutine — when its value can be read
+        // before the call writes it.
+        if Self::body_has_carried_static(
+            &body,
+            matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic)),
+        ) {
+            return false;
+        }
         if ports.len() != args.len()
             || ports.iter().any(|p| {
                 !matches!(p.direction, PortDirection::Input | PortDirection::Output)
@@ -12729,6 +12739,52 @@ impl<'a> BytecodeCompiler<'a> {
                 })
             }
             _ => false,
+        })
+    }
+
+    /// §6.21: does a subroutine body declare, at any depth, a static
+    /// variable whose value can carry from one call to the next? `auto` is
+    /// the subroutine's lifetime: in an automatic one only a variable
+    /// declared `static` is static.
+    fn body_has_carried_static(stmts: &[Statement], auto: bool) -> bool {
+        use crate::ast::types::Lifetime;
+        fn nested(s: &Statement, auto: bool) -> bool {
+            match &s.kind {
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    BytecodeCompiler::body_has_carried_static(stmts, auto)
+                }
+                StatementKind::If {
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => nested(then_stmt, auto) || else_stmt.as_ref().is_some_and(|e| nested(e, auto)),
+                StatementKind::Case { items, .. } => items.iter().any(|it| nested(&it.stmt, auto)),
+                StatementKind::For { body, .. }
+                | StatementKind::Foreach { body, .. }
+                | StatementKind::While { body, .. }
+                | StatementKind::DoWhile { body, .. }
+                | StatementKind::Repeat { body, .. }
+                | StatementKind::Forever { body }
+                | StatementKind::TimingControl { stmt: body, .. }
+                | StatementKind::Wait { stmt: body, .. } => nested(body, auto),
+                _ => false,
+            }
+        }
+        stmts.iter().enumerate().any(|(i, s)| match &s.kind {
+            StatementKind::VarDecl {
+                lifetime,
+                declarators,
+                ..
+            } => {
+                let explicit = matches!(lifetime, Some(Lifetime::Static));
+                let is_static = explicit || (!auto && lifetime.is_none());
+                is_static
+                    && declarators.iter().any(|d| match &d.init {
+                        Some(_) => explicit,
+                        None => Self::static_local_carries(&d.name.name, &stmts[i + 1..]),
+                    })
+            }
+            _ => nested(s, auto),
         })
     }
 
