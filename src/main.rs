@@ -1,44 +1,8 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-// A reader that goes away early (`xezim run.sv | head -1`) must not end the
-// run. std's print macros panic when the write fails, and `panic = "abort"`
-// turns that into SIGABRT: exit 134 instead of the run's own status, and
-// nothing after the failed line runs. These shadow them for the whole binary
-// (they come before the `mod` items, so the modules see them too) and drop
-// the error, as the `$display` writer does.
-macro_rules! print {
-    ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = write!(std::io::stdout(), $($arg)*);
-    }};
-}
-macro_rules! println {
-    () => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stdout());
-    }};
-    ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stdout(), $($arg)*);
-    }};
-}
-macro_rules! eprint {
-    ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = write!(std::io::stderr(), $($arg)*);
-    }};
-}
-macro_rules! eprintln {
-    () => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr());
-    }};
-    ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr(), $($arg)*);
-    }};
-}
+#[macro_use]
+mod stdio;
 
 // Opt-in end-of-run statistics footer (`--report-stats` / XEZIM_REPORT_STATS).
 // CLI-only plumbing, so it lives in the binary, not the library.

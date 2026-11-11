@@ -6,6 +6,9 @@
 //!
 //! For ahead-of-time native compilation, use the `xezim-b` crate.
 
+#[macro_use]
+mod stdio;
+
 /// Internal engine chatter (`[PHASE]` timings, end-of-run `[PROF]`/`[FUSE]`
 /// counters, compile-time optimisation notes) goes through this instead of
 /// `eprintln!`: it prints only when [`verbose`] is on, so a default run shows
