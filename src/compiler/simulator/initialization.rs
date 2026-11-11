@@ -1341,6 +1341,7 @@ impl Simulator {
                     new_signals.push(alias.clone());
                     new_assigns.push(super::elaborate::ContinuousAssignment {
                         gate_delay_fall: None,
+                        delay_select: None,
                         origin: None,
                         lhs: mk_ident(&alias, span),
                         rhs,
@@ -2289,6 +2290,7 @@ impl Simulator {
                     .continuous_assigns
                     .push(super::elaborate::ContinuousAssignment {
                         gate_delay_fall: None,
+                        delay_select: None,
                         origin: None,
                         lhs: mk_ident(&nm, rhs.span),
                         rhs,

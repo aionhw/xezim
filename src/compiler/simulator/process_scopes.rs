@@ -4699,12 +4699,24 @@ impl Simulator {
 
     /// Schedule a delayed signal update with an explicit delay (inertial delay model).
     pub(super) fn schedule_delayed_with_delay(&mut self, id: usize, val: Value, delay: u64) {
+        self.schedule_delayed_transition(id, val, delay, None);
+    }
+
+    /// §10.3.3 vector assignments use rise for x and mixed values;
+    /// scalar assignments and gate/net delays retain §28.16.
+    pub(super) fn schedule_delayed_transition(
+        &mut self,
+        id: usize,
+        val: Value,
+        delay: u64,
+        delay_target: Option<DelayTarget>,
+    ) {
         // §30.4 path-delayed net: the module paths pick the delay.
         if let Some(k) = self.module_paths.as_ref().and_then(|mp| mp.table_of(id)) {
             self.schedule_module_path(id, k, val);
             return;
         }
-        // §28.11: a gate declared `#(rise, fall)` uses the FALL value for a
+        // §28.16: a gate declared `#(rise, fall)` uses the FALL value for a
         // transition to 0. The lowered cont-assign only carries the rise
         // delay, so consult the per-driver fall map here — this is the single
         // choke point where both the target and the new value are known.
@@ -4715,6 +4727,22 @@ impl Simulator {
         {
             delay
         } else {
+            // §10.3.3 / §28.16: select the transition delay from the
+            // original target bits, not z padding added for resolution.
+            let selected = delay_target
+                .filter(|target| target.lo != 0 || target.width != val.width)
+                .map(|target| {
+                    let hi = (target.lo + target.width - 1) as usize;
+                    (
+                        val.range_select(hi, target.lo as usize),
+                        self.signal_table[id].range_select(hi, target.lo as usize),
+                    )
+                });
+            let vector_assign = delay_target.is_some_and(|target| target.vector);
+            let new_value = selected.as_ref().map_or(&val, |(new, _)| new);
+            let old_value = selected
+                .as_ref()
+                .map_or(&self.signal_table[id], |(_, old)| old);
             // NB: `to_u64()` MASKS x/z to 0 rather than returning None, so it
             // cannot distinguish a genuine 0 from z — use an explicit bit test.
             // The initial x/z -> 0 settle counts as a fall as well, so the
@@ -4729,14 +4757,16 @@ impl Simulator {
             };
             if fall.is_none() && off.is_none() {
                 delay
-            } else if all_zero(&val) && !all_zero(&self.signal_table[id]) {
+            } else if all_zero(new_value) && !all_zero(old_value) {
                 fall.unwrap_or(delay)
-            } else if all_z(&val) {
-                // §10.3.3 / §28.11: to z uses the turn-off delay; with only
+            } else if all_z(new_value) {
+                // §10.3.3 / §28.16: to z uses the turn-off delay; with only
                 // two delays given, the smaller of rise and fall.
                 off.unwrap_or_else(|| fall.map_or(delay, |f| f.min(delay)))
-            } else if val.has_xz() {
-                // To x: the smallest of the delays given.
+            } else if new_value.has_xz() && !vector_assign {
+                // §28.16: scalar/gate to x uses the smallest delay. For a
+                // vector continuous assignment, §10.3.3 uses rise for every
+                // case other than nonzero -> all 0 or -> all z.
                 [Some(delay), fall, off]
                     .into_iter()
                     .flatten()
