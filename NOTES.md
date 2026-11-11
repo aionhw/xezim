@@ -161,6 +161,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   indexed record fields retain their own dependencies (§18.5, §11.4.3,
   #1003, reported by Ganesh-TNL).
 
+* A typed constructor call builds the class it names: `b = Derived::new()`
+  into a `Base` handle built a `Base`, and `Derived::new` without
+  parentheses, a `Base t = Derived::new` initializer in a function, `T::new()`
+  with a class type parameter and `pkg::C::new` gave null or the wrong class
+  (§8.8, #1051).
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
