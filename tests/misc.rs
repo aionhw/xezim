@@ -624,3 +624,6 @@ mod review_class_param_undeclared_888;
 mod preprocessor_closed_pipe;
 #[path = "misc/review_interconnect_element_types.rs"]
 mod review_interconnect_element_types;
+
+#[path = "misc/cli_worker_stack_1055.rs"]
+mod cli_worker_stack_1055;
