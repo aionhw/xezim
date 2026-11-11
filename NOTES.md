@@ -204,6 +204,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   dynamic arrays and class properties. Each item takes the element type, and
   all source values are read before the selected elements are overwritten
   (§7.4.5, §10.9.1, #1045, reported by Ganesh-TNL).
+* A `disable`, `break` or `continue` run in a `forever` body before the
+  body's delay ends the iteration there. `disable` of a process's own
+  top-level block, an `always` body or a named `forever` body stops that
+  block, and `%m` in such a body names it (§9.6.2, §12.8, #1068, reported and
+  contributed by chuanseng-ng).
 
 **Performance**
 
