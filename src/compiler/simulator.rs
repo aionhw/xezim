@@ -1107,6 +1107,15 @@ enum TsSlot {
     Yes(std::sync::Arc<super::bytecode::TwoStateBlock>),
 }
 
+/// §10.3.3 / §28.16: transition bits and rule before driver widening.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct DelayTarget {
+    lo: u32,
+    width: u32,
+    /// §10.3.3 vector assignment, rather than §28.16 gate/scalar rules.
+    vector: bool,
+}
+
 /// A combinatorial item (continuous assign or always @*/always_comb block)
 /// with pre-computed sensitivity set for efficient evaluation.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -1118,6 +1127,8 @@ enum CombItem {
         lhs: Box<Expression>,
         rhs: Box<Expression>,
         delay: u64,
+        /// §10.3.3 / §28.16: the original target before driver widening.
+        delay_target: Option<DelayTarget>,
     },
     /// Fast path: direct signal-to-signal copy (assign b = a) with pre-resolved IDs.
     DirectCopy {
@@ -1653,7 +1664,8 @@ struct CombEntryCold {
 // an element of an unpacked array of structs, or of the whole array, now
 // depend on its members too.
 // §10.3.3: keep falling and turn-off delays when prepared tables are restored.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB032";
+// §10.3.3 / §28.16: retain each delayed entry's original transition target.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB033";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

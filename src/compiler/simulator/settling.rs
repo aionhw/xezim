@@ -607,6 +607,7 @@ impl Simulator {
                 lhs,
                 rhs,
                 delay: explicit_delay,
+                delay_target,
             } => {
                 if let Some(c) = entry.cold.cov {
                     self.cov_count(c);
@@ -707,7 +708,7 @@ impl Simulator {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {
                             if !self.delayed_update_pending_is(id, &val) {
-                                self.schedule_delayed_with_delay(id, val, delay);
+                                self.schedule_delayed_transition(id, val, delay, *delay_target);
                             }
                         } else {
                             self.cancel_delayed(id);

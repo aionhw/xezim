@@ -867,6 +867,28 @@ impl Simulator {
                 || primitive_fall
                 || ca.delay_fall.is_some_and(|d| d > 0)
                 || ca.delay_off.is_some_and(|d| d > 0);
+            // §10.3.3 versus §28.16: use the assignment's origin, not the
+            // target's gate marker. Multi-driver lowering can give a gate
+            // and an assignment separate, unmarked driver nets.
+            let delay_target = if has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
+                ca.delay_select
+                    .or_else(|| {
+                        ca.origin.as_ref().and_then(|_| {
+                            xezim_core::elaborate::continuous_assign_delay_select(
+                                &ca.lhs,
+                                &self.module,
+                                Some(self.signal_widths[wids[0]]),
+                            )
+                        })
+                    })
+                    .map(|(lo, width, vector)| DelayTarget {
+                        lo,
+                        width,
+                        vector: ca.origin.is_some() && vector,
+                    })
+            } else {
+                None
+            };
             let fused = if !has_transition_delay && cov_counter.is_none() {
                 self.try_build_fused_gate(&ca.lhs, &ca.rhs, scope_hint.as_deref())
             } else {
@@ -876,7 +898,8 @@ impl Simulator {
             // item carries the rise delay; the fall / turn-off values go to
             // the per-driver maps consulted by `schedule_delayed_with_delay`,
             // the one point where both the target and the new value are
-            // known. Whole-net targets only, like the gate form (§28.11).
+            // known. Whole-net targets only, including widened overlapping
+            // selects, like the gate form (§28.16).
             if has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
                 if let Some(f) = ca.delay_fall {
                     if f != explicit_delay {
@@ -901,6 +924,7 @@ impl Simulator {
                     lhs: Box::new(ca.lhs.clone()),
                     rhs: Box::new(ca.rhs.clone()),
                     delay: explicit_delay,
+                    delay_target,
                 }
             } else if let Some(op) = fused {
                 CombItem::FusedGate { op }
@@ -998,6 +1022,7 @@ impl Simulator {
                             lhs: Box::new(ca.lhs),
                             rhs: Box::new(ca.rhs),
                             delay: 0,
+                            delay_target: None,
                         }
                     }
                 }
@@ -1088,6 +1113,7 @@ impl Simulator {
                             lhs: Box::new(ca.lhs),
                             rhs: Box::new(ca.rhs),
                             delay: 0,
+                            delay_target: None,
                         }
                     }
                 }
@@ -1096,6 +1122,7 @@ impl Simulator {
                     lhs: Box::new(ca.lhs),
                     rhs: Box::new(ca.rhs),
                     delay: 0,
+                    delay_target: None,
                 }
             };
 
