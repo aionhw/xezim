@@ -1211,3 +1211,6 @@ mod rand_sub_object_back_handle;
 
 #[path = "classes/rand_solver_sparse_1003.rs"]
 mod rand_solver_sparse_1003;
+
+#[path = "classes/typed_constructor_call.rs"]
+mod typed_constructor_call;
