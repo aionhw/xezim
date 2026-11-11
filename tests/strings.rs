@@ -17,6 +17,8 @@ mod assoc_in_always_ff_and_string_element_methods;
 mod call_time_defaults_and_string_queries;
 #[path = "strings/class_member_string_queue_element_via_path.rs"]
 mod class_member_string_queue_element_via_path;
+#[path = "strings/class_member_string_queue_element_bytecode_compare.rs"]
+mod class_member_string_queue_element_bytecode_compare;
 #[path = "strings/compiled_sformatf_native.rs"]
 mod compiled_sformatf_native;
 #[path = "strings/display_only_always.rs"]
