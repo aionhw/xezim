@@ -480,3 +480,5 @@ mod static_local_in_clocked_call;
 
 #[path = "scheduling/hierarchical_subroutine_static.rs"]
 mod hierarchical_subroutine_static;
+#[path = "scheduling/review_loop_jumps_and_block_disables.rs"]
+mod review_loop_jumps_and_block_disables;
