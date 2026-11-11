@@ -4,6 +4,14 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// Bit-exact (`===`/`!==`) element equality at a declared element width: the
+/// 4-state case-equality of `a` and `b` resized to `width` bits. Used for the
+/// case-comparison path through the collection comparators, where an x/z
+/// element matches an identical x/z element and never matches a known one.
+pub(crate) fn a_resized_case_eq(a: &Value, b: &Value, width: u32) -> bool {
+    a.resize(width).case_eq(&b.resize(width)).to_u64() == Some(1)
+}
+
 /// An associative array's index type, for `item.index` (§7.12.4) and
 /// `_index` locator results (§7.12.1).
 #[derive(Clone, Copy)]
@@ -215,6 +223,7 @@ impl Simulator {
         left: &Expression,
         right: &Expression,
         want_eq: bool,
+        case: bool,
     ) -> Option<Value> {
         let ln = self.dyn_cmp_operand_name(left)?;
         let rn = self.dyn_cmp_operand_name(right)?;
@@ -234,6 +243,9 @@ impl Simulator {
             .map(|t| t.2)
             .or_else(|| self.module.arrays.get(&rn).map(|t| t.2))
             .unwrap_or(32);
+        let ew = self
+            .coll_elem_width(&ln)
+            .or_else(|| self.coll_elem_width(&rn));
         let mut equal = true;
         for i in 0..ls {
             let lv = self
@@ -242,21 +254,35 @@ impl Simulator {
             let rv = self
                 .get_signal_value_by_name(&format!("{}[{}]", rn, i))
                 .unwrap_or_else(|| Value::zero(w));
-            if lv.has_unknown() || rv.has_unknown() {
-                // Reference behavior: an x/z element makes the comparison
-                // neither equal NOR unequal — both `==` and `!=` yield 0
-                // (verified: `q1 == q1` and `q1 != q1` with an 8'hxx element
-                // both print 0 there; returning x instead rendered `%b` as x).
-                return Some(Value::from_u64(0, 1));
-            }
-            // Compare at the declared element width so a differing storage
-            // slot (width/signedness) does not decide the pair (the packed/
-            // unpacked element-table family) — bits are what matter.
-            let ew = self
-                .coll_elem_width(&ln)
-                .or_else(|| self.coll_elem_width(&rn));
-            if !self.coll_values_eq(&lv, &rv, ew) {
-                equal = false;
+            if case {
+                // `===`/`!==`: bit-exact element compare. An x/z element is
+                // compared for equality with its exact 4-state bits (so an x
+                // element matches an x element, and never matches a known one),
+                // and no element makes the whole result unknown.
+                let eq = if let Some(e) = ew {
+                    a_resized_case_eq(&lv, &rv, e)
+                } else {
+                    lv.case_eq(&rv).to_u64() == Some(1)
+                };
+                if !eq {
+                    equal = false;
+                    break;
+                }
+            } else {
+                if lv.has_unknown() || rv.has_unknown() {
+                    // Reference behavior: an x/z element makes the comparison
+                    // neither equal NOR unequal — both `==` and `!=` yield 0
+                    // (verified: `q1 == q1` and `q1 != q1` with an 8'hxx element
+                    // both print 0 there; returning x instead rendered `%b` as x).
+                    return Some(Value::from_u64(0, 1));
+                }
+                // Compare at the declared element width so a differing storage
+                // slot (width/signedness) does not decide the pair (the packed/
+                // unpacked element-table family) — bits are what matter.
+                if !self.coll_values_eq(&lv, &rv, ew) {
+                    equal = false;
+                    break;
+                }
             }
         }
         let res = if want_eq { equal } else { !equal };
@@ -315,21 +341,47 @@ impl Simulator {
     /// if it does not name one (the caller then falls through). Mirrors
     /// [`Self::dyn_cmp_operand_name`] but for associative arrays.
     pub(super) fn assoc_cmp_operand_name(&mut self, e: &Expression) -> Option<String> {
+        if let ExprKind::Ident(h) = &e.kind {
+            // A method-local associative array under its per-call storage key.
+            if let [seg] = h.path.as_slice()
+                && seg.selects.is_empty()
+                && let Some(uq) = self
+                    .dyn_name_lookup(seg.name.name.as_str())
+                    .filter(|uq| *uq != seg.name.name.as_str())
+                && self.module.associative_arrays.contains_key(uq)
+            {
+                return Some(uq.to_string());
+            }
+            // A bare-identifier associative-array formal or local/signal
+            // registered in `associative_arrays`. Mirror the dyn-array path:
+            // a single segment (or flattened hierarchical name) that is a
+            // registered signal assoc array resolves to itself, shadowed by
+            // `this`-scoped members only when it isn't a plain collection.
+            let registered = if self.ident_shadowed_by_non_collection(h) {
+                false
+            } else {
+                match h.path.as_slice() {
+                    [seg] => self
+                        .module
+                        .associative_arrays
+                        .contains_key(seg.name.name.as_str()),
+                    _ => {
+                        let n = Self::resolve_hier_name_static(h, &self.module);
+                        self.module.associative_arrays.contains_key(&n)
+                    }
+                }
+            };
+            if registered {
+                let n = Self::resolve_hier_name_static(h, &self.module);
+                if let Some(m) = self.instance_assoc_member(&n) {
+                    return Some(m);
+                }
+                return Some(n);
+            }
+        }
         let an = self.expr_assoc_name(e)?;
         if !self.is_associative_array(&an) {
             return None;
-        }
-        // A bare associative-array local may live under a per-call storage
-        // key shadow; follow the same lookup as the dyn path.
-        if let ExprKind::Ident(h) = &e.kind {
-            if let [seg] = h.path.as_slice() {
-                let bare = seg.name.name.as_str();
-                if seg.selects.is_empty() {
-                    if let Some(uq) = self.dyn_name_lookup(bare) {
-                        return Some(uq.to_string());
-                    }
-                }
-            }
         }
         Some(an)
     }
@@ -347,6 +399,7 @@ impl Simulator {
         left: &Expression,
         right: &Expression,
         want_eq: bool,
+        case: bool,
     ) -> Option<Value> {
         let ln = self.assoc_cmp_operand_name(left)?;
         let rn = self.assoc_cmp_operand_name(right)?;
@@ -370,14 +423,26 @@ impl Simulator {
                 let rv = self
                     .get_signal_value_by_name(&format!("{}[{}]", rn, k))
                     .unwrap_or_else(|| Value::zero(ew.unwrap_or(32)));
-                if lv.has_unknown() || rv.has_unknown() {
-                    // An unknown element makes the comparison ambiguous: both
-                    // `==` and `!=` come out 0.
-                    return Some(Value::from_u64(0, 1));
-                }
-                if !self.coll_values_eq(&lv, &rv, ew) {
-                    equal = false;
-                    break;
+                if case {
+                    let eq = if let Some(e) = ew {
+                        a_resized_case_eq(&lv, &rv, e)
+                    } else {
+                        lv.case_eq(&rv).to_u64() == Some(1)
+                    };
+                    if !eq {
+                        equal = false;
+                        break;
+                    }
+                } else {
+                    if lv.has_unknown() || rv.has_unknown() {
+                        // An unknown element makes the comparison ambiguous: both
+                        // `==` and `!=` come out 0.
+                        return Some(Value::from_u64(0, 1));
+                    }
+                    if !self.coll_values_eq(&lv, &rv, ew) {
+                        equal = false;
+                        break;
+                    }
                 }
             }
         }
