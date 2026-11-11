@@ -8015,6 +8015,11 @@ pub struct Simulator {
     join_waiters: Vec<JoinWaiter>,
     /// Map from child PID -> parent PID
     process_parents: HashMap<usize, usize>,
+    /// Processes handed up to a grandparent in `process_parents` because
+    /// their own parent finished. They stay its descendants for `disable
+    /// fork` (§9.6.3), but are not its immediate children for `wait fork`
+    /// (§9.6.1).
+    adopted_pids: HashSet<usize>,
     /// Per-process execution context for scheduled class/task processes.
     process_contexts: HashMap<usize, ProcessContext>,
     /// Instance scope (e.g. `"TB.p1"`) for a scheduled process, set from the

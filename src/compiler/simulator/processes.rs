@@ -5704,13 +5704,9 @@ impl Simulator {
                 // transitive closure made a `join_none` grandchild extend the
                 // wait arbitrarily — or forever, for a persistent monitor
                 // spawned by a child, which is exactly the shape UVM drivers
-                // use.
-                let children: HashSet<usize> = self
-                    .process_parents
-                    .iter()
-                    .filter(|&(_, &parent)| parent == pid)
-                    .map(|(&child, _)| child)
-                    .collect();
+                // use. A finished child's children, handed up to this process
+                // for `disable fork`, are not its own (`wait_fork_children`).
+                let children: HashSet<usize> = self.wait_fork_children(pid);
 
                 if children.is_empty() {
                     i += 1;
