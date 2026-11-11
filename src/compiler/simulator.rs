@@ -8475,6 +8475,13 @@ pub struct Simulator {
     edge_parallel_work: Vec<usize>,
     edge_sequential_work: Vec<usize>,
     nba_queue: Vec<NbaEntry>,
+    /// §4.6 b): signals with a nonblocking update waiting in `nba_queue`
+    /// this NBA window, among its first `nba_queue_noted` entries. A later
+    /// whole-signal or element nonblocking update to one of them queues
+    /// behind it instead of taking `nba_fast`, which commits first
+    /// (`nba_behind_queued_partial`). Cleared when the window commits.
+    nba_queued_partial_ids: HashSet<usize>,
+    nba_queue_noted: usize,
     /// §15.5.2 `->> e` nonblocking event triggers: fired when the NBA region
     /// flushes, not in the active region (a same-slot `.triggered` read in an
     /// active/inactive process must still see 0).

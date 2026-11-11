@@ -4532,7 +4532,21 @@ impl Simulator {
                 }
                 if d == 0 {
                     let id_opt = self.resolve_nba_target(lvalue);
-                    if let Some(id) = id_opt {
+                    if let Some(id) = id_opt
+                        && self.nba_behind_queued_partial(id)
+                    {
+                        // §4.6 b): a partial update to this signal is already
+                        // queued; `nba_fast` would commit this one first.
+                        self.nba_queue.push(NbaEntry {
+                            lhs: None,
+                            value: val.resize_for_assign(w),
+                            resolved_id: Some(id),
+                            static_key: None,
+                            static_slice: None,
+                            this_handle: None,
+                            root_frame: None,
+                        });
+                    } else if let Some(id) = id_opt {
                         // Track via index map so subsequent partial-NBAs
                         // (NbaAssignRange / NbaAssignBitDyn from the
                         // bytecode VM) targeting the same signal merge into
@@ -4548,10 +4562,6 @@ impl Simulator {
                     } else if self.try_schedule_packed_index_nba(lvalue, &val) {
                         // The packed slice has already been merged into the
                         // pending whole-signal value.
-                    } else if self.try_schedule_packed_slice_nba(lvalue, &val) {
-                        // A member / part-select / concat piece: merged into
-                        // the pending whole-signal NBA value, preserving
-                        // schedule order against whole-signal NBAs (§4.7).
                     } else if matches!(&lvalue.kind, ExprKind::Ident(h)
                         if h.path.len() == 1
                             && self.local_stack.last().is_some_and(|m| m.contains_key(&h.path[0].name.name)))

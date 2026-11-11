@@ -3968,6 +3968,11 @@ impl Simulator {
         let Some(&id) = self.signal_name_to_id.get(name.as_ref()) else {
             return false;
         };
+        // §4.6 b): behind a partial update already queued for the signal.
+        // Decided before the index is evaluated, which the queued path does.
+        if self.nba_behind_queued_partial(id) {
+            return false;
+        }
         let selected = self.eval_expr(index);
         if selected.has_xz() && !selected.is_real {
             return true;
@@ -4008,167 +4013,80 @@ impl Simulator {
         true
     }
 
-    /// §10.4.1/§4.7: NBAs to the same variable commit in scheduling order, so
-    /// a partial-region NBA (a struct member, bit-/part-select, or concat
-    /// piece) scheduled BEFORE a whole-variable NBA to the same signal must
-    /// not stick over the later whole write. The generic `nba_queue`
-    /// commits AFTER `nba_fast` (where `resolve_nba_target` routes
-    /// whole-signal NBAs), so scheduling a partial there inverted the order:
-    /// `bus.vld <= 1'b0; bus <= PKT;` left vld deasserted. When the partial
-    /// resolves to a slice of a packed SIGNAL, merge it into the same
-    /// `nba_fast` stream instead — splice the slice into the pending entry
-    /// for that signal (seeding one from `signal_table` when none is
-    /// pending), the same read-modify-write the blocking member path (§7.8)
-    /// performs, applied to the pending NBA value. Class properties,
-    /// statics, locals and collections keep the queued path: their
-    /// whole-form NBAs queue too, so ordering there is already consistent.
-    pub(super) fn try_schedule_packed_slice_nba(&mut self, lhs: &Expression, val: &Value) -> bool {
-        let Some(pieces) = self.packed_nba_slice_pieces(lhs, val) else {
-            return false;
-        };
-        for (id, lsb, w, piece_val) in pieces {
-            let piece = piece_val.resize_for_assign(w);
-            if let Some(entry_index) = self.nba_fast_index.get(id) {
-                self.nba_fast[entry_index].value.copy_bits_from(
-                    lsb as usize,
-                    &piece,
-                    0,
-                    w as usize,
-                );
-            } else {
-                let mut pending = self.signal_table[id].clone();
-                if pending.copy_bits_from(lsb as usize, &piece, 0, w as usize) {
-                    self.nba_fast_index.insert(id, self.nba_fast.len());
-                    self.nba_fast.push(NbaFast {
-                        block_index: 0,
-                        signal_id: id,
-                        value: pending,
-                    });
-                } else {
-                    self.prof_nba_elided += 1;
+    /// §4.6 b), §10.4.2: nonblocking updates to one variable commit in the
+    /// order they were scheduled. A whole-signal update goes to `nba_fast`,
+    /// which commits before `nba_queue`, so a partial one (a struct member,
+    /// a bit- or part-select, a concatenation piece) queued BEFORE a whole one
+    /// to the same signal used to win over it: `bus.vld <= 1'b0; bus <= PKT;`
+    /// left `vld` at 0. Returns whether a whole or element update of signal
+    /// `id` must queue behind one already waiting in `nba_queue`; the queued
+    /// update is applied to the value the variable holds when the window
+    /// commits, so a blocking write to its other bits in the meantime
+    /// survives.
+    ///
+    /// The signals the queued updates write are found here, when a signal
+    /// update is about to take `nba_fast`, for the entries queued since the
+    /// last look (`nba_queue_noted`): a window that queues only class
+    /// properties or other storage never pays for the walk.
+    pub(super) fn nba_behind_queued_partial(&mut self, id: usize) -> bool {
+        if self.nba_queue.len() > self.nba_queue_noted {
+            let queue = std::mem::take(&mut self.nba_queue);
+            let mut ids = Vec::new();
+            for entry in &queue[self.nba_queue_noted..] {
+                // The signal walk evaluates the lvalue's indices, which the
+                // queued entry froze to constants.
+                let Some(lhs) = &entry.lhs else { continue };
+                if entry.static_key.is_some() || !Self::cond_expr_is_effect_free(lhs, false) {
+                    continue;
+                }
+                // The scheduling `this`, for a property naming a virtual
+                // interface (see NbaEntry::this_handle).
+                if let Some(h) = entry.this_handle {
+                    self.this_stack.push(Some(h));
+                }
+                self.partial_nba_signal_ids(lhs, &mut ids);
+                if entry.this_handle.is_some() {
+                    self.this_stack.pop();
                 }
             }
+            self.nba_queue_noted = queue.len();
+            self.nba_queue = queue;
+            self.nba_queued_partial_ids.extend(ids);
         }
-        true
+        !self.nba_queued_partial_ids.is_empty() && self.nba_queued_partial_ids.contains(&id)
     }
 
-    /// The `(signal_id, lsb, width, value)` pieces a partial-NBA lvalue
-    /// writes, in lvalue order. `None` declines the shape (the generic
-    /// queued path takes it). All selects are evaluated NOW — §10.4.1
-    /// samples an NBA lvalue's indices at schedule time, the same instant
-    /// `freeze_lvalue_indices` would.
-    fn packed_nba_slice_pieces(
-        &mut self,
-        lhs: &Expression,
-        val: &Value,
-    ) -> Option<Vec<(usize, u32, u32, Value)>> {
-        // The queued fallback re-evaluates the selects via
-        // `freeze_lvalue_indices`, so only effect-free shapes may probe
-        // here without double-firing a side effect in a declined index.
-        if !Self::cond_expr_is_effect_free(lhs, false) {
-            return None;
-        }
-        let slices = self.packed_nba_slices(lhs)?;
-        let total: u32 = slices.iter().try_fold(0u32, |a, s| a.checked_add(s.2))?;
-        if total == 0 {
-            return None;
-        }
-        // §10.4.1: size the RHS to the lvalue (zero-extend / truncate), then
-        // split it across the slices — the LEFTMOST concat element takes
-        // the most-significant bits.
-        let whole = val.resize_for_assign(total);
-        let mut out = Vec::with_capacity(slices.len());
-        let mut off = 0u32;
-        for &(id, lsb, w) in slices.iter().rev() {
-            let piece = whole.range_select((off + w - 1) as usize, off as usize);
-            out.push((id, lsb, w, piece));
-            off += w;
-        }
-        out.reverse();
-        Some(out)
-    }
-
-    /// The `(signal_id, lsb, width)` slices a partial-NBA lvalue writes, in
-    /// lvalue order: a concatenation decomposes into its elements, a
-    /// part-select narrows its base's slice, anything else resolves through
-    /// [`Self::packed_nba_base_slice`].
-    fn packed_nba_slices(&mut self, lhs: &Expression) -> Option<Vec<(usize, u32, u32)>> {
+    /// The signals a partial nonblocking lvalue writes: a concatenation
+    /// contributes each element's, a select the signal of its base, anything
+    /// else the signal [`Self::packed_nba_base_slice`] finds.
+    fn partial_nba_signal_ids(&mut self, lhs: &Expression, out: &mut Vec<usize>) {
         match &lhs.kind {
             // A collapsed multi-segment identifier carrying selects
             // (`cia[0].bus_a.vld` in always/initial code) re-spells as an
             // Index/MemberAccess chain the arms below already walk.
             ExprKind::Ident(h) if h.path.iter().any(|s| !s.selects.is_empty()) => {
                 let chain = Self::hier_select_chain(h, lhs.span);
-                self.packed_nba_slices(&chain)
+                self.partial_nba_signal_ids(&chain, out);
             }
-            ExprKind::Paren(inner) => self.packed_nba_slices(inner),
+            ExprKind::Paren(inner) => self.partial_nba_signal_ids(inner, out),
             ExprKind::Concatenation(elements) => {
-                let mut out = Vec::with_capacity(elements.len());
                 for e in elements {
-                    out.extend(self.packed_nba_slices(e)?);
+                    self.partial_nba_signal_ids(e, out);
                 }
-                Some(out)
             }
-            ExprKind::RangeSelect {
-                expr: base,
-                left,
-                right,
-                kind,
-            } => {
-                let (id, lsb, w) = self.packed_nba_base_slice(base)?;
-                // Part-select labels map through the base's declared range
-                // (§7.4.1: an ascending range puts its left index at the MS
-                // end). A multi-dimensional packed base (element strides)
-                // keeps the queued path.
-                let dims_key = self.flat_member_name(base).unwrap_or_default();
-                let dims = self.module.packed_full_dims.get(&dims_key);
-                if dims.is_some_and(|d| d.len() > 1) {
-                    return None;
+            // The base is the signal itself (`v[3:0]`, `arr[1][3]`), or a
+            // member or element of one (`q.addr[7:0]`, `m[2][1:0]`).
+            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
+                if let Some((id, ..)) = self.packed_nba_base_slice(base) {
+                    out.push(id);
+                } else {
+                    self.partial_nba_signal_ids(base, out);
                 }
-                let (dl, dr) = dims
-                    .and_then(|d| d.first().copied())
-                    .unwrap_or((w as i64 - 1, 0));
-                let a = self.eval_expr(left).to_index()?;
-                let b = self.eval_expr(right).to_index()?;
-                let (l, r) = match kind {
-                    RangeKind::Constant => (a, b),
-                    RangeKind::IndexedUp if b > 0 => {
-                        if dl >= dr {
-                            (a.checked_add(b - 1)?, a)
-                        } else {
-                            (a, a.checked_add(b - 1)?)
-                        }
-                    }
-                    RangeKind::IndexedDown if b > 0 => {
-                        if dl >= dr {
-                            (a, a.checked_sub(b - 1)?)
-                        } else {
-                            (a.checked_sub(b - 1)?, a)
-                        }
-                    }
-                    _ => return None,
-                };
-                // Bit position of a label within the base slice.
-                let pos = |lab: i64| -> Option<i64> {
-                    let (lo_b, hi_b) = (dl.min(dr), dl.max(dr));
-                    if lab < lo_b || lab > hi_b {
-                        return None;
-                    }
-                    let count = hi_b - lo_b + 1;
-                    let off = lab - lo_b;
-                    Some(if dl >= dr { off } else { count - 1 - off })
-                };
-                let lo_pos = pos(l)?.min(pos(r)?);
-                let width = u32::try_from(l.abs_diff(r) + 1).ok()?;
-                let new_lsb = lsb.checked_add(u32::try_from(lo_pos).ok()?)?;
-                if new_lsb.checked_add(width)? > lsb + w {
-                    return None;
-                }
-                Some(vec![(id, new_lsb, width)])
             }
             _ => {
-                let (id, lsb, w) = self.packed_nba_base_slice(lhs)?;
-                Some(vec![(id, lsb, w)])
+                if let Some((id, ..)) = self.packed_nba_base_slice(lhs) {
+                    out.push(id);
+                }
             }
         }
     }
@@ -4181,9 +4099,10 @@ impl Simulator {
     /// packed-struct base names the storage signal and the layout supplies
     /// the member's offset/width. A head bound to a virtual interface
     /// rewrites to the bound instance first (§25.9) so interface variables
-    /// resolve as well. A whole-signal base (a plain vector) resolves
-    /// directly. Everything else — locals, class properties, statics,
-    /// collections — declines, keeping the queued path.
+    /// resolve as well. A base that is a signal itself (a vector, an
+    /// unpacked-array element, an interface variable) resolves directly.
+    /// Everything else — locals, class properties, statics, collections —
+    /// declines.
     fn packed_nba_base_slice(&mut self, base: &Expression) -> Option<(usize, u32, u32)> {
         // Root guards: walk to the chain's root identifier.
         let mut root = base;
@@ -4262,10 +4181,8 @@ impl Simulator {
         } else if let Some((storage, o, w)) = arr_slice {
             (storage, Some((o, w)))
         } else {
-            // Whole-signal base: a plain vector with no member part.
-            if flat.contains('.') || flat.contains('[') {
-                return None;
-            }
+            // The base is a signal itself: a vector, an element of an
+            // unpacked array (`arr[1]`), an interface variable (`ci.bus_a`).
             (flat, None)
         };
         let id = match self.signal_name_to_id.get(base_name.as_str()) {
@@ -4417,8 +4334,12 @@ impl Simulator {
         self.drain_jit_nba_side_queue();
         // Reset the per-window partial-NBA index.
         self.nba_fast_index.clear();
+        if !self.nba_queued_partial_ids.is_empty() {
+            self.nba_queued_partial_ids.clear();
+        }
         let mut nba = std::mem::take(&mut self.nba_fast);
 
+        self.nba_queue_noted = 0;
         for entry in nba.drain(..) {
             self.apply_nba_entry(entry);
         }
@@ -4504,6 +4425,8 @@ impl Simulator {
                 if entry.this_handle.is_some() {
                     self.this_stack.pop();
                 }
+            } else if let Some(id) = entry.resolved_id {
+                self.apply_queued_whole_nba(id, entry.value);
             }
         }
         // §15.5.2 deferred `->>` triggers fire with the NBA flush.
@@ -4580,6 +4503,20 @@ impl Simulator {
         }
     }
 
+    /// A whole-signal update queued behind a partial one
+    /// (`nba_behind_queued_partial`). Out of line, so the `nba_fast` commit
+    /// loop keeps `apply_nba_entry` inlined.
+    #[cold]
+    #[inline(never)]
+    fn apply_queued_whole_nba(&mut self, id: usize, value: Value) {
+        self.apply_nba_entry(NbaFast {
+            block_index: 0,
+            signal_id: id,
+            value,
+        });
+    }
+
+    #[inline(always)]
     pub(super) fn apply_nba_entry(&mut self, entry: NbaFast) {
         // Defensive landing for a packed-arena id: the per-signal table
         // indexing below cannot take one (it would index far out of bounds).
