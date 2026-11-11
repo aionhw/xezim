@@ -1,6 +1,7 @@
 //! Simulator collection methods.
 
 use super::*;
+use crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
@@ -594,6 +595,9 @@ impl Simulator {
             (ExprKind::AssignmentPattern(it), _) => (right, it),
             _ => return None,
         };
+        if let Some(v) = self.compare_packed_with_pattern(op, left, right, x) {
+            return Some(v);
+        }
         let mode = if matches!(op, BinaryOp::WildcardEq | BinaryOp::WildcardNeq) {
             PatternCmpMode::Wildcard
         } else if matches!(op, BinaryOp::CaseEq | BinaryOp::CaseNeq) {
@@ -609,6 +613,44 @@ impl Simulator {
             // An x/z array element: neither equal nor unequal, as for an
             // array-to-array comparison.
             PatCmp::Neither => Value::zero(1),
+        })
+    }
+
+    /// §10.9: a bare pattern compared with a PACKED operand `x` takes `x`'s
+    /// type, as the source of an assignment to `x` would (§10.8), and is one
+    /// packed value of that type. The two operands then compare bit for
+    /// bit like any integral pair: `==` is x where an x/z bit leaves the
+    /// relation open (§11.4.5), `==?` masks the right operand's x/z bits
+    /// (§11.4.6). The type comes from wherever `x` is declared — a variable,
+    /// a member, an element, a class property or a function result — so an
+    /// unsized item is sized by its element, not concatenated at 32 bits.
+    /// `None` when `x` is not of a packed aggregate type.
+    fn compare_packed_with_pattern(
+        &mut self,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+        x: &Expression,
+    ) -> Option<Value> {
+        let dt = self.expr_type(x)?;
+        let (l, r) = if std::ptr::eq(x, left) {
+            let pv = self.eval_in_packed_type(right, &dt)?;
+            (self.eval_expr(left), pv)
+        } else {
+            let pv = self.eval_in_packed_type(left, &dt)?;
+            (pv, self.eval_expr(right))
+        };
+        if l.is_real || r.is_real {
+            return None;
+        }
+        Some(match op {
+            BinaryOp::Eq => l.is_equal(&r),
+            BinaryOp::Neq => l.is_not_equal(&r),
+            BinaryOp::CaseEq => l.case_eq(&r),
+            BinaryOp::CaseNeq => l.case_neq(&r),
+            BinaryOp::WildcardEq => l.wildcard_eq(&r),
+            BinaryOp::WildcardNeq => l.wildcard_ne(&r),
+            _ => return None,
         })
     }
 
@@ -669,61 +711,6 @@ impl Simulator {
                 return Some(self.pattern_cmp_dims(x, &[(0, n - 1)], &[false], items, mode));
             }
         }
-        // PACKED array: an integral aggregate the pattern binds element-wise.
-        // `packed_full_dims` stores every packed dim PLUS a trailing leaf bit-
-        // range (`[(0,3),(2,0)]` for `u3_t [0:3] a`), so the ELEMENT index
-        // dims are all but the last entry — the same dims `pattern_cmp_dims`
-        // iterates for a fixed unpacked array. Each `x[i]` element read slices
-        // the packed operand at the right leaf width.
-        if let Some((pname, pdims, pdesc)) = self.packed_array_elem_geometry(x) {
-            let _ = pname;
-            return Some(self.pattern_cmp_dims(x, &pdims, &pdesc, items, mode));
-        }
-        // PACKED struct: the pattern binds member-by-member (§10.9.2) but the
-        // packed value is one integral, so slice it member-wise. The bit-offset
-        // layout is LSB-first, so reverse it to MSB-first fill order (the first
-        // pattern item is the most-significant member).
-        if let Some(pfields) = self.packed_struct_fields_of(x) {
-            let msb_first: Vec<(String, u32, u32)> = pfields.into_iter().rev().collect();
-            let mut by_member: Vec<Option<&Expression>> = vec![None; msb_first.len()];
-            let mut ordered: Vec<&Expression> = Vec::new();
-            let mut default: Option<&Expression> = None;
-            for item in items {
-                match item {
-                    AssignmentPatternItem::Named(id, e) => {
-                        if let Some(i) = msb_first.iter().position(|(n, _, _)| n == &id.name) {
-                            by_member[i] = Some(e);
-                        }
-                    }
-                    AssignmentPatternItem::Default(e) => default = Some(e),
-                    AssignmentPatternItem::Ordered(e) => ordered.push(e),
-                    AssignmentPatternItem::Typed(_, e) => default = Some(e),
-                    _ => {}
-                }
-            }
-            let mut acc = PatCmp::Equal;
-            let mut oi = 0usize;
-            for (i, member) in msb_first.iter().enumerate() {
-                let item = match by_member[i] {
-                    Some(e) => Some(e),
-                    None if oi < ordered.len() => {
-                        let e = ordered[oi];
-                        oi += 1;
-                        Some(e)
-                    }
-                    None => default,
-                };
-                let Some(item) = item else {
-                    return Some(PatCmp::Unequal);
-                };
-                let member_expr = Self::append_member_expr(x, &member.0);
-                acc = acc.and(self.pattern_elem_cmp(member_expr, item, mode), true);
-                if acc == PatCmp::Unequal {
-                    break;
-                }
-            }
-            return Some(acc);
-        }
         // Unpacked struct: member by member (§10.9.2 binding rules).
         let su = self.unpacked_struct_type_of(x)?;
         let mut acc = PatCmp::Equal;
@@ -738,74 +725,6 @@ impl Simulator {
             }
         }
         Some(acc)
-    }
-
-    /// The packed ELEMENT index dims of a packed-array operand `x` (the part
-    /// of `packed_full_dims` before its trailing leaf bit-range — for
-    /// `u3_t [0:3] a` the dims `[(0,3),(2,0)]` map to the element dim `(0,3)`)
-    /// and the flattened operand name. `None` when `x` is not a packed array
-    /// (plain packed vector, packed struct, unpacked aggregate). Only a
-    /// genuine multi-element packed aggregate returns here (≥1 element dim
-    /// plus a leaf-width dim), so a plain `logic [11:0] v == '{..}` integral
-    /// stays on the leaf-compare path it already serves.
-    ///
-    /// Scope note: matches a bare packed VARIABLE (or a packed SLICE like
-    /// `d2[0]`, which unwraps to its packed base and drops the consumed outer
-    /// dims) against a pattern — the issue-1043 family.
-    fn packed_array_elem_geometry(
-        &self,
-        x: &Expression,
-    ) -> Option<(String, Vec<(i64, i64)>, Vec<bool>)> {
-        // Unwrap index/slice wrappers to find the packed base and how many
-        // outer element dims the expression already consumed. `d2[0]` is a
-        // packed sub-array whose OWN pattern dims are the base's element dims
-        // minus the consumed outer one — comparing `d2[0] == '{..}` routes its
-        // rows element-wise just like the whole array.
-        let mut base = x;
-        let mut consumed = 0usize;
-        while let ExprKind::Index { expr: inner, .. } = &base.kind {
-            base = inner;
-            consumed += 1;
-        }
-        let name = match &base.kind {
-            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
-                self.resolve_hier_name(h).into_owned()
-            }
-            _ => return None,
-        };
-        let full = self.module.packed_full_dims.get(&name)?;
-        // Every remaining dim (all consumed outer dims are gone, take the leaf
-        // off) must leave at least one element dim above the leaf bit-range.
-        let sub_full = &full[consumed..full.len()];
-        if sub_full.len() < 2 {
-            return None;
-        }
-        // `packed_full_dims` stores RAW (left, right) bounds in their declared
-        // orientation (`(1,0)` for a descending `[1:0]` dim). Normalize each to
-        // ascending `(min, max)` so `pattern_cmp_dims`'s index iteration works
-        // (its `descending` flag then re-reverses the range the right way).
-        let descending: Vec<bool> = sub_full[..sub_full.len() - 1]
-            .iter()
-            .map(|&(l, r)| l > r)
-            .collect();
-        let elem: Vec<(i64, i64)> = sub_full[..sub_full.len() - 1]
-            .iter()
-            .map(|&(l, r)| (l.min(r), l.max(r)))
-            .collect();
-        Some((name, elem, descending))
-    }
-
-    /// The packed-struct member layout `(name, lsb, width)` (LSB-first) of a
-    /// packed-struct operand `x`, via [`Self::coll_packed_elem_fields`].
-    /// `None` when `x` is not (or does not resolve to) a packed struct.
-    fn packed_struct_fields_of(&mut self, x: &Expression) -> Option<Vec<(String, u32, u32)>> {
-        let name = match &x.kind {
-            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
-                self.resolve_hier_name(h).into_owned()
-            }
-            _ => self.flat_member_name(x)?,
-        };
-        self.coll_packed_elem_fields(&name)
     }
 
     /// One dimension of [`Self::pattern_cmp`]: `x[i]` for every index of

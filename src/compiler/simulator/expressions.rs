@@ -4051,7 +4051,12 @@ impl Simulator {
                         self.unpacked_typed_pattern(left),
                         self.unpacked_typed_pattern(right),
                     );
-                    let (l, r) = (lt.unwrap_or(left), rt.unwrap_or(right));
+                    // `(a) == ('{...})`: parentheses do not change the
+                    // pattern's context, as in an assignment (§10.8).
+                    let (l, r) = (
+                        lt.unwrap_or(Self::peel_parens(left)),
+                        rt.unwrap_or(Self::peel_parens(right)),
+                    );
                     let pat = |e: &Expression| matches!(e.kind, ExprKind::AssignmentPattern(_));
                     let v = if pat(l) && pat(r) {
                         // Two patterns: a typed one is the value of its type.
