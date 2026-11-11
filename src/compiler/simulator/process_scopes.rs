@@ -43,6 +43,7 @@ impl Simulator {
         let own = |slf: &Self| {
             slf.killed_pids.contains(&pid)
                 || slf.cont_has_named_block(pc, &x)
+                || slf.is_process_top_label(pid, &x)
                 || slf
                     .active_task_pids
                     .get(&x)
@@ -54,6 +55,18 @@ impl Simulator {
                 // The block's own fork children die with it.
                 if !self.killed_pids.contains(&pid) && self.cont_has_named_block(pc, &x) {
                     let kids = self.children_forked_in(pid, &x);
+                    for k in kids {
+                        self.proc_kill(k);
+                    }
+                } else if !self.killed_pids.contains(&pid) && self.is_process_top_label(pid, &x) {
+                    // The process's top-level block holds everything it forked.
+                    let mut kids: Vec<usize> = self
+                        .process_parents
+                        .iter()
+                        .filter(|&(_, &p)| p == pid)
+                        .map(|(&c, _)| c)
+                        .collect();
+                    kids.sort_unstable();
                     for k in kids {
                         self.proc_kill(k);
                     }
@@ -285,6 +298,17 @@ impl Simulator {
 
     pub(super) fn disable_remote_block(&mut self, x: &str) {
         self.disable_remote_block_of(x, None);
+    }
+
+    /// §9.6.2: does `x` name process `pid`'s top-level block
+    /// (`initial begin : blk`)? That block is flattened into the process's
+    /// own frame, so it has no named frame; its label is kept for `%m`.
+    pub(super) fn is_process_top_label(&self, pid: usize, x: &str) -> bool {
+        !self.process_m_label.is_empty()
+            && self
+                .process_m_label
+                .get(&pid)
+                .is_some_and(|l| Self::block_name_matches(x, l))
     }
 
     /// §9.6.2: whether a `disable` of `target` may name a block or task this
@@ -2822,6 +2846,28 @@ impl Simulator {
         idx: usize,
     ) {
         let resume_at = pc.start + idx + 1;
+        // §9.6.2, §21.2.1.7: a NAMED body (`always begin : ab`, `forever
+        // begin : it`) is a block entered again on every iteration. Run it as
+        // the block statement, so the process loop gives it a named frame:
+        // `%m` names it, and `disable ab` ends the iteration. Flattening it
+        // into the loop dropped the name.
+        if let StatementKind::SeqBlock {
+            name: Some(_),
+            stmts,
+        } = &body.kind
+            && self.stmts_have_blocking(stmts)
+        {
+            let cont = self.forever_cont(pid, body, std::slice::from_ref(body), 0, 4, body);
+            let contp = pc.pushed_frame(cont, resume_at);
+            if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
+                self.event_queue.schedule(self.time, pid, contp);
+                return;
+            }
+            self.forever_depth += 1;
+            self.run_process_stmts(pid, &contp);
+            self.forever_depth -= 1;
+            return;
+        }
         let body_stmts: &[Statement] = match &body.kind {
             StatementKind::SeqBlock { stmts, .. } => stmts.as_slice(),
             _ => std::slice::from_ref(body),

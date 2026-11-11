@@ -5753,6 +5753,20 @@ impl Simulator {
                     }
                 }
             }
+            // §9.6.2: a `disable` of the process's own top-level block ends
+            // with the process; leave no flag for the next activation.
+            if pc.next.is_none()
+                && self.break_flag
+                && !self.killed_pids.contains(&pid)
+                && self
+                    .disable_target
+                    .as_deref()
+                    .is_some_and(|t| self.is_process_top_label(pid, t))
+            {
+                self.disable_target = None;
+                self.break_flag = false;
+                self.continue_flag = false;
+            }
             if let Some(frame) = pc.next.clone() {
                 self.run_process_stmts(pid, &frame);
             }
