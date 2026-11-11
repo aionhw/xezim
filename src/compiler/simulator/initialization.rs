@@ -3960,6 +3960,7 @@ impl Simulator {
             local_meta_cache: HashMap::default(),
             local_meta_claims: Vec::new(),
             class_gc_live: 0,
+            class_gc_live_signals: 0,
             class_gc_released: 0,
             class_gc_runs: 0,
             virtual_iface_bindings: HashMap::default(),

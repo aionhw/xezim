@@ -9,6 +9,10 @@ use super::*;
 /// Fewest allocations between two collections.
 const CLASS_GC_MIN_ALLOCS: usize = 20_000;
 
+/// Signal count threshold for triggering GC even when object count is low.
+/// Large array/unpacked payloads create many dynamic signal entries.
+const CLASS_GC_MIN_SIGNALS: usize = 100_000;
+
 /// `XEZIM_CLASS_GC=0` disables reclamation; `XEZIM_CLASS_GC=stress` collects
 /// at every time advance that allocated an object (for validating roots).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,17 +40,21 @@ impl Simulator {
             return;
         }
         let grown = self.heap.len().saturating_sub(self.class_gc_heap_len);
+        let grown_signals = self.signals.len().saturating_sub(self.class_gc_live_signals);
         // A collection traces the previous survivors and the slots allocated
         // since, not every slot ever allocated, so its cost follows the live
         // objects plus the new ones and a fixed threshold stays linear over a
         // long run.
-        let threshold = match mode {
-            ClassGcMode::Stress => 1,
-            _ => CLASS_GC_MIN_ALLOCS.max(self.class_gc_live),
+        let (threshold, signal_threshold) = match mode {
+            ClassGcMode::Stress => (1, 1),
+            _ => (
+                CLASS_GC_MIN_ALLOCS.max(self.class_gc_live),
+                CLASS_GC_MIN_SIGNALS.max(self.class_gc_live_signals),
+            ),
         };
         // A suspended DPI task keeps values on a foreign stack the trace
         // cannot see; wait until none is parked.
-        if grown < threshold || !self.dpi_tasks.is_empty() {
+        if (grown < threshold && grown_signals < signal_threshold) || !self.dpi_tasks.is_empty() {
             return;
         }
         self.class_gc_heap_len = self.heap.len();
@@ -69,6 +77,7 @@ impl Simulator {
         }
         let released = self.release_class_storage(&dead, &dead_list);
         self.class_gc_live = live.len();
+        self.class_gc_live_signals = self.signals.len();
         self.class_gc_survivors = live;
         self.class_gc_released += released;
         self.class_gc_runs += 1;
