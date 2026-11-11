@@ -27,7 +27,7 @@ use serde::ser::{SerializeSeq, Serializer};
 
 /// File magic and format version; bump the last byte with any change to a
 /// state field's type.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x04";
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x05";
 
 #[derive(Default)]
 struct Session {

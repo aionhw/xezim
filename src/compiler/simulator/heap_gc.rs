@@ -9,8 +9,10 @@ use super::*;
 /// Fewest allocations between two collections.
 const CLASS_GC_MIN_ALLOCS: usize = 20_000;
 
-/// Signal count threshold for triggering GC even when object count is low.
-/// Large array/unpacked payloads create many dynamic signal entries.
+/// Fewest name-keyed values (`signals`) added between two collections. The
+/// elements of an object's fixed array are stored there, one entry each, so a
+/// few objects can own most of the store: 16,384 objects with a 256-element
+/// array stay under `CLASS_GC_MIN_ALLOCS` while holding four million entries.
 const CLASS_GC_MIN_SIGNALS: usize = 100_000;
 
 /// `XEZIM_CLASS_GC=0` disables reclamation; `XEZIM_CLASS_GC=stress` collects
@@ -49,7 +51,8 @@ impl Simulator {
         // objects plus the new ones and a fixed threshold stays linear over a
         // long run.
         let (threshold, signal_threshold) = match mode {
-            ClassGcMode::Stress => (1, 1),
+            // Stress keeps to its definition: a time advance that allocated.
+            ClassGcMode::Stress => (1, usize::MAX),
             _ => (
                 CLASS_GC_MIN_ALLOCS.max(self.class_gc_live),
                 CLASS_GC_MIN_SIGNALS.max(self.class_gc_live_signals),
@@ -61,6 +64,11 @@ impl Simulator {
             return;
         }
         self.class_gc_heap_len = self.heap.len();
+        // Both counts restart here, before the trace: one that fails (or a
+        // design whose store grows without any object) must wait for the next
+        // threshold like the allocation count does, not retry the root trace
+        // at every time advance.
+        self.class_gc_live_signals = self.signals.len();
         let objects: Vec<usize> = self
             .class_gc_survivors
             .iter()
@@ -68,6 +76,10 @@ impl Simulator {
             .chain(self.class_gc_scan_from.max(1)..self.heap.len())
             .filter(|&h| self.heap[h].is_some())
             .collect();
+        // No object, nothing to release: skip the trace of every root.
+        if objects.is_empty() {
+            return;
+        }
         let Ok(marked) = self.class_heap_mark(&objects) else {
             return;
         };
