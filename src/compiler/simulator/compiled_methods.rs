@@ -2123,25 +2123,15 @@ impl Simulator {
                         self.compiled_method_skip.insert((cid, mid, spec_id));
                         return None;
                     };
-                    // Seed width MIRRORS the interpreter's formal-binding branch
-                    // (exec_method_in_class_hierarchy): a TypeReference / IntegerAtom
-                    // / literal-packed formal resizes the actual to its declared
-                    // width; a PARAMETERIZED-packed formal (`logic [W-1:0]` with a
-                    // class type-param bound, non-literal) keeps the CALLER's
-                    // width — `scalar_formal_integral` would wrongly read the param
-                    // from module scope and truncate the seed. Width 0 = keep the
-                    // source width, exactly like the AST path (which only stamps
-                    // signedness there).
+                    // §13.5.1 / §8.25: mirror the interpreter's declared
+                    // formal width, resolving class parameters in this
+                    // specialization rather than through module defaults.
                     let keep_source = !matches!(port.data_type, DT::TypeReference { .. })
                         && !matches!(port.data_type, DT::IntegerAtom { .. })
-                        && !Self::packed_dims_are_literal(&port.data_type);
-                    // §8.25: a class typedef sized by a class parameter
-                    // (`vec_t a`) is as wide as this specialization makes it;
-                    // the plan is kept per specialization.
-                    let class_typedef_w = matches!(port.data_type, DT::TypeReference { .. })
-                        .then(|| self.method_formal_param_width(handle, cname, &port.data_type))
-                        .flatten();
-                    if let Some(w) = class_typedef_w {
+                        && !Self::packed_dims_are_constant(&port.data_type);
+                    let param_w =
+                        self.method_formal_param_width(handle, cname, &port.data_type);
+                    if let Some(w) = param_w {
                         w
                     } else if keep_source {
                         0
@@ -2203,13 +2193,10 @@ impl Simulator {
         let result_width = if self.param_result_is_real(cname, &pre.return_type) {
             0
         } else if pre.param_able_result
-            && matches!(
-                &*pre.return_type,
-                crate::ast::types::DataType::TypeReference { .. }
-            )
             && let Some(w) = self.method_formal_param_width(handle, cname, &pre.return_type)
         {
-            // §8.25: a class typedef sized by a class parameter (`vec_t`).
+            // §8.25: packed bounds and class typedefs use this specialization,
+            // including a static call whose receiver handle is zero.
             w
         } else if pre.param_able_result {
             // The null handle (a free function) binds no class parameters,
@@ -3805,7 +3792,7 @@ impl Simulator {
                 } else {
                     (0, None)
                 }
-            } else if matches!(dt, DT::IntegerAtom { .. }) || Self::packed_dims_are_literal(dt) {
+            } else if matches!(dt, DT::IntegerAtom { .. }) || Self::packed_dims_are_constant(dt) {
                 let pw = super::elaborate::resolve_type_width(
                     dt,
                     Some(&self.module.parameters),

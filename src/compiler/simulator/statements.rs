@@ -2033,8 +2033,16 @@ impl Simulator {
                         idx += step;
                     }
                 } else {
-                    // Bit-by-bit foreach over a packed vector.
-                    let size = self.lookup_signal_width(&name).unwrap_or(1) as u64;
+                    // §12.7.3: a formal's live value has the callee's width,
+                    // including class-specialized bounds. It shadows any
+                    // module signal or stale width entry with the same name.
+                    let size = self
+                        .local_stack
+                        .iter()
+                        .rev()
+                        .find_map(|frame| frame.get(&*name).map(|v| v.width))
+                        .or_else(|| self.lookup_signal_width(&name))
+                        .unwrap_or(1) as u64;
                     for i in 0..size {
                         if self.finished {
                             break;

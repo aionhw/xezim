@@ -699,3 +699,5 @@ mod struct_array_member_elem_select;
 
 #[path = "types/packed_select_geometry_1002.rs"]
 mod packed_select_geometry_1002;
+#[path = "types/unpacked_slice_patterns_1045.rs"]
+mod unpacked_slice_patterns_1045;

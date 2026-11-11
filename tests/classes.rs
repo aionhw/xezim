@@ -35,6 +35,8 @@ mod class_descending_array_members;
 mod class_formal_named_like_struct;
 #[path = "classes/class_formal_typedef_widen.rs"]
 mod class_formal_typedef_widen;
+#[path = "classes/implicit_formal_width_1044.rs"]
+mod implicit_formal_width_1044;
 #[path = "classes/class_interface_same_name.rs"]
 mod class_interface_same_name;
 #[path = "classes/class_member_name_clash.rs"]
