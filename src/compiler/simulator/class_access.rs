@@ -734,17 +734,26 @@ impl Simulator {
             .map(|pos| &self.module.instances[self.instance_path_order[pos]])
     }
 
-    /// LRM §25.5.2: a modport-qualified hierarchical reference
-    /// (`inst.mp.var`) names the instance's own variable — the modport view
-    /// only restricts directions. Drop a path segment that names a modport
-    /// of the interface instance the preceding prefix resolves to, so the
-    /// name lands on the real variable instead of a phantom `inst.mp.var`
-    /// copy that only the writing path ever populated.
-    pub(super) fn strip_modport_segments(&self, raw: &str) -> String {
-        let mut segs: Vec<&str> = raw.split('.').collect();
-        if segs.len() < 3 {
-            return raw.to_string();
+    /// §25.5: a modport-qualified hierarchical reference (`inst.mp.var`)
+    /// names the instance's own variable — the modport view only restricts
+    /// directions. Drop a path segment that names a modport of the interface
+    /// instance the preceding prefix resolves to, so the name lands on the
+    /// real variable instead of a phantom `inst.mp.var` copy that only the
+    /// writing path ever populated. `None` when no segment is dropped.
+    pub(super) fn strip_modport_segments(&self, raw: &str) -> Option<String> {
+        // Only an inner segment can be a modport; most names have none, and
+        // they leave here without allocating.
+        let n = raw.split('.').count();
+        if n < 3
+            || !raw
+                .split('.')
+                .skip(1)
+                .take(n - 2)
+                .any(|seg| self.modport_names.contains(seg))
+        {
+            return None;
         }
+        let mut segs: Vec<&str> = raw.split('.').collect();
         let mut changed = false;
         let mut i = 1;
         while i + 1 < segs.len() {
@@ -761,11 +770,7 @@ impl Simulator {
                 i += 1;
             }
         }
-        if changed {
-            segs.join(".")
-        } else {
-            raw.to_string()
-        }
+        changed.then(|| segs.join("."))
     }
 
     /// §23.9: `scope` and its enclosing generate blocks, ending at the nearest
@@ -894,14 +899,12 @@ impl Simulator {
             .map(|s| s.name.name.as_str())
             .collect::<Vec<_>>()
             .join(".");
-        // LRM §25.5.2: a modport-qualified reference names the instance's
-        // own variable; strip modport segments before any lookup. Gated on
-        // the design declaring modports at all, so modport-free designs pay
-        // nothing on this cold path.
-        let raw = if self.module.modport_member_dirs.is_empty() {
+        // §25.5: a modport-qualified reference names the instance's own
+        // variable; strip modport segments before any lookup.
+        let raw = if self.modport_names.is_empty() {
             raw
         } else {
-            self.strip_modport_segments(&raw)
+            self.strip_modport_segments(&raw).unwrap_or(raw)
         };
         // §8/§23.9: in a method of a class declared inside a module, a
         // dotted name headed by an item of the object's instance (an

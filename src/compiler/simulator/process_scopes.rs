@@ -4144,11 +4144,13 @@ impl Simulator {
         // path.
         let in_method = matches!(self.this_stack.last(), Some(Some(_)));
         let mut flat = self.flat_member_name(base)?;
-        // §25.5.2: a modport-qualified member path names the instance's own
+        // §25.5: a modport-qualified member path names the instance's own
         // variable — strip the modport segment so the layout walk below
         // lands on the real base.
-        if !self.module.modport_member_dirs.is_empty() {
-            flat = self.strip_modport_segments(&flat);
+        if !self.modport_names.is_empty()
+            && let Some(stripped) = self.strip_modport_segments(&flat)
+        {
+            flat = stripped;
         }
         let mut slice = self.packed_nba_flat_slice(&flat);
         let mut rewritten = false;
@@ -4337,9 +4339,9 @@ impl Simulator {
         if !self.nba_queued_partial_ids.is_empty() {
             self.nba_queued_partial_ids.clear();
         }
+        self.nba_queue_noted = 0;
         let mut nba = std::mem::take(&mut self.nba_fast);
 
-        self.nba_queue_noted = 0;
         for entry in nba.drain(..) {
             self.apply_nba_entry(entry);
         }

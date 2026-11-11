@@ -3429,17 +3429,7 @@ impl Simulator {
         }
     }
 
-    /// Rewrite an expression chain whose RECEIVER is a bound virtual
-    /// interface — at any depth, spelled any way [`vif_recv_target`]
-    /// resolves — into a DIRECT access of the bound instance, so everything
-    /// downstream (read, write, NBA, event and wait controls, clocking
-    /// blocks, interface subroutine calls) sees the instance path, which
-    /// already works in every shape. Inside a subroutine body the parser
-    /// emits `MemberAccess`/`Index`/`Call` chains rather than one flat
-    /// `Ident`; at module scope the same source is one flat `Ident`. `None`
-    /// when no receiver in the chain is a bound vif — the common case, gated
-    /// to a few emptiness and name checks.
-    /// LRM §25.5.2: a modport-qualified reference spelled as a MEMBER CHAIN
+    /// §25.5: a modport-qualified reference spelled as a MEMBER CHAIN
     /// (`(ci.drv).bus_a` — how a task body parses the text; module level
     /// parses the same text as one flat ident) names the instance's own
     /// variable; the modport view only restricts directions. Rewrite the
@@ -3451,10 +3441,16 @@ impl Simulator {
     fn modport_strip_chain(&self, e: &Expression) -> Option<Expression> {
         // Only a pure `.name` chain (or a flat multi-segment ident) has a
         // well-defined dotted spelling to strip; selects, calls and indices
-        // keep their shape and stay with the machinery that owns them.
+        // keep their shape and stay with the machinery that owns them. An
+        // inner segment must be spelled like some modport: the common chain
+        // leaves here without allocating.
         let (root, names, span): (Option<String>, Vec<String>, crate::ast::Span) = match &e.kind {
             ExprKind::Ident(h)
-                if h.path.len() >= 3 && h.path.iter().all(|s| s.selects.is_empty()) =>
+                if h.path.len() >= 3
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && h.path[1..h.path.len() - 1]
+                        .iter()
+                        .any(|s| self.modport_names.contains(s.name.name.as_str())) =>
             {
                 (
                     h.root.clone(),
@@ -3462,17 +3458,21 @@ impl Simulator {
                     h.span,
                 )
             }
-            ExprKind::MemberAccess { .. } => {
+            ExprKind::MemberAccess { expr: inner, .. } => {
+                let mut cur: &Expression = inner;
+                let mut inner_modport = false;
+                while let ExprKind::MemberAccess { expr, member } = &cur.kind {
+                    inner_modport |= self.modport_names.contains(member.name.as_str());
+                    cur = expr;
+                }
+                if !inner_modport {
+                    return None;
+                }
                 let mut names: Vec<String> = Vec::new();
                 let mut cur = e;
-                loop {
-                    match &cur.kind {
-                        ExprKind::MemberAccess { expr, member } => {
-                            names.push(member.name.clone());
-                            cur = expr;
-                        }
-                        _ => break,
-                    }
+                while let ExprKind::MemberAccess { expr, member } = &cur.kind {
+                    names.push(member.name.clone());
+                    cur = expr;
                 }
                 let ExprKind::Ident(h) = &cur.kind else {
                     return None;
@@ -3489,11 +3489,7 @@ impl Simulator {
             }
             _ => return None,
         };
-        let raw = names.join(".");
-        let stripped = self.strip_modport_segments(&raw);
-        if stripped == raw {
-            return None;
-        }
+        let stripped = self.strip_modport_segments(&names.join("."))?;
         let path: Vec<crate::ast::expr::HierPathSegment> = stripped
             .split('.')
             .map(|part| crate::ast::expr::HierPathSegment {
@@ -3517,6 +3513,16 @@ impl Simulator {
         ))
     }
 
+    /// Rewrite an expression chain whose RECEIVER is a bound virtual
+    /// interface — at any depth, spelled any way [`vif_recv_target`]
+    /// resolves — into a DIRECT access of the bound instance, so everything
+    /// downstream (read, write, NBA, event and wait controls, clocking
+    /// blocks, interface subroutine calls) sees the instance path, which
+    /// already works in every shape. Inside a subroutine body the parser
+    /// emits `MemberAccess`/`Index`/`Call` chains rather than one flat
+    /// `Ident`; at module scope the same source is one flat `Ident`. `None`
+    /// when no receiver in the chain is a bound vif — the common case, gated
+    /// to a few emptiness and name checks.
     pub(super) fn vif_rebase_expr(&self, e: &Expression) -> Option<Expression> {
         // A definition-qualified self reference is an instance access even
         // without a virtual handle. Normalize the whole selected chain so
@@ -3524,13 +3530,13 @@ impl Simulator {
         if let Some(local) = self.strip_own_definition_name(e) {
             return Some(local);
         }
-        // LRM §25.5.2: a modport-qualified chain (`(ci.drv).bus_a`, or the
-        // flat `ci.drv.bus_a`) names the instance's own variable. Normalize
-        // it to the stripped flat ident BEFORE the vif gates below — a
-        // design with modports but no virtual interfaces never reaches
-        // them, and the class-aggregate arms of the read/write paths would
-        // otherwise claim the chain for heap storage.
-        if !self.module.modport_member_dirs.is_empty()
+        // §25.5: a modport-qualified chain (`(ci.drv).bus_a`, or the flat
+        // `ci.drv.bus_a`) names the instance's own variable. Normalize it to
+        // the stripped flat ident BEFORE the vif gates below — a design with
+        // modports but no virtual interfaces never reaches them, and the
+        // class-aggregate arms of the read/write paths would otherwise claim
+        // the chain for heap storage.
+        if !self.modport_names.is_empty()
             && let Some(stripped) = self.modport_strip_chain(e)
         {
             return Some(stripped);

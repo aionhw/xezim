@@ -355,7 +355,8 @@ fn method_boost_enabled() -> bool {
 // §13.5.1 / §8.25: packed method arguments and results retain specialized widths.
 // §8.8: typed constructors compile the named class scope.
 // §6.21: addressed static locals retain shared storage.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3074;
+// §25.5: a modport-qualified name resolves to the interface instance's own variable.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3075;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -8507,6 +8508,10 @@ pub struct Simulator {
     event_obj_ids: HashMap<(usize, String), u64>,
     event_obj_slots: HashMap<u64, Vec<(usize, String)>>,
     next_event_obj_id: u64,
+    /// The modport names the design declares (`modport_member_dirs`), built
+    /// at setup: a dotted name with no inner segment among them is not
+    /// modport-qualified (§25.5).
+    modport_names: HashSet<String>,
     /// The class properties that can hold a `real`
     /// (`collect_class_real_props`), built at setup.
     class_real_props: HashSet<String>,

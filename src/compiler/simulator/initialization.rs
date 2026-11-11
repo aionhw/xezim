@@ -3721,6 +3721,11 @@ impl Simulator {
                 .collect()
         };
         let class_real_props = Self::collect_class_real_props(&module);
+        let modport_names: HashSet<String> = module
+            .modport_member_dirs
+            .keys()
+            .map(|(_, mp)| mp.clone())
+            .collect();
         let mut sim = Self {
             prev_val,
             prev_xz,
@@ -4207,6 +4212,7 @@ impl Simulator {
             next_event_obj_id: 0,
             class_event_prop_names: None,
             class_real_props,
+            modport_names,
             nba_fast: Vec::new(),
             // Named signals stay on the dense hot path. Unnamed large-array
             // elements use NbaFastIndex's sparse tail.
