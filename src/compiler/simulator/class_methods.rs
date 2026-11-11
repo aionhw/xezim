@@ -1870,6 +1870,7 @@ impl Simulator {
                         // (and the partially-bound formals visible) so a
                         // `this`-dependent method default resolves instead
                         // of silently evaluating to the type's zero value.
+                        let saved_spec = self.seed_callee_spec_from_instance(handle, cname);
                         self.this_stack.push(Some(handle));
                         self.class_context_stack.push(Some(cname.clone()));
                         self.push_local_frame_typed(locals.clone(), frame_types.clone());
@@ -1880,6 +1881,7 @@ impl Simulator {
                         self.pop_local_frame();
                         self.class_context_stack.pop();
                         self.this_stack.pop();
+                        self.restore_spec_pooled(saved_spec);
                         v
                     } else {
                         Value::zero(32)

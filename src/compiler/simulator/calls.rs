@@ -19,6 +19,15 @@ impl Simulator {
         let lexical = self.lexical_spec();
         let extracted = self.resolve_call_spec_params(Self::extract_call_spec(func), &lexical);
         if let Some((ref base, ref sig)) = extracted {
+            // §8.8/§13.5.1: constructor actuals precede the callee scope.
+            if matches!(&func.kind, ExprKind::MemberAccess { member, .. } if member.name == "new") {
+                let normalized = Self::strip_spec_shape(func);
+                if Self::typed_ctor_call(&normalized).is_some_and(|(prefix, _)| prefix == base)
+                    && let Some(v) = self.construct_typed_ctor(&format!("{base}#({sig})"), args)
+                {
+                    return v;
+                }
+            }
             self.ensure_spec_statics(base, sig);
         }
         // Execute the callee with `current_spec` = the CALLER'S spec so an

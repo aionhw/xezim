@@ -4536,12 +4536,12 @@ impl Simulator {
         }
         let (cls, spec) = self.resolve_class_scope_prefix(prefix)?;
         let class_def = self.module.classes.get(&cls).cloned()?;
-        let Some(sig) = spec else {
-            return Some(self.instantiate_class(&class_def, args));
-        };
-        self.ensure_spec_statics(&cls, &sig);
-        let saved = self.current_spec.replace((cls, sig));
-        let v = self.instantiate_class(&class_def, args);
+        let saved = self.current_spec.clone();
+        if let Some(sig) = spec {
+            self.ensure_spec_statics(&cls, &sig);
+            self.current_spec = Some((cls, sig));
+        }
+        let v = self.instantiate_class_in_scope(&class_def, args, None, Some(saved.clone()));
         self.current_spec = saved;
         Some(v)
     }
