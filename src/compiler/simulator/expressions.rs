@@ -5227,8 +5227,35 @@ impl Simulator {
                 // struct reached through a member chain (`h.r.t[k]`,
                 // `a[0].r.t[k]`): the field's first dimension picks an
                 // element, not a bit.
+                //
+                // The resolver usually flattens such a chain to a bare Ident
+                // (`h.frame.lanes[0]` → `Ident h.frame.lanes`), so the
+                // MemberAccess-only probe above misses it; reconstruct the
+                // struct-side of the chain (`h.frame`) and reuse the same
+                // element slicing.
+                if let ExprKind::Ident(h) = &expr.kind
+                    && h.path.len() >= 2
+                    && !h.path.iter().any(|s| !s.selects.is_empty())
+                {
+                    let last = h.path.len() - 1;
+                    // `h.frame.lanes` → sb = `(h).frame` (MemberAccess),
+                    // member = `lanes`.
+                    let sb = Self::ident_prefix_member_access(expr, last);
+                    let member = crate::ast::Identifier {
+                        name: h.path[last].name.name.clone(),
+                        span: expr.span,
+                    };
+                    if let Some(v) = self.struct_field_elem_read(&sb, &member, index) {
+                        return v;
+                    }
+                }
                 if let ExprKind::MemberAccess { expr: sb, member } = &expr.kind
-                    && matches!(sb.kind, ExprKind::MemberAccess { .. })
+                    && (matches!(sb.kind, ExprKind::MemberAccess { .. })
+                        // §7.4.5 implicit-`this` receiver: `frame.lanes[0]`
+                        // inside a method flattens to
+                        // `MemberAccess{ Ident[frame], lanes }`.
+                        || (matches!(sb.kind, ExprKind::Ident(_))
+                            && self.this_stack.last().copied().flatten().is_some()))
                     && let Some(v) = self.struct_field_elem_read(sb, member, index)
                 {
                     return v;

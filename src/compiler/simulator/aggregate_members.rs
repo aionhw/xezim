@@ -1288,6 +1288,53 @@ impl Simulator {
         None
     }
 
+    /// Build the leading `count` segments of the flattened Ident chain `e` as
+    /// a nested `MemberAccess` expression — `h.frame.lanes` with `count=2`
+    /// → `(h).frame`. Used to hand a real Expression shape to
+    /// [`Self::struct_field_elem_read`], whose receiver/type probes walk
+    /// `MemberAccess` chains (the resolver flattened the same chain to a
+    /// bare `Ident`).
+    pub(super) fn ident_prefix_member_access(e: &Expression, count: usize) -> Expression {
+        let ExprKind::Ident(h) = &e.kind else {
+            return e.clone();
+        };
+        let count = count.min(h.path.len());
+        if count == 0 {
+            return e.clone();
+        }
+        let span = e.span;
+        let mut acc = Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: h.root.clone(),
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: h.path[0].name.name.clone(),
+                        span,
+                    },
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            }),
+            span,
+        );
+        for seg in h.path.iter().take(count).skip(1) {
+            acc = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(acc),
+                    member: crate::ast::Identifier {
+                        name: seg.name.name.clone(),
+                        span,
+                    },
+                },
+                span,
+            );
+        }
+        acc
+    }
+
     /// `sb.member[index]` with `member` a packed-array field (two or more
     /// packed dimensions) of the packed struct `sb` names: the element.
     #[inline(never)]
@@ -1393,6 +1440,20 @@ impl Simulator {
                     .find(|m| m.declarators.iter().any(|d| d.name.name == member.name))
                     .map(|m| m.data_type.clone())?;
                 Self::resolve_type_ref(&m_dt, &self.module.typedef_types)
+            }
+            ExprKind::Ident(h) => {
+                // §7.4.5 implicit-`this` receiver: `frame.lanes[0]` inside a
+                // method flattens to `MemberAccess{ Ident[frame], lanes }`,
+                // so the struct-side base is the bare property `frame` held
+                // by the current `this` object. (A module-scope struct
+                // variable receiver, or a bare name with no `this`, is not a
+                // class property and falls through to None.)
+                if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    return None;
+                }
+                let obj = self.this_stack.last().copied().flatten()?;
+                let su = self.class_prop_struct(obj, &h.path[0].name.name)?;
+                DataType::Struct((*su).clone())
             }
             _ => return None,
         };
