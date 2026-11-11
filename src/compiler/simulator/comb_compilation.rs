@@ -290,6 +290,7 @@ impl Simulator {
         self.comb_time0_idx = cache.time0_idx;
         self.comb_time0_deferred = cache.time0_deferred;
         self.cont_driven = cache.cont_driven;
+        self.initialize_continuously_driven_nets();
         self.gate_fall_delay_by_id
             .extend(cache.gate_fall_delay_by_id);
         self.gate_off_delay_by_id.extend(cache.gate_off_delay_by_id);
@@ -353,6 +354,68 @@ impl Simulator {
             Err(err) => {
                 let _ = std::fs::remove_file(&tmp);
                 eprintln!("[CACHE] prepared-comb store skipped: {}", err);
+            }
+        }
+    }
+
+    // Prepared tables store the program, not the initial signal values, so a
+    // cache hit replays this initialization of the cold path before the
+    // time-0 continuous assignments run.
+    fn initialize_continuously_driven_nets(&mut self) {
+        // §6.6.1 vs a DRIVEN net: an undriven net reads z, but a net that has a
+        // continuous driver is not undriven — its value is whatever that driver
+        // produces, and until the driver first resolves that is UNKNOWN, not
+        // high-impedance. The distinction is invisible for a zero-delay driver
+        // (the time-0 settle overwrites it immediately) but shows through the
+        // whole delay window of a DELAYED one, which is exactly a gate-level
+        // netlist: `and #(2,5) g(o, a, b);` leaves `o` readable for 5 ticks
+        // before it first resolves, and it should read x there.
+        //
+        // A combinational CYCLE (`assign p = q; assign q = p;`) keeps this
+        // x forever — measured: the reference does the SAME (cycles read x,
+        // driven or not). `alias` is NOT a cycle — it unifies names onto one
+        // net (see `alias_pairs`).
+        //
+        // Only all-z signals are touched, so a net given a real initial value
+        // (supply0/1) keeps it. A tri0/tri1 net is no different from a wire
+        // here: its pull is only the weak fallback where no driver drives, so
+        // with a driver it is x as well until that driver resolves (measured
+        // on the reference: `tri0 t; assign #2 t = a;` reads x until t=2).
+        let cont_driven: Vec<usize> = self.cont_driven.iter().copied().collect();
+        let has_pulled = self.module.resolved_net_kinds.values().any(|k| {
+            matches!(
+                k,
+                xezim_core::elaborate::ResolvedNetKind::Tri0
+                    | xezim_core::elaborate::ResolvedNetKind::Tri1
+            )
+        });
+        for id in cont_driven {
+            if self.signal_real[id] {
+                continue;
+            }
+            let w = self.signal_widths[id];
+            if w == 0 {
+                continue;
+            }
+            let cur = &self.signal_table[id];
+            let all_z = (0..w as usize).all(|i| cur.get_bit(i) == LogicBit::Z);
+            let pulled = has_pulled
+                && !all_z
+                && self
+                    .name_opt(id)
+                    .and_then(|n| self.module.resolved_net_kinds.get(n))
+                    .is_some_and(|k| {
+                        matches!(
+                            k,
+                            xezim_core::elaborate::ResolvedNetKind::Tri0
+                                | xezim_core::elaborate::ResolvedNetKind::Tri1
+                        )
+                    });
+            if all_z || pulled {
+                let mut v = Value::new(w); // all-x
+                v.is_signed = self.signal_signed[id];
+                self.signal_table[id] = v;
+                self.sync_mirror(id);
             }
         }
     }
@@ -1483,62 +1546,7 @@ impl Simulator {
             });
         }
 
-        // §6.6.1 vs a DRIVEN net: an undriven net reads z, but a net that has a
-        // continuous driver is not undriven — its value is whatever that driver
-        // produces, and until the driver first resolves that is UNKNOWN, not
-        // high-impedance. The distinction is invisible for a zero-delay driver
-        // (the time-0 settle overwrites it immediately) but shows through the
-        // whole delay window of a DELAYED one, which is exactly a gate-level
-        // netlist: `and #(2,5) g(o, a, b);` leaves `o` readable for 5 ticks
-        // before it first resolves, and it should read x there.
-        //
-        // A combinational CYCLE (`assign p = q; assign q = p;`) keeps this
-        // x forever — measured: the reference does the SAME (cycles read x,
-        // driven or not). `alias` is NOT a cycle — it unifies names onto one
-        // net (see `alias_pairs`).
-        //
-        // Only all-z signals are touched, so a net given a real initial value
-        // (supply0/1) keeps it. A tri0/tri1 net is no different from a wire
-        // here: its pull is only the weak fallback where no driver drives, so
-        // with a driver it is x as well until that driver resolves (measured
-        // on the reference: `tri0 t; assign #2 t = a;` reads x until t=2).
-        let cont_driven: Vec<usize> = self.cont_driven.iter().copied().collect();
-        let has_pulled = self.module.resolved_net_kinds.values().any(|k| {
-            matches!(
-                k,
-                xezim_core::elaborate::ResolvedNetKind::Tri0
-                    | xezim_core::elaborate::ResolvedNetKind::Tri1
-            )
-        });
-        for id in cont_driven {
-            if self.signal_real[id] {
-                continue;
-            }
-            let w = self.signal_widths[id];
-            if w == 0 {
-                continue;
-            }
-            let cur = &self.signal_table[id];
-            let all_z = (0..w as usize).all(|i| cur.get_bit(i) == LogicBit::Z);
-            let pulled = has_pulled
-                && !all_z
-                && self
-                    .name_opt(id)
-                    .and_then(|n| self.module.resolved_net_kinds.get(n))
-                    .is_some_and(|k| {
-                        matches!(
-                            k,
-                            xezim_core::elaborate::ResolvedNetKind::Tri0
-                                | xezim_core::elaborate::ResolvedNetKind::Tri1
-                        )
-                    });
-            if all_z || pulled {
-                let mut v = Value::new(w); // all-x
-                v.is_signed = self.signal_signed[id];
-                self.signal_table[id] = v;
-                self.sync_mirror(id);
-            }
-        }
+        self.initialize_continuously_driven_nets();
 
         // Always @* and always_comb blocks. Reuse `reads`/`writes` from the
         // continuous_assigns loop above (clear-not-realloc). always_latch is
