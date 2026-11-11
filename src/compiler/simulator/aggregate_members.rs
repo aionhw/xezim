@@ -2741,6 +2741,31 @@ impl Simulator {
                     i += 1;
                 }
                 MemberSel::Range { kind, l, r } => {
+                    // Indexed part-selects (`+:` / `-:`) directed at a still-
+                    // packed ARRAY dimension address ELEMENTS, not bits
+                    // (§11.5.1): `lanes[0 +: 1]` is element 0, not bit 0, of
+                    // the whole member. Rebase the element index to a
+                    // physical offset exactly as a plain Index would, then
+                    // scale the width by the element size.
+                    if matches!(kind, RangeKind::IndexedUp | RangeKind::IndexedDown)
+                        && d < dims.len()
+                    {
+                        let &(L, R) = dims.get(d)?;
+                        let count = counts.get(d).copied().unwrap_or(1).max(1);
+                        let ew = span.checked_div(count)?;
+                        let elem_off = |E: i64| -> Option<u32> {
+                            let slot = if L >= R { E - R } else { R - E };
+                            (slot >= 0).then(|| (slot as u32).checked_mul(ew)).flatten()
+                        };
+                        let end_e = if matches!(kind, RangeKind::IndexedUp) {
+                            l + r - 1
+                        } else {
+                            l - r + 1
+                        };
+                        let lo = elem_off(*l)?.min(elem_off(end_e)?);
+                        let w = u32::try_from(*r).ok()?.max(1);
+                        return Some((off.checked_add(lo)?, w * ew));
+                    }
                     let (o, w) = Self::range_within(span, *kind, *l, *r)?;
                     return Some((off.checked_add(o)?, w));
                 }
