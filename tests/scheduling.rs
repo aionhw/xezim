@@ -475,3 +475,6 @@ mod clocking_edge_regressions;
 
 #[path = "scheduling/static_local_in_clocked_call.rs"]
 mod static_local_in_clocked_call;
+
+#[path = "scheduling/hierarchical_subroutine_static.rs"]
+mod hierarchical_subroutine_static;
