@@ -257,6 +257,8 @@ mod coll_shape_iteration;
 
 #[path = "collections/review_coll_shape_rows.rs"]
 mod review_coll_shape_rows;
+#[path = "collections/review_aggregate_unknown_compare_1043.rs"]
+mod review_aggregate_unknown_compare_1043;
 #[path = "collections/review_packed_pattern_compare_1043.rs"]
 mod review_packed_pattern_compare_1043;
 
