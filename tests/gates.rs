@@ -98,3 +98,5 @@ mod driver_transition_delays;
 
 #[path = "gates/shared_net_driver_stages.rs"]
 mod shared_net_driver_stages;
+#[path = "gates/vector_continuous_delay.rs"]
+mod vector_continuous_delay;
