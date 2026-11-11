@@ -87,6 +87,40 @@ endmodule
 }
 
 #[test]
+fn interconnect_array_elements_adopt_element_real_type() {
+    // #1039: a typeless `interconnect` UNPACKED ARRAY (`iBus[0:1]`) used to
+    // stay a 1-bit net — its element storage (`arrays` elem_w) was never
+    // shaped from the typed ports bound to it, so a `realNet` element
+    // truncated 2.5 to 1. Each element must adopt the width/realness of the
+    // port it is bound to (§6.6.8).
+    let out = msgs(
+        r#"
+package NetsPkg;
+  nettype real realNet;
+endpackage
+module rDriver import NetsPkg::*; (output realNet out); assign out = 2.5; endmodule
+module rMod import NetsPkg::*; (input realNet i); endmodule
+module rlMod import NetsPkg::*; (input interconnect iBus[0:1]);
+  rMod r1(iBus[1]);
+endmodule
+module top;
+  interconnect iBus[0:1];
+  rDriver d1(iBus[1]);
+  rlMod m1(iBus);
+  initial begin
+    #1; $display("IAR_%g", m1.r1.i);
+  end
+endmodule
+"#,
+    );
+    assert!(
+        out.iter().any(|m| m == "IAR_2.5"),
+        "interconnect array real element truncated: {:?}",
+        out
+    );
+}
+
+#[test]
 fn var_kw_continues_across_port_comma() {
     let out = msgs(
         r#"
