@@ -7,10 +7,9 @@
 //! (§20.10 for `$fatal`) and still writes its waveform. Process handling
 //! only: no simulation output is compared.
 use std::io::{BufRead, BufReader};
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 fn xezim() -> String {
     let mut p = std::env::current_exe().expect("current_exe");
@@ -25,13 +24,9 @@ fn xezim() -> String {
 /// writing when the reader goes away.
 const LINES: &str = "for (int i = 0; i < 50000; i++) $display(\"line %0d\", i);";
 
-/// Close-on-exec, so a run spawned by a parallel test does not inherit this
-/// pipe's read end and keep it open after the reader here goes away.
-fn pipe() -> (OwnedFd, OwnedFd) {
-    let mut fds = [0; 2];
-    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    assert_eq!(rc, 0, "pipe2");
-    unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+/// The standard pipe API provides portable, non-inheritable handles.
+fn pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
+    std::io::pipe().expect("pipe")
 }
 
 struct Run {
@@ -48,6 +43,16 @@ fn initial_only(body: &str) -> String {
 /// Run `src` with `args`, read one line of stdout and close the pipe. With
 /// `merge`, stderr shares the pipe (`2>&1 | head -1`).
 fn run_closing_early(tag: &str, src: &str, args: &[&str], merge: bool) -> Run {
+    run_closing_early_with_stack(tag, src, args, merge, None)
+}
+
+fn run_closing_early_with_stack(
+    tag: &str,
+    src: &str,
+    args: &[&str],
+    merge: bool,
+    stack_mb: Option<&str>,
+) -> Run {
     let dir = std::env::temp_dir().join(format!("broken_pipe_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("t.sv");
@@ -58,7 +63,11 @@ fn run_closing_early(tag: &str, src: &str, args: &[&str], merge: bool) -> Run {
         true => Stdio::from(write_end.try_clone().unwrap()),
         false => Stdio::from(std::fs::File::create(&err_log).unwrap()),
     };
-    let mut child = Command::new(xezim())
+    let mut command = Command::new(xezim());
+    if let Some(stack_mb) = stack_mb {
+        command.env("XEZIM_STACK_MB", stack_mb);
+    }
+    let mut child = command
         .current_dir(&dir)
         .args(args)
         .arg(&path)
@@ -66,11 +75,22 @@ fn run_closing_early(tag: &str, src: &str, args: &[&str], merge: bool) -> Run {
         .stderr(stderr)
         .spawn()
         .expect("run xezim");
-    let mut reader = BufReader::new(std::fs::File::from(read_end));
+    let mut reader = BufReader::new(read_end);
     let mut first = String::new();
     reader.read_line(&mut first).unwrap();
     drop(reader);
-    let status = child.wait().expect("wait");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("run did not terminate after its output reader closed");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let stderr = std::fs::read_to_string(&err_log).unwrap_or_default();
     Run {
         status,
@@ -80,13 +100,6 @@ fn run_closing_early(tag: &str, src: &str, args: &[&str], merge: bool) -> Run {
 }
 
 fn assert_status(run: &Run, code: i32) {
-    assert_eq!(
-        run.status.signal(),
-        None,
-        "killed by a signal: {:?}; stderr: {}",
-        run.status,
-        run.stderr
-    );
     assert_eq!(run.status.code(), Some(code), "stderr: {}", run.stderr);
     assert!(!run.stderr.contains("panicked"), "stderr: {}", run.stderr);
 }
@@ -158,4 +171,58 @@ fn the_waveform_is_complete_after_the_reader_closes() {
         vcd.lines().any(|l| l.starts_with("b100111000100000 ")),
         "VCD holds the last value of c (20000)"
     );
+}
+
+/// §20.16: a runtime diagnostic still exits with failure when stderr is closed.
+#[test]
+fn missing_sdf_keeps_its_failing_status_on_a_closed_pipe() {
+    let body = format!("{LINES}\n#1 $sdf_annotate(\"absent_input.sdf\");\n$finish;");
+    // Direct execution also exposes a diagnostic panic in debug builds:
+    // a worker's caught panic would otherwise resemble the expected exit 1.
+    for stack in [None, Some("0")] {
+        let run =
+            run_closing_early_with_stack("missing_sdf", &initial_only(&body), &[], true, stack);
+        assert_status(&run, 1);
+    }
+}
+
+/// §20.16: parsing an invalid SDF reaches the library's diagnostic writer too.
+#[test]
+fn invalid_sdf_keeps_its_failing_status_on_a_closed_pipe() {
+    let body = format!(
+        "integer fd;\n{LINES}\n\
+         fd = $fopen(\"bad.sdf\", \"w\");\n\
+         $fdisplay(fd, \"not-an-sdf-file\"); $fclose(fd);\n\
+         #1 $sdf_annotate(\"bad.sdf\");\n$finish;"
+    );
+    for stack in [None, Some("0")] {
+        let run =
+            run_closing_early_with_stack("invalid_sdf", &initial_only(&body), &[], true, stack);
+        assert_status(&run, 1);
+    }
+}
+
+/// §8.4: a null-receiver diagnostic must retain its failing status.
+#[test]
+fn null_receiver_keeps_its_failing_status_on_a_closed_pipe() {
+    let src = format!(
+        "class handler;\nfunction void act(); endfunction\nendclass\n\
+         module t;\nhandler h;\ninitial begin\n{LINES}\n#1 h.act();\n$finish;\nend\nendmodule"
+    );
+    for stack in [None, Some("0")] {
+        let run = run_closing_early_with_stack("null_receiver", &src, &[], true, stack);
+        assert_status(&run, 1);
+    }
+}
+
+/// The environment listing lives in the library and uses the same stdout policy.
+#[test]
+fn environment_listing_tolerates_a_closed_reader() {
+    let run = run_closing_early(
+        "env_listing",
+        &initial_only("$finish;"),
+        &["--show-env-avail"],
+        false,
+    );
+    assert_status(&run, 0);
 }
