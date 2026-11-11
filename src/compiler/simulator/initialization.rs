@@ -4098,6 +4098,7 @@ impl Simulator {
             cg_this: None,
             join_waiters: Vec::new(),
             process_parents: HashMap::default(),
+            adopted_pids: HashSet::default(),
             process_contexts: HashMap::default(),
             process_scope_hint: HashMap::default(),
             process_m_scope: HashMap::default(),

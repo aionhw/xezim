@@ -5928,7 +5928,7 @@ impl Simulator {
                     self.dpi_wait_fork();
                 } else if self.dpi_export_depth > 0 {
                     let me = self.current_pid;
-                    self.run_nested_until(|sim| !sim.process_parents.values().any(|&p| p == me));
+                    self.run_nested_until(|sim| !sim.has_wait_fork_children(me));
                 }
             }
             StatementKind::RsReturn => {

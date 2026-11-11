@@ -460,6 +460,27 @@ impl Simulator {
         self.release_fork_collections(pid);
         self.fork_signal_captures.remove(&pid);
         self.suspended_loop_frames.remove(&pid);
+        if !self.adopted_pids.is_empty() {
+            self.adopted_pids.remove(&pid);
+        }
+    }
+
+    /// §9.6.1: the children `wait fork` in process `pid` waits for: the
+    /// processes `pid` forked itself, not those handed up to it from a child
+    /// that has finished (`adopted_pids`).
+    pub(super) fn wait_fork_children(&self, pid: usize) -> HashSet<usize> {
+        self.process_parents
+            .iter()
+            .filter(|&(c, &p)| p == pid && !self.adopted_pids.contains(c))
+            .map(|(&c, _)| c)
+            .collect()
+    }
+
+    /// Whether `wait fork` in process `pid` still has a child to wait for.
+    pub(super) fn has_wait_fork_children(&self, pid: usize) -> bool {
+        self.process_parents
+            .iter()
+            .any(|(c, &p)| p == pid && !self.adopted_pids.contains(c))
     }
 
     fn release_process_execution_caches(&mut self, pid: usize) {
@@ -549,10 +570,16 @@ impl Simulator {
             self.wake_await_waiters(&terminated);
         }
 
+        if !self.adopted_pids.is_empty() {
+            self.adopted_pids.remove(&child_pid);
+        }
         // Reparent any still-running children of the completing process to its
-        // own parent, so the fork descendant tree stays connected (a `wait fork`
-        // higher up must still see grandchildren whose intermediate parent has
-        // finished). Without this, completing `X` would orphan its child `G`.
+        // own parent, so the fork descendant tree stays connected: a `disable
+        // fork` or `kill()` higher up still reaches grandchildren whose
+        // intermediate parent has finished (§9.6.3, §9.7). Without this,
+        // completing `X` would orphan its child `G`. They are marked adopted:
+        // they are not the new parent's immediate children, so its `wait fork`
+        // does not wait for them (§9.6.1).
         if let Some(&grandparent) = self.process_parents.get(&child_pid) {
             if self.process_parents.values().any(|&p| p == child_pid) {
                 let regrandkids: Vec<usize> = self
@@ -563,6 +590,7 @@ impl Simulator {
                     .collect();
                 for c in regrandkids {
                     self.process_parents.insert(c, grandparent);
+                    self.adopted_pids.insert(c);
                 }
             }
         }
