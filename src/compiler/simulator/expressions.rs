@@ -4040,7 +4040,12 @@ impl Simulator {
                 // against another pattern it is a value of its type.
                 if matches!(
                     op,
-                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
+                    BinaryOp::Eq
+                        | BinaryOp::Neq
+                        | BinaryOp::CaseEq
+                        | BinaryOp::CaseNeq
+                        | BinaryOp::WildcardEq
+                        | BinaryOp::WildcardNeq
                 ) {
                     let (lt, rt) = (
                         self.unpacked_typed_pattern(left),
