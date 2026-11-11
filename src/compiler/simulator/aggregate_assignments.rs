@@ -2233,12 +2233,47 @@ impl Simulator {
     #[inline(never)]
     pub(super) fn assign_rhs_ctx(&mut self, lvalue: &Expression, w: u32) -> u32 {
         // A real variable is 64 bits wide; any other width is integral.
-        if w == 64 && matches!(lvalue.kind, ExprKind::Ident(_)) && self.expr_is_real_static(lvalue)
-        {
-            0
-        } else {
-            w
+        if w == 64 && matches!(lvalue.kind, ExprKind::Ident(_)) && self.expr_is_real_static(lvalue) {
+            return 0;
         }
+        // §11.8.2: a REAL class property also lends only its storage width
+        // (64) — `infer_lhs_width` sizes it so a real NBA RHS Value survives
+        // the schedule-time resize — but a real target has no bit width to
+        // lend an integral RHS either: `r = u - 2` with `int unsigned u = 1`
+        // evaluates `u - 2` self-determined (32-bit wrap → 4294967295.0),
+        // not at 64, where the read of `u` widens and 1-2 wraps to 2^64-1.
+        // The flat tables above cannot see properties, so ask the declared
+        // types; a 64-bit INTEGRAL property (`logic [63:0]`) keeps the 64
+        // context, and only an Ident-shaped lvalue is consulted.
+        if w == 64
+            && !self.no_class_objects()
+            && let ExprKind::Ident(h) = &lvalue.kind
+            && h.root.is_none()
+        {
+            // Bare leaf in a method: this object's declared property.
+            if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                if let Some(&Some(handle)) = self.this_stack.last()
+                    && self.class_prop_is_real(handle, &h.path[0].name.name)
+                {
+                    return 0;
+                }
+            } else if h.path.len() > 1 && self.head_denotes_class_object(h) {
+                let prop = &h.path.last().unwrap().name.name;
+                let head = &h.path[0].name.name;
+                // Handle-qualified (`h.prop`): the head's live object.
+                if let Some(handle) = self.eval_ident_handle(head) {
+                    if self.class_prop_is_real(handle, prop) {
+                        return 0;
+                    }
+                } else if let Some(cn) = self.class_of_var(head) {
+                    // Owner-qualified static (`C::prop`): the class itself.
+                    if self.class_prop_is_real_in(&cn, prop, 0) {
+                        return 0;
+                    }
+                }
+            }
+        }
+        w
     }
 
     /// §11.8.2: true when `e` is REAL-typed by declaration — a real literal,
