@@ -852,7 +852,19 @@ impl Simulator {
             // Try fused-gate fast path first: recognizes yosys patterns like
             // `assign d[0] = a & b` or `assign d[0] = ~(a & b)` — executes
             // without VM dispatch, just bit reads + 4-state combinator + set_bit.
+            // §28.16: a primitive that is the only driver of its net keeps
+            // its fall delay in the name map alone, so one with a zero rise
+            // delay (`buf #(0, 5)`) shows no delay of its own here; it took
+            // the undelayed gate path and fell at once.
+            let primitive_fall = ca.gate_delay_fall.is_some()
+                && wids.len() == 1
+                && lhs_is_bare_ident
+                && self
+                    .gate_fall_delay_by_id
+                    .get(&wids[0])
+                    .is_some_and(|&d| d > 0);
             let has_transition_delay = explicit_delay > 0
+                || primitive_fall
                 || ca.delay_fall.is_some_and(|d| d > 0)
                 || ca.delay_off.is_some_and(|d| d > 0);
             let fused = if !has_transition_delay && cov_counter.is_none() {
