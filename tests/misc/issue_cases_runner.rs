@@ -586,3 +586,24 @@ fn static_vif_local_shadow_433() {
     assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
 }
+
+/// The NBA struct-shape sweep MWE: 38 checks (s1..s61) covering one production
+/// bug and its cousin shapes. The core shape — a partial-member NBA followed
+/// in the same timestep by a whole-struct NBA to the same variable — lost the
+/// whole-struct value of the partial's member (the partial stuck), found as an
+/// interface request bus whose valid bit never asserted. Guards three fixes:
+/// same-timestep partial+whole NBA ordering (nba_fast stream merge),
+/// modport-qualified references in both parse shapes (flat ident at module
+/// level, nested MemberAccess chain in task bodies — LRM 25.5.2), and
+/// class-static packed-struct member reads sliced from the shared static cell
+/// (LRM 8.9). Each diverging shape prints a "FAIL: sNN" line; a clean run
+/// ends with TEST_PASS.
+#[test]
+fn nba_struct_shape_sweep() {
+    let msgs = outputs(
+        include_str!("../issue_cases/nba_struct_shapes_1050.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}
