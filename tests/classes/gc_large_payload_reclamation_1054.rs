@@ -1,6 +1,7 @@
-//! Verification for Issue #1054 / #1055:
-//! - Duplicate worker stack avoids nested 1 GiB reservation
-//! - Class GC collects large payloads before hitting 20,000 objects
+//! IEEE 1800-2023 §8.7 (#1054): objects with large array members are
+//! reclaimed before 20,000 of them exist, and the run is unchanged by it.
+//! That a collection ran is asserted beside the collector
+//! (`array_payloads_trigger_reclamation_below_the_allocation_count`).
 
 #[test]
 fn gc_reclaims_large_array_payloads_below_object_threshold() {
