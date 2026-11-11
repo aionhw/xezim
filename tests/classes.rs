@@ -1222,3 +1222,6 @@ mod rand_solver_bound_order;
 
 #[path = "classes/typed_constructor_call.rs"]
 mod typed_constructor_call;
+
+#[path = "classes/typed_constructor_scope.rs"]
+mod typed_constructor_scope;
