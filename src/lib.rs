@@ -1210,7 +1210,14 @@ pub fn simulate_multi(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024);
-    if stack_mb == 0 {
+    // If stack size is 0 or if already running on a thread with an enlarged stack
+    // (such as "xezim-main" spawned by the CLI wrapper), reuse the current thread's
+    // stack directly rather than creating a duplicate stack reservation (issue #1055).
+    let is_already_enlarged_worker = std::thread::current()
+        .name()
+        .map(|n| n == "xezim-main")
+        .unwrap_or(false);
+    if stack_mb == 0 || is_already_enlarged_worker {
         return simulate_multi_inner(
             sources,
             max_time,
