@@ -1520,16 +1520,22 @@ impl Simulator {
             self.run_fast_delay_always(pid);
         } else if stmts.is_empty() && self.proc_fsm.contains_key(&pid) {
             self.run_proc_fsm(pid);
-        } else if stmts.is_empty() && self.lazy_initial.contains_key(&pid) {
-            let (p, _block_label) = self.lazy_initial.remove(&pid).unwrap();
+        } else if stmts.is_empty()
+            && !self.lazy_initial.is_empty()
+            && let Some(p) = self.lazy_initial.remove(&pid)
+        {
+            // An initial block queued by its pending form (see `compile`):
+            // its body is materialized for this instance now, with the
+            // block locals given storage of their own as an instance's
+            // always block gets (`materialize_pending_always`), and is
+            // dropped again when the process ends.
             let mut ib = p.materialize();
             Self::rename_instance_locals(&mut ib.stmt, &ib.scope);
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
                 other => vec![Statement::new(other, ib.stmt.span)],
             };
-            let cont = ProcCont::from_vec(stmts);
-            self.run_process_stmts(pid, &cont);
+            self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
         } else {
             self.run_process_stmts(pid, stmts);
         }

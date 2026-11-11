@@ -952,6 +952,10 @@ impl Simulator {
         self.reopen_files(file.files)?;
         // Caches keyed by an address in the run that wrote the checkpoint.
         self.recv_call_memo.clear();
+        // A checkpoint is taken at the end of a time slot, so every initial
+        // block of the saving run had started; the bodies this build queued
+        // for its own time 0 belong to no restored process.
+        self.lazy_initial.clear();
         self.method_plans.borrow_mut().clear();
         self.fsm_clobber_cache.clear();
         self.class_task_frame_cache.clear();

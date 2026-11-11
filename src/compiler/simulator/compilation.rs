@@ -1677,21 +1677,31 @@ impl Simulator {
             Materialized(super::elaborate::InitialBlock),
             Lazy(super::elaborate::PendingInitial),
         }
+        // An instance's initial block shares its source with every other
+        // instance of the module until it is materialized for its own
+        // (`PendingInitial`). Materializing all of them here kept one owned
+        // copy of the body per instance queued at once: 512 instances of a
+        // 512-statement block took setup from 52 MB to 350 MB. A block is
+        // instead queued by its pending form and materialized when its
+        // process starts (`run_process_payload`), wherever nothing below
+        // needs the materialized statements first:
+        // - code coverage instruments them (`cov_initial`);
+        // - the clock-generator shape (two statements) is detected on them;
+        // - a body with an event control may become a process FSM, as may
+        //   any body with a wait under XEZIM_PROC_FSM=1;
+        // - a call in statement position blocks or not by the callee the
+        //   instance's own names resolve to, which decides the block's place
+        //   in the time-0 order (`t0_timing_free`).
+        let fsm_all = self.proc_fsm_mode == 1;
         let can_defer_initial = |p: &super::elaborate::PendingInitial| -> bool {
-            if self.code_cov.is_some() {
+            if self.code_cov.is_some() || fsm_all {
                 return false;
             }
-            let is_seq_or_len2 = match &p.source.kind {
-                StatementKind::SeqBlock { stmts, .. } => stmts.len() == 2,
-                _ => false,
-            };
-            if is_seq_or_len2 {
+            if matches!(&p.source.kind, StatementKind::SeqBlock { stmts, .. } if stmts.len() == 2) {
                 return false;
             }
-            if Self::stmt_contains_event_control(&p.source) {
-                return false;
-            }
-            true
+            !Self::stmt_contains_event_control(&p.source)
+                && !Self::stmt_has_call_statement(&p.source)
         };
         let (deferred_pending, direct_pending): (Vec<_>, Vec<_>) =
             pending_initial.into_iter().partition(can_defer_initial);
@@ -1782,6 +1792,9 @@ impl Simulator {
                 // count runs first so memory-init megablocks skip without the
                 // SeqBlock rebuild.
                 {
+                    // 1 = every compilable initial body; 0 = none; unset = the
+                    // plain-stimulus shape below (a testbench's clocked stimulus
+                    // loop ran 8.6x slower on the AST path than as an FSM).
                     let fsm_mode = self.proc_fsm_mode;
                     let timing = stmts.iter().map(Self::count_timing_controls).sum::<usize>();
                     let admit = timing >= 1
@@ -1789,6 +1802,14 @@ impl Simulator {
                             1 => true,
                             0 => false,
                             _ => {
+                                // Clock-driven only: a body with at least one `@`
+                                // wait is the hot stimulus loop; delay-only
+                                // sequences (reset scripts, UDP/stall probes,
+                                // ordering tests) stay on the AST path, whose
+                                // per-statement waiter and UDP evaluation order
+                                // their pinned traces rely on. A labeled block is
+                                // a hierarchical scope (`disable lbl`, `lbl.v`)
+                                // the FSM does not model.
                                 std::env::var_os("XEZIM_VALUE_TRACE").is_none()
                                     && block_label.is_none()
                                     && stmts.iter().any(Self::stmt_contains_event_control)
@@ -1825,7 +1846,7 @@ impl Simulator {
                 self.register_disable_label(l, pid);
             }
             if let Some(p) = lazy_entry {
-                self.lazy_initial.insert(pid, (p, block_label));
+                self.lazy_initial.insert(pid, p);
                 self.event_queue.schedule(0, pid, ProcCont::empty());
             } else {
                 let stmts = stmts.unwrap();
