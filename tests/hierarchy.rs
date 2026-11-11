@@ -466,3 +466,5 @@ mod package_header_shadow_995;
 mod generate_child_label_refs;
 #[path = "hierarchy/review_tri_port_net_types.rs"]
 mod review_tri_port_net_types;
+#[path = "hierarchy/modport_qualified_access.rs"]
+mod modport_qualified_access;
