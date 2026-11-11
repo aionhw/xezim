@@ -4535,6 +4535,10 @@ impl Simulator {
                     } else if self.try_schedule_packed_index_nba(lvalue, &val) {
                         // The packed slice has already been merged into the
                         // pending whole-signal value.
+                    } else if self.try_schedule_packed_slice_nba(lvalue, &val) {
+                        // A member / part-select / concat piece: merged into
+                        // the pending whole-signal NBA value, preserving
+                        // schedule order against whole-signal NBAs (§4.7).
                     } else if matches!(&lvalue.kind, ExprKind::Ident(h)
                         if h.path.len() == 1
                             && self.local_stack.last().is_some_and(|m| m.contains_key(&h.path[0].name.name)))

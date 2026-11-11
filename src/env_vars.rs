@@ -631,6 +631,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "NBA queue: use dense per-signal slots instead of hash map (0/1)",
     ),
     (
+        "XEZIM_NBA_SLICE_DEBUG",
+        "Trace partial-NBA slice scheduling declines (Bug A ordering investigation)",
+    ),
+    (
         "XEZIM_NO_CACHE",
         "Elab cache: disable reading/writing the design cache",
     ),
