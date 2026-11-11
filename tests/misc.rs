@@ -620,3 +620,5 @@ mod macro_actual_count_888;
 mod typed_localparam_dimension_894;
 #[path = "misc/review_class_param_undeclared_888.rs"]
 mod review_class_param_undeclared_888;
+#[path = "misc/preprocessor_closed_pipe.rs"]
+mod preprocessor_closed_pipe;
