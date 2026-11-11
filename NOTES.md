@@ -161,6 +161,25 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   indexed record fields retain their own dependencies (§18.5, §11.4.3,
   #1003, reported by Ganesh-TNL).
 
+
+* Nested generate labels resolve within the declaring block and instance,
+  including child functions and indexed generate arrays after cache or artifact
+  reloads (§23.6, §23.8, §27.6, core #187 / #188, reported and contributed by
+  chuanseng-ng).
+* An inlined function hides its caller's loop constants while executing its
+  body, then restores the caller's bindings before copying output arguments
+  back to local variables or indexed destinations (§13.4, §13.5.3, #1041 /
+  #1042, reported and contributed by chuanseng-ng).
+* Explicit static locals of automatic tasks and void functions retain shared
+  state across clocked calls, nested blocks and conditional updates. Automatic
+  and write-first locals keep their ordinary behavior (§6.21, #1049).
+* `$dumpflush` waits until the threaded VCD writer has flushed preceding
+  records, so another reader can see them during simulation (§21.7.1.6,
+  #1047 / #1048, core #189, reported and contributed by ds54e).
+* Closing stdout or stderr early preserves the run's exit status and waveform,
+  including library and core diagnostics for runtime failures (§20.10, #1037 /
+  #1038, reported and contributed by chuanseng-ng).
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
