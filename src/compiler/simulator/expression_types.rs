@@ -907,6 +907,83 @@ impl Simulator {
                 return Some(r);
             }
         }
+        if Self::chain_root_is_super(e)
+            && let Some(r) = self.super_chain_as_this(e)
+        {
+            return Some(r);
+        }
+        Self::super_as_this(e)
+    }
+
+    /// Whether the member and select chain `e` starts at `super` — a walk
+    /// without allocation, so the reads that reach [`Self::super_rewrite`]
+    /// pay nothing for the chain rewrite.
+    fn chain_root_is_super(e: &Expression) -> bool {
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => cur = expr,
+                ExprKind::Ident(h) => {
+                    return h.path.first().is_some_and(|s| s.name.name == "super");
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// §8.15: `super.frame.lanes[0]` — a member or select chain rooted at
+    /// `super.m` reads and writes `this.m`'s chain, unless `m` is redeclared
+    /// (the select paths resolve a shadowed member themselves). `None` when
+    /// `e` is no such chain.
+    #[inline(never)]
+    fn super_chain_as_this(&self, e: &Expression) -> Option<Expression> {
+        let rebuilt = match &e.kind {
+            ExprKind::Index { expr, index } => ExprKind::Index {
+                expr: Box::new(self.super_chain_root(expr)?),
+                index: index.clone(),
+            },
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+            } => ExprKind::RangeSelect {
+                expr: Box::new(self.super_chain_root(expr)?),
+                left: left.clone(),
+                right: right.clone(),
+                kind: *kind,
+            },
+            ExprKind::MemberAccess { expr, member } if !matches!(expr.kind, ExprKind::Ident(_)) => {
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.super_chain_root(expr)?),
+                    member: member.clone(),
+                }
+            }
+            _ => return None,
+        };
+        Some(Expression::new(rebuilt, e.span))
+    }
+
+    /// The `this`-rooted spelling of the receiver `e` of a chain under
+    /// [`Self::super_chain_as_this`].
+    fn super_chain_root(&self, e: &Expression) -> Option<Expression> {
+        let first = match &e.kind {
+            ExprKind::Ident(h) if h.path.len() >= 2 && h.path[0].name.name == "super" => {
+                &h.path[1].name.name
+            }
+            ExprKind::MemberAccess { expr, member }
+                if matches!(&expr.kind, ExprKind::Ident(bh)
+                    if bh.path.len() == 1 && bh.path[0].name.name == "super") =>
+            {
+                &member.name
+            }
+            _ => return self.super_chain_as_this(e),
+        };
+        if self.shadowed_prop_names.contains(first.as_str()) {
+            return None;
+        }
         Self::super_as_this(e)
     }
 
