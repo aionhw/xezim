@@ -482,3 +482,5 @@ mod static_local_in_clocked_call;
 mod hierarchical_subroutine_static;
 #[path = "scheduling/review_loop_jumps_and_block_disables.rs"]
 mod review_loop_jumps_and_block_disables;
+#[path = "scheduling/nba_partial_commit_order.rs"]
+mod nba_partial_commit_order;
