@@ -2860,22 +2860,25 @@ impl Simulator {
                 // An unpacked-struct element keeps its member cells in the
                 // instance (`sta[1].f`), where member reads and writes go.
                 let (fill, elem_su) = self.class_array_elem_fill(cdef, prop, width);
-                for i in lo..=hi {
-                    let elem = format!("{}[{}]", scoped, i);
-                    if let Some(su) = &elem_su {
-                        let mut cells = Vec::new();
-                        self.struct_leaf_plain_defaults(
-                            &format!("{}[{}]", prop, i),
-                            su,
-                            0,
-                            &mut cells,
-                        );
-                        for (k, v) in cells {
-                            instance.properties.insert(k, v);
+                let count = (hi - lo + 1).max(0);
+                if elem_su.is_some() || count <= 65536 {
+                    for i in lo..=hi {
+                        let elem = format!("{}[{}]", scoped, i);
+                        if let Some(su) = &elem_su {
+                            let mut cells = Vec::new();
+                            self.struct_leaf_plain_defaults(
+                                &format!("{}[{}]", prop, i),
+                                su,
+                                0,
+                                &mut cells,
+                            );
+                            for (k, v) in cells {
+                                instance.properties.insert(k, v);
+                            }
                         }
+                        self.signals.insert(elem.clone(), fill.clone());
+                        self.widths.insert(elem, width);
                     }
-                    self.signals.insert(elem.clone(), fill.clone());
-                    self.widths.insert(elem, width);
                 }
             }
             // Per-instance MULTI-dim fixed array members (`test_t foo[0:3][0:7]`):

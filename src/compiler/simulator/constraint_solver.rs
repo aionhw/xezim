@@ -4099,12 +4099,15 @@ impl Simulator {
                 let su = self
                     .class_prop_struct(handle, prop)
                     .filter(|su| Self::spreads_member_wise(su));
-                for i in lo..=hi {
-                    let en = format!("{}[{}]", scoped, i);
-                    self.signals.insert(en.clone(), fill.clone());
-                    self.widths.insert(en, w);
-                    if let Some(su) = &su {
-                        self.seed_class_struct_cells(handle, &format!("{}[{}]", prop, i), su);
+                let count = (hi - lo + 1).max(0);
+                if su.is_some() || count <= 65536 {
+                    for i in lo..=hi {
+                        let en = format!("{}[{}]", scoped, i);
+                        self.signals.insert(en.clone(), fill.clone());
+                        self.widths.insert(en, w);
+                        if let Some(su) = &su {
+                            self.seed_class_struct_cells(handle, &format!("{}[{}]", prop, i), su);
+                        }
                     }
                 }
             }
