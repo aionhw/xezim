@@ -1211,3 +1211,9 @@ mod rand_sub_object_back_handle;
 
 #[path = "classes/rand_solver_sparse_1003.rs"]
 mod rand_solver_sparse_1003;
+
+#[path = "classes/rand_concat_field_equality.rs"]
+mod rand_concat_field_equality;
+
+#[path = "classes/rand_solver_bound_order.rs"]
+mod rand_solver_bound_order;
