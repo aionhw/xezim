@@ -261,3 +261,29 @@ endmodule
 "#;
     expect(src, "top", &["T|q=111 acc=19"]);
 }
+
+/// §13.4.1 / §13.5.3: nested inline returns resume the innermost caller,
+/// including before output writeback and across a conditional early return.
+#[test]
+fn nested_inline_returns_resume_before_output_writeback() {
+    let src = r#"
+module top;
+  function automatic int next_value(input int n);
+    return n + 1;
+  endfunction
+  function automatic int put(input int n, output int dst);
+    dst = next_value(n);
+    if (n == 1) return 17;
+    return n;
+  endfunction
+  function automatic int outer();
+    int items[3];
+    int sum = 0;
+    for (int i = 0; i < 3; i++) sum += put(i, items[i]);
+    return sum * 1000 + items[0] * 100 + items[1] * 10 + items[2];
+  endfunction
+  initial $display("T|outer=%0d", outer());
+endmodule
+"#;
+    expect(src, "top", &["T|outer=19123"]);
+}
