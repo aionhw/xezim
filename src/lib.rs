@@ -1174,6 +1174,10 @@ pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, Stri
     )
 }
 
+/// Name of the large-stack worker thread the `xezim` binary runs on. A
+/// `simulate_multi` call made on it runs there instead of on a second worker.
+pub const CLI_WORKER_THREAD: &str = "xezim-main";
+
 /// Public entry point: runs the whole compile+simulate on a worker thread
 /// with a LARGE stack. The parser, elaborator, and statement interpreter are
 /// all deeply recursive; an embedder's thread (a 2 MiB `cargo test` thread,
@@ -1210,14 +1214,14 @@ pub fn simulate_multi(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024);
-    // If stack size is 0 or if already running on a thread with an enlarged stack
-    // (such as "xezim-main" spawned by the CLI wrapper), reuse the current thread's
-    // stack directly rather than creating a duplicate stack reservation (issue #1055).
-    let is_already_enlarged_worker = std::thread::current()
-        .name()
-        .map(|n| n == "xezim-main")
-        .unwrap_or(false);
-    if stack_mb == 0 || is_already_enlarged_worker {
+    // The command line already runs on a worker with this stack size
+    // (`CLI_WORKER_THREAD`, sized by the same XEZIM_STACK_MB), and calls this
+    // with nothing else on it. A second worker reserved the address range
+    // again: two 1 GiB stacks are half of a 4 GiB address-space limit, and
+    // the allocation that failed first under one was the design's, not a
+    // stack's.
+    let on_cli_worker = std::thread::current().name() == Some(CLI_WORKER_THREAD);
+    if stack_mb == 0 || on_cli_worker {
         return simulate_multi_inner(
             sources,
             max_time,

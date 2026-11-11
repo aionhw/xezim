@@ -2031,7 +2031,7 @@ fn main() {
         .unwrap_or(1024);
     if stack_mb > 0 {
         let code = std::thread::Builder::new()
-            .name("xezim-main".to_string())
+            .name(xezim::CLI_WORKER_THREAD.to_string())
             .stack_size(stack_mb * 1024 * 1024)
             .spawn(run_main)
             .expect("spawn simulation thread")
