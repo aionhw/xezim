@@ -261,6 +261,8 @@ mod review_coll_shape_rows;
 mod review_aggregate_unknown_compare_1043;
 #[path = "collections/review_packed_pattern_compare_1043.rs"]
 mod review_packed_pattern_compare_1043;
+#[path = "collections/review_packed_struct_member_select_1046.rs"]
+mod review_packed_struct_member_select_1046;
 
 #[path = "collections/string_key_escaping.rs"]
 mod string_key_escaping;
