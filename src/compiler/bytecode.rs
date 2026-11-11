@@ -13332,7 +13332,9 @@ impl<'a> BytecodeCompiler<'a> {
             // jumps to the method's common exit (the prologue reads that
             // register's value and returns it to the caller). Trailing/jump
             // targets are back-patched like `inline_ret_jumps` below.
-            StatementKind::Return(e) if self.method_mode => {
+            // §13.4.1: a nested inline returns to its caller inside this
+            // method, using inline_ret below, rather than ending the method.
+            StatementKind::Return(e) if self.method_mode && self.inline_ret.is_none() => {
                 // class-perf collection-return: only `return '{…}` literals
                 // are admitted — each element lands in a contiguous arg slot
                 // and one `RetCollection` hands the range to the interpreter's
