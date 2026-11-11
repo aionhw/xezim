@@ -1951,12 +1951,10 @@ impl Simulator {
                             // `T=int` formal renders signed like the reference.
                             val.is_signed = true;
                         }
-                    } else if matches!(&port.data_type, DataType::IntegerAtom { .. })
-                        || Self::packed_dims_are_literal(&port.data_type)
-                    {
+                    } else if plan.ports[i].fixed_width.is_some() {
                         // A built-in integer formal (`int`, `byte`, ...) or a
-                        // packed vector with LITERAL bounds (`logic signed
-                        // [15:0]`) has a fixed width that no class
+                        // packed vector with constant bounds (`logic signed
+                        // [16-1:0]`) has a fixed width that no class
                         // type-parameter can alter, so widen the actual FIRST
                         // and stamp the signedness after: marking a 2-bit
                         // unsigned actual signed and letting the frame widen it

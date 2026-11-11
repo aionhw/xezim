@@ -352,7 +352,8 @@ fn method_boost_enabled() -> bool {
 // §6.21: a subroutine whose static variable carries between calls is not inlined.
 // §13.5.3: function copy-out resolves caller locals and indexed targets after return.
 // §13.4.1: returns inside nested inline calls exit only the innermost callee.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3071;
+// §13.5.1 / §8.25: packed method arguments and results retain specialized widths.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3072;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
