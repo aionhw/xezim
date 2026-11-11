@@ -95,3 +95,6 @@ mod udp_output_reg_body_868;
 
 #[path = "gates/driver_transition_delays.rs"]
 mod driver_transition_delays;
+
+#[path = "gates/shared_net_driver_stages.rs"]
+mod shared_net_driver_stages;
