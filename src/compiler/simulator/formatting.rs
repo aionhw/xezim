@@ -1155,6 +1155,44 @@ impl Simulator {
         false
     }
 
+    /// Whether some class declares a property `prop` (or `C::prop`) that can
+    /// hold a `real`: one declared real, or one typed by a class type
+    /// parameter (`class_real_props`). Keeps the declared-type walks below
+    /// off the assignments that cannot name one.
+    #[inline]
+    pub(super) fn may_name_real_class_prop(&self, prop: &str) -> bool {
+        if self.class_real_props.is_empty() {
+            return false;
+        }
+        let leaf = prop.rsplit_once("::").map_or(prop, |(_, l)| l);
+        self.class_real_props.contains(leaf)
+    }
+
+    /// The `class_real_props` of a design: the class properties declared
+    /// `real`, `shortreal` or `realtime` (or a typedef of one), or typed by a
+    /// class type parameter, which a specialization can bind to one.
+    pub(super) fn collect_class_real_props(module: &ElaboratedModule) -> HashSet<String> {
+        let mut out = HashSet::default();
+        for cd in module.classes.values() {
+            for (name, dt) in &cd.property_types {
+                let real = match dt {
+                    DataType::TypeReference { name: tn, .. } => {
+                        cd.type_param_names.iter().any(|t| *t == tn.name.name)
+                            || cd.typedef_targets.get(&tn.name.name).is_some_and(|t| {
+                                super::elaborate::is_type_real_resolved(t, &module.typedef_types)
+                            })
+                            || super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
+                    }
+                    _ => super::elaborate::is_type_real_resolved(dt, &module.typedef_types),
+                };
+                if real {
+                    out.insert(name.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// Whether property `prop` of the object `handle` is declared `real`
     /// (or a typedef of one). The twin of `class_prop_two_state`: a real
     /// property has no integral width, so `class_prop_width_impl` answers
@@ -1175,6 +1213,9 @@ impl Simulator {
     /// object exists. `handle` 0 (null) leaves a type parameter unbound,
     /// which a real declaration never is.
     pub(super) fn class_prop_is_real_in(&self, start: &str, prop: &str, handle: usize) -> bool {
+        if !self.may_name_real_class_prop(prop) {
+            return false;
+        }
         let mut cur = Some(start);
         while let Some(cn) = cur {
             let Some(cd) = self.module.classes.get(cn) else {
@@ -1188,6 +1229,19 @@ impl Simulator {
                     }
                     _ => dt,
                 };
+                // §8.25: a type parameter the object binds to a real type.
+                // `bind_type_params_in` answers only integral bindings.
+                if let DataType::TypeReference { name, .. } = dt
+                    && !name.has_scope()
+                    && cd.type_param_names.iter().any(|t| *t == name.name.name)
+                    && let Some(b) = self.obj_type_param(handle, cn, &name.name.name)
+                {
+                    let b = b.trim();
+                    return matches!(b, "real" | "shortreal" | "realtime")
+                        || self.module.typedef_types.get(b).is_some_and(|t| {
+                            super::elaborate::is_type_real_resolved(t, &self.module.typedef_types)
+                        });
+                }
                 // §8.25: the state domain of a type parameter belongs to
                 // this object, including when another specialization calls it.
                 let bound =

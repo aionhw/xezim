@@ -2247,9 +2247,11 @@ impl Simulator {
         // types; a 64-bit INTEGRAL property (`logic [63:0]`) keeps the 64
         // context, and only an Ident-shaped lvalue is consulted.
         if w == 64
-            && !self.no_class_objects()
             && let ExprKind::Ident(h) = &lvalue.kind
             && h.root.is_none()
+            && h.path
+                .last()
+                .is_some_and(|s| self.may_name_real_class_prop(&s.name.name))
         {
             // Bare leaf in a method: this object's declared property.
             if h.path.len() == 1 && h.path[0].selects.is_empty() {

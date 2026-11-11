@@ -8507,6 +8507,9 @@ pub struct Simulator {
     event_obj_ids: HashMap<(usize, String), u64>,
     event_obj_slots: HashMap<u64, Vec<(usize, String)>>,
     next_event_obj_id: u64,
+    /// The class properties that can hold a `real`
+    /// (`collect_class_real_props`), built at setup.
+    class_real_props: HashSet<String>,
     /// Every class property name declared `event`, built on first use.
     class_event_prop_names: Option<std::rc::Rc<HashSet<String>>>,
     /// Fast-path NBA buffer: pre-resolved (signal_id, value) pairs.

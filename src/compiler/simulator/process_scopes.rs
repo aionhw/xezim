@@ -3669,9 +3669,9 @@ impl Simulator {
                 // name (a real flattened signal, a virtual-interface
                 // rewrite) still takes the fast path below.
                 if hier.path.len() > 1
+                    && name.as_ref() == hier.path[hier.path.len() - 1].name.name
                     && !self.no_class_objects()
                     && self.head_denotes_class_object(hier)
-                    && name.as_ref() == hier.path[hier.path.len() - 1].name.name
                 {
                     return None;
                 }

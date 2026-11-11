@@ -3720,6 +3720,7 @@ impl Simulator {
                 .map(|(f, _, ts)| (f.strip_prefix(top.as_str()).unwrap_or(f).to_string(), *ts))
                 .collect()
         };
+        let class_real_props = Self::collect_class_real_props(&module);
         let mut sim = Self {
             prev_val,
             prev_xz,
@@ -4196,15 +4197,16 @@ impl Simulator {
             edge_sequential_work: Vec::new(),
             nba_queue: Vec::new(),
             nba_queued_partial_ids: HashSet::default(),
+            nba_queue_noted: 0,
             pending_nba_triggers: Vec::new(),
             pending_nba_instance_triggers: Vec::new(),
             active_task_pids: HashMap::default(),
             event_aliases: HashMap::default(),
             event_obj_ids: HashMap::default(),
             event_obj_slots: HashMap::default(),
-            nba_queue_noted: 0,
             next_event_obj_id: 0,
             class_event_prop_names: None,
+            class_real_props,
             nba_fast: Vec::new(),
             // Named signals stay on the dense hot path. Unnamed large-array
             // elements use NbaFastIndex's sparse tail.

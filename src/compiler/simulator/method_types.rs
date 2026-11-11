@@ -383,9 +383,25 @@ impl Simulator {
                 // property). `class_prop_lvalue_width` walks the DECLARED
                 // types only — no object is read, no method runs — and
                 // answers None for every shape it cannot size, so
-                // non-class paths keep the flat-table lookups below.
-                if !self.no_class_objects()
-                    && h.path.len() > 1
+                // non-class paths keep the flat-table lookups below. Only
+                // the leaf-capture shape is checked here: a name the
+                // resolver kept whole reaches its own signal or none.
+                //
+                // §6.12, §8.25: a `real` property of the handle's object —
+                // also one typed by a type parameter the object binds to
+                // `real` — keeps a real RHS whole (64), which the declared
+                // width walk cannot see through the parameter.
+                if h.path.len() == 2
+                    && h.path[1].selects.is_empty()
+                    && self.may_name_real_class_prop(&h.path[1].name.name)
+                    && let Some(handle) = self.eval_ident_handle(&h.path[0].name.name)
+                    && self.class_prop_is_real(handle, &h.path[1].name.name)
+                {
+                    return 64;
+                }
+                if h.path.len() > 1
+                    && name.as_ref() == h.path[h.path.len() - 1].name.name
+                    && !self.no_class_objects()
                     && self.head_denotes_class_object(h)
                     && let Some(w) = self.class_prop_lvalue_width(h).filter(|w| *w > 0)
                 {
