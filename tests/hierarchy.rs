@@ -464,3 +464,5 @@ mod package_header_shadow_995;
 
 #[path = "hierarchy/generate_child_label_refs.rs"]
 mod generate_child_label_refs;
+#[path = "hierarchy/review_tri_port_net_types.rs"]
+mod review_tri_port_net_types;
