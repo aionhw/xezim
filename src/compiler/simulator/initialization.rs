@@ -4247,6 +4247,7 @@ impl Simulator {
             t0_timing_free: HashSet::default(),
             t0_pid_ord: HashMap::default(),
             fast_delay_always: HashMap::default(),
+            lazy_initial: HashMap::default(),
             proc_fsm: HashMap::default(),
             fsm_start_pc: 0,
             fsm_suspend: None,

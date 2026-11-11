@@ -1673,113 +1673,169 @@ impl Simulator {
         self.m_block_scope = saved_block_scope;
         self.m_block_scope_id = saved_block_scope_id;
         self.m_block_active = saved_block_active;
-        for ib in early
-            .into_iter()
-            .chain(pending_initial.into_iter().map(&mut rename_pending))
-            .chain(initial_blocks)
-        {
-            let ib = self.cov_initial(ib);
-            let scope = ib.scope;
-            let span = ib.stmt.span;
-            let block_label = match &ib.stmt.kind {
-                StatementKind::SeqBlock { name, .. } => name.as_ref().map(|n| n.name.clone()),
-                _ => None,
-            };
-            let stmts = match ib.stmt.kind {
-                StatementKind::SeqBlock { stmts, .. } => stmts,
-                other => vec![Statement::new(other, ib.stmt.span)],
-            };
-            // Clock-generator fast path:
-            //     initial begin VAR = CONST; forever #d VAR = ~VAR; end
-            // Otherwise each half-period would schedule a new process
-            // (~2.5ms per toggle on c910). Detect this pattern, apply
-            // the seed assignment immediately, and register a ClockGen
-            // so `fire_clock_generators` can toggle the signal O(1).
-            // The detection below EVALUATES the block's seed RHS, and that
-            // eval memoizes each bare name's resolution on its AST node. It
-            // must therefore run under THIS block's scope — the hint still
-            // holds whatever the previous block (or any earlier compile-time
-            // eval) left, and a bare wildcard-imported constant resolved once
-            // under a sibling's scope stays wrong for the whole run: `user`'s
-            // enum member `C` permanently read `shadower`'s local `int C`.
-            *self.name_resolve_hint.borrow_mut() = (!scope.is_empty()).then(|| scope.clone());
-            if let Some(cg) = self.try_extract_initial_clock_gen(&stmts) {
-                self.clock_gen_src
-                    .push((self.clock_generators.len(), scope.clone(), span.start));
-                self.clock_generators.push(cg);
-                if !self.sva_sites.is_empty() {
-                    // §16.5.1: keep the seed in Active so the slot-entry
-                    // Preponed snapshot precedes it, just like an ordinary
-                    // blocking assignment. The periodic toggles stay fast.
-                    let pid = self.next_pid;
-                    self.next_pid += 1;
-                    if !scope.is_empty() {
-                        self.process_scope_hint.insert(pid, scope);
-                    }
-                    self.process_origin.insert(pid, (span, "initial block"));
-                    self.event_queue
-                        .schedule(0, pid, vec![stmts[0].clone()].into());
-                }
-                continue;
+        enum InitItem {
+            Materialized(super::elaborate::InitialBlock),
+            Lazy(super::elaborate::PendingInitial),
+        }
+        let can_defer_initial = |p: &super::elaborate::PendingInitial| -> bool {
+            if self.code_cov.is_some() {
+                return false;
             }
-            // Roadmap 12 (opt-in XEZIM_PROC_FSM=1): a compilable initial body
-            // with waits becomes a process FSM. The cheap timing-control
-            // count runs first so memory-init megablocks skip without the
-            // SeqBlock rebuild.
-            {
-                // 1 = every compilable initial body; 0 = none; unset = the
-                // plain-stimulus shape below (a testbench's clocked stimulus
-                // loop ran 8.6x slower on the AST path than as an FSM).
-                let fsm_mode = self.proc_fsm_mode;
-                let timing = stmts.iter().map(Self::count_timing_controls).sum::<usize>();
-                let admit = timing >= 1
-                    && match fsm_mode {
-                        1 => true,
-                        0 => false,
-                        _ => {
-                            // Clock-driven only: a body with at least one `@`
-                            // wait is the hot stimulus loop; delay-only
-                            // sequences (reset scripts, UDP/stall probes,
-                            // ordering tests) stay on the AST path, whose
-                            // per-statement waiter and UDP evaluation order
-                            // their pinned traces rely on. A labeled block is
-                            // a hierarchical scope (`disable lbl`, `lbl.v`)
-                            // the FSM does not model.
-                            std::env::var_os("XEZIM_VALUE_TRACE").is_none()
-                                && block_label.is_none()
-                                && stmts.iter().any(Self::stmt_contains_event_control)
-                                && stmts.iter().all(|st| self.stmt_is_plain_stimulus(st))
+            let is_seq_or_len2 = match &p.source.kind {
+                StatementKind::SeqBlock { stmts, .. } => stmts.len() == 2,
+                _ => false,
+            };
+            if is_seq_or_len2 {
+                return false;
+            }
+            if Self::stmt_contains_event_control(&p.source) {
+                return false;
+            }
+            true
+        };
+        let (deferred_pending, direct_pending): (Vec<_>, Vec<_>) = pending_initial
+            .into_iter()
+            .partition(can_defer_initial);
+        for item in early
+            .into_iter()
+            .chain(direct_pending.into_iter().map(&mut rename_pending))
+            .chain(initial_blocks)
+            .map(InitItem::Materialized)
+            .chain(deferred_pending.into_iter().map(InitItem::Lazy))
+        {
+            let (
+                scope,
+                span,
+                block_label,
+                is_blocking,
+                lazy_entry,
+                stmts,
+            ): (
+                String,
+                crate::ast::Span,
+                Option<String>,
+                bool,
+                Option<super::elaborate::PendingInitial>,
+                Option<Vec<Statement>>,
+            ) = match item {
+                InitItem::Materialized(ib) => {
+                    let ib = self.cov_initial(ib);
+                    let scope = ib.scope;
+                    let span = ib.stmt.span;
+                    let block_label = match &ib.stmt.kind {
+                        StatementKind::SeqBlock { name, .. } => {
+                            name.as_ref().map(|n| n.name.clone())
                         }
+                        _ => None,
                     };
-                if admit {
-                    let wrapped = Statement::new(
-                        StatementKind::SeqBlock {
-                            name: None,
-                            stmts: stmts.clone(),
-                        },
-                        span,
-                    );
-                    if self.try_register_proc_fsm(&wrapped, &scope, false, "initial block") {
-                        continue;
+                    let stmts = match ib.stmt.kind {
+                        StatementKind::SeqBlock { stmts, .. } => stmts,
+                        other => vec![Statement::new(other, ib.stmt.span)],
+                    };
+                    let is_blocking = stmts.iter().any(|st| self.stmt_is_blocking(st));
+                    (scope, span, block_label, is_blocking, None, Some(stmts))
+                }
+                InitItem::Lazy(p) => {
+                    let scope = p.scope();
+                    let span = p.source.span;
+                    let block_label = match &p.source.kind {
+                        StatementKind::SeqBlock { name, .. } => {
+                            name.as_ref().map(|n| n.name.clone())
+                        }
+                        _ => None,
+                    };
+                    let is_blocking = self.stmt_is_blocking(&p.source);
+                    (scope, span, block_label, is_blocking, Some(p), None)
+                }
+            };
+            if let Some(stmts) = &stmts {
+                // Clock-generator fast path:
+                //     initial begin VAR = CONST; forever #d VAR = ~VAR; end
+                // Otherwise each half-period would schedule a new process
+                // (~2.5ms per toggle on c910). Detect this pattern, apply
+                // the seed assignment immediately, and register a ClockGen
+                // so `fire_clock_generators` can toggle the signal O(1).
+                // The detection below EVALUATES the block's seed RHS, and that
+                // eval memoizes each bare name's resolution on its AST node. It
+                // must therefore run under THIS block's scope — the hint still
+                // holds whatever the previous block (or any earlier compile-time
+                // eval) left, and a bare wildcard-imported constant resolved once
+                // under a sibling's scope stays wrong for the whole run: `user`'s
+                // enum member `C` permanently read `shadower`'s local `int C`.
+                *self.name_resolve_hint.borrow_mut() = (!scope.is_empty()).then(|| scope.clone());
+                if let Some(cg) = self.try_extract_initial_clock_gen(stmts) {
+                    self.clock_gen_src
+                        .push((self.clock_generators.len(), scope.clone(), span.start));
+                    self.clock_generators.push(cg);
+                    if !self.sva_sites.is_empty() {
+                        // §16.5.1: keep the seed in Active so the slot-entry
+                        // Preponed snapshot precedes it, just like an ordinary
+                        // blocking assignment. The periodic toggles stay fast.
+                        let pid = self.next_pid;
+                        self.next_pid += 1;
+                        if !scope.is_empty() {
+                            self.process_scope_hint.insert(pid, scope);
+                        }
+                        self.process_origin.insert(pid, (span, "initial block"));
+                        self.event_queue
+                            .schedule(0, pid, vec![stmts[0].clone()].into());
+                    }
+                    continue;
+                }
+                // Roadmap 12 (opt-in XEZIM_PROC_FSM=1): a compilable initial body
+                // with waits becomes a process FSM. The cheap timing-control
+                // count runs first so memory-init megablocks skip without the
+                // SeqBlock rebuild.
+                {
+                    let fsm_mode = self.proc_fsm_mode;
+                    let timing = stmts.iter().map(Self::count_timing_controls).sum::<usize>();
+                    let admit = timing >= 1
+                        && match fsm_mode {
+                            1 => true,
+                            0 => false,
+                            _ => {
+                                std::env::var_os("XEZIM_VALUE_TRACE").is_none()
+                                    && block_label.is_none()
+                                    && stmts.iter().any(Self::stmt_contains_event_control)
+                                    && stmts.iter().all(|st| self.stmt_is_plain_stimulus(st))
+                            }
+                        };
+                    if admit {
+                        let wrapped = Statement::new(
+                            StatementKind::SeqBlock {
+                                name: None,
+                                stmts: stmts.clone(),
+                            },
+                            span,
+                        );
+                        if self.try_register_proc_fsm(&wrapped, &scope, false, "initial block") {
+                            continue;
+                        }
                     }
                 }
             }
             let pid = self.next_pid;
             self.next_pid += 1;
-            if !stmts.iter().any(|st| self.stmt_is_blocking(st)) {
+            if !is_blocking {
                 self.t0_timing_free.insert(pid);
             }
             if !scope.is_empty() {
                 self.process_scope_hint.insert(pid, scope);
             }
             self.process_origin.insert(pid, (span, "initial block"));
-            if let Some(l) = block_label {
+            if let Some(l) = &block_label {
                 // The outermost `begin/end` is flattened away below, so keep
                 // the label for `%m` here — see `process_m_label`.
                 self.process_m_label.insert(pid, l.clone());
-                self.register_disable_label(&l, pid);
+                self.register_disable_label(l, pid);
             }
-            self.event_queue.schedule(0, pid, stmts.into());
+            if let Some(p) = lazy_entry {
+                self.lazy_initial.insert(pid, (p, block_label));
+                self.event_queue.schedule(0, pid, ProcCont::empty());
+            } else {
+                let stmts = stmts.unwrap();
+                self.event_queue.schedule(0, pid, stmts.into());
+            }
         }
         self.order_time0_processes();
         // LRM §24: `program` initial blocks execute in the reactive region.

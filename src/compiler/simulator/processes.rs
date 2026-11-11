@@ -1520,6 +1520,16 @@ impl Simulator {
             self.run_fast_delay_always(pid);
         } else if stmts.is_empty() && self.proc_fsm.contains_key(&pid) {
             self.run_proc_fsm(pid);
+        } else if stmts.is_empty() && self.lazy_initial.contains_key(&pid) {
+            let (p, _block_label) = self.lazy_initial.remove(&pid).unwrap();
+            let mut ib = p.materialize();
+            Self::rename_instance_locals(&mut ib.stmt, &ib.scope);
+            let stmts = match ib.stmt.kind {
+                StatementKind::SeqBlock { stmts, .. } => stmts,
+                other => vec![Statement::new(other, ib.stmt.span)],
+            };
+            let cont = ProcCont::from_vec(stmts);
+            self.run_process_stmts(pid, &cont);
         } else {
             self.run_process_stmts(pid, stmts);
         }

@@ -8656,6 +8656,11 @@ pub struct Simulator {
     t0_pid_ord: HashMap<usize, usize>,
     /// Dynamic-delay simple assignments, keyed by their scheduled process id.
     fast_delay_always: HashMap<usize, FastDelayAlways>,
+    /// Pending initial blocks deferred until time-0 process dispatch to avoid
+    /// retaining thousands of unrolled statement trees in memory simultaneously.
+    /// Keyed by pid, stores (pending_initial, block_label).
+    #[serde(skip)]
+    lazy_initial: HashMap<usize, (super::elaborate::PendingInitial, Option<String>)>,
     /// Compiled process FSMs by pid (roadmap 11-12, opt-in XEZIM_PROC_FSM=1).
     proc_fsm: HashMap<usize, Box<ProcFsm>>,
     /// Resume pc for the next `exec_insns` call (consumed at entry; 0 for
