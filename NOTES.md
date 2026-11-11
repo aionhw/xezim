@@ -180,6 +180,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Closing stdout or stderr early preserves the run's exit status and waveform,
   including library and core diagnostics for runtime failures (§20.10, #1037 /
   #1038, reported and contributed by chuanseng-ng).
+* Method formals written without a type keyword (`input [W-1:0] v`) keep
+  their declared width, including class specializations, defaults and narrow
+  expression actuals. Compiled results retain their specialized width, and
+  packed-formal `foreach` loops use the bound width
+  (§13.5.1, §11.8.2, §12.7.3, #1044, reported by Ganesh-TNL).
+* Assignment patterns write unpacked-array slices in declared order, including
+  dynamic arrays and class properties. Each item takes the element type, and
+  all source values are read before the selected elements are overwritten
+  (§7.4.5, §10.9.1, #1045, reported by Ganesh-TNL).
 
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
