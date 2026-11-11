@@ -4473,6 +4473,79 @@ impl Simulator {
         self.spec_from_declared_type(decl)
     }
 
+    /// §8.8: the class prefix and actuals of a typed constructor call,
+    /// `C::new` or `C::new(args)`, in any of the shapes it reaches the
+    /// simulator in: the parser's `MemberAccess`, or a dotted `Ident`
+    /// `[C, new]` once flattened, each bare or as the callee of a `Call`.
+    /// A package-qualified `pkg::C::new` yields `C`, the name classes are
+    /// kept under. `super.new` and `this.new` are not typed constructor
+    /// calls.
+    pub(crate) fn typed_ctor_call(e: &Expression) -> Option<(&str, &[Expression])> {
+        let (callee, args): (&Expression, &[Expression]) = match &e.kind {
+            ExprKind::Call { func, args } => (func, args.as_slice()),
+            _ => (e, &[]),
+        };
+        let prefix = match &callee.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && (2..=3).contains(&h.path.len())
+                    && h.path.last().is_some_and(|s| s.name.name == "new")
+                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                h.path[h.path.len() - 2].name.name.as_str()
+            }
+            ExprKind::MemberAccess { expr, member } if member.name == "new" => match &expr.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                {
+                    h.path[0].name.name.as_str()
+                }
+                ExprKind::MemberAccess {
+                    expr: pkg,
+                    member: cls,
+                } if matches!(&pkg.kind, ExprKind::Ident(p)
+                        if p.root.is_none() && p.path.len() == 1 && p.path[0].selects.is_empty()) =>
+                {
+                    cls.name.as_str()
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        (prefix != "super" && prefix != "this").then_some((prefix, args))
+    }
+
+    /// §8.8: `lhs = C::new(...)` builds a `C`, whatever class `lhs` is
+    /// declared with. `C` may be a class, a class type parameter, or a
+    /// typedef of a class or of a specialization; a specialization
+    /// constructs with its parameters active. None when `prefix` names no
+    /// class scope or is a variable, so the caller keeps its other readings.
+    pub(super) fn construct_typed_ctor(
+        &mut self,
+        prefix: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|m| m.contains_key(prefix))
+            || self.signal_name_to_id.contains_key(prefix)
+            || self.signals.contains_key(prefix)
+        {
+            return None;
+        }
+        let (cls, spec) = self.resolve_class_scope_prefix(prefix)?;
+        let class_def = self.module.classes.get(&cls).cloned()?;
+        let Some(sig) = spec else {
+            return Some(self.instantiate_class(&class_def, args));
+        };
+        self.ensure_spec_statics(&cls, &sig);
+        let saved = self.current_spec.replace((cls, sig));
+        let v = self.instantiate_class(&class_def, args);
+        self.current_spec = saved;
+        Some(v)
+    }
+
     /// `Name.method(args)` where `Name` names a CLASS-scope entity — the
     /// shared resolution for the AST member-call path and the compiled
     /// `Insn::CallStaticScoped` executor (class-perf Step 9h). Resolution
@@ -4488,6 +4561,14 @@ impl Simulator {
         mname: &str,
         args: &[Expression],
     ) -> Option<Value> {
+        // §8.8: `T::new(...)` from compiled code (`CallStaticScoped`)
+        // builds the class the prefix denotes; `exec_static_method`
+        // never runs `new`, so the type-parameter branch below gave null.
+        if mname == "new"
+            && let Some(v) = self.construct_typed_ctor(name, args)
+        {
+            return Some(v);
+        }
         // Type-parameter used as a class name: `Tregistry::get()`.
 
         // Resolve the type param to a concrete class/specialization

@@ -15288,6 +15288,21 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn compile_expr(&mut self, expr: &Expression, ctx_width: u32) -> Option<RegId> {
+        // §8.8: a bare typed constructor `C::new` constructs, as `C::new()`
+        // does, rather than reading a class-scope name.
+        if !matches!(expr.kind, ExprKind::Call { .. })
+            && let Some((prefix, _)) = crate::compiler::simulator::Simulator::typed_ctor_call(expr)
+            && self.scope_static_receivers.contains(prefix)
+        {
+            let call = Expression::new(
+                ExprKind::Call {
+                    func: Box::new(expr.clone()),
+                    args: Vec::new(),
+                },
+                expr.span,
+            );
+            return self.compile_expr_typed(&call, ctx_width, false);
+        }
         self.compile_expr_typed(expr, ctx_width, false)
     }
 
