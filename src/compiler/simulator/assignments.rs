@@ -1262,8 +1262,18 @@ impl Simulator {
                     let ew = self.module.packed_signal_elem_widths.get(&mkey).copied();
                     let (step_w, slot) = if idxs.len() == 1 {
                         // A member with no element width is a plain vector:
-                        // the index is a bit select.
-                        (ew.unwrap_or(1), u32::try_from(idxs[0]).ok()?)
+                        // the index is a bit select. §7.4.1: an element of a
+                        // packed-array member is labelled by its declared
+                        // range, so `pair[0]` of `lane_t [0:1] pair` is the
+                        // MOST significant lane.
+                        let slot = match self.module.packed_full_dims.get(&mkey) {
+                            Some(dims) if ew.is_some() => Self::flatten_packed_slot_iter(
+                                idxs.iter().copied(),
+                                Some(dims.as_slice()),
+                            )?,
+                            _ => u32::try_from(idxs[0]).ok()?,
+                        };
+                        (ew.unwrap_or(1), slot)
                     } else {
                         let ew = ew?;
                         let dims = self.module.packed_full_dims.get(&mkey)?;
