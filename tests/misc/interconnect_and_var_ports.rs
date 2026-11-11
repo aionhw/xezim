@@ -121,6 +121,40 @@ endmodule
 }
 
 #[test]
+fn interconnect_struct_nettype_members_survive() {
+    // #1040: a nettype over an UNPACKED STRUCT is stored per member — the
+    // sub-module declaration path creates real member leaves (`d.o.V`,
+    // `d.o.I`) for the port formal. A typeless `interconnect w` bound to it
+    // used to adopt only the packed 128-bit container and got NO member
+    // leaves, so the member-wise connects (`w.V = d.o.V`) wrote into
+    // bit-selects of the packed storage and every read came back nan. The
+    // interconnect must get the same member leaves as the formal.
+    let out = msgs(
+        r#"
+typedef struct { real V; real I; } vi_t;
+nettype vi_t vinet;
+module drv(output vinet o); assign o = '{1.5, 0.125}; endmodule
+module rd(input vinet i); endmodule
+module top;
+  interconnect w;
+  drv d(.o(w));
+  rd r(.i(w));
+  initial begin
+    #1;
+    if (r.i.V == 1.5 && r.i.I == 0.125) $display("IST_%g_%g", r.i.V, r.i.I);
+    else $display("IST_FAIL_%g_%g", r.i.V, r.i.I);
+  end
+endmodule
+"#,
+    );
+    assert!(
+        out.iter().any(|m| m == "IST_1.5_0.125"),
+        "interconnect struct-nettype members lost: {:?}",
+        out
+    );
+}
+
+#[test]
 fn var_kw_continues_across_port_comma() {
     let out = msgs(
         r#"
