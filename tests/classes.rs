@@ -1219,3 +1219,6 @@ mod rand_concat_field_equality;
 
 #[path = "classes/rand_solver_bound_order.rs"]
 mod rand_solver_bound_order;
+
+#[path = "classes/typed_constructor_call.rs"]
+mod typed_constructor_call;

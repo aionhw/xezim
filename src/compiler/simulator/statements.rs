@@ -3376,8 +3376,11 @@ impl Simulator {
                         crate::ast::types::DataType::Struct(su) if Self::spreads_member_wise(&su)
                     );
                 let v = if let Some(init_expr) = d.init.as_ref().filter(|_| !struct_init_later) {
-                    let mut produced: Option<Value> = None;
-                    if let Some(cn) = &class_name {
+                    // §8.8: `B h = C::new(...)` builds a `C`, not the
+                    // declared class (the `new` forms below).
+                    let mut produced: Option<Value> = Self::typed_ctor_call(init_expr)
+                        .and_then(|(prefix, args)| self.construct_typed_ctor(prefix, args));
+                    if let Some(cn) = class_name.as_ref().filter(|_| produced.is_none()) {
                         // `T x = new(...);` / `T x = new;` — detect the
                         // constructor form once; consumed by both the
                         // class and covergroup branches below.

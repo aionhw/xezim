@@ -10,6 +10,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* Typed constructor calls build the named class, including type parameters
+  and specializations (§8.8, #1051).
+
 * `randomize()` propagates aligned packed-concatenation equalities field by
   field and establishes unconditional hard bounds before translating bounded
   wide arithmetic. Satisfiable relations could exhaust the search budget or

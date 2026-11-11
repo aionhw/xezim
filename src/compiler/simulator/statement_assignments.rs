@@ -3663,7 +3663,14 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
-        let val = if let ExprKind::Call { func, args } = &rvalue.kind {
+        // §8.8: `lhs = C::new(...)` builds a `C`, not the class `lhs` is
+        // declared with (the `new` branch below), and the bare `C::new`
+        // constructs too rather than reading a name.
+        let typed_ctor = Self::typed_ctor_call(rvalue)
+            .and_then(|(prefix, args)| self.construct_typed_ctor(prefix, args));
+        let val = if let Some(v) = typed_ctor {
+            v
+        } else if let ExprKind::Call { func, args } = &rvalue.kind {
             if let ExprKind::Ident(hier) = &func.kind {
                 let method_name = hier.path.last().unwrap().name.name.as_str();
                 if method_name == "new" {
