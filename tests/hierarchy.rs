@@ -461,3 +461,6 @@ mod struct_member_actuals;
 
 #[path = "hierarchy/package_header_shadow_995.rs"]
 mod package_header_shadow_995;
+
+#[path = "hierarchy/generate_child_label_refs.rs"]
+mod generate_child_label_refs;
