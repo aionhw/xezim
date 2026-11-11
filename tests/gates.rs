@@ -92,3 +92,6 @@ mod udp_delay_forms;
 mod udp_adjacent_symbols_841;
 #[path = "gates/udp_output_reg_body_868.rs"]
 mod udp_output_reg_body_868;
+
+#[path = "gates/driver_transition_delays.rs"]
+mod driver_transition_delays;
