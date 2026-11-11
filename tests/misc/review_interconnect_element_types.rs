@@ -91,3 +91,54 @@ endmodule
         ]
     );
 }
+
+/// §6.6.8: the same values with the run-time native switch set. The array
+/// kept the interconnect's implicit declared type, and a reader that goes
+/// by the declared type took a real element's bits for an integer
+/// (`4.61281e+18` for 2.5).
+#[test]
+fn real_interconnect_elements_keep_their_type_with_the_native_switch() {
+    let mut exe = std::env::current_exe().expect("current_exe");
+    exe.pop();
+    if exe.ends_with("deps") {
+        exe.pop();
+    }
+    let dir = std::env::temp_dir().join(format!("xezim_interconnect_real_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("tb.sv"),
+        r#"
+`timescale 1ns/1ps
+package NetsPkg;
+  nettype real realNet;
+endpackage
+module rDriver import NetsPkg::*; #(real V = 2.5) (output realNet out); assign out = V; endmodule
+module rMod import NetsPkg::*; (input realNet i); endmodule
+module arrMod(input interconnect b[0:1]);
+  rMod r0(b[0]); rMod r1(b[1]);
+endmodule
+module t;
+  interconnect b[0:1];
+  rDriver #(1.25) d0(b[0]);
+  rDriver #(3.75) d1(b[1]);
+  arrMod m(b);
+  initial begin
+    #1 $display("T|reals %g %g", m.r0.i, m.r1.i);
+    $finish;
+  end
+endmodule
+"#,
+    )
+    .unwrap();
+    let out = std::process::Command::new(exe.join("xezim"))
+        .current_dir(&dir)
+        .env("XEZIM_JIT", "1")
+        .args(["--no-cache", "tb.sv", "-s", "t"])
+        .output()
+        .expect("spawn xezim");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let got: Vec<&str> = text.lines().filter(|l| l.starts_with("T|")).collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(got, ["T|reals 1.25 3.75"], "{text}");
+}
