@@ -2992,6 +2992,36 @@ impl Simulator {
                 return;
             }
             self.exec_statement(s);
+            // §12.8, §9.6.2: a `break`, `continue`, `return` or `disable`
+            // raised here ends the iteration before the suspension point
+            // still ahead in the body. Run the rest of the iteration through
+            // `run_process_stmts`, whose flag gates skip it and whose
+            // `ForeverTail` consumes the flag. Going on to schedule that
+            // suspension ran the statements after the jump, and a pending
+            // `disable` was dropped at the next activation.
+            if !self.finished
+                && (self.break_flag || self.continue_flag || self.return_flag)
+                && body_stmts[i + 1..].iter().any(|t| {
+                    matches!(t.kind, StatementKind::TimingControl { .. })
+                        || self.stmt_is_blocking(t)
+                        || Self::stmt_is_mailbox_get(t)
+                })
+            {
+                let null = Statement::new(StatementKind::Null, s.span);
+                let cont = self.forever_cont(pid, body, body_stmts, i, 3, &null);
+                let contp = pc.pushed_frame(cont, resume_at);
+                if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
+                    if let Some(t) = self.disable_target.clone() {
+                        self.pending_block_disable.insert(pid, t);
+                    }
+                    self.event_queue.schedule(self.time, pid, contp);
+                    return;
+                }
+                self.forever_depth += 1;
+                self.run_process_stmts(pid, &contp);
+                self.forever_depth -= 1;
+                return;
+            }
         }
         // No delay/event in the forever body: the loop can never yield, so
         // running it is a zero-delay livelock (`always fb = ~fb;`). The old
