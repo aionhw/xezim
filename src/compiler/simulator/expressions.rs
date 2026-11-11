@@ -1773,6 +1773,15 @@ impl Simulator {
             || self.module.associative_arrays.contains_key(&*r))
     }
 
+    /// Whether the comparison operand `e` may be an unpacked aggregate: not
+    /// a literal and not a plain scalar name (`cmp_name_scalar`).
+    pub(super) fn may_be_aggregate(&mut self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => !self.cmp_name_scalar(h),
+            _ => !Self::cmp_literal_like(e),
+        }
+    }
+
     /// A relational or (in)equality comparison of literal-like operands,
     /// named operands (`cmp_named_ok`) and at most one named per side. With
     /// one side literal-like the binary arm's struct, array and queue
@@ -4082,8 +4091,13 @@ impl Simulator {
                         return v;
                     }
                 }
-                // §11.4.5, §11.4.6: equality on unpacked structs is member-wise.
-                if let Some((mode, want_eq)) = PatternCmpMode::of(*op)
+                // §11.4.5, §11.4.6: equality on unpacked structs is member-wise,
+                // on unpacked arrays element-wise (below). Both operands must
+                // be aggregates: a literal or a plain scalar name on either
+                // side skips the probes.
+                let agg_cmp = PatternCmpMode::of(*op)
+                    .filter(|_| self.may_be_aggregate(left) && self.may_be_aggregate(right));
+                if let Some((mode, want_eq)) = agg_cmp
                     && let Some(c) = self.compare_unpacked_structs(left, right, mode)
                 {
                     return c.value(want_eq);
@@ -4178,7 +4192,7 @@ impl Simulator {
                 // element, not as the container's packed scalar. UVM's
                 // `uvm_resource#(T)::do_write` guards on `val == t` for a
                 // `T`-typed queue.
-                if let Some((mode, want_eq)) = PatternCmpMode::of(*op)
+                if let Some((mode, want_eq)) = agg_cmp
                     && let Some(c) = self.compare_unpacked_arrays(left, right, mode)
                 {
                     return c.value(want_eq);
