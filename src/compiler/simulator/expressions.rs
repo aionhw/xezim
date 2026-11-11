@@ -5097,6 +5097,12 @@ impl Simulator {
                 if let ExprKind::Ident(h) = &expr.kind
                     && h.path.len() >= 2
                     && !h.path.iter().any(|s| !s.selects.is_empty())
+                    // Only a chain through a struct-typed class property can
+                    // name such a field; `obj.arr[i]` and `u.mem[i]` skip
+                    // building the receiver.
+                    && h.path[..h.path.len() - 1]
+                        .iter()
+                        .any(|s| self.struct_prop_name_possible(&s.name.name))
                 {
                     let last = h.path.len() - 1;
                     // `h.frame.lanes` → sb = `(h).frame` (MemberAccess),
@@ -5115,7 +5121,9 @@ impl Simulator {
                         // §7.4.5 implicit-`this` receiver: `frame.lanes[0]`
                         // inside a method flattens to
                         // `MemberAccess{ Ident[frame], lanes }`.
-                        || (matches!(sb.kind, ExprKind::Ident(_))
+                        || (matches!(&sb.kind, ExprKind::Ident(bh)
+                                if bh.path.len() == 1
+                                    && self.struct_prop_name_possible(&bh.path[0].name.name))
                             && self.this_stack.last().copied().flatten().is_some()))
                     && let Some(v) = self.struct_field_elem_read(sb, member, index)
                 {
