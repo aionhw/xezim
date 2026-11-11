@@ -1223,7 +1223,16 @@ impl Simulator {
         // this, `super.p` resolved to no handle and flattened to a phantom
         // name: reads returned 0 and writes vanished with no diagnostic, even
         // for a uniquely-named inherited property.
-        if name == "super" {
+        // `this` needs the same rung for the FLAT identifier form: a dotted
+        // lvalue frozen by the NBA scheduler (`super.bp <= v` normalizes to
+        // `Ident([super, bp])`, then `super_rewrite`/`super_as_this` rewrites
+        // it to `Ident([this, bp])`) reaches the §4c class-property write
+        // with the head spelled as a plain `this` segment. `ExprKind::This`
+        // is special-cased on the read path, but a bare `Ident([this])` is
+        // not, so the head evaluated to 0 and the scheduled write vanished.
+        // `this` is a reserved keyword: no local, signal or static can be
+        // named `this`, so short-circuiting to the active handle is exact.
+        if name == "super" || name == "this" {
             return self.this_stack.last().copied().flatten();
         }
         if let Some(locals) = self.local_stack.last() {

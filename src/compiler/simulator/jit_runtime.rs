@@ -914,6 +914,38 @@ impl Simulator {
         None
     }
 
+    /// §10.4.2/§6.12.2: the DECLARED width of a class-property LVALUE whose
+    /// path is rooted at a class object — a handle variable (`h.prop`) or a
+    /// class name (`C::prop`, flattened by elaboration into a 2-segment
+    /// path). Unlike `lrm_self_width`, the flat signal tables are NOT
+    /// consulted first: `resolve_hier_name` falls back to the LEAF for
+    /// names it cannot bind, so a module-scope signal of the same leaf
+    /// name would otherwise win — `hdl2.vec` (a 64-bit property) was sized
+    /// 60 from an unrelated module `logic [59:0] vec`. The walk reads only
+    /// DECLARED types — no object is read, no method runs — and answers
+    /// None for every shape it cannot size.
+    pub(super) fn class_prop_lvalue_width(&mut self, h: &HierarchicalIdentifier) -> Option<u32> {
+        if h.path.len() > 1 && h.root.is_none() {
+            if let Some(w) = self.class_var_path_width(h) {
+                return Some(w);
+            }
+            // Owner-qualified static (`C::prop`) whose class-name head did
+            // not resolve through `class_of_var` (e.g. a specialization
+            // key): the same tail `lrm_self_width` uses.
+            let owner = h.path.first().map(|s| s.name.name.as_str()).unwrap_or("");
+            let prop = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+            if !owner.is_empty() && !prop.is_empty() && owner != prop {
+                if let Some(w) = self
+                    .class_prop_width_impl(owner, None, prop)
+                    .filter(|w| *w > 0)
+                {
+                    return Some(w);
+                }
+            }
+        }
+        None
+    }
+
     fn declared_select_width(&mut self, expr: &Expression) -> Option<u32> {
         use crate::ast::expr::ExprKind;
         // A chain rooted at a CALL (`w.me().x`, `q.pop_front().addr`) is owned

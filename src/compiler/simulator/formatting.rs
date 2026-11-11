@@ -1155,6 +1155,56 @@ impl Simulator {
         false
     }
 
+    /// Whether property `prop` of the object `handle` is declared `real`
+    /// (or a typedef of one). The twin of `class_prop_two_state`: a real
+    /// property has no integral width, so `class_prop_width_impl` answers
+    /// None for it and a caller that must still size a store (an NBA
+    /// lvalue) needs the real-ness itself.
+    pub(super) fn class_prop_is_real(&self, handle: usize, prop: &str) -> bool {
+        let Some(Some(inst)) = self.heap.get(handle) else {
+            return false;
+        };
+        let (start, prop) = prop
+            .rsplit_once("::")
+            .unwrap_or((inst.class_name.as_str(), prop));
+        self.class_prop_is_real_in(start, prop, handle)
+    }
+
+    /// The declared-type walk behind `class_prop_is_real`, started from a
+    /// class NAME — for an owner-qualified static (`C::prop`) where no
+    /// object exists. `handle` 0 (null) leaves a type parameter unbound,
+    /// which a real declaration never is.
+    pub(super) fn class_prop_is_real_in(&self, start: &str, prop: &str, handle: usize) -> bool {
+        let mut cur = Some(start);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                return false;
+            };
+            if let Some(dt) = cd.property_types.get(prop) {
+                // A class-local typedef first, then the design's.
+                let dt = match dt {
+                    DataType::TypeReference { name, .. } => {
+                        cd.typedef_targets.get(&name.name.name).unwrap_or(dt)
+                    }
+                    _ => dt,
+                };
+                // §8.25: the state domain of a type parameter belongs to
+                // this object, including when another specialization calls it.
+                let bound =
+                    self.bind_type_params_in(dt, &|name| self.obj_type_param(handle, cn, name));
+                return super::elaborate::is_type_real_resolved(
+                    bound.as_ref().unwrap_or(dt),
+                    &self.module.typedef_types,
+                );
+            }
+            if cd.properties.contains_key(prop) {
+                return false;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
     /// §8.4: `var.prop` where `var` is a DECLARED class handle currently
     /// null and `prop` is an instance property of that class — a runtime
     /// fatal. Emits the error and terminates; returns true when it fired.
