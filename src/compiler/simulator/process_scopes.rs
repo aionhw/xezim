@@ -4420,7 +4420,7 @@ impl Simulator {
         }
         // §28.11: a gate declared `#(rise, fall)` uses the FALL value for a
         // transition to 0. The lowered cont-assign only carries the rise
-        // delay, so consult the per-net fall map here — this is the single
+        // delay, so consult the per-driver fall map here — this is the single
         // choke point where both the target and the new value are known.
         // Scalar gate outputs are the case that matters; "to 0" is judged on
         // the whole value so a vector net keeps using the rise delay unless it
