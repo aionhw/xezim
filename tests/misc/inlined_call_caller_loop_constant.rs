@@ -64,7 +64,7 @@ fn expect(src: &str, top: &str, want: &[&str]) {
 
 #[test]
 fn a_function_loop_named_like_the_callers_loop_variable_returns() {
-    // The evaluation report's case: an instanced module, a parameter bound,
+    // The reported case: an instanced module, a parameter bound,
     // both loop variables `int unsigned s`. It hung at time zero.
     let src = r#"
 module m #(parameter int unsigned N = 2);
@@ -154,4 +154,110 @@ endmodule
 module top; m u (); endmodule
 "#;
     expect(src, "top", &["T|local=12 formal=12 task=12 k=12"]);
+}
+
+/// §13.5.3: an output's indexed actual belongs to the caller's unrolled loop.
+#[test]
+fn output_copy_out_keeps_the_callers_loop_index() {
+    let src = r#"
+module top;
+  int i = 0;
+  bit [2:0] q = '0;
+  int acc = 0;
+  function automatic int put(input int n, output bit dst);
+    dst = 1;
+    return n + 1;
+  endfunction
+  initial begin
+    for (int i = 0; i < 3; i++) acc += put(i, q[i]);
+    $display("T|q=%b acc=%0d", q, acc);
+  end
+endmodule
+"#;
+    expect(src, "top", &["T|q=111 acc=6"]);
+}
+
+/// §13.5.3: a same-named formal must not capture the output's actual.
+#[test]
+fn output_copy_out_resolves_a_same_named_actual() {
+    let src = r#"
+module top;
+  int result = 3;
+  int calls;
+  function automatic int put(output int result);
+    result = 13;
+    return 1;
+  endfunction
+  initial begin
+    calls = put(result);
+    $display("T|result=%0d calls=%0d", result, calls);
+  end
+endmodule
+"#;
+    expect(src, "top", &["T|result=13 calls=1"]);
+}
+
+/// §13.5.3: nested calls write into the enclosing function's array locals.
+#[test]
+fn output_copy_out_restores_the_callers_local_array() {
+    let src = r#"
+module top;
+  function automatic int put(input int n, output int dst);
+    dst = n + 1;
+    return 0;
+  endfunction
+  function automatic int outer();
+    int items[3];
+    int ignored;
+    for (int i = 0; i < 3; i++) ignored = put(i, items[i]);
+    return items[0] * 100 + items[1] * 10 + items[2];
+  endfunction
+  initial $display("T|outer=%0d", outer());
+endmodule
+"#;
+    expect(src, "top", &["T|outer=123"]);
+}
+
+/// §13.5.3: every output uses the caller's bindings, including index expressions.
+#[test]
+fn multiple_outputs_keep_independent_caller_targets() {
+    let src = r#"
+module top;
+  int i = 0;
+  bit [2:0] q = '0, r = '0;
+  int acc = 0;
+  function automatic int split(input int n, output bit a, output bit b);
+    a = 1;
+    b = n[0];
+    return n;
+  endfunction
+  initial begin
+    for (int i = 0; i < 3; i++) acc += split(i, q[i], r[2-i]);
+    $display("T|q=%b r=%b acc=%0d", q, r, acc);
+  end
+endmodule
+"#;
+    expect(src, "top", &["T|q=111 r=010 acc=3"]);
+}
+
+/// §13.5.3: early returns reach the same copy-out in the caller's scope.
+#[test]
+fn early_return_copies_outputs_to_caller_indices() {
+    let src = r#"
+module top;
+  int i = 0;
+  bit [2:0] q = '0;
+  int acc = 0;
+  function automatic int put(input int n, output bit dst);
+    dst = 1;
+    if (n == 1) return 17;
+    return n;
+  endfunction
+  initial begin
+    for (int i = 0; i < 3; i++) acc += put(i, q[i]);
+    $display("T|q=%b acc=%0d", q, acc);
+  end
+endmodule
+"#;
+    expect(src, "top", &["T|q=111 acc=19"]);
 }
