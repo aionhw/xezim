@@ -10,6 +10,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* `randomize()` propagates aligned packed-concatenation equalities field by
+  field and establishes unconditional hard bounds before translating bounded
+  wide arithmetic. Satisfiable relations could exhaust the search budget or
+  be rejected depending on constraint order (§18.5, §11.4.12, #1003).
+
 * An index naming a class property selects the virtual interface it names:
   `dst[j] = src[j]` with `j` a property, `@(posedge vifs[idx].clk)`,
   `vifs[n-1]`, `vifs[cfg.idx]` and a static index copied a null handle or
@@ -180,6 +185,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Closing stdout or stderr early preserves the run's exit status and waveform,
   including library and core diagnostics for runtime failures (§20.10, #1037 /
   #1038, reported and contributed by chuanseng-ng).
+
+**Performance**
+
+* Preparing parameterized modules preserves shared function/task bodies when
+  local declarations need no dimension or type folding. The public core #192
+  reproducer's peak requested heap falls from 150.3 MB to 9.7 MB; genuinely
+  instance-specific rewritten bodies still retain their own storage (§13.3,
+  §13.4, #721).
 
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 

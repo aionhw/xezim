@@ -2768,31 +2768,69 @@ impl Simulator {
         }
         let env = Env::default();
         self.csp_slice_links(csp);
+        // §18.5: establish unconditional scalar bounds before dependent arithmetic.
+        // Keep soft, conditional and foreach bounds in their original scope.
+        fn leaves<'a>(items: &'a [ConstraintItem], out: &mut Vec<&'a ConstraintItem>) {
+            for item in items {
+                match item {
+                    ConstraintItem::Block(items) => leaves(items, out),
+                    item => out.push(item),
+                }
+            }
+        }
+        let mut ordered = Vec::new();
         for (index, con) in constraints.iter().enumerate() {
+            let mut items = Vec::new();
+            leaves(&con.items, &mut items);
+            for item in items {
+                ordered.push((index, item, self.csp_unconditional_bound(csp, item, &env)));
+            }
+        }
+        let mut dist_order = Vec::new();
+        for (position, (index, it, _)) in ordered
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, bound))| *bound)
+            .chain(
+                ordered
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, _, bound))| !*bound),
+            )
+        {
+            let con = &constraints[*index];
             csp.soft_rank = if con.name.name == "__inline__" {
                 (0, usize::MAX)
             } else {
                 (
                     depths
-                        .get(index)
+                        .get(*index)
                         .copied()
                         .unwrap_or(usize::MAX - 1)
                         .saturating_add(1),
                     con.span.start as usize,
                 )
             };
-            for it in &con.items {
-                let Some(n) = self.csp_item(csp, it, &env) else {
-                    if std::env::var_os("XEZIM_RAND_DBG").is_some() {
-                        eprintln!("[rand-dbg] joint solve does not model: {:?}", it);
-                    }
-                    return None;
-                };
-                if !matches!(n, Node::True) {
-                    csp.nodes.push(n);
+            let dist_start = csp.dists.len();
+            let Some(n) = self.csp_item(csp, it, &env) else {
+                if std::env::var_os("XEZIM_RAND_DBG").is_some() {
+                    eprintln!("[rand-dbg] joint solve does not model: {:?}", it);
                 }
+                return None;
+            };
+            dist_order.extend(std::iter::repeat_n(position, csp.dists.len() - dist_start));
+            if !matches!(n, Node::True) {
+                csp.nodes.push(n);
             }
         }
+        // Sampling uses the first active distribution. Keep its original
+        // registration order even when its hard membership bound moved first.
+        let mut dists: Vec<_> = dist_order
+            .into_iter()
+            .zip(std::mem::take(&mut csp.dists))
+            .collect();
+        dists.sort_by_key(|(position, _)| *position);
+        csp.dists = dists.into_iter().map(|(_, dist)| dist).collect();
         // §18.5: top-level conjunctions can be watched independently.
         // Rechecking a whole foreach after each element decision otherwise
         // repeats every element's constraint for every decision.
@@ -2812,6 +2850,64 @@ impl Simulator {
             separate(n, &mut csp.nodes);
         }
         Some(())
+    }
+
+    /// A simple, hard bound that can be translated without bounds from other
+    /// constraints. Only called for leaves of the unconditional conjunction.
+    fn csp_unconditional_bound(&self, csp: &Csp, item: &ConstraintItem, env: &Env) -> bool {
+        let scalar = |e: &Expression| {
+            self.csp_member(csp, Self::unparen(e))
+                .is_some_and(|name| csp.scalars.contains_key(&name))
+        };
+        let free = |e: &Expression| {
+            // A solver-free call can still consume randomness or have other
+            // effects. Keep its evaluation in the ordinary translation pass.
+            let mut calls = false;
+            Self::walk_operands(e, &mut |e| {
+                calls |= matches!(
+                    e.kind,
+                    ExprKind::Call { .. }
+                        | ExprKind::SystemCall { .. }
+                        | ExprKind::WithClause { .. }
+                        | ExprKind::Unary {
+                            op: UnaryOp::PreIncr
+                                | UnaryOp::PreDecr
+                                | UnaryOp::PostIncr
+                                | UnaryOp::PostDecr,
+                            ..
+                        }
+                );
+            });
+            !calls && self.csp_free(csp, e, env)
+        };
+        match item {
+            ConstraintItem::Expr(e) => match &Self::unparen(e).kind {
+                ExprKind::Binary {
+                    op: BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq,
+                    left,
+                    right,
+                } => (scalar(left) && free(right)) || (free(left) && scalar(right)),
+                ExprKind::Inside { expr, ranges } => scalar(expr) && ranges.iter().all(free),
+                _ => false,
+            },
+            ConstraintItem::Inside {
+                expr,
+                range,
+                dist_weights,
+                ..
+            } => {
+                scalar(expr)
+                    && range.iter().all(|r| match r {
+                        ConstraintRange::Value(e) => free(e),
+                        ConstraintRange::Range { lo, hi } => free(lo) && free(hi),
+                    })
+                    && dist_weights.iter().all(|w| match w {
+                        Some(DistWeight::Each(e) | DistWeight::Total(e)) => free(e),
+                        None => true,
+                    })
+            }
+            _ => false,
+        }
     }
 
     /// Search with restarts, then write and verify a solution.
@@ -6794,6 +6890,61 @@ impl Simulator {
         Some(Self::csp_and(out))
     }
 
+    /// §11.4.12/§11.6: split aligned equality into fields to avoid sparse search.
+    /// Singleton concatenations preserve unsigned bits and self-determined widths.
+    fn csp_concat_eq(
+        &mut self,
+        csp: &mut Csp,
+        left: &Expression,
+        right: &Expression,
+        env: &Env,
+    ) -> Option<Node> {
+        fn fields<'a>(e: &'a Expression, out: &mut Vec<&'a Expression>) {
+            let e = Simulator::unparen(e);
+            if let ExprKind::Concatenation(parts) = &e.kind {
+                for part in parts {
+                    fields(part, out);
+                }
+            } else {
+                out.push(e);
+            }
+        }
+        if !matches!(Self::unparen(left).kind, ExprKind::Concatenation(_))
+            || !matches!(Self::unparen(right).kind, ExprKind::Concatenation(_))
+        {
+            return None;
+        }
+        let (mut ls, mut rs) = (Vec::new(), Vec::new());
+        fields(left, &mut ls);
+        fields(right, &mut rs);
+        // A singleton also terminates recursive translation of the fields.
+        if ls.len() < 2 || ls.len() != rs.len() {
+            return None;
+        }
+        for (&l, &r) in ls.iter().zip(&rs) {
+            let (wl, _) = Self::csp_ws(&self.csp_ae(csp, l, env)?);
+            let (wr, _) = Self::csp_ws(&self.csp_ae(csp, r, env)?);
+            if wl == 0 || wl > 64 || wl != wr {
+                return None;
+            }
+        }
+        let mut nodes = Vec::with_capacity(ls.len());
+        for (l, r) in ls.into_iter().zip(rs) {
+            let l = Expression::new(ExprKind::Concatenation(vec![l.clone()]), l.span);
+            let r = Expression::new(ExprKind::Concatenation(vec![r.clone()]), r.span);
+            let whole = Expression::new(
+                ExprKind::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(l.clone()),
+                    right: Box::new(r.clone()),
+                },
+                left.span,
+            );
+            nodes.push(self.csp_rel(csp, &whole, BinaryOp::Eq, &l, &r, env, false)?);
+        }
+        Some(Self::csp_and(nodes))
+    }
+
     /// `left op right` (§11.6.1: both sides extended to the context width
     /// and signedness).
     #[allow(clippy::too_many_arguments)]
@@ -6807,6 +6958,12 @@ impl Simulator {
         env: &Env,
         neg: bool,
     ) -> Option<Node> {
+        if matches!(op, BinaryOp::Eq | BinaryOp::CaseEq)
+            && !neg
+            && let Some(n) = self.csp_concat_eq(csp, left, right, env)
+        {
+            return Some(n);
+        }
         // A relation on a wide variable is modelled over its segments; one
         // that only reads single segments (a field, an aligned select) also
         // fits the forms below, where the segment is an ordinary variable.
