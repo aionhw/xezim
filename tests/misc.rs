@@ -622,3 +622,5 @@ mod typed_localparam_dimension_894;
 mod review_class_param_undeclared_888;
 #[path = "misc/preprocessor_closed_pipe.rs"]
 mod preprocessor_closed_pipe;
+#[path = "misc/review_interconnect_element_types.rs"]
+mod review_interconnect_element_types;
