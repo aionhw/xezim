@@ -4265,14 +4265,6 @@ impl<'a> BytecodeCompiler<'a> {
         self.loop_break_patches = saved_break_patches;
         self.loop_continue_patches = saved_continue_patches;
         self.named_block_patches = saved_named_block_patches;
-        if ok {
-            for (target, value, width) in &ref_writes {
-                if !self.compile_blocking_target(target, *value, *width) {
-                    ok = false;
-                    break;
-                }
-            }
-        }
         self.allow_ast_fallback = saved_fallback;
         self.inlining_stack.pop();
         self.local_var_regs = saved_locals;
@@ -4286,6 +4278,16 @@ impl<'a> BytecodeCompiler<'a> {
         self.local_const_kinds = saved_const_kinds;
         self.const_var_binds = saved_const_binds;
         self.decl_local_regs = saved_decl_locals;
+        // §13.5.3: copy-out assigns the caller's lvalues after return. Restore
+        // its locals and loop constants first, including for indexed targets.
+        if ok {
+            for (target, value, width) in &ref_writes {
+                if !self.compile_blocking_target(target, *value, *width) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
         if !ok {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
                 eprintln!(
