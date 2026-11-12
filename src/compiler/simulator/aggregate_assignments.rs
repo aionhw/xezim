@@ -3282,12 +3282,11 @@ impl Simulator {
         ) && self.is_queue_or_dyn_row(elem)
         {
             let vals = match &pattern.kind {
-                ExprKind::AssignmentPattern(items) => Some(
-                    items
-                        .iter()
-                        .map(|it| self.eval_expr(it.expr()))
-                        .collect::<Vec<_>>(),
-                ),
+                // §10.9.1: a replicated item (`'{3{7}}`) is that many items.
+                ExprKind::AssignmentPattern(items) => {
+                    let items = self.pattern_ordered(items);
+                    Some(items.iter().map(|e| self.eval_expr(e)).collect::<Vec<_>>())
+                }
                 ExprKind::Concatenation(parts) => {
                     Some(self.unpacked_concat_operand_values(parts.iter().collect()))
                 }
