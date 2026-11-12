@@ -960,12 +960,20 @@ struct Env {
     it: Option<(String, usize, i64)>,
     /// Conditions of the enclosing `if`/`->` items.
     guards: Vec<Node>,
+    /// `Some(false)` under a disjunct or soft item the solver may skip.
+    mask_note: Option<bool>,
 }
 
 impl Env {
     fn guarded(&self, g: &Node) -> Env {
         let mut e = self.clone();
         e.guards.push(g.clone());
+        e
+    }
+
+    fn optional_mask(&self) -> Env {
+        let mut e = self.clone();
+        e.mask_note = Some(false);
         e
     }
 }
@@ -5857,7 +5865,7 @@ impl Simulator {
                 let dist_len = csp.dists.len();
                 let order_len = csp.order.len();
                 let opaque = csp.opaque;
-                let node = self.csp_item(csp, inner, env)?;
+                let node = self.csp_item(csp, inner, &env.optional_mask())?;
                 if enabled {
                     Some(node)
                 } else {
@@ -6278,8 +6286,13 @@ impl Simulator {
             } => self.csp_bool(csp, operand, env, !neg),
             ExprKind::Binary { op, left, right } => match op {
                 BinaryOp::LogAnd | BinaryOp::LogOr => {
-                    let l = self.csp_bool(csp, left, env, neg)?;
-                    let r = self.csp_bool(csp, right, env, neg)?;
+                    let e = if (*op == BinaryOp::LogOr) != neg {
+                        env.optional_mask()
+                    } else {
+                        env.clone()
+                    };
+                    let l = self.csp_bool(csp, left, &e, neg)?;
+                    let r = self.csp_bool(csp, right, &e, neg)?;
                     // De Morgan: a negated && is an || of the negations
                     Some(if (*op == BinaryOp::LogAnd) != neg {
                         Node::And(vec![l, r])
@@ -6297,8 +6310,13 @@ impl Simulator {
                 BinaryOp::BitAnd | BinaryOp::BitOr
                     if Self::csp_one_bit(left) && Self::csp_one_bit(right) =>
                 {
-                    let l = self.csp_bool(csp, left, env, neg)?;
-                    let r = self.csp_bool(csp, right, env, neg)?;
+                    let e = if (*op == BinaryOp::BitOr) != neg {
+                        env.optional_mask()
+                    } else {
+                        env.clone()
+                    };
+                    let l = self.csp_bool(csp, left, &e, neg)?;
+                    let r = self.csp_bool(csp, right, &e, neg)?;
                     Some(if (*op == BinaryOp::BitAnd) != neg {
                         Node::And(vec![l, r])
                     } else {
@@ -10403,6 +10421,9 @@ impl Simulator {
         other: &Expression,
         env: &Env,
     ) {
+        if env.mask_note == Some(false) {
+            return;
+        }
         let ExprKind::Binary {
             op: BinaryOp::BitAnd,
             left,
@@ -10490,13 +10511,23 @@ impl Simulator {
         if pin == 0 {
             return None;
         }
-        let size = dom_size(&st.d[v]);
-        for _ in 0..16 {
-            let k = self.cur_rng().gen_range(0..size);
-            let u = dom_nth(&st.d[v], k);
-            let x = ((u as u64 & !pin) | val) as i128;
-            if dom_has(&st.d[v], x) {
-                return Some(x);
+        let d = &st.d[v];
+        let mut n = 0u128;
+        for &(l, h) in d {
+            n += (l..=h).filter(|&v| (v as u64 & pin) == val).count() as u128;
+        }
+        if n == 0 {
+            return None;
+        }
+        let mut k = self.cur_rng().gen_range(0..n);
+        for &(l, h) in d {
+            for v in l..=h {
+                if (v as u64 & pin) == val {
+                    if k == 0 {
+                        return Some(v);
+                    }
+                    k -= 1;
+                }
             }
         }
         None

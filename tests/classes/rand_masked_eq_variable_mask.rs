@@ -50,3 +50,39 @@ endmodule
         .collect();
     assert_eq!(lines, ["ok 10 bad 0"]);
 }
+
+#[test]
+fn masked_equality_regressions() {
+    let result = xezim::simulate(
+        r#"
+class d;
+  rand bit [31:0] x, m;
+  constraint c { solve m before x; m == -1; ((x & m) == 0) || (x != 0); }
+  constraint need_x { x != 0; }
+endclass
+class u; rand int unsigned x, m; constraint c { x inside {[0:100]}; m == 1; (x & m) == 0; } endclass
+module t; initial begin
+  d a; u b; int ok, v, sum, hist[101];
+  a = new; b = new; ok = 0; sum = 0;
+  a.srandom(31);
+  repeat (200) if (a.randomize()) ok++;
+  foreach (hist[i]) hist[i] = 0;
+  b.srandom(29);
+  repeat (5100) if (b.randomize() && b.x <= 100) hist[b.x]++;
+  for (v = 0; v <= 100; v += 2) sum += hist[v];
+  $display("disj %0d", ok);
+  $display("uni %0d %0d", hist[100], sum / 51);
+  $finish;
+end endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result.output.iter().map(|e| e.message.as_str()).collect();
+    let d: Vec<&str> = lines[0].split_whitespace().collect();
+    let ok = d[1].parse::<i32>().unwrap();
+    assert!(ok > 0, "disjunction mask bug: ok={ok} ({})", lines[0]);
+    let u: Vec<&str> = lines[1].split_whitespace().collect();
+    let (c100, mean) = (u[1].parse::<i32>().unwrap(), u[2].parse::<i32>().unwrap());
+    assert!(c100 * 20 >= mean * 17, "{}", lines[1]);
+}
