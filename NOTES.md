@@ -10,6 +10,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* `push_back`, `push_front` and `insert` on a queue of queues or of dynamic
+  arrays store a concatenation or pattern argument as the new row:
+  `qq.push_back({1, 2})` and `qq.push_back('{3, 4, 5})` stored an empty row,
+  and a queue operand (`{tmp, 3}`) now splices its elements (§7.10.2.2,
+  §10.10, #1086).
 * Hierarchical references reach static task/function locals before their first
   call and preserve instance-specific storage (§6.21, §23.6).
 * Preprocessor warnings preserve the run's exit status when stderr closes
