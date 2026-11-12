@@ -125,6 +125,102 @@ impl LocatorPicks {
     }
 }
 
+/// §7.12.1, §7.12.2: the ordering keys of `sort`/`rsort`, `min`/`max` and
+/// `unique`, one per element: each value (the element, or its `with`
+/// expression) compared as its type compares it, at its full width, signed
+/// or unsigned, a `real` as a real. A 64-bit key kept only the low word of a
+/// wider element and read a signed one as unsigned. An x/z bit counts as 0,
+/// so the order is total.
+pub(super) enum OrderKeys {
+    /// Every value fits 128 bits: the value mapped to an order-preserving
+    /// unsigned integer.
+    Narrow(Vec<u128>),
+    /// Wider values: the words of the mapped value, most significant first.
+    Wide(Vec<Box<[u64]>>),
+}
+
+impl OrderKeys {
+    pub(super) fn of(vals: &[Value]) -> OrderKeys {
+        if vals.iter().any(|v| v.is_real) {
+            // IEEE 754 total order of the real value.
+            return OrderKeys::Narrow(
+                vals.iter()
+                    .map(|v| {
+                        let b = v.to_f64().to_bits();
+                        (if b >> 63 == 1 { !b } else { b | 1 << 63 }) as u128
+                    })
+                    .collect(),
+            );
+        }
+        let w = vals.iter().map(|v| v.width).max().unwrap_or(0);
+        if w <= 128 {
+            return OrderKeys::Narrow(vals.iter().map(Self::narrow).collect());
+        }
+        let n = w.div_ceil(64) as usize;
+        OrderKeys::Wide(vals.iter().map(|v| Self::wide(v, n)).collect())
+    }
+
+    pub(super) fn narrow(v: &Value) -> u128 {
+        let w = v.width.min(128);
+        let mut raw = v.to_u128();
+        if w < 128 {
+            raw &= (1u128 << w) - 1;
+        }
+        if !v.is_signed {
+            return raw;
+        }
+        if w > 0 && w < 128 && (raw >> (w - 1)) & 1 == 1 {
+            raw |= !0u128 << w;
+        }
+        raw ^ (1u128 << 127)
+    }
+
+    fn wide(v: &Value, n: usize) -> Box<[u64]> {
+        let mut words = vec![0u64; n];
+        let width = v.width as usize;
+        if !v.words_if_clean(&mut words) {
+            for (k, slot) in words.iter_mut().enumerate() {
+                let lo = k * 64;
+                if lo >= width {
+                    break;
+                }
+                *slot = v.range_select((lo + 63).min(width - 1), lo).to_u128() as u64;
+            }
+        }
+        if v.is_signed {
+            if width > 0 && (words[(width - 1) / 64] >> ((width - 1) % 64)) & 1 == 1 {
+                for bit in width..n * 64 {
+                    words[bit / 64] |= 1 << (bit % 64);
+                }
+            }
+            words[n - 1] ^= 1 << 63;
+        }
+        words.reverse();
+        words.into_boxed_slice()
+    }
+
+    pub(super) fn cmp(&self, i: usize, j: usize) -> std::cmp::Ordering {
+        match self {
+            OrderKeys::Narrow(k) => k[i].cmp(&k[j]),
+            OrderKeys::Wide(k) => k[i].cmp(&k[j]),
+        }
+    }
+
+    /// The positions whose value has not occurred before (`unique`).
+    pub(super) fn first_of_each(&self) -> Vec<usize> {
+        match self {
+            OrderKeys::Narrow(k) => {
+                let mut seen: HashSet<u128> = HashSet::default();
+                (0..k.len()).filter(|&i| seen.insert(k[i])).collect()
+            }
+            OrderKeys::Wide(k) => {
+                let mut seen: HashSet<&[u64]> = HashSet::default();
+                (0..k.len()).filter(|&i| seen.insert(&k[i])).collect()
+            }
+        }
+    }
+}
+
 impl Simulator {
     /// If `e` names a plain object-typed lvalue holding a live class handle,
     /// returns that handle; otherwise `None`. Used by `std::randomize(obj)`
@@ -1237,7 +1333,14 @@ impl Simulator {
         } else {
             None
         };
-        let mut keys: Vec<i64> = Vec::with_capacity(size);
+        let psigns = pfields
+            .as_ref()
+            .map(|f| self.coll_packed_elem_field_signs(arr, f))
+            .unwrap_or_default();
+        // min/max/unique order by value (`OrderKeys`); the find forms test
+        // the truth of the `with` expression only.
+        let keyed = matches!(method, "min" | "max" | "unique" | "unique_index");
+        let mut keys: Vec<Value> = Vec::with_capacity(if keyed { size } else { 0 });
         let mut truth: Vec<bool> = Vec::with_capacity(size);
         for i in 0..size {
             let elem = match &assoc {
@@ -1269,8 +1372,9 @@ impl Simulator {
                 }
                 if let Some(fields) = &pfields {
                     let it = iter_name.unwrap_or("item");
-                    for (fname, off, w) in fields {
-                        let slice = v.range_select((off + w - 1) as usize, *off as usize);
+                    for (k, (fname, off, w)) in fields.iter().enumerate() {
+                        let mut slice = v.range_select((off + w - 1) as usize, *off as usize);
+                        slice.is_signed = psigns.get(k).copied().unwrap_or(false);
                         f.insert(format!("{}.{}", it, fname), slice);
                     }
                 }
@@ -1279,11 +1383,15 @@ impl Simulator {
                 Some(f) => {
                     let fv = self.eval_expr(f);
                     truth.push(fv.is_true());
-                    keys.push(fv.to_i64().unwrap_or(0));
+                    if keyed {
+                        keys.push(fv);
+                    }
                 }
                 None => {
                     truth.push(true);
-                    keys.push(v.to_i64().unwrap_or(0));
+                    if keyed {
+                        keys.push(v);
+                    }
                 }
             }
         }
@@ -1329,12 +1437,15 @@ impl Simulator {
             "find_last" | "find_last_index" => {
                 (0..size).rev().find(|&i| truth[i]).into_iter().collect()
             }
-            "min" => (0..size).min_by_key(|&i| keys[i]).into_iter().collect(),
-            "max" => (0..size).max_by_key(|&i| keys[i]).into_iter().collect(),
-            "unique" | "unique_index" => {
-                let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
-                (0..size).filter(|&i| seen.insert(keys[i])).collect()
+            "min" => {
+                let k = OrderKeys::of(&keys);
+                (0..size).min_by(|&i, &j| k.cmp(i, j)).into_iter().collect()
             }
+            "max" => {
+                let k = OrderKeys::of(&keys);
+                (0..size).max_by(|&i, &j| k.cmp(i, j)).into_iter().collect()
+            }
+            "unique" | "unique_index" => OrderKeys::of(&keys).first_of_each(),
             _ => Vec::new(),
         };
         LocatorPicks {
@@ -1674,7 +1785,21 @@ impl Simulator {
         let str_keys = self.expr_is_string_valued(filter)
             || (bare_elem && self.is_string_collection(arr))
             || self.sort_key_is_string(arr, filter, iter);
-        let mut keys: Vec<i64> = Vec::with_capacity(size);
+        // §7.12.2, §7.2.1: a PACKED-struct element binds its members, as for
+        // the locators and reductions, so `with (item.rank)` slices them out
+        // of `item`. Unbound, the member read 0 for every element and the
+        // stable sort kept the queue as it was.
+        let pfields = if elem_su.is_none() {
+            self.coll_packed_elem_fields(arr)
+        } else {
+            None
+        };
+        let psigns = pfields
+            .as_ref()
+            .map(|f| self.coll_packed_elem_field_signs(arr, f))
+            .unwrap_or_default();
+        let it = iter.unwrap_or("item");
+        let mut keys: Vec<Value> = Vec::with_capacity(size);
         let mut skeys: Vec<String> = Vec::with_capacity(size);
         for i in 0..size {
             let elem = format!("{}[{}]", arr, i);
@@ -1685,6 +1810,13 @@ impl Simulator {
                 .get_signal_value_by_name(&elem)
                 .unwrap_or_else(|| Value::zero(32));
             if let Some(f) = self.local_stack.last_mut() {
+                if let Some(fields) = &pfields {
+                    for (k, (fname, off, w)) in fields.iter().enumerate() {
+                        let mut slice = v.range_select((off + w - 1) as usize, *off as usize);
+                        slice.is_signed = psigns.get(k).copied().unwrap_or(false);
+                        f.insert(format!("{}.{}", it, fname), slice);
+                    }
+                }
                 if let Some(nm) = iter {
                     f.insert(nm.to_string(), v.clone());
                 }
@@ -1694,7 +1826,12 @@ impl Simulator {
             if str_keys {
                 skeys.push(kv.to_sv_string());
             } else {
-                keys.push(kv.to_i64().unwrap_or(0));
+                keys.push(kv);
+            }
+        }
+        if let (Some(fields), Some(f)) = (&pfields, self.local_stack.last_mut()) {
+            for (fname, _, _) in fields {
+                f.remove(&format!("{}.{}", it, fname));
             }
         }
 
@@ -1718,20 +1855,21 @@ impl Simulator {
         }
 
         let mut order: Vec<usize> = (0..size).collect();
+        let keys = OrderKeys::of(&keys);
         match method {
-            // `sort_by_key` is stable, so equal keys keep their order.
+            // `sort_by` is stable, so equal keys keep their order.
             "sort" => {
                 if str_keys {
-                    order.sort_by_key(|&i| skeys[i].clone());
+                    order.sort_by(|&i, &j| skeys[i].cmp(&skeys[j]));
                 } else {
-                    order.sort_by_key(|&i| keys[i]);
+                    order.sort_by(|&i, &j| keys.cmp(i, j));
                 }
             }
             "rsort" => {
                 if str_keys {
-                    order.sort_by_key(|&i| std::cmp::Reverse(skeys[i].clone()));
+                    order.sort_by(|&i, &j| skeys[j].cmp(&skeys[i]));
                 } else {
-                    order.sort_by_key(|&i| std::cmp::Reverse(keys[i]));
+                    order.sort_by(|&i, &j| keys.cmp(j, i));
                 }
             }
             // `unique` is a LOCATOR (§7.12.1): it returns a queue and must not
@@ -1749,6 +1887,34 @@ impl Simulator {
                 self.signals.remove(&format!("{}[{}]", arr, i));
             }
         }
+    }
+
+    /// `vals` in ascending (or, `reverse`, descending) order of their values
+    /// (§7.12.2, `OrderKeys`); equal values keep their order.
+    pub(super) fn sorted_by_order_keys(vals: Vec<Value>, reverse: bool) -> Vec<Value> {
+        // Integral elements of up to 128 bits: each value travels with its
+        // key, mapped once (one allocation, no index indirection).
+        if vals.iter().all(|v| !v.is_real && v.width <= 128) {
+            let mut pairs: Vec<(u128, Value)> = vals
+                .into_iter()
+                .map(|v| (OrderKeys::narrow(&v), v))
+                .collect();
+            if reverse {
+                pairs.sort_by(|a, b| b.0.cmp(&a.0));
+            } else {
+                pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            return pairs.into_iter().map(|(_, v)| v).collect();
+        }
+        let keys = OrderKeys::of(&vals);
+        let mut order: Vec<usize> = (0..vals.len()).collect();
+        if reverse {
+            order.sort_by(|&i, &j| keys.cmp(j, i));
+        } else {
+            order.sort_by(|&i, &j| keys.cmp(i, j));
+        }
+        let mut slots: Vec<Option<Value>> = vals.into_iter().map(Some).collect();
+        order.into_iter().filter_map(|i| slots[i].take()).collect()
     }
 
     /// The index type of associative array `arr`. Wildcard indices are not
@@ -1799,6 +1965,10 @@ impl Simulator {
         // §7.12.3/§7.2.1: a packed-struct element binds its fields, as for
         // the locators: `sum() with (item.code)` read 0 for every element.
         let pfields = self.coll_packed_elem_fields(arr);
+        let psigns = pfields
+            .as_ref()
+            .map(|f| self.coll_packed_elem_field_signs(arr, f))
+            .unwrap_or_default();
         // §7.12.3: accumulate at 128 bits — the `with` expression's type can
         // be wider than 64 bits (`q.sum() with (item)` over `logic [95:0]`),
         // and an i64 accumulator wrapped there, building a result capped at
@@ -1834,8 +2004,9 @@ impl Simulator {
                 }
                 if let Some(fields) = &pfields {
                     let it = iter.unwrap_or("item");
-                    for (fname, off, w) in fields {
-                        let slice = elem.range_select((off + w - 1) as usize, *off as usize);
+                    for (k, (fname, off, w)) in fields.iter().enumerate() {
+                        let mut slice = elem.range_select((off + w - 1) as usize, *off as usize);
+                        slice.is_signed = psigns.get(k).copied().unwrap_or(false);
                         f.insert(format!("{}.{}", it, fname), slice);
                     }
                 }
@@ -3186,7 +3357,7 @@ impl Simulator {
                 if is_str {
                     elements.sort_by(|a, b| a.to_sv_string().cmp(&b.to_sv_string()));
                 } else {
-                    elements.sort_by_key(|a| a.to_u64().unwrap_or(0));
+                    elements = Self::sorted_by_order_keys(elements, false);
                 }
                 for (i, v) in elements.into_iter().enumerate() {
                     self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v);
@@ -3208,7 +3379,7 @@ impl Simulator {
                 if is_str {
                     elements.sort_by(|a, b| b.to_sv_string().cmp(&a.to_sv_string()));
                 } else {
-                    elements.sort_by(|a, b| b.to_u64().unwrap_or(0).cmp(&a.to_u64().unwrap_or(0)));
+                    elements = Self::sorted_by_order_keys(elements, true);
                 }
                 for (i, v) in elements.into_iter().enumerate() {
                     self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v);

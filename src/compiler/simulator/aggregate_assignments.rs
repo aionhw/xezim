@@ -3313,6 +3313,19 @@ impl Simulator {
                 return;
             }
         }
+        // §10.8, §10.9, §7.10.2: an assignment pattern pushed into a queue of
+        // packed elements takes the element type, so `q.push_back('{k, v})`
+        // of a packed struct sizes each item to its member; concatenated at
+        // 32 bits and cut to the element, every member but the last read 0.
+        if crate::compiler::packed_assignment_pattern_plan::has_pattern(arg)
+            && let Some(dt) = self.coll_elem_decl_type(obj_name)
+            && matches!(self.resolve_dt_ref(&dt), DataType::Struct(su) if su.packed)
+            && let Some(v) = self.eval_in_packed_type(arg, &dt)
+        {
+            let v = self.fit_queue_push_elem(obj_name, v);
+            self.set_signal_value_by_name(elem, v);
+            return;
+        }
         let mut val = self.queue_eval_arg(obj_name, arg);
         // §5.7.1: an unsized fill (`q.push_back('1)`) takes the element's
         // width, not one bit.

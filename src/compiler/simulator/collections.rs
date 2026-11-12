@@ -607,6 +607,74 @@ impl Simulator {
         fields.filter(|f| !f.is_empty())
     }
 
+    /// §7.2.2, §11.8.1: whether each packed member `fields` names
+    /// ([`Self::coll_packed_elem_fields`] of `arr`) is signed, so the slice
+    /// bound for `item.<member>` keeps its member's signedness: `sort() with
+    /// (item.lo)` of a `bit signed [3:0] lo` orders -8 first.
+    pub(super) fn coll_packed_elem_field_signs(
+        &self,
+        arr: &str,
+        fields: &[(String, u32, u32)],
+    ) -> Vec<bool> {
+        let elem = self.coll_elem_decl_type(arr);
+        fields
+            .iter()
+            .map(|(path, _, _)| {
+                let Some(mut cur) = elem.clone() else {
+                    return false;
+                };
+                for seg in path.split('.') {
+                    let DataType::Struct(su) = self.resolve_dt(&cur) else {
+                        return false;
+                    };
+                    let Some(m) = su
+                        .members
+                        .iter()
+                        .find(|m| m.declarators.iter().any(|d| d.name.name == seg))
+                    else {
+                        return false;
+                    };
+                    cur = m.data_type.clone();
+                }
+                super::elaborate::is_type_signed_resolved(&cur, &self.module.typedef_types)
+            })
+            .collect()
+    }
+
+    /// The declared element type of collection `arr`: a module, package or
+    /// local one (`var_decl_types` holds the element type), a class
+    /// member's (`<handle>#m`) from its declaring class, or a struct's
+    /// dynamic member's.
+    pub(super) fn coll_elem_decl_type(&self, arr: &str) -> Option<DataType> {
+        if let Some(dt) = self.p_elem_type_ref(arr) {
+            Some(dt.into_owned())
+        } else if let Some((h, prop)) = arr.split_once('#')
+            && let Ok(handle) = h.parse::<usize>()
+        {
+            let mut cls = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.class_name.clone());
+            let mut found = None;
+            for _ in 0..64 {
+                let Some(cd) = cls.as_deref().and_then(|c| self.module.classes.get(c)) else {
+                    break;
+                };
+                if let Some(dt) = self.class_prop_decl_type(cd, prop) {
+                    found = Some(dt.clone());
+                    break;
+                }
+                cls = cd.extends.clone();
+            }
+            found
+        } else if arr.contains('.') && self.struct_colls_possible() {
+            self.struct_member_coll_of(arr).map(|(_, dt, _)| dt)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn is_associative_array(&self, name: &str) -> bool {
         if self.module.associative_arrays.contains_key(name) {
             return true;
