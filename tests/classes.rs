@@ -1236,3 +1236,5 @@ mod static_packed_member_reads;
 mod type_param_struct_members_1082;
 #[path = "classes/redeclared_property_base_scope_1064.rs"]
 mod redeclared_property_base_scope_1064;
+#[path = "classes/static_packed_member_writes_1046.rs"]
+mod static_packed_member_writes_1046;
