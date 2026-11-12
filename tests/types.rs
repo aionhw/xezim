@@ -704,3 +704,5 @@ mod unpacked_slice_patterns_1045;
 
 #[path = "types/package_nettype_import.rs"]
 mod package_nettype_import;
+#[path = "types/struct_pattern_keys_continuous_assign.rs"]
+mod struct_pattern_keys_continuous_assign;
