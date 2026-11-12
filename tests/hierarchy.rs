@@ -468,3 +468,5 @@ mod generate_child_label_refs;
 mod review_tri_port_net_types;
 #[path = "hierarchy/modport_qualified_access.rs"]
 mod modport_qualified_access;
+#[path = "hierarchy/defparam_targets_core_199.rs"]
+mod defparam_targets_core_199;
