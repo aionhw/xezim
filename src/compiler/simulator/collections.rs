@@ -232,14 +232,20 @@ impl Simulator {
         let Some(dt) = self.module.var_decl_types.get(name) else {
             return val;
         };
-        // Integral element types only: a class handle or struct element
-        // keeps its own representation.
-        if !matches!(
-            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types),
+        // Integral element types only: a class handle or an unpacked struct
+        // element keeps its own representation. §6.11.1: a packed struct or
+        // union is integral, so its element is fitted too (§10.7);
+        // `a[0] = '0` kept the fill's one bit (§5.7.1) and a later member
+        // write read x.
+        let integral = match super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types)
+        {
             crate::ast::types::DataType::IntegerVector { .. }
-                | crate::ast::types::DataType::IntegerAtom { .. }
-                | crate::ast::types::DataType::Enum(_)
-        ) {
+            | crate::ast::types::DataType::IntegerAtom { .. }
+            | crate::ast::types::DataType::Enum(_) => true,
+            crate::ast::types::DataType::Struct(su) => su.packed,
+            _ => false,
+        };
+        if !integral {
             return val;
         }
         let mut fitted = if val.width != w {
