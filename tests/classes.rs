@@ -1232,3 +1232,5 @@ mod gc_large_payload_reclamation_1054;
 mod class_property_nba_real_targets;
 #[path = "classes/static_packed_member_reads.rs"]
 mod static_packed_member_reads;
+#[path = "classes/type_param_struct_members_1082.rs"]
+mod type_param_struct_members_1082;
