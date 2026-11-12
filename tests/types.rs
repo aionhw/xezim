@@ -708,3 +708,5 @@ mod package_nettype_import;
 mod struct_pattern_keys_continuous_assign;
 #[path = "types/ansi_port_inheritance_1078.rs"]
 mod ansi_port_inheritance_1078;
+#[path = "types/packed_struct_array_local_fill_1082.rs"]
+mod packed_struct_array_local_fill_1082;
