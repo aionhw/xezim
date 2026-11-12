@@ -2528,6 +2528,22 @@ impl Simulator {
             {
                 return Value::from_u64(n as u64, 32);
             }
+            // §20.7, §13.4.1: `$size` of a call returning an unpacked array
+            // counts the elements it returns, the call running once.
+            if name == "$size"
+                && args.len() == 1
+                && matches!(operand.kind, ExprKind::Call { .. })
+                && let Some(src) = self.ret_collection_operand(operand)
+            {
+                let n = match src {
+                    Some(s) if self.is_associative_array(&s) => {
+                        self.assoc_top_level_keys(&s).len() as u64
+                    }
+                    Some(s) => self.get_queue_size(&s),
+                    None => 0,
+                };
+                return Value::from_u64(n, 32);
+            }
             if let ExprKind::Conditional {
                 then_expr,
                 else_expr,

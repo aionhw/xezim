@@ -170,10 +170,11 @@ impl Simulator {
                 || val.less_equal(&self.eval_expr(hi)).is_true();
             return lo_ok && hi_ok;
         }
-        if let Some(nm) = self.array_operand_name(pat) {
-            let sz = self.get_queue_size(&nm);
-            for i in 0..sz {
-                if let Some(ev) = self.get_signal_value_by_name(&format!("{}[{}]", nm, i)) {
+        // An array item, also an associative one or a call returning an
+        // array (§11.4.13, §13.4.1), matches any of its elements.
+        if let Some(keys) = self.inside_operand_keys(pat) {
+            for key in keys {
+                if let Some(ev) = self.get_signal_value_by_name(&key) {
                     if val.wildcard_eq(&ev).is_true() {
                         return true;
                     }

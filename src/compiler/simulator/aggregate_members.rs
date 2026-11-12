@@ -1038,7 +1038,7 @@ impl Simulator {
     /// The declared return type of `name` as the first class in `cls`'s
     /// lexical chain declares it (§8.20: a non-virtual bare call binds to
     /// the first defining class; an override keeps the prototype).
-    fn class_method_return_type(&self, cls: &str, name: &str) -> Option<DataType> {
+    pub(super) fn class_method_return_type(&self, cls: &str, name: &str) -> Option<DataType> {
         use crate::ast::decl::ClassMethodKind as Kind;
         let mut seen: HashSet<String> = HashSet::default();
         let mut cur = cls.to_string();

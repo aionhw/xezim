@@ -256,9 +256,39 @@ impl Simulator {
     /// §11.4.13: an unpacked array in an inside set contributes its values,
     /// including associative arrays with sparse or string keys.
     pub(super) fn inside_operand_keys(&mut self, expr: &Expression) -> Option<Vec<String>> {
-        if let Some(name) = self.expr_assoc_name(expr)
-            && self.is_associative_array(&name)
-        {
+        // §11.4.13, §13.4.1: a call returning an unpacked array contributes
+        // the elements it returns, evaluated once; read as a scalar it was 0.
+        if let Some(src) = self.ret_collection_operand(expr) {
+            let Some(src) = src else {
+                return Some(Vec::new());
+            };
+            if self.is_associative_array(&src) {
+                return Some(
+                    self.assoc_top_level_keys(&src)
+                        .into_iter()
+                        .map(|key| format!("{}[{}]", src, key))
+                        .collect(),
+                );
+            }
+            return Some(
+                (0..self.get_queue_size(&src))
+                    .map(|i| format!("{}[{}]", src, i))
+                    .collect(),
+            );
+        }
+        // An associative member (`h.aa`), or a module, package or local
+        // associative variable by its own name (`v inside {aa}` read the
+        // whole array as a scalar).
+        let assoc = match self.expr_assoc_name(expr) {
+            Some(name) if self.is_associative_array(&name) => Some(name),
+            _ if !self.module.associative_arrays.is_empty()
+                && matches!(expr.kind, ExprKind::Ident(_)) =>
+            {
+                self.ret_assoc_operand_name(expr)
+            }
+            _ => None,
+        };
+        if let Some(name) = assoc {
             return Some(
                 self.assoc_top_level_keys(&name)
                     .into_iter()

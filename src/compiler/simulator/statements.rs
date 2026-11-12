@@ -14,6 +14,20 @@ impl Simulator {
     pub(super) fn unpacked_concat_operand_values(&mut self, items: Vec<&Expression>) -> Vec<Value> {
         let mut all_vals: Vec<Value> = Vec::new();
         for expr in items {
+            // §10.10, §13.4.1: a call returning an unpacked array contributes
+            // the elements it returns, in order (the call runs once).
+            if matches!(expr.kind, ExprKind::Call { .. })
+                && let Some(src) = self.ret_collection_operand(expr)
+            {
+                if let Some(src) = src.filter(|s| !self.is_associative_array(s)) {
+                    for j in 0..self.get_queue_size(&src) {
+                        if let Some(v) = self.get_signal_value_by_name(&format!("{src}[{j}]")) {
+                            all_vals.push(v);
+                        }
+                    }
+                }
+                continue;
+            }
             // A queue/array operand — bare (`q`), an instance-
             // scoped member (`obj.q`, `arr[i].q`), or a nested
             // assoc-of-queue element (`assoc[key]`) —

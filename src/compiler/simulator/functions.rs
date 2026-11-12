@@ -1336,23 +1336,41 @@ impl Simulator {
     /// Is `func` a call of a module/package function whose return type is
     /// a queue, dynamic or associative array typedef?
     pub(super) fn call_returns_collection(&self, func: &Expression) -> bool {
+        self.call_ret_coll_dims(func).is_some()
+    }
+
+    /// The unpacked dimensions of the collection `func` returns
+    /// ([`Self::fn_ret_coll_dims`]), `None` when it returns none.
+    pub(super) fn call_ret_coll_dims(
+        &self,
+        func: &Expression,
+    ) -> Option<Vec<crate::ast::types::UnpackedDimension>> {
         // §13.4: a METHOD returning a collection (`o.build().size()`,
         // `B::make().size()`): the receiver's class, or the scope class of a
         // static call, declares it. Only module functions were recognized,
         // so the collection method ran on nothing and answered 0.
-        let (recv, mname): (Option<Expression>, &str) = match &func.kind {
+        let (recv, mname): (Option<std::borrow::Cow<'_, Expression>>, &str) = match &func.kind {
             ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let mname = h.path[h.path.len() - 1].name.name.as_str();
+                // §26.3: `pkg::f()` names the package's function.
+                if h.path.len() == 2 && self.module.packages.contains(&h.path[0].name.name) {
+                    return self.pkg_function_ret_coll_dims(&h.path[0].name.name, mname);
+                }
                 let mut r = h.clone();
                 r.path.pop();
                 r.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                 (
-                    Some(Expression::new(ExprKind::Ident(r), func.span)),
-                    h.path[h.path.len() - 1].name.name.as_str(),
+                    Some(std::borrow::Cow::Owned(Expression::new(
+                        ExprKind::Ident(r),
+                        func.span,
+                    ))),
+                    mname,
                 )
             }
-            ExprKind::MemberAccess { expr, member } => {
-                (Some((**expr).clone()), member.name.as_str())
-            }
+            ExprKind::MemberAccess { expr, member } => (
+                Some(std::borrow::Cow::Borrowed(&**expr)),
+                member.name.as_str(),
+            ),
             _ => (None, ""),
         };
         if let Some(recv) = recv {
@@ -1363,31 +1381,78 @@ impl Simulator {
                 {
                     Some(rh.path[0].name.name.clone())
                 }
+                ExprKind::Ident(rh)
+                    if rh.path.len() == 1
+                        && self.module.packages.contains(&rh.path[0].name.name) =>
+                {
+                    return self.pkg_function_ret_coll_dims(&rh.path[0].name.name, mname);
+                }
+                // §8.11: `this.f()` is a method of the executing class.
+                ExprKind::This => self.class_context_stack.last().cloned().flatten(),
                 _ => self.get_expr_type_name(&recv),
             };
-            let mut cur = class;
-            while let Some(cn) = cur {
-                let Some(cd) = self.module.classes.get(&cn) else {
-                    break;
-                };
-                if let Some(m) = cd.methods.get(mname) {
-                    return matches!(&m.kind, crate::ast::decl::ClassMethodKind::Function(f)
-                        if self.fn_ret_coll_dims(&f.return_type).is_some());
-                }
-                cur = cd.extends.clone();
-            }
-            return false;
+            return class.and_then(|cn| self.class_method_ret_coll_dims(&cn, mname)?);
         }
         let ExprKind::Ident(h) = &func.kind else {
-            return false;
+            return None;
         };
-        let Some(seg) = h.path.last() else {
-            return false;
-        };
+        let seg = h.path.last()?;
+        // §8.20, §23.9: a bare call inside a class method binds to the class
+        // chain before a module function of the same name.
+        if let Some(cls) = self.class_context_stack.last().and_then(|c| c.as_deref())
+            && let Some(found) = self.class_method_ret_coll_dims(cls, &seg.name.name)
+        {
+            return found;
+        }
+        let fd = self.module.functions.get(&seg.name.name)?;
+        self.fn_ret_coll_dims(&fd.return_type)
+    }
+
+    /// The collection dimensions of what the method `name` that `cls`'s
+    /// chain declares first returns (its prototype's return type: an
+    /// `extern` or `pure virtual` declaration counts); `None` when no class
+    /// in the chain declares it.
+    #[allow(clippy::type_complexity)]
+    fn class_method_ret_coll_dims(
+        &self,
+        cls: &str,
+        name: &str,
+    ) -> Option<Option<Vec<crate::ast::types::UnpackedDimension>>> {
+        use crate::ast::decl::ClassMethodKind as Kind;
+        let mut cur = self.module.classes.get(cls);
+        // The extends chain is acyclic; the bound guards a malformed one.
+        for _ in 0..=self.module.classes.len() {
+            let cd = cur?;
+            if let Some(m) = cd.methods.get(name) {
+                return Some(match &m.kind {
+                    Kind::Function(f) | Kind::Extern(f) | Kind::PureVirtual(f) => {
+                        self.fn_ret_coll_dims(&f.return_type)
+                    }
+                    Kind::Task(_) => None,
+                });
+            }
+            cur = self.module.classes.get(cd.extends.as_deref()?);
+        }
+        None
+    }
+
+    /// The collection dimensions of what package `pkg`'s function `name`
+    /// returns.
+    fn pkg_function_ret_coll_dims(
+        &self,
+        pkg: &str,
+        name: &str,
+    ) -> Option<Vec<crate::ast::types::UnpackedDimension>> {
+        let key = format!("{pkg}::{name}");
         self.module
             .functions
-            .get(&seg.name.name)
-            .is_some_and(|fd| self.fn_ret_coll_dims(&fd.return_type).is_some())
+            .get(&key)
+            .or_else(|| {
+                self.module.functions.get(name).filter(|_| {
+                    self.module.pkg_subr_owner.get(name).map(|s| s.as_str()) == Some(pkg)
+                })
+            })
+            .and_then(|fd| self.fn_ret_coll_dims(&fd.return_type))
     }
 
     pub(super) fn fn_returns_collection(&self, dt: &DataType) -> bool {

@@ -2746,6 +2746,17 @@ impl Simulator {
                                         }
                                     }
                                 }
+                                // §21.2.1.7, §13.4.1: a call returning an
+                                // unpacked array prints the elements it
+                                // returns, as the same value in a variable.
+                                if let Some(src) = self.ret_collection_operand(arg) {
+                                    self.p_top_level = true;
+                                    let core = src
+                                        .and_then(|s| self.render_p_var(&s))
+                                        .unwrap_or_else(|| "'{}".to_string());
+                                    result.push_str(&core);
+                                    continue;
+                                }
                                 // §21.2.1.7: a call returning an unpacked struct.
                                 if let Some(core) = self.render_p_struct_call(arg) {
                                     result.push_str(&core);

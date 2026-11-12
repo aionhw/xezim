@@ -623,6 +623,14 @@ impl Simulator {
     /// §13.5.1: a collection returned by an actual expression is evaluated
     /// once in the caller and copied before the callee's frame is entered.
     pub(super) fn collection_call_actual(&mut self, arg: &Expression) -> Option<String> {
+        self.ret_collection_operand(arg).flatten()
+    }
+
+    /// §13.4.1: when `arg` is a call returning an unpacked array, evaluate
+    /// it once and name the store holding the returned elements:
+    /// `Some(None)` when the call ran but handed back no collection, `None`
+    /// (nothing evaluated) when `arg` is no such call.
+    pub(super) fn ret_collection_operand(&mut self, arg: &Expression) -> Option<Option<String>> {
         let arg = Self::unparen(arg);
         let ExprKind::Call { func, .. } = &arg.kind else {
             return None;
@@ -630,7 +638,29 @@ impl Simulator {
         if !self.call_returns_collection(func) {
             return None;
         }
-        let data_type = self.call_return_type(func)?;
+        let data_type = self
+            .call_return_type(func)
+            .or_else(|| self.static_call_return_type(func))?;
+        Some(self.eval_ret_collection(arg, data_type))
+    }
+
+    /// §8.10: the declared return type of a static method called through
+    /// its class, `C::f()`, which `call_return_type` (resolving a receiver
+    /// object) does not answer.
+    fn static_call_return_type(&self, func: &Expression) -> Option<DataType> {
+        let ExprKind::Ident(h) = &func.kind else {
+            return None;
+        };
+        let [cls, m] = h.path.as_slice() else {
+            return None;
+        };
+        if !self.module.classes.contains_key(&cls.name.name) {
+            return None;
+        }
+        self.class_method_return_type(&cls.name.name, &m.name.name)
+    }
+
+    fn eval_ret_collection(&mut self, arg: &Expression, data_type: DataType) -> Option<String> {
         let width = resolve_type_width(
             &data_type,
             Some(&self.module.parameters),
@@ -647,6 +677,10 @@ impl Simulator {
             // consumers also need its type and storage classification.
             self.module.arrays.insert(name.clone(), (0, -1, width));
             self.module.dynamic_arrays.insert(name.clone());
+            self.module.var_decl_types.insert(name.clone(), data_type);
+        } else if name == Self::RET_ASSOC_SNAP {
+            // §21.2.1.7: the element type of a returned associative array
+            // (an enum prints its labels, a string is quoted).
             self.module.var_decl_types.insert(name.clone(), data_type);
         }
         Some(name)
