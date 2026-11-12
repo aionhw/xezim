@@ -100,3 +100,5 @@ mod driver_transition_delays;
 mod shared_net_driver_stages;
 #[path = "gates/vector_continuous_delay.rs"]
 mod vector_continuous_delay;
+#[path = "gates/review_select_continuous_delay.rs"]
+mod review_select_continuous_delay;
