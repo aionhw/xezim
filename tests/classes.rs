@@ -17,6 +17,8 @@ mod array_equality_class;
 mod assoc_typedef_element_class;
 #[path = "classes/bit_class_property_signedness.rs"]
 mod bit_class_property_signedness;
+#[path = "classes/byte_array_elem_signed_bytecode_store.rs"]
+mod byte_array_elem_signed_bytecode_store;
 #[path = "classes/block_local_shadows_enclosing.rs"]
 mod block_local_shadows_enclosing;
 #[path = "classes/blocking_task_super_dispatch.rs"]
