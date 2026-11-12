@@ -472,3 +472,5 @@ mod modport_qualified_access;
 mod defparam_targets_core_199;
 #[path = "hierarchy/bind_instance_lists_core_200.rs"]
 mod bind_instance_lists_core_200;
+#[path = "hierarchy/bind_instance_names_core_201.rs"]
+mod bind_instance_names_core_201;
