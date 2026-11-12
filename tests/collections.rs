@@ -356,3 +356,6 @@ mod call_returned_array_whole_value_1036;
 
 #[path = "collections/struct_array_shape_copies_1057.rs"]
 mod struct_array_shape_copies_1057;
+
+#[path = "collections/queue_sort_packed_members_1059.rs"]
+mod queue_sort_packed_members_1059;
