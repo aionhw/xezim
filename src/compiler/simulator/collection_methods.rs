@@ -3947,9 +3947,16 @@ impl Simulator {
             // string wrote the key's ASCII bytes into the ref arg.
             // A key type wider than 64 bits is keyed by fixed-width hex
             // digits (`assoc_key_str`), which order as the values do.
+            // A STRING key whose KEY is a type parameter bound to `string`
+            // (`pool#(string,..)`/`VAL aa[KEY]`) reports a spurious 1024-bit
+            // index width (elaboration can't resolve the type param to
+            // `SimpleType::String`), so the hex path below would ship the
+            // key's ASCII bytes as an integer into the ref arg (e.g. "ID103"
+            // -> 2 garbage bytes). String keys are strings however they read;
+            // never treat a string-keyed array as a wide numeric key.
             let wide = self
                 .assoc_index_width_for(obj_name)
-                .filter(|&(kw, _)| kw > 64);
+                .filter(|&(kw, _)| kw > 64 && !self.is_string_keyed_array(obj_name));
             // §7.8.2, §7.9.4: string keys are strings however they read.
             let all_numeric = wide.is_none()
                 && !self.is_string_keyed_array(obj_name)
