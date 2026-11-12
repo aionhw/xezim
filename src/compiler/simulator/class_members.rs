@@ -3008,6 +3008,8 @@ impl Simulator {
                                         .iter()
                                         .any(|s| statics.contains(s.name.name.as_str())));
                         }
+                        // `this.sp.m` in a method of the class.
+                        ExprKind::This => break hit,
                         _ => return None,
                     }
                 }
@@ -3027,12 +3029,20 @@ impl Simulator {
                     names.push(member.name.as_str());
                     cur = expr;
                 }
-                let ExprKind::Ident(h) = &cur.kind else {
+                if let ExprKind::Ident(h) = &cur.kind {
+                    names.extend(h.path.iter().rev().map(|s| s.name.name.as_str()));
+                } else if !matches!(cur.kind, ExprKind::This) {
                     return None;
-                };
-                names.extend(h.path.iter().rev().map(|s| s.name.name.as_str()));
+                }
                 names.reverse();
             }
+        }
+        // `this.sp.m` names the running object's class's static.
+        if names.first() == Some(&"this") {
+            names.remove(0);
+        }
+        if names.len() < 2 {
+            return None;
         }
         let shadowed = |sim: &Self, n: &str| {
             sim.signal_name_to_id.contains_key(n)

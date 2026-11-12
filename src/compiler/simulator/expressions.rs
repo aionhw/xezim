@@ -2551,9 +2551,8 @@ impl Simulator {
         // the shared static cell by the struct layout. It is not a class
         // aggregate (no object holds it): the aggregate arm below read the
         // object's own cell, and the later arms a 32-bit 0.
-        if !self.no_class_objects()
-            && let Some(v) = self.static_packed_member_value(expr)
-        {
+        // No object need exist: a static is reachable through its class.
+        if let Some(v) = self.static_packed_member_value(expr) {
             return v;
         }
         // §7.2/§18.4: a leaf of an unpacked-struct CLASS PROPERTY at any
