@@ -350,3 +350,6 @@ mod package_array_operand_in_method;
 
 #[path = "collections/unpacked_struct_concat_1035.rs"]
 mod unpacked_struct_concat_1035;
+
+#[path = "collections/queue_of_queues_push_concat.rs"]
+mod queue_of_queues_push_concat;
