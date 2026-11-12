@@ -1247,6 +1247,26 @@ pub(super) fn uvm_1_2_sequencer_driver_handshake() {
     );
 }
 
+/// §8.14 (#1064): a user sequencer that declares its own `m_req_fifo` hides
+/// `uvm_sequencer_param_base`'s only for code written in the subclass. The
+/// base's `finish_item` path and the driver's `get_next_item` keep the base's
+/// FIFO, so every item reaches the driver and the user's FIFO stays empty, as
+/// in the reference simulator. The user FIFO took the requests and the test
+/// hung in `get_next_item`.
+pub(super) fn uvm_1_2_user_sequencer_redeclares_req_fifo() {
+    let test_src = std::fs::read_to_string("tests/uvm/uvm_sequencer_redeclared_req_fifo.sv")
+        .expect("Could not read uvm_sequencer_redeclared_req_fifo.sv");
+    let sim = run_uvm("1.2", &[], test_src, "top")
+        .expect("UVM 1.2 redeclared m_req_fifo failed to simulate");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        out.iter()
+            .any(|l| l.contains("DRIVER GOT 3 ITEMS, USER FIFO USED 0")),
+        "driver must receive all 3 items through the base FIFO:\n{}",
+        out.join("\n")
+    );
+}
+
 /// UVM 1.2 register-model FRONTDOOR path end-to-end: read of reset value,
 /// write + auto-predict mirror, read-back, field read-modify-write, and
 /// set/update — with REAL data (the checks below pin exact values because

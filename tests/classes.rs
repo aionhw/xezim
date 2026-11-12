@@ -1234,3 +1234,5 @@ mod class_property_nba_real_targets;
 mod static_packed_member_reads;
 #[path = "classes/type_param_struct_members_1082.rs"]
 mod type_param_struct_members_1082;
+#[path = "classes/redeclared_property_base_scope_1064.rs"]
+mod redeclared_property_base_scope_1064;
