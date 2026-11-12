@@ -353,3 +353,6 @@ mod unpacked_struct_concat_1035;
 
 #[path = "collections/call_returned_array_whole_value_1036.rs"]
 mod call_returned_array_whole_value_1036;
+
+#[path = "collections/struct_array_shape_copies_1057.rs"]
+mod struct_array_shape_copies_1057;
