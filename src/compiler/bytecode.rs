@@ -2899,7 +2899,7 @@ impl<'a> BytecodeCompiler<'a> {
             let &(_, m1_off, _) = fields.iter().find(|(n, _, _)| n == &m1.name)?;
             let (stride1, dim1) = self.packed_member_array_shape(&key, &hier, &m1.name)?;
             let elem = self.emit_packed_member_slice(v, idx1, dim1, stride1, m1_off, stride1)?;
-            let (_, mem_off, _) = Self::elem_zero_field(&fields, &m1.name, &member.name)?;
+            let (_, mem_off, _) = Self::elem_zero_field(&fields, &m1.name, &member.name, stride1)?;
             let rel = mem_off.checked_sub(m1_off)?;
             let nested = format!("{}.{}", m1.name, member.name);
             let (elem_w, dim2) = self.packed_member_array_shape(&key, &hier, &nested)?;
@@ -2936,27 +2936,38 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         };
         let (root_value, root_key, hier, fields) = self.compile_packed_struct_value(root)?;
-        let (_, field_offset, field_width) = Self::elem_zero_field(&fields, &member.name, leaf)?;
         let (elem_w, dim) = self.packed_member_array_shape(&root_key, &hier, &member.name)?;
+        let (_, field_offset, field_width) =
+            Self::elem_zero_field(&fields, &member.name, leaf, elem_w)?;
         self.emit_packed_member_slice(root_value, index, dim, elem_w, field_offset, field_width)
     }
 
-    /// Element-0 layout of `<member>[i].<leaf>`. Elaboration registers an
-    /// array-of-struct member under two conventions: element-relative
-    /// (`descriptors.region`, plain struct nets) or expanded per element
-    /// (`descriptors[0].region`, packed arrays of structs). Both put element
-    /// 0 at the member's base, so either key gives the stride origin.
+    /// Layout of `<member>[i].<leaf>` in the element at the member's base
+    /// (slot 0, the stride origin). Elaboration registers an array-of-struct
+    /// member under two conventions: element-relative (`descriptors.region`,
+    /// plain struct nets) or expanded per element (`descriptors[0].region`,
+    /// packed arrays of structs). §7.4.1: element 0 sits at the base only
+    /// for a descending range; in an ascending one (`hdr_t [0:2] slots`) it
+    /// is the most significant element, so the leaf's offset is reduced to
+    /// its place within one `stride`-bit element above the member's base.
     fn elem_zero_field(
         fields: &[(String, u32, u32)],
         member: &str,
         leaf: &str,
+        stride: u32,
     ) -> Option<(String, u32, u32)> {
         let rel = format!("{}.{}", member, leaf);
         let per_elem = format!("{}[0].{}", member, leaf);
-        fields
+        let (name, off, w) = fields
             .iter()
             .find(|(name, _, _)| name == &rel || name == &per_elem)
-            .cloned()
+            .cloned()?;
+        match fields.iter().find(|(n, _, _)| n == member) {
+            Some(&(_, base, _)) if stride > 0 && off >= base => {
+                Some((name, base + (off - base) % stride, w))
+            }
+            _ => Some((name, off, w)),
+        }
     }
 
     /// `<path>.<member>[i].<leaf>` where the container and member arrive as
@@ -2980,8 +2991,8 @@ impl<'a> BytecodeCompiler<'a> {
             seg.selects.clear();
         }
         let (root_key, fields) = self.packed_struct_layout_for_hier(&bare)?;
-        let (_, field_offset, field_width) = Self::elem_zero_field(&fields, member, leaf)?;
         let (elem_w, dim) = self.packed_member_array_shape(&root_key, &bare, member)?;
+        let (_, field_offset, field_width) = Self::elem_zero_field(&fields, member, leaf, elem_w)?;
         let root = if root_hier.path.iter().any(|s| !s.selects.is_empty()) {
             let e = Expression::new(ExprKind::Ident(root_hier.clone()), root_hier.span);
             self.compile_expr(&e, 0)?
