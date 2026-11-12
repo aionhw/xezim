@@ -716,6 +716,369 @@ impl Simulator {
             writes.clear();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
             Self::collect_lhs_writes(&ca.lhs, &self.module, &mut writes);
+            // §10.3.2, §7.2.2: struct operands anywhere in a call actual
+            // also read their existing member leaves. Keep ordinary reads and
+            // unresolved callee reads; member writes do not update containers.
+            let mut actual_aggregates = Vec::new();
+            let mut seen_aggregates = HashSet::default();
+            let mut pending = vec![(&ca.rhs, false)];
+            while let Some((expr, in_actual)) = pending.pop() {
+                if self.unpacked_struct_sens.is_empty() {
+                    break;
+                }
+                // One DFS: nested calls inherit the actual context, without
+                // walking an enclosing call's argument subtree again.
+                let mut visit = |e, actual| pending.push((e, actual));
+                match &expr.kind {
+                    ExprKind::Call { func, args } => {
+                        visit(func, false);
+                        for arg in args.iter().rev() {
+                            visit(arg, true);
+                        }
+                    }
+                    ExprKind::SystemCall { name, args } => {
+                        // §20.6.1/§20.6.2: type queries do not evaluate their
+                        // operand, including calls nested within it. §20.7:
+                        // array queries read shape, not member data; ordinary
+                        // reads retain dynamic shape dependencies. A dimension
+                        // argument is still an evaluated expression.
+                        let skip = usize::from(matches!(
+                            name.as_str(),
+                            "$bits"
+                                | "$typename"
+                                | "$dimensions"
+                                | "$unpacked_dimensions"
+                                | "$left"
+                                | "$right"
+                                | "$low"
+                                | "$high"
+                                | "$increment"
+                                | "$size"
+                        ));
+                        for arg in args.iter().skip(skip).rev() {
+                            visit(arg, in_actual);
+                        }
+                    }
+                    ExprKind::Ident(_)
+                    | ExprKind::MemberAccess { .. }
+                    | ExprKind::Index { .. }
+                    | ExprKind::RangeSelect { .. } => {
+                        // A select/member chain is ONE operand. Consume its
+                        // base here, but schedule every index expression in
+                        // the same DFS. Only a variable select or slice drops
+                        // the suffix and conservatively reads its base (§7.4.5).
+                        let mut base = expr;
+                        let mut suffix = String::new();
+                        let mut member_suffixes = Vec::new();
+                        let mut selected_paths = Vec::new();
+                        // An indexed struct element can also have a container
+                        // signal. Only a member without a trailing select can
+                        // use the scalar-leaf shortcut below (§7.4.5).
+                        let scalar_member = match &expr.kind {
+                            ExprKind::MemberAccess { .. } => true,
+                            ExprKind::Ident(hier) => {
+                                hier.path.last().is_some_and(|seg| seg.selects.is_empty())
+                            }
+                            _ => false,
+                        };
+                        let name = loop {
+                            match &base.kind {
+                                ExprKind::MemberAccess { expr, member } => {
+                                    suffix = format!(".{}{suffix}", member.name);
+                                    member_suffixes.push(suffix.len());
+                                    base = expr;
+                                }
+                                ExprKind::Index { expr, index } => {
+                                    visit(index, in_actual);
+                                    if let Some(i) = Self::constant_array_index(index, &self.module)
+                                    {
+                                        suffix = format!("[{i}]{suffix}");
+                                    } else {
+                                        selected_paths.insert(0, std::mem::take(&mut suffix));
+                                        member_suffixes.clear();
+                                    }
+                                    base = expr;
+                                }
+                                ExprKind::RangeSelect {
+                                    expr, left, right, ..
+                                } => {
+                                    visit(right, in_actual);
+                                    visit(left, in_actual);
+                                    selected_paths.insert(0, std::mem::take(&mut suffix));
+                                    member_suffixes.clear();
+                                    base = expr;
+                                }
+                                ExprKind::Paren(inner) => base = inner,
+                                ExprKind::Ident(hier) => {
+                                    let mut name = String::new();
+                                    let mut member_prefixes = Vec::new();
+                                    let mut selected_base = false;
+                                    let mut selected_path = String::new();
+                                    let mut hier_selected_paths = Vec::new();
+                                    let mut ambiguous_unit = false;
+                                    for seg in &hier.path {
+                                        // §3.12.1: elaboration can erase $unit::.
+                                        // A reserved unit declaration means this
+                                        // spelling cannot safely bind new edges.
+                                        let unit_name = if let Some((scope, leaf)) =
+                                            seg.name.name.rsplit_once('.')
+                                        {
+                                            format!(
+                                                "{scope}.{}",
+                                                crate::sv_parser::unit_scope_name(leaf)
+                                            )
+                                        } else {
+                                            crate::sv_parser::unit_scope_name(&seg.name.name)
+                                        };
+                                        ambiguous_unit |=
+                                            self.module.var_decl_types.contains_key(&unit_name)
+                                                || self.unit_scope_decl_exists(&unit_name);
+                                        if !selected_base {
+                                            if !name.is_empty() {
+                                                member_prefixes.push(name.len());
+                                                name.push('.');
+                                            }
+                                            name.push_str(&seg.name.name);
+                                        } else {
+                                            selected_path.push('.');
+                                            selected_path.push_str(&seg.name.name);
+                                        }
+                                        for sel in &seg.selects {
+                                            visit(sel, in_actual);
+                                            if let Some(i) =
+                                                Self::constant_array_index(sel, &self.module)
+                                            {
+                                                use std::fmt::Write as _;
+                                                let target = if selected_base {
+                                                    &mut selected_path
+                                                } else {
+                                                    &mut name
+                                                };
+                                                let _ = write!(target, "[{i}]");
+                                            } else {
+                                                if selected_base {
+                                                    hier_selected_paths
+                                                        .push(std::mem::take(&mut selected_path));
+                                                }
+                                                selected_base = true;
+                                            }
+                                        }
+                                    }
+                                    if !selected_base {
+                                        name.push_str(&suffix);
+                                        member_prefixes
+                                            .extend(member_suffixes.iter().map(|n| name.len() - n));
+                                    }
+                                    if selected_base {
+                                        selected_path.push_str(&suffix);
+                                        hier_selected_paths.push(selected_path);
+                                        hier_selected_paths.append(&mut selected_paths);
+                                        selected_paths = hier_selected_paths;
+                                    }
+                                    member_prefixes.sort_unstable_by(|a, b| b.cmp(a));
+                                    break (!ambiguous_unit).then_some((
+                                        name,
+                                        hier.root.is_some()
+                                            || hier
+                                                .path
+                                                .first()
+                                                .is_some_and(|seg| seg.name.name == "$root"),
+                                        member_prefixes,
+                                    ));
+                                }
+                                _ => {
+                                    visit(base, in_actual);
+                                    break None;
+                                }
+                            }
+                        };
+                        if !in_actual {
+                            continue;
+                        }
+                        let Some((name, rooted, member_prefixes)) = name else {
+                            continue;
+                        };
+                        let raw_name = name.as_str();
+                        let name = raw_name.strip_prefix("$root.").unwrap_or(raw_name);
+                        // §23.3.1/§23.6: a rooted top name is never a child
+                        // instance of the same name. Normalize before lookup.
+                        let name = if rooted {
+                            name.strip_prefix(&format!("{}.", self.module.name))
+                                .unwrap_or(name)
+                        } else {
+                            name
+                        };
+                        let scope = ca
+                            .origin
+                            .as_ref()
+                            .map(|(_, s)| s.as_str())
+                            .filter(|s| !rooted && !s.is_empty());
+                        let scoped = scope.map(|s| format!("{s}.{name}"));
+                        // §23.9: an already-prefixed name is absolute first;
+                        // a downward relative name still tries its scope first.
+                        let prefixed = scope.is_some_and(|s| {
+                            name.strip_prefix(s)
+                                .is_some_and(|rest| rest.starts_with('.'))
+                        });
+                        // §23.8/§23.9: matching text does not establish whether
+                        // elaboration prefixed a name or it names a local block.
+                        // A single rewritten identifier has no AST member
+                        // boundary; it still denotes its own declaration.
+                        // Withhold edges when both path bindings exist.
+                        if prefixed
+                            && !member_prefixes.is_empty()
+                            && self.unpacked_struct_sens.contains_key(name)
+                            && scoped
+                                .as_ref()
+                                .is_some_and(|s| self.unpacked_struct_sens.contains_key(s))
+                        {
+                            continue;
+                        }
+                        let bare = Some(name);
+                        let candidates = if prefixed {
+                            [bare, scoped.as_deref()]
+                        } else {
+                            [scoped.as_deref(), bare]
+                        };
+                        for candidate in candidates.into_iter().flatten().chain(
+                            name.strip_prefix(&format!("{}.", self.module.name))
+                                .filter(|_| !rooted),
+                        ) {
+                            let mut prefixes = std::iter::once(candidate.len()).chain(
+                                member_prefixes.iter().filter_map(|&len| {
+                                    // Prefix lengths come from AST member boundaries,
+                                    // never dots inside an escaped identifier.
+                                    candidate.len().checked_sub(raw_name.len() - len)
+                                }),
+                            );
+                            let mut found = false;
+                            for len in &mut prefixes {
+                                let prefix = &candidate[..len];
+                                if let Some((key, _)) =
+                                    self.unpacked_struct_sens.get_key_value(prefix)
+                                {
+                                    // §7.4.5/§10.3.2: retain the member path
+                                    // after a variable select. Ordinary reads
+                                    // already cover scalar leaves at every index.
+                                    let scalar = scalar_member
+                                        && selected_paths.len() == 1
+                                        && !selected_paths[0].is_empty()
+                                        && self.unpacked_struct_sens[key].first().is_some_and(
+                                            |&id| {
+                                                self.name_for_id(id)
+                                                    .strip_prefix(candidate)
+                                                    .and_then(|rest| rest.strip_prefix('['))
+                                                    .and_then(|rest| rest.split_once(']'))
+                                                    .is_some_and(|(index, _)| {
+                                                        let leaf = format!(
+                                                            "{candidate}[{index}]{}",
+                                                            selected_paths[0]
+                                                        );
+                                                        !self
+                                                            .unpacked_struct_sens
+                                                            .contains_key(&leaf)
+                                                            && self
+                                                                .signal_name_to_id
+                                                                .get(&leaf)
+                                                                .is_some_and(|id| {
+                                                                    !self
+                                                                        .unpacked_struct_leaves
+                                                                        .contains_key(id)
+                                                                })
+                                                    })
+                                            },
+                                        );
+                                    if !scalar
+                                        && seen_aggregates
+                                            .insert((candidate.to_string(), selected_paths.clone()))
+                                    {
+                                        actual_aggregates.push((
+                                            key,
+                                            candidate.to_string(),
+                                            selected_paths.clone(),
+                                        ));
+                                    }
+                                    found = true;
+                                    break;
+                                }
+                                // Exact scalar leaves already occur in ordinary
+                                // reads; never widen one to its enclosing struct.
+                                if len == candidate.len()
+                                    && self.signal_name_to_id.contains_key(prefix)
+                                {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if found {
+                                break;
+                            }
+                        }
+                    }
+                    ExprKind::Unary { operand, .. } => visit(operand, in_actual),
+                    ExprKind::Binary { left, right, .. } | ExprKind::Range(left, right) => {
+                        visit(right, in_actual);
+                        visit(left, in_actual);
+                    }
+                    ExprKind::Conditional {
+                        condition,
+                        then_expr,
+                        else_expr,
+                    } => {
+                        visit(else_expr, in_actual);
+                        visit(then_expr, in_actual);
+                        visit(condition, in_actual);
+                    }
+                    ExprKind::Concatenation(xs) => {
+                        for x in xs.iter().rev() {
+                            visit(x, in_actual);
+                        }
+                    }
+                    ExprKind::Replication { count, exprs } => {
+                        for x in exprs.iter().rev() {
+                            visit(x, in_actual);
+                        }
+                        visit(count, in_actual);
+                    }
+                    ExprKind::AssignmentPattern(items) => {
+                        for item in items.iter().rev() {
+                            visit(item.expr(), in_actual);
+                        }
+                    }
+                    ExprKind::NamedArg { expr: Some(x), .. }
+                    | ExprKind::Paren(x)
+                    | ExprKind::Specialization { base: x, .. }
+                    | ExprKind::ShallowCopy { source: x }
+                    | ExprKind::TypedPattern { pattern: x, .. }
+                    | ExprKind::Tagged { inner: Some(x), .. } => visit(x, in_actual),
+                    ExprKind::Inside { expr, ranges } => {
+                        for x in ranges.iter().rev() {
+                            visit(x, in_actual);
+                        }
+                        visit(expr, in_actual);
+                    }
+                    ExprKind::WithClause { expr, filter } => {
+                        visit(filter, in_actual);
+                        visit(expr, in_actual);
+                    }
+                    ExprKind::StreamOp {
+                        slice_size, exprs, ..
+                    } => {
+                        for x in exprs.iter().rev() {
+                            visit(x, in_actual);
+                        }
+                        if let Some(x) = slice_size {
+                            visit(x, in_actual);
+                        }
+                    }
+                    ExprKind::AssignExpr { lvalue, rvalue } => {
+                        visit(rvalue, in_actual);
+                        visit(lvalue, in_actual);
+                    }
+                    _ => {}
+                }
+            }
+
             // Substituted port actuals whose bare name collides with a child
             // declaration arrive ROOT-marked (core rewrite_expr_impl, issue
             // #128: `.v_node(out_val)` into a module with its own `out_val`).
@@ -1525,6 +1888,53 @@ impl Simulator {
                 if !found {
                     unresolved_count += 1;
                 }
+            }
+            // Append only after ordinary resolution: its linear membership
+            // searches must not scan the additional member IDs (§10.3.2).
+            // Preserve encounter order, including when an actual occurs twice.
+            if !actual_aggregates.is_empty() {
+                let mut seen: HashSet<usize> = rids.iter().copied().collect();
+                let sim = &*self;
+                let additions: Vec<_> = actual_aggregates
+                    .into_iter()
+                    .flat_map(|(key, operand, selected_paths)| {
+                        self.unpacked_struct_sens[key]
+                            .iter()
+                            .copied()
+                            .filter(move |&id| {
+                                // A member array may only have its enclosing struct's
+                                // entry. Select that operand's leaves, not its siblings.
+                                if key == &operand && selected_paths.is_empty() {
+                                    return true;
+                                }
+                                let leaf = sim.name_for_id(id);
+                                let Some(mut rest) = leaf.strip_prefix(&operand) else {
+                                    return false;
+                                };
+                                if !rest.is_empty() && !rest.starts_with(['.', '[']) {
+                                    return false;
+                                }
+                                for path in &selected_paths {
+                                    let Some((_, tail)) =
+                                        rest.strip_prefix('[').and_then(|s| s.split_once(']'))
+                                    else {
+                                        return false;
+                                    };
+                                    let Some(tail) = tail.strip_prefix(path.as_str()) else {
+                                        return false;
+                                    };
+                                    rest = tail;
+                                    if !rest.is_empty() && !rest.starts_with(['.', '[']) {
+                                        return false;
+                                    }
+                                }
+                                true
+                            })
+                    })
+                    .filter(|id| seen.insert(*id))
+                    .collect();
+                rids.reserve(additions.len());
+                rids.extend(additions);
             }
             if dump_ca_reads {
                 let rn: Vec<&str> = rids.iter().map(|&i| self.name_for_id(i)).collect();
