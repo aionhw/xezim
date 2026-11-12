@@ -474,3 +474,5 @@ mod defparam_targets_core_199;
 mod bind_instance_lists_core_200;
 #[path = "hierarchy/bind_instance_names_core_201.rs"]
 mod bind_instance_names_core_201;
+#[path = "hierarchy/instance_struct_members_root_1046.rs"]
+mod instance_struct_members_root_1046;
