@@ -4104,11 +4104,14 @@ impl Simulator {
                 // §11.4.5, §11.4.6: equality on unpacked structs is member-wise,
                 // on unpacked arrays element-wise (below). Both operands must
                 // be aggregates: a literal or a plain scalar name on either
-                // side skips the probes.
+                // side skips the probes. §11.3.2: parentheses do not change
+                // an operand's value, so the probes look through them (UVM's
+                // comparer writes `(LVALUE) !== (RVALUE)`).
+                let (agg_l, agg_r) = (Self::peel_parens(left), Self::peel_parens(right));
                 let agg_cmp = PatternCmpMode::of(*op)
-                    .filter(|_| self.may_be_aggregate(left) && self.may_be_aggregate(right));
+                    .filter(|_| self.may_be_aggregate(agg_l) && self.may_be_aggregate(agg_r));
                 if let Some((mode, want_eq)) = agg_cmp
-                    && let Some(c) = self.compare_unpacked_structs(left, right, mode)
+                    && let Some(c) = self.compare_unpacked_structs(agg_l, agg_r, mode)
                 {
                     return c.value(want_eq);
                 }
@@ -4203,7 +4206,7 @@ impl Simulator {
                 // `uvm_resource#(T)::do_write` guards on `val == t` for a
                 // `T`-typed queue.
                 if let Some((mode, want_eq)) = agg_cmp
-                    && let Some(c) = self.compare_unpacked_arrays(left, right, mode)
+                    && let Some(c) = self.compare_unpacked_arrays(agg_l, agg_r, mode)
                 {
                     return c.value(want_eq);
                 }

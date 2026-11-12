@@ -641,7 +641,141 @@ impl Simulator {
         if let Some(c) = self.compare_assoc_arrays(left, right, mode) {
             return Some(c);
         }
-        self.compare_dyn_arrays(left, right, mode)
+        if let Some(c) = self.compare_dyn_arrays(left, right, mode) {
+            return Some(c);
+        }
+        self.compare_ret_collections(left, right, mode)
+    }
+
+    /// §11.4.5, §13.4.1: an equality operator with a call returning a
+    /// one-dimensional fixed-size, dynamic array or queue on either side
+    /// compares the returned elements, in order, with the other operand's —
+    /// another such call, or a one-dimensional unpacked array. Each call runs
+    /// once, the left operand first; read as a scalar the call compared as
+    /// `x`. `None`, with nothing evaluated, for any other pair.
+    fn compare_ret_collections(
+        &mut self,
+        left: &Expression,
+        right: &Expression,
+        mode: PatternCmpMode,
+    ) -> Option<PatCmp> {
+        use crate::ast::types::UnpackedDimension as UD;
+        let seq_call = |me: &Self, e: &Expression| match &e.kind {
+            ExprKind::Call { func, .. } => me
+                .call_ret_coll_dims(func)
+                .is_some_and(|d| d.len() == 1 && !matches!(d[0], UD::Associative { .. })),
+            _ => false,
+        };
+        let (lc, rc) = (seq_call(self, left), seq_call(self, right));
+        if !lc && !rc {
+            return None;
+        }
+        // The other operand: its elements in order, by storage name.
+        let side = |me: &mut Self, e: &Expression, call: bool| -> Option<(String, Vec<i64>)> {
+            if call {
+                return None;
+            }
+            if let Some((n, lo, hi)) = me.fixed_array_operand(e) {
+                let idx = if me.module.descending_arrays.contains(&n) {
+                    (lo..=hi).rev().collect()
+                } else {
+                    (lo..=hi).collect()
+                };
+                return Some((n, idx));
+            }
+            let n = me.dyn_cmp_operand_name(e)?;
+            let len = me.get_queue_size(&n) as i64;
+            Some((n, (0..len).collect()))
+        };
+        let lside = side(self, left, lc);
+        if !lc && lside.is_none() {
+            return None;
+        }
+        let rside = side(self, right, rc);
+        if !rc && rside.is_none() {
+            return None;
+        }
+        // A returned collection lives in a reserved store the other call
+        // may reuse: keep the left one's elements under a store of its own.
+        let ret_seq = |me: &mut Self, e: &Expression, keep: Option<&str>| -> (String, Vec<i64>) {
+            let src = match me.ret_collection_operand(e) {
+                Some(src) => src,
+                // The return type did not resolve: run the call as is.
+                None => {
+                    me.pending_ret_collection = None;
+                    me.vm_ret_vals = None;
+                    let _ = me.eval_expr(e);
+                    me.take_pending_ret_collection()
+                }
+            };
+            let Some(src) = src else {
+                return (String::new(), Vec::new());
+            };
+            let src = match keep {
+                Some(k) if src != k => {
+                    if let Some(dt) = me.module.var_decl_types.get(&src).cloned() {
+                        me.module.var_decl_types.insert(k.to_string(), dt);
+                    } else {
+                        me.module.var_decl_types.remove(k);
+                    }
+                    let w = me.module.arrays.get(&src).map_or(32, |t| t.2);
+                    me.module.arrays.insert(k.to_string(), (0, -1, w));
+                    me.module.dynamic_arrays.insert(k.to_string());
+                    me.copy_whole_queue(k, &src);
+                    k.to_string()
+                }
+                _ => src,
+            };
+            let len = me.get_queue_size(&src) as i64;
+            (src, (0..len).collect())
+        };
+        let (ln, li) = match lside {
+            Some(s) => s,
+            None => ret_seq(self, left, rc.then_some("__xz_cmp_ret__")),
+        };
+        let (rn, ri) = match rside {
+            Some(s) => s,
+            None => ret_seq(self, right, None),
+        };
+        if li.len() != ri.len() {
+            return Some(PatCmp::Unequal);
+        }
+        let ew = self
+            .coll_elem_width(&ln)
+            .or_else(|| self.coll_elem_width(&rn));
+        let su = self
+            .queue_elem_struct(&ln)
+            .or_else(|| self.queue_elem_struct(&rn));
+        let leaves = su.as_ref().map(|su| self.struct_leaf_suffixes(su));
+        let mut acc = PatCmp::Equal;
+        for (a, b) in li.iter().zip(ri.iter()) {
+            match &leaves {
+                Some(sfx) => {
+                    for s in sfx {
+                        let lv = self.struct_leaf_value(&format!("{ln}[{a}].{s}"));
+                        let rv = self.struct_leaf_value(&format!("{rn}[{b}].{s}"));
+                        acc = acc.and(match (lv, rv) {
+                            (Some(x), Some(y)) => Self::struct_leaf_cmp(&x, &y, mode),
+                            _ => PatCmp::Unequal,
+                        });
+                    }
+                }
+                None => {
+                    let w = ew.unwrap_or(32);
+                    let lv = self
+                        .get_signal_value_by_name(&format!("{ln}[{a}]"))
+                        .unwrap_or_else(|| Value::zero(w));
+                    let rv = self
+                        .get_signal_value_by_name(&format!("{rn}[{b}]"))
+                        .unwrap_or_else(|| Value::zero(w));
+                    acc = acc.and(Self::coll_elem_cmp(&lv, &rv, ew, mode));
+                }
+            }
+            if acc == PatCmp::Unequal {
+                break;
+            }
+        }
+        Some(acc)
     }
 
     /// IEEE 1800-2017 §11.4.5 / §7.2: `==` and `!=` on unpacked structs compare
