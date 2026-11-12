@@ -3095,6 +3095,16 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §8.14: a member a derived class redeclares is the
+                        // copy the declared class of the chain so far sees.
+                        if self.shadowed_prop_mask != 0 && self.prop_maybe_shadowed(&seg.name.name)
+                        {
+                            let view = self.path_view_class(&hier.path[..loop_start + si]);
+                            handle = self
+                                .member_handle_viewed(handle, &seg.name.name, view.as_deref())
+                                .unwrap_or(0);
+                            continue;
+                        }
                         handle = self
                             .heap
                             .get(handle)

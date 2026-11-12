@@ -1010,7 +1010,39 @@ impl Simulator {
                     && h.path.iter().all(|s| s.selects.is_empty()) =>
             {
                 let m = h.path.last()?.name.name.as_str();
-                if !self.prop_maybe_shadowed(m) || h.path[0].name.name == "super" {
+                if h.path[0].name.name == "super" {
+                    return None;
+                }
+                if !self.prop_maybe_shadowed(m) {
+                    // §8.14: a shadowed property INSIDE the chain (`b.f.tag`
+                    // with `b` of the base type) names the base's copy too;
+                    // rewrite the chain up to it and hang the rest off the
+                    // rewritten handle.
+                    for k in (1..h.path.len() - 1).rev() {
+                        if !self.prop_maybe_shadowed(&h.path[k].name.name) {
+                            continue;
+                        }
+                        let mut head = h.clone();
+                        head.path.truncate(k + 1);
+                        head.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                        head.cached_resolved_name = crate::ast::cache::NameCache::new();
+                        let Some(mut out) = self.shadowed_member_rewrite(&Expression::new(
+                            ExprKind::Ident(head),
+                            e.span,
+                        )) else {
+                            continue;
+                        };
+                        for seg in &h.path[k + 1..] {
+                            out = Expression::new(
+                                ExprKind::MemberAccess {
+                                    expr: Box::new(out),
+                                    member: seg.name.clone(),
+                                },
+                                e.span,
+                            );
+                        }
+                        return Some(out);
+                    }
                     return None;
                 }
                 let p = hier_prefix(h);
@@ -1023,7 +1055,23 @@ impl Simulator {
             }
             ExprKind::MemberAccess { expr: base, member } => {
                 if !self.prop_maybe_shadowed(member.name.as_str()) {
-                    return None;
+                    // §8.14: `this.f.n` / `b.f.inner.n` — a shadowed member
+                    // below the receiver selects the copy the receiver's
+                    // declared class sees, as the read of `this.f` does.
+                    if !matches!(
+                        base.kind,
+                        ExprKind::MemberAccess { .. } | ExprKind::Ident(_)
+                    ) {
+                        return None;
+                    }
+                    let rb = self.shadowed_member_rewrite(base)?;
+                    return Some(Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(rb),
+                            member: member.clone(),
+                        },
+                        e.span,
+                    ));
                 }
                 let prefix = match &base.kind {
                     ExprKind::Ident(bh)
@@ -1095,15 +1143,19 @@ impl Simulator {
             .filter(|&h| h != 0)?;
         let inst = self.heap.get(handle)?.as_ref()?;
         let leaf = declarer_from(&inst.class_name)?;
-        if leaf == target {
+        let tcd = self.module.classes.get(&target)?;
+        let target_static =
+            tcd.static_properties.contains(m) || tcd.param_defaults.iter().any(|(p, _)| p == m);
+        // A static the object's own class declares, hiding a base instance
+        // property, has no cell in the object either (`d.s.n`).
+        if leaf == target && !target_static {
             return None;
         }
         // §8.9/§8.14: the visible declaration is a static (or a constant)
         // that a derived class hides with an instance property: the
         // reference names the class's shared cell, never a copy in the
         // object (`this.s` in the base's method, `base_h.s`).
-        let tcd = self.module.classes.get(&target)?;
-        if tcd.static_properties.contains(m) || tcd.param_defaults.iter().any(|(p, _)| p == m) {
+        if target_static {
             if self.class_is_parameterized(&target) {
                 return None;
             }
@@ -1270,7 +1322,15 @@ impl Simulator {
         if !is_static_prop {
             if let Some(Some(handle)) = self.this_stack.last() {
                 if let Some(Some(inst)) = self.heap.get(*handle) {
-                    if let Some(v) = inst.properties.get(name) {
+                    // §8.14: a property a derived class redeclares names the
+                    // copy the executing method's class sees.
+                    let shadowed = if self.shadowed_prop_mask != 0 && self.prop_maybe_shadowed(name)
+                    {
+                        self.shadowed_prop_key(name, false)
+                    } else {
+                        None
+                    };
+                    if let Some(v) = inst.properties.get(shadowed.as_deref().unwrap_or(name)) {
                         return v.to_u64().map(|h| h as usize);
                     }
                 }

@@ -450,14 +450,22 @@ impl Simulator {
         let mut property_seed_keys = interleaved_seeds.then(|| vec![Vec::new(); chain.len()]);
         for (ci, cdef) in chain.iter().enumerate().rev() {
             for (prop_name, prop_sig) in cdef.properties.iter() {
-                if cdef.static_properties.contains(prop_name)
-                    || cdef.assoc_properties.contains_key(prop_name)
-                {
-                    continue;
-                }
                 let redeclared = leaf_declarer
                     .get(prop_name.as_str())
                     .is_some_and(|l| *l != cdef.name.as_str());
+                if cdef.static_properties.contains(prop_name)
+                    || cdef.assoc_properties.contains_key(prop_name)
+                {
+                    // §8.14: a static a derived class redeclares is still
+                    // what the base class's code and base handles name.
+                    if redeclared
+                        && cdef.static_properties.contains(prop_name)
+                        && !shadowed_props.contains(prop_name)
+                    {
+                        shadowed_props.push(prop_name.clone());
+                    }
+                    continue;
+                }
                 let key = if redeclared {
                     if !shadowed_props.contains(prop_name) {
                         shadowed_props.push(prop_name.clone());

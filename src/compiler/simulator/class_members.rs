@@ -3328,6 +3328,38 @@ impl Simulator {
             .map(|h| h as usize)
     }
 
+    /// `member_handle` of `handle.member` read through a reference whose
+    /// declared class is `view` (§8.14): a member a derived class redeclares
+    /// is the copy `view` sees, not the object's leaf copy.
+    pub(super) fn member_handle_viewed(
+        &self,
+        handle: usize,
+        member: &str,
+        view: Option<&str>,
+    ) -> Option<usize> {
+        if let Some(v) = view {
+            // The declaration `view` sees is a static: its class's cell.
+            if self.member_is_static_prop(v, member) {
+                return self
+                    .static_prop_key(v, member)
+                    .and_then(|k| self.class_statics.get(&k))
+                    .and_then(|x| x.to_u64())
+                    .map(|h| h as usize);
+            }
+            if let Some(key) = self.shadowed_prop_key_in(v, handle, member) {
+                return self
+                    .heap
+                    .get(handle)?
+                    .as_ref()?
+                    .properties
+                    .get(&key)?
+                    .to_u64()
+                    .map(|h| h as usize);
+            }
+        }
+        self.member_handle(handle, member)
+    }
+
     /// §13.3: selected object receivers must enter the suspend-aware task
     /// path, not execute a blocking task through the synchronous fallback.
     pub(super) fn eval_live_object_receiver(&mut self, expr: &Expression) -> Option<usize> {
@@ -3395,6 +3427,24 @@ impl Simulator {
                     }
                     Some(handle)
                 };
+                // §8.14: a member some class redeclares is the copy the
+                // declared class of the chain up to it sees.
+                if self.shadowed_prop_mask != 0
+                    && h.path[1..]
+                        .iter()
+                        .any(|s| self.prop_maybe_shadowed(&s.name.name))
+                {
+                    let mut handle = self.eval_ident_handle(&h.path[0].name.name);
+                    for k in 1..h.path.len() {
+                        handle = handle.filter(|&x| x != 0).and_then(|x| {
+                            let view = self.path_view_class(&h.path[..k]);
+                            self.member_handle_viewed(x, &h.path[k].name.name, view.as_deref())
+                        });
+                    }
+                    if handle.is_some() {
+                        return handle;
+                    }
+                }
                 if let Some(found) = self
                     .eval_ident_handle(&h.path[0].name.name)
                     .and_then(|handle| walk(handle, &h.path[1..]))
@@ -3445,6 +3495,10 @@ impl Simulator {
                 let bh = self.eval_handle_expr(base)?;
                 if bh == 0 {
                     return None;
+                }
+                if self.shadowed_prop_mask != 0 && self.prop_maybe_shadowed(&member.name) {
+                    let view = self.ref_view_class(base);
+                    return self.member_handle_viewed(bh, &member.name, view.as_deref());
                 }
                 self.member_handle(bh, &member.name)
             }

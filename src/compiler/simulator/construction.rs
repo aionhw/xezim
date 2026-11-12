@@ -2616,6 +2616,16 @@ impl Simulator {
                     if cdef.static_properties.contains(prop_name)
                         || cdef.assoc_properties.contains_key(prop_name)
                     {
+                        // §8.14: see `inst_template`.
+                        if cdef.static_properties.contains(prop_name)
+                            && leaf_declarer
+                                .get(prop_name.as_str())
+                                .is_some_and(|l| *l != cdef.name.as_str())
+                            && !self.shadowed_prop_names.contains(prop_name.as_str())
+                        {
+                            self.shadowed_prop_mask |= meta_key_bits(prop_name);
+                            self.shadowed_prop_names.insert(prop_name.clone());
+                        }
                         continue;
                     }
                     let seed = if leaf_declarer

@@ -356,7 +356,8 @@ fn method_boost_enabled() -> bool {
 // §8.8: typed constructors compile the named class scope.
 // §6.21: addressed static locals retain shared storage.
 // §25.5: a modport-qualified name resolves to the interface instance's own variable.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3075;
+// §8.14: a base static that a derived class redeclares counts as a redeclared member.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3076;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
