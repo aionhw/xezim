@@ -249,6 +249,68 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   is one driver of the resolved net; the last writer used to win (§29.3,
   §28.12).
 
+* A whole-variable nonblocking assignment after a partial one to the same
+  variable in the same time step wins: `bus.vld <= 1'b0; bus <= PKT;` in a
+  task, initial block or class method left `vld` at 0. This covered struct
+  members, bit-, part- and indexed part-selects, concatenations, and
+  interface, package, generate, submodule and virtual-interface targets. A
+  queued partial update also keeps a blocking write to the variable's other
+  bits (§4.6, §10.4.2, #1050, reported and contributed by Ganesh-TNL).
+
+* A nonblocking assignment to a class property is sized by its declared type.
+  Through a handle or the class name, a property wider than 32 bits kept only
+  its low 32 bits, a `real` one (also through a type parameter) took an
+  integer, a `super.` one was dropped, and one sharing a module signal's name
+  wrote that signal (§10.4.2, §8.5, §6.12, #1050, reported and contributed by
+  Ganesh-TNL).
+
+* A reference through an interface modport (`ci.drv.bus_a`) names the
+  instance's own variable; writes went to a copy that reads did not see
+  (§25.5, #1050, reported and contributed by Ganesh-TNL).
+
+* A member of a packed-struct static class property (`C::sp.vld`, `h.sp.addr`,
+  `sp.hdr.tag` inside the class) reads the static's value; it read 0 (§8.9,
+  §7.2.1, #1050, reported and contributed by Ganesh-TNL).
+
+* `wait fork` no longer waits for a grandchild whose parent finished before
+  it, including in DPI-exported tasks; `disable fork` and `kill()` still
+  terminate it (§9.6.1, §9.6.3, §9.7, #1072, reported and contributed by
+  chuanseng-ng).
+
+* A packed array or packed struct compared with a bare assignment pattern (`a
+  == '{2,2,2,2}`, `ps != '{lo:1, default:2}`) takes the pattern in the
+  operand's type and compares the two packed values bit for bit, from every
+  declaration form: a variable, a packed member or element of an unpacked
+  aggregate, a class property (also through implicit `this`), a function
+  result or formal, a plain vector, a parenthesized operand, a continuous
+  assignment and a concurrent assertion. The pattern was concatenated at its
+  items' 32-bit widths, so the comparison always reported unequal (§10.8,
+  §10.9, §11.4.5, §11.4.6, #1043, reported by Ganesh-TNL, contributed by
+  Thomasb81).
+
+* `===` and `!==` on unpacked arrays, queues, dynamic and associative arrays
+  and unpacked structs compare the elements' 4-state bits; they answered
+  "exactly equal" for any two same-shaped arrays (and "not equal" for
+  associative arrays). `==?`/`!=?` compare unpacked arrays and structs
+  element-wise, and `==`/`!=` compare module-level associative arrays by
+  content (§11.4.5, §11.4.6, §7.8, #1043, reported by Ganesh-TNL, contributed
+  by Thomasb81).
+
+* `==` and `!=` on unpacked arrays and structs are x when x or z elements
+  leave the relation open, and a differing element decides wherever it sits;
+  both answered 0, and an element differing after an x one was ignored
+  (§11.4.5, #1043, reported by Ganesh-TNL).
+
+* An element select of a packed-array member of a packed struct reached
+  through a class property (`h.frame.lanes[0]`, `frame.lanes[0]` in a method,
+  `arr[i].lanes[0]` of an array property) reads and writes the element;
+  indexed and constant part-selects (`lanes[0 +: 2]`, `lanes[1:2]`) address
+  lanes, not bits; `super.frame.lanes[0] = v`, `foreach (frame.lanes[k])` and
+  an ascending inner member (`g.pairs[0].pair[0]`) select the declared
+  element. The select read one bit and a write through a typedef-typed member
+  hit the wrong bits (§7.2.1, §7.4.1, §11.5.1, §12.7.3, #1046, reported by
+  Ganesh-TNL, contributed by Thomasb81).
+
 **Performance**
 
 * Callable locals with literal or name-free dimensions stay shared during
