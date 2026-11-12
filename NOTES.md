@@ -385,6 +385,82 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   is one bit. A list opened by a port kind or packed dimensions now parses as
   ANSI (§23.2.2.3, #1078, reported by ds54e).
 
+* The equality operators compare parenthesized unpacked arrays and structs
+  element by element (member by member): `(a) === (b)` was 1 for two different
+  arrays and `(a) == (b)` x, so a UVM `compare()`, whose comparer macros write
+  `(LVALUE) !== (RVALUE)`, reported differing `uvm_field_array_*` and
+  `uvm_field_sarray_*` fields equal. A call returning a fixed-size, dynamic
+  array or queue compares its returned elements too (`f() == g` was x)
+  (§11.3.2, §11.4.5, §13.4.1, #1085, reported by philipaxer).
+
+* An unpacked array of unpacked structs copies member by member between
+  differently shaped arrays: fixed-size to dynamic or queue and back,
+  variables and class properties (`da = fx` in a method, `g = h.fx`), and out
+  of a function, also a local queue or dynamic array of structs. The copy had
+  the right length and default members, or was empty. A member written from a
+  variable into an element of a subroutine's local dynamic array of structs
+  (`d[i].a = s[i].a`) was taken for the whole struct and lost (§7.6, §7.2,
+  §13.4.1, #1057, reported by Ganesh-TNL).
+
+* `sort()` and `rsort()` with `with (item.<member>)` order a queue of packed
+  structs by the member: the members were unbound, every key read 0 and the
+  queue kept its order. `sort`, `rsort`, `min`, `max` and `unique` compare
+  elements and keys at their full width and as their type does: a value wider
+  than 64 bits was cut to its low word, a signed `int` sorted as unsigned
+  (`'{0, 5, 7, -10, -3}`) and a `real` by its bit pattern. A signed packed
+  member read in a `with` clause is signed, and a pattern pushed into a queue
+  of packed structs (`q.push_back('{k, v})`) takes the element type (§7.12.1,
+  §7.12.2, §7.12.3, §10.9, #1059, reported by Ganesh-TNL).
+
+* A call returning an unpacked array, used as a whole operand of `inside`,
+  `case ... inside`, `%p`, `$size` or an unpacked array concatenation, reads
+  the elements it returns and runs once: `v inside {f()}` compared `v` with 0,
+  `%p` printed 0 and a constraint `x inside {f()}` drew 0. A bare call in a
+  class method (bound to the class first), `this.f()`, `pkg::f()`, `C::f()`
+  and a method known by its `extern` or `pure virtual` prototype are
+  recognized as returning an array, also for `size()`. An associative array
+  variable in an `inside` set contributes its elements (§11.4.13, §21.2.1.7,
+  §13.4.1, §18.5.11, #1036, reported by git-hevangel).
+
+* `$urandom(seed)` reads its seed and never writes the generated value back
+  into it, whatever the argument's storage or context (a `for` loop over a
+  seeded index ran once). The seed now initializes the calling thread's
+  generator: the calls without a seed that follow repeat for the same seed,
+  and other threads are untouched. A seeded call returns the same value as
+  before (§18.13.1, §18.14.2, #1058, reported by Ganesh-TNL).
+
+* A property a subclass redeclares hides the base property only in code
+  written in the subclass. Base-class methods (`f.add()`, `f.n++`), base-type
+  handles at any link of a chain (`b.f.tag`, `b.f.n = 50`, `b.f.add()`) and
+  `super.f` keep the base's property, also when one of the two is static. A
+  sequencer that declared its own `m_req_fifo` took the requests, and the
+  driver waited in `get_next_item` forever (§8.14, §8.15, #1064, reported by
+  philipaxer).
+
+* A member write to a packed-struct static class property (`Cls::sp.m = v`)
+  updates the shared cell, and an element select of its packed-array member
+  (`Cls::sp.lanes[0]`, `sp.lanes[1]` in a method) slices it. The write went to
+  a stray copy that only module-scope reads saw (§8.9, §7.2.1, §7.4.1, #1046,
+  reported by Ganesh-TNL).
+
+* `$root.top.u.s.m` reads like `top.u.s.m`, and `top.u.s.lanes[i]` selects the
+  element; both read x or a single bit. In a module instance, including every
+  top of a multi-top design, `s.pairs[1].pair[0]` and an unpacked struct's
+  `us.lanes[0]` select whole elements in declared order (§23.6, §7.2.1,
+  §7.4.1, #1046, reported by Ganesh-TNL).
+
+* A member of an element of an ascending packed array of packed structs inside
+  a struct (`b.slots[0].dir` on `hdr_t [0:2] slots`) reads the right element
+  in continuous assignments, `always_comb` and functions, through ports and in
+  instances; `slots[0]` read x and `slots[2]` read element 0 (§7.4.1, §7.2.1,
+  #1088, reported by Ganesh-TNL).
+
+* `push_back`, `push_front` and `insert` on a queue of queues or of dynamic
+  arrays store a concatenation (`{1, 2}`, `{tmp, 3}`) or an assignment pattern
+  (`'{3, 4, 5}`, `'{3{7}}`) as the new row; the row was empty, or had one
+  element for a class property or task local (§7.10.2.2, §10.10, #1086,
+  contributed by chuanseng-ng).
+
 **Performance**
 
 * Callable locals with literal or name-free dimensions stay shared during
