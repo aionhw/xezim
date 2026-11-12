@@ -58,14 +58,13 @@ fn masked_equality_regressions() {
 class d;
   rand bit [31:0] x, m;
   constraint c { solve m before x; m == -1; ((x & m) == 0) || (x != 0); }
-  constraint need_x { x != 0; }
 endclass
 class u; rand int unsigned x, m; constraint c { x inside {[0:100]}; m == 1; (x & m) == 0; } endclass
 module t; initial begin
   d a; u b; int ok, v, sum, hist[101];
   a = new; b = new; ok = 0; sum = 0;
   a.srandom(31);
-  repeat (200) if (a.randomize()) ok++;
+  repeat (200) if (a.randomize() && a.x != 0) ok++;
   foreach (hist[i]) hist[i] = 0;
   b.srandom(29);
   repeat (5100) if (b.randomize() && b.x <= 100) hist[b.x]++;
@@ -81,8 +80,48 @@ end endmodule
     let lines: Vec<_> = result.output.iter().map(|e| e.message.as_str()).collect();
     let d: Vec<&str> = lines[0].split_whitespace().collect();
     let ok = d[1].parse::<i32>().unwrap();
-    assert!(ok > 0, "disjunction mask bug: ok={ok} ({})", lines[0]);
+    assert!(ok >= 190, "a disjunct's mask forced x: {}", lines[0]);
     let u: Vec<&str> = lines[1].split_whitespace().collect();
     let (c100, mean) = (u[1].parse::<i32>().unwrap(), u[2].parse::<i32>().unwrap());
     assert!(c100 * 20 >= mean * 17, "{}", lines[1]);
+}
+
+#[test]
+fn masked_equality_wide_domain_draws() {
+    let result = xezim::simulate(
+        r#"
+class c; rand bit [63:0] x, m; constraint c { solve m before x; m == 1; (x & m) == 0; } endclass
+module t; initial begin
+  c a = new; int ok = 0;
+  repeat (5) if (a.randomize()) ok++;
+  $display("ok %0d", ok);
+  $finish;
+end endmodule
+"#,
+        30_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result.output.iter().map(|e| e.message.as_str()).collect();
+    let n: i32 = lines[0].split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert_eq!(n, 5, "{}", lines[0]);
+}
+
+#[test]
+fn masked_equality_soft_enabled_hint() {
+    let result = xezim::simulate(
+        r#"
+class c; rand bit [31:0] x, m; constraint c { solve m before x; m == -1; soft ((x & m) == 0); } endclass
+module t; initial begin
+  c a = new; int bad = 0;
+  repeat (100) if (!a.randomize()) bad++;
+  $display("bad %0d", bad);
+  $finish;
+end endmodule
+"#,
+        120_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result.output.iter().map(|e| e.message.as_str()).collect();
+    let n: i32 = lines[0].split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert_eq!(n, 0, "{}", lines[0]);
 }

@@ -92,6 +92,8 @@ const WORK_BUDGET: u64 = 1_000_000;
 const EST_BUDGET: u64 = 200_000;
 /// Largest domain whose values are weighed one by one.
 const EST_MAX_DOM: u128 = 64;
+/// Largest interval scanned value-wise in `csp_mask_draw`.
+const MASK_DRAW_SCAN: i128 = 4096;
 /// Budget for auxiliary slice expansion, independent of declared inputs.
 const MAX_VARS: usize = 8192;
 /// Largest size the size phase gives a dynamic array (§18.5.8.1).
@@ -5865,7 +5867,12 @@ impl Simulator {
                 let dist_len = csp.dists.len();
                 let order_len = csp.order.len();
                 let opaque = csp.opaque;
-                let node = self.csp_item(csp, inner, &env.optional_mask())?;
+                let mask_env = if enabled {
+                    env.clone()
+                } else {
+                    env.optional_mask()
+                };
+                let node = self.csp_item(csp, inner, &mask_env)?;
                 if enabled {
                     Some(node)
                 } else {
@@ -10512,9 +10519,23 @@ impl Simulator {
             return None;
         }
         let d = &st.d[v];
+        if d.iter().any(|&(l, h)| h - l > MASK_DRAW_SCAN) {
+            let size = dom_size(d);
+            for _ in 0..16 {
+                let k = self.cur_rng().gen_range(0..size);
+                let u = dom_nth(d, k);
+                let x = ((u as u64 & !pin) | val) as i128;
+                if dom_has(d, x) {
+                    return Some(x);
+                }
+            }
+            return None;
+        }
         let mut n = 0u128;
         for &(l, h) in d {
-            n += (l..=h).filter(|&v| (v as u64 & pin) == val).count() as u128;
+            n += (l..=h)
+                .filter(|&v| (v as u64 & pin) == val)
+                .count() as u128;
         }
         if n == 0 {
             return None;
