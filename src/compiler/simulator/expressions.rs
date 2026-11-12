@@ -2334,6 +2334,23 @@ impl Simulator {
                 if let Some(v) = self.plain_ident_read(h) {
                     return v;
                 }
+                // §23.6: `$root.top.u.s.m` reads exactly like the absolute
+                // `top.u.s.m`. Only the name resolver knew the `$root`
+                // segment; the member and select arms, keyed on the
+                // segments, missed it, and a packed-struct member read x.
+                // A generate or instance-array index (`$root.top.g[1].x`) is
+                // part of the resolver's flat key and stays with it.
+                if h.path.len() >= 3
+                    && h.path[0].name.name == "$root"
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                {
+                    let mut abs = h.clone();
+                    abs.path.remove(0);
+                    abs.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                    abs.cached_resolved_name = crate::ast::cache::NameCache::new();
+                    let rewritten = Expression::new(ExprKind::Ident(abs), expr.span);
+                    return self.eval_expr_ctx_inner(&rewritten, ctx_width, unsigned_context);
+                }
                 if h.path.len() >= 2
                     && !self.local_stack.is_empty()
                     && let Some(v) = self.frame_handle_path_read(expr)

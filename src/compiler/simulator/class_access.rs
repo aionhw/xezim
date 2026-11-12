@@ -623,7 +623,13 @@ impl Simulator {
             // Do NOT memoize through the shared-node cache here — go through
             // the generic top-prefix logic below on a rebuilt name instead.
             if let Some(rest) = stripped.strip_prefix(&format!("{}.", self.module.name)) {
-                if self.signal_name_to_id.contains_key(rest) || self.signals.contains_key(rest) {
+                // §7.2.1: a member of a packed struct of the design is a bit
+                // slice of its variable, never a signal of its own.
+                if self.signal_name_to_id.contains_key(rest)
+                    || self.signals.contains_key(rest)
+                    || self.unit_scope_decl_exists(rest)
+                    || self.packed_leaf_of_hier(rest).is_some()
+                {
                     let _ = hier.cached_resolved_name.set(rest.to_string());
                     return rest.to_string();
                 }
@@ -1163,7 +1169,10 @@ impl Simulator {
                     .local_stack
                     .last()
                     .is_some_and(|f| f.contains_key(head))
-                && (self.signal_name_to_id.contains_key(rest) || check_known_or_signal(rest, self))
+                && (self.signal_name_to_id.contains_key(rest)
+                    || check_known_or_signal(rest, self)
+                    // §23.6: `top.u.s.m` names member `m` of `u.s`.
+                    || (head == self.module.name && self.packed_leaf_of_hier(rest).is_some()))
             {
                 let out = rest.to_string();
                 if out.contains('.') {

@@ -226,6 +226,13 @@ impl Simulator {
                             .contains_key(h.path[0].name.name.as_str())
                         && !self.signals.contains_key(&h.path[0].name.name),
                 );
+                // §23.6: `$root.top.x` is the absolute `top.x`, which the
+                // top module's own storage spells `x`.
+                let skip = if h.path.len() >= 3 && h.path[0].name.name == "$root" {
+                    1 + usize::from(h.path[1].name.name == self.module.name)
+                } else {
+                    skip
+                };
                 let segs = &h.path[skip..];
                 // The overwhelmingly common shape is a single segment; the
                 // Vec + join below allocates twice for it. This is the
