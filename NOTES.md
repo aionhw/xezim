@@ -311,6 +311,80 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   hit the wrong bits (§7.2.1, §7.4.1, §11.5.1, §12.7.3, #1046, reported by
   Ganesh-TNL, contributed by Thomasb81).
 
+* An explicit import of a package nettype (`import p::N; N w;`, in a module
+  body, a module header or at compilation-unit scope) declares nets of that
+  nettype; elaboration stopped with "Symbol 'N' not found in package 'p'". The
+  resolver named after `with` is the package's function, even where the
+  importing module declares a function of the same name, a typedef or nettype
+  of the same name in another package no longer takes the imported nettype's
+  place, and a nettype that two wildcard-imported packages declare is an error
+  where it is used (§26.3, §6.6.7, #1083, contributed by ds54e).
+
+* A delayed continuous assignment to a vector net takes the rise delay when
+  its value changes to x or to a partly-z value, as for any change other than
+  one to 0 (fall) or to z (turn-off): `assign #(4,2) w = x;` changed `w` after
+  the smallest delay, the gate rule §10.3.3 keeps for a scalar target. This
+  covers net declaration assignments, `[0:0]` vectors, packed-struct nets and
+  a select another driver overlaps (§10.3.3, §28.16, #1076, contributed by
+  ds54e). A whole vector variable follows the same rules, and an assignment to
+  a part-select or bit-select that no other driver overlaps, and a primitive
+  whose output is a bit-select (`and #(4,2) g(w[2], a, b);`), apply their fall
+  and turn-off delays; they took the rise delay for every change. Disjoint
+  select drivers of one net that change in the same step keep their own
+  delays: `assign #2 d[3:0] = a; assign #5 d[7:4] = b;` changed both halves
+  after 2 (§10.3.3, §28.16, #1076).
+
+* A warm `--cache-dir` run starts continuously driven nets at x before their
+  drivers' first update, as an uncached run does; with the prepared tables
+  from the cache they started at z, so `assign #2 w = a;` read z at t1 and a
+  zero-delay loop read z for the whole run (§6.7.1, #1079, contributed by
+  ds54e).
+
+* A continuous assignment of a structure pattern gives an unpacked array
+  member every element its nested pattern sets by `default:`, by index key (a
+  parameter name too), by type key or by replication (`assign v = '{tag: x, a:
+  '{default: x}};`), and a structure-level `default:` or type key reaches the
+  members and elements of nested arrays and structures, through a child
+  module's output port and on nets of a user nettype with or without a
+  resolver. The array member read 0, or x on a nettype net, and a replication
+  set only its first element (§10.9.1, §10.9.2, #1081, reported by ds54e).
+
+* A `defparam` cannot set a parameter that cannot be overridden, wherever the
+  child is defined: a body `parameter` of a module that has a parameter port
+  list, a `localparam`, a type parameter, or a parameter of one of the child's
+  generate blocks. With the child in another file, the value was applied or
+  dropped without a message (§23.10.1, §6.20.1, §6.20.3, core #199,
+  contributed by chuanseng-ng).
+
+* A `defparam` written in a generate block reaches that block's instances. It
+  was dropped, so `u.A` kept its default (§23.10.1, §27).
+
+* A bind directive with several instances (`bind t c #(3) a(), b();`) binds
+  each of them, also in the colon form and into an instance path. A bound
+  array of instances builds its elements, and a bind directive the parser
+  cannot read is an error (§23.11, §23.3.2, core #200, contributed by
+  chuanseng-ng).
+
+* A module can name an instance that a compilation-unit `bind` adds to it
+  (`a.y`), from its own processes and from below through an upward name.
+  Another top cannot (§23.11, §23.8, core #201, contributed by chuanseng-ng).
+
+* A variable declared through a type parameter has the members of the type the
+  parameter is bound to. This covers class-method locals and formals of every
+  kind, collections, class typedefs of `T`, structs with `T` members, static
+  properties, static methods called through a handle, and module, interface
+  and program subroutine locals. Member reads returned 0 while the whole value
+  was right. A store into an element of a packed-struct or packed-union array
+  local is fitted to the element's width: `a[0] = '0;` kept one bit, so later
+  member writes read x (§6.20.3, §8.25, §7.2, §10.7, #1082, reported by
+  Ganesh-TNL).
+
+* A later ANSI port that omits its direction, port kind and data type takes
+  all three from the port before it; a port that gives any of them takes only
+  the direction. In `input logic [7:0] d, input clk, rst_n` the port `rst_n`
+  is one bit. A list opened by a port kind or packed dimensions now parses as
+  ANSI (§23.2.2.3, #1078, reported by ds54e).
+
 **Performance**
 
 * Callable locals with literal or name-free dimensions stay shared during
