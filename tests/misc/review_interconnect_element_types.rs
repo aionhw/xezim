@@ -98,11 +98,6 @@ endmodule
 /// (`4.61281e+18` for 2.5).
 #[test]
 fn real_interconnect_elements_keep_their_type_with_the_native_switch() {
-    let mut exe = std::env::current_exe().expect("current_exe");
-    exe.pop();
-    if exe.ends_with("deps") {
-        exe.pop();
-    }
     let dir = std::env::temp_dir().join(format!("xezim_interconnect_real_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -131,7 +126,7 @@ endmodule
 "#,
     )
     .unwrap();
-    let out = std::process::Command::new(exe.join("xezim"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
         .current_dir(&dir)
         .env("XEZIM_JIT", "1")
         .args(["--no-cache", "tb.sv", "-s", "t"])

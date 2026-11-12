@@ -933,12 +933,7 @@ fn sdf_timingcheck_back_annotation() {
 
     let sv = dir.join("t.sv");
     std::fs::write(&sv, SDF1_SRC.replace("ANNOTATE", "")).unwrap();
-    let mut bin = std::env::current_exe().unwrap();
-    bin.pop();
-    if bin.ends_with("deps") {
-        bin.pop();
-    }
-    let out = std::process::Command::new(bin.join("xezim"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg("--sdf")
         .arg(&sdf)
         .arg(&sv)

@@ -5,12 +5,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn xezim_bin() -> PathBuf {
-    let mut path = std::env::current_exe().expect("current_exe");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("xezim")
+    // Cargo names the binary it built for the integration tests.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"))
 }
 
 fn metric(output: &str, key: &str) -> u64 {

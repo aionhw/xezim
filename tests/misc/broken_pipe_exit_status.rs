@@ -12,12 +12,8 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 fn xezim() -> String {
-    let mut p = std::env::current_exe().expect("current_exe");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("xezim").to_string_lossy().into_owned()
+    // Cargo names the binary it built for the integration tests.
+    env!("CARGO_BIN_EXE_xezim").to_string()
 }
 
 /// Enough output after the first line to fill the pipe, so the run is still

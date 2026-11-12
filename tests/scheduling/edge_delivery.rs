@@ -157,12 +157,8 @@ fn signal_ping_pong_livelocks_into_attributed_stall() {
     use std::process::Command;
 
     fn xezim_bin() -> std::path::PathBuf {
-        let mut p = std::env::current_exe().expect("current_exe");
-        p.pop();
-        if p.ends_with("deps") {
-            p.pop();
-        }
-        p.join("xezim")
+        // Cargo names the binary it built for the integration tests.
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"))
     }
 
     let dir = std::env::temp_dir().join("xezim_edge_pingpong_test");
@@ -256,12 +252,8 @@ fn settle_limit_warning_names_the_oscillating_signals() {
     use std::process::Command;
 
     fn xezim_bin() -> std::path::PathBuf {
-        let mut p = std::env::current_exe().expect("current_exe");
-        p.pop();
-        if p.ends_with("deps") {
-            p.pop();
-        }
-        p.join("xezim")
+        // Cargo names the binary it built for the integration tests.
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"))
     }
 
     let dir = std::env::temp_dir().join("xezim_settle_warn_test");
@@ -348,12 +340,7 @@ fn nba_feedback_loop_is_reported_not_dropped() {
          module tb; pll_cell u_pll(); initial #100 $finish; endmodule\n",
     )
     .unwrap();
-    let mut bin = std::env::current_exe().unwrap();
-    bin.pop();
-    if bin.ends_with("deps") {
-        bin.pop();
-    }
-    let out = std::process::Command::new(bin.join("xezim"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg(&sv)
         .output()
         .expect("run");

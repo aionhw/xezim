@@ -25,12 +25,7 @@ impl CaseDir {
     fn run(&self, source: &str, compiled: bool, fast: bool, cached: bool) -> String {
         let input = self.0.join("case.sv");
         std::fs::write(&input, source).expect("write test source");
-        let mut binary = std::env::current_exe().expect("test executable");
-        binary.pop();
-        if binary.ends_with("deps") {
-            binary.pop();
-        }
-        binary.push("xezim");
+        let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"));
         let output = Command::new("timeout")
             .args(["--kill-after=5s", "60s"])
             .arg(binary)

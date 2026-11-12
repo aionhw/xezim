@@ -5,12 +5,8 @@
 //! silently freezing. The warning goes to stderr, so this drives the CLI.
 
 fn xezim_bin() -> std::path::PathBuf {
-    let mut p = std::env::current_exe().expect("current_exe");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("xezim")
+    // Cargo names the binary it built for the integration tests.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"))
 }
 
 fn run(src: &str, tag: &str) -> String {

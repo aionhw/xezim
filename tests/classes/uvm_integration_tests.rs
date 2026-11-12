@@ -1651,12 +1651,8 @@ pub(super) fn stress_bench_items_flow_end_to_end_1_2() {
 // topology) is what makes the clobber reproduce, so this shells the xezim
 // binary with `-s test -s dut` rather than the single-top `simulate_multi`.
 fn xezim_bin() -> String {
-    let mut p = std::env::current_exe().expect("current_exe");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("xezim").to_string_lossy().into_owned()
+    // Cargo names the binary it built for the integration tests.
+    env!("CARGO_BIN_EXE_xezim").to_string()
 }
 
 const TWO_TOP_PARAM_AGENT: &str = r#"

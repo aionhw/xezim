@@ -225,14 +225,8 @@ endmodule
     assert_eq!(f(&off), f(&on), "ON != OFF");
 }
 
-/// Subprocess binary path (tests run from the crate's test harness —
-/// current_exe-relative like the other compiled-method tests).
+/// Subprocess binary path, as Cargo built it for the integration tests.
 fn xezim_bin() -> std::path::PathBuf {
-    let mut p = std::env::current_exe().expect("current_exe");
-    p.pop(); // deps/
-    p.pop(); // tests/ (or debug/)
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("xezim")
+    // Cargo names the binary it built for the integration tests.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"))
 }
