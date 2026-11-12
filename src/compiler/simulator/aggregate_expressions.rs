@@ -3724,9 +3724,15 @@ impl Simulator {
             }
             "$urandom" => {
                 if let Some(seed_arg) = args.first() {
+                    // §18.13.1: `seed` is an input (`$urandom [(int seed)]`),
+                    // never written back, and it initializes the generator:
+                    // the calls without a seed that follow continue the
+                    // sequence that seed determines, in this thread only
+                    // (§18.14.2).
                     let s = self.eval_expr(seed_arg).to_u64().unwrap_or(0) as u32;
                     let next = Self::prng_next(s);
-                    self.assign_value(seed_arg, &Value::from_u64(next as u64, 32));
+                    self.proc_rng
+                        .insert(self.current_pid, SvRng::from_seed(u64::from(s)));
                     Value::from_u64(next as u64, 32)
                 } else {
                     Value::from_u64(self.rng_u32() as u64, 32)
