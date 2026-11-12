@@ -857,6 +857,71 @@ impl Simulator {
         })
     }
 
+    /// §6.20.3/§8.25: the design typedef a class type parameter's binding
+    /// `b` names (`p::pkt_t`), as a reference keeping its package scope so
+    /// the members' widths read the package's parameters. A declaration
+    /// written `T x;` takes its struct layout, member names and packed
+    /// dimensions from it; the bare `T` names nothing in the design's type
+    /// tables. `None` for a binding that is no design typedef (a built-in
+    /// type is sized from the binding directly).
+    pub(super) fn bound_typedef_dt(&self, b: &str) -> Option<DataType> {
+        let b = b.trim();
+        if !self.module.typedef_types.contains_key(b) || self.module.classes.contains_key(b) {
+            return None;
+        }
+        let span = crate::ast::Span::dummy();
+        let mut parts: Vec<&str> = b.split("::").collect();
+        let leaf = parts.pop()?;
+        Some(DataType::TypeReference {
+            name: crate::ast::types::TypeName {
+                scopes: parts
+                    .into_iter()
+                    .map(|s| crate::ast::types::TypeScope {
+                        name: crate::ast::Identifier {
+                            name: s.to_string(),
+                            span,
+                        },
+                        type_args: Vec::new(),
+                    })
+                    .collect(),
+                name: crate::ast::Identifier {
+                    name: leaf.to_string(),
+                    span,
+                },
+                span,
+                bound: Default::default(),
+            },
+            dimensions: Vec::new(),
+            type_args: Vec::new(),
+            span,
+        })
+    }
+
+    /// §8.25/§7.2: a struct type whose members name a class TYPE parameter
+    /// the active object or specialization binds, with those members bound
+    /// (see `bind_type_params_in`). `None` for any other type, or outside a
+    /// parameterized class.
+    pub(super) fn struct_with_bound_members(&mut self, dt: &DataType) -> Option<DataType> {
+        // Cheap reject first: this runs for every local declaration.
+        if !matches!(dt, DataType::Struct(_)) || !self.in_parameterized_class() {
+            return None;
+        }
+        self.bind_type_params_in(dt, &|n| self.resolve_type_param_binding(n))
+    }
+
+    /// Whether the executing method's object or specialization is that of a
+    /// parameterized class.
+    fn in_parameterized_class(&self) -> bool {
+        self.current_spec.is_some()
+            || self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|h| self.heap.get(h)?.as_ref())
+                .is_some_and(|i| !i.type_bindings.is_empty())
+    }
+
     /// §8.25/§7.2: the width of a struct, union or enum type whose members
     /// name a class TYPE parameter the active object or specialization binds
     /// (`struct packed { T a; bit b; }`). `None` for any other type, or

@@ -1401,6 +1401,33 @@ impl Simulator {
         false
     }
 
+    /// §6.20.3/§8.25: the design typedef that a formal of a method of
+    /// `cname` declared through one of its class type parameters (`T item`)
+    /// names in the object `handle`, before the call's frame is entered.
+    pub(super) fn formal_bound_typedef(
+        &mut self,
+        handle: usize,
+        cname: &str,
+        dt: &DataType,
+    ) -> Option<DataType> {
+        let DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = dt
+        else {
+            return None;
+        };
+        if name.has_scope() || !dimensions.is_empty() || !type_args.is_empty() {
+            return None;
+        }
+        self.this_stack.push(Some(handle));
+        let binding = self.type_param_concrete_in(dt, cname);
+        self.this_stack.pop();
+        self.bound_typedef_dt(&binding?)
+    }
+
     pub(super) fn exec_method_in_class_hierarchy(
         &mut self,
         handle: usize,
@@ -1617,6 +1644,25 @@ impl Simulator {
                     };
                     let plain_class = class_ref.is_some();
                     let plain = plain_class || pp.plain_scalar;
+                    // §6.20.3/§8.25: a formal declared through a class type
+                    // parameter (`T item`, `T q[$]`) has the type its binding
+                    // names, for its metadata and for every binder below.
+                    // Under the bare `T` no member layout was registered and
+                    // `item.data` or `q[0].data` read 0.
+                    let bound_port;
+                    let port = match (!plain)
+                        .then(|| self.formal_bound_typedef(handle, cname, &port.data_type))
+                        .flatten()
+                    {
+                        Some(data_type) => {
+                            bound_port = crate::ast::decl::FunctionPort {
+                                data_type,
+                                ..port.clone()
+                            };
+                            &bound_port
+                        }
+                        None => port,
+                    };
                     if !plain && matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_))
                     {
                         self.register_formal_type_metadata(

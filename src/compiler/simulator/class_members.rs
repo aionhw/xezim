@@ -3084,6 +3084,14 @@ impl Simulator {
             }
             found?
         };
+        // §6.20.3/§8.25: a static declared through a class type parameter
+        // (`static T sp;`) has the type its binding names.
+        if let Some(bound) = self
+            .type_param_concrete_in(&dt, &cls)
+            .and_then(|c| self.bound_typedef_dt(&c))
+        {
+            dt = bound;
+        }
         // Walk the member path through the packed layouts: each level's
         // offset is relative to the enclosing member's least significant bit.
         let (mut off, mut w) = (0u32, 0u32);

@@ -2161,6 +2161,19 @@ impl Simulator {
             None
         };
         let tp_concrete = tp_param.or_else(|| tp_scoped.clone());
+        // §6.20.3/§8.25: a binding that names a design typedef (a packed
+        // struct, say) is the local's declared type for the metadata below:
+        // the member layout, member names and packed dimensions. Under the
+        // bare `T` none was registered, so `loc.data` read 0 while `loc`
+        // held the right bits.
+        // So is a struct whose members name a type parameter (`typedef
+        // struct packed { T inner; logic [3:0] tag; } wrap_t;`) with the
+        // members bound: `w.inner` had no width in its layout.
+        let bound_typedef = match tp_concrete.as_deref() {
+            Some(c) => self.bound_typedef_dt(c),
+            None => self.struct_with_bound_members(data_type),
+        };
+        let data_type: &DataType = bound_typedef.as_ref().unwrap_or(data_type);
         let tp_width = tp_concrete
             .as_deref()
             .and_then(|c| self.concrete_type_width(c));
