@@ -823,12 +823,14 @@ impl Simulator {
             if self.module.dynamic_arrays.contains(&n) || self.is_associative_array(&n) {
                 if ret_is_assoc {
                     self.snapshot_ret_assoc(&n);
-                } else if self.queue_elem_struct(&n).is_none() {
+                } else if let Some(su) = self.queue_elem_struct(&n) {
+                    let len = self.get_queue_size(&n) as i64;
+                    let idx: Vec<i64> = (0..len).collect();
+                    self.snapshot_ret_structs(&n, &idx, &su);
+                } else {
                     const RET_SNAP: &str = "__xz_ret_coll__";
                     self.copy_whole_queue(RET_SNAP, &n);
                     self.pending_ret_collection = Some(RET_SNAP.to_string());
-                } else {
-                    self.pending_ret_collection = Some(n);
                 }
                 self.return_value = Some(Value::zero(32));
             } else if self.snapshot_ret_fixed(&n) {

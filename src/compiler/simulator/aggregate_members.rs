@@ -1816,7 +1816,7 @@ impl Simulator {
         }
         let (handle, prop) = self.class_prop_receiver(lvalue)?;
         let su = self.class_prop_struct(handle, &prop)?;
-        if !Self::spreads_member_wise(&su) {
+        if !Self::spreads_member_wise(&su) || self.whole_class_array_prop(lvalue, handle, &prop) {
             return None;
         }
         // §10.6/§13.4.1: a CALL source (`last = q.pop_front()`, `p = mk()`)
@@ -1859,6 +1859,54 @@ impl Simulator {
             }
         }
         Some(())
+    }
+
+    /// §7.2, §7.4: `e` names a whole unpacked-ARRAY property `prop` of the
+    /// object `handle` (its elements are structs), not one struct: the
+    /// whole-array copy paths own it. A member-wise decomposition of
+    /// `da = fx` wrote members of the array itself and copied nothing.
+    pub(super) fn whole_class_array_prop(&self, e: &Expression, handle: usize, prop: &str) -> bool {
+        let selected = match &e.kind {
+            ExprKind::Ident(h) => h.path.last().is_some_and(|s| !s.selects.is_empty()),
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } => true,
+            _ => false,
+        };
+        if selected {
+            return false;
+        }
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .and_then(|i| self.module.classes.get(&i.class_name));
+        for _ in 0..=self.module.classes.len() {
+            let Some(cd) = cur else {
+                return false;
+            };
+            if cd.array_properties.contains_key(prop)
+                || cd.array_nd_properties.contains_key(prop)
+                || cd.queue_properties.contains_key(prop)
+                || cd.queue_property_names.contains(prop)
+                || cd.assoc_properties.contains_key(prop)
+                || cd.param_sized_props.contains_key(prop)
+            {
+                return true;
+            }
+            if let Some(dt) = cd.property_types.get(prop) {
+                // A property declared through an unpacked-array typedef.
+                return matches!(dt, DataType::TypeReference { name, dimensions, .. }
+                    if dimensions.is_empty()
+                        && !name.has_scope()
+                        && self
+                            .class_chain_typedef_dims(handle, &name.name.name)
+                            .is_some_and(|d| !d.is_empty()));
+            }
+            cur = cd
+                .extends
+                .as_deref()
+                .and_then(|b| self.module.classes.get(b));
+        }
+        false
     }
 
     /// `lhs = rhs` for one struct member. A nested UNPACKED struct member has
@@ -1946,7 +1994,7 @@ impl Simulator {
         }
         let (handle, prop) = self.class_prop_receiver(rvalue)?;
         let su = self.class_prop_struct(handle, &prop)?;
-        if !Self::spreads_member_wise(&su) {
+        if !Self::spreads_member_wise(&su) || self.whole_class_array_prop(rvalue, handle, &prop) {
             return None;
         }
         // Same per-element decomposition of members with FIXED unpacked

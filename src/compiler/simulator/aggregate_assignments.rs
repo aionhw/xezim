@@ -667,6 +667,10 @@ impl Simulator {
     /// Reserved storage for an associative array a function returns.
     pub(super) const RET_ASSOC_SNAP: &'static str = "__xz_ret_aa__";
 
+    /// Reserved storage for a fixed array of unpacked structs a function
+    /// returns (see `snapshot_ret_fixed`).
+    pub(super) const RET_STRUCT_SNAP: &'static str = "__xz_ret_sa__";
+
     /// Copy the returned associative array `src` to the reserved snapshot,
     /// register it and hand it to the caller via `pending_ret_collection`.
     pub(super) fn snapshot_ret_assoc(&mut self, src: &str) {
@@ -1803,8 +1807,15 @@ impl Simulator {
                             continue;
                         }
                     }
-                    if let Some(v) = self.get_signal_value_by_name(&sname) {
-                        self.write_leaf_by_name(&d, v);
+                    if let Some(v) = self.struct_leaf_value(&sname) {
+                        let is_str = matches!(
+                            self.resolve_dt_ref(&m.data_type),
+                            DataType::Simple {
+                                kind: crate::ast::types::SimpleType::String,
+                                ..
+                            }
+                        );
+                        self.write_struct_leaf(&d, v, is_str);
                     }
                 } else if md.dimensions.iter().any(|dim| {
                     matches!(
@@ -1868,6 +1879,38 @@ impl Simulator {
                 }
             }
         }
+    }
+
+    /// The leaf `flat` of an unpacked struct, wherever it is stored: a signal,
+    /// or, for an element of a class property's fixed array of unpacked
+    /// structs (`<h>#fx[1].a`), the instance's own cell `fx[1].a`.
+    pub(super) fn struct_leaf_value(&self, flat: &str) -> Option<Value> {
+        if let Some(v) = self.get_signal_value_by_name(flat) {
+            return Some(v);
+        }
+        let (h, key) = flat.split_once('#')?;
+        let inst = self.heap.get(h.parse::<usize>().ok()?)?.as_ref()?;
+        inst.properties.get(key).cloned()
+    }
+
+    /// Store `v` into the struct leaf `flat` ([`Self::struct_leaf_value`]):
+    /// an instance cell that exists keeps its width (a string its length).
+    pub(super) fn write_struct_leaf(&mut self, flat: &str, v: Value, is_str: bool) {
+        if let Some((h, key)) = flat.split_once('#')
+            && let Ok(h) = h.parse::<usize>()
+            && let Some(Some(inst)) = self.heap.get_mut(h)
+            && let Some(old) = inst.properties.get_mut(key)
+        {
+            *old = if is_str || v.is_real || old.is_real {
+                v
+            } else {
+                let mut nv = v.resize(old.width);
+                nv.is_signed = old.is_signed;
+                nv
+            };
+            return;
+        }
+        self.write_leaf_by_name(flat, v);
     }
 
     /// The unpacked-struct element type of queue `obj_name`, if it has one.
@@ -4198,13 +4241,25 @@ impl Simulator {
         }
         // A collection formal's per-call key `@name#N` (see
         // `formal_dyn_key`): the formal's own declared type.
-        if let Some(bare) = name
-            .strip_prefix('@')
-            .and_then(|s| s.rsplit_once('#'))
-            .map(|(b, _)| b)
-            && let Some(dt) = self.module.var_decl_types.get(bare)
-        {
-            return Some(Cow::Borrowed(dt));
+        // Its elements (`@name#N[i]`) take the same entry, as below; a
+        // member of an element (`@d#9[1].d`) is not the element: it resolves
+        // through the declared member types, or a struct element's leaf
+        // `d` was taken for the struct and the write spread over it.
+        if let Some((bare, rest)) = name.strip_prefix('@').and_then(|s| s.rsplit_once('#')) {
+            let sel = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            if sel.len() < rest.len()
+                && sel.starts_with('[')
+                && sel
+                    .rfind(']')
+                    .is_some_and(|p| sel[p + 1..].starts_with('.'))
+            {
+                return self
+                    .flat_path_type(&format!("{bare}{sel}"))
+                    .map(|(d, _)| Cow::Owned(d));
+            }
+            if let Some(dt) = self.module.var_decl_types.get(bare) {
+                return Some(Cow::Borrowed(dt));
+            }
         }
         // A plain identifier without `[` or `.` already missed `var_decl_types`
         // above; skip `flat_single_base` (which would return `Some(name)` and

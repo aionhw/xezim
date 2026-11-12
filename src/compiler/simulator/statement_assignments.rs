@@ -536,6 +536,33 @@ impl Simulator {
         }
     }
 
+    /// §7.2, §13.4.1: hand over the returned array `name` of unpacked
+    /// structs, its elements `idx` in order, through a store of its own that
+    /// records the element type, so the caller copies each element member by
+    /// member. Frame teardown wipes a subroutine-local array before the
+    /// caller reads it, which left the copy empty.
+    pub(super) fn snapshot_ret_structs(
+        &mut self,
+        name: &str,
+        idx: &[i64],
+        su: &crate::ast::types::StructUnionType,
+    ) {
+        let snap = Self::RET_STRUCT_SNAP;
+        if name != snap {
+            let w = self.module.arrays.get(name).map_or(32, |t| t.2);
+            self.module.arrays.insert(snap.to_string(), (0, -1, w));
+            self.module.dynamic_arrays.insert(snap.to_string());
+            self.module
+                .var_decl_types
+                .insert(snap.to_string(), DataType::Struct(su.clone()));
+            for (pos, i) in idx.iter().enumerate() {
+                self.copy_unpacked_struct(&format!("{snap}[{pos}]"), &format!("{name}[{i}]"), su);
+            }
+            self.set_queue_size(snap, idx.len() as u64);
+        }
+        self.pending_ret_collection = Some(snap.to_string());
+    }
+
     /// §7.6/§13.4.1: snapshot a fixed unpacked return in declaration
     /// order before its local storage is restored or destroyed. The reserved
     /// return store has zero-based indices, independently of the source range.
@@ -547,6 +574,18 @@ impl Simulator {
             return false;
         };
         let descending = self.module.descending_arrays.contains(name);
+        // §7.2, §13.4.1: an unpacked-struct element has member leaves and no
+        // value of its own. Its copy goes to a store of its own that records
+        // the element type, so the caller copies it member by member too.
+        if let Some(su) = self.queue_elem_struct(name) {
+            let idx: Vec<i64> = if descending {
+                (lo..=hi).rev().collect()
+            } else {
+                (lo..=hi).collect()
+            };
+            self.snapshot_ret_structs(name, &idx, &su);
+            return true;
+        }
         const RET_SNAP: &str = "__xz_ret_coll__";
         for pos in 0..=(hi - lo) {
             let idx = if descending { hi - pos } else { lo + pos };
@@ -2819,6 +2858,25 @@ impl Simulator {
                 // elements + size, not re-key assoc entries. Distinguish
                 // by whether the collection is a true assoc array.
                 let dst_is_assoc = self.is_associative_array(&dst);
+                // §7.6, §7.2: a FIXED class-property array of unpacked
+                // structs from a queue or dynamic array (`fx = da`): each
+                // element member by member, from the destination's left
+                // bound, into the instance cells its reads use.
+                if !dst_is_assoc
+                    && !self.is_associative_array(&src)
+                    && let Some((_, lo, hi)) = self.fixed_array_operand(lvalue)
+                    && let Some(su) = self
+                        .queue_elem_struct(&src)
+                        .or_else(|| self.queue_elem_struct(&dst))
+                {
+                    let n = self.get_queue_size(&src).min((hi - lo + 1) as u64);
+                    for i in 0..n {
+                        let (d, s) = (format!("{dst}[{}]", lo + i as i64), format!("{src}[{i}]"));
+                        self.copy_unpacked_struct(&d, &s, &su);
+                    }
+                    self.settle_after_proc_write();
+                    return;
+                }
                 if !dst_is_assoc
                     && (self.module.dynamic_arrays.contains(&dst)
                         || self.signals.contains_key(&format!("{}.size", dst)))
@@ -4040,8 +4098,18 @@ impl Simulator {
         if let (Some(dst), Some((src, lo, hi))) = (l_dyn.clone(), r_fix) {
             let desc = self.module.descending_arrays.contains(&src);
             let n = (hi - lo + 1) as u64;
+            // §7.6, §7.2: an unpacked-struct element has no value of its own,
+            // only member leaves: copy each element member by member.
+            let su = self
+                .queue_elem_struct(&src)
+                .or_else(|| self.queue_elem_struct(&dst));
             for i in 0..n {
                 let ridx = if desc { hi - i as i64 } else { lo + i as i64 };
+                if let Some(su) = &su {
+                    let (d, s) = (format!("{dst}[{i}]"), format!("{src}[{ridx}]"));
+                    self.copy_unpacked_struct(&d, &s, su);
+                    continue;
+                }
                 let v = self
                     .get_signal_value_by_name(&format!("{}[{}]", src, ridx))
                     .unwrap_or_else(|| Value::zero(32));
@@ -4065,8 +4133,16 @@ impl Simulator {
             let desc = self.module.descending_arrays.contains(&dst);
             let cap = (hi - lo + 1) as u64;
             let n = self.get_queue_size(&src).min(cap);
+            let su = self
+                .queue_elem_struct(&src)
+                .or_else(|| self.queue_elem_struct(&dst));
             for i in 0..n {
                 let lidx = if desc { hi - i as i64 } else { lo + i as i64 };
+                if let Some(su) = &su {
+                    let (d, s) = (format!("{dst}[{lidx}]"), format!("{src}[{i}]"));
+                    self.copy_unpacked_struct(&d, &s, su);
+                    continue;
+                }
                 let v = self
                     .get_signal_value_by_name(&format!("{}[{}]", src, i))
                     .unwrap_or_else(|| Value::zero(32));
