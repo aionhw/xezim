@@ -470,3 +470,5 @@ mod review_tri_port_net_types;
 mod modport_qualified_access;
 #[path = "hierarchy/defparam_targets_core_199.rs"]
 mod defparam_targets_core_199;
+#[path = "hierarchy/bind_instance_lists_core_200.rs"]
+mod bind_instance_lists_core_200;
