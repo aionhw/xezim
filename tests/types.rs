@@ -706,3 +706,5 @@ mod unpacked_slice_patterns_1045;
 mod package_nettype_import;
 #[path = "types/struct_pattern_keys_continuous_assign.rs"]
 mod struct_pattern_keys_continuous_assign;
+#[path = "types/ansi_port_inheritance_1078.rs"]
+mod ansi_port_inheritance_1078;
