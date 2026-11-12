@@ -1115,6 +1115,11 @@ struct DelayTarget {
     width: u32,
     /// §10.3.3 vector assignment, rather than §28.16 gate/scalar rules.
     vector: bool,
+    /// The fall and turn-off delays of an assignment to a constant bit- or
+    /// part-select, whose net other drivers share; the bits come from the
+    /// select at each update. None for a whole-net target, whose delays are
+    /// in the per-driver maps.
+    select_delays: Option<(Option<u64>, Option<u64>)>,
 }
 
 /// A combinatorial item (continuous assign or always @*/always_comb block)
@@ -1128,8 +1133,9 @@ enum CombItem {
         lhs: Box<Expression>,
         rhs: Box<Expression>,
         delay: u64,
-        /// §10.3.3 / §28.16: the original target before driver widening.
-        delay_target: Option<DelayTarget>,
+        /// §10.3.3 / §28.16: the original target before driver widening,
+        /// boxed like the ASTs so the entry stays cache compact.
+        delay_target: Option<Box<DelayTarget>>,
     },
     /// Fast path: direct signal-to-signal copy (assign b = a) with pre-resolved IDs.
     DirectCopy {
@@ -1666,7 +1672,8 @@ struct CombEntryCold {
 // depend on its members too.
 // §10.3.3: keep falling and turn-off delays when prepared tables are restored.
 // §10.3.3 / §28.16: retain each delayed entry's original transition target.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB033";
+// §10.3.3 / §28.16: and the fall and turn-off delays of a select target.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB034";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -7545,6 +7552,10 @@ pub struct Simulator {
     sdf_delays: Vec<u64>,
     /// Pending delayed signal updates: (time, signal_id, value)
     delayed_updates: Vec<(u64, usize, Value)>,
+    /// §10.3.3 / §28.16: some net may hold more than one pending update in
+    /// `delayed_updates` (select drivers due at different times, see
+    /// `schedule_delayed_slice_chain`). Cleared when no update is pending.
+    delayed_slice_chains: bool,
     /// §4.9.4: future-time NBA updates (`a <= #d v`). Kept SEPARATE from
     /// `delayed_updates` (gate/CA transport, an ACTIVE-region event at
     /// maturity): these commit in the target slot's NBA region, after that

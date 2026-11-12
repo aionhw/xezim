@@ -612,6 +612,7 @@ impl Simulator {
                 if let Some(c) = entry.cold.cov {
                     self.cov_count(c);
                 }
+                let delay_target = delay_target.as_deref().copied();
                 let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = std::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
@@ -700,6 +701,7 @@ impl Simulator {
                     self.packed_array_copy_values.insert(ids, val.clone());
                 }
                 if delay > 0
+                    || delay_target.is_some_and(|t| t.select_delays.is_some())
                     || lhs_id.is_some_and(|id| {
                         self.gate_fall_delay_by_id.contains_key(&id)
                             || self.gate_off_delay_by_id.contains_key(&id)
@@ -708,7 +710,7 @@ impl Simulator {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {
                             if !self.delayed_update_pending_is(id, &val) {
-                                self.schedule_delayed_transition(id, val, delay, *delay_target);
+                                self.schedule_delayed_transition(id, val, delay, delay_target);
                             }
                         } else {
                             self.cancel_delayed(id);
@@ -719,6 +721,27 @@ impl Simulator {
                         // this used to DROP the write silently. Composes
                         // against the PENDING delayed value (issue #143).
                         let sel_val = val.resize(sel_w);
+                        // §10.3.3 / §28.16: the select's own transition
+                        // delay, from the selected bits' current value.
+                        let delay = match delay_target {
+                            Some(DelayTarget {
+                                vector,
+                                select_delays: Some((fall, off)),
+                                ..
+                            }) => {
+                                let hi = (lo + sel_w - 1) as usize;
+                                let old = self.signal_table[base_id].range_select(hi, lo as usize);
+                                Self::transition_delay(
+                                    &sel_val,
+                                    &old,
+                                    delay,
+                                    fall,
+                                    off,
+                                    vector || sel_w > 1,
+                                )
+                            }
+                            _ => delay,
+                        };
                         self.schedule_delayed_slice(base_id, lo, sel_w, &sel_val, delay);
                     }
                 } else if let Some(id) = lhs_id {

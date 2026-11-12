@@ -926,10 +926,23 @@ impl Simulator {
                     .gate_fall_delay_by_id
                     .get(&wids[0])
                     .is_some_and(|&d| d > 0);
+            // §28.16: a primitive keeps its fall delay apart from the
+            // assignment's own; like the per-driver map of a whole-net output
+            // it follows the structural delay mode.
+            let select_target = matches!(
+                ca.lhs.kind,
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+            );
+            let select_fall = ca.delay_fall.or_else(|| {
+                ca.gate_delay_fall
+                    .filter(|_| select_target && delay_mode() != 1)
+                    .map(apply_delay_mode)
+            });
             let has_transition_delay = explicit_delay > 0
                 || primitive_fall
                 || ca.delay_fall.is_some_and(|d| d > 0)
-                || ca.delay_off.is_some_and(|d| d > 0);
+                || ca.delay_off.is_some_and(|d| d > 0)
+                || (select_target && select_fall.is_some_and(|d| d > 0));
             // §10.3.3 versus §28.16: use the assignment's origin, not the
             // target's gate marker. Multi-driver lowering can give a gate
             // and an assignment separate, unmarked driver nets.
@@ -948,7 +961,26 @@ impl Simulator {
                         lo,
                         width,
                         vector: ca.origin.is_some() && vector,
+                        select_delays: None,
                     })
+            } else if has_transition_delay
+                && select_target
+                && (select_fall.is_some_and(|f| f != explicit_delay)
+                    || ca.delay_off.is_some_and(|t| t != explicit_delay))
+            {
+                // §10.3.3 / §28.16: a constant select keeps a select target
+                // (no other driver overlaps it), so the per-driver maps of
+                // its net cannot hold its fall and turn-off delays. A
+                // part-select is a vector target; a bit-select (or a gate
+                // output on one) takes the gate rules unless it selects a
+                // vector element.
+                Some(DelayTarget {
+                    lo: 0,
+                    width: 0,
+                    vector: ca.origin.is_some()
+                        && matches!(ca.lhs.kind, ExprKind::RangeSelect { .. }),
+                    select_delays: Some((select_fall, ca.delay_off)),
+                })
             } else {
                 None
             };
@@ -987,7 +1019,7 @@ impl Simulator {
                     lhs: Box::new(ca.lhs.clone()),
                     rhs: Box::new(ca.rhs.clone()),
                     delay: explicit_delay,
-                    delay_target,
+                    delay_target: delay_target.map(Box::new),
                 }
             } else if let Some(op) = fused {
                 CombItem::FusedGate { op }

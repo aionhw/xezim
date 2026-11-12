@@ -3942,6 +3942,7 @@ impl Simulator {
             sdf_select: None,
             sdf_delays: Vec::new(),
             delayed_updates: Vec::new(),
+            delayed_slice_chains: false,
             delayed_nba: Vec::new(),
             delayed_nba_queue: Vec::new(),
             packed_nba: Vec::new(),

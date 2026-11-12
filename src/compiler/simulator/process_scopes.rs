@@ -4604,6 +4604,9 @@ impl Simulator {
                 i += 1;
             }
         }
+        if self.delayed_updates.is_empty() {
+            self.delayed_slice_chains = false;
+        }
         applied
     }
 
@@ -4702,6 +4705,51 @@ impl Simulator {
         self.schedule_delayed_transition(id, val, delay, None);
     }
 
+    /// §10.3.3 / §28.16: the delay of a change from `old` to `new` with the
+    /// rise delay `rise` and the given fall and turn-off delays: fall for a
+    /// change to 0, turn-off for a change to z (with only two delays, the
+    /// smaller of rise and fall), and rise otherwise, except that a scalar
+    /// target (`vector` false) takes the smallest delay for a change to x.
+    pub(super) fn transition_delay(
+        new: &Value,
+        old: &Value,
+        rise: u64,
+        fall: Option<u64>,
+        off: Option<u64>,
+        vector: bool,
+    ) -> u64 {
+        // NB: `to_u64()` MASKS x/z to 0 rather than returning None, so it
+        // cannot distinguish a genuine 0 from z — use an explicit bit test.
+        // The initial x/z -> 0 settle counts as a fall as well, so the
+        // test is "the new value is a real 0 and the old one was not".
+        let all_zero = |v: &Value| -> bool {
+            !v.has_xz() && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Zero)
+        };
+        let all_z = |v: &Value| -> bool {
+            v.width > 0 && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Z)
+        };
+        if fall.is_none() && off.is_none() {
+            rise
+        } else if all_zero(new) && !all_zero(old) {
+            fall.unwrap_or(rise)
+        } else if all_z(new) {
+            // §10.3.3 / §28.16: to z uses the turn-off delay; with only
+            // two delays given, the smaller of rise and fall.
+            off.unwrap_or_else(|| fall.map_or(rise, |f| f.min(rise)))
+        } else if new.has_xz() && !vector {
+            // §28.16: scalar/gate to x uses the smallest delay. For a
+            // vector continuous assignment, §10.3.3 uses rise for every
+            // case other than nonzero -> all 0 or -> all z.
+            [Some(rise), fall, off]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(rise)
+        } else {
+            rise
+        }
+    }
+
     /// §10.3.3 vector assignments use rise for x and mixed values;
     /// scalar assignments and gate/net delays retain §28.16.
     pub(super) fn schedule_delayed_transition(
@@ -4743,38 +4791,9 @@ impl Simulator {
             let old_value = selected
                 .as_ref()
                 .map_or(&self.signal_table[id], |(_, old)| old);
-            // NB: `to_u64()` MASKS x/z to 0 rather than returning None, so it
-            // cannot distinguish a genuine 0 from z — use an explicit bit test.
-            // The initial x/z -> 0 settle counts as a fall as well, so the
-            // test is "the new value is a real 0 and the old one was not".
-            let all_zero = |v: &Value| -> bool {
-                !v.has_xz() && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Zero)
-            };
             let fall = self.gate_fall_delay_by_id.get(&id).copied();
             let off = self.gate_off_delay_by_id.get(&id).copied();
-            let all_z = |v: &Value| -> bool {
-                v.width > 0 && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Z)
-            };
-            if fall.is_none() && off.is_none() {
-                delay
-            } else if all_zero(new_value) && !all_zero(old_value) {
-                fall.unwrap_or(delay)
-            } else if all_z(new_value) {
-                // §10.3.3 / §28.16: to z uses the turn-off delay; with only
-                // two delays given, the smaller of rise and fall.
-                off.unwrap_or_else(|| fall.map_or(delay, |f| f.min(delay)))
-            } else if new_value.has_xz() && !vector_assign {
-                // §28.16: scalar/gate to x uses the smallest delay. For a
-                // vector continuous assignment, §10.3.3 uses rise for every
-                // case other than nonzero -> all 0 or -> all z.
-                [Some(delay), fall, off]
-                    .into_iter()
-                    .flatten()
-                    .min()
-                    .unwrap_or(delay)
-            } else {
-                delay
-            }
+            Self::transition_delay(new_value, old_value, delay, fall, off, vector_assign)
         };
         let target_time = self.time + delay;
         // Inertial delay: remove any pending update for this signal
@@ -4794,6 +4813,11 @@ impl Simulator {
     /// that reverts to the CURRENT value reduces the pending entry (cancelling
     /// it outright when nothing is left to change — the inertial glitch
     /// swallow, issues #143/#144).
+    ///
+    /// §10.3.3 / §28.16: select drivers of one net may choose different
+    /// delays (a bit falling beside a bit rising). An update due at another
+    /// time than the net's pending one joins it as a second update instead
+    /// of moving it (`schedule_delayed_slice_chain`).
     pub(super) fn schedule_delayed_slice(
         &mut self,
         id: usize,
@@ -4802,11 +4826,51 @@ impl Simulator {
         sel_val: &Value,
         delay: u64,
     ) {
-        let pending = self
-            .delayed_updates
-            .iter()
-            .find(|(_, sid, _)| *sid == id)
-            .map(|(_, _, v)| v.clone());
+        let target = self.time + delay;
+        let mut first = None;
+        let mut more = false;
+        if self.delayed_slice_chains {
+            for (k, (_, sid, _)) in self.delayed_updates.iter().enumerate() {
+                if *sid == id {
+                    if first.is_some() {
+                        more = true;
+                        break;
+                    }
+                    first = Some(k);
+                }
+            }
+        } else {
+            first = self
+                .delayed_updates
+                .iter()
+                .position(|(_, sid, _)| *sid == id);
+        }
+        // One pending update that only this slice changes (its own earlier
+        // change, the usual inertial reschedule) or that is due at `target`
+        // merges as before; anything else is a chain of updates.
+        if let Some(k) = first
+            && !self
+                .module_paths
+                .as_ref()
+                .is_some_and(|mp| mp.table_of(id).is_some())
+        {
+            let merges = !more && {
+                let (t, _, v) = &self.delayed_updates[k];
+                *t == target || {
+                    let current = &self.signal_table[id];
+                    let mut others = v.clone();
+                    for i in 0..sel_w as usize {
+                        others.set_bit_code(lo as usize + i, current.get_bit_code(lo as usize + i));
+                    }
+                    others == *current
+                }
+            };
+            if !merges {
+                self.schedule_delayed_slice_chain(id, lo as usize, sel_w as usize, sel_val, target);
+                return;
+            }
+        }
+        let pending = first.map(|k| self.delayed_updates[k].2.clone());
         let in_flight = pending.is_some();
         let mut merged = pending.unwrap_or_else(|| self.signal_table[id].clone());
         // The slice already holds these bits in the pending update: nothing
@@ -4825,6 +4889,81 @@ impl Simulator {
             self.cancel_delayed(id);
         } else {
             self.schedule_delayed_with_delay(id, merged, delay);
+        }
+    }
+
+    /// `schedule_delayed_slice` for a net with an update pending at another
+    /// time. The net's pending updates are kept as a chain ordered by time,
+    /// each holding the net's whole value from its time on, so the slice's
+    /// bits are its current bits in every update before `target` (an update
+    /// of its own pending there is descheduled, §10.3.3) and the new bits in
+    /// `target`'s update and every later one. An update that changes nothing
+    /// from the value before it is dropped.
+    #[cold]
+    #[inline(never)]
+    fn schedule_delayed_slice_chain(
+        &mut self,
+        id: usize,
+        lo: usize,
+        sel_w: usize,
+        sel_val: &Value,
+        target: u64,
+    ) {
+        let mut chain: Vec<(u64, usize)> = self
+            .delayed_updates
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, sid, _))| *sid == id)
+            .map(|(k, (t, _, _))| (*t, k))
+            .collect();
+        chain.sort_unstable();
+        // The slice is already scheduled to take these bits: keep its time.
+        if let Some(&(_, last)) = chain.last()
+            && (0..sel_w).all(|i| {
+                self.delayed_updates[last].2.get_bit_code(lo + i) == sel_val.get_bit_code(i)
+            })
+        {
+            return;
+        }
+        let current = self.signal_table[id].clone();
+        let mut base = current.clone();
+        for &(t, k) in &chain {
+            let v = &mut self.delayed_updates[k].2;
+            for i in 0..sel_w {
+                let bit = if t < target {
+                    current.get_bit_code(lo + i)
+                } else {
+                    sel_val.get_bit_code(i)
+                };
+                v.set_bit_code(lo + i, bit);
+            }
+            if t < target {
+                base = v.clone();
+            }
+        }
+        if !chain.iter().any(|&(t, _)| t == target) {
+            for i in 0..sel_w {
+                base.set_bit_code(lo + i, sel_val.get_bit_code(i));
+            }
+            chain.push((target, self.delayed_updates.len()));
+            self.delayed_updates.push((target, id, base));
+            chain.sort_unstable();
+        }
+        let mut prev = current;
+        let mut drop: Vec<usize> = Vec::new();
+        for &(_, k) in &chain {
+            if self.delayed_updates[k].2 == prev {
+                drop.push(k);
+            } else {
+                prev = self.delayed_updates[k].2.clone();
+            }
+        }
+        if chain.len() > drop.len() + 1 {
+            self.delayed_slice_chains = true;
+        }
+        drop.sort_unstable();
+        for k in drop.into_iter().rev() {
+            self.delayed_updates.remove(k);
         }
     }
 

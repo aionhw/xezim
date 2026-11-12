@@ -28,7 +28,8 @@ use serde::ser::{SerializeSeq, Serializer};
 /// File magic and format version; bump the last byte with any change to a
 /// state field's type.
 // §10.3.3 / §28.16: CombItem::ContAssign retains its original delay target.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x07";
+// §10.3.3 / §28.16: and the fall and turn-off delays of a select target.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x08";
 
 #[derive(Default)]
 struct Session {
@@ -1223,6 +1224,7 @@ checkpoint_state!(
     deferred_comb_pool,
     deferred_proc_entries,
     delayed_nba,
+    delayed_slice_chains,
     delayed_updates,
     dirty_any,
     dirty_list,
