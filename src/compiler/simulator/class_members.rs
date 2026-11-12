@@ -5057,6 +5057,42 @@ impl Simulator {
         None
     }
 
+    /// §8.25: the specialization of an object built without one recorded
+    /// (`C #(p::pkt_t) c; c = new();`), from its type-parameter bindings,
+    /// when `method` is declared by the object's own class and that class has
+    /// only type parameters. A static method called through the handle then
+    /// sees the bound types (`T loc;` in it was unsized and had no members).
+    fn type_bindings_spec(
+        &self,
+        handle: usize,
+        class_name: &str,
+        method: &str,
+    ) -> Option<(String, String)> {
+        let inst = self.heap.get(handle)?.as_ref()?;
+        if inst.type_bindings.is_empty() {
+            return None;
+        }
+        let origin = self.class_origin(&inst.class_name).to_string();
+        let cd = self.module.classes.get(&inst.class_name)?;
+        if !cd.methods.contains_key(method)
+            || self.class_origin(class_name) != origin
+            || cd.param_order.is_empty()
+            || cd
+                .param_order
+                .iter()
+                .any(|p| !cd.type_param_names.contains(p))
+        {
+            return None;
+        }
+        let sig = cd
+            .param_order
+            .iter()
+            .map(|p| inst.type_bindings.get(p).map(String::as_str))
+            .collect::<Option<Vec<_>>>()?
+            .join(",");
+        Some((origin.clone(), self.canonicalize_spec_sig(&origin, &sig)))
+    }
+
     /// §8.25 + §8.10: a static method called through an object handle
     /// (`c.depth()`) belongs to the object's specialization: `c` of type
     /// `St#(2)` runs `St#(2)::depth`, whose bare parameter `N` reads 2, not
@@ -5095,6 +5131,7 @@ impl Simulator {
                     self.inherited_method_spec(handle, &declaring)
                 }
             });
+        let spec = spec.or_else(|| self.type_bindings_spec(handle, class_name, method_name));
         match spec {
             Some(spec) => {
                 let saved = std::mem::replace(&mut self.current_spec, Some(spec));
