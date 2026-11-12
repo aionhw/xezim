@@ -630,3 +630,5 @@ mod cli_worker_stack_1055;
 
 #[path = "misc/prepared_cache_driven_init.rs"]
 mod prepared_cache_driven_init;
+#[path = "misc/urandom_seed_input_1058.rs"]
+mod urandom_seed_input_1058;
