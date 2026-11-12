@@ -364,3 +364,5 @@ mod queue_sort_packed_members_1059;
 mod paren_aggregate_compare_1085;
 #[path = "collections/queue_of_queues_push_concat.rs"]
 mod queue_of_queues_push_concat;
+#[path = "collections/review_queue_of_queues_push_1086.rs"]
+mod review_queue_of_queues_push_1086;
