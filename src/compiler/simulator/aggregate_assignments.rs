@@ -3193,6 +3193,15 @@ impl Simulator {
         }
     }
 
+    /// Whether `name` is a row of a declared collection whose row kind is a
+    /// queue or dynamic array (`qq[k]` of `int qq[$][$]`), not a fixed or
+    /// associative row.
+    fn is_queue_or_dyn_row(&self, name: &str) -> bool {
+        self.coll_shape_at(name).is_some_and(|(shape, depth)| {
+            depth >= 1 && matches!(shape.dims.get(depth), Some(Dim::Queue | Dim::Dyn))
+        })
+    }
+
     /// Store `arg` into queue element `elem`. An UNPACKED-STRUCT element keeps
     /// each member in its own signal, so writing one packed value (what
     /// `push_back` used to do) loses every member.
@@ -3258,6 +3267,39 @@ impl Simulator {
                     self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);
                 }
                 self.set_queue_size(elem, n);
+                return;
+            }
+        }
+        // §7.10.2.2, §10.10: a concatenation (`{1, 2}`) or pattern
+        // (`'{3, 4, 5}`) pushed into a queue whose rows are queues or
+        // dynamic arrays is an unpacked-array value of the row type: each
+        // item is one element, and a collection operand contributes all of
+        // its elements. Evaluated as one packed value it left the row empty.
+        let pattern = self.unpacked_pattern(arg);
+        if matches!(
+            pattern.kind,
+            ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
+        ) && self.is_queue_or_dyn_row(elem)
+        {
+            let vals = match &pattern.kind {
+                ExprKind::AssignmentPattern(items) => Some(
+                    items
+                        .iter()
+                        .map(|it| self.eval_expr(it.expr()))
+                        .collect::<Vec<_>>(),
+                ),
+                ExprKind::Concatenation(parts) => {
+                    Some(self.unpacked_concat_operand_values(parts.iter().collect()))
+                }
+                _ => None,
+            };
+            if let Some(vals) = vals {
+                let n = vals.len();
+                for (j, v) in vals.into_iter().enumerate() {
+                    let v = self.fit_queue_push_elem(elem, v);
+                    self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);
+                }
+                self.set_queue_size(elem, n as u64);
                 return;
             }
         }
