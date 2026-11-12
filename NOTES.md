@@ -339,6 +339,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * The reference census of dotted names is released when the last compilation
   session ends (xezim-core #191, contributed by Thomasb81).
 
+* A constant-function call during elaboration (a generate condition, a
+  dimension or a parameter that calls a package function) shares the design's
+  typedef tables instead of copying them on every call, and copies of an
+  elaboration share its typedef table until one of them is written. 64
+  generate conditions calling a package function beside 256 packed-struct
+  typedefs take 0.89 G instructions instead of 4.67 G, 256 calls beside 1,024
+  typedefs 3.6 G instead of 63.8 G, and 2,048 typedefs peak at 373 MB instead
+  of 484 MB (§13.4.3, #721, reported by amal-khailtash).
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
