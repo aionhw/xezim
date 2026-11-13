@@ -3667,7 +3667,26 @@ impl<'a> BytecodeCompiler<'a> {
             }
             (!out.is_empty()).then_some(out)
         };
-        let (sfd, sargs) = super::struct_sra::scalarize_member_call(fd, args, member, &members)?;
+        // §7.4.2/§10.9.2: typedef array members keep the existing scalarizer
+        // handling; only the new replication expansion is disabled for them.
+        let replication_allowed = |ms: &super::struct_sra::Members| {
+            !ms.iter().any(|(_, dt)| {
+                let DataType::TypeReference { name, .. } = dt else {
+                    return false;
+                };
+                self.typedef_unpacked_dims.is_some_and(|dims| {
+                    self.typedef_entry(dims, name, scope)
+                        .is_some_and(|(_, d)| !d.is_empty())
+                })
+            })
+        };
+        let (sfd, sargs) = super::struct_sra::scalarize_member_call(
+            fd,
+            args,
+            member,
+            &members,
+            &replication_allowed,
+        )?;
         let start = self.insns.len();
         let next = self.next_reg;
         let saved_reason = self.bail_reason;

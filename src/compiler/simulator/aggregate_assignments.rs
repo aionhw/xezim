@@ -969,6 +969,16 @@ impl Simulator {
             }
         }
 
+        if !super::elaborate::struct_pattern_has_array_member(
+            su,
+            &self.module.typedef_types,
+            &self.module.typedef_unpacked_dims,
+        ) && let Some(expanded) =
+            super::elaborate::struct_pattern_replication(items, members.len())
+        {
+            ordered = expanded;
+        }
+
         members
             .into_iter()
             .enumerate()
