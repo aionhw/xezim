@@ -6,10 +6,16 @@
 //! The cases now live one directory down and are included here as
 //! modules, so this group links ONCE. Tests, names and assertions are
 //! unchanged — only the link unit is.
+
 //!
 //! The explicit module paths below are required: a crate root resolves a
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
+
+#[path = "types/constant_real_math_1089.rs"]
+mod constant_real_math_1089;
+#[path = "types/struct_array_continuous_sensitivity_1090.rs"]
+mod struct_array_continuous_sensitivity_1090;
 
 #[path = "types/ansi_port_name_with_unpacked_dim.rs"]
 mod ansi_port_name_with_unpacked_dim;
