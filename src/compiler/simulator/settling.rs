@@ -88,9 +88,14 @@ impl Simulator {
 
     pub(super) fn mark_release_sources_dirty(&mut self, id: usize) {
         let mut sources: Vec<usize> = Vec::new();
+        let mut constant_drivers: Vec<CombEntry> = Vec::new();
         for entry in self.comb_entries.iter() {
             if entry.cold.write_signal_ids.contains(&id) {
-                sources.extend(entry.cold.read_signal_ids.iter().copied());
+                if entry.cold.read_signal_ids.is_empty() {
+                    constant_drivers.push(entry.clone());
+                } else {
+                    sources.extend(entry.cold.read_signal_ids.iter().copied());
+                }
             }
         }
         for src_id in sources {
@@ -99,6 +104,13 @@ impl Simulator {
                 self.dirty_list.push(src_id);
                 self.dirty_any = true;
             }
+        }
+        // §10.6.2: a driver that reads no signal (`wire w = 4'h5;`,
+        // `assign w = 4'h6;`) is never re-run by a dirty mark, so the
+        // released net kept the forced value. Re-run it here; its value does
+        // not depend on evaluation order.
+        for entry in &constant_drivers {
+            self.eval_comb_entry_full(entry);
         }
     }
 
