@@ -1595,7 +1595,12 @@ impl Simulator {
     /// sub-bin index for `name[N]`).
     /// §19.5.1.1: whether bin `bin`'s `with (expr)` filter admits value `v`
     /// (`item` bound to it). The filter is a constant expression of `item`.
-    pub(super) fn cg_with_admits(&self, bin: &crate::ast::decl::CoverBin, v: i64) -> bool {
+    pub(super) fn cg_with_admits(
+        &self,
+        bin: &crate::ast::decl::CoverBin,
+        v: i64,
+        ctor: &[(String, Value)],
+    ) -> bool {
         let Some(f) = &bin.with_filter else {
             return true;
         };
@@ -1611,7 +1616,128 @@ impl Simulator {
             f.span,
         );
         Self::subst_ident_expr(&mut e, "item", &lit);
-        self.cg_const_bool(&e).unwrap_or(true)
+        self.cg_const_bool(&e, ctor).unwrap_or(true)
+    }
+
+    /// Whether `with` filter `f` uses `item` only compared to constants, so
+    /// its result changes only at cut points pushed onto `cuts`.
+    fn cg_with_cuts(
+        f: &Expression,
+        ctor: &[(String, Value)],
+        sim: &Self,
+        cuts: &mut Vec<i64>,
+    ) -> bool {
+        use crate::ast::expr::{BinaryOp as B, UnaryOp as U};
+        let point = |c: i64, cuts: &mut Vec<i64>| {
+            cuts.push(c);
+            cuts.extend(c.checked_add(1));
+        };
+        if !Self::cg_mentions_item(f) {
+            return true;
+        }
+        match &f.kind {
+            _ if Self::cg_is_item(f) => {
+                point(0, cuts);
+                true
+            }
+            ExprKind::Paren(x) | ExprKind::Unary { op: U::LogNot, operand: x } => {
+                Self::cg_with_cuts(x, ctor, sim, cuts)
+            }
+            ExprKind::Binary {
+                op: B::LogAnd | B::LogOr | B::LogImplies | B::LogEquiv,
+                left,
+                right,
+            } => {
+                Self::cg_with_cuts(left, ctor, sim, cuts)
+                    && Self::cg_with_cuts(right, ctor, sim, cuts)
+            }
+            ExprKind::Binary {
+                op: B::Eq | B::Neq | B::CaseEq | B::CaseNeq | B::Lt | B::Leq | B::Gt | B::Geq,
+                left,
+                right,
+            } => {
+                let other = match (Self::cg_is_item(left), Self::cg_is_item(right)) {
+                    (true, false) => right,
+                    (false, true) => left,
+                    _ => return false,
+                };
+                match sim.cg_const_i64(other, ctor) {
+                    Some(c) if !Self::cg_mentions_item(other) => {
+                        point(c, cuts);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            ExprKind::Inside { expr, ranges } if Self::cg_is_item(expr) => {
+                ranges.iter().all(|r| match &r.kind {
+                    ExprKind::Range(lo, hi) => {
+                        match (sim.cg_const_i64(lo, ctor), sim.cg_const_i64(hi, ctor)) {
+                            (Some(l), Some(h)) => {
+                                point(l.min(h), cuts);
+                                point(l.max(h), cuts);
+                                true
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => match sim.cg_const_i64(r, ctor) {
+                        Some(c) => {
+                            point(c, cuts);
+                            true
+                        }
+                        None => false,
+                    },
+                })
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => Self::cg_with_cuts(condition, ctor, sim, cuts)
+                && Self::cg_with_cuts(then_expr, ctor, sim, cuts)
+                && Self::cg_with_cuts(else_expr, ctor, sim, cuts),
+            _ => false,
+        }
+    }
+
+    /// Whether `e` is the bare `item` of a `with` filter.
+    fn cg_is_item(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Paren(x) => Self::cg_is_item(x),
+            ExprKind::Ident(h) => {
+                h.path.len() == 1 && h.path[0].selects.is_empty() && h.path[0].name.name == "item"
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `e` may read `item`. A form not walked here counts as reading
+    /// it, so `cg_with_cuts` declines and every value is checked.
+    fn cg_mentions_item(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) => false,
+            ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].name.name == "item",
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => Self::cg_mentions_item(x),
+            ExprKind::Binary { left, right, .. } | ExprKind::Range(left, right) => {
+                Self::cg_mentions_item(left) || Self::cg_mentions_item(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => [condition, then_expr, else_expr]
+                .iter()
+                .any(|x| Self::cg_mentions_item(x)),
+            ExprKind::Inside { expr, ranges } => {
+                Self::cg_mentions_item(expr) || ranges.iter().any(Self::cg_mentions_item)
+            }
+            ExprKind::Concatenation(xs) => xs.iter().any(Self::cg_mentions_item),
+            ExprKind::Index { expr, index } => {
+                Self::cg_mentions_item(expr) || Self::cg_mentions_item(index)
+            }
+            _ => true,
+        }
     }
 
     /// The constant value ranges of bin `bin`, in the order written, keeping
@@ -1624,12 +1750,36 @@ impl Simulator {
         bin: &crate::ast::decl::CoverBin,
         ctor: &[(String, Value)],
     ) -> Vec<(i64, i64)> {
-        let segs = bin
+        let segs: Vec<(i64, i64)> = bin
             .values
             .iter()
-            .filter_map(|r| self.cg_range_bounds(r, ctor));
-        if bin.with_filter.is_none() {
-            return segs.collect();
+            .filter_map(|r| self.cg_range_bounds(r, ctor))
+            .collect();
+        let Some(f) = &bin.with_filter else {
+            return segs;
+        };
+        let mut cuts = Vec::new();
+        if Self::cg_with_cuts(f, ctor, self, &mut cuts) {
+            cuts.sort_unstable();
+            cuts.dedup();
+            let mut out: Vec<(i64, i64)> = Vec::new();
+            let mut keep = |a: i64, b: i64| match out.last_mut() {
+                Some(last) if last.1.checked_add(1) == Some(a) => last.1 = b,
+                _ => out.push((a, b)),
+            };
+            for &(l, h) in &segs {
+                let mut a = l;
+                for &c in cuts.iter().filter(|&&c| c > l && c <= h) {
+                    if self.cg_with_admits(bin, a, ctor) {
+                        keep(a, c - 1);
+                    }
+                    a = c;
+                }
+                if self.cg_with_admits(bin, a, ctor) {
+                    keep(a, h);
+                }
+            }
+            return out;
         }
         let mut out: Vec<(i64, i64)> = Vec::new();
         let mut tried = 0u64;
@@ -1641,7 +1791,7 @@ impl Simulator {
                     break 'segs;
                 }
                 tried += 1;
-                if self.cg_with_admits(bin, v) {
+                if self.cg_with_admits(bin, v, ctor) {
                     run = Some(run.map_or((v, v), |(a, _)| (a, v)));
                 } else if let Some(r) = run.take() {
                     out.push(r);
@@ -1655,27 +1805,25 @@ impl Simulator {
     /// A constant Boolean: `inside` (values and `[lo:hi]` ranges), `&&`,
     /// `||`, `!` and parentheses here, anything else through the constant
     /// evaluator. None when it is not constant.
-    fn cg_const_bool(&self, e: &Expression) -> Option<bool> {
+    fn cg_const_bool(&self, e: &Expression, ctor: &[(String, Value)]) -> Option<bool> {
         use crate::ast::expr::{BinaryOp, UnaryOp};
-        let num = |x: &Expression| {
-            super::elaborate::const_eval_i64_with_params(x, Some(&self.module.parameters))
-        };
+        let num = |x: &Expression| self.cg_const_i64(x, ctor);
         match &e.kind {
-            ExprKind::Paren(x) => self.cg_const_bool(x),
+            ExprKind::Paren(x) => self.cg_const_bool(x, ctor),
             ExprKind::Unary {
                 op: UnaryOp::LogNot,
                 operand,
-            } => self.cg_const_bool(operand).map(|b| !b),
+            } => self.cg_const_bool(operand, ctor).map(|b| !b),
             ExprKind::Binary {
                 op: BinaryOp::LogAnd,
                 left,
                 right,
-            } => Some(self.cg_const_bool(left)? && self.cg_const_bool(right)?),
+            } => Some(self.cg_const_bool(left, ctor)? && self.cg_const_bool(right, ctor)?),
             ExprKind::Binary {
                 op: BinaryOp::LogOr,
                 left,
                 right,
-            } => Some(self.cg_const_bool(left)? || self.cg_const_bool(right)?),
+            } => Some(self.cg_const_bool(left, ctor)? || self.cg_const_bool(right, ctor)?),
             ExprKind::Inside { expr, ranges } => {
                 let v = num(expr)?;
                 for r in ranges {
@@ -1954,7 +2102,7 @@ impl Simulator {
                         };
                         // §19.5.1.1: a value the bin's `with` filter rejects
                         // is not in the bin at all (a `default` bin may take it).
-                        if !matched || vi.is_some_and(|v| !self.cg_with_admits(bin, v)) {
+                        if !matched || vi.is_some_and(|v| !self.cg_with_admits(bin, v, &ctor)) {
                             continue;
                         }
                         any_value_match = true;
