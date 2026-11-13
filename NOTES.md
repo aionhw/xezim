@@ -475,6 +475,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
+* Edge-dispatch plans execute serially by default
+  (`XEZIM_PARALLEL_SERIALIZE=1`). Set it to `0` to allow worker threads
+  when the parallel dispatcher qualifies.
+
 * Callable locals with literal or name-free dimensions stay shared during
   elaboration, avoiding copies for unrelated parameters (§6.20.2, #721).
 
