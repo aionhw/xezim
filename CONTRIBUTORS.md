@@ -92,7 +92,8 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   command-line timescale, bind actuals the target does not declare, class
   associative-array keys sized per specialization, and specialization
   arguments written as expressions of package parameters keyed by their
-  value (§8.25).
+  value (§8.25); per-element clocking input history for unpacked arrays with
+  an explicit positive skew (§14.4, PR #1138).
 - **Taichi Ishitani** — constrained-random fixes (members of rand object array
   elements, `pre_randomize` before the rand and constraint modes are read,
   `this.` member paths in the joint solver, and `XEZIM_RAND_DIAG` reports of

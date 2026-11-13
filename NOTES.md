@@ -26,6 +26,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* Clocking inputs with an explicit positive skew retain history for each
+  unpacked-array element, so indexed reads use the skewed sample (§14.4,
+  #1137, PR #1138).
+
 * Constant arithmetic uses the enclosing operand width before truncation,
   including conditional arms, real-math arguments, declaration initializers
   and packed-pattern elements (§11.8.2, #1096, #1109, #1125).
