@@ -510,6 +510,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   typedefs 3.6 G instead of 63.8 G, and 2,048 typedefs peak at 373 MB instead
   of 484 MB (§13.4.3, #721, reported by amal-khailtash).
 
+**Build**
+
+* Building from source requires Rust 1.100 or newer. The simulator, core and
+  parser share this minimum supported Rust version, checked directly in CI
+  for default and optional native-backend builds.
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
