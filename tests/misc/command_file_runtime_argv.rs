@@ -40,6 +40,7 @@ endmodule
     )
     .unwrap();
     std::fs::write(dir.join("run.args"), "+MODE=file\n+MARKER\n").unwrap();
+    std::fs::write(dir.join("+MODE=file"), "+MODE=file\n+MARKER\n").unwrap();
     std::fs::write(dir.join("nested/inner.args"), "+MODE=nested\n+MARKER\n").unwrap();
     std::fs::write(dir.join("outer.args"), "-F nested/inner.args\n+TAIL\n").unwrap();
     let bin = env!("CARGO_BIN_EXE_xezim");
@@ -52,6 +53,15 @@ endmodule
         (vec!["+MODE=direct"], vec!["+MODE=direct"]),
         (vec!["-f", "run.args"], vec!["+MODE=file", "+MARKER"]),
         (vec!["-F", "run.args"], vec!["+MODE=file", "+MARKER"]),
+        (vec!["-f", "+MODE=file"], vec!["+MODE=file", "+MARKER"]),
+        (
+            vec!["+MODE=file", "-f", "+MODE=file"],
+            vec!["+MODE=file", "+MODE=file", "+MARKER"],
+        ),
+        (
+            vec!["-F", "+MODE=file", "+MODE=direct"],
+            vec!["+MODE=file", "+MARKER", "+MODE=direct"],
+        ),
         (
             vec!["-f", "run.args", "+MODE=direct"],
             vec!["+MODE=file", "+MARKER", "+MODE=direct"],
