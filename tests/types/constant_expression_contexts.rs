@@ -221,3 +221,24 @@ endmodule
         ["T|unit-array 2 4 7 7"]
     );
 }
+
+#[test]
+fn constant_function_calls_under_casts_concatenations_and_math_are_resolved() {
+    assert_eq!(
+        lines(
+            r#"
+module top;
+  function automatic int twice(input int x); return x*2; endfunction
+  function automatic int concat_call(input int x); return {twice(x)}; endfunction
+  function automatic int math_call(input int x); return $clog2(twice(x)); endfunction
+  function automatic int cast_call(input int x); return 8'(twice(x)+1); endfunction
+  function automatic real real_call(input int x); return $sqrt(twice(x)); endfunction
+  localparam A=concat_call(3), B=math_call(3), C=cast_call(3);
+  localparam real D=real_call(8);
+  initial $display("T|calls %0d %0d %0d %f", A,B,C,D);
+endmodule
+"#
+        ),
+        ["T|calls 6 3 7 4.000000"]
+    );
+}
