@@ -1526,6 +1526,19 @@ impl Simulator {
                     unresolved_count += 1;
                 }
             }
+            // §10.3.2, §7.2: a whole unpacked struct or struct-array
+            // operand changes when any member does. Array resolution above
+            // yields element containers; those never change on a member
+            // write, so depend on their registered leaves as well.
+            for i in 0..rids.len() {
+                if let Some(leaves) = self.unpacked_struct_sens.get(self.name_for_id(rids[i])) {
+                    for &id in leaves {
+                        if !rids.contains(&id) {
+                            rids.push(id);
+                        }
+                    }
+                }
+            }
             if dump_ca_reads {
                 let rn: Vec<&str> = rids.iter().map(|&i| self.name_for_id(i)).collect();
                 eprintln!(
