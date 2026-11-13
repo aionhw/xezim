@@ -9,6 +9,7 @@ impl Simulator {
         if self.compiled {
             return;
         }
+        let _oom_scope = xezim_core::oom_trace::scope("compile bytecode", "", &self.module.name, "");
         self.checkpoint_muted = super::checkpoint::restore_pending();
         self.instrument_code_coverage();
         let trace_compile_phases = std::env::var_os("XEZIM_COMPILE_PHASES").is_some();

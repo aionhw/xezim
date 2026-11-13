@@ -671,6 +671,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Semantics: `whole` makes a partially out-of-range part-select read x as a whole (some tools); default follows IEEE 1800 11.5.1, where only the out-of-range bits read x",
     ),
     (
+        "XEZIM_OOM_TRACE",
+        "Memory diagnostics: stream JSONL phase/source/instance and RSS samples to a file (1 = stderr; 0 = off)",
+    ),
+    (
         "XEZIM_OPCODE_CENSUS",
         "Print executed-insn opcode histogram at end of sim",
     ),

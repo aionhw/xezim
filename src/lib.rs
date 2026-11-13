@@ -40,6 +40,7 @@ pub fn verbose() -> bool {
 /// RSS is a construction-time number on large designs, so attributing it
 /// needs the curve between phases, not just the final maximum.
 pub fn rss_trace(label: &str) {
+    xezim_core::oom_trace::checkpoint(label, &[]);
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("XEZIM_RSS_TRACE").is_some()) {
         return;
@@ -1318,6 +1319,7 @@ fn simulate_multi_inner(
     profile_input: Option<&str>,
     collapse_islands: bool,
 ) -> Result<compiler::Simulator, String> {
+    let _oom_trace = xezim_core::oom_trace::session();
     let total_start = WallTimer::now();
     let compilation_start = WallTimer::now();
     rss_trace("start");

@@ -2044,6 +2044,7 @@ fn main() {
 }
 
 fn run_main() -> i32 {
+    let _oom_trace = xezim_core::oom_trace::session();
     let compile_wall_start = std::time::Instant::now();
 
     // Default to IEEE 1800-2023 mode. SV-2023 is additive over -2017, so

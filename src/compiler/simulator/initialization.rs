@@ -4,6 +4,15 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+fn trace_array_storage(name: &str, cells: usize, width: u32) -> xezim_core::oom_trace::Scope {
+    let scope = xezim_core::oom_trace::scope("array storage", "", "", name);
+    xezim_core::oom_trace::checkpoint(
+        "allocate array",
+        &[("cells", cells), ("element_bits", width as usize)],
+    );
+    scope
+}
+
 impl Simulator {
     /// `XEZIM_MEM_CENSUS` end-of-run class-heap line: live object slots,
     /// property entries, and the heap bytes of their names.
@@ -1651,6 +1660,7 @@ impl Simulator {
     }
 
     pub fn new(mut module: ElaboratedModule, max_time: u64) -> Self {
+        let _oom_scope = xezim_core::oom_trace::scope("construct simulator", "", &module.name, "");
         let phase_total = std::time::Instant::now();
         // The simulator counts ticks of `module.tick_s` (the finest timescale
         // precision; 1 ns by default). Delays were pre-scaled to ticks at
@@ -2878,6 +2888,14 @@ impl Simulator {
         // Return those pages to the OS before the array storage below claims
         // fresh memory (see `release_free_memory`).
         xezim_core::release_free_memory();
+        xezim_core::oom_trace::checkpoint(
+            "reserve array tables",
+            &[
+                ("array_cells", array_elem_count),
+                ("named_cells", named_elem_count),
+                ("static_signals", signal_table.len()),
+            ],
+        );
         signal_table.reserve(array_elem_count);
         signal_widths_vec.reserve(array_elem_count);
         signal_signed_vec.reserve(array_elem_count);
@@ -2940,6 +2958,10 @@ impl Simulator {
                         + PACKED_PAD
                 })
                 .fold(0usize, usize::saturating_add);
+            xezim_core::oom_trace::checkpoint(
+                "reserve packed arrays",
+                &[("packed_capacity_bytes", bound)],
+            );
             packed_mem_arena.reserve(bound);
         }
         let mut packed_arrays: std::collections::HashSet<String> =
@@ -2947,6 +2969,7 @@ impl Simulator {
         let mut packed_cells: usize = 0;
         for (base, &(lo, hi, w)) in arrays_sorted {
             let count = (hi - lo + 1).max(0) as usize;
+            let _oom_array = trace_array_storage(base, count, w);
             if mem_census && count > 0 {
                 census.push((base.clone(), count, w));
             }
@@ -3245,6 +3268,11 @@ impl Simulator {
             module.arrays_2d.iter().collect();
         arrays_2d_sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (base, &((lo1, hi1), (lo2, hi2), w)) in arrays_2d_sorted {
+            let _oom_array = trace_array_storage(
+                base,
+                ((hi1 - lo1 + 1).max(0) as usize).saturating_mul((hi2 - lo2 + 1).max(0) as usize),
+                w,
+            );
             let first_id = signal_table.len();
             for i in lo1..=hi1 {
                 for j in lo2..=hi2 {
@@ -3290,6 +3318,17 @@ impl Simulator {
             module.arrays_nd.iter().collect();
         arrays_nd_sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (base, (shape, w)) in arrays_nd_sorted {
+            let _oom_array = if xezim_core::oom_trace::enabled() {
+                Some(trace_array_storage(
+                    base,
+                    shape.iter().fold(1usize, |count, &(lo, hi)| {
+                        count.saturating_mul((hi - lo + 1).max(0) as usize)
+                    }),
+                    *w,
+                ))
+            } else {
+                None
+            };
             fn enumerate(dims: &[(i64, i64)], prefix: String, out: &mut Vec<String>) {
                 if dims.is_empty() {
                     out.push(prefix);
