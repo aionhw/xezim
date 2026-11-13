@@ -630,6 +630,9 @@ mod review_interconnect_element_types;
 #[path = "misc/cli_worker_stack_1055.rs"]
 mod cli_worker_stack_1055;
 
+#[path = "misc/cli_address_space.rs"]
+mod cli_address_space;
+
 #[path = "misc/prepared_cache_driven_init.rs"]
 mod prepared_cache_driven_init;
 #[path = "misc/urandom_seed_input_1058.rs"]
