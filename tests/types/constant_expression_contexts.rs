@@ -201,3 +201,23 @@ endmodule
         ["T|patterns 1010 0000 1000 ffff"]
     );
 }
+
+#[test]
+fn injected_unit_array_parameters_keep_declaring_dimensions_in_children() {
+    assert_eq!(
+        lines(
+            r#"
+parameter int N=4;
+parameter int A[N]='{default:7};
+module child;
+  parameter int N=2;
+  initial $display("T|unit-array %0d %0d %0d %0d", N,$size(A),A[0],A[3]);
+endmodule
+module top;
+  child u();
+endmodule
+"#
+        ),
+        ["T|unit-array 2 4 7 7"]
+    );
+}
