@@ -475,6 +475,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
+* Deferred instance type contexts share exact-equal type, width and array-query
+  maps, including the thread-local snapshots used during materialization.
+  A synthetic 2,048-instance design with 64 type parameters peaks at 272 MiB
+  instead of 449 MiB; different widths and bounds remain independent
+  (§6.20.3, §20.7, #721).
+
+* Unused compilation-unit properties and sequences remain on one root for
+  validation instead of being copied into every unrelated module definition.
+  A synthetic case with 1,024 unused modules and four 512-term properties
+  peaks at 35 MiB instead of 1,141 MiB (§3.12.1, §16.8, §16.12, #721).
+
 * Edge-dispatch plans execute serially by default
   (`XEZIM_PARALLEL_SERIALIZE=1`). Set it to `0` to allow worker threads
   when the parallel dispatcher qualifies.

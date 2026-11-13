@@ -187,4 +187,8 @@ work. Thank you in particular to
 [urbanij](https://github.com/urbanij) and
 [vrajeshprakhya](https://github.com/vrajeshprakhya).
 
+The elaboration-memory investigation in #721 uses synthetic reproducers,
+allocation profiles and controlled type-context comparisons supplied by
+[amal-khailtash](https://github.com/amal-khailtash).
+
 New contributors are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
