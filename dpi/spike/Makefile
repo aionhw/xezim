@@ -3,12 +3,15 @@
 #   make              -> ./xezim_spike_dpi.so (stub mode, no Spike calls)
 #   make real         -> .so with XEZIM_SPIKE_REAL=1; links against
 #                        libriscv.so + libfesvr.a + libsoftfloat.so
-#                        under SPIKE_PREFIX (defaults to /home/bondan/gnu).
+#                        under SPIKE_PREFIX (defaults to /usr/local).
 #   make clean        -> remove build outputs.
 
-SPIKE_PREFIX ?= /home/bondan/gnu
+SPIKE_PREFIX ?= /usr/local
 
-CXX      ?= g++
+ifeq ($(origin CXX),default)
+CXX      = clang++
+endif
+CXX      ?= clang++
 CXXFLAGS ?= -O2 -fPIC -std=c++17 -Wall -Wextra
 LDFLAGS  ?= -shared
 
