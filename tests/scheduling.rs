@@ -445,6 +445,8 @@ mod class_collection_named_wait;
 
 #[path = "scheduling/class_or_value_change.rs"]
 mod class_or_value_change;
+#[path = "scheduling/event_control_class_prop_expr.rs"]
+mod event_control_class_prop_expr;
 
 #[path = "scheduling/preprocessor_linear_join.rs"]
 mod preprocessor_linear_join;
