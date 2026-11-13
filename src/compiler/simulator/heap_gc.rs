@@ -188,6 +188,8 @@ impl Simulator {
             forever_cont_cache,
             forever_sens_cache,
             blocking_cont_cache,
+            task_contains_fork,
+            task_frame_cache,
             class_task_frame_cache,
             compiled_fast_calls,
             compiled_fast_static_calls,

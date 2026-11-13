@@ -555,6 +555,12 @@ pub fn set_save_at(save_at: Vec<(f64, String)>) {
     COMMAND_LINE.lock().unwrap().save_at = save_at;
 }
 
+/// Whether the driver can write or read a checkpoint in this run.
+pub(super) fn command_line_requested() -> bool {
+    let cl = COMMAND_LINE.lock().unwrap();
+    !cl.save_at.is_empty() || cl.restore.is_some()
+}
+
 /// Whether the run starts from a checkpoint.
 pub(super) fn restore_pending() -> bool {
     COMMAND_LINE.lock().unwrap().restore.is_some()
@@ -960,6 +966,8 @@ impl Simulator {
         self.lazy_initial.clear();
         self.method_plans.borrow_mut().clear();
         self.fsm_clobber_cache.clear();
+        self.task_contains_fork.clear();
+        self.task_frame_cache.clear();
         self.class_task_frame_cache.clear();
         // Serialized callable bodies restore with scope caches disabled.
         // Rebuild private runtime bodies on their next call (§13.3/§13.4);

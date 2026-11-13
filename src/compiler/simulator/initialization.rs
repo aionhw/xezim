@@ -1652,6 +1652,8 @@ impl Simulator {
 
     pub fn new(mut module: ElaboratedModule, max_time: u64) -> Self {
         let phase_total = std::time::Instant::now();
+        let share_task_frames =
+            !checkpoint::command_line_requested() && !checkpoint_calls::in_design(&module);
         // The simulator counts ticks of `module.tick_s` (the finest timescale
         // precision; 1 ns by default). Delays were pre-scaled to ticks at
         // elaboration. `max_time` is supplied in nanoseconds, so convert it to
@@ -4734,6 +4736,9 @@ impl Simulator {
             vif_return_pending: false,
             lhs_leaf_width_cache: HashMap::default(),
             blocking_cont_cache: HashMap::default(),
+            share_task_frames,
+            task_contains_fork: HashMap::default(),
+            task_frame_cache: HashMap::default(),
             class_task_frame_cache: HashMap::default(),
             forever_sens_cache: HashMap::default(),
             exec_cache_pids: HashSet::default(),
