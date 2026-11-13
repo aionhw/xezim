@@ -325,6 +325,8 @@ mod package_and_unit_delays_scale_by_timescale;
 mod package_cli_timescale_delay;
 #[path = "scheduling/phase_jump_static_latch.rs"]
 mod phase_jump_static_latch;
+#[path = "scheduling/release_constant_driver_from_always.rs"]
+mod release_constant_driver_from_always;
 #[path = "scheduling/release_from_level_sensitive_block.rs"]
 mod release_from_level_sensitive_block;
 #[path = "scheduling/static_recursion_shared_cell.rs"]
