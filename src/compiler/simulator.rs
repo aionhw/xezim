@@ -10205,9 +10205,9 @@ pub struct Simulator {
     blocking_cont_cache: HashMap<(usize, u8), (Arc<[Statement]>, Arc<[Statement]>)>,
     /// Computed once from the design and checkpoint command-line options.
     share_task_frames: bool,
-    /// Structural fork eligibility, computed once per declaration. Holding the
+    /// Structural continuation eligibility, computed once per declaration. Holding the
     /// declaration keeps its address valid; no statement body is cloned here.
-    task_contains_fork: HashMap<usize, (std::rc::Rc<TaskDeclaration>, bool)>,
+    task_frame_eligibility: HashMap<usize, (std::rc::Rc<TaskDeclaration>, bool)>,
     /// See `task_body_frame`.
     #[allow(clippy::type_complexity)]
     task_frame_cache:

@@ -188,8 +188,7 @@ impl Simulator {
             forever_cont_cache,
             forever_sens_cache,
             blocking_cont_cache,
-            task_contains_fork,
-            task_frame_cache,
+            task_frame_eligibility,
             class_task_frame_cache,
             compiled_fast_calls,
             compiled_fast_static_calls,
@@ -219,6 +218,14 @@ impl Simulator {
             cg_instance_event_waiters,
             cg_type_options
         );
+        // task_frame_eligibility retains every declaration used by this cache.
+        // Trace each immutable declaration once there, and only the frames
+        // here; visiting both maps whole repeats declaration bodies per site.
+        for (_, frame) in self.task_frame_cache.values() {
+            if let Some(frame) = frame {
+                trace.trace(frame)?;
+            }
+        }
         for (name, value) in self.signals.iter() {
             // An object's own storage is an edge FROM that object, not a root.
             if Self::class_storage_owner(name).is_none() {

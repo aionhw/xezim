@@ -6,31 +6,83 @@
 use super::ElaboratedModule;
 use serde::ser::{self, Serialize};
 
-/// Linear in the unfolded serialized size (shared Rc bodies are revisited).
-/// Deferred bodies are
-/// skipped by artifact serialization, so visit their source syntax explicitly.
-/// No expression is evaluated (§13.3/§13.4); dead branches still count.
+/// Inspect executable source roots once, including unreachable syntax. Avoid
+/// walking flattened signal/value/type tables, and deduplicate shared source
+/// bodies across instances. No expression is evaluated (§13.3/§13.4).
 pub(super) fn in_design(module: &ElaboratedModule) -> bool {
-    let mut walk = Walk { call_name: false };
-    let scan = (|| -> Result<(), Stop> {
-        walk.visit(module)?;
-        for pending in &module.pending_initial {
-            walk.visit(&pending.source)?;
+    let mut walk = Walk::default();
+    // Any serialization error conservatively keeps the original lifetime.
+    scan_sources(module, &mut walk).is_err()
+}
+
+fn scan_sources(module: &ElaboratedModule, walk: &mut Walk) -> Result<(), Stop> {
+    for block in module
+        .initial_blocks
+        .iter()
+        .chain(&module.final_blocks)
+        .chain(&module.static_init_blocks)
+        .chain(&module.program_initial_blocks)
+    {
+        walk.statement(&block.stmt)?;
+    }
+    for block in &module.always_blocks {
+        walk.statement(&block.stmt)?;
+    }
+    for block in &module.pending_initial {
+        walk.statement(&block.source)?;
+    }
+    for block in &module.pending_always {
+        walk.statement(&block.source)?;
+    }
+    for block in &module.pending_cont_assign {
+        walk.expression(&block.lhs_source)?;
+        walk.expression(&block.rhs_source)?;
+        for delay in [
+            &block.delay_source,
+            &block.delay_fall_source,
+            &block.delay_off_source,
+        ] {
+            if let Some(delay) = delay {
+                walk.expression(delay)?;
+            }
         }
-        for pending in &module.pending_always {
-            walk.visit(&pending.source)?;
+    }
+    for assignment in &module.continuous_assigns {
+        walk.expression(&assignment.lhs)?;
+        walk.expression(&assignment.rhs)?;
+    }
+    for routine in module.tasks.values() {
+        walk.visit(&routine.ports)?;
+        walk.statements(&routine.items)?;
+    }
+    for routine in module.functions.values() {
+        walk.visit(&routine.ports)?;
+        walk.statements(&routine.items)?;
+    }
+    for class in module.classes.values() {
+        for method in class.methods.values() {
+            use crate::ast::decl::ClassMethodKind as M;
+            let items = match &method.kind {
+                M::Function(f) | M::Extern(f) | M::PureVirtual(f) => &f.items,
+                M::Task(t) => &t.items,
+            };
+            walk.statements(items)?;
         }
-        for pending in &module.pending_cont_assign {
-            walk.visit(&pending.lhs_source)?;
-            walk.visit(&pending.rhs_source)?;
-            walk.visit(&pending.delay_source)?;
-            walk.visit(&pending.delay_fall_source)?;
-            walk.visit(&pending.delay_off_source)?;
+        walk.visit(&class.constraints)?;
+        walk.visit(&class.param_defaults)?;
+        walk.visit(&class.extends_args)?;
+        for init in class.property_inits.values() {
+            walk.expression(init)?;
         }
-        Ok(())
-    })();
-    // Any serialization error conservatively keeps the original cloning path.
-    scan.is_err()
+    }
+    // These are syntax declarations, not expanded runtime storage.
+    for checker in module.checker_decls.values() {
+        walk.visit(checker)?;
+    }
+    for covergroup in module.covergroups.values() {
+        walk.visit(covergroup)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -47,10 +99,30 @@ impl ser::Error for Stop {
     }
 }
 
+#[derive(Default)]
 struct Walk {
     call_name: bool,
+    seen: super::HashSet<(u8, usize, usize)>,
 }
 impl Walk {
+    fn statement(&mut self, stmt: &super::Statement) -> Result<(), Stop> {
+        if self.seen.insert((0, stmt as *const _ as usize, 0)) {
+            self.visit(stmt)?;
+        }
+        Ok(())
+    }
+    fn expression(&mut self, expr: &super::Expression) -> Result<(), Stop> {
+        if self.seen.insert((1, expr as *const _ as usize, 0)) {
+            self.visit(expr)?;
+        }
+        Ok(())
+    }
+    fn statements(&mut self, stmts: &[super::Statement]) -> Result<(), Stop> {
+        if !stmts.is_empty() && self.seen.insert((2, stmts.as_ptr() as usize, stmts.len())) {
+            self.visit(stmts)?;
+        }
+        Ok(())
+    }
     fn visit<T: Serialize + ?Sized>(&mut self, v: &T) -> Result<(), Stop> {
         v.serialize(&mut *self)
     }

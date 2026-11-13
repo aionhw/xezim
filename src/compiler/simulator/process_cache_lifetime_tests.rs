@@ -298,8 +298,8 @@ fn blocking_task_call_sites_share_only_after_reuse() {
                     let sim = crate::simulate(&source, 100).expect("task call sites fixture");
                     assert_eq!(sim.error_count, 0);
                     assert!(sim.finished);
-                    assert_eq!(sim.task_contains_fork.len(), 1);
-                    assert_eq!(sim.task_contains_fork.values().next().unwrap().1, fork);
+                    assert_eq!(sim.task_frame_eligibility.len(), 1);
+                    assert_eq!(sim.task_frame_eligibility.values().next().unwrap().1, fork);
                     assert_eq!(
                         sim.task_frame_cache.len(),
                         if fork { sites + usize::from(reuse) } else { 0 }
@@ -517,9 +517,9 @@ fn blocking_task_fork_eligibility_visits_nested_statements() {
         let sim = crate::simulate(&source, 100).expect("nested fork eligibility fixture");
         assert_eq!(sim.error_count, 0, "{body}");
         assert!(sim.finished, "{body}");
-        assert_eq!(sim.task_contains_fork.len(), 1, "{body}");
+        assert_eq!(sim.task_frame_eligibility.len(), 1, "{body}");
         assert_eq!(
-            sim.task_contains_fork.values().next().unwrap().1,
+            sim.task_frame_eligibility.values().next().unwrap().1,
             eligible,
             "{body}"
         );
@@ -555,7 +555,7 @@ fn blocking_task_control_fixtures_reach_shared_bodies() {
         assert_eq!(sim.error_count, 0);
         assert!(sim.finished);
         assert!(sim.output.iter().any(|o| o.message == output));
-        assert_eq!(sim.task_contains_fork.len(), declarations);
+        assert_eq!(sim.task_frame_eligibility.len(), declarations);
         assert_eq!(sim.task_frame_cache.len(), sites);
         assert!(
             sim.task_frame_cache

@@ -684,70 +684,6 @@ checkpoint_once_cells!(
 );
 
 impl Simulator {
-    /// Annex D.9 permits restoring a file saved by an earlier invocation.
-    /// Decide before any process runs: by the time `$restart` executes, an
-    /// ended child's unsaved origin could already have been released. Scan
-    /// elaborated procedural bodies, including uncalled subroutines, once.
-    pub(super) fn design_can_restart(module: &ElaboratedModule) -> bool {
-        let mut found = false;
-        let mut seen = HashSet::default();
-        let mut scan = |stmt: &Statement| {
-            if !found && seen.insert(stmt as *const Statement as usize) {
-                elaborate::for_each_stmt_expr(stmt, &mut |expr| {
-                    elaborate::for_each_sub_expr(expr, &mut |expr| {
-                        if matches!(&expr.kind, ExprKind::SystemCall { name, .. } if name == "$restart")
-                        {
-                            found = true;
-                        }
-                    });
-                });
-            }
-        };
-        for block in module
-            .initial_blocks
-            .iter()
-            .chain(&module.final_blocks)
-            .chain(&module.static_init_blocks)
-            .chain(&module.program_initial_blocks)
-        {
-            scan(&block.stmt);
-        }
-        for block in &module.always_blocks {
-            scan(&block.stmt);
-        }
-        // Read shared pending bodies without forcing instance materialization.
-        for block in &module.pending_initial {
-            scan(&block.source);
-        }
-        for block in &module.pending_always {
-            scan(&block.source);
-        }
-        // Package routines are in these same elaborated tables (§26).
-        for routine in module.tasks.values() {
-            for stmt in &routine.items {
-                scan(stmt);
-            }
-        }
-        for routine in module.functions.values() {
-            for stmt in &routine.items {
-                scan(stmt);
-            }
-        }
-        for class in module.classes.values() {
-            for method in class.methods.values() {
-                use crate::ast::decl::ClassMethodKind as M;
-                let items = match &method.kind {
-                    M::Function(f) | M::Extern(f) | M::PureVirtual(f) => &f.items,
-                    M::Task(t) => &t.items,
-                };
-                for stmt in items {
-                    scan(stmt);
-                }
-            }
-        }
-        found
-    }
-
     /// The design a checkpoint belongs to: its signals' names and widths.
     fn design_digest(&self) -> u64 {
         use std::hash::Hasher as _;
@@ -1036,7 +972,7 @@ impl Simulator {
         self.lazy_initial.clear();
         self.method_plans.borrow_mut().clear();
         self.fsm_clobber_cache.clear();
-        self.task_contains_fork.clear();
+        self.task_frame_eligibility.clear();
         self.task_frame_cache.clear();
         self.class_task_frame_cache.clear();
         // Serialized callable bodies restore with scope caches disabled.

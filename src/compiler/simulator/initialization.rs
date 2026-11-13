@@ -1662,9 +1662,9 @@ impl Simulator {
     pub fn new(mut module: ElaboratedModule, max_time: u64) -> Self {
         let _oom_scope = xezim_core::oom_trace::scope("construct simulator", "", &module.name, "");
         let phase_total = std::time::Instant::now();
-        let checkpoint_requested = Self::design_can_restart(&module);
-        let share_task_frames =
-            !checkpoint::command_line_requested() && !checkpoint_calls::in_design(&module);
+        let checkpoint_requested =
+            checkpoint::command_line_requested() || checkpoint_calls::in_design(&module);
+        let share_task_frames = !checkpoint_requested;
         // The simulator counts ticks of `module.tick_s` (the finest timescale
         // precision; 1 ns by default). Delays were pre-scaled to ticks at
         // elaboration. `max_time` is supplied in nanoseconds, so convert it to
@@ -4781,7 +4781,7 @@ impl Simulator {
             lhs_leaf_width_cache: HashMap::default(),
             blocking_cont_cache: HashMap::default(),
             share_task_frames,
-            task_contains_fork: HashMap::default(),
+            task_frame_eligibility: HashMap::default(),
             task_frame_cache: HashMap::default(),
             class_task_frame_cache: HashMap::default(),
             forever_sens_cache: HashMap::default(),

@@ -2786,14 +2786,15 @@ impl Simulator {
         f
     }
 
-    /// §9.3.2: admit task bodies containing a structural fork.
-    /// Inspect nested statements, not calls to other task declarations.
-    fn statement_contains_fork(stmt: &Statement) -> bool {
+    /// §9.3/§13.3: cache an owner for forks and nested blocks that suspend.
+    /// A flat delay needs no continuation-cache owner and keeps its original
+    /// lifetime. Inspect syntax without entering other task declarations.
+    fn statement_needs_task_frame(&self, stmt: &Statement) -> bool {
         use StatementKind::*;
-        let contains = Self::statement_contains_fork;
+        let contains = |stmt: &Statement| self.statement_needs_task_frame(stmt);
         match &stmt.kind {
             ParBlock { .. } => true,
-            SeqBlock { stmts, .. } => stmts.iter().any(contains),
+            SeqBlock { stmts, .. } => self.stmts_have_blocking(stmts) || stmts.iter().any(contains),
             If {
                 then_stmt,
                 else_stmt,
@@ -2842,8 +2843,8 @@ impl Simulator {
     }
 
     /// §13.3.1–§13.3.2: share immutable task statements, not invocation
-    /// storage, only for tasks containing a fork and after a call site is reused.
-    /// Fork-free tasks keep the original path, without a site marker. The first
+    /// storage, for forks or nested suspending blocks after a site is reused.
+    /// Flat task bodies keep the original path without a site marker. The first
     /// eligible call keeps the original body lifetime; retain only its declaration
     /// and site marker.
     /// Keep ScopePop in the body to preserve assertion flush boundaries (§16.4.2).
@@ -2853,16 +2854,19 @@ impl Simulator {
         call_span: crate::ast::Span,
     ) -> Option<Arc<[Statement]>> {
         let declaration = std::rc::Rc::as_ptr(td) as usize;
-        let (_, contains_fork) = self
-            .task_contains_fork
-            .entry(declaration)
-            .or_insert_with(|| {
-                (
-                    td.clone(),
-                    td.items.iter().any(Self::statement_contains_fork),
-                )
-            });
-        if !*contains_fork {
+        let needs_frame = match self.task_frame_eligibility.get(&declaration) {
+            Some((_, eligible)) => *eligible,
+            None => {
+                let eligible = td
+                    .items
+                    .iter()
+                    .any(|stmt| self.statement_needs_task_frame(stmt));
+                self.task_frame_eligibility
+                    .insert(declaration, (td.clone(), eligible));
+                eligible
+            }
+        };
+        if !needs_frame {
             return None;
         }
         let key = (declaration, call_span.start, call_span.end);
