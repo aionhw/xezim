@@ -636,3 +636,5 @@ mod prepared_cache_driven_init;
 mod urandom_seed_input_1058;
 #[path = "misc/oom_trace.rs"]
 mod oom_trace;
+#[path = "misc/scope_randomize_without_std.rs"]
+mod scope_randomize_without_std;
