@@ -1943,3 +1943,7 @@ pub(super) mod audit {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "checkpoint_property_cache_tests.rs"]
+mod property_cache_tests;
