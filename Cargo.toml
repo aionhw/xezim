@@ -3,7 +3,7 @@ name = "xezim"
 version = "0.11.5"
 build = "src/build.rs"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.100"
 description = "SystemVerilog bytecode interpreter (IEEE 1800-2023, with --sv2017 opt-out)."
 license = "MIT OR Apache-2.0"
 

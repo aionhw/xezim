@@ -49,7 +49,7 @@ scripts/                       PGO build, UVM DPI build, local-core switch
 
 ## Build and test
 
-Rust 1.92 MSRV, edition 2024. See `docs/building.md` for requirements and
+Rust 1.100 MSRV, edition 2024. See `docs/building.md` for requirements and
 the profile-guided build.
 
 ```bash
