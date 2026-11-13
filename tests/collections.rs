@@ -366,3 +366,6 @@ mod paren_aggregate_compare_1085;
 mod queue_of_queues_push_concat;
 #[path = "collections/review_queue_of_queues_push_1086.rs"]
 mod review_queue_of_queues_push_1086;
+
+#[path = "collections/assoc_struct_delete_1124.rs"]
+mod assoc_struct_delete_1124;

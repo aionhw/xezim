@@ -63,6 +63,8 @@ mod child_decl_init_and_wide_rand;
 mod cli_files;
 #[path = "misc/cli_max_time_units.rs"]
 mod cli_max_time_units;
+#[path = "misc/command_file_runtime_argv.rs"]
+mod command_file_runtime_argv;
 #[path = "misc/clocked_loop_case_nest_compiled.rs"]
 mod clocked_loop_case_nest_compiled;
 #[path = "misc/code_coverage.rs"]

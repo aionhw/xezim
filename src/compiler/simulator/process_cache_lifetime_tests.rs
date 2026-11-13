@@ -471,10 +471,11 @@ fn hierarchical_task_frames_obey_checkpoint_guard() {
 }
 
 /// IEEE 1800-2023 §9.3–§9.4, §12.4–§12.7, §15.5.4, §16.3, §18.16–§18.17:
-/// eligibility visits every nested statement arm, even an unexecuted fork.
-/// Calling a forking task or spelling "fork" in a string is not a structural fork.
+/// eligibility visits every nested statement arm, even unexecuted syntax.
+/// Nested calls/waits need an owner too; flat task calls stay covered by
+/// `blocking_task_call_sites_share_only_after_reuse` without added frames.
 #[test]
-fn blocking_task_fork_eligibility_visits_nested_statements() {
+fn blocking_task_frame_eligibility_visits_nested_statements() {
     let nested = [
         "fork #1; join",
         "begin : nested fork #1; join end",
@@ -498,9 +499,10 @@ fn blocking_task_fork_eligibility_visits_nested_statements() {
         "randsequence (s) s: { fork #1; join }; endsequence",
     ];
     for (body, eligible) in nested.into_iter().map(|body| (body, true)).chain([
-        ("child();", false),
+        ("child();", true),
         ("$display(\"fork\");", false),
-        ("wait fork; disable fork;", false),
+        ("wait fork; disable fork;", true),
+        ("#1; #1;", true),
     ]) {
         let source = format!(
             "module top;
@@ -563,4 +565,21 @@ fn blocking_task_control_fixtures_reach_shared_bodies() {
                 .all(|(_, frame)| frame.is_some())
         );
     }
+}
+
+/// #1127 / §9.3.1 / §13.3: a nested timed block has the same owner lifetime
+/// requirement as a fork, while each call still runs its own activation.
+#[test]
+fn nested_timed_task_blocks_share_continuation_owners() {
+    let run = |calls: u64| {
+        let source = format!(
+            "module top; int count; task automatic tk(); begin #2; #1; count++; end endtask initial begin repeat ({calls}) tk(); if(count!={calls}) $fatal(1); $finish; end endmodule"
+        );
+        let sim = crate::simulate(&source, calls * 3 + 10).unwrap();
+        assert_eq!(sim.error_count, 0);
+        assert!(sim.finished);
+        assert_eq!(sim.task_frame_cache.len(), 1);
+        sim.blocking_cont_cache.len()
+    };
+    assert_eq!(run(20), run(2000));
 }

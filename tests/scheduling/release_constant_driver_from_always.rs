@@ -144,3 +144,24 @@ endmodule
 "#);
     assert_eq!(lines, ["R released v=0", "R assigned v=7"]);
 }
+
+/// §21.2.1.7: evaluating a released child's driver preserves the caller's %m.
+#[test]
+fn release_keeps_the_calling_procedure_scope() {
+    let lines = run(r#"
+module leaf; wire [3:0] n=4'h9; endmodule
+module top;
+  leaf u(); bit trigger;
+  initial force u.n=0;
+  always @(trigger) begin : releasing
+    string before_scope, after_scope;
+    before_scope=$sformatf("%m");
+    release u.n;
+    after_scope=$sformatf("%m");
+    if (before_scope != after_scope) $fatal(1,"release changed scope");
+  end
+  initial begin #1; trigger=1; #1; $display("R scope n=%h",u.n); end
+endmodule
+"#);
+    assert_eq!(lines, ["R scope n=9"]);
+}

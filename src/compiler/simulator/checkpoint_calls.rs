@@ -306,3 +306,7 @@ impl<'a> ser::Serializer for &'a mut Walk {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "checkpoint_calls_tests.rs"]
+mod tests;

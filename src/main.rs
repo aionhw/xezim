@@ -4169,3 +4169,16 @@ fn report_fatal_error(e: &str) {
         eprintln!("Simulation error: {}", e);
     }
 }
+
+#[test]
+fn integer_femtosecond_limits_round_exactly() {
+    for (input, expected) in [
+        ("9007199255499999fs", 9_007_199_255),
+        ("9007199255500000fs", 9_007_199_256),
+        ("9007199256500001FS", 9_007_199_257),
+        ("18446744073709551614000000fs", u64::MAX - 1),
+        ("18446744073709551615000000fs", u64::MAX),
+    ] {
+        assert_eq!(parse_max_time(input).unwrap(), expected, "{input}");
+    }
+}

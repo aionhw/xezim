@@ -155,3 +155,30 @@ endmodule
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn oversized_stack_requests_retry_without_arithmetic_overflow() {
+    let dir = std::env::temp_dir().join(format!("xezim_oversized_stack_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("top.sv");
+    std::fs::write(
+        &src,
+        "module top; initial begin $display(\"STACK_PASS\"); $finish; end endmodule",
+    )
+    .unwrap();
+    let requested = usize::MAX.to_string();
+    let output = limited(
+        &["--no-cache", src.to_str().unwrap()],
+        Some(&requested),
+        2097152,
+    );
+    let text = String::from_utf8_lossy(&output.stdout).into_owned()
+        + &String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && text.contains("STACK_PASS"),
+        "{text}"
+    );
+    assert!(!text.contains("panicked"), "{text}");
+    assert!(text.contains("requested stack size is too large"), "{text}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
