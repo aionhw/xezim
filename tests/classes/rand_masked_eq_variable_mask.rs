@@ -60,14 +60,16 @@ class d;
   constraint c { solve m before x; m == -1; ((x & m) == 0) || (x != 0); }
 endclass
 class e; rand bit [31:0] x, m; constraint c { solve m before x; m == -1; if ((x & m) == 0) { 1; } } endclass
+class f; rand bit [31:0] x, m; constraint c { solve m before x; m == -1; (x & m) == '1; } endclass
 class u; rand int unsigned x, m; constraint c { x inside {[0:100]}; m == 1; (x & m) == 0; } endclass
 module t; initial begin
-  d a; e c; u b; int ok, okc, v, sum, hist[101];
-  a = new; b = new; c = new; ok = 0; okc = 0; sum = 0;
+  d a; e c; f g; u b; int ok, okc, okf, v, sum, hist[101];
+  a = new; b = new; c = new; g = new; ok = 0; okc = 0; okf = 0; sum = 0;
   a.srandom(31);
   repeat (200) if (a.randomize() && a.x != 0) ok++;
   c.srandom(37);
   repeat (200) if (c.randomize() && c.x != 0) okc++;
+  repeat (20) if (g.randomize() && g.x == 32'hffff_ffff) okf++;
   foreach (hist[i]) hist[i] = 0;
   b.srandom(29);
   repeat (5100) if (b.randomize() && b.x <= 100) hist[b.x]++;
@@ -75,6 +77,7 @@ module t; initial begin
   $display("disj %0d", ok);
   $display("uni %0d %0d", hist[100], sum / 51);
   $display("cond %0d", okc);
+  $display("fill %0d", okf);
   $finish;
 end endmodule
 "#,
@@ -90,6 +93,7 @@ end endmodule
     assert!(c100 * 20 >= mean * 17, "{}", lines[1]);
     let okc: i32 = lines[2].split_whitespace().nth(1).unwrap().parse().unwrap();
     assert!(okc >= 190, "an if condition's mask forced x: {}", lines[2]);
+    assert_eq!(lines[3], "fill 20");
 }
 
 #[test]

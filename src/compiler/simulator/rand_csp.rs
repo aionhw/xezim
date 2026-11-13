@@ -10449,6 +10449,11 @@ impl Simulator {
             let Some((var, lo, w, _)) = self.csp_slice_base_k(csp, x, &mut konst) else {
                 continue;
             };
+            // §5.7.1: a `'0`/`'1` takes the comparison's width, which the
+            // hint's self-determined evaluation would lose.
+            if Self::csp_has_fill(m) || Self::csp_has_fill(other) {
+                return;
+            }
             let mut deps = Vec::new();
             if !self.csp_refs(csp, m, env, &mut deps) || !self.csp_refs(csp, other, env, &mut deps) {
                 return;
@@ -10475,6 +10480,33 @@ impl Simulator {
                 guards: env.guards.clone(),
             });
             return;
+        }
+    }
+
+    /// Whether `e` may contain an unbased unsized literal (`'0`, `'1`, ...).
+    /// A form not walked here counts as containing one.
+    fn csp_has_fill(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(n) => {
+                matches!(n, crate::ast::expr::NumberLiteral::UnbasedUnsized(_))
+            }
+            ExprKind::Ident(_) => false,
+            ExprKind::Index { expr, index } => {
+                Self::csp_has_fill(expr) || Self::csp_has_fill(index)
+            }
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => Self::csp_has_fill(x),
+            ExprKind::Binary { left, right, .. } => {
+                Self::csp_has_fill(left) || Self::csp_has_fill(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => [condition, then_expr, else_expr]
+                .iter()
+                .any(|x| Self::csp_has_fill(x)),
+            ExprKind::Concatenation(xs) => xs.iter().any(Self::csp_has_fill),
+            _ => true,
         }
     }
 
