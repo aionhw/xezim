@@ -483,7 +483,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 * Deferred instance type contexts share exact-equal type, width and array-query
   maps, including the thread-local snapshots used during materialization.
-  A synthetic 2,048-instance design with 64 type parameters peaks at 272 MiB
+  A synthetic 2,048-instance design with 64 type parameters peaks at 269 MiB
   instead of 449 MiB; different widths and bounds remain independent
   (§6.20.3, §20.7, #721).
 
