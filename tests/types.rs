@@ -12,6 +12,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "types/constant_expression_contexts.rs"]
+mod constant_expression_contexts;
 #[path = "types/constant_real_math_1089.rs"]
 mod constant_real_math_1089;
 #[path = "types/deferred_type_contexts_721.rs"]
