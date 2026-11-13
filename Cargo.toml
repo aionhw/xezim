@@ -61,6 +61,7 @@ libffi = { version = "3", features = ["system"] }
 corosensei = { version = "0.3", default-features = false }
 
 [dev-dependencies]
+serde_json = "1"
 # `tests/gates/fst_roundtrip.rs` DECODES the FST dumps this crate writes, to
 # check var types, widths, aliases, values and the trailer's end_time. An FST
 # is block-compressed, so byte-level assertions cannot see any of that — and
