@@ -401,6 +401,9 @@ mod vif_nested_instance_570;
 
 #[path = "hierarchy/nonansi_child_port_width_572.rs"]
 mod nonansi_child_port_width_572;
+
+#[path = "hierarchy/clocking_unpacked_array_input.rs"]
+mod clocking_unpacked_array_input;
 #[path = "hierarchy/nested_iface_vif_612.rs"]
 mod nested_iface_vif_612;
 #[path = "hierarchy/own_definition_name_assign_target.rs"]
