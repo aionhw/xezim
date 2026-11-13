@@ -197,6 +197,8 @@ mod null_mailbox_and_stall_location;
 mod oracle_timing_semantics;
 #[path = "scheduling/parallel_dispatch_expr_fallback.rs"]
 mod parallel_dispatch_expr_fallback;
+#[path = "scheduling/unit_assertion_contexts_721.rs"]
+mod unit_assertion_contexts_721;
 #[path = "scheduling/preprocessor_diagnostic_location.rs"]
 mod preprocessor_diagnostic_location;
 #[path = "scheduling/preprocessor_github_issues.rs"]
