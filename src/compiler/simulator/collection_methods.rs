@@ -3879,12 +3879,19 @@ impl Simulator {
                     let key = self.eval_expr(arg);
                     let key_str = self.assoc_key_str(obj_name, &key);
                     let elem_name = format!("{}[{}]", obj_name, key_str);
-                    if self.signals.remove(&elem_name).is_none() {
-                        // §7.9.2: an aggregate element (an unpacked struct,
-                        // a nested collection) has no `aa[k]` cell of its
-                        // own — it lives as member / element cells under
-                        // that name (the shapes `exists` probes), and all
-                        // of them go. Only reached on the direct-entry miss.
+                    let aggregate = self
+                        .class_member_coll_type(obj_name)
+                        .map(std::borrow::Cow::Borrowed)
+                        .or_else(|| self.p_elem_type_ref(obj_name))
+                        .is_some_and(|ty| {
+                            matches!(self.resolve_dt_ref(ty.as_ref()), DataType::Struct(su)
+                            if Self::spreads_member_wise(su))
+                        });
+                    if self.signals.remove(&elem_name).is_none() || aggregate {
+                        // §7.9.2: deleting an unpacked struct removes its
+                        // member cells even when a pattern store also left
+                        // an `aa[k]` marker. Scalar entries keep the direct
+                        // removal path without scanning the array (#1124).
                         let member = Self::name_with_suffix(&elem_name, ".");
                         let sub = Self::name_with_suffix(&elem_name, "[");
                         let prefix = format!("{}[", obj_name);
