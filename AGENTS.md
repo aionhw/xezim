@@ -52,6 +52,10 @@ scripts/                       PGO build, UVM DPI build, local-core switch
 Rust 1.100 MSRV, edition 2024. See `docs/building.md` for requirements and
 the profile-guided build.
 
+Native C/C++ builds use Clang and LLVM archive tools. Install `clang`,
+`clang++`, `llvm-ar` and `llvm-ranlib` on `PATH`. Linux x86_64 Rust links
+use Clang with the Rust toolchain's bundled LLD.
+
 ```bash
 cargo build --release                          # target/release/xezim (thin LTO)
 cargo test --release --no-fail-fast            # the full default suite, as CI runs it
@@ -154,7 +158,8 @@ The same section is in `../xezim-core/AGENTS.md`; change both together.
   it. Core's own CI runs only the core and parser tests.
 - **Develop against the local checkout.** Run `scripts/use-local-core.sh`
   once; plain `cargo build`/`cargo test` then uses `../xezim-core` (or
-  `./xezim-core`) through a git-ignored `.cargo/config.toml` `[patch]`.
+  `./xezim-core`) through a git-ignored `.cargo/local-core.toml` `[patch]`, included by
+  the tracked `.cargo/config.toml` compiler configuration.
   `cargo tree -p xezim-core` shows a path when the patch is active.
 - **Validate the exact commit you will pin.** Commit everything in core first
   (`git -C ../xezim-core status` clean), then run core's tests (`cargo test`
@@ -166,7 +171,7 @@ The same section is in `../xezim-core/AGENTS.md`; change both together.
   2. Here, add a commit `Sync core revision` that changes only both `rev =`
      lines to the pushed core `HEAD` (`git -C ../xezim-core rev-parse HEAD`).
   3. Check that the pin resolves without the local patch: move
-     `.cargo/config.toml` aside, run `cargo fetch`, put it back.
+     `.cargo/local-core.toml` aside, run `cargo fetch`, put it back.
   4. Push xezim, with the commits that need the new core in the same push.
 - **Never pin a core commit that is not on core's `origin/main`**
   (`git -C ../xezim-core merge-base --is-ancestor <rev> origin/main`). A

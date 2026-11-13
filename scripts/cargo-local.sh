@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run cargo with the xezim-core git dependency patched to the sibling
 # ../xezim-core checkout WHEN one exists; plain cargo (git fetch) otherwise.
-# No per-machine .cargo/config.toml needed.
+# No persistent local-core override file needed.
 #
 # Usage:
 #   ./scripts/cargo-local.sh build --release

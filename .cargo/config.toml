@@ -1,0 +1,12 @@
+# Keep machine-local dependency overrides separate from the toolchain defaults.
+include = [{ path = "local-core.toml", optional = true }]
+
+[env]
+CC = "clang"
+CXX = "clang++"
+AR = "llvm-ar"
+RANLIB = "llvm-ranlib"
+
+# Clang drives LLD, including when RUSTFLAGS is set by a build wrapper.
+[target.x86_64-unknown-linux-gnu]
+linker = ".cargo/clang-linker.sh"

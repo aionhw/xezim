@@ -819,7 +819,7 @@ fn open_dpi_library(path: &str) -> Result<Library, libloading::Error> {
 }
 
 /// The command that builds the DPI export trampoline (§35.5.4): the host C
-/// compiler (`$CC` when set, else `cc`) producing a position-independent
+/// compiler (`$CC` when set, else `clang`) producing a position-independent
 /// shared object. Only portable flags: the compiler's default target is
 /// already the host, and an x86-only flag such as `-m64` makes a non-x86
 /// compiler reject the command (#282). `$CC` may carry its own leading
@@ -833,7 +833,7 @@ fn dpi_trampoline_cc_command(
     let mut cmd: Vec<std::ffi::OsString> = cc_env
         .map(|v| v.split_whitespace().map(Into::into).collect::<Vec<_>>())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| vec!["cc".into()]);
+        .unwrap_or_else(|| vec!["clang".into()]);
     for a in ["-fPIC", "-shared", "-O1"] {
         cmd.push(a.into());
     }
