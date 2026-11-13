@@ -5249,7 +5249,7 @@ impl Simulator {
                     if let Some(h) = self.process_scope_hint.get(&self.current_pid).cloned() {
                         self.process_scope_hint.insert(pid, h);
                     }
-                    self.process_origin.insert(pid, (s.span, "fork child"));
+                    self.process_origin.insert(pid, (s.span, FORK_CHILD_ORIGIN));
                     self.inherit_fork_child_context(pid);
                     self.inherit_fork_m_scope(pid, self.current_pid, block_name.as_ref());
                     let frame = self.fork_child_frame(s);

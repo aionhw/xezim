@@ -582,6 +582,71 @@ impl Simulator {
     /// Forget the per-timestamp stall bookkeeping (time moved, or a livelock
     /// was broken by jumping ahead).
     pub(super) fn reset_stall_window(&mut self) {
+        // §9.3.2 / §9.6.2: terminal fork children no longer need their
+        // scopes or origins after this window and any native stack unwind.
+        // Ordinary windows visit only queued IDs. Only native deferrals
+        // request a table sweep, once all readers have unwound.
+        // Annex D.9: origins are not checkpointed; a restart needs them.
+        if self.proc_depth == 0
+            && self.dpi_export_depth == 0
+            && self.dpi_tasks.is_empty()
+            && !self.checkpoint_requested
+            && !self.warn_x
+            && self.value_trace_ids.is_none()
+            && self.trace_sched.is_none()
+        {
+            if self.retired_fork_sweep_needed {
+                self.process_origin.retain(|pid, origin| {
+                    #[cfg(test)]
+                    {
+                        self.retired_fork_reset_visits += 1;
+                    }
+                    if origin.1 == FORK_CHILD_ORIGIN
+                        && (self.finished_pids.contains(pid) || self.killed_pids.contains(pid))
+                    {
+                        self.process_scope_hint.remove(pid);
+                        self.process_m_scope.remove(pid);
+                        self.process_m_label.remove(pid);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                self.retired_fork_sweep_needed = false;
+                self.retired_fork_pids.clear();
+                // A long native call can leave mostly empty tables. Pay for
+                // shrinking here, not during later small retirements.
+                if self.process_origin.len() < self.process_origin.capacity() / 4 {
+                    self.process_origin.shrink_to_fit();
+                }
+                if self.process_scope_hint.len() < self.process_scope_hint.capacity() / 4 {
+                    self.process_scope_hint.shrink_to_fit();
+                }
+                if self.process_m_scope.len() < self.process_m_scope.capacity() / 4 {
+                    self.process_m_scope.shrink_to_fit();
+                }
+                if self.process_m_label.len() < self.process_m_label.capacity() / 4 {
+                    self.process_m_label.shrink_to_fit();
+                }
+            }
+            for pid in self.retired_fork_pids.drain(..) {
+                #[cfg(test)]
+                {
+                    self.retired_fork_reset_visits += 1;
+                }
+                if (self.finished_pids.contains(&pid) || self.killed_pids.contains(&pid))
+                    && self
+                        .process_origin
+                        .get(&pid)
+                        .is_some_and(|o| o.1 == FORK_CHILD_ORIGIN)
+                {
+                    self.process_origin.remove(&pid);
+                    self.process_scope_hint.remove(&pid);
+                    self.process_m_scope.remove(&pid);
+                    self.process_m_label.remove(&pid);
+                }
+            }
+        }
         self.stall_pid_hits.clear();
         self.stall_pid_state.clear();
         self.stall_edge_block_hits.clear();
