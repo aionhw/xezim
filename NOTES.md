@@ -516,6 +516,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   parser share this minimum supported Rust version, checked directly in CI
   for default and optional native-backend builds.
 
+* Native C/C++ dependencies, DPI libraries and build shims default to Clang
+  and LLVM archive tools. Linux x86_64 Rust builds link through Clang and
+  Rust's bundled LLD. Local core overrides now live in the ignored
+  `.cargo/local-core.toml`, preserving the tracked compiler configuration.
+
 ### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
 
 **Command line**
