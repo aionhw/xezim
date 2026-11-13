@@ -461,6 +461,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   element for a class property or task local (§7.10.2.2, §10.10, #1086,
   contributed by chuanseng-ng).
 
+* Real math functions in constant expressions, including logarithms,
+  trigonometric functions and nested real/bit conversions, produce their
+  real results at elaboration. `$rtoi` can use those results in dimensions,
+  and parameter substitutions in subroutine signatures preserve the declared
+  width and signedness. Recompile saved designs made with an earlier build
+  (§11.2.1, §20.5, §20.8.2, #1089, reported by ds54e).
+
+* Continuous assignments passing an unpacked struct array to a function
+  reevaluate when an element's member changes, including nested members and
+  instance-scoped arrays; the result previously retained its old value
+  (§10.3.2, §7.2, #1090, reported by ds54e).
+
 **Performance**
 
 * Callable locals with literal or name-free dimensions stay shared during
