@@ -14673,6 +14673,9 @@ mod event_name_tests;
 mod process_cache_lifetime_tests;
 
 #[cfg(test)]
+mod finished_process_lifetime_tests;
+
+#[cfg(test)]
 mod class_heap_lifetime_tests;
 
 mod heap_trace;
