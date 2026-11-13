@@ -415,7 +415,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_FORCE_PARALLEL",
-        "Parallel: force parallel dispatch even below thresholds",
+        "Parallel: force eligible edge dispatch without calibration",
     ),
     (
         "XEZIM_FOREACH_REPLAY_LIMIT",
@@ -680,7 +680,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_PARALLEL_SERIALIZE",
-        "Parallel: run parallel plan serially (debug determinism check)",
+        "Parallel: run edge-dispatch plans serially (default 1; 0 enables worker threads)",
     ),
     (
         "XEZIM_PARTITION_BY_CLOCK",

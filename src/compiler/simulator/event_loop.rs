@@ -2865,7 +2865,7 @@ impl Simulator {
         );
         if self.prof_par_ticks > 0 {
             chatter!(
-                "[PROF] parallel_dispatch ticks={} blocks={} (their insns are NOT counted in insns= below — they run on worker threads)",
+                "[PROF] parallel_dispatch ticks={} blocks={} (their insns are NOT counted in insns= below — isolated dispatch)",
                 self.prof_par_ticks,
                 self.prof_par_blocks
             );

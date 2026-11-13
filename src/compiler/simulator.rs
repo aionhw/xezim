@@ -907,7 +907,11 @@ fn parallel_disabled_by_env() -> bool {
 
 fn parallel_serialize_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    cached_env_flag("XEZIM_PARALLEL_SERIALIZE", &FLAG)
+    *FLAG.get_or_init(|| {
+        std::env::var("XEZIM_PARALLEL_SERIALIZE")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 macro_rules! sim_dbg_eprintln {
