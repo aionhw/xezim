@@ -348,7 +348,14 @@ impl Simulator {
                     .copied()
                     .unwrap_or(dskew);
                 if skew != 0 && skew != CB_SKEW_1STEP {
-                    hist.push((net.clone(), skew));
+                    if let Some(elems) = [net.as_str(), v.as_str()]
+                        .into_iter()
+                        .find_map(|a| self.clocking_array_elems(a))
+                    {
+                        hist.extend(elems.into_iter().map(|(_, e)| (e, skew)));
+                    } else {
+                        hist.push((net.clone(), skew));
+                    }
                 }
             }
         }
