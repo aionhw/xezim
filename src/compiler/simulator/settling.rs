@@ -110,8 +110,20 @@ impl Simulator {
         // released net kept the forced value. Re-run it here; its value does
         // not depend on evaluation order.
         for entry in &constant_drivers {
-            self.eval_comb_entry_full(entry);
+            self.eval_released_comb_entry(entry);
         }
+    }
+
+    /// §10.6.2 / §21.2.1.7: evaluating a net's driver uses its declaration
+    /// scope, then returns to the scope of the procedure doing the release.
+    pub(super) fn eval_released_comb_entry(&mut self, entry: &CombEntry) {
+        let scope = std::mem::take(&mut self.m_block_scope);
+        let scope_id = self.m_block_scope_id;
+        let active = self.m_block_active;
+        self.eval_comb_entry_full(entry);
+        self.m_block_scope = scope;
+        self.m_block_scope_id = scope_id;
+        self.m_block_active = active;
     }
 
     /// Level-BSP combinational settle (XEZIM_BSP_SETTLE=1). Reaches the SAME

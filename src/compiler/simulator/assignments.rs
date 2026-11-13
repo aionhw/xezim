@@ -579,11 +579,14 @@ impl Simulator {
                     let drivers: Vec<CombEntry> = self
                         .comb_entries
                         .iter()
-                        .filter(|e| e.cold.write_signal_ids.contains(&id))
+                        .filter(|e| {
+                            e.cold.write_signal_ids.contains(&id)
+                                && !e.cold.read_signal_ids.is_empty()
+                        })
                         .cloned()
                         .collect();
                     for entry in &drivers {
-                        self.eval_comb_entry_full(entry);
+                        self.eval_released_comb_entry(entry);
                     }
                 }
             }
