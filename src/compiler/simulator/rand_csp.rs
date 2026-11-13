@@ -10449,9 +10449,11 @@ impl Simulator {
             let Some((var, lo, w, _)) = self.csp_slice_base_k(csp, x, &mut konst) else {
                 continue;
             };
-            // §5.7.1: a `'0`/`'1` takes the comparison's width, which the
-            // hint's self-determined evaluation would lose.
-            if Self::csp_has_fill(m) || Self::csp_has_fill(other) {
+            // §5.7.1: a `'0`/`'1` takes the comparison's width. One that is
+            // a whole operand gets it in `csp_mask_draw`; a nested one would
+            // be evaluated at its own width.
+            let nested = |e: &Expression| Self::csp_fill(e).is_none() && Self::csp_has_fill(e);
+            if nested(m) || nested(other) {
                 return;
             }
             let mut deps = Vec::new();
@@ -10480,6 +10482,14 @@ impl Simulator {
                 guards: env.guards.clone(),
             });
             return;
+        }
+    }
+
+    /// The digit of `e` when it is an unbased unsized literal (`'1`).
+    fn csp_fill(e: &Expression) -> Option<char> {
+        match &Self::unparen(e).kind {
+            ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(c)) => Some(*c),
+            _ => None,
         }
     }
 
@@ -10534,8 +10544,14 @@ impl Simulator {
             {
                 continue;
             }
-            let m = self.csp_eval_in(csp, st, h.src, &h.mask).to_u64()? & ones(h.w);
-            let c = self.csp_eval_in(csp, st, h.src, &h.want).to_u64()?;
+            let val_of = |me: &mut Self, e: &Expression| match Self::csp_fill(e) {
+                Some('0') => Some(0),
+                Some('1') => Some(ones(h.w)),
+                Some(_) => None,
+                None => me.csp_eval_in(csp, st, h.src, e).to_u64(),
+            };
+            let m = val_of(self, &h.mask)? & ones(h.w);
+            let c = val_of(self, &h.want)?;
             if c & !m != 0 {
                 return None;
             }
