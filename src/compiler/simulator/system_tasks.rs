@@ -1052,6 +1052,7 @@ impl Simulator {
                     self.checkpoint_ops
                         .push(super::checkpoint::CheckpointOp::Restart(path));
                 } else {
+                    self.checkpoint_requested = true;
                     self.checkpoint_ops
                         .push(super::checkpoint::CheckpointOp::Save(path));
                 }

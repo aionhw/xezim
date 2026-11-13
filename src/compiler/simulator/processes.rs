@@ -5289,7 +5289,7 @@ impl Simulator {
                         self.process_scope_hint.insert(pid_child, h);
                     }
                     self.process_origin
-                        .insert(pid_child, (s.span, "fork child"));
+                        .insert(pid_child, (s.span, FORK_CHILD_ORIGIN));
                     // §9.6.2: `disable <label>` where the label names this
                     // child's own top-level `begin : name` block terminates
                     // the child. `disable_labels` was populated ONLY for

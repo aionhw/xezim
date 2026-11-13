@@ -8073,10 +8073,22 @@ pub struct Simulator {
     process_m_label: HashMap<usize, String>,
     /// Where each process came from: the creating construct's source span
     /// and its kind ("initial block", "always block", "fork child", …).
-    /// One insert per process CREATION (never on the activation hot path);
-    /// read only by `report_zero_delay_stall` so a spinning pid can be
-    /// traced back to the RTL construct that spawned it.
+    /// Used by stall/waiter reports, X warnings, value and scheduler traces.
+    /// Terminated fork children release entries after their last diagnostic
+    /// window and native stack unwind, unless deferred diagnostics or a
+    /// checkpoint restart can still need them.
     process_origin: HashMap<usize, (crate::ast::Span, &'static str)>,
+    /// Ordinary deferrals, indexed by this window's stall hits or still on
+    /// a scheduler stack, need only individual lookups at a safe reset.
+    #[serde(skip)]
+    retired_fork_pids: Vec<usize>,
+    /// A native-guard decline needs one sweep at the next safe reset.
+    /// Keep no per-child backlog while imported/exported DPI tasks are live.
+    #[serde(skip)]
+    retired_fork_sweep_needed: bool,
+    #[cfg(test)]
+    #[serde(skip)]
+    retired_fork_reset_visits: usize,
     /// XEZIM_TRACE_SCHED=1|all|<t>|<t0>:<t1> — an ORDERED log of what runs
     /// inside each time slot: the tick header, every clock-generator toggle,
     /// and every process as it is popped from the timing wheel. A race is a
@@ -10378,6 +10390,10 @@ pub struct Simulator {
     /// `$save`/`$incsave`/`$restart` requests for the end of this slot.
     #[serde(skip)]
     checkpoint_ops: Vec<checkpoint::CheckpointOp>,
+    /// A save was requested, or the design can call `$restart` (Annex D.9).
+    /// Origins are not checkpointed: retain them even for an external save.
+    #[serde(skip)]
+    checkpoint_requested: bool,
     /// `--save-at` times still ahead, in ticks, earliest first.
     #[serde(skip)]
     checkpoint_save_at: Vec<(u64, String)>,
@@ -14662,3 +14678,6 @@ mod class_heap_lifetime_tests;
 mod heap_trace;
 
 mod heap_gc;
+
+/// Origin tag shared by fork creation and terminal metadata retirement.
+const FORK_CHILD_ORIGIN: &str = "fork child";
