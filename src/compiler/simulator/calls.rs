@@ -3691,6 +3691,16 @@ impl Simulator {
                 self.exec_task_call(&td, args);
                 return Value::zero(32);
             }
+            // §18.12: a bare `randomize(…)` outside a class is the scope
+            // randomize function with its optional `std::` prefix left out.
+            // It names no declared subroutine, so it returned 0 unsolved.
+            if hier.root.is_none()
+                && hier.path.len() == 1
+                && name == "randomize"
+                && self.bare_randomize_is_scope_randomize()
+            {
+                return self.exec_std_randomize(args);
+            }
             // A module-class method naming an instance subroutine that
             // resolved nowhere: report the skipped call instead of dropping
             // it silently.
@@ -3712,5 +3722,13 @@ impl Simulator {
             }
         }
         Value::zero(32)
+    }
+
+    /// Whether a bare `randomize` call here is the §18.12 scope randomize
+    /// function (`std::randomize`): it is outside every class method, where
+    /// a bare call is `this.randomize` (§18.11).
+    pub(super) fn bare_randomize_is_scope_randomize(&self) -> bool {
+        !matches!(self.class_context_stack.last(), Some(Some(_)))
+            && !matches!(self.this_stack.last(), Some(Some(_)))
     }
 }

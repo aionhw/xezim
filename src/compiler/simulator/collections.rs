@@ -4989,6 +4989,37 @@ impl Simulator {
             return self.eval_randomize_with(&call, constraints);
         }
         if let ExprKind::Call { func, args } = &call.kind {
+            // §18.12: outside a class the `std::` prefix of the scope
+            // randomize function may be omitted. Read a bare
+            // `randomize(…) with {…}` as `std::randomize(…) with {…}`; it fell
+            // through to the plain call and returned 0 without solving.
+            if let ExprKind::Ident(h) = &func.kind
+                && h.root.is_none()
+                && h.path.len() == 1
+                && h.path[0].selects.is_empty()
+                && h.path[0].name.name == "randomize"
+                && self.bare_randomize_is_scope_randomize()
+            {
+                let member = h.path[0].name.clone();
+                let mut std_expr = (**func).clone();
+                if let ExprKind::Ident(sh) = &mut std_expr.kind {
+                    sh.path[0].name.name = "std".to_string();
+                }
+                let std_call = Expression::new(
+                    ExprKind::Call {
+                        func: Box::new(Expression::new(
+                            ExprKind::MemberAccess {
+                                expr: Box::new(std_expr),
+                                member,
+                            },
+                            func.span,
+                        )),
+                        args: args.clone(),
+                    },
+                    call.span,
+                );
+                return self.eval_randomize_with(&std_call, constraints);
+            }
             if let ExprKind::MemberAccess { expr, member } = &func.kind {
                 if member.name == "randomize" {
                     // std::randomize(vars) with {...}
