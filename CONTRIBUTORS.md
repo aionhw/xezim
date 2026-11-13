@@ -139,7 +139,8 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   declared in a child module's body (§7.4.1, §7.4.5); CLI operation under
   address-space limits, femtosecond runtime caps, finished-fork metadata
   reclamation and shared task continuations, with memory and checkpoint
-  regression tests.
+  regression tests; reports on constant-expression widths, real function
+  locals and compilation-unit parameter shadowing.
 - **[git-hevangel](https://github.com/git-hevangel)** — shared statement-list
   numbering when restoring checkpoints of processes that have forked,
   including suspended class tasks and condition or event waiters.

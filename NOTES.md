@@ -26,6 +26,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* Constant arithmetic uses the enclosing operand width before truncation,
+  including conditional arms, real-math arguments, declaration initializers
+  and packed-pattern elements (§11.8.2, #1096, #1109, #1125).
+* Constant functions preserve real locals and declared formal/return types;
+  integral expressions finish before conversion to a real destination
+  (§6.12.2, §13.4.1, #1125).
+* Qualified compilation-unit parameters survive module shadowing, and their
+  dependent initializers and ranges retain compilation-unit scope
+  (§3.12.1, #1109).
+
 * Hierarchical references reach static task/function locals before their first
   call and preserve instance-specific storage (§6.21, §23.6).
 * Preprocessor warnings preserve the run's exit status when stderr closes
