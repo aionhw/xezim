@@ -49,6 +49,7 @@ struct Ctx<'a> {
     fname: &'a str,
     ret: &'a Members,
     sel: &'a str,
+    replication_allowed: &'a dyn Fn(&Members) -> bool,
 }
 
 fn leaf(base: &str, m: &str) -> String {
@@ -122,8 +123,20 @@ fn effect_free(e: &Expression) -> bool {
 /// One expression per member from a struct-valued actual or item: an ordered
 /// or named pattern is taken apart, anything else is member-selected, which
 /// evaluates it once per member, so it must have no effect.
-fn split_value(e: &Expression, members: &Members) -> Option<Vec<Expression>> {
+fn split_value(
+    e: &Expression,
+    members: &Members,
+    replication_allowed: bool,
+) -> Option<Vec<Expression>> {
     if let ExprKind::AssignmentPattern(items) = &e.peel_typed_pattern().kind {
+        // IEEE 1800-2023 §10.9.2: replicated items become scalar actuals,
+        // each retaining its corresponding member's assignment context.
+        if replication_allowed
+            && let Some(parts) =
+                xezim_core::elaborate::struct_pattern_replication(items, members.len())
+        {
+            return Some(parts.into_iter().cloned().collect());
+        }
         if items
             .iter()
             .all(|it| matches!(it, AssignmentPatternItem::Ordered(_)))
@@ -394,7 +407,7 @@ impl Ctx<'_> {
                     if let Some(ms) = self.members_of(&d.name.name) {
                         let ms = ms.clone();
                         let inits = match &d.init {
-                            Some(e) => Some(split_value(e, &ms)?),
+                            Some(e) => Some(split_value(e, &ms, (self.replication_allowed)(&ms))?),
                             None => None,
                         };
                         for (i, (m, mdt)) in ms.iter().enumerate() {
@@ -448,20 +461,21 @@ impl Ctx<'_> {
                     // Whole-struct write: one write per member. A struct
                     // source names its scalars directly; anything else is
                     // split and then rewritten like any expression.
-                    let src: Vec<Expression> =
-                        match bare_name(rvalue).and_then(|r| self.members_of(r).map(|_| r)) {
-                            Some(r) => ms
-                                .iter()
-                                .map(|(m, _)| ident(&self.scalar_of(r, m), rvalue.span))
-                                .collect(),
-                            None => {
-                                let mut v = split_value(rvalue, ms)?;
-                                for e in &mut v {
-                                    self.expr(e)?;
-                                }
-                                v
+                    let src: Vec<Expression> = match bare_name(rvalue)
+                        .and_then(|r| self.members_of(r).map(|_| r))
+                    {
+                        Some(r) => ms
+                            .iter()
+                            .map(|(m, _)| ident(&self.scalar_of(r, m), rvalue.span))
+                            .collect(),
+                        None => {
+                            let mut v = split_value(rvalue, ms, (self.replication_allowed)(ms))?;
+                            for e in &mut v {
+                                self.expr(e)?;
                             }
-                        };
+                            v
+                        }
+                    };
                     ms.iter()
                         .zip(src)
                         .map(|((m, _), e)| self.assign(self.scalar_of(n, m), e, span))
@@ -483,7 +497,7 @@ impl Ctx<'_> {
                 {
                     ident(&self.scalar_of(n, self.sel), e.span)
                 } else {
-                    let parts = split_value(e, self.ret)?;
+                    let parts = split_value(e, self.ret, (self.replication_allowed)(self.ret))?;
                     let i = self.ret.iter().position(|(m, _)| m == self.sel)?;
                     // §10.9.2: every item of the pattern is evaluated; only
                     // the selected one is kept here.
@@ -584,6 +598,7 @@ pub(crate) fn scalarize_member_call(
     args: &[Expression],
     sel: &str,
     struct_members: &dyn Fn(&DataType) -> Option<Members>,
+    replication_allowed: &dyn Fn(&Members) -> bool,
 ) -> Option<(FunctionDeclaration, Vec<Expression>)> {
     let ret = struct_members(&fd.return_type)?;
     let sel_ty = ret.iter().find(|(m, _)| m == sel)?.1.clone();
@@ -604,7 +619,10 @@ pub(crate) fn scalarize_member_call(
         }
         match p.dimensions.as_slice() {
             [] => {
-                for ((m, mdt), e) in ms.iter().zip(split_value(a, &ms)?) {
+                for ((m, mdt), e) in ms
+                    .iter()
+                    .zip(split_value(a, &ms, replication_allowed(&ms))?)
+                {
                     ports.push(FunctionPort {
                         data_type: mdt.clone(),
                         name: Identifier {
@@ -627,7 +645,10 @@ pub(crate) fn scalarize_member_call(
                     let AssignmentPatternItem::Ordered(e) = it else {
                         return None;
                     };
-                    for (c, v) in cols.iter_mut().zip(split_value(e, &ms)?) {
+                    for (c, v) in
+                        cols.iter_mut()
+                            .zip(split_value(e, &ms, replication_allowed(&ms))?)
+                    {
                         c.push(AssignmentPatternItem::Ordered(v));
                     }
                 }
@@ -749,6 +770,7 @@ pub(crate) fn scalarize_member_call(
         fname: &fname,
         ret: &ret,
         sel,
+        replication_allowed,
     };
     let mut items = Vec::new();
     // The result's other members, should the body write them through the
