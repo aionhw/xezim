@@ -2241,6 +2241,7 @@ fn run_main() -> i32 {
     let mut vpi_libs: Vec<String> = Vec::new();
     let mut module_timescale_args: Vec<String> = Vec::new();
     let mut plusargs: Vec<String> = Vec::new();
+    let mut direct_plusarg_positions: Vec<usize> = Vec::new();
     let mut emit_hypergraph: Option<String> = None;
     let mut load_partition: Option<String> = None;
     let mut write_profile: Option<String> = None;
@@ -2539,6 +2540,7 @@ fn run_main() -> i32 {
                     xezim::compiler::simulator::set_warn_x(true);
                     xezim::compiler::simulator::set_warn_x_limit(n);
                 }
+                direct_plusarg_positions.push(i);
                 plusargs.push(arg.clone());
             }
             // `-v <file>` — a library FILE (traditional library semantics): its
@@ -3558,7 +3560,11 @@ suppressed but the explicit SDF annotation still applies."
                         // Pass the full CLI invocation (binary name +
                         // all args + plusargs) so vpi_get_vlog_info
                         // can hand the same argv back to UVM.
-                        sim.set_args(&cli_files::runtime_argv(&args, &plusargs));
+                        sim.set_args(&cli_files::runtime_argv(
+                            &args,
+                            &plusargs,
+                            &direct_plusarg_positions,
+                        ));
                         let compilation_start = xezim::WallTimer::now();
                         sim.compile();
                         if !sim.compile_errors.is_empty() {
