@@ -569,6 +569,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   path. The startup checkpoint scan visits shared source once and skips
   runtime value tables (§9.3, §13.3, #1127).
 
+* Checkpoints omit the derived class-property owner index and rebuild it
+  from restored shared class definitions. Serializing this cache copied each
+  declaring class once per property and greatly inflated restored memory
+  (Annex D.9, §8.3, #1116).
+
 **Build**
 
 * Building from source requires Rust 1.100 or newer. The simulator, core and
