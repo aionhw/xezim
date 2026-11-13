@@ -1701,6 +1701,7 @@ impl Simulator {
         }
     }
 
+    /// Whether `e` is the bare `item` of a `with` filter.
     fn cg_is_item(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Paren(x) => Self::cg_is_item(x),
@@ -1711,8 +1712,11 @@ impl Simulator {
         }
     }
 
+    /// Whether `e` may read `item`. A form not walked here counts as reading
+    /// it, so `cg_with_cuts` declines and every value is checked.
     fn cg_mentions_item(e: &Expression) -> bool {
         match &e.kind {
+            ExprKind::Number(_) => false,
             ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].name.name == "item",
             ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => Self::cg_mentions_item(x),
             ExprKind::Binary { left, right, .. } | ExprKind::Range(left, right) => {
@@ -1732,7 +1736,7 @@ impl Simulator {
             ExprKind::Index { expr, index } => {
                 Self::cg_mentions_item(expr) || Self::cg_mentions_item(index)
             }
-            _ => false,
+            _ => true,
         }
     }
 
