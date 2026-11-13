@@ -12,8 +12,8 @@ module typed #(parameter type T=logic [7:4], parameter int B=4, L=7, R=4)
 endmodule
 module dependent #(parameter int W=8, parameter type T=logic [W-1:0])
                   (output int ready);
+  T value;
   initial begin
-    T value;
     value='1;
     if ($bits(T)!=W || $bits(value)!=W || $left(T)!=W-1 || $right(T)!=0 || value !== '1)
       $fatal(1,"dependent type width: expected=%0d type=%0d value=%0d",W,$bits(T),$bits(value));
