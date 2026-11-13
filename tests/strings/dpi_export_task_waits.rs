@@ -35,7 +35,7 @@ fn shared_lib(dir: &Path, stem: &str, src: &str) -> PathBuf {
     let so = dir.join(format!("{stem}.so"));
     std::fs::write(&c, src).unwrap();
     let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
-    let mut cc = Command::new("cc");
+    let mut cc = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()));
     cc.args(["-shared", "-fPIC"]);
     if cfg!(target_os = "macos") {
         // The exported subroutines resolve when xezim loads the library.

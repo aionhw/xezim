@@ -22,7 +22,7 @@ fn compile_dpi_lib(c_file: &str, stem: &str) -> PathBuf {
     // subdirectory so users don't accidentally pick up unrelated
     // xezim source files via the include search path.
     let include_dir = manifest_path("include");
-    let status = Command::new("cc")
+    let status = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .arg("-shared")
         .arg("-fPIC")
         .arg("-I")

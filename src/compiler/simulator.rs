@@ -14598,7 +14598,7 @@ mod dpi_trampoline_cc_tests {
     #[test]
     fn trampoline_command_is_portable() {
         let a = args(None);
-        assert_eq!(a[0], "cc");
+        assert_eq!(a[0], "clang");
         assert!(
             !a.iter()
                 .any(|x| x == "-m64" || x == "-m32" || x.starts_with("-march"))
@@ -14610,7 +14610,7 @@ mod dpi_trampoline_cc_tests {
         let b = args(Some("ccache  aarch64-linux-gnu-gcc"));
         assert_eq!(&b[..2], ["ccache", "aarch64-linux-gnu-gcc"]);
         assert!(!b.iter().any(|x| x == "-m64"));
-        assert_eq!(args(Some("  "))[0], "cc");
+        assert_eq!(args(Some("  "))[0], "clang");
     }
 }
 

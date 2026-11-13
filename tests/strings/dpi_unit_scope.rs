@@ -20,7 +20,7 @@ fn compile_dpi_lib(c_file: &str, stem: &str) -> PathBuf {
         .as_nanos();
     let so_path =
         std::env::temp_dir().join(format!("{}_{}_{}.so", stem, std::process::id(), nanos));
-    let status = Command::new("cc")
+    let status = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .args(["-shared", "-fPIC", "-I"])
         .arg(manifest_path("include"))
         .arg(manifest_path(c_file))

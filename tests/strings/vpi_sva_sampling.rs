@@ -337,7 +337,7 @@ fn setup(tag: &str, sv: &str) -> (PathBuf, PathBuf) {
     std::fs::write(&c, DRIVER_C).unwrap();
     std::fs::write(dir.join("top.sv"), sv).unwrap();
     let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
-    let ok = Command::new("cc")
+    let ok = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .args(["-shared", "-fPIC", "-Wall", "-I"])
         .arg(&include)
         .arg(&c)

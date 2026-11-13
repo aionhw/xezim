@@ -60,6 +60,11 @@ jobs:
       - name: Coverage analyzer tests
         run: python3 scripts/test_analyze_test_coverage.py
 
+      - name: Build configuration tests
+        run: |
+          python3 scripts/test_use_local_core.py
+          python3 scripts/test_llvm_linker.py
+
       - name: cargo test (no features)
         run: cargo test --no-fail-fast
 

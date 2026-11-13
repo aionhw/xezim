@@ -151,7 +151,7 @@ void (*vlog_startup_routines[])(void)={boot,0};
 "#,
     )
     .unwrap();
-    let output = Command::new("cc")
+    let output = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-I"])
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("include"))
         .args(["output.c", "-o", "output.so"])

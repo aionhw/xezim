@@ -32,7 +32,7 @@ fn shared_lib(dir: &Path, stem: &str, src: &str) -> PathBuf {
     let c = dir.join(format!("{stem}.c"));
     let so = dir.join(format!("{stem}.so"));
     std::fs::write(&c, src).unwrap();
-    let ok = Command::new("cc")
+    let ok = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .args(["-shared", "-fPIC"])
         .arg(&c)
         .arg("-o")

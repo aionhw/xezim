@@ -566,7 +566,7 @@ fn vpi_toggles(d: &Path, c: &str, src: &str, case: &str) -> (String, String) {
     if !so.exists() {
         std::fs::write(d.join("t0.c"), c).unwrap();
         let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
-        let ok = Command::new("cc")
+        let ok = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
             .args(["-shared", "-fPIC", "-I"])
             .arg(&include)
             .arg(d.join("t0.c"))
