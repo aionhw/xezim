@@ -8,6 +8,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+**Command line**
+
+* `XEZIM_OOM_TRACE=memory.jsonl` streams phase, source, instance, table-count
+  and resident-memory records during compilation and simulation. Periodic
+  samples preserve the active work when a process is killed (#721).
+
 **Correctness**
 
 * Hierarchical references reach static task/function locals before their first
