@@ -13,7 +13,7 @@ simulator".
    worker), so deep UVM elaborations work in either build — but older
    binaries without that guard overflow the default 8 MiB main stack in
    debug builds ("thread 'main' has overflowed its stack").
-   If worker creation fails, the CLI retries 512, 256, 128 and 64 MiB stacks
+   If worker creation fails, the CLI retries 1024, 512, 256, 128 and 64 MiB stacks
    below the requested size, then the current thread, and warns with the
    selected stack and a remedy (`XEZIM_STACK_MB`, or `ulimit -s` for the
    current thread).
