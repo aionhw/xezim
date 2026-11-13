@@ -92,8 +92,6 @@ const WORK_BUDGET: u64 = 1_000_000;
 const EST_BUDGET: u64 = 200_000;
 /// Largest domain whose values are weighed one by one.
 const EST_MAX_DOM: u128 = 64;
-/// Largest interval scanned value-wise in `csp_mask_draw`.
-const MASK_DRAW_SCAN: i128 = 4096;
 /// Budget for auxiliary slice expansion, independent of declared inputs.
 const MAX_VARS: usize = 8192;
 /// Largest size the size phase gives a dynamic array (§18.5.8.1).
@@ -5598,7 +5596,7 @@ impl Simulator {
                 constraint,
                 ..
             } => {
-                let c = self.csp_bool(csp, condition, env, false)?;
+                let c = self.csp_bool(csp, condition, &env.optional_mask(), false)?;
                 let then = self.csp_item(csp, constraint, &env.guarded(&c))?;
                 self.csp_if(csp, condition, then, Node::True, env)
             }
@@ -5608,11 +5606,11 @@ impl Simulator {
                 else_item,
                 ..
             } => {
-                let c = self.csp_bool(csp, condition, env, false)?;
+                let c = self.csp_bool(csp, condition, &env.optional_mask(), false)?;
                 let then = self.csp_item(csp, then_item, &env.guarded(&c))?;
                 let els = match else_item {
                     Some(e) => {
-                        let nc = self.csp_bool(csp, condition, env, true)?;
+                        let nc = self.csp_bool(csp, condition, &env.optional_mask(), true)?;
                         self.csp_item(csp, e, &env.guarded(&nc))?
                     }
                     None => Node::True,
@@ -6257,6 +6255,7 @@ impl Simulator {
         els: Node,
         env: &Env,
     ) -> Option<Node> {
+        let env = &env.optional_mask();
         let c = self.csp_bool(csp, cond, env, false)?;
         match c {
             Node::True => return Some(then),
@@ -6336,7 +6335,8 @@ impl Simulator {
                         let r = self.csp_bool(csp, right, env, true)?;
                         Some(Node::And(vec![l, r]))
                     } else {
-                        let then = self.csp_bool(csp, right, env, false)?;
+                        let c = self.csp_bool(csp, left, &env.optional_mask(), false)?;
+                        let then = self.csp_bool(csp, right, &env.guarded(&c), false)?;
                         self.csp_if(csp, left, then, Node::True, env)
                     }
                 }
@@ -10518,38 +10518,52 @@ impl Simulator {
         if pin == 0 {
             return None;
         }
-        let d = &st.d[v];
-        if d.iter().any(|&(l, h)| h - l > MASK_DRAW_SCAN) {
-            let size = dom_size(d);
-            for _ in 0..16 {
-                let k = self.cur_rng().gen_range(0..size);
-                let u = dom_nth(d, k);
-                let x = ((u as u64 & !pin) | val) as i128;
-                if dom_has(d, x) {
-                    return Some(x);
+        // The values in 0..=n whose pinned bits equal `val`.
+        let upto = |n: i128| -> u128 {
+            if n < 0 {
+                return 0;
+            }
+            let n = n as u64;
+            let mut c = 0u128;
+            for b in (0..64).rev() {
+                let free_below = (!pin & ones(b)).count_ones();
+                let pinned = pin >> b & 1 == 1;
+                if n >> b & 1 == 1 {
+                    if !pinned || val >> b & 1 == 0 {
+                        c += 1u128 << free_below;
+                    }
+                    if pinned && val >> b & 1 == 0 {
+                        return c;
+                    }
+                } else if pinned && val >> b & 1 == 1 {
+                    return c;
                 }
             }
-            return None;
-        }
-        let mut n = 0u128;
-        for &(l, h) in d {
-            n += (l..=h)
-                .filter(|&v| (v as u64 & pin) == val)
-                .count() as u128;
-        }
+            c + 1
+        };
+        let d = &st.d[v];
+        let n: u128 = d.iter().map(|&(l, h)| upto(h) - upto(l - 1)).sum();
         if n == 0 {
             return None;
         }
         let mut k = self.cur_rng().gen_range(0..n);
         for &(l, h) in d {
-            for v in l..=h {
-                if (v as u64 & pin) == val {
-                    if k == 0 {
-                        return Some(v);
-                    }
-                    k -= 1;
+            let base = upto(l - 1);
+            let here = upto(h) - base;
+            if k >= here {
+                k -= here;
+                continue;
+            }
+            let (mut lo, mut hi) = (l, h);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if upto(mid) - base > k {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
                 }
             }
+            return Some(lo);
         }
         None
     }
