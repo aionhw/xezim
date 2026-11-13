@@ -221,6 +221,8 @@ mod select_event_terms;
 mod sequential_event_waits;
 #[path = "scheduling/shared_edge_outputs.rs"]
 mod shared_edge_outputs;
+#[path = "scheduling/shared_task_frames.rs"]
+mod shared_task_frames;
 #[path = "scheduling/specify_delays_and_event_list.rs"]
 mod specify_delays_and_event_list;
 #[path = "scheduling/star_sensitivity_and_implicit_port_net.rs"]
