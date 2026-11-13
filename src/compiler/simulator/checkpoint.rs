@@ -491,6 +491,10 @@ struct OpenFile {
     pos: u64,
 }
 
+/// `ContCacheEntry::node` of an entry whose key statement is not in its
+/// owner list: the entry is not restored.
+const NO_NODE: u32 = u32::MAX;
+
 /// One `blocking_cont_cache` entry: the statement its key names is found by
 /// its position in the owner list's walk.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1027,6 +1031,15 @@ impl Simulator {
         Ok(())
     }
 
+    /// The continuation cache as entries. Every list `stmts_ref` numbers
+    /// here is written in full the first time, and a restore numbers the
+    /// lists in the order it reads them, so an entry is never left out of
+    /// the stream once its owner is numbered: the lists after it would be
+    /// numbered one too high on restore, and a `Seen` reference would name
+    /// the wrong list or none. An entry whose key statement is not in its
+    /// owner list (a fork child's frame owns itself, and its key is the
+    /// statement the frame was cloned from) cannot be carried over, so it
+    /// gets `NO_NODE`, which a restore skips, and no frame.
     fn checkpoint_cont_cache(&self) -> Vec<ContCacheEntry> {
         let mut out = Vec::new();
         for (&(node, kind), (owner, frame)) in &self.blocking_cont_cache {
@@ -1035,19 +1048,21 @@ impl Simulator {
                 StmtsRef::New(..) => with(|s| s.saved.len() as u32 - 1),
                 StmtsRef::Seen(n) => *n,
             };
-            let Some(pos) = with(|s| {
+            let pos = with(|s| {
                 s.saved_stmts
                     .get(&node)
                     .filter(|(n, _)| *n == owner_n)
                     .map(|&(_, p)| p)
-            }) else {
-                continue;
+            });
+            let (node, frame) = match pos {
+                Some(p) => (p, stmts_ref(frame)),
+                None => (NO_NODE, StmtsRef::Seen(owner_n)),
             };
             out.push(ContCacheEntry {
                 owner,
-                node: pos,
+                node,
                 kind,
-                frame: stmts_ref(frame),
+                frame,
             });
         }
         out
@@ -1065,9 +1080,14 @@ impl Simulator {
             }
         }
         for e in entries {
+            // Both lists are admitted even for an entry that is then
+            // skipped: the saving run numbered them.
             let (Some(owner), Some(frame)) = (admit_ref(e.owner), admit_ref(e.frame)) else {
                 continue;
             };
+            if e.node == NO_NODE {
+                continue;
+            }
             let entry = with(|s| {
                 let (o, addrs) = &s.restored[owner as usize];
                 let node = *addrs.get(e.node as usize)?;
