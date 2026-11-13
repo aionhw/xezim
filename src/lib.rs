@@ -1178,13 +1178,20 @@ pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, Stri
 /// `simulate_multi` call made on it runs there instead of on a second worker.
 pub const CLI_WORKER_THREAD: &str = "xezim-main";
 
+/// The CLI exhausted its worker stack choices and must stay on the current
+/// thread. This process-local choice must not alter children's environment.
+#[doc(hidden)]
+pub static CLI_CURRENT_THREAD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Public entry point: runs the whole compile+simulate on a worker thread
 /// with a LARGE stack. The parser, elaborator, and statement interpreter are
 /// all deeply recursive; an embedder's thread (a 2 MiB `cargo test` thread,
 /// a debug build's frames) otherwise overflows on real designs — CI's debug
-/// UVM suites aborted with "fatal runtime error: stack overflow". Same
-/// policy as the binary's `main()`: XEZIM_STACK_MB overrides (0 = run on
-/// the caller's thread); the memory is virtual, committed only as used.
+/// UVM suites aborted with "fatal runtime error: stack overflow".
+/// XEZIM_STACK_MB overrides (0 = run on the caller's thread); the memory is
+/// virtual, committed only as used. Unlike the binary's `main()`, this does
+/// not retry smaller stacks when the worker cannot be spawned.
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_multi(
     sources: &[String],
@@ -1214,14 +1221,17 @@ pub fn simulate_multi(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024);
-    // The command line already runs on a worker with this stack size
-    // (`CLI_WORKER_THREAD`, sized by the same XEZIM_STACK_MB), and calls this
-    // with nothing else on it. A second worker reserved the address range
+    // The command line already runs on its selected worker
+    // (`CLI_WORKER_THREAD`), and calls this with nothing else on it.
+    // A second worker reserved the address range
     // again: two 1 GiB stacks are half of a 4 GiB address-space limit, and
     // the allocation that failed first under one was the design's, not a
     // stack's.
     let on_cli_worker = std::thread::current().name() == Some(CLI_WORKER_THREAD);
-    if stack_mb == 0 || on_cli_worker {
+    if stack_mb == 0
+        || on_cli_worker
+        || CLI_CURRENT_THREAD.load(std::sync::atomic::Ordering::Relaxed)
+    {
         return simulate_multi_inner(
             sources,
             max_time,
