@@ -19,6 +19,36 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 
 #[test]
 fn impure_call_block_stays_off_the_parallel_path() {
+    // Cached flags need fresh processes. Exercise the default and both
+    // explicit modes so the worker-thread path remains covered.
+    if std::env::var_os("PARALLEL_DISPATCH_TEST_CHILD").is_none() {
+        for mode in [None, Some("1"), Some("0")] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "parallel_dispatch_expr_fallback::impure_call_block_stays_off_the_parallel_path",
+                    "--nocapture",
+                ])
+                .env("PARALLEL_DISPATCH_TEST_CHILD", "1")
+                .env("XEZIM_FORCE_PARALLEL", "1")
+                .env_remove("XEZIM_NO_PARALLEL")
+                .env_remove("XEZIM_PARALLEL_SERIALIZE");
+            if let Some(value) = mode {
+                command.env("XEZIM_PARALLEL_SERIALIZE", value);
+            }
+            let output = command
+                .output()
+                .expect("run isolated parallel dispatch test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "parallel mode {mode:?}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
     // 192 generate instances x a fat compiled always_ff body -> well past the
     // 10k-static-insn parallel qualification bar; one extra block holds the
     // impure call (reads `mode` without taking it as an argument), which
@@ -66,13 +96,8 @@ module tb;
   end
 endmodule
 "#;
-    // The dispatcher calibrates for its first 64 qualifying ticks (always
-    // sequential), so a short run never threads on its own. FORCE_PARALLEL is
-    // read uncached at every dispatch and only affects designs that qualify
-    // (>=2 eligible blocks, >=10k insns) — no other test in this binary does.
-    unsafe { std::env::set_var("XEZIM_FORCE_PARALLEL", "1") };
+    // Each child forces eligible dispatch before calibration finishes.
     let sim = simulate(src, 1000).expect("simulate failed");
-    unsafe { std::env::remove_var("XEZIM_FORCE_PARALLEL") };
     // `fin = fb_r` runs at the 40th posedge BEFORE that edge's NBA lands, so
     // it observes 39 applied updates of fb_r <= (fb_r + 'h11) ^ 5, from 0.
     let mut expect: u64 = 0;
