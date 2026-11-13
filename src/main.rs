@@ -553,8 +553,25 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     if !(num > 0.0) {
         return Err(format!("--max-time must be positive, got '{}'", raw));
     }
-    let ns = num * factor_ns;
-    let rounded = ns.round();
+    // Keep integer femtoseconds exact above f64's 53-bit mantissa. Rounding
+    // to whole ns happens once, after the unit conversion (#1113).
+    if let Some(fs) = lower
+        .strip_suffix("fs")
+        .and_then(|value| value.trim().parse::<u128>().ok())
+    {
+        let ns = fs / 1_000_000 + u128::from(fs % 1_000_000 >= 500_000);
+        if ns >= u64::MAX as u128 {
+            return Ok(u64::MAX);
+        }
+        if ns == 0 {
+            return Err(format!(
+                "--max-time '{}' is below 1 ns; the cap is tracked in whole nanoseconds",
+                raw
+            ));
+        }
+        return Ok(ns as u64);
+    }
+    let rounded = (num * factor_ns).round();
     if rounded < 1.0 {
         return Err(format!(
             "--max-time '{}' is below 1 ns; the cap is tracked in whole nanoseconds",
