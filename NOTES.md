@@ -50,6 +50,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Typed constructor calls build the named class, including type parameters
   and specializations (§8.8, #1051).
 
+* A task, function or method local declared with an unpacked-array typedef
+  and dimensions of its own (`typedef int q_t[$]; q_t l[$];`) is a collection
+  of collections, the declarator's dimensions first; the typedef's were
+  dropped, so each row held one scalar (§7.4.5, §6.18, #1140, contributed
+  by chuanseng-ng).
+
 * `randomize()` propagates aligned packed-concatenation equalities field by
   field and establishes unconditional hard bounds before translating bounded
   wide arithmetic. Satisfiable relations could exhaust the search budget or
