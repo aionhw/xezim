@@ -592,6 +592,8 @@ mod always_star_spacing;
 mod artifact_with_sources_738;
 #[path = "misc/checkpoint_save_restore.rs"]
 mod checkpoint_save_restore;
+#[path = "misc/checkpoint_forked_process_bodies.rs"]
+mod checkpoint_forked_process_bodies;
 
 #[path = "misc/block_local_array_for_loop.rs"]
 mod block_local_array_for_loop;
