@@ -123,31 +123,36 @@ fn spawn_memory_watchdog() {
         _ => return, // /proc unavailable (non-Linux); skip silently
     };
     let limit_kb = total_kb / 4 * 3;
-    std::thread::spawn(move || {
-        let pid = std::process::id();
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            if let Some(rss_kb) = proc_kb("/proc/self/status", "VmRSS") {
-                if rss_kb > limit_kb {
-                    eprintln!(
-                        "[xezim][mem-watchdog] RSS {} MiB exceeds 3/4 of system memory ({} MiB of {} MiB) — killing pid {} to prevent OOM. Set XEZIM_NO_MEM_WATCHDOG=1 to disable.",
-                        rss_kb / 1024,
-                        limit_kb / 1024,
-                        total_kb / 1024,
-                        pid,
-                    );
-                    // SIGKILL self — bypasses panic handlers, no Drop runs,
-                    // but ensures the process actually exits even if a thread
-                    // is stuck inside a long allocation.
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
+    let watchdog = std::thread::Builder::new()
+        .name("xezim-memwatch".to_string())
+        .spawn(move || {
+            let pid = std::process::id();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if let Some(rss_kb) = proc_kb("/proc/self/status", "VmRSS") {
+                    if rss_kb > limit_kb {
+                        eprintln!(
+                            "[xezim][mem-watchdog] RSS {} MiB exceeds 3/4 of system memory ({} MiB of {} MiB) — killing pid {} to prevent OOM. Set XEZIM_NO_MEM_WATCHDOG=1 to disable.",
+                            rss_kb / 1024,
+                            limit_kb / 1024,
+                            total_kb / 1024,
+                            pid,
+                        );
+                        // SIGKILL self — bypasses panic handlers, no Drop runs,
+                        // but ensures the process actually exits even if a thread
+                        // is stuck inside a long allocation.
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGKILL);
+                        }
+                        // Fallback if libc isn't available somehow.
+                        std::process::exit(137);
                     }
-                    // Fallback if libc isn't available somehow.
-                    std::process::exit(137);
                 }
             }
-        }
-    });
+        });
+    if let Err(e) = watchdog {
+        eprintln!("Warning: cannot spawn memory watchdog ({e}); running without it");
+    }
 }
 
 /// `-xezim_env <file>`: set (or with `unsetenv`, remove) the `XEZIM_*`
@@ -1985,11 +1990,46 @@ fn append_adopted_libs_to_merged(
     );
 }
 
+fn smaller_worker_stacks(requested_mb: usize) -> impl Iterator<Item = usize> {
+    [512, 256, 128, 64]
+        .into_iter()
+        .filter(move |&size_mb| size_mb < requested_mb)
+}
+
+#[test]
+fn smaller_worker_stack_ladder() {
+    for (requested, expected) in [
+        (1536, vec![512, 256, 128, 64]),
+        (1024, vec![512, 256, 128, 64]),
+        (512, vec![256, 128, 64]),
+        (256, vec![128, 64]),
+        (128, vec![64]),
+        (64, vec![]),
+        (32, vec![]),
+    ] {
+        // Exhausting this iterator selects the current-thread fallback.
+        assert_eq!(
+            smaller_worker_stacks(requested).collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
 fn main() {
     // `-xezim_env <file>` before anything reads an `XEZIM_*` variable (this
     // very function reads XEZIM_HUGEPAGE and XEZIM_STACK_MB). The process is
     // still single-threaded here, so setting the environment is sound.
     apply_xezim_env_files();
+    // Standalone informational commands need neither compilation nor a worker
+    // stack. Keep their output available even under a tight address-space limit.
+    if env::args().len() == 1
+        || matches!(
+            env::args().nth(1).as_deref(),
+            Some("-V" | "-h" | "--help" | "--show-env-avail")
+        )
+    {
+        std::process::exit(run_main());
+    }
     // FIRST thing, before any large allocation: a parent can disable transparent
     // huge pages for its whole descendant tree with prctl(PR_SET_THP_DISABLE, 1),
     // and the flag is inherited across fork+exec. While set, madvise(MADV_HUGEPAGE)
@@ -2012,7 +2052,6 @@ fn main() {
             libc::prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
         }
     }
-    spawn_memory_watchdog();
     // Install the SIGUSR1 hang-report handler before compile: a user poking a
     // seemingly-hung run during a long elaboration must not kill it (the
     // default SIGUSR1 action is termination).
@@ -2024,21 +2063,44 @@ fn main() {
     // aborts with "thread 'main' has overflowed its stack"). Do what rustc
     // does: run the whole compile+simulate on a worker thread with a large
     // stack. The memory is virtual — pages commit only if actually used —
-    // so the big default costs nothing. XEZIM_STACK_MB overrides.
+    // but the reservation still counts against address-space limits.
+    // XEZIM_STACK_MB overrides; retry smaller workers before the main stack.
     let stack_mb: usize = std::env::var("XEZIM_STACK_MB")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024);
     if stack_mb > 0 {
-        let code = std::thread::Builder::new()
-            .name(xezim::CLI_WORKER_THREAD.to_string())
-            .stack_size(stack_mb * 1024 * 1024)
-            .spawn(run_main)
-            .expect("spawn simulation thread")
-            .join()
-            .unwrap_or_else(|_| 101);
-        std::process::exit(code);
+        let mut first_error = None;
+        for size_mb in std::iter::once(stack_mb).chain(smaller_worker_stacks(stack_mb)) {
+            let warning = first_error.as_ref().map(|e| {
+                format!(
+                    "Warning: cannot spawn the simulation thread with a {stack_mb} MiB stack ({e}); running with a {size_mb} MiB stack (set XEZIM_STACK_MB to a size that fits)"
+                )
+            });
+            match std::thread::Builder::new()
+                .name(xezim::CLI_WORKER_THREAD.to_string())
+                .stack_size(size_mb * 1024 * 1024)
+                .spawn(move || {
+                    if let Some(warning) = warning {
+                        eprintln!("{warning}");
+                    }
+                    spawn_memory_watchdog();
+                    run_main()
+                }) {
+                Ok(worker) => std::process::exit(worker.join().unwrap_or(101)),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        eprintln!(
+            "Warning: cannot spawn the simulation thread with a {stack_mb} MiB stack ({}); running on the current thread (set XEZIM_STACK_MB to a size that fits, or raise `ulimit -s`)",
+            first_error.unwrap()
+        );
+        // Keep simulate_multi here too, without changing what children inherit.
+        xezim::CLI_CURRENT_THREAD.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    spawn_memory_watchdog();
     let code = run_main();
     std::process::exit(code);
 }
