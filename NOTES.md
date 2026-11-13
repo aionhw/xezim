@@ -14,17 +14,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and resident-memory records during compilation and simulation. Periodic
   samples preserve the active work when a process is killed (#721).
 
+* Informational flags run without a simulation worker. If its requested
+  stack does not fit the address-space limit, startup retries smaller stacks
+  without changing `XEZIM_STACK_MB`. Output remains available if its writer
+  thread cannot start (#1111).
+* `--max-time` accepts `fs` and rounds integer femtosecond values exactly to
+  whole nanoseconds, including values beyond floating-point precision (#1113).
+* Runtime plusargs read from `-f` and `-F` files reach the native DPI/VPI
+  argument list in parsed order, including duplicates, when running a compiled
+  artifact. The native view previously omitted file values (#1131).
+
 **Correctness**
 
-* A scope randomize call without the `std::` prefix outside a class,
-  `randomize(x)` or `randomize(x) with { x == 9; }`, solves its variables as
-  `std::randomize` does; it returned 0 and left them unchanged (§18.12,
-  #1105).
-
-* A `release` of a forced net run from an `always` block returns the net to
-  a driver that reads no signal (`wire w = 4'h5;`, `assign w = 4'h6;`); the
-  net kept the forced value, so such nets stayed `'x` after a UPF power-up
-  (§10.6.2, #1121).
 * Hierarchical references reach static task/function locals before their first
   call and preserve instance-specific storage (§6.21, §23.6).
 * Preprocessor warnings preserve the run's exit status when stderr closes
@@ -488,6 +489,25 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   instance-scoped arrays; the result previously retained its old value
   (§10.3.2, §7.2, #1090, reported by ds54e).
 
+* A scope randomize call without the `std::` prefix outside a class,
+  `randomize(x)` or `randomize(x) with { x == 9; }`, solves its variables as
+  `std::randomize` does; it returned 0 and left them unchanged (§18.12,
+  #1105).
+
+* A `release` of a forced net run from an `always` block returns the net to
+  a driver that reads no signal (`wire w = 4'h5;`, `assign w = 4'h6;`); the
+  net kept the forced value, so such nets stayed `'x` after a UPF power-up
+  (§10.6.2, #1121).
+  Re-evaluating the driver also preserves the releasing procedure's `%m`.
+* Restoring a checkpoint preserves the complete continuation of a process
+  that forked before the save; omitted continuation-cache entries could
+  misnumber shared statement lists (Annex D.9, §9.3.2, #1115).
+* Deleting an associative-array element of unpacked struct type removes its
+  member cells even after an assignment-pattern store. Residual members made
+  `num()` and `exists()` report deleted entries (§7.9.2, #1124).
+* UPF root-scope element paths resolve without a leading dot, so root power
+  domains corrupt and release their connected child outputs (core #206).
+
 **Performance**
 
 * Deferred instance type contexts share exact-equal type, width and array-query
@@ -539,6 +559,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   typedefs take 0.89 G instructions instead of 4.67 G, 256 calls beside 1,024
   typedefs 3.6 G instead of 63.8 G, and 2,048 typedefs peak at 373 MB instead
   of 484 MB (§13.4.3, #721, reported by amal-khailtash).
+
+* Finished fork children release origin and scope metadata after their last
+  reader, while retained process handles, diagnostics, callbacks and
+  checkpoint restoration retain the state they need (§9.3.2, §9.7, #1118).
+* Repeated module and interface task calls share immutable continuation bodies
+  for forks and nested blocks with timing controls. Each invocation retains
+  its own arguments and locals; checkpoint designs keep the serialization
+  path. The startup checkpoint scan visits shared source once and skips
+  runtime value tables (§9.3, §13.3, #1127).
 
 **Build**
 
