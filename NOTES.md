@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A scope randomize call without the `std::` prefix outside a class,
+  `randomize(x)` or `randomize(x) with { x == 9; }`, solves its variables as
+  `std::randomize` does; it returned 0 and left them unchanged (§18.12,
+  #1105).
 * Hierarchical references reach static task/function locals before their first
   call and preserve instance-specific storage (§6.21, §23.6).
 * Preprocessor warnings preserve the run's exit status when stderr closes
