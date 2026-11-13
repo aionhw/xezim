@@ -1996,7 +1996,7 @@ fn append_adopted_libs_to_merged(
 }
 
 fn smaller_worker_stacks(requested_mb: usize) -> impl Iterator<Item = usize> {
-    [512, 256, 128, 64]
+    [1024, 512, 256, 128, 64]
         .into_iter()
         .filter(move |&size_mb| size_mb < requested_mb)
 }
@@ -2004,7 +2004,7 @@ fn smaller_worker_stacks(requested_mb: usize) -> impl Iterator<Item = usize> {
 #[test]
 fn smaller_worker_stack_ladder() {
     for (requested, expected) in [
-        (1536, vec![512, 256, 128, 64]),
+        (1536, vec![1024, 512, 256, 128, 64]),
         (1024, vec![512, 256, 128, 64]),
         (512, vec![256, 128, 64]),
         (256, vec![128, 64]),
@@ -2077,6 +2077,18 @@ fn main() {
     if stack_mb > 0 {
         let mut first_error = None;
         for size_mb in std::iter::once(stack_mb).chain(smaller_worker_stacks(stack_mb)) {
+            let Some(stack_bytes) = size_mb
+                .checked_mul(1024 * 1024)
+                .filter(|&bytes| bytes <= isize::MAX as usize)
+            else {
+                first_error.get_or_insert_with(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "requested stack size is too large",
+                    )
+                });
+                continue;
+            };
             let warning = first_error.as_ref().map(|e| {
                 format!(
                     "Warning: cannot spawn the simulation thread with a {stack_mb} MiB stack ({e}); running with a {size_mb} MiB stack (set XEZIM_STACK_MB to a size that fits)"
@@ -2084,7 +2096,7 @@ fn main() {
             });
             match std::thread::Builder::new()
                 .name(xezim::CLI_WORKER_THREAD.to_string())
-                .stack_size(size_mb * 1024 * 1024)
+                .stack_size(stack_bytes)
                 .spawn(move || {
                     if let Some(warning) = warning {
                         eprintln!("{warning}");
