@@ -208,7 +208,7 @@ fn print_usage() {
     eprintln!("  --dump-tokens    With --parse, print the token stream");
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!(
-        "  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100ms)"
+        "  --max-time <n>[fs|ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100ms)"
     );
     eprintln!("  --save-at <time>[,<file>]  Save a checkpoint at the end of the last time slot at");
     eprintln!(
@@ -512,14 +512,19 @@ fn parse_timescale_value(d: &str) -> Result<(i32, i32), String> {
 /// Build the `--module-timescale` configuration from raw option strings,
 /// validating units and detecting conflicting named assignments.
 /// Parse a `--max-time` value: a bare number is NANOSECONDS (historical
-/// default), an attached suffix selects the unit: `30000000ps`, `30us`,
+/// default), an attached suffix selects the unit: `925000000000fs`, `30us`,
 /// `1ms`, `2s` (case-insensitive; `us` or `µs`). Returns nanoseconds.
 /// A customer run set `--max-time 30000000` intending picoseconds under a
 /// 1ps timescale and got 30 ms — the unit was invisible and unspellable.
 fn parse_max_time(raw: &str) -> Result<u64, String> {
     let t = raw.trim();
     let lower = t.to_ascii_lowercase();
-    let (num_str, factor_ns): (&str, f64) = if let Some(n) = lower.strip_suffix("ps") {
+    let (num_str, factor_ns): (&str, f64) = if let Some(n) = lower
+        .strip_suffix("fs")
+        .filter(|n| n.trim().parse::<f64>().is_ok())
+    {
+        (n, 1e-6)
+    } else if let Some(n) = lower.strip_suffix("ps") {
         (n, 1e-3)
     } else if let Some(n) = lower.strip_suffix("ns") {
         (n, 1.0)
@@ -536,7 +541,7 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     };
     let num: f64 = num_str.trim().parse().map_err(|_| {
         format!(
-            "invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s])",
+            "invalid --max-time value '{}' (expected <n>[fs|ps|ns|us|ms|s])",
             raw
         )
     })?;
@@ -555,7 +560,7 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
 }
 
 /// Parse a `--save-at` time: like `--max-time`, a bare number is
-/// nanoseconds, but `fs` is accepted and so is zero and anything below 1 ns.
+/// nanoseconds, but zero and anything below 1 ns are also accepted.
 /// Returns seconds.
 fn parse_save_time(raw: &str) -> Result<f64, String> {
     let lower = raw.trim().to_ascii_lowercase();
