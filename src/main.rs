@@ -3558,7 +3558,7 @@ suppressed but the explicit SDF annotation still applies."
                         // Pass the full CLI invocation (binary name +
                         // all args + plusargs) so vpi_get_vlog_info
                         // can hand the same argv back to UVM.
-                        sim.set_args(&args);
+                        sim.set_args(&cli_files::runtime_argv(&args, &plusargs));
                         let compilation_start = xezim::WallTimer::now();
                         sim.compile();
                         if !sim.compile_errors.is_empty() {

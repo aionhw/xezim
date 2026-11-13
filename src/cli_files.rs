@@ -127,3 +127,19 @@ pub(crate) fn env_files_in_args(args: &[String]) -> Result<Vec<String>, String> 
     }
     Ok(files)
 }
+
+/// Register the same ordered runtime plusargs with VPI/DPI as with the SV
+/// plusarg functions, including command-file values. Keep non-plusarg argv
+/// entries, and replace command-line plusargs with the complete parsed list;
+/// appending only file values would reverse mixed direct/file precedence.
+pub(crate) fn runtime_argv(args: &[String], plusargs: &[String]) -> Vec<String> {
+    let runtime: std::collections::HashSet<&str> = plusargs.iter().map(String::as_str).collect();
+    let mut argv: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, arg)| *i == 0 || !arg.starts_with('+') || !runtime.contains(arg.as_str()))
+        .map(|(_, arg)| arg.clone())
+        .collect();
+    argv.extend_from_slice(plusargs);
+    argv
+}
