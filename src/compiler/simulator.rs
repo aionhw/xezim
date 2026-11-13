@@ -2993,6 +2993,7 @@ mod assignments;
 mod bytecode_runtime;
 mod calls;
 mod checkpoint;
+mod checkpoint_calls;
 mod class_access;
 mod class_members;
 mod class_methods;
@@ -10202,6 +10203,15 @@ pub struct Simulator {
     /// processes (`pid`s) executing the same shared AST node reuse one frame.
     #[allow(clippy::type_complexity)]
     blocking_cont_cache: HashMap<(usize, u8), (Arc<[Statement]>, Arc<[Statement]>)>,
+    /// Computed once from the design and checkpoint command-line options.
+    share_task_frames: bool,
+    /// Structural fork eligibility, computed once per declaration. Holding the
+    /// declaration keeps its address valid; no statement body is cloned here.
+    task_contains_fork: HashMap<usize, (std::rc::Rc<TaskDeclaration>, bool)>,
+    /// See `task_body_frame`.
+    #[allow(clippy::type_complexity)]
+    task_frame_cache:
+        HashMap<(usize, usize, usize), (std::rc::Rc<TaskDeclaration>, Option<Arc<[Statement]>>)>,
     /// See `class_task_body_frame`.
     #[allow(clippy::type_complexity)]
     class_task_frame_cache:

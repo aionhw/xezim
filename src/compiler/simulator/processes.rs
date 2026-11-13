@@ -3470,11 +3470,28 @@ impl Simulator {
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
-                                    let mut cont: Vec<Statement> = td.items.to_vec();
-                                    cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
-                                    // Chain the caller's tail instead of copying it onto the end of
-                                    // the spliced body (ProcCont::pushed).
-                                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                                    let frame = if self.share_task_frames {
+                                        self.task_body_frame(&td, stmt.span)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(frame) = frame {
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed_frame(frame, pc.start + i + 1),
+                                        );
+                                    } else {
+                                        // Preserve first-call lifetimes and checkpoint numbering.
+                                        let mut cont: Vec<Statement> = td.items.to_vec();
+                                        cont.push(Statement::new(
+                                            StatementKind::ScopePop,
+                                            stmt.span,
+                                        ));
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed(cont, pc.start + i + 1),
+                                        );
+                                    }
                                     return;
                                 }
                             }
@@ -3535,9 +3552,28 @@ impl Simulator {
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
-                                    let mut cont: Vec<Statement> = td.items.to_vec();
-                                    cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
-                                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                                    let frame = if self.share_task_frames {
+                                        self.task_body_frame(&td, stmt.span)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(frame) = frame {
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed_frame(frame, pc.start + i + 1),
+                                        );
+                                    } else {
+                                        // Preserve first-call lifetimes and checkpoint numbering.
+                                        let mut cont: Vec<Statement> = td.items.to_vec();
+                                        cont.push(Statement::new(
+                                            StatementKind::ScopePop,
+                                            stmt.span,
+                                        ));
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed(cont, pc.start + i + 1),
+                                        );
+                                    }
                                     return;
                                 }
                             }

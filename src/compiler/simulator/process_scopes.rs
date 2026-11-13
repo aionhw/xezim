@@ -2786,6 +2786,103 @@ impl Simulator {
         f
     }
 
+    /// §9.3.2: admit task bodies containing a structural fork.
+    /// Inspect nested statements, not calls to other task declarations.
+    fn statement_contains_fork(stmt: &Statement) -> bool {
+        use StatementKind::*;
+        let contains = Self::statement_contains_fork;
+        match &stmt.kind {
+            ParBlock { .. } => true,
+            SeqBlock { stmts, .. } => stmts.iter().any(contains),
+            If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => contains(then_stmt) || else_stmt.as_deref().is_some_and(contains),
+            Case { items, .. } => items.iter().any(|item| contains(&item.stmt)),
+            RandCase { items } => items.iter().any(|(_, stmt)| contains(stmt)),
+            For { body, .. }
+            | Foreach { body, .. }
+            | ForeachTail { body, .. }
+            | While { body, .. }
+            | DoWhile { body, .. }
+            | Repeat { body, .. }
+            | Forever { body }
+            | ForeverTail { body }
+            | RsAction { body }
+            | TimingControl { stmt: body, .. }
+            | Wait { stmt: body, .. } => contains(body),
+            Assertion(assertion) => {
+                assertion.action.as_deref().is_some_and(contains)
+                    || assertion.else_action.as_deref().is_some_and(contains)
+            }
+            WaitOrder { pass, fail, .. } => {
+                pass.as_deref().is_some_and(contains) || fail.as_deref().is_some_and(contains)
+            }
+            Null
+            | ScopePop
+            | LoopStep
+            | DisableFork
+            | Expr(_)
+            | BlockingAssign { .. }
+            | NonblockingAssign { .. }
+            | EventTrigger { .. }
+            | WaitFork
+            | Disable(_)
+            | Return(_)
+            | Break
+            | Continue
+            | ProceduralContinuous(_)
+            | VarDecl { .. }
+            | Typedef(_)
+            | Coverpoint { .. }
+            | Cross { .. }
+            | RsReturn => false,
+        }
+    }
+
+    /// §13.3.1–§13.3.2: share immutable task statements, not invocation
+    /// storage, only for tasks containing a fork and after a call site is reused.
+    /// Fork-free tasks keep the original path, without a site marker. The first
+    /// eligible call keeps the original body lifetime; retain only its declaration
+    /// and site marker.
+    /// Keep ScopePop in the body to preserve assertion flush boundaries (§16.4.2).
+    pub(super) fn task_body_frame(
+        &mut self,
+        td: &std::rc::Rc<crate::ast::decl::TaskDeclaration>,
+        call_span: crate::ast::Span,
+    ) -> Option<Arc<[Statement]>> {
+        let declaration = std::rc::Rc::as_ptr(td) as usize;
+        let (_, contains_fork) = self
+            .task_contains_fork
+            .entry(declaration)
+            .or_insert_with(|| {
+                (
+                    td.clone(),
+                    td.items.iter().any(Self::statement_contains_fork),
+                )
+            });
+        if !*contains_fork {
+            return None;
+        }
+        let key = (declaration, call_span.start, call_span.end);
+        if let Some((_, frame)) = self.task_frame_cache.get(&key) {
+            if let Some(frame) = frame {
+                return Some(frame.clone());
+            }
+        } else {
+            self.task_frame_cache.insert(key, (td.clone(), None));
+            return None;
+        }
+        let mut cont: Vec<Statement> = Vec::with_capacity(td.items.len() + 1);
+        cont.extend_from_slice(&td.items);
+        cont.push(Statement::new(StatementKind::ScopePop, call_span));
+        let frame: Arc<[Statement]> = Arc::from(cont);
+        self.task_frame_cache
+            .insert(key, (td.clone(), Some(frame.clone())));
+        Some(frame)
+    }
+
     /// A class task's body followed by its `ScopePop` sentinel (spanned at
     /// the call), shared per (task, call site) instead of cloned per call.
     /// The entry keeps the method alive, so its address cannot be recycled.
