@@ -20,6 +20,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `randomize(x)` or `randomize(x) with { x == 9; }`, solves its variables as
   `std::randomize` does; it returned 0 and left them unchanged (§18.12,
   #1105).
+
+* A `release` of a forced net run from an `always` block returns the net to
+  a driver that reads no signal (`wire w = 4'h5;`, `assign w = 4'h6;`); the
+  net kept the forced value, so such nets stayed `'x` after a UPF power-up
+  (§10.6.2, #1121).
 * Hierarchical references reach static task/function locals before their first
   call and preserve instance-specific storage (§6.21, §23.6).
 * Preprocessor warnings preserve the run's exit status when stderr closes
