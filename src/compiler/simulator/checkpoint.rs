@@ -29,7 +29,8 @@ use serde::ser::{SerializeSeq, Serializer};
 /// state field's type.
 // §10.3.3 / §28.16: CombItem::ContAssign retains its original delay target.
 // §10.3.3 / §28.16: and the fall and turn-off delays of a select target.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x08";
+// Annex D.9 / §8.3: rebuild property-owner indexes from restored classes.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x09";
 
 #[derive(Default)]
 struct Session {
@@ -972,6 +973,10 @@ impl Simulator {
         self.lazy_initial.clear();
         self.method_plans.borrow_mut().clear();
         self.fsm_clobber_cache.clear();
+        // Annex D.9 / §8.3: this derived index borrows the class table.
+        // Serializing its Arc values duplicates every declaring class for
+        // every property. Rebuild it lazily from the restored shared table.
+        self.prop_owner_index.borrow_mut().clear();
         self.task_frame_eligibility.clear();
         self.task_frame_cache.clear();
         self.class_task_frame_cache.clear();
@@ -1499,7 +1504,6 @@ checkpoint_state!(
     program_initials_live,
     program_pid_scope,
     program_pids,
-    prop_owner_index,
     prop_raw_ty_cache,
     prop_width_memo,
     queue_frame_saves,
