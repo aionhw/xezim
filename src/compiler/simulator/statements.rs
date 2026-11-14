@@ -2648,50 +2648,56 @@ impl Simulator {
             // §6.18/§6.20.3: a typedef'd (or type-param-bound) local
             // carries its unpacked dims on the TYPE — `my_array_t a;`
             // declared inside a task elaborated as a scalar.
-            let typedef_dims: Vec<crate::ast::types::UnpackedDimension> =
-                if d.dimensions.is_empty() && !plain_class {
-                    if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
-                        let tn = &name.name.name;
-                        let concrete = self
-                            .resolve_type_param_binding(tn)
-                            .unwrap_or_else(|| tn.clone());
-                        self.module
-                            .typedef_unpacked_dims
-                            .get(&concrete)
-                            .cloned()
-                            .or_else(|| {
-                                // CLASS-LOCAL typedef: an explicit
-                                // `C::t_t v;` scope, else the class
-                                // whose method is executing — a
-                                // `Ph::d_t dd;` local bound as a
-                                // scalar, so a later `ref` call saw
-                                // no collection to write back to.
-                                let start = name
-                                    .scopes
-                                    .first()
-                                    .map(|s| s.name.name.clone())
-                                    .or_else(|| self.class_context_stack.last().cloned().flatten())
-                                    .or_else(|| {
-                                        self.this_stack.last().copied().flatten().and_then(|h| {
-                                            self.heap
-                                                .get(h)
-                                                .and_then(|x| x.as_ref())
-                                                .map(|i| i.class_name.clone())
-                                        })
-                                    })?;
-                                Self::typedef_dims_via_tables(&self.module, &start, &concrete)
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    }
+            let typedef_dims: Vec<crate::ast::types::UnpackedDimension> = if !plain_class {
+                if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
+                    let tn = &name.name.name;
+                    let concrete = self
+                        .resolve_type_param_binding(tn)
+                        .unwrap_or_else(|| tn.clone());
+                    self.module
+                        .typedef_unpacked_dims
+                        .get(&concrete)
+                        .cloned()
+                        .or_else(|| {
+                            // CLASS-LOCAL typedef: an explicit
+                            // `C::t_t v;` scope, else the class
+                            // whose method is executing — a
+                            // `Ph::d_t dd;` local bound as a
+                            // scalar, so a later `ref` call saw
+                            // no collection to write back to.
+                            let start = name
+                                .scopes
+                                .first()
+                                .map(|s| s.name.name.clone())
+                                .or_else(|| self.class_context_stack.last().cloned().flatten())
+                                .or_else(|| {
+                                    self.this_stack.last().copied().flatten().and_then(|h| {
+                                        self.heap
+                                            .get(h)
+                                            .and_then(|x| x.as_ref())
+                                            .map(|i| i.class_name.clone())
+                                    })
+                                })?;
+                            Self::typedef_dims_via_tables(&self.module, &start, &concrete)
+                        })
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
-                };
+                }
+            } else {
+                Vec::new()
+            };
+            // §7.4.5: a local with dimensions of its own (`q_t l[$];`) puts
+            // them first, then the typedef's, as at module scope; the
+            // typedef's were dropped, so each row of `l` held one scalar.
+            let joined_dims: Vec<crate::ast::types::UnpackedDimension>;
             let dims: &Vec<crate::ast::types::UnpackedDimension> = if typedef_dims.is_empty() {
                 &d.dimensions
-            } else {
+            } else if d.dimensions.is_empty() {
                 &typedef_dims
+            } else {
+                joined_dims = d.dimensions.iter().chain(&typedef_dims).cloned().collect();
+                &joined_dims
             };
             // §7.4.2 / §8.23: a dimension sized by a constant of the
             // enclosing scope (`l[N]`, `l[N * 2]`, `l[cls::N]`) — the
