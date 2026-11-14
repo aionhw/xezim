@@ -361,7 +361,8 @@ fn method_boost_enabled() -> bool {
 // §10.9.2: structure replication in scalarized function calls.
 // §6.16: a string-collection element read through a class handle compares as a string.
 // §7.4.2: an index into an array with a negative bound is sign-extended.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3078;
+// §10.9.1: packed pattern keys retain literal width and signedness.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3079;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1690,7 +1691,8 @@ struct CombEntryCold {
 // §7.4.1: compiled members of ascending packed arrays of structs slice from slot 0.
 // §10.9.2: scalarized resolver calls expand structure replication.
 // §7.4.2: compiled blocks sign-extend an index into an array with a negative bound.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB036";
+// §10.9.1: rebuild packed pattern plans with typed literal indices.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB037";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
