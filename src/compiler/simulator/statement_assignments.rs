@@ -3833,6 +3833,13 @@ impl Simulator {
                     // `other.h = new()` with `other` a `W #(B)` builds a `B`
                     // (#596).
                     let type_name = self.member_target_class(lvalue).or(type_name);
+                    // §15.3, §15.4, §6.18: a built-in class named with its
+                    // specialization (`mailbox #(int)`) or through a typedef.
+                    let type_name = type_name.map(|tn| {
+                        self.builtin_container_kind(&tn)
+                            .map(str::to_string)
+                            .unwrap_or(tn)
+                    });
                     if let Some(tname) = type_name {
                         if tname == "semaphore" {
                             let handle = self.heap.len();

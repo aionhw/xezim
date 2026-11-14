@@ -5047,6 +5047,23 @@ impl Simulator {
         }
     }
 
+    /// `container_base` of a type name, following a typedef chain (§6.18):
+    /// `typedef mailbox #(int) mbox_t;` makes `mbox_t` a mailbox.
+    pub(super) fn builtin_container_kind(&self, t: &str) -> Option<&'static str> {
+        let mut cur = t.to_string();
+        for _ in 0..8 {
+            if let Some(k) = Self::container_base(&cur) {
+                return Some(k);
+            }
+            let base = cur.split(['#', ' ', '(']).next().unwrap_or("").trim();
+            match self.module.typedef_types.get(base) {
+                Some(DataType::TypeReference { name, .. }) => cur = name.name.name.clone(),
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// §15.3/§15.4: if `lvalue`'s declared type is a (possibly parameterized)
     /// mailbox/semaphore, return "mailbox"/"semaphore". Consults the local
     /// container-decl map and the class-property type via the current class
@@ -5077,13 +5094,13 @@ impl Simulator {
                 .properties
                 .get(member)
                 .and_then(|s| s.type_name.as_deref())
-                .and_then(Self::container_base)
+                .and_then(|t| self.builtin_container_kind(t))
             {
                 return Some(k);
             }
             if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
                 cd.property_types.get(member)
-                && let Some(k) = Self::container_base(&name.name.name)
+                && let Some(k) = self.builtin_container_kind(&name.name.name)
             {
                 return Some(k);
             }
@@ -5120,7 +5137,7 @@ impl Simulator {
                     for key in [full.as_ref(), leaf.as_str()] {
                         if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
                             self.module.var_decl_types.get(key)
-                            && let Some(k) = Self::container_base(&name.name.name)
+                            && let Some(k) = self.builtin_container_kind(&name.name.name)
                         {
                             return Some(k);
                         }
@@ -5167,7 +5184,27 @@ impl Simulator {
                     .map(|s| s.name.name.as_str())
                     .collect::<Vec<_>>()
                     .join(".");
-                if let Some(hnd) = self.eval_ident_handle(&head)
+                // `C::mb = new()`: a static property named through its class.
+                if h.path.len() == 2 {
+                    let mut cur = Some(h.path[0].name.name.clone());
+                    while let Some(cd) = cur.as_deref().and_then(|c| self.module.classes.get(c)) {
+                        if cd.static_properties.contains(&member) {
+                            if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
+                                cd.property_types.get(&member)
+                            {
+                                return self.builtin_container_kind(&name.name.name);
+                            }
+                            break;
+                        }
+                        cur = cd.extends.clone();
+                    }
+                }
+                // A chain of handles (`o.in.mb`) is walked, not read by name.
+                let hnd = self.eval_ident_handle(&head).or_else(|| {
+                    let recv = Expression::new(ExprKind::Ident(hier_prefix(h)), lvalue.span);
+                    self.eval_handle_expr(&recv)
+                });
+                if let Some(hnd) = hnd
                     && let Some(k) = self.handle_prop_container_kind(hnd, &member)
                 {
                     return Some(k);
@@ -5185,7 +5222,7 @@ impl Simulator {
         if let Some(pn) = &prop {
             // 1. tracked local (procedural `mailbox m;`).
             if let Some(k) = self.var_container_types.get(pn) {
-                return Self::container_base(k);
+                return self.builtin_container_kind(k);
             }
             // 2. class property of the current class (walk the hierarchy).
             if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
@@ -5193,7 +5230,10 @@ impl Simulator {
                 while let Some(cn) = cur {
                     if let Some(cd) = self.module.classes.get(&cn) {
                         if let Some(sig) = cd.properties.get(pn) {
-                            if let Some(k) = sig.type_name.as_deref().and_then(Self::container_base)
+                            if let Some(k) = sig
+                                .type_name
+                                .as_deref()
+                                .and_then(|t| self.builtin_container_kind(t))
                             {
                                 return Some(k);
                             }
@@ -5204,7 +5244,7 @@ impl Simulator {
                             // declared type before giving up.
                             if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
                                 cd.property_types.get(pn)
-                                && let Some(k) = Self::container_base(&name.name.name)
+                                && let Some(k) = self.builtin_container_kind(&name.name.name)
                             {
                                 return Some(k);
                             }
@@ -5220,7 +5260,7 @@ impl Simulator {
         // 3. module-scope signal (get_expr_type_name returns "mailbox" here).
         self.get_expr_type_name(lvalue)
             .as_deref()
-            .and_then(Self::container_base)
+            .and_then(|t| self.builtin_container_kind(t))
     }
 
     /// §7.2/§8.4: the class a CLASS-HANDLE member of an unpacked struct
@@ -5404,7 +5444,8 @@ impl Simulator {
     /// would abort a run over an ordinary user method named `get`.
     /// Deliberately conservative — an undeterminable type answers false.
     pub(super) fn is_declared_mailbox(&self, expr: &Expression) -> bool {
-        let says_mailbox = |t: &str| t.starts_with("mailbox") || t == "mailbox";
+        // §6.18: a typedef of a mailbox type is one too.
+        let says_mailbox = |t: &str| self.builtin_container_kind(t) == Some("mailbox");
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
             if self

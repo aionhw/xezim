@@ -1944,7 +1944,11 @@ fn is_builtin_type(n: &str) -> bool {
             | "enum"
             | "struct"
             | "union"
+            // §15.3, §15.4, §9.7: the built-in classes of package `std`,
+            // visible in every scope.
             | "process"
+            | "mailbox"
+            | "semaphore"
             | "supply0"
             | "supply1"
     )
