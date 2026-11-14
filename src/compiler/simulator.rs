@@ -4124,6 +4124,9 @@ struct SvaClockedSite {
     past_names: Vec<String>,
     /// The body compiled to an evaluable property tree (see `SvaNode`).
     node: std::sync::Arc<SvaNode>,
+    /// `node` holds an `accept_on` / `reject_on` (§16.12.14), whose
+    /// condition is checked in every time step, not only at the ticks.
+    async_abort: bool,
     /// §16.12 `disable iff (guard)`: while the guard holds, every attempt in
     /// flight is cancelled and no new one starts. Evaluated with the current
     /// (unsampled) values, as the LRM's asynchronous reset semantics require.
@@ -4357,6 +4360,15 @@ enum SvaNode {
     Eventually(Expression),
     /// §16.12.6 `s_always e`: fails the first tick `e` samples false.
     Always(Expression),
+    /// §16.12.14 `accept_on (cond) body` / `reject_on (cond) body`
+    /// (`accept`), and their `sync_` forms (`sync`): `cond` holding during
+    /// the evaluation of `body` aborts it, with success or failure.
+    Abort {
+        cond: Expression,
+        accept: bool,
+        sync: bool,
+        body: Box<SvaNode>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4413,6 +4425,16 @@ enum SvaState {
     },
     /// `s_eventually` / `s_always`, with the attempt's local variables.
     Leaf(SvaEnv),
+    /// An abort property's evaluation. `latched`: an asynchronous abort
+    /// condition held in a time step since the last tick, settled at the
+    /// next tick or at the end of simulation; `aborted`: an abort settled
+    /// the attempt.
+    Abort {
+        body: Box<SvaState>,
+        env: SvaEnv,
+        latched: bool,
+        aborted: bool,
+    },
 }
 
 /// One candidate start point of a property-valued until operand.
