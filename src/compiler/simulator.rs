@@ -9470,6 +9470,13 @@ pub struct Simulator {
     /// §21.7.1.4 `$dumpvars` depth argument: 0 = every level below the given
     /// scope, N = N levels starting at it.
     vcd_dump_depth: u32,
+    /// §21.7.1.2: the `(scopes, depth)` selections of the `$dumpvars` calls
+    /// executed before the latest one at the time the dump started. Each call
+    /// adds its objects to the dump (`vcd_filter_scopes` and `vcd_dump_depth`
+    /// hold the latest call's).
+    vcd_earlier_selections: Vec<(Vec<String>, u32)>,
+    /// The simulation time the VCD dump started at (`u64::MAX` before).
+    vcd_start_time: u64,
     /// §21.7.2.1 var type per `vcd_trace` entry (parallel vector). Drives both
     /// the `$var` declaration and the runtime record shape (an `event` emits a
     /// bare `1<id>` pulse, a `real` an `r<decimal>` record).

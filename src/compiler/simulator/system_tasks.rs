@@ -959,6 +959,7 @@ impl Simulator {
                     self.vcd_filter_scopes = Vec::new();
                     self.vcd_dump_none = false;
                     self.vcd_dump_depth = 0;
+                    self.vcd_earlier_selections.clear();
                     self.vcd_start_dump();
                 } else {
                     self.vcd_dump_on();
@@ -1002,16 +1003,35 @@ impl Simulator {
                 // when the user DID name arguments and not one of them survived
                 // as a name, the run must not fail open into a full dump: say
                 // so, and select nothing.
-                self.vcd_dump_none = false;
-                if args.len() > 1 && filter_scopes.is_empty() {
+                let dump_none = args.len() > 1 && filter_scopes.is_empty();
+                if dump_none {
                     self.warn_system_task_once(
                         "$dumpvars no usable argument",
                         "Warning: no $dumpvars argument named a scope or variable, so the dump \
                          selects nothing (an empty $dumpvars filter would dump the whole \
                          design)",
                     );
-                    self.vcd_dump_none = true;
                 }
+                // §21.7.1.2: "$dumpvars can be invoked as often as desired
+                // throughout the model ... but the execution of all the
+                // $dumpvars tasks shall be at the same simulation time", and
+                // dumping starts at the end of that time unit, so a further
+                // call at the start time adds its objects: restart the dump
+                // with every selection. A call at a later time stays a
+                // checkpoint of the running dump (`vcd_start_dump`).
+                if self.vcd_writer.is_some() && self.vcd_start_time == self.time {
+                    if !self.vcd_dump_none {
+                        let earlier = std::mem::take(&mut self.vcd_filter_scopes);
+                        self.vcd_earlier_selections
+                            .push((earlier, self.vcd_dump_depth));
+                    }
+                    // Dropping the writer flushes it and joins its thread
+                    // before the file is created again.
+                    self.vcd_writer = None;
+                } else if self.vcd_writer.is_none() {
+                    self.vcd_earlier_selections.clear();
+                }
+                self.vcd_dump_none = dump_none;
                 self.vcd_filter_scopes = filter_scopes;
                 self.vcd_dump_depth = depth;
                 self.vcd_start_dump();

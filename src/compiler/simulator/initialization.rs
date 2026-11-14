@@ -4527,6 +4527,8 @@ impl Simulator {
             vcd_filter_scopes: Vec::new(),
             vcd_dump_none: false,
             vcd_dump_depth: 0,
+            vcd_earlier_selections: Vec::new(),
+            vcd_start_time: u64::MAX,
             vcd_var_kinds: Vec::new(),
             vcd_event_last: Vec::new(),
             vcd_limit: None,

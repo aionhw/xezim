@@ -525,13 +525,24 @@ impl Simulator {
             }
         };
 
-        let sig_names = if self.vcd_dump_none {
+        let mut sig_names = if self.vcd_dump_none {
             Vec::new()
         } else {
             self.dump_signal_names(&self.vcd_filter_scopes, self.vcd_dump_depth)
         };
+        // §21.7.1.2: the objects of every `$dumpvars` call made at the start
+        // time, each with its own depth.
+        let mut earlier = String::new();
+        for (scopes, depth) in &self.vcd_earlier_selections {
+            sig_names.extend(self.dump_signal_names(scopes, *depth));
+            earlier.push_str(&format!("; filter_scopes={:?}, depth={}", scopes, depth));
+        }
+        if !self.vcd_earlier_selections.is_empty() {
+            sig_names.sort();
+            sig_names.dedup();
+        }
         eprintln!(
-            "[VCD] dumping {} signals ({}, depth={})",
+            "[VCD] dumping {} signals ({}, depth={}{})",
             sig_names.len(),
             // `filter_scopes=[]` alone cannot tell "no filter was given" from
             // "every filter was thrown away" — say which.
@@ -540,7 +551,8 @@ impl Simulator {
             } else {
                 format!("filter_scopes={:?}", self.vcd_filter_scopes)
             },
-            self.vcd_dump_depth
+            self.vcd_dump_depth,
+            earlier
         );
 
         // Assign VCD identifier codes. Codes are Arc<str> so the per-change
@@ -777,6 +789,7 @@ impl Simulator {
         self.vcd_var_kinds = kinds;
         self.vcd_prev_signals = prev;
         self.vcd_writer = Some(w);
+        self.vcd_start_time = self.time;
         self.vcd_enabled = true;
         self.vcd_bytes = 0;
         self.vcd_limit_hit = false;
