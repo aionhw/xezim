@@ -58,7 +58,7 @@ fn vhdl_top_ports_through_vpi() {
     );
     assert!(
         stderr.contains(
-            "vpi_top.vhd:11:5: warning: VHDL: inout port 'io' cannot be connected to SystemVerilog yet; it is not visible to VPI"
+            "vpi_top.vhd:11:5: warning: VHDL: inout port 'io' cannot be connected to SystemVerilog yet (only a resolved std_logic scalar or vector can); it is not visible to VPI"
         ),
         "{stderr}"
     );
