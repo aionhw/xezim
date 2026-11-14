@@ -8,6 +8,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+**Correctness**
+
+* The abort properties `accept_on (b) p`, `reject_on (b) p`,
+  `sync_accept_on (b) p` and `sync_reject_on (b) p` are evaluated (§16.12.14,
+  #1155). When `b` holds during an evaluation of `p`, the attempt is accepted
+  as a vacuous success or rejected as a failure; otherwise it has the result
+  of `p`. At a clock tick the abort takes precedence over `p`'s result. The
+  `sync_` forms check `b` only at the ticks; the others check its sampled
+  value in every time step and report a hit at the next tick, or at the end
+  of simulation. Parsing them needs aionhw/xezim-core#223. A checkpoint
+  saved by an earlier build is refused.
+
 ### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
 
 **Performance**
