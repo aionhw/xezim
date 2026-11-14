@@ -651,3 +651,7 @@ mod urandom_seed_input_1058;
 mod oom_trace;
 #[path = "misc/scope_randomize_without_std.rs"]
 mod scope_randomize_without_std;
+#[path = "misc/interconnect_array_drivers_1098.rs"]
+mod interconnect_array_drivers_1098;
+#[path = "misc/replication_signedness_1095.rs"]
+mod replication_signedness_1095;
