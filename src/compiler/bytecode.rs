@@ -21355,7 +21355,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // §5.7 (issue #31): compiled-path literals warn here — once
                 // per literal string, deduped with the elaboration/AST sites.
                 crate::compiler::elaborate::warn_unsized_decimal_wrap(*size, base, value);
-                let mut v = Value::from_str_radix(value, r, w);
+                let mut v = Value::from_literal_text(value, r, w);
                 // Same inline cache the AST evaluator keeps on this node: a
                 // literal in a declared range is re-evaluated for every
                 // reference to the signal.

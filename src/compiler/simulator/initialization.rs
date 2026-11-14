@@ -808,7 +808,7 @@ impl Simulator {
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
-                Value::from_str_radix(value, r, w).to_u64()
+                Value::from_literal_text(value, r, w).to_u64()
             }
             ExprKind::Paren(inner) => Self::const_expr_u64(inner, params),
             ExprKind::Ident(h) => params
