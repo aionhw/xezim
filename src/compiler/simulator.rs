@@ -562,6 +562,11 @@ const RPS_TRAMPOLINE_DEPTH: usize = 300;
 /// Internal marker retrieving a §9.4.5 intra-assignment RHS value captured in
 /// `Simulator::intra_saved` (see `make_intra_saved_expr`). Never user-visible.
 const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
+/// §9.4.5, §10.9: an item of an intra-assignment pattern, captured when the
+/// statement ran. Read without being taken (a `default:` item is read once
+/// per element); `INTRA_RELEASE_MARKER` frees the items after the store.
+const INTRA_KEPT_MARKER: &str = "$__xz_intra_kept";
+const INTRA_RELEASE_MARKER: &str = "$__xz_intra_release";
 /// Internal `$__xz_vc_changed(idx, expr)`: true once `expr` differs from the
 /// value stashed in `Simulator::vc_saved[idx]` when a value-change event
 /// control (`@prop` on a non-event class property) was armed. Never

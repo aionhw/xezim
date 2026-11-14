@@ -4237,8 +4237,8 @@ impl Simulator {
                     if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4 {
                         let n_val = self.eval_expr(&args[0]).to_u64().unwrap_or(1) as i64;
                         let edge_code = self.eval_expr(&args[1]).to_u64().unwrap_or(0);
-                        let val = self.eval_target_rhs(packed_lvalue, &args[3]);
-                        let saved = self.make_intra_saved_expr(val, rvalue.span);
+                        let (saved, release) =
+                            self.capture_intra_rhs(packed_lvalue, &args[3], rvalue.span);
                         let edge = match edge_code {
                             1 => Some(Edge::Posedge),
                             2 => Some(Edge::Negedge),
@@ -4269,6 +4269,7 @@ impl Simulator {
                             },
                             stmt.span,
                         ));
+                        cont.extend(release);
                         let child = self.next_pid;
                         self.next_pid += 1;
                         self.process_origin

@@ -306,6 +306,14 @@ impl Simulator {
     }
 
     pub(super) fn exec_system_task(&mut self, name: &str, args: &[Expression]) {
+        if name == INTRA_RELEASE_MARKER {
+            for a in args {
+                if let Some(idx) = self.eval_expr(a).to_u64() {
+                    self.intra_saved.remove(&idx);
+                }
+            }
+            return;
+        }
         if name == SYNC_WAKE_MARKER {
             if let Some(id) = args.first().and_then(|a| self.eval_expr(a).to_u64()) {
                 self.sync_wakes.insert(id);
