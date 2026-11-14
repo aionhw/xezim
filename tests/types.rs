@@ -745,3 +745,5 @@ mod literal_pattern_key_params_1164;
 mod constant_expression_types_1143;
 #[path = "types/unsigned_operand_kinds_1158.rs"]
 mod unsigned_operand_kinds_1158;
+#[path = "types/signed_packed_member_reads_1159.rs"]
+mod signed_packed_member_reads_1159;
