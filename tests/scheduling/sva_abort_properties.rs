@@ -67,18 +67,15 @@ fn sync_forms_miss_a_pulse_between_ticks() {
 }
 
 /// `r` samples 1 at the tick where `p` fails: the abort wins. The attempt
-/// that starts at that tick is aborted too (accepted silently, rejected
-/// with a second failure).
+/// that starts at that tick has matched no antecedent, so an accept settles
+/// it silently and a reject leaves it to pass vacuously (F.5.3.1): one
+/// failure, as on the reference simulator.
 #[test]
 fn an_abort_at_a_tick_takes_precedence() {
     let r_at_15 = "#14 r=1; #2 r=0;";
     check("accept_on (r) start |-> ##1 b", r_at_15, &[]);
     check("sync_accept_on (r) start |-> ##1 b", r_at_15, &[]);
-    check(
-        "sync_reject_on (r) start |-> ##1 1",
-        r_at_15,
-        &["T|F 15", "T|F 15"],
-    );
+    check("sync_reject_on (r) start |-> ##1 1", r_at_15, &["T|F 15"]);
 }
 
 /// The condition is checked at the tick where the evaluation starts.
