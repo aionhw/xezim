@@ -620,6 +620,11 @@ impl Simulator {
         &mut self,
         event: &EventControl,
     ) -> Option<Expression> {
+        // §13.5.2: `@(x)` on a `ref` formal aliased to a property waits for
+        // a change of that property.
+        if let Some(ev) = self.ref_event_on_pinned_prop(event) {
+            return self.class_prop_value_change_cond(&ev);
+        }
         let exprs = if let EventControl::EventExpr(terms) = event
             && terms.len() > 1
         {
@@ -801,6 +806,10 @@ impl Simulator {
     /// one term, an `iff`, an `event` operand, or still names a real signal
     /// (those keep the signal-sensitivity path).
     pub(super) fn class_prop_edge_cond(&mut self, event: &EventControl) -> Option<Expression> {
+        // §13.5.2: `@(posedge x)` on a formal aliased to a property.
+        if let Some(ev) = self.ref_event_on_pinned_prop(event) {
+            return self.class_prop_edge_cond(&ev);
+        }
         let EventControl::EventExpr(terms) = event else {
             return None;
         };
@@ -1579,6 +1588,33 @@ impl Simulator {
                             return Some(format!("{}[{}]", bname, idx));
                         }
                     }
+                    // An element of a module-scope queue, dynamic or
+                    // associative array, frozen at call time as above.
+                    if !caller_local
+                        && self
+                            .ref_binding_stack
+                            .last()
+                            .is_none_or(|m| !m.contains_key(&bname))
+                        && (self.module.dynamic_arrays.contains(&bname)
+                            || self.module.queue_vars.contains(&bname)
+                            || self.module.associative_arrays.contains_key(&bname))
+                    {
+                        let iv = self.eval_expr(index);
+                        let cell = if self.module.associative_arrays.contains_key(&bname) {
+                            format!("{}[{}]", bname, self.assoc_key_str(&bname, &iv))
+                        } else {
+                            let idx = iv.to_i64().filter(|&i| i >= 0)?;
+                            if idx as u64 >= self.get_queue_size(&bname) {
+                                return None;
+                            }
+                            format!("{}[{}]", bname, idx)
+                        };
+                        if self.signals.contains_key(&cell)
+                            || self.signal_name_to_id.contains_key(cell.as_str())
+                        {
+                            return Some(cell);
+                        }
+                    }
                 }
             }
             return None;
@@ -1606,12 +1642,11 @@ impl Simulator {
         {
             return None; // ref-bound in the caller but not aliasable
         }
-        // Aggregates and strings keep their dedicated formal machinery.
+        // Aggregates keep their dedicated formal machinery.
         if self.module.arrays.contains_key(name)
             || self.module.dynamic_arrays.contains(name)
             || self.module.queue_vars.contains(name)
             || self.module.associative_arrays.contains_key(name)
-            || self.string_signals.contains(name)
         {
             return None;
         }

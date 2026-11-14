@@ -954,7 +954,7 @@ impl Simulator {
         // general path.
         if self.ref_redirect_possible() {
             if let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(root)) {
-                h = self.get_signal_value_by_name(storage)?.to_u64()? as usize;
+                h = self.ref_alias_peek(storage)?.to_u64()? as usize;
             } else if self
                 .ref_identity_stack
                 .last()

@@ -3067,6 +3067,7 @@ mod event_stamps;
 mod module_paths;
 mod names;
 mod rand_csp;
+mod ref_aliases;
 mod rand_diag;
 
 /// Marks a `dist` target recorded by MEMBER path in `rand_order_sensitive`.
@@ -8975,6 +8976,9 @@ pub struct Simulator {
     /// the only state in which `ref_formal_redirect_*` can rewrite anything.
     /// Maintained on push/pop/take/restore so the hot paths test one bool.
     ref_redirect_hot: bool,
+    /// §13.5.2: callee frames aliasing a property of each pinned object
+    /// (see `ref_pins_acquire`); the pin variable lives while this is > 0.
+    ref_pin_users: HashMap<usize, u32>,
     /// §19.7.1 `cg::type_option.<field>` per covergroup TYPE (weight, goal,
     /// comment, strobe, merge_instances), seeded from the body's
     /// `type_option.f = v;` items on first access.

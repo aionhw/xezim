@@ -3197,7 +3197,7 @@ impl Simulator {
                         .and_then(|m| m.get(name.as_str()))
                         .cloned()
                     {
-                        if let Some(v) = self.get_signal_value_by_name(&storage) {
+                        if let Some(v) = self.ref_alias_read(&storage) {
                             return v;
                         }
                     }

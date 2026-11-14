@@ -3113,7 +3113,9 @@ impl Simulator {
             // module-scope object existed, silently returned THAT object's
             // field. The whole-struct read was correct throughout, which is
             // what disguised this as an argument-passing bug.
-            if let Some(cur) = self.get_local_or_signal(&base) {
+            // §13.5.2: an aliased `ref` formal's member is the actual's.
+            let aliased = self.ref_alias_base_value(&base);
+            if let Some(cur) = aliased.or_else(|| self.get_local_or_signal(&base)) {
                 let mut v = cur.range_select((off + w - 1) as usize, off as usize);
                 // §7.2.1: the slice is a raw bit pattern — re-stamp the
                 // member's DECLARED signedness (`int s` in a packed struct
@@ -3281,7 +3283,9 @@ impl Simulator {
         // independent leaf that would silently stop aliasing its siblings.
         if let Some((base, off, w)) = self.packed_leaf_of_hier(name) {
             // Frame first, mirroring the read path above.
-            if let Some(cur) = self.get_local_or_signal(&base) {
+            let aliased = self.ref_alias_base_value(&base);
+            let through_alias = aliased.is_some();
+            if let Some(cur) = aliased.or_else(|| self.get_local_or_signal(&base)) {
                 let mut next = cur.clone();
                 let mut piece = val.resize(w);
                 if !self.mixed_packed_vars.is_empty() {
@@ -3290,7 +3294,10 @@ impl Simulator {
                 for i in 0..w {
                     next.set_bit((off + i) as usize, piece.get_bit(i as usize));
                 }
-                if next != cur {
+                if through_alias {
+                    // §13.5.2: write the actual now, and keep the frame copy.
+                    self.ref_alias_store_base(&base, &next);
+                } else if next != cur {
                     self.set_local_or_signal(&base, next);
                 }
                 return;

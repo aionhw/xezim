@@ -1287,6 +1287,15 @@ impl Simulator {
         if name == "super" || name == "this" {
             return self.this_stack.last().copied().flatten();
         }
+        // §13.5.2: an aliased `ref` formal is the caller's storage NOW; the
+        // frame keeps the call-time copy (a method receiver `mb.num()` on a
+        // handle constructed after the call read null from it).
+        if self.ref_redirect_possible()
+            && let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(name))
+            && let Some(v) = self.ref_alias_peek(storage)
+        {
+            return v.to_u64().map(|h| h as usize);
+        }
         if let Some(locals) = self.local_stack.last() {
             if let Some(v) = locals.get(name) {
                 return v.to_u64().map(|h| h as usize);

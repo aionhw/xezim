@@ -3053,6 +3053,11 @@ impl Simulator {
                 self.this_stack.last().copied().flatten().is_some()
             );
         }
+        // §13.5.2: a built-in method of an aliased `ref` formal (`s.len()`)
+        // reads the caller's storage now; the frame keeps the call-time copy.
+        if self.ref_redirect_possible() {
+            self.ref_alias_refresh_slot(obj_name);
+        }
         let _resolved = self.spec_static_coll_key(obj_name);
         let obj_name: &str = &_resolved;
         // §8.10: inside a class method, a MEMBER collection shadows any

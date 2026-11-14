@@ -1630,6 +1630,27 @@ impl Simulator {
             if storage == name || member_wise_struct(self) {
                 return None;
             }
+            // A pinned property (`<pin>.<prop>`): the formal's selects go on
+            // the property segment.
+            if let Some(mut pinned) = Self::ref_pin_hier(storage, hier.span) {
+                // A member of a packed struct formal is sliced out of the
+                // property's value by the packed-leaf paths (see
+                // `ref_alias_base_value`); the pin has no declared type to
+                // resolve the member through.
+                if hier.path.len() >= 2
+                    && hier.path[0].selects.is_empty()
+                    && self
+                        .packed_leaf_of_hier(&format!("{}.{}", name, hier.path[1].name.name))
+                        .is_some()
+                {
+                    return None;
+                }
+                let mut rest = hier.path.clone();
+                let first = rest.remove(0);
+                pinned.path[1].selects = first.selects;
+                pinned.path.extend(rest);
+                return Some(pinned);
+            }
             let mut path = hier.path.clone();
             path[0].name.name = storage.clone();
             return Some(crate::ast::expr::HierarchicalIdentifier {
@@ -3968,7 +3989,7 @@ impl Simulator {
                     .and_then(|m| m.get(&fname))
                     .cloned()
                 {
-                    if let Some(full) = self.get_signal_value_by_name(&storage) {
+                    if let Some(full) = self.ref_alias_read(&storage) {
                         if let Some(frame) = self.local_stack.last_mut() {
                             if let Some(slot) = frame.get_mut(&fname) {
                                 *slot = full;
@@ -4358,9 +4379,7 @@ impl Simulator {
                                 self.viface_var_aliases.remove(&storage);
                             }
                         }
-                        let prev = self.get_signal_value_by_name(&storage);
-                        self.set_signal_value_by_name(&storage, val.clone());
-                        return prev.as_ref() != self.get_signal_value_by_name(&storage).as_ref();
+                        return self.ref_alias_write(&storage, val);
                     }
                 }
             }

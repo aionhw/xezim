@@ -4388,6 +4388,7 @@ impl Simulator {
             ref_identity_stack: Vec::new(),
             pending_formal_dyn: Vec::new(),
             ref_redirect_hot: false,
+            ref_pin_users: HashMap::default(),
             cg_type_options: HashMap::default(),
             method_receiver_cache: HashMap::default(),
             hint_key_scratch: std::cell::RefCell::new(String::new()),

@@ -3921,7 +3921,7 @@ impl Simulator {
                 && let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(name))
             {
                 return self
-                    .get_signal_value_by_name(storage)
+                    .ref_alias_peek(storage)
                     .and_then(|v| v.to_u64())
                     .and_then(|t| self.iface_by_token(t))
                     .map(str::to_string);

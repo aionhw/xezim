@@ -1161,7 +1161,9 @@ impl Simulator {
             })
             .collect();
         self.ref_binding_stack.pop();
-        self.ref_alias_stack.pop();
+        if let Some(frame) = self.ref_alias_stack.pop() {
+            self.ref_pins_release(&frame);
+        }
         self.ref_identity_stack.pop();
         self.refresh_ref_redirect_hot();
         self.local_iface_aliases.pop();
@@ -2211,6 +2213,26 @@ impl Simulator {
                     .as_ref()
                     .is_none_or(|mask| mask.get(i).copied().unwrap_or(false))
         };
+        // §13.5.2: a `ref` actual that is a property of an object, or a
+        // hierarchical or member name, aliases storage only the CALLER's
+        // scope can resolve; freeze it before the callee's frame exists.
+        let scope_aliases: Vec<Option<String>> = if td
+            .ports
+            .iter()
+            .any(|p| matches!(p.direction, PortDirection::Ref))
+        {
+            td.ports
+                .iter()
+                .enumerate()
+                .map(|(i, port)| {
+                    (matches!(port.direction, PortDirection::Ref) && arg_supplied(i))
+                        .then(|| self.ref_scope_alias_target(port, &args[i]))
+                        .flatten()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // §8.25: a formal typed by one of the class's type parameters has
         // the type bound in the CALLEE's specialization. Resolve each under
         // it now — the arguments below evaluate in the caller's context,
@@ -2717,7 +2739,12 @@ impl Simulator {
         let mut alias_map: HashMap<String, String> = HashMap::default();
         for (i, port) in td.ports.iter().enumerate() {
             if matches!(port.direction, crate::ast::types::PortDirection::Ref) && arg_supplied(i) {
-                if let Some(frozen) = self.ref_alias_target(&args[i]) {
+                if let Some(frozen) = scope_aliases
+                    .get(i)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| self.ref_alias_target(&args[i]))
+                {
                     alias_map.insert(port.name.name.clone(), frozen);
                 }
                 // Chained identity binding: an actual that is itself the
@@ -2766,6 +2793,7 @@ impl Simulator {
                 }
             }
         }
+        self.ref_pins_acquire(&alias_map);
         self.ref_alias_stack.push(alias_map);
         self.ref_identity_stack.push(identity_formals);
         self.refresh_ref_redirect_hot();
