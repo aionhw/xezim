@@ -18,7 +18,7 @@ impl PatternTypeResolver for Simulator {
     }
 
     fn pattern_index(&mut self, e: &Expression, bounds: (i64, i64)) -> Option<i64> {
-        super::elaborate::const_eval_literal_pattern_index(e, bounds)
+        super::elaborate::const_eval_typed_pattern_index(e, Some(&self.module.parameters), bounds)
             .or_else(|| self.const_i64(e))
     }
 

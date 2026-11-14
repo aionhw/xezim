@@ -31378,7 +31378,7 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
     }
 
     fn pattern_index(&mut self, e: &Expression, bounds: (i64, i64)) -> Option<i64> {
-        xezim_core::elaborate::const_eval_literal_pattern_index(e, bounds)
+        xezim_core::elaborate::const_eval_typed_pattern_index(e, self.0.params, bounds)
             .or_else(|| self.0.fold_const_i64(e))
     }
 
