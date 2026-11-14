@@ -485,3 +485,9 @@ mod shared_net_initializer_targets;
 mod negative_genvar_cached;
 #[path = "hierarchy/unit_storage_shared_bodies_721.rs"]
 mod unit_storage_shared_bodies_721;
+#[path = "hierarchy/net_alias_groups_1092.rs"]
+mod net_alias_groups_1092;
+#[path = "hierarchy/generate_net_port_actuals_1093.rs"]
+mod generate_net_port_actuals_1093;
+#[path = "hierarchy/generate_real_struct_members_1099.rs"]
+mod generate_real_struct_members_1099;
