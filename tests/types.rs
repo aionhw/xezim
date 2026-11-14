@@ -741,3 +741,5 @@ mod signed_literal_pattern_index;
 mod literal_pattern_key_sites;
 #[path = "types/literal_pattern_key_params_1164.rs"]
 mod literal_pattern_key_params_1164;
+#[path = "types/constant_expression_types_1143.rs"]
+mod constant_expression_types_1143;
