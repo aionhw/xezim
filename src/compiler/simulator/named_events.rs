@@ -653,24 +653,49 @@ impl Simulator {
         }))
     }
 
+    fn expr_has_non_event_prop(&mut self, expr: &Expression) -> bool {
+        match &expr.kind {
+            ExprKind::Paren(inner) => self.expr_has_non_event_prop(inner),
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let fname = &h.path[0].name.name;
+                if self.method_local_shadows(fname) {
+                    return false;
+                }
+                self.this_stack
+                    .last()
+                    .copied()
+                    .flatten()
+                    .filter(|&h| !self.class_prop_is_event(h, fname))
+                    .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+                    .is_some_and(|inst| inst.properties.contains_key(fname.as_str()))
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_has_non_event_prop(left) || self.expr_has_non_event_prop(right)
+            }
+            ExprKind::Unary { operand, .. } => self.expr_has_non_event_prop(operand),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_has_non_event_prop(condition)
+                    || self.expr_has_non_event_prop(then_expr)
+                    || self.expr_has_non_event_prop(else_expr)
+            }
+            _ => self
+                .expr_handle_prop_any(expr)
+                .is_some_and(|(h, f)| !self.class_prop_is_event(h, &f))
+                || (self.chain_rooted_at_handle(expr)
+                    && !self.chain_may_name_vif(expr)
+                    && self
+                        .expr_instance_prop_field_general(expr)
+                        .is_some_and(|(h, f)| !self.class_prop_is_event(h, &f))),
+        }
+    }
+
     fn class_prop_value_change_expr(&mut self, event: &EventControl) -> Option<Expression> {
         let expr = Self::event_control_single_expr(event)?;
-        let on_class_prop = if let Some(fname) = self.event_control_field_name(event)
-            && !self.method_local_shadows(&fname)
-        {
-            self.this_stack
-                .last()
-                .copied()
-                .flatten()
-                .filter(|&h| !self.class_prop_is_event(h, &fname))
-                .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
-                .is_some_and(|inst| inst.properties.contains_key(fname.as_str()))
-        } else {
-            false
-        } || self
-            .expr_handle_prop_any(&expr)
-            .is_some_and(|(h, f)| !self.class_prop_is_event(h, &f));
-        if !on_class_prop {
+        if !self.expr_has_non_event_prop(&expr) {
             return None;
         }
         Some(expr)
@@ -879,6 +904,19 @@ impl Simulator {
         // signal path, armed on nothing and returned at once.
         match &e.kind {
             ExprKind::Paren(inner) => return self.edge_wait_operand(inner),
+            ExprKind::Binary { left, right, .. } => {
+                return self.edge_wait_operand(left) || self.edge_wait_operand(right);
+            }
+            ExprKind::Unary { operand, .. } => return self.edge_wait_operand(operand),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                return self.edge_wait_operand(condition)
+                    || self.edge_wait_operand(then_expr)
+                    || self.edge_wait_operand(else_expr);
+            }
             ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
                 return self.edge_select_base(base);
             }

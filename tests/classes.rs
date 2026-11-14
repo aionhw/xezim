@@ -17,10 +17,14 @@ mod array_equality_class;
 mod assoc_typedef_element_class;
 #[path = "classes/bit_class_property_signedness.rs"]
 mod bit_class_property_signedness;
+#[path = "classes/byte_array_elem_signed_bytecode_store.rs"]
+mod byte_array_elem_signed_bytecode_store;
 #[path = "classes/block_local_shadows_enclosing.rs"]
 mod block_local_shadows_enclosing;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
+#[path = "classes/global_class_assert_else_block_local.rs"]
+mod global_class_assert_else_block_local;
 #[path = "classes/blocklocal_struct_named_like_member.rs"]
 mod blocklocal_struct_named_like_member;
 #[path = "classes/call_actual_formal_width_557.rs"]
@@ -53,6 +57,8 @@ mod compiled_method_member_array_compare;
 mod compiled_method_static_locals;
 #[path = "classes/class_param_default_scope.rs"]
 mod class_param_default_scope;
+#[path = "classes/class_param_string_ref_formal_key_walk.rs"]
+mod class_param_string_ref_formal_key_walk;
 #[path = "classes/class_queue_struct_prop_copy.rs"]
 mod class_queue_struct_prop_copy;
 #[path = "classes/class_property_x_default.rs"]

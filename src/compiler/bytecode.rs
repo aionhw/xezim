@@ -47,6 +47,12 @@ pub(crate) struct MethodAdmission {
     /// The `instance_fields` that are strings (§6.16), so a dotted read
     /// through a handle of that class is a string operand.
     pub instance_string_fields: HashMap<String, HashSet<String>>,
+    /// The `instance_fields` that are STRING QUEUE / dynamic / associative
+    /// arrays (§6.16 + §7.10/§7.11), keyed by declared class: a dotted
+    /// element read `obj.m_q[i]` through a handle of that class is a
+    /// string operand (`string_cmp`/`StrOp` typing, not the integral
+    /// fallback).
+    pub instance_string_colls: HashMap<String, HashSet<String>>,
     /// §8.20: declared class -> method -> the class whose body a call
     /// through a handle of that declared type binds to, for every
     /// NON-virtual method that some subclass redeclares (the only case where
@@ -6783,15 +6789,13 @@ impl<'a> BytecodeCompiler<'a> {
             crate::ast::expr::ExprKind::MemberAccess { expr: base, member } => {
                 let m = member.name.as_str();
                 // A receiver of another declared class (`p.contents` with
-                // `pattern p`) is admitted by THAT class's collections.
-                let admitted = match self.foreign_colls(base) {
-                    Some(colls) => colls.members.contains(m),
-                    None => {
-                        self.method_handle_chain_class(base).is_some()
-                            && self.coll_member_names.contains(m)
-                    }
-                };
-                admitted.then(|| (member.name.clone(), false, Some((**base).clone())))
+                // `pattern p`) is admitted by THAT class's collections. A
+                // STRING collection (`obj.m_q[i]`) is admitted by the
+                // class's string-collection set (kept separate — see
+                // `instance_string_colls`); its element loads as a real
+                // string Value, so `StrOp` typing works.
+                self.foreign_coll_admitted(base, m)
+                    .then(|| (member.name.clone(), false, Some((**base).clone())))
             }
             // The parser's spelling of a dotted foreach array: `p.contents`.
             crate::ast::expr::ExprKind::Ident(h)
@@ -6801,12 +6805,35 @@ impl<'a> BytecodeCompiler<'a> {
             {
                 let base = Self::dotted_head_expr(h);
                 let m = h.path[1].name.name.as_str();
-                self.foreign_colls(&base)?
-                    .members
-                    .contains(m)
+                self.foreign_coll_admitted(&base, m)
                     .then(|| (m.to_string(), false, Some(base)))
             }
             _ => None,
+        }
+    }
+
+    /// `obj.m_q` — is `m_q` a collection member (integral OR string) of
+    /// `obj`'s DECLARED class, resolvable through a handle chain?
+    /// Returns true for the plan's integral `instance_colls` members and
+    /// for string collections (`instance_string_colls`).
+    fn foreign_coll_admitted(&self, base: &Expression, m: &str) -> bool {
+        match self.foreign_colls(base) {
+            Some(colls) => {
+                colls.members.contains(m)
+                    || self
+                        .method_admission
+                        .as_ref()
+                        .and_then(|a| {
+                            self.method_handle_chain_class(base).and_then(|c| {
+                                a.instance_string_colls.get(&c)
+                            })
+                        })
+                        .is_some_and(|sc| sc.contains(m))
+            }
+            None => {
+                self.method_handle_chain_class(base).is_some()
+                    && self.coll_member_names.contains(m)
+            }
         }
     }
 
@@ -8338,7 +8365,13 @@ impl<'a> BytecodeCompiler<'a> {
             // (`q[0]` on `string q[$]`), local or instance member, is a
             // string.
             ExprKind::Index { expr: base, .. } => {
-                self.local_string_coll(base) || self.member_string_coll(base)
+                if self.local_string_coll(base) || self.member_string_coll(base) {
+                    return true;
+                }
+                // `obj.m_q[i]`: a referenced object's string-collection
+                // element is a string too (§6.16/§7.10) — the member
+                // collection may be on a class other than the method's own.
+                self.foreign_string_coll_member(base).is_some()
             }
             ExprKind::Paren(inner) => self.expr_is_string_static(inner),
             ExprKind::SystemCall { name, args } => match name.as_str() {
@@ -8459,6 +8492,55 @@ impl<'a> BytecodeCompiler<'a> {
                     .is_some_and(|fields| fields.contains(member))
             })
         })
+    }
+
+    /// Method mode: is `base.member` a STRING-COLLECTION member (queue /
+    /// dynamic / associative array of `string`) of `base`'s DECLARED class,
+    /// read through an admitted handle chain? Mirrors `dotted_string_member`
+    /// for collection members, so `obj.m_q[i]` (a referenced object's string
+    /// collection element) is typed as a string by `string_cmp` instead of
+    /// falling to the integral X-padded compare (§6.16/§7.10).
+    fn dotted_string_coll(&self, base: &Expression, member: &str) -> bool {
+        if !self.method_handle_chain_ok(base) || !self.method_instance_field_ok(base, member) {
+            return false;
+        }
+        let class = self.method_handle_chain_class(base);
+        if class.as_deref() == Some(self.method_class.as_deref().unwrap_or("")) {
+            return false;
+        }
+        class.is_some_and(|class| {
+            self.method_admission.as_ref().is_some_and(|admission| {
+                admission
+                    .instance_string_colls
+                    .get(&class)
+                    .is_some_and(|colls| colls.contains(member))
+            })
+        })
+    }
+
+    /// If `expr` is an admitted, select-free reference to a foreign
+    /// object's string-collection member (`a1.q`, `this.holder.q`), return
+    /// the member name; else None. Consumes the two AST spellings a dotted
+    /// collection element (`a1.q[i]`) reaches: `MemberAccess { expr: a1,
+    /// member: q }` and the dotted two-segment Ident `a1.q`.
+    fn foreign_string_coll_member(&self, expr: &Expression) -> Option<String> {
+        match &expr.kind {
+            ExprKind::MemberAccess { expr: base, member } => self
+                .dotted_string_coll(base, member.name.as_str())
+                .then(|| member.name.clone()),
+            ExprKind::Ident(h)
+                if self.method_mode
+                    && h.root.is_none()
+                    && h.path.len() == 2
+                    && h.path.iter().all(|seg| seg.selects.is_empty()) =>
+            {
+                let base = Self::dotted_head_expr(h);
+                let member = h.path[1].name.name.as_str();
+                self.dotted_string_coll(&base, member)
+                    .then(|| h.path[1].name.name.to_string())
+            }
+            _ => None,
+        }
     }
 
     /// `recv.method(args)` where the receiver is a statically-known STRING

@@ -1296,9 +1296,19 @@ impl Simulator {
         }
         let mut signals: Vec<String> = Vec::new();
         self.string_signals_removed.push(Vec::new());
+        // A formal's string-ness must resolve a TYPE PARAMETER bound to
+        // `string` (e.g. `uvm_pool#(string,..)::first(ref KEY key)`), or a
+        // multi-byte string key written through the formal is sized by the
+        // formal's fallback width and truncates (the report-handler pool
+        // iteration never terminates when a key like "ID207" reads back
+        // "207"). Same resolution `method_return_is_string` already does for
+        // return types.
+        let port_is_string = |me: &Self, dt: &crate::ast::types::DataType| -> bool {
+            me.method_return_is_string(dt)
+        };
         if is_function {
             for port in ports.iter() {
-                if !Self::is_string_data_type(&port.data_type) {
+                if !port_is_string(self, &port.data_type) {
                     self.forget_string_flag(&port.name.name);
                 }
             }
@@ -1309,7 +1319,7 @@ impl Simulator {
             }
         }
         for port in ports.iter() {
-            if Self::is_string_data_type(&port.data_type) {
+            if port_is_string(self, &port.data_type) {
                 if self.string_signals.insert(port.name.name.clone()) {
                     signals.push(port.name.name.clone());
                 }
