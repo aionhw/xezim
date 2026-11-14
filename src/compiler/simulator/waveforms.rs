@@ -63,6 +63,67 @@ impl Simulator {
         Some(out)
     }
 
+    /// The `[N]` an indexed path segment carries in a signal-table name, or
+    /// `None` when the select is not a known integer the table could be named
+    /// by — an x/z index, a range, a non-constant expression.
+    fn dump_index_suffix(&mut self, index: &Expression) -> Option<String> {
+        Some(format!("[{}]", self.eval_expr(index).to_index()?))
+    }
+
+    /// Render a `$dumpvars` / `$fsdbDumpvars` argument into the dotted,
+    /// top-qualified spelling the signal table uses — the same spelling
+    /// `--fst-scope` takes as a raw string and `dump_name_selected` matches.
+    ///
+    /// The argument arrives as an EXPRESSION, and the parser does not keep an
+    /// indexed path inside `ExprKind::Ident`: `top.g[2].u` parses as
+    /// `MemberAccess(Index(Ident(top.g), 2), u)` and `top.vec[3]` as
+    /// `Index(Ident(top.vec), 3)`. Matching only `ExprKind::Ident` — all this
+    /// used to do — threw away every argument naming a generate-block instance
+    /// or an unpacked-array element, i.e. the only way to name ONE generated
+    /// instance, and did it silently: the filter list came back empty, which
+    /// means "no filter", and the run dumped the whole design.
+    ///
+    /// `None` means the argument is not a name at all (an arithmetic
+    /// expression, a part-select, a call). Callers must say so out loud rather
+    /// than drop it.
+    pub(super) fn dump_scope_arg(&mut self, e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.dump_scope_arg(inner),
+            ExprKind::Ident(hier) => {
+                // A package- or `$unit`-qualified root is not a signal-table
+                // path; `$root` is a marker the table's names do not carry.
+                if hier.root.is_some() {
+                    return None;
+                }
+                let skip_root =
+                    usize::from(hier.path.first().is_some_and(|s| s.name.name == "$root"));
+                let mut out = String::new();
+                for (i, seg) in hier.path.iter().enumerate().skip(skip_root) {
+                    if i > skip_root {
+                        out.push('.');
+                    }
+                    out.push_str(&seg.name.name);
+                    for sel in &seg.selects {
+                        out.push_str(&self.dump_index_suffix(sel)?);
+                    }
+                }
+                (!out.is_empty()).then_some(out)
+            }
+            ExprKind::Index { expr, index } => {
+                let mut base = self.dump_scope_arg(expr)?;
+                base.push_str(&self.dump_index_suffix(index)?);
+                Some(base)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let mut base = self.dump_scope_arg(expr)?;
+                base.push('.');
+                base.push_str(&member.name);
+                Some(base)
+            }
+            _ => None,
+        }
+    }
+
     /// Whether a top-relative signal name is selected by a normalized filter
     /// list and the `$dumpvars` depth (§21.7.1.4: 0 = all levels below the
     /// scope, N = N levels starting at the scope; a filter that names a SIGNAL
@@ -464,11 +525,21 @@ impl Simulator {
             }
         };
 
-        let sig_names = self.dump_signal_names(&self.vcd_filter_scopes, self.vcd_dump_depth);
+        let sig_names = if self.vcd_dump_none {
+            Vec::new()
+        } else {
+            self.dump_signal_names(&self.vcd_filter_scopes, self.vcd_dump_depth)
+        };
         eprintln!(
-            "[VCD] dumping {} signals (filter_scopes={:?}, depth={})",
+            "[VCD] dumping {} signals ({}, depth={})",
             sig_names.len(),
-            self.vcd_filter_scopes,
+            // `filter_scopes=[]` alone cannot tell "no filter was given" from
+            // "every filter was thrown away" — say which.
+            if self.vcd_dump_none {
+                "no $dumpvars argument named a scope or variable".to_string()
+            } else {
+                format!("filter_scopes={:?}", self.vcd_filter_scopes)
+            },
             self.vcd_dump_depth
         );
 
@@ -1856,7 +1927,9 @@ impl Simulator {
         // A scope may carry a depth, `LEVEL:SCOPE` (§21.7.1.4: 0 = every
         // level below the scope, N = N levels starting at it). Scopes with the
         // same depth are selected together; the union keeps first-seen order.
-        let mut sig_names: Vec<String> = if self.fst_scopes.is_empty() {
+        let mut sig_names: Vec<String> = if self.fst_dump_none {
+            Vec::new()
+        } else if self.fst_scopes.is_empty() {
             self.dump_signal_names(&self.fst_scopes, 0)
         } else {
             let mut groups: Vec<(u32, Vec<String>)> = Vec::new();
