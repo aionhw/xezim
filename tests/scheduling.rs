@@ -402,6 +402,8 @@ mod sampled_action_468;
 #[path = "scheduling/sampled_action_array_509.rs"]
 mod sampled_action_array_509;
 
+#[path = "scheduling/sva_abort_properties.rs"]
+mod sva_abort_properties;
 #[path = "scheduling/sva_until_properties.rs"]
 mod sva_until_properties;
 

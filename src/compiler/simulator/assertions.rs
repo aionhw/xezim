@@ -577,6 +577,7 @@ impl Simulator {
                 Self::sva_inject_init(a, init);
                 Self::sva_inject_init(b, init);
             }
+            SvaNode::Abort { body, .. } => Self::sva_inject_init(body, init),
             // Not modelled: initialisers ahead of `s_eventually` /
             // `s_always` of a boolean.
             SvaNode::Eventually(_) | SvaNode::Always(_) => {}
@@ -684,6 +685,17 @@ impl Simulator {
                     Box::new(self.sva_compile_node(right)),
                 )
             }
+            // §16.12.14 abort properties, `$sva_<operator>(cond, body)`.
+            ExprKind::SystemCall { name, args }
+                if Self::sva_abort_marker(name) && args.len() == 2 =>
+            {
+                SvaNode::Abort {
+                    cond: args[0].clone(),
+                    accept: name.ends_with("accept_on"),
+                    sync: name.starts_with("$sva_sync_"),
+                    body: Box::new(self.sva_compile_node(&args[1])),
+                }
+            }
             // §16.12.2 `strong(seq)` / `weak(seq)` as a property.
             ExprKind::SystemCall { name, args }
                 if matches!(name.as_str(), "$sva_strong" | "$sva_weak") && args.len() == 1 =>
@@ -768,6 +780,17 @@ impl Simulator {
             (SvaNode::Until { .. }, SvaState::Until { nonvacuous, .. }) => *nonvacuous,
             (SvaNode::Eventually(_), SvaState::Leaf(_))
             | (SvaNode::Always(_), SvaState::Leaf(_)) => true,
+            // §16.14.8: an aborted attempt is vacuous; otherwise the body's
+            // attempt decides.
+            (
+                SvaNode::Abort { body, .. },
+                SvaState::Abort {
+                    body: bst,
+                    latched,
+                    aborted,
+                    ..
+                },
+            ) => !*latched && !*aborted && Self::sva_attempt_nonvacuous(body, bst),
             _ => false,
         }
     }
@@ -809,6 +832,20 @@ impl Simulator {
                 },
                 SvaState::Until { ticks, .. },
             ) => Self::sva_until_fails_at_end(left, right, *strong, ticks),
+            // §16.12.14: an abort latched after the last tick settles the
+            // attempt: an accept holds, a reject fails.
+            (
+                SvaNode::Abort { accept, body, .. },
+                SvaState::Abort {
+                    body: bst, latched, ..
+                },
+            ) => {
+                if *latched {
+                    !*accept
+                } else {
+                    Self::sva_fails_at_end(body, bst)
+                }
+            }
             _ => false,
         }
     }
@@ -881,7 +918,7 @@ impl Simulator {
                 if matches!(
                     name.as_str(),
                     "$sva_follow_overlap" | "$sva_follow_nonoverlap"
-                ) =>
+                ) || Self::sva_abort_marker(name) =>
             {
                 true
             }
@@ -901,6 +938,32 @@ impl Simulator {
                     || (matches!(op, UnaryOp::LogNot) && Self::sva_is_temporal(operand))
             }
             _ => false,
+        }
+    }
+
+    /// The markers the parser emits for the §16.12.14 abort properties.
+    pub(super) fn sva_abort_marker(name: &str) -> bool {
+        matches!(
+            name,
+            "$sva_accept_on" | "$sva_reject_on" | "$sva_sync_accept_on" | "$sva_sync_reject_on"
+        )
+    }
+
+    /// Whether a compiled property holds an asynchronous abort (§16.12.14).
+    pub(super) fn sva_has_async_abort(node: &SvaNode) -> bool {
+        match node {
+            SvaNode::Abort { sync, body, .. } => !*sync || Self::sva_has_async_abort(body),
+            SvaNode::Not(inner) => Self::sva_has_async_abort(inner),
+            SvaNode::Impl { cons, .. } | SvaNode::Followed { cons, .. } => {
+                Self::sva_has_async_abort(cons)
+            }
+            SvaNode::And(a, b)
+            | SvaNode::Or(a, b)
+            | SvaNode::Iff(a, b)
+            | SvaNode::Until {
+                left: a, right: b, ..
+            } => Self::sva_has_async_abort(a) || Self::sva_has_async_abort(b),
+            SvaNode::Seq(..) | SvaNode::Eventually(_) | SvaNode::Always(_) => false,
         }
     }
 
@@ -954,6 +1017,12 @@ impl Simulator {
                 closed: false,
             },
             SvaNode::Eventually(_) | SvaNode::Always(_) => SvaState::Leaf(env.clone()),
+            SvaNode::Abort { body, .. } => SvaState::Abort {
+                body: Box::new(Self::sva_new_state(body, env)),
+                env: env.clone(),
+                latched: false,
+                aborted: false,
+            },
         }
     }
 
@@ -1569,8 +1638,112 @@ impl Simulator {
                     Some(SvaOutcome::Fail)
                 }
             }
+            // §16.12.14: an abort latched since the last tick, or the
+            // condition's sampled value at this tick, settles the attempt
+            // without evaluating the body at this tick: an abort takes
+            // precedence over the body's result in the same time step. An
+            // accept is a vacuous success (§16.14.8).
+            (
+                SvaNode::Abort {
+                    cond, accept, body, ..
+                },
+                SvaState::Abort {
+                    body: bst,
+                    env,
+                    latched,
+                    aborted,
+                },
+            ) => {
+                if *latched || self.sva_eval_env(cond, env).is_true() {
+                    *aborted = true;
+                    return Some(if *accept {
+                        SvaOutcome::Vacuous
+                    } else {
+                        SvaOutcome::Fail
+                    });
+                }
+                self.sva_advance(body, bst)
+            }
             _ => Some(SvaOutcome::Vacuous),
         }
+    }
+
+    /// §16.12.14: latch the asynchronous aborts of the evaluations in flight
+    /// whose condition's sampled value holds in this time step. Only
+    /// evaluations that have started are checked: a nonoverlapped
+    /// consequent waiting for its first tick has not.
+    pub(super) fn sva_latch_aborts(&mut self, node: &SvaNode, st: &mut SvaState) {
+        match (node, st) {
+            (
+                SvaNode::Abort {
+                    cond, sync, body, ..
+                },
+                SvaState::Abort {
+                    body: bst,
+                    env,
+                    latched,
+                    ..
+                },
+            ) => {
+                if !*sync && !*latched && self.sva_eval_env(cond, env).is_true() {
+                    *latched = true;
+                }
+                if !*latched {
+                    self.sva_latch_aborts(body, bst);
+                }
+            }
+            (SvaNode::Not(inner), SvaState::Not(ist)) => self.sva_latch_aborts(inner, ist),
+            (
+                SvaNode::Impl { cons: cn, .. } | SvaNode::Followed { cons: cn, .. },
+                SvaState::Impl { cons, .. } | SvaState::Followed { cons, .. },
+            ) => {
+                for (delay, cs) in cons.iter_mut() {
+                    if *delay == 0 {
+                        self.sva_latch_aborts(cn, cs);
+                    }
+                }
+            }
+            (SvaNode::And(na, nb) | SvaNode::Iff(na, nb), SvaState::And { a, b, ra, rb })
+            | (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
+                if ra.is_none() {
+                    self.sva_latch_aborts(na, a);
+                }
+                if rb.is_none() {
+                    self.sva_latch_aborts(nb, b);
+                }
+            }
+            (SvaNode::Until { left, right, .. }, SvaState::Until { ticks, .. }) => {
+                for tick in ticks.iter_mut() {
+                    if tick.left_result.is_none() {
+                        self.sva_latch_aborts(left, &mut tick.left);
+                    }
+                    if tick.right_result.is_none() {
+                        self.sva_latch_aborts(right, &mut tick.right);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// §16.12.14: in a time step without a tick of site `i`, check the
+    /// asynchronous abort conditions of its attempts, with sampled values.
+    fn sva_latch_site_aborts(&mut self, i: usize) {
+        let node = self.sva_sites[i].node.clone();
+        let sampled_ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
+        let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
+        let prev_active = self.active_sva_site.replace(i);
+        let prev_scope = self.activation_scope.borrow().clone();
+        *self.activation_scope.borrow_mut() = Some(self.sva_sites[i].scope.clone());
+        let saved = self.install_preponed(&sampled_ids);
+        for st in &mut attempts {
+            self.sva_latch_aborts(&node, st);
+        }
+        self.restore_preponed(saved);
+        self.sva_sites[i].attempts = attempts;
+        self.sva_sites[i].sampled_ids = sampled_ids;
+        self.active_sva_site = prev_active;
+        *self.activation_scope.borrow_mut() = prev_scope;
     }
 
     fn sva_event_value(&mut self, event: &SvaClockEvent) -> Value {
@@ -1804,6 +1977,7 @@ impl Simulator {
         };
         let stat_key = Self::assert_stat_key(span_key, src);
         self.note_assert_label(stat_key, label);
+        let async_abort = Self::sva_has_async_abort(&node);
         self.sva_sites.push(SvaClockedSite {
             span_key,
             stat_key,
@@ -1816,6 +1990,7 @@ impl Simulator {
             events: clock_events,
             past_names,
             node: std::sync::Arc::new(node),
+            async_abort,
             disable,
             fired: false,
             attempts: Vec::new(),
@@ -2816,8 +2991,12 @@ impl Simulator {
             if self.finished {
                 break;
             }
-            // Only the sites whose clock event was recorded tick.
+            // Only the sites whose clock event was recorded tick. The others
+            // check their asynchronous abort conditions (§16.12.14).
             if !std::mem::take(&mut self.sva_sites[i].fired) {
+                if self.sva_sites[i].async_abort && !self.sva_sites[i].attempts.is_empty() {
+                    self.sva_latch_site_aborts(i);
+                }
                 continue;
             }
             let span_key = self.sva_sites[i].stat_key;
