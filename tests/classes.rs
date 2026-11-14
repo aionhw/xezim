@@ -904,6 +904,8 @@ mod inherited_type_param_create;
 mod dynamic_array_property_new_init;
 #[path = "classes/dynamic_array_new_in_method.rs"]
 mod dynamic_array_new_in_method;
+#[path = "classes/spec_args_module_params.rs"]
+mod spec_args_module_params;
 #[path = "classes/null_receiver_nonvirtual_call.rs"]
 mod null_receiver_nonvirtual_call;
 #[path = "classes/type_param_handle_not_struct.rs"]
