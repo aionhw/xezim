@@ -83,7 +83,9 @@ endmodule
 }
 
 /// Guards: a whole-array right-hand side and a delayed nonblocking pattern
-/// were already right.
+/// were already right. The nonblocking update lands in the NBA region of
+/// its time step (§4.4.2.4), after the Active region where a process
+/// resumed by `#1` reads, so the read waits one more step.
 #[test]
 fn plain_array_and_nonblocking_guard() {
     let lines = run(r#"
@@ -94,7 +96,7 @@ module t;
     wc = '{1, 2};
     wc = #1 wc;
     wn <= #1 '{3, 4};
-    #1;
+    #2;
     $display("R wc=%0d %0d wn=%0d %0d", wc[0], wc[1], wn[0], wn[1]);
   end
 endmodule
