@@ -479,6 +479,8 @@ mod process_status_name;
 mod pure_fn_loops_compiled;
 #[path = "misc/queue_ref_formal_shadowing.rs"]
 mod queue_ref_formal_shadowing;
+#[path = "misc/ref_formal_actual_storage.rs"]
+mod ref_formal_actual_storage;
 #[path = "misc/recursive_function_in_continuous_assign.rs"]
 mod recursive_function_in_continuous_assign;
 #[path = "misc/ref_args_alias.rs"]
