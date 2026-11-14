@@ -2056,6 +2056,34 @@ impl Simulator {
         value
     }
 
+    /// §7.4.1: whether `expr` (an index chain on a plain packed variable,
+    /// not a local or an unpacked array) selects an element of the named
+    /// signed type the variable is a packed array of.
+    #[inline(never)]
+    pub(super) fn packed_named_select_signed(&mut self, expr: &Expression) -> bool {
+        let mut root = expr;
+        let mut selects = 0usize;
+        while let ExprKind::Index { expr: base, .. } = &root.kind {
+            selects += 1;
+            root = base;
+        }
+        let ExprKind::Ident(h) = &root.kind else {
+            return false;
+        };
+        if h.root.is_some()
+            || h.path.iter().any(|s| !s.selects.is_empty())
+            || self.frame_bound_bare_name(h).is_some()
+        {
+            return false;
+        }
+        let name = self.resolve_hier_name(h);
+        let name = name.as_ref();
+        self.packed_named_signed.get(name) == Some(&selects)
+            && !self.module.arrays.contains_key(name)
+            && !self.module.arrays_2d.contains_key(name)
+            && !self.module.arrays_nd.contains_key(name)
+    }
+
     /// Declared expression signedness without executing conditional arms or
     /// calls. Context-determined operands need this type before evaluation.
     #[inline(never)]
@@ -2134,6 +2162,10 @@ impl Simulator {
                             || self.is_associative_array(name.as_ref()),
                     )
                 };
+                if unpacked == 0 && self.packed_named_signed.get(name.as_ref()) == Some(&indices) {
+                    // §7.4.1: an element of a named signed type.
+                    return Some(true);
+                }
                 if indices > unpacked {
                     // More indices can enter a nested queue or associative
                     // row. Only a known scalar signal proves a packed select;
@@ -2328,6 +2360,25 @@ impl Simulator {
             if let Some(stripped) = self.strip_rand_receiver_expr(expr) {
                 return self.eval_expr_ctx(&stripped, ctx_width);
             }
+        }
+        // §7.4.1: an element of a packed array of a named signed type is
+        // signed; the slice that reads it is not. One length test when no
+        // variable is declared that way.
+        if !self.packed_named_signed.is_empty()
+            && matches!(expr.kind, ExprKind::Index { .. })
+            && self.packed_named_sign_guard != expr as *const Expression as usize
+            && self.packed_named_select_signed(expr)
+        {
+            let saved = std::mem::replace(
+                &mut self.packed_named_sign_guard,
+                expr as *const Expression as usize,
+            );
+            let mut v = self.eval_expr_ctx_inner(expr, ctx_width, unsigned_context);
+            self.packed_named_sign_guard = saved;
+            if !v.is_real {
+                v.is_signed = true;
+            }
+            return v;
         }
         match &expr.kind {
             ExprKind::Ident(h) => {

@@ -9615,6 +9615,17 @@ pub struct Simulator {
     /// signed). Built once at construction; handed to every bytecode
     /// compiler so `type'(expr)` compiles instead of falling back.
     cast_widths: HashMap<String, (u32, bool)>,
+    /// §7.4.1: variables declared as a packed array of a named signed type
+    /// (`lane_t [0:8] x`), with the number of selects that reaches that
+    /// element type (see `bytecode::signed_named_packed_elem_depth`). Built
+    /// at construction from the declared types; empty in most designs, which
+    /// keeps the element-read check to one length test.
+    #[serde(skip)]
+    packed_named_signed: HashMap<String, usize>,
+    /// The `Index` expression whose signed element read is in progress (its
+    /// address), so the re-entrant evaluation reads the slice itself.
+    #[serde(skip)]
+    packed_named_sign_guard: usize,
     /// `module.functions` holds each `FunctionDeclaration` by value, so the
     /// obvious `get(name).cloned()` deep-copies a whole function AST — body,
     /// statements and all — on EVERY call. On a design that calls a function

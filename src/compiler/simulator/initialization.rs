@@ -3763,6 +3763,31 @@ impl Simulator {
             }
             m
         };
+        let packed_named_signed: HashMap<String, usize> = {
+            let types = &module.typedef_types;
+            let mut m: HashMap<String, usize> = HashMap::default();
+            for (name, dt) in &module.var_decl_types {
+                if let Some(depth) = super::bytecode::signed_named_packed_elem_depth(dt, types) {
+                    m.insert(name.clone(), depth);
+                }
+                // §7.2: a member of a structure variable (`st.m` with
+                // `lane_t [0:8] m`) keeps its declared type.
+                if let DataType::Struct(su) = super::elaborate::resolve_typedef_chain(dt, types) {
+                    for member in &su.members {
+                        let Some(depth) = super::bytecode::signed_named_packed_elem_depth(
+                            &member.data_type,
+                            types,
+                        ) else {
+                            continue;
+                        };
+                        for d in &member.declarators {
+                            m.insert(format!("{}.{}", name, d.name.name), depth);
+                        }
+                    }
+                }
+            }
+            m
+        };
         let addressed_statics = Self::addressed_subroutine_statics(&module, &deferred_always);
         let (hoisted_sub_static_names, hoisted_static_subroutines) =
             Self::hoist_subroutine_statics(&mut module, &addressed_statics);
@@ -4561,6 +4586,8 @@ impl Simulator {
             fst_dump_none: false,
             fst_writer: None,
             cast_widths,
+            packed_named_signed,
+            packed_named_sign_guard: 0,
             fn_decl_cache: HashMap::default(),
             free_fn_table: None,
             class_handle_member_types_cache: None,

@@ -2170,6 +2170,9 @@ pub struct BytecodeCompiler<'a> {
     /// subtrees, so a long expression asks for the same leaf many times.
     /// Cleared with the scope hint, which name resolution depends on.
     dotted_ident_sign: HashMap<String, Option<bool>>,
+    /// `packed_named_select_signed`'s declaration lookup, by variable name:
+    /// the select depth that reaches a named signed element, if any.
+    named_elem_depth: HashMap<String, Option<usize>>,
     /// Top-module name (e.g. "tb"). When a hierarchical identifier reads a
     /// signal whose absolute path is `<top>.<rest>` (e.g. xezim's
     /// port-rewriting baked the top name into a cross-hierarchical
@@ -2403,6 +2406,7 @@ impl<'a> BytecodeCompiler<'a> {
             local_packed_types: HashMap::default(),
             cast_widths: None,
             dotted_ident_sign: HashMap::default(),
+            named_elem_depth: HashMap::default(),
             pattern_ctx: None,
             inline_ret_ty: None,
             local_const_vars: HashMap::default(),
@@ -3452,6 +3456,7 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_scope_hint(&mut self, scope: Option<String>) {
         self.dotted_ident_sign.clear();
+        self.named_elem_depth.clear();
         self.scope_hint = scope;
     }
 
@@ -9331,6 +9336,47 @@ impl<'a> BytecodeCompiler<'a> {
             self.emit(Insn::SetSigned(dest));
         }
         Some(dest)
+    }
+
+    /// §7.4.1: whether `expr` (an index chain on a plain packed variable)
+    /// selects an element whose type is a named signed type — see
+    /// `signed_named_packed_elem_depth`.
+    fn packed_named_select_signed(&mut self, expr: &Expression) -> bool {
+        let (Some(decls), Some(types)) = (self.var_decl_types, self.typedef_types) else {
+            return false;
+        };
+        let mut root = expr;
+        let mut selects = 0usize;
+        while let ExprKind::Index { expr: base, .. } = &root.kind {
+            selects += 1;
+            root = base;
+        }
+        let ExprKind::Ident(h) = &root.kind else {
+            return false;
+        };
+        if h.root.is_some()
+            || h.path.iter().any(|s| !s.selects.is_empty())
+            || self.local_var_reg_of(h).is_some()
+            || self.lookup_array_name(h).is_some()
+            || self.is_multi_dim_array(h)
+        {
+            return false;
+        }
+        let raw = Self::hier_raw_name(h);
+        if let Some(&depth) = self.named_elem_depth.get(&raw) {
+            return depth == Some(selects);
+        }
+        let scoped = self
+            .scope_hint
+            .as_ref()
+            .map(|scope| format!("{}.{}", scope, raw));
+        let depth = scoped
+            .as_deref()
+            .and_then(|q| declared_type_of(q, decls, types))
+            .or_else(|| declared_type_of(&raw, decls, types))
+            .and_then(|dt| signed_named_packed_elem_depth(dt, types));
+        self.named_elem_depth.insert(raw, depth);
+        depth == Some(selects)
     }
 
     /// §7.2.1, §6.11.3: the signedness of `member` (a dotted path) of the
@@ -15609,6 +15655,11 @@ impl<'a> BytecodeCompiler<'a> {
             return self.compile_pattern(expr, ctx_width, pattern_ctx);
         }
         let result = self.compile_expr_inner(expr, ctx_width, unsigned_context)?;
+        // §7.4.1: an element of a packed array of a named signed type
+        // (`lane_t [0:8] x; x[1]`) is signed; the slice that read it is not.
+        if matches!(expr.kind, ExprKind::Index { .. }) && self.packed_named_select_signed(expr) {
+            self.emit(Insn::SetSigned(result));
+        }
         let propagates = matches!(
             expr.kind,
             ExprKind::Binary { .. }
@@ -21771,6 +21822,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // Part-selects, concatenations and replications are UNSIGNED
             // regardless of their operands (§11.8.1).
+            ExprKind::Index { .. } if self.packed_named_select_signed(e) => Some(true),
             ExprKind::Index { expr, .. } => {
                 // §7.4: an unpacked element retains its declared type; only
                 // a packed bit-select is necessarily unsigned (§11.8.1).
@@ -31444,6 +31496,85 @@ fn chain_has_call_base(e: &Expression) -> bool {
 /// string-valued functions, and the ones that carry their argument's type
 /// (`system_function_carries_arg`), are None. Shared by the compiler's width
 /// and signedness inference and by the interpreter, so every path agrees.
+/// The declared type of variable `name`, or of member `m` of a structure
+/// variable `v` for `name` = `v.m` (§7.2: a member keeps its declared type).
+pub(crate) fn declared_type_of<'a>(
+    name: &str,
+    decls: &'a HashMap<String, crate::ast::types::DataType>,
+    types: &'a HashMap<String, crate::ast::types::DataType>,
+) -> Option<&'a crate::ast::types::DataType> {
+    if let Some(dt) = decls.get(name) {
+        return Some(dt);
+    }
+    let (var, member) = name.rsplit_once('.')?;
+    let crate::ast::types::DataType::Struct(su) =
+        crate::compiler::elaborate::resolve_typedef_chain(decls.get(var)?, types)
+    else {
+        return None;
+    };
+    su.members
+        .iter()
+        .find(|m| m.declarators.iter().any(|d| d.name.name == member))
+        .map(|m| &m.data_type)
+}
+
+/// §7.4.1: the number of selects at which a packed array declared as
+/// `T [d1]...[dn] x` (directly, or through typedefs) reaches its NAMED
+/// element type `T`, when `T` is a signed integral type. Such an element
+/// select is signed; every other select of a packed array is unsigned
+/// ("the individual elements of the array are unsigned unless they are of a
+/// named type declared as signed"). None for any other declaration.
+pub(crate) fn signed_named_packed_elem_depth(
+    dt: &crate::ast::types::DataType,
+    types: &HashMap<String, crate::ast::types::DataType>,
+) -> Option<usize> {
+    use crate::ast::types::DataType as D;
+    /// Through plain aliases (`typedef T U;`) to the defining type.
+    fn follow<'a>(mut cur: &'a D, types: &'a HashMap<String, D>) -> Option<&'a D> {
+        for _ in 0..64 {
+            match cur {
+                D::TypeReference {
+                    name, dimensions, ..
+                } if dimensions.is_empty() => {
+                    cur = crate::compiler::elaborate::lookup_scoped_type(name, types)?;
+                }
+                _ => return Some(cur),
+            }
+        }
+        None
+    }
+    let mut cur = follow(dt, types)?;
+    let mut depth = 0usize;
+    for _ in 0..64 {
+        let D::TypeReference {
+            name, dimensions, ..
+        } = cur
+        else {
+            return None;
+        };
+        depth += dimensions.len();
+        let elem = follow(
+            crate::compiler::elaborate::lookup_scoped_type(name, types)?,
+            types,
+        )?;
+        match elem {
+            // The element is itself a packed array of a named type: an
+            // element of THAT array is one select deeper.
+            D::TypeReference { .. } => cur = elem,
+            D::IntegerAtom { .. } | D::IntegerVector { .. } | D::Enum(_) => {
+                return crate::compiler::elaborate::is_type_signed_resolved(elem, types)
+                    .then_some(depth);
+            }
+            D::Struct(su) if su.packed => {
+                return crate::compiler::elaborate::is_type_signed_resolved(elem, types)
+                    .then_some(depth);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
     Some(match name {
         "$countones"
