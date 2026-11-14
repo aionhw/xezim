@@ -916,7 +916,7 @@ impl Simulator {
         }
         for assign in &module.pending_cont_assign {
             let mut names = HashSet::default();
-            expr_names(&assign.lhs_source, &mut names);
+            expr_names(&assign.source_lhs(), &mut names);
             expr_names(&assign.rhs_source, &mut names);
             insert(&names.into_iter().collect::<Vec<_>>(), &assign.ctx.prefix);
         }

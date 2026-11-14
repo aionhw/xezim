@@ -1578,7 +1578,7 @@ mod edgesel_writers {
                 }
             }
             for (i, p) in module.pending_cont_assign.iter().enumerate() {
-                for t in targets(&p.lhs_source) {
+                for t in targets(&p.source_lhs()) {
                     let Some(b) = base_ident(t) else {
                         continue;
                     };

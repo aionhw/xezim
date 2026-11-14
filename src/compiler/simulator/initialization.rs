@@ -1532,7 +1532,8 @@ impl Simulator {
         }
         for &i in index.pend.get(vleaf).unwrap_or(&none) {
             let p = &module.pending_cont_assign[i];
-            let src = &*p.lhs_source;
+            let lhs_source = p.source_lhs();
+            let src = &*lhs_source;
             let may_name_v = |e: &Expression| -> bool {
                 base_ident(e).is_some_and(|b| {
                     leaf(&b) == vleaf
@@ -1558,7 +1559,7 @@ impl Simulator {
                     &p.ctx.interface_map,
                 )
             };
-            let lhs = rw(src);
+            let lhs = p.materialize_lhs();
             let rhs = matches!(p.rhs_source.kind, ExprKind::Replication { .. })
                 .then(|| rw(&p.rhs_source));
             classify(&lhs, rhs.as_ref());
