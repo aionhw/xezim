@@ -4437,10 +4437,12 @@ enum SvaState {
     },
     /// `s_eventually` / `s_always`, with the attempt's local variables.
     Leaf(SvaEnv),
-    /// An abort property's evaluation; `aborted`: its condition settled it.
+    /// An abort property's evaluation; `started`: its first tick is past;
+    /// `aborted`: its condition settled it.
     Abort {
         body: Box<SvaState>,
         env: SvaEnv,
+        started: bool,
         aborted: bool,
     },
 }

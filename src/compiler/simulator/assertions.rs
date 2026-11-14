@@ -1029,6 +1029,7 @@ impl Simulator {
             SvaNode::Abort { body, .. } => SvaState::Abort {
                 body: Box::new(Self::sva_new_state(body, env)),
                 env: env.clone(),
+                started: false,
                 aborted: false,
             },
         }
@@ -1685,6 +1686,14 @@ impl Simulator {
             // inner abort that settled the body earlier ended its
             // evaluation, so a later outer condition no longer applies. An
             // accept is a vacuous success (§16.14.8 ab-ae).
+            //
+            // Annex F.5.3.1: an abort in time step i settles the evaluation
+            // on the steps before i, continued as if every Boolean held
+            // (accept) or none did (reject). At the first tick nothing
+            // precedes it, so the operand decides structurally: an implication
+            // holds when nothing matches its antecedent, so `reject_on (rst)
+            // req |=> ack` is not rejected at the tick it starts in while
+            // `rst` holds; the attempt goes on (vacuous when `req` is 0).
             (
                 SvaNode::Abort {
                     cond,
@@ -1695,10 +1704,21 @@ impl Simulator {
                 SvaState::Abort {
                     body: bst,
                     env,
+                    started,
                     aborted,
                 },
             ) => {
-                if !(abort_step && *sync) && self.sva_eval_env(cond, env).is_true() {
+                let first = !*started;
+                *started |= !abort_step;
+                if !(abort_step && *sync)
+                    && (!first
+                        || if *accept {
+                            Self::sva_holds_on(body, true)
+                        } else {
+                            !Self::sva_holds_on(body, false)
+                        })
+                    && self.sva_eval_env(cond, env).is_true()
+                {
                     *aborted = true;
                     return Some(if *accept {
                         SvaOutcome::Vacuous
@@ -1709,6 +1729,38 @@ impl Simulator {
                 self.sva_advance(body, bst)
             }
             _ => Some(SvaOutcome::Vacuous),
+        }
+    }
+
+    /// Annex F.5.3.1: whether a fresh evaluation of `node` holds on a word
+    /// whose every letter satisfies every Boolean (`top`) or none (`!top`).
+    /// A sequence matches only on the first; an implication holds on the
+    /// second because its antecedent cannot match.
+    pub(super) fn sva_holds_on(node: &SvaNode, top: bool) -> bool {
+        match node {
+            SvaNode::Seq(..) | SvaNode::Eventually(_) | SvaNode::Always(_) => top,
+            SvaNode::Impl { cons, .. } | SvaNode::Followed { cons, .. } => {
+                let follows = matches!(node, SvaNode::Followed { .. });
+                if top {
+                    Self::sva_holds_on(cons, true)
+                } else {
+                    !follows
+                }
+            }
+            SvaNode::Not(inner) => !Self::sva_holds_on(inner, !top),
+            SvaNode::And(a, b) => Self::sva_holds_on(a, top) && Self::sva_holds_on(b, top),
+            SvaNode::Or(a, b) => Self::sva_holds_on(a, top) || Self::sva_holds_on(b, top),
+            SvaNode::Iff(a, b) => Self::sva_holds_on(a, top) == Self::sva_holds_on(b, top),
+            SvaNode::Implies(a, b) => !Self::sva_holds_on(a, top) || Self::sva_holds_on(b, top),
+            SvaNode::Until {
+                left,
+                right,
+                strong,
+            } => Self::sva_holds_on(right, top) || (!*strong && Self::sva_holds_on(left, top)),
+            // An accept holds on either word exactly when its operand does,
+            // and so does a reject: `reject_on(b) p` is `not accept_on(b)
+            // not p`, whose `not` turns the word into the other one.
+            SvaNode::Abort { body, .. } => Self::sva_holds_on(body, top),
         }
     }
 
