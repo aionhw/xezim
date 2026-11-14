@@ -21,6 +21,8 @@ pub(crate) trait PatternTypeResolver {
     fn typedef_target(&mut self, name: &TypeName) -> Option<DataType>;
     /// A constant expression (packed bounds, index keys, replication counts).
     fn const_i64(&mut self, e: &Expression) -> Option<i64>;
+    /// A pattern index, without changing bounds or replication evaluation.
+    fn pattern_index(&mut self, e: &Expression, bounds: (i64, i64)) -> Option<i64>;
     /// Whether a bare `name:` key names a type (§10.9.2 type key).
     fn is_type_name(&mut self, name: &str) -> bool;
     /// The self-determined type of `e`, when known: a declared variable, a
@@ -681,7 +683,7 @@ impl PlanBuilder<'_> {
                 }
                 for (k, e) in &keys.keyed {
                     let idx = match k {
-                        Key::Expr(k) => self.r.const_i64(k)?,
+                        Key::Expr(k) => self.r.pattern_index(k, (left, right))?,
                         Key::Name(id) => self.r.const_i64(&ident_expr(id))?,
                     };
                     let pos = if left >= right {

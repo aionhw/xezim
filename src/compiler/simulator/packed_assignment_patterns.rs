@@ -17,6 +17,11 @@ impl PatternTypeResolver for Simulator {
             .or_else(|| self.eval_expr(e).to_i64())
     }
 
+    fn pattern_index(&mut self, e: &Expression, bounds: (i64, i64)) -> Option<i64> {
+        super::elaborate::const_eval_literal_pattern_index(e, bounds)
+            .or_else(|| self.const_i64(e))
+    }
+
     fn is_type_name(&mut self, name: &str) -> bool {
         !self.module.parameters.contains_key(name) && self.lookup_typedef_target(name).is_some()
     }

@@ -31377,6 +31377,11 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
         self.0.fold_const_i64(e)
     }
 
+    fn pattern_index(&mut self, e: &Expression, bounds: (i64, i64)) -> Option<i64> {
+        xezim_core::elaborate::const_eval_literal_pattern_index(e, bounds)
+            .or_else(|| self.0.fold_const_i64(e))
+    }
+
     fn is_type_name(&mut self, name: &str) -> bool {
         if self.0.params.is_some_and(|p| p.contains_key(name)) {
             return false;
