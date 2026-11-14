@@ -3122,6 +3122,32 @@ impl<'a> BytecodeCompiler<'a> {
         Some(Box::new(ArrayOperand::Named(name)))
     }
 
+    /// `array_operand` with the index register the element instruction
+    /// reads. §7.4.2: an index into an array whose range has a negative
+    /// bound addresses elements by its signed value, but the element
+    /// instructions read the register's bits as an unsigned number, so
+    /// `arr[-1]` of `int arr[-1:1]`, or `arr[k]` with `int k = -1`, missed its
+    /// element in every compiled block (a read gave x, a write was lost).
+    /// Widen the index to 64 bits first: `MoveResize` sign-extends a signed
+    /// index and zero-extends an unsigned one, which stays out of range.
+    fn array_operand_index(
+        &mut self,
+        name: String,
+        idx_reg: RegId,
+    ) -> Option<(Box<ArrayOperand>, RegId)> {
+        let array = self.array_operand(name)?;
+        let lowest = match array.as_ref() {
+            ArrayOperand::Dense { lo, hi, .. } => (*lo).min(*hi),
+            ArrayOperand::Named(name) => self.arrays.get(name).map_or(0, |&(lo, hi, _)| lo.min(hi)),
+        };
+        if lowest >= 0 {
+            return Some((array, idx_reg));
+        }
+        let wide = self.alloc_reg();
+        self.emit(Insn::MoveResize(wide, idx_reg, 64));
+        Some((array, wide))
+    }
+
     pub fn set_params(&mut self, params: &'a HashMap<String, Value>) {
         self.params = Some(params);
     }
@@ -16774,7 +16800,7 @@ impl<'a> BytecodeCompiler<'a> {
                             ));
                             return Some(dest);
                         }
-                        let array = self.array_operand(name)?;
+                        let (array, idx_reg) = self.array_operand_index(name, idx_reg)?;
                         self.emit(Insn::LoadArrayElem(dest, array, idx_reg));
                         return Some(dest);
                     }
@@ -18768,7 +18794,8 @@ impl<'a> BytecodeCompiler<'a> {
             lo_reg,
             Box::new(Value::from_u64(off as u64, 32)),
         ));
-        Some((self.array_operand(name)?, idx_reg, hi_reg, lo_reg, resized))
+        let (array, idx_reg) = self.array_operand_index(name, idx_reg)?;
+        Some((array, idx_reg, hi_reg, lo_reg, resized))
     }
 
     /// A packed lvalue PATH that mixes several dynamic steps:
@@ -19146,7 +19173,8 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            let Some(array) = self.array_operand(name) else {
+                            let Some((array, idx_reg)) = self.array_operand_index(name, idx_reg)
+                            else {
                                 return false;
                             };
                             self.emit(Insn::NbaAssignArray(array, idx_reg, val_reg, width));
@@ -19452,7 +19480,9 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                 };
                                 if let Some((hi_reg, lo_reg)) = regs {
-                                    let Some(array) = self.array_operand(name) else {
+                                    let Some((array, idx_reg)) =
+                                        self.array_operand_index(name, idx_reg)
+                                    else {
                                         return false;
                                     };
                                     self.emit(Insn::NbaAssignArrayRange(
@@ -19729,7 +19759,7 @@ impl<'a> BytecodeCompiler<'a> {
                     b_reg,
                     Box::new(Value::from_u64(b as u64, 32)),
                 ));
-                let Some(array) = self.array_operand(name) else {
+                let Some((array, idx_reg)) = self.array_operand_index(name, idx_reg) else {
                     return Some(false);
                 };
                 self.emit(Insn::BlockingAssignArrayRange(
@@ -20350,7 +20380,8 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            let Some(array) = self.array_operand(name) else {
+                            let Some((array, idx_reg)) = self.array_operand_index(name, idx_reg)
+                            else {
                                 return false;
                             };
                             self.emit(Insn::BlockingAssignArray(array, idx_reg, val_reg, width));
@@ -20776,7 +20807,9 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                 };
                                 if let Some((hi_reg, lo_reg)) = regs {
-                                    let Some(array) = self.array_operand(name) else {
+                                    let Some((array, idx_reg)) =
+                                        self.array_operand_index(name, idx_reg)
+                                    else {
                                         return false;
                                     };
                                     self.emit(Insn::BlockingAssignArrayRange(

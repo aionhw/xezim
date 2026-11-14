@@ -359,6 +359,7 @@ fn method_boost_enabled() -> bool {
 // §8.14: a base static that a derived class redeclares counts as a redeclared member.
 // §7.4.1: a member of an element of an ascending packed array of structs slices from slot 0.
 // §10.9.2: structure replication in scalarized function calls.
+// §7.4.2: an index into an array with a negative bound is sign-extended.
 const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3078;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
@@ -1687,6 +1688,7 @@ struct CombEntryCold {
 // §10.3.3 / §28.16: and the fall and turn-off delays of a select target.
 // §7.4.1: compiled members of ascending packed arrays of structs slice from slot 0.
 // §10.9.2: scalarized resolver calls expand structure replication.
+// §7.4.2: compiled blocks sign-extend an index into an array with a negative bound.
 const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB036";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
