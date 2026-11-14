@@ -186,7 +186,7 @@ own workload and keep the
 [Native compilation](docs/user-guide.md#native-compilation) pays on designs
 with few, very hot blocks, so measure it on yours.
 
-Current main also shares net-initializer targets across child instances.
+Xezim 0.11.6 also shares net-initializer targets across child instances.
 On the synthetic [#721 fixture](https://github.com/aionhw/xezim/issues/721#issuecomment-6863295230)
 (32,768 instances, 32 initialized nets each), median peak RSS fell from
 1,431 to 1,105 MiB (22.8%), and compile time from 8.40 to 7.89 seconds.

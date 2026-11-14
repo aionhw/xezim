@@ -8,11 +8,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
-**Memory**
+### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
+
+**Performance**
 
 * Child net initializers share their declaration target expressions across
   instances, qualifying each target when needed instead of retaining a
-  separate qualified expression per instance (§10.3.1, #721).
+  separate qualified expression per instance (§10.3.1, #721). Three alternating
+  runs of the 32,768-instance synthetic fixture reduce median peak RSS from
+  1,431 to 1,105 MiB (22.8%) and compile time from 8.40 to 7.89 seconds.
+  The original full-design OOM remains unverified.
 
 **Command line**
 
