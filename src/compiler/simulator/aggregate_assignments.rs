@@ -969,13 +969,7 @@ impl Simulator {
             }
         }
 
-        if !super::elaborate::struct_pattern_has_array_member(
-            su,
-            &self.module.typedef_types,
-            &self.module.typedef_unpacked_dims,
-        ) && let Some(expanded) =
-            super::elaborate::struct_pattern_replication(items, members.len())
-        {
+        if let Some(expanded) = self.struct_replication_items(su, items, members.len()) {
             ordered = expanded;
         }
 
@@ -988,6 +982,41 @@ impl Simulator {
                 (mname, mdt, dims, e, explicit.is_some())
             })
             .collect()
+    }
+
+    /// IEEE 1800-2023 §10.9.2: the member expressions of a replicated
+    /// structure pattern `'{n{a, b}}` that sets exactly the `members` members
+    /// of `su`, in declaration order. The count is a constant expression
+    /// (A.6.7.1), so a parameter or localparam count is evaluated here; an
+    /// integer literal needs no evaluation. None for any other pattern, a
+    /// count other than the member count, or a structure with an unpacked
+    /// array member, which keeps the existing binding.
+    pub(super) fn struct_replication_items<'a>(
+        &mut self,
+        su: &crate::ast::types::StructUnionType,
+        items: &'a [AssignmentPatternItem],
+        members: usize,
+    ) -> Option<Vec<&'a Expression>> {
+        // Decide "not a replication" first: every structure pattern
+        // assignment comes through here, and the member scan below allocates.
+        let [AssignmentPatternItem::Ordered(e)] = items else {
+            return None;
+        };
+        if !matches!(e.kind, ExprKind::Replication { .. }) {
+            return None;
+        }
+        let expanded =
+            super::elaborate::struct_pattern_replication_with(items, members, &mut |count| {
+                super::elaborate::struct_pattern_count_value(&self.eval_expr(count))
+            })?;
+        if super::elaborate::struct_pattern_has_array_member(
+            su,
+            &self.module.typedef_types,
+            &self.module.typedef_unpacked_dims,
+        ) {
+            return None;
+        }
+        Some(expanded)
     }
 
     /// Spread an assignment pattern across the members of the UNPACKED struct

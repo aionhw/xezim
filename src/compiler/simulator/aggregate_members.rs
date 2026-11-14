@@ -4256,11 +4256,8 @@ impl Simulator {
                 _ => None,
             })
             .collect();
-        if !super::elaborate::struct_pattern_has_array_member(
+        if let Some(expanded) = self.struct_replication_items(
             su,
-            &self.module.typedef_types,
-            &self.module.typedef_unpacked_dims,
-        ) && let Some(expanded) = super::elaborate::struct_pattern_replication(
             items.unwrap_or(&[]),
             su.members.iter().map(|m| m.declarators.len()).sum(),
         ) {

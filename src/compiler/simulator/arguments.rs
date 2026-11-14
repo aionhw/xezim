@@ -1656,13 +1656,7 @@ impl Simulator {
         };
         // §10.9.2: even a one-member replication needs member type
         // context. Let the shared structure binder remove its inner braces.
-        if parts.len() != n
-            || (!super::elaborate::struct_pattern_has_array_member(
-                su,
-                &self.module.typedef_types,
-                &self.module.typedef_unpacked_dims,
-            ) && super::elaborate::struct_pattern_replication(parts, n).is_some())
-        {
+        if parts.len() != n || self.struct_replication_items(su, parts, n).is_some() {
             return None;
         }
         let mut out = Vec::with_capacity(n);
