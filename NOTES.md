@@ -8,6 +8,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+**Memory**
+
+* Child net initializers share their declaration target expressions across
+  instances, qualifying each target when needed instead of retaining a
+  separate qualified expression per instance (§10.3.1, #721).
+
 **Command line**
 
 * `XEZIM_OOM_TRACE=memory.jsonl` streams phase, source, instance, table-count
