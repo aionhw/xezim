@@ -36,6 +36,8 @@ mod enum_continuous_delay;
 
 #[path = "gates/dumpvars_generate_scope.rs"]
 mod dumpvars_generate_scope;
+#[path = "gates/dumpvars_repeated_calls.rs"]
+mod dumpvars_repeated_calls;
 #[path = "gates/fn_return_member_inlines.rs"]
 mod fn_return_member_inlines;
 #[path = "gates/fst_roundtrip.rs"]
