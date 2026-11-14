@@ -971,10 +971,15 @@ impl Env {
         e
     }
 
-    fn optional_mask(&self) -> Env {
+    /// The scope with mask hints off; borrowed when they already are, so a
+    /// nested disjunct or condition does not copy the scope again.
+    fn optional_mask(&self) -> std::borrow::Cow<'_, Env> {
+        if self.mask_note == Some(false) {
+            return std::borrow::Cow::Borrowed(self);
+        }
         let mut e = self.clone();
         e.mask_note = Some(false);
-        e
+        std::borrow::Cow::Owned(e)
     }
 }
 
@@ -5866,7 +5871,7 @@ impl Simulator {
                 let order_len = csp.order.len();
                 let opaque = csp.opaque;
                 let mask_env = if enabled {
-                    env.clone()
+                    std::borrow::Cow::Borrowed(env)
                 } else {
                     env.optional_mask()
                 };
@@ -6295,7 +6300,7 @@ impl Simulator {
                     let e = if (*op == BinaryOp::LogOr) != neg {
                         env.optional_mask()
                     } else {
-                        env.clone()
+                        std::borrow::Cow::Borrowed(env)
                     };
                     let l = self.csp_bool(csp, left, &e, neg)?;
                     let r = self.csp_bool(csp, right, &e, neg)?;
@@ -6319,7 +6324,7 @@ impl Simulator {
                     let e = if (*op == BinaryOp::BitOr) != neg {
                         env.optional_mask()
                     } else {
-                        env.clone()
+                        std::borrow::Cow::Borrowed(env)
                     };
                     let l = self.csp_bool(csp, left, &e, neg)?;
                     let r = self.csp_bool(csp, right, &e, neg)?;
@@ -10526,12 +10531,15 @@ impl Simulator {
     /// holds and `M` and `C` are fixed. None when no mask is in force or no
     /// draw lands in the domain.
     fn csp_mask_draw(&mut self, csp: &Csp, st: &St, v: usize) -> Option<i128> {
+        if csp.masks.is_empty() {
+            return None;
+        }
         let (base, off, width) = csp
             .aux_base
             .get(&v)
             .copied()
             .unwrap_or((v, 0, csp.vars[v].width));
-        if csp.masks.is_empty() || width > 64 || csp.vars[v].signed {
+        if width > 64 || csp.vars[v].signed {
             return None;
         }
         let ones = |w: u32| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
