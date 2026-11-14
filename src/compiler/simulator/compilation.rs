@@ -142,6 +142,16 @@ impl Simulator {
                     self.clocking_sig_bound_sel
                         .insert(cb_name.clone(), bound_sels);
                 }
+                // §14.16: a clocking OUTPUT creates a driver on the net it
+                // is bound to. Where that net has another driver, the clockvar
+                // drives a stage of its own and the stage joins the net's
+                // other drivers in the resolution fold.
+                for ((cb, net), stage) in self.module.clocking_output_stages.iter() {
+                    if cb == cb_name {
+                        self.clocking_output_stages
+                            .insert((cb_name.clone(), net.clone()), stage.clone());
+                    }
+                }
                 // §14.11: alias the parser's reserved `##N` marker to the
                 // `default clocking` block, so the desugared
                 // `repeat (N) @(__xz_default_clocking)` resolves through the
