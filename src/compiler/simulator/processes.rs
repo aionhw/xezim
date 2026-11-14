@@ -2472,10 +2472,6 @@ impl Simulator {
         }
     }
 
-    /// Stash a §9.4.5 RHS value evaluated at statement-execution time and
-    /// synthesize the `$__xz_intra_saved(idx)` expression that retrieves it
-    /// when the delayed assignment finally runs — the pre-computed Value
-    /// survives process rescheduling this way.
     /// §9.4.5: capture the right-hand side of an intra-assignment timing
     /// control when the statement runs, against its target as an
     /// assignment without the timing control would evaluate it: at the
@@ -2495,9 +2491,26 @@ impl Simulator {
         while let ExprKind::Paren(e) = &inner.kind {
             inner = e;
         }
-        if matches!(inner.kind, ExprKind::AssignmentPattern(_))
-            && self.eval_pattern_for_lvalue(lvalue, inner).is_none()
+        // §11.4.11: a conditional of unpacked aggregates (`c ? '{1, 2} :
+        // '{3, 4}`) selects its operand now, and that operand is captured.
+        // An operand read through a call, or both operands merged under an
+        // unknown condition, are already a snapshot taken now.
+        if matches!(inner.kind, ExprKind::Conditional { .. })
+            && let Some(selected) = self.selected_aggregate_rhs(Some(lvalue), inner)
         {
+            if matches!(&selected.kind, ExprKind::Ident(h)
+                if h.path.len() == 1 && h.path[0].name.name.starts_with("__xz_cond_aggregate_"))
+            {
+                return (selected, None);
+            }
+            return self.capture_intra_rhs(lvalue, &selected, span);
+        }
+        if matches!(inner.kind, ExprKind::AssignmentPattern(_)) {
+            // A packed target shapes the pattern now; its value is the one
+            // evaluation of the items (a second would repeat their calls).
+            if let Some(v) = self.eval_pattern_for_lvalue(lvalue, inner) {
+                return (self.make_intra_saved_expr(v, span), None);
+            }
             let mut slots = Vec::new();
             let captured = self.capture_intra_pattern(inner, &mut slots);
             let args = slots
@@ -2588,6 +2601,10 @@ impl Simulator {
         )
     }
 
+    /// Stash a §9.4.5 RHS value evaluated at statement-execution time and
+    /// synthesize the `$__xz_intra_saved(idx)` expression that retrieves it
+    /// when the delayed assignment finally runs — the pre-computed Value
+    /// survives process rescheduling this way.
     pub(super) fn make_intra_saved_expr(
         &mut self,
         val: Value,
