@@ -749,3 +749,5 @@ mod unsigned_operand_kinds_1158;
 mod signed_packed_member_reads_1159;
 #[path = "types/signed_named_packed_elements_1107.rs"]
 mod signed_named_packed_elements_1107;
+#[path = "types/package_typedef_negative_bound_1148.rs"]
+mod package_typedef_negative_bound_1148;
