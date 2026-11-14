@@ -63,7 +63,7 @@ fn user_dpi_library_overrides_builtin_uvm_helpers() {
     std::fs::write(d.join("user.c"), USER_C).unwrap();
     std::fs::write(d.join("top.sv"), SV).unwrap();
     let so = d.join("user.so");
-    let build = Command::new("cc")
+    let build = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .args(["-shared", "-fPIC"])
         .arg(d.join("user.c"))
         .arg("-o")

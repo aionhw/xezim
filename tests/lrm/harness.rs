@@ -258,7 +258,7 @@ pub fn check_lib(
         let (c, so) = (dir.join("lib.c"), dir.join("lib.so"));
         std::fs::write(&c, c_src).unwrap();
         let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
-        let ok = Command::new("cc")
+        let ok = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
             .args(["-shared", "-fPIC", "-I"])
             .arg(&include)
             .arg(&c)

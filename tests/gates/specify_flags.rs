@@ -9,12 +9,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn xezim_bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("current_exe");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("xezim")
+    // Cargo names the binary it built for the integration tests.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"))
 }
 
 const SRC: &str = "`timescale 1ns/1ns
@@ -267,12 +263,8 @@ fn lint_checks_apply_inside_generate() {
 #[test]
 fn delay_mode_zero_and_unit() {
     fn xbin() -> PathBuf {
-        let mut p = std::env::current_exe().unwrap();
-        p.pop();
-        if p.ends_with("deps") {
-            p.pop();
-        }
-        p.join("xezim")
+        // Cargo names the binary it built for the integration tests.
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"))
     }
     let dir = std::env::temp_dir().join(format!("xezim_delaymode_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

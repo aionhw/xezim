@@ -1011,6 +1011,71 @@ impl Simulator {
         })
     }
 
+    /// §6.20.3/§8.25: the design typedef a class type parameter's binding
+    /// `b` names (`p::pkt_t`), as a reference keeping its package scope so
+    /// the members' widths read the package's parameters. A declaration
+    /// written `T x;` takes its struct layout, member names and packed
+    /// dimensions from it; the bare `T` names nothing in the design's type
+    /// tables. `None` for a binding that is no design typedef (a built-in
+    /// type is sized from the binding directly).
+    pub(super) fn bound_typedef_dt(&self, b: &str) -> Option<DataType> {
+        let b = b.trim();
+        if !self.module.typedef_types.contains_key(b) || self.module.classes.contains_key(b) {
+            return None;
+        }
+        let span = crate::ast::Span::dummy();
+        let mut parts: Vec<&str> = b.split("::").collect();
+        let leaf = parts.pop()?;
+        Some(DataType::TypeReference {
+            name: crate::ast::types::TypeName {
+                scopes: parts
+                    .into_iter()
+                    .map(|s| crate::ast::types::TypeScope {
+                        name: crate::ast::Identifier {
+                            name: s.to_string(),
+                            span,
+                        },
+                        type_args: Vec::new(),
+                    })
+                    .collect(),
+                name: crate::ast::Identifier {
+                    name: leaf.to_string(),
+                    span,
+                },
+                span,
+                bound: Default::default(),
+            },
+            dimensions: Vec::new(),
+            type_args: Vec::new(),
+            span,
+        })
+    }
+
+    /// §8.25/§7.2: a struct type whose members name a class TYPE parameter
+    /// the active object or specialization binds, with those members bound
+    /// (see `bind_type_params_in`). `None` for any other type, or outside a
+    /// parameterized class.
+    pub(super) fn struct_with_bound_members(&mut self, dt: &DataType) -> Option<DataType> {
+        // Cheap reject first: this runs for every local declaration.
+        if !matches!(dt, DataType::Struct(_)) || !self.in_parameterized_class() {
+            return None;
+        }
+        self.bind_type_params_in(dt, &|n| self.resolve_type_param_binding(n))
+    }
+
+    /// Whether the executing method's object or specialization is that of a
+    /// parameterized class.
+    fn in_parameterized_class(&self) -> bool {
+        self.current_spec.is_some()
+            || self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|h| self.heap.get(h)?.as_ref())
+                .is_some_and(|i| !i.type_bindings.is_empty())
+    }
+
     /// §8.25/§7.2: the width of a struct, union or enum type whose members
     /// name a class TYPE parameter the active object or specialization binds
     /// (`struct packed { T a; bit b; }`). `None` for any other type, or
@@ -1127,7 +1192,7 @@ impl Simulator {
     /// The declared return type of `name` as the first class in `cls`'s
     /// lexical chain declares it (§8.20: a non-virtual bare call binds to
     /// the first defining class; an override keeps the prototype).
-    fn class_method_return_type(&self, cls: &str, name: &str) -> Option<DataType> {
+    pub(super) fn class_method_return_type(&self, cls: &str, name: &str) -> Option<DataType> {
         use crate::ast::decl::ClassMethodKind as Kind;
         let mut seen: HashSet<String> = HashSet::default();
         let mut cur = cls.to_string();
@@ -1575,6 +1640,74 @@ impl Simulator {
         None
     }
 
+    /// Build the leading `count` segments of the flattened Ident chain `e` as
+    /// a nested `MemberAccess` expression — `h.frame.lanes` with `count=2`
+    /// → `(h).frame`. Used to hand a real Expression shape to
+    /// [`Self::struct_field_elem_read`], whose receiver/type probes walk
+    /// `MemberAccess` chains (the resolver flattened the same chain to a
+    /// bare `Ident`).
+    pub(super) fn ident_prefix_member_access(e: &Expression, count: usize) -> Expression {
+        let ExprKind::Ident(h) = &e.kind else {
+            return e.clone();
+        };
+        let count = count.min(h.path.len());
+        if count == 0 {
+            return e.clone();
+        }
+        let span = e.span;
+        let mut acc = Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: h.root.clone(),
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: h.path[0].name.name.clone(),
+                        span,
+                    },
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            }),
+            span,
+        );
+        for seg in h.path.iter().take(count).skip(1) {
+            acc = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(acc),
+                    member: crate::ast::Identifier {
+                        name: seg.name.name.clone(),
+                        span,
+                    },
+                },
+                span,
+            );
+        }
+        acc
+    }
+
+    /// The packed dimensions, outermost first, of the member the flattened
+    /// chain `e` (`h.frame.lanes`, `frame.lanes` in a method) names when its
+    /// receiver is a packed-struct class property; `None` otherwise.
+    pub(super) fn struct_member_packed_dims(&mut self, e: &Expression) -> Option<Vec<(i64, i64)>> {
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        let last = h.path.len().checked_sub(1).filter(|&l| l > 0)?;
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let sb = Self::ident_prefix_member_access(e, last);
+        let su = self.chain_base_packed_struct(&sb)?;
+        let member = &h.path[last].name.name;
+        let m = su
+            .members
+            .iter()
+            .find(|m| m.declarators.iter().any(|d| &d.name.name == member))?;
+        self.packed_dim_bounds(&m.data_type, &self.module.parameters)
+    }
+
     /// `sb.member[index]` with `member` a packed-array field (two or more
     /// packed dimensions) of the packed struct `sb` names: the element.
     #[inline(never)]
@@ -1657,7 +1790,13 @@ impl Simulator {
                     return None;
                 }
                 let name = self.resolve_hier_name(h).into_owned();
-                if self.foreach_dims(&name)?.len() != rank {
+                let Some(dims) = self.foreach_dims(&name) else {
+                    // §7.4.1, §8.4: an element of an unpacked-array class
+                    // property whose elements are the struct (`arr[i]` in a
+                    // method, `o.arr[i]`).
+                    return self.packed_struct_elem_type(e);
+                };
+                if dims.len() != rank {
                     return None;
                 }
                 let dt = self.p_elem_type(&name)?;
@@ -1680,6 +1819,20 @@ impl Simulator {
                     .find(|m| m.declarators.iter().any(|d| d.name.name == member.name))
                     .map(|m| m.data_type.clone())?;
                 Self::resolve_type_ref(&m_dt, &self.module.typedef_types)
+            }
+            ExprKind::Ident(h) => {
+                // §7.4.5 implicit-`this` receiver: `frame.lanes[0]` inside a
+                // method flattens to `MemberAccess{ Ident[frame], lanes }`,
+                // so the struct-side base is the bare property `frame` held
+                // by the current `this` object. (A module-scope struct
+                // variable receiver, or a bare name with no `this`, is not a
+                // class property and falls through to None.)
+                if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    return None;
+                }
+                let obj = self.this_stack.last().copied().flatten()?;
+                let su = self.class_prop_struct(obj, &h.path[0].name.name)?;
+                DataType::Struct((*su).clone())
             }
             _ => return None,
         };
@@ -1950,7 +2103,7 @@ impl Simulator {
         }
         let (handle, prop) = self.class_prop_receiver(lvalue)?;
         let su = self.class_prop_struct(handle, &prop)?;
-        if !Self::spreads_member_wise(&su) {
+        if !Self::spreads_member_wise(&su) || self.whole_class_array_prop(lvalue, handle, &prop) {
             return None;
         }
         // §10.6/§13.4.1: a CALL source (`last = q.pop_front()`, `p = mk()`)
@@ -1993,6 +2146,54 @@ impl Simulator {
             }
         }
         Some(())
+    }
+
+    /// §7.2, §7.4: `e` names a whole unpacked-ARRAY property `prop` of the
+    /// object `handle` (its elements are structs), not one struct: the
+    /// whole-array copy paths own it. A member-wise decomposition of
+    /// `da = fx` wrote members of the array itself and copied nothing.
+    pub(super) fn whole_class_array_prop(&self, e: &Expression, handle: usize, prop: &str) -> bool {
+        let selected = match &e.kind {
+            ExprKind::Ident(h) => h.path.last().is_some_and(|s| !s.selects.is_empty()),
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } => true,
+            _ => false,
+        };
+        if selected {
+            return false;
+        }
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .and_then(|i| self.module.classes.get(&i.class_name));
+        for _ in 0..=self.module.classes.len() {
+            let Some(cd) = cur else {
+                return false;
+            };
+            if cd.array_properties.contains_key(prop)
+                || cd.array_nd_properties.contains_key(prop)
+                || cd.queue_properties.contains_key(prop)
+                || cd.queue_property_names.contains(prop)
+                || cd.assoc_properties.contains_key(prop)
+                || cd.param_sized_props.contains_key(prop)
+            {
+                return true;
+            }
+            if let Some(dt) = cd.property_types.get(prop) {
+                // A property declared through an unpacked-array typedef.
+                return matches!(dt, DataType::TypeReference { name, dimensions, .. }
+                    if dimensions.is_empty()
+                        && !name.has_scope()
+                        && self
+                            .class_chain_typedef_dims(handle, &name.name.name)
+                            .is_some_and(|d| !d.is_empty()));
+            }
+            cur = cd
+                .extends
+                .as_deref()
+                .and_then(|b| self.module.classes.get(b));
+        }
+        false
     }
 
     /// `lhs = rhs` for one struct member. A nested UNPACKED struct member has
@@ -2080,7 +2281,7 @@ impl Simulator {
         }
         let (handle, prop) = self.class_prop_receiver(rvalue)?;
         let su = self.class_prop_struct(handle, &prop)?;
-        if !Self::spreads_member_wise(&su) {
+        if !Self::spreads_member_wise(&su) || self.whole_class_array_prop(rvalue, handle, &prop) {
             return None;
         }
         // Same per-element decomposition of members with FIXED unpacked
@@ -2944,7 +3145,7 @@ impl Simulator {
         if rest.is_empty() {
             return Some((0, total_w));
         }
-        let dims = Self::packed_dim_bounds(dt, params)?;
+        let dims = self.packed_dim_bounds(dt, params)?;
         let counts: Vec<u32> = dims
             .iter()
             .map(|&(l, r)| u32::try_from((l - r).unsigned_abs() + 1).ok().unwrap_or(0))
@@ -2966,6 +3167,30 @@ impl Simulator {
                     d += 1;
                     i += 1;
                 }
+                MemberSel::Range { kind, l, r } if d < dims.len() => {
+                    // §7.4.1, §11.5.1: a part-select of a packed dimension
+                    // addresses that dimension's ELEMENTS in its declared
+                    // index order — `lanes[1:2]` and `lanes[0 +: 1]` of a
+                    // `lane_t [0:3] lanes` member select whole lanes, not
+                    // bits. The innermost dimension's elements are bits.
+                    let (dl, dr) = dims[d];
+                    let ew = span.checked_div(counts[d].max(1))?;
+                    let (a, b) = match kind {
+                        RangeKind::Constant => (*l, *r),
+                        RangeKind::IndexedUp if *r > 0 => (*l, l.checked_add(*r - 1)?),
+                        RangeKind::IndexedDown if *r > 0 => (*l, l.checked_sub(*r - 1)?),
+                        _ => return None,
+                    };
+                    let slot = |e: i64| {
+                        (dl.min(dr)..=dl.max(dr))
+                            .contains(&e)
+                            .then(|| if dl >= dr { e - dr } else { dr - e })
+                    };
+                    let (sa, sb) = (slot(a)?, slot(b)?);
+                    let lo = u32::try_from(sa.min(sb)).ok()?.checked_mul(ew)?;
+                    let n = u32::try_from(sa.abs_diff(sb) + 1).ok()?;
+                    return Some((off.checked_add(lo)?, n.checked_mul(ew)?));
+                }
                 MemberSel::Range { kind, l, r } => {
                     let (o, w) = Self::range_within(span, *kind, *l, *r)?;
                     return Some((off.checked_add(o)?, w));
@@ -2983,13 +3208,30 @@ impl Simulator {
     /// contributes its own width as one range so bit-selects on it still
     /// resolve; a `real` never does).
     pub(super) fn packed_dim_bounds(
+        &self,
         dt: &DataType,
         params: &HashMap<String, Value>,
     ) -> Option<Vec<(i64, i64)>> {
-        use crate::ast::types::{DataType as DT, PackedDimension};
-        let dims: Vec<PackedDimension> = match dt {
+        use crate::ast::types::DataType as DT;
+        // Follow a typedef chain, collecting each level's PACKED dimensions
+        // outermost-first, so a member typed through a typedef (`lane_t
+        // [0:3]` with `typedef logic [7:0] lane_t;`) gets its array shape as
+        // well as a bare vector would.
+        let mut out: Vec<(i64, i64)> = Vec::new();
+        let mut cur = dt;
+        for _ in 0..64 {
+            let DT::TypeReference {
+                name, dimensions, ..
+            } = cur
+            else {
+                break;
+            };
+            out.extend(Self::packed_range_bounds(dimensions, params)?);
+            cur = self.module.typedef_types.get(&name.name.name)?;
+        }
+        match cur {
             DT::IntegerVector { dimensions, .. } | DT::Implicit { dimensions, .. } => {
-                dimensions.clone()
+                out.extend(Self::packed_range_bounds(dimensions, params)?);
             }
             DT::IntegerAtom { kind, .. } => {
                 let w = match kind {
@@ -3000,15 +3242,14 @@ impl Simulator {
                     crate::ast::types::IntegerAtomType::LongInt
                     | crate::ast::types::IntegerAtomType::Time => 64,
                 };
-                return Some(vec![(w as i64 - 1, 0)]);
+                out.push((w as i64 - 1, 0));
             }
-            DT::Struct(su) if !su.dimensions.is_empty() => su.dimensions.clone(),
+            DT::Struct(su) if !su.dimensions.is_empty() => {
+                out.extend(Self::packed_range_bounds(&su.dimensions, params)?);
+            }
             _ => return None,
-        };
-        if dims.is_empty() {
-            return None;
         }
-        Self::packed_range_bounds(&dims, params)
+        (!out.is_empty()).then_some(out)
     }
 
     /// Const-resolved `(left, right)` of each of `dims`, in order; `None` for

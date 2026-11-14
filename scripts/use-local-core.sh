@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Make PLAIN `cargo build` use a LOCAL xezim-core checkout instead of
 # fetching the git dependency — persistently, by writing the repo-local
-# (git-ignored) .cargo/config.toml with a [patch] section.
+# (git-ignored) .cargo/local-core.toml with a [patch] section. The tracked
+# .cargo/config.toml includes it and keeps the compiler defaults intact.
 #
 # Search order for the local checkout:
 #   1. ./xezim-core   (nested checkout, e.g. the sv-tests vendored layout)
@@ -19,10 +20,10 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 
-CFG=.cargo/config.toml
+CFG=.cargo/local-core.toml
 
 if [ "${1:-}" = "--remove" ]; then
-  if [ -f "$CFG" ]; then rm -f "$CFG"; rmdir .cargo 2>/dev/null || true; fi
+  if [ -f "$CFG" ]; then rm -f "$CFG"; fi
   echo "local-core patch removed; cargo resolves the rev-pinned git dependency"
   exit 0
 fi

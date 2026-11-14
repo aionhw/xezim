@@ -47,6 +47,8 @@ mod begin_keywords_noconfig;
 mod bind_upward_refs;
 #[path = "misc/blocking_task_call.rs"]
 mod blocking_task_call;
+#[path = "misc/broken_pipe_exit_status.rs"]
+mod broken_pipe_exit_status;
 #[path = "misc/c910_create_en_cont_assign.rs"]
 mod c910_create_en_cont_assign;
 #[path = "misc/c910_create_en_full_path.rs"]
@@ -59,6 +61,10 @@ mod chained_member_access;
 mod child_decl_init_and_wide_rand;
 #[path = "misc/cli_files.rs"]
 mod cli_files;
+#[path = "misc/cli_max_time_units.rs"]
+mod cli_max_time_units;
+#[path = "misc/command_file_runtime_argv.rs"]
+mod command_file_runtime_argv;
 #[path = "misc/clocked_loop_case_nest_compiled.rs"]
 mod clocked_loop_case_nest_compiled;
 #[path = "misc/code_coverage.rs"]
@@ -143,6 +149,8 @@ mod implicit_static_diagnostic;
 mod include_path_from_function_macro;
 #[path = "misc/init_reg_seed.rs"]
 mod init_reg_seed;
+#[path = "misc/inlined_call_caller_loop_constant.rs"]
+mod inlined_call_caller_loop_constant;
 #[path = "misc/inspect_types.rs"]
 mod inspect_types;
 #[path = "misc/interconnect_and_var_ports.rs"]
@@ -593,6 +601,8 @@ mod always_star_spacing;
 mod artifact_with_sources_738;
 #[path = "misc/checkpoint_save_restore.rs"]
 mod checkpoint_save_restore;
+#[path = "misc/checkpoint_forked_process_bodies.rs"]
+mod checkpoint_forked_process_bodies;
 
 #[path = "misc/block_local_array_for_loop.rs"]
 mod block_local_array_for_loop;
@@ -621,3 +631,22 @@ mod macro_actual_count_888;
 mod typed_localparam_dimension_894;
 #[path = "misc/review_class_param_undeclared_888.rs"]
 mod review_class_param_undeclared_888;
+#[path = "misc/preprocessor_closed_pipe.rs"]
+mod preprocessor_closed_pipe;
+#[path = "misc/review_interconnect_element_types.rs"]
+mod review_interconnect_element_types;
+
+#[path = "misc/cli_worker_stack_1055.rs"]
+mod cli_worker_stack_1055;
+
+#[path = "misc/cli_address_space.rs"]
+mod cli_address_space;
+
+#[path = "misc/prepared_cache_driven_init.rs"]
+mod prepared_cache_driven_init;
+#[path = "misc/urandom_seed_input_1058.rs"]
+mod urandom_seed_input_1058;
+#[path = "misc/oom_trace.rs"]
+mod oom_trace;
+#[path = "misc/scope_randomize_without_std.rs"]
+mod scope_randomize_without_std;

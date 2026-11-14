@@ -419,7 +419,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_FORCE_PARALLEL",
-        "Parallel: force parallel dispatch even below thresholds",
+        "Parallel: force eligible edge dispatch without calibration",
     ),
     (
         "XEZIM_FOREACH_REPLAY_LIMIT",
@@ -675,6 +675,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Semantics: `whole` makes a partially out-of-range part-select read x as a whole (some tools); default follows IEEE 1800 11.5.1, where only the out-of-range bits read x",
     ),
     (
+        "XEZIM_OOM_TRACE",
+        "Memory diagnostics: stream JSONL phase/source/instance and RSS samples to a file (1 = stderr; 0 = off)",
+    ),
+    (
         "XEZIM_OPCODE_CENSUS",
         "Print executed-insn opcode histogram at end of sim",
     ),
@@ -684,7 +688,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_PARALLEL_SERIALIZE",
-        "Parallel: run parallel plan serially (debug determinism check)",
+        "Parallel: run edge-dispatch plans serially (default 1; 0 enables worker threads)",
     ),
     (
         "XEZIM_PARTITION_BY_CLOCK",

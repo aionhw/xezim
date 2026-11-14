@@ -43,6 +43,7 @@ impl Simulator {
         let own = |slf: &Self| {
             slf.killed_pids.contains(&pid)
                 || slf.cont_has_named_block(pc, &x)
+                || slf.is_process_top_label(pid, &x)
                 || slf
                     .active_task_pids
                     .get(&x)
@@ -54,6 +55,18 @@ impl Simulator {
                 // The block's own fork children die with it.
                 if !self.killed_pids.contains(&pid) && self.cont_has_named_block(pc, &x) {
                     let kids = self.children_forked_in(pid, &x);
+                    for k in kids {
+                        self.proc_kill(k);
+                    }
+                } else if !self.killed_pids.contains(&pid) && self.is_process_top_label(pid, &x) {
+                    // The process's top-level block holds everything it forked.
+                    let mut kids: Vec<usize> = self
+                        .process_parents
+                        .iter()
+                        .filter(|&(_, &p)| p == pid)
+                        .map(|(&c, _)| c)
+                        .collect();
+                    kids.sort_unstable();
                     for k in kids {
                         self.proc_kill(k);
                     }
@@ -285,6 +298,17 @@ impl Simulator {
 
     pub(super) fn disable_remote_block(&mut self, x: &str) {
         self.disable_remote_block_of(x, None);
+    }
+
+    /// §9.6.2: does `x` name process `pid`'s top-level block
+    /// (`initial begin : blk`)? That block is flattened into the process's
+    /// own frame, so it has no named frame; its label is kept for `%m`.
+    pub(super) fn is_process_top_label(&self, pid: usize, x: &str) -> bool {
+        !self.process_m_label.is_empty()
+            && self
+                .process_m_label
+                .get(&pid)
+                .is_some_and(|l| Self::block_name_matches(x, l))
     }
 
     /// §9.6.2: whether a `disable` of `target` may name a block or task this
@@ -631,11 +655,423 @@ impl Simulator {
         }
     }
 
+    /// §23.6: find addressed subroutine storage without expanding lazy bodies
+    /// or enumerating array elements. Qualify paths against their source scope.
+    pub(super) fn addressed_subroutine_statics(
+        module: &ElaboratedModule,
+        deferred: &[DeferredAlways],
+    ) -> HashSet<String> {
+        let routines: HashSet<&str> = module
+            .tasks
+            .values()
+            .filter(|t| t.name.scopes.is_empty())
+            .map(|t| t.name.name.name.as_str())
+            .chain(
+                module
+                    .functions
+                    .values()
+                    .filter(|f| f.name.scopes.is_empty())
+                    .map(|f| f.name.name.name.as_str()),
+            )
+            .collect();
+        let routine_leaves: HashSet<&str> = routines
+            .iter()
+            .map(|name| name.rsplit('.').next().unwrap_or(name))
+            .collect();
+        let mut addressed = HashSet::default();
+        if routines.is_empty() {
+            return addressed;
+        }
+        fn constraint_exprs(item: &ConstraintItem, f: &mut dyn FnMut(&Expression)) {
+            use crate::ast::decl::{ConstraintRange, DistWeight};
+            match item {
+                ConstraintItem::Expr(e) => f(e),
+                ConstraintItem::Inside {
+                    expr,
+                    range,
+                    dist_weights,
+                    ..
+                } => {
+                    f(expr);
+                    for range in range {
+                        match range {
+                            ConstraintRange::Value(e) => f(e),
+                            ConstraintRange::Range { lo, hi } => {
+                                f(lo);
+                                f(hi);
+                            }
+                        }
+                    }
+                    for weight in dist_weights.iter().flatten() {
+                        match weight {
+                            DistWeight::Each(e) | DistWeight::Total(e) => f(e),
+                        }
+                    }
+                }
+                ConstraintItem::Implication {
+                    condition,
+                    constraint,
+                    ..
+                } => {
+                    f(condition);
+                    constraint_exprs(constraint, f);
+                }
+                ConstraintItem::IfElse {
+                    condition,
+                    then_item,
+                    else_item,
+                    ..
+                } => {
+                    f(condition);
+                    constraint_exprs(then_item, f);
+                    if let Some(item) = else_item {
+                        constraint_exprs(item, f);
+                    }
+                }
+                ConstraintItem::Foreach { array, item, .. } => {
+                    f(array);
+                    constraint_exprs(item, f);
+                }
+                ConstraintItem::Soft(item) => constraint_exprs(item, f),
+                ConstraintItem::Block(items) => {
+                    for item in items {
+                        constraint_exprs(item, f);
+                    }
+                }
+                ConstraintItem::Unique { exprs, .. } => {
+                    for expr in exprs {
+                        f(expr);
+                    }
+                }
+                ConstraintItem::Solve {
+                    before_paths,
+                    after_paths,
+                    ..
+                } => {
+                    for expr in before_paths.iter().chain(after_paths) {
+                        f(expr);
+                    }
+                }
+            }
+        }
+        fn pattern_exprs(pattern: &crate::ast::stmt::Pattern, f: &mut dyn FnMut(&Expression)) {
+            use crate::ast::stmt::Pattern;
+            match pattern {
+                Pattern::Expr(e) => f(e),
+                Pattern::Tagged { inner: Some(p), .. } => pattern_exprs(p, f),
+                Pattern::Struct(items) => {
+                    for (_, p) in items {
+                        pattern_exprs(p, f);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let top = format!("{}.", module.name);
+        fn collect_expr_names(
+            expr: &Expression,
+            module: &ElaboratedModule,
+            routine_leaves: &HashSet<&str>,
+            names: &mut HashSet<String>,
+        ) {
+            super::elaborate::for_each_sub_expr(expr, &mut |e| {
+                // Constraint/pattern binders stay out of the shared validator
+                // visitor; only their expression payloads enter this census.
+                match &e.kind {
+                    ExprKind::RandomizeWith { constraints, .. } => {
+                        for item in constraints {
+                            constraint_exprs(item, &mut |e| {
+                                collect_expr_names(e, module, routine_leaves, names)
+                            });
+                        }
+                    }
+                    ExprKind::Matches { pattern, .. } => {
+                        pattern_exprs(pattern, &mut |e| {
+                            collect_expr_names(e, module, routine_leaves, names)
+                        });
+                    }
+                    _ => {}
+                }
+                let name = match &e.kind {
+                    ExprKind::Ident(h) => Simulator::resolve_hier_name_static(h, module),
+                    ExprKind::MemberAccess { .. } => {
+                        let Some(parts) = Simulator::flatten_member_path(e) else {
+                            return;
+                        };
+                        parts.join(".")
+                    }
+                    _ => return,
+                };
+                if let Some((prefix, leaf)) = name.rsplit_once('.') {
+                    if !prefix.split('.').any(|part| routine_leaves.contains(part)) {
+                        return;
+                    }
+                    let leaf = leaf.split('[').next().unwrap_or(leaf);
+                    names.insert(format!("{prefix}.{leaf}"));
+                }
+            });
+        }
+        let expr_names = |e: &Expression, names: &mut HashSet<String>| {
+            collect_expr_names(e, module, &routine_leaves, names);
+        };
+        let mut insert = |names: &[String], scope: &str| {
+            for name in names {
+                let mut scope = if name.starts_with(top.as_str()) {
+                    ""
+                } else {
+                    scope.trim_end_matches('.')
+                };
+                'scopes: loop {
+                    let candidate = if scope.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{scope}.{name}")
+                    };
+                    let candidate = candidate.strip_prefix(top.as_str()).unwrap_or(&candidate);
+                    let mut prefix = candidate;
+                    while let Some((parent, _)) = prefix.rsplit_once('.') {
+                        if routines.contains(parent) {
+                            addressed.insert(candidate.to_string());
+                            break 'scopes;
+                        }
+                        prefix = parent;
+                    }
+                    if scope.is_empty() {
+                        break;
+                    }
+                    scope = scope.rsplit_once('.').map_or("", |(p, _)| p);
+                }
+            }
+        };
+        let mut raw_cache: HashMap<usize, Vec<String>> = HashMap::default();
+        let mut scan = |stmt: &Statement, scope: &str| {
+            let raw = raw_cache
+                .entry(stmt as *const Statement as usize)
+                .or_insert_with(|| {
+                    let mut names = HashSet::default();
+                    super::elaborate::for_each_stmt_expr(stmt, &mut |e| expr_names(e, &mut names));
+                    names.into_iter().collect()
+                });
+            insert(raw, scope);
+        };
+        for block in module
+            .initial_blocks
+            .iter()
+            .chain(&module.final_blocks)
+            .chain(&module.static_init_blocks)
+            .chain(&module.program_initial_blocks)
+        {
+            scan(&block.stmt, &block.scope);
+        }
+        for block in &module.always_blocks {
+            scan(&block.stmt, &block.scope);
+        }
+        for block in &module.pending_initial {
+            let scope = format!("{}{}", block.ctx.prefix, block.gen_scope);
+            scan(&block.source, &scope);
+        }
+        for block in deferred {
+            match block {
+                DeferredAlways::Eager(block) => scan(&block.stmt, &block.scope),
+                DeferredAlways::Lazy { lazy, .. } => scan(&lazy.src.source, &lazy.src.scope()),
+            }
+        }
+        for routine in module.tasks.values() {
+            for stmt in &routine.items {
+                scan(stmt, &routine.name.name.name);
+            }
+        }
+        for routine in module.functions.values() {
+            for stmt in &routine.items {
+                scan(stmt, &routine.name.name.name);
+            }
+        }
+        for class in module.classes.values() {
+            for method in class.methods.values() {
+                use crate::ast::decl::ClassMethodKind as M;
+                let items = match &method.kind {
+                    M::Function(f) | M::Extern(f) | M::PureVirtual(f) => &f.items,
+                    M::Task(t) => &t.items,
+                };
+                for stmt in items {
+                    scan(stmt, "");
+                }
+            }
+        }
+        drop(scan);
+        for class in module.classes.values() {
+            for constraint in class.constraints.values() {
+                let mut names = HashSet::default();
+                for item in &constraint.items {
+                    constraint_exprs(item, &mut |e| expr_names(e, &mut names));
+                }
+                insert(&names.into_iter().collect::<Vec<_>>(), "");
+            }
+        }
+        for assign in &module.continuous_assigns {
+            let mut names = HashSet::default();
+            expr_names(&assign.lhs, &mut names);
+            expr_names(&assign.rhs, &mut names);
+            insert(&names.into_iter().collect::<Vec<_>>(), "");
+        }
+        for assign in &module.pending_cont_assign {
+            let mut names = HashSet::default();
+            expr_names(&assign.source_lhs(), &mut names);
+            expr_names(&assign.rhs_source, &mut names);
+            insert(&names.into_iter().collect::<Vec<_>>(), &assign.ctx.prefix);
+        }
+        addressed
+    }
+
+    /// Mark only declaration-owned static locals; automatic frames must
+    /// never become addressable because another routine reuses a name.
+    fn has_addressed_statics(
+        stmt: &Statement,
+        scope: &str,
+        automatic: bool,
+        addressed: &HashSet<String>,
+    ) -> bool {
+        use crate::ast::types::Lifetime;
+        match &stmt.kind {
+            StatementKind::VarDecl {
+                lifetime,
+                declarators,
+                ..
+            } => {
+                if *lifetime == Some(Lifetime::Automatic) || (lifetime.is_none() && automatic) {
+                    return false;
+                }
+                let found = declarators.iter().any(|d| {
+                    let path = if d.name.name.contains('.') {
+                        d.name.name.clone()
+                    } else {
+                        format!("{scope}.{}", d.name.name)
+                    };
+                    addressed.contains(&path)
+                });
+                found
+            }
+            StatementKind::SeqBlock { name, stmts }
+            | StatementKind::ParBlock { name, stmts, .. } => {
+                let nested = name.as_ref().map(|n| format!("{scope}.{}", n.name));
+                let scope = nested.as_deref().unwrap_or(scope);
+                let mut found = false;
+                for stmt in stmts {
+                    found |= Self::has_addressed_statics(stmt, scope, automatic, addressed);
+                }
+                found
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                let mut found = Self::has_addressed_statics(then_stmt, scope, automatic, addressed);
+                if let Some(stmt) = else_stmt {
+                    found |= Self::has_addressed_statics(stmt, scope, automatic, addressed);
+                }
+                found
+            }
+            StatementKind::Case { items, .. } => {
+                let mut found = false;
+                for item in items {
+                    found |= Self::has_addressed_statics(&item.stmt, scope, automatic, addressed);
+                }
+                found
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => {
+                Self::has_addressed_statics(body, scope, automatic, addressed)
+            }
+            _ => false,
+        }
+    }
+
+    fn mark_addressed_statics(
+        stmt: &mut Statement,
+        scope: &str,
+        automatic: bool,
+        addressed: &HashSet<String>,
+    ) -> bool {
+        use crate::ast::types::Lifetime;
+        match &mut stmt.kind {
+            StatementKind::VarDecl {
+                lifetime,
+                declarators,
+                ..
+            } => {
+                if *lifetime == Some(Lifetime::Automatic) || (lifetime.is_none() && automatic) {
+                    return false;
+                }
+                let found = declarators.iter().any(|d| {
+                    let path = if d.name.name.contains('.') {
+                        d.name.name.clone()
+                    } else {
+                        format!("{scope}.{}", d.name.name)
+                    };
+                    addressed.contains(&path)
+                });
+                if found {
+                    *lifetime = Some(Lifetime::Static);
+                }
+                found
+            }
+            StatementKind::SeqBlock { name, stmts }
+            | StatementKind::ParBlock { name, stmts, .. } => {
+                let nested = name.as_ref().map(|n| format!("{scope}.{}", n.name));
+                let scope = nested.as_deref().unwrap_or(scope);
+                let mut found = false;
+                for stmt in stmts {
+                    found |= Self::mark_addressed_statics(stmt, scope, automatic, addressed);
+                }
+                found
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                let mut found =
+                    Self::mark_addressed_statics(then_stmt, scope, automatic, addressed);
+                if let Some(stmt) = else_stmt {
+                    found |= Self::mark_addressed_statics(stmt, scope, automatic, addressed);
+                }
+                found
+            }
+            StatementKind::Case { items, .. } => {
+                let mut found = false;
+                for item in items {
+                    found |=
+                        Self::mark_addressed_statics(&mut item.stmt, scope, automatic, addressed);
+                }
+                found
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => {
+                Self::mark_addressed_statics(body, scope, automatic, addressed)
+            }
+            _ => false,
+        }
+    }
+
     /// §6.21 / §13.3 / §13.4: module subroutine statics have one
     /// declaration-owned store, shared by recursion and allocated before
     /// time zero. Allocate all cells first, then evaluate their initializers.
     pub(super) fn hoist_subroutine_statics(
         module: &mut ElaboratedModule,
+        addressed: &HashSet<String>,
     ) -> (HashSet<String>, HashSet<String>) {
         fn selected(s: &Statement, nba_names: &HashSet<String>) -> bool {
             match &s.kind {
@@ -679,6 +1115,7 @@ impl Simulator {
             initialize: &mut Vec<Statement>,
             names: &mut HashSet<String>,
             nba_names: &HashSet<String>,
+            addressed: &HashSet<String>,
         ) {
             match &s.kind {
                 StatementKind::VarDecl {
@@ -690,6 +1127,7 @@ impl Simulator {
                         if d.init.is_none()
                             && d.dimensions.is_empty()
                             && !nba_names.contains(&d.name.name)
+                            && !addressed.contains(&d.name.name)
                         {
                             continue;
                         }
@@ -739,7 +1177,9 @@ impl Simulator {
                 }
                 StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                     for st in stmts {
-                        collect(st, module, formals, allocate, initialize, names, nba_names);
+                        collect(
+                            st, module, formals, allocate, initialize, names, nba_names, addressed,
+                        );
                     }
                 }
                 StatementKind::If {
@@ -749,15 +1189,19 @@ impl Simulator {
                 } => {
                     collect(
                         then_stmt, module, formals, allocate, initialize, names, nba_names,
+                        addressed,
                     );
                     if let Some(st) = else_stmt {
-                        collect(st, module, formals, allocate, initialize, names, nba_names);
+                        collect(
+                            st, module, formals, allocate, initialize, names, nba_names, addressed,
+                        );
                     }
                 }
                 StatementKind::Case { items, .. } => {
                     for i in items {
                         collect(
                             &i.stmt, module, formals, allocate, initialize, names, nba_names,
+                            addressed,
                         );
                     }
                 }
@@ -769,27 +1213,38 @@ impl Simulator {
                 | StatementKind::Foreach { body, .. }
                 | StatementKind::TimingControl { stmt: body, .. }
                 | StatementKind::Wait { stmt: body, .. } => collect(
-                    body, module, formals, allocate, initialize, names, nba_names,
+                    body, module, formals, allocate, initialize, names, nba_names, addressed,
                 ),
                 _ => {}
             }
         }
         fn prepare(
             module: &ElaboratedModule,
-            items: &mut Vec<Statement>,
+            items: &mut crate::ast::shared_vec::SharedVec<Statement>,
             ports: &[crate::ast::decl::FunctionPort],
             routine: &str,
             ordinal: usize,
             allocate: &mut Vec<Statement>,
             initialize: &mut Vec<Statement>,
             names: &mut HashSet<String>,
+            addressed: &HashSet<String>,
+            automatic: bool,
         ) -> bool {
+            let addressable = !addressed.is_empty()
+                && items.iter().any(|stmt| {
+                    Simulator::has_addressed_statics(stmt, routine, automatic, addressed)
+                });
             let mut nba_names = HashSet::default();
             for stmt in items.iter() {
                 Simulator::collect_nba_roots(stmt, &mut nba_names);
             }
-            if !items.iter().any(|s| selected(s, &nba_names)) {
+            if !addressable && !items.iter().any(|s| selected(s, &nba_names)) {
                 return false;
+            }
+            if addressable {
+                for stmt in items.iter_mut() {
+                    Simulator::mark_addressed_statics(stmt, routine, automatic, addressed);
+                }
             }
             let span = items
                 .first()
@@ -801,7 +1256,7 @@ impl Simulator {
                         name: routine.to_string(),
                         span,
                     }),
-                    stmts: std::mem::take(items),
+                    stmts: std::mem::take(items).into_vec(),
                 },
                 span,
             );
@@ -866,10 +1321,10 @@ impl Simulator {
             nba_names.clear();
             Simulator::collect_nba_roots(&body, &mut nba_names);
             collect(
-                &body, module, &formals, allocate, initialize, names, &nba_names,
+                &body, module, &formals, allocate, initialize, names, &nba_names, addressed,
             );
             if let StatementKind::SeqBlock { stmts, .. } = body.kind {
-                *items = stmts;
+                *items = stmts.into();
             }
             true
         }
@@ -880,7 +1335,8 @@ impl Simulator {
         let mut ordinal = 0usize;
         let mut functions: Vec<_> = module.functions.keys().cloned().collect();
         functions.sort();
-        let mut rewritten: HashMap<String, crate::ast::shared_vec::SharedVec<Statement>> = HashMap::default();
+        let mut rewritten: HashMap<String, crate::ast::shared_vec::SharedVec<Statement>> =
+            HashMap::default();
         for key in functions {
             let Some(original) = module.functions.get(&key) else {
                 continue;
@@ -902,6 +1358,8 @@ impl Simulator {
                     &mut allocate,
                     &mut initialize,
                     &mut names,
+                    addressed,
+                    fd.lifetime == Some(crate::ast::types::Lifetime::Automatic),
                 ) {
                     continue;
                 }
@@ -927,6 +1385,8 @@ impl Simulator {
                     &mut allocate,
                     &mut initialize,
                     &mut names,
+                    addressed,
+                    td.lifetime == Some(crate::ast::types::Lifetime::Automatic),
                 ) {
                     routines.insert(td.name.name.name.clone());
                 }
@@ -2326,6 +2786,107 @@ impl Simulator {
         f
     }
 
+    /// §9.3/§13.3: cache an owner for forks and nested blocks that suspend.
+    /// A flat delay needs no continuation-cache owner and keeps its original
+    /// lifetime. Inspect syntax without entering other task declarations.
+    fn statement_needs_task_frame(&self, stmt: &Statement) -> bool {
+        use StatementKind::*;
+        let contains = |stmt: &Statement| self.statement_needs_task_frame(stmt);
+        match &stmt.kind {
+            ParBlock { .. } => true,
+            SeqBlock { stmts, .. } => self.stmts_have_blocking(stmts) || stmts.iter().any(contains),
+            If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => contains(then_stmt) || else_stmt.as_deref().is_some_and(contains),
+            Case { items, .. } => items.iter().any(|item| contains(&item.stmt)),
+            RandCase { items } => items.iter().any(|(_, stmt)| contains(stmt)),
+            For { body, .. }
+            | Foreach { body, .. }
+            | ForeachTail { body, .. }
+            | While { body, .. }
+            | DoWhile { body, .. }
+            | Repeat { body, .. }
+            | Forever { body }
+            | ForeverTail { body }
+            | RsAction { body }
+            | TimingControl { stmt: body, .. }
+            | Wait { stmt: body, .. } => contains(body),
+            Assertion(assertion) => {
+                assertion.action.as_deref().is_some_and(contains)
+                    || assertion.else_action.as_deref().is_some_and(contains)
+            }
+            WaitOrder { pass, fail, .. } => {
+                pass.as_deref().is_some_and(contains) || fail.as_deref().is_some_and(contains)
+            }
+            Null
+            | ScopePop
+            | LoopStep
+            | DisableFork
+            | Expr(_)
+            | BlockingAssign { .. }
+            | NonblockingAssign { .. }
+            | EventTrigger { .. }
+            | WaitFork
+            | Disable(_)
+            | Return(_)
+            | Break
+            | Continue
+            | ProceduralContinuous(_)
+            | VarDecl { .. }
+            | Typedef(_)
+            | Coverpoint { .. }
+            | Cross { .. }
+            | RsReturn => false,
+        }
+    }
+
+    /// §13.3.1–§13.3.2: share immutable task statements, not invocation
+    /// storage, for forks or nested suspending blocks after a site is reused.
+    /// Flat task bodies keep the original path without a site marker. The first
+    /// eligible call keeps the original body lifetime; retain only its declaration
+    /// and site marker.
+    /// Keep ScopePop in the body to preserve assertion flush boundaries (§16.4.2).
+    pub(super) fn task_body_frame(
+        &mut self,
+        td: &std::rc::Rc<crate::ast::decl::TaskDeclaration>,
+        call_span: crate::ast::Span,
+    ) -> Option<Arc<[Statement]>> {
+        let declaration = std::rc::Rc::as_ptr(td) as usize;
+        let needs_frame = match self.task_frame_eligibility.get(&declaration) {
+            Some((_, eligible)) => *eligible,
+            None => {
+                let eligible = td
+                    .items
+                    .iter()
+                    .any(|stmt| self.statement_needs_task_frame(stmt));
+                self.task_frame_eligibility
+                    .insert(declaration, (td.clone(), eligible));
+                eligible
+            }
+        };
+        if !needs_frame {
+            return None;
+        }
+        let key = (declaration, call_span.start, call_span.end);
+        if let Some((_, frame)) = self.task_frame_cache.get(&key) {
+            if let Some(frame) = frame {
+                return Some(frame.clone());
+            }
+        } else {
+            self.task_frame_cache.insert(key, (td.clone(), None));
+            return None;
+        }
+        let mut cont: Vec<Statement> = Vec::with_capacity(td.items.len() + 1);
+        cont.extend_from_slice(&td.items);
+        cont.push(Statement::new(StatementKind::ScopePop, call_span));
+        let frame: Arc<[Statement]> = Arc::from(cont);
+        self.task_frame_cache
+            .insert(key, (td.clone(), Some(frame.clone())));
+        Some(frame)
+    }
+
     /// A class task's body followed by its `ScopePop` sentinel (spanned at
     /// the call), shared per (task, call site) instead of cloned per call.
     /// The entry keeps the method alive, so its address cannot be recycled.
@@ -2386,6 +2947,28 @@ impl Simulator {
         idx: usize,
     ) {
         let resume_at = pc.start + idx + 1;
+        // §9.6.2, §21.2.1.7: a NAMED body (`always begin : ab`, `forever
+        // begin : it`) is a block entered again on every iteration. Run it as
+        // the block statement, so the process loop gives it a named frame:
+        // `%m` names it, and `disable ab` ends the iteration. Flattening it
+        // into the loop dropped the name.
+        if let StatementKind::SeqBlock {
+            name: Some(_),
+            stmts,
+        } = &body.kind
+            && self.stmts_have_blocking(stmts)
+        {
+            let cont = self.forever_cont(pid, body, std::slice::from_ref(body), 0, 4, body);
+            let contp = pc.pushed_frame(cont, resume_at);
+            if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
+                self.event_queue.schedule(self.time, pid, contp);
+                return;
+            }
+            self.forever_depth += 1;
+            self.run_process_stmts(pid, &contp);
+            self.forever_depth -= 1;
+            return;
+        }
         let body_stmts: &[Statement] = match &body.kind {
             StatementKind::SeqBlock { stmts, .. } => stmts.as_slice(),
             _ => std::slice::from_ref(body),
@@ -2556,6 +3139,36 @@ impl Simulator {
                 return;
             }
             self.exec_statement(s);
+            // §12.8, §9.6.2: a `break`, `continue`, `return` or `disable`
+            // raised here ends the iteration before the suspension point
+            // still ahead in the body. Run the rest of the iteration through
+            // `run_process_stmts`, whose flag gates skip it and whose
+            // `ForeverTail` consumes the flag. Going on to schedule that
+            // suspension ran the statements after the jump, and a pending
+            // `disable` was dropped at the next activation.
+            if !self.finished
+                && (self.break_flag || self.continue_flag || self.return_flag)
+                && body_stmts[i + 1..].iter().any(|t| {
+                    matches!(t.kind, StatementKind::TimingControl { .. })
+                        || self.stmt_is_blocking(t)
+                        || Self::stmt_is_mailbox_get(t)
+                })
+            {
+                let null = Statement::new(StatementKind::Null, s.span);
+                let cont = self.forever_cont(pid, body, body_stmts, i, 3, &null);
+                let contp = pc.pushed_frame(cont, resume_at);
+                if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
+                    if let Some(t) = self.disable_target.clone() {
+                        self.pending_block_disable.insert(pid, t);
+                    }
+                    self.event_queue.schedule(self.time, pid, contp);
+                    return;
+                }
+                self.forever_depth += 1;
+                self.run_process_stmts(pid, &contp);
+                self.forever_depth -= 1;
+                return;
+            }
         }
         // No delay/event in the forever body: the loop can never yield, so
         // running it is a zero-delay livelock (`always fb = ~fb;`). The old
@@ -3146,6 +3759,23 @@ impl Simulator {
                     }
                 }
                 let name = self.resolve_hier_name(hier);
+                // §10.4.2/§6.12.2: a MULTI-SEGMENT path rooted at a class
+                // object (`h.prop`, `C::prop`) targets a heap property or
+                // a static cell. When the resolver cannot bind the full
+                // dotted name, its last-resort fallback returns the LEAF,
+                // and a module-scope signal of that leaf name then
+                // captured the NBA — the property never saw the write
+                // (`hdl2.vec <= v` landed in a module `vec`). Divert only
+                // that leaf-capture shape: a resolution that kept the full
+                // name (a real flattened signal, a virtual-interface
+                // rewrite) still takes the fast path below.
+                if hier.path.len() > 1
+                    && name.as_ref() == hier.path[hier.path.len() - 1].name.name
+                    && !self.no_class_objects()
+                    && self.head_denotes_class_object(hier)
+                {
+                    return None;
+                }
                 if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                     hier.cached_signal_id.set(Some(id));
                     return Some(id);
@@ -3439,6 +4069,11 @@ impl Simulator {
         let Some(&id) = self.signal_name_to_id.get(name.as_ref()) else {
             return false;
         };
+        // §4.6 b): behind a partial update already queued for the signal.
+        // Decided before the index is evaluated, which the queued path does.
+        if self.nba_behind_queued_partial(id) {
+            return false;
+        }
         let selected = self.eval_expr(index);
         if selected.has_xz() && !selected.is_real {
             return true;
@@ -3477,6 +4112,250 @@ impl Simulator {
             self.prof_nba_elided += 1;
         }
         true
+    }
+
+    /// §4.6 b), §10.4.2: nonblocking updates to one variable commit in the
+    /// order they were scheduled. A whole-signal update goes to `nba_fast`,
+    /// which commits before `nba_queue`, so a partial one (a struct member,
+    /// a bit- or part-select, a concatenation piece) queued BEFORE a whole one
+    /// to the same signal used to win over it: `bus.vld <= 1'b0; bus <= PKT;`
+    /// left `vld` at 0. Returns whether a whole or element update of signal
+    /// `id` must queue behind one already waiting in `nba_queue`; the queued
+    /// update is applied to the value the variable holds when the window
+    /// commits, so a blocking write to its other bits in the meantime
+    /// survives.
+    ///
+    /// The signals the queued updates write are found here, when a signal
+    /// update is about to take `nba_fast`, for the entries queued since the
+    /// last look (`nba_queue_noted`): a window that queues only class
+    /// properties or other storage never pays for the walk.
+    pub(super) fn nba_behind_queued_partial(&mut self, id: usize) -> bool {
+        if self.nba_queue.len() > self.nba_queue_noted {
+            let queue = std::mem::take(&mut self.nba_queue);
+            let mut ids = Vec::new();
+            for entry in &queue[self.nba_queue_noted..] {
+                // The signal walk evaluates the lvalue's indices, which the
+                // queued entry froze to constants.
+                let Some(lhs) = &entry.lhs else { continue };
+                if entry.static_key.is_some() || !Self::cond_expr_is_effect_free(lhs, false) {
+                    continue;
+                }
+                // The scheduling `this`, for a property naming a virtual
+                // interface (see NbaEntry::this_handle).
+                if let Some(h) = entry.this_handle {
+                    self.this_stack.push(Some(h));
+                }
+                self.partial_nba_signal_ids(lhs, &mut ids);
+                if entry.this_handle.is_some() {
+                    self.this_stack.pop();
+                }
+            }
+            self.nba_queue_noted = queue.len();
+            self.nba_queue = queue;
+            self.nba_queued_partial_ids.extend(ids);
+        }
+        !self.nba_queued_partial_ids.is_empty() && self.nba_queued_partial_ids.contains(&id)
+    }
+
+    /// The signals a partial nonblocking lvalue writes: a concatenation
+    /// contributes each element's, a select the signal of its base, anything
+    /// else the signal [`Self::packed_nba_base_slice`] finds.
+    fn partial_nba_signal_ids(&mut self, lhs: &Expression, out: &mut Vec<usize>) {
+        match &lhs.kind {
+            // A collapsed multi-segment identifier carrying selects
+            // (`cia[0].bus_a.vld` in always/initial code) re-spells as an
+            // Index/MemberAccess chain the arms below already walk.
+            ExprKind::Ident(h) if h.path.iter().any(|s| !s.selects.is_empty()) => {
+                let chain = Self::hier_select_chain(h, lhs.span);
+                self.partial_nba_signal_ids(&chain, out);
+            }
+            ExprKind::Paren(inner) => self.partial_nba_signal_ids(inner, out),
+            ExprKind::Concatenation(elements) => {
+                for e in elements {
+                    self.partial_nba_signal_ids(e, out);
+                }
+            }
+            // The base is the signal itself (`v[3:0]`, `arr[1][3]`), or a
+            // member or element of one (`q.addr[7:0]`, `m[2][1:0]`).
+            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
+                if let Some((id, ..)) = self.packed_nba_base_slice(base) {
+                    out.push(id);
+                } else {
+                    self.partial_nba_signal_ids(base, out);
+                }
+            }
+            _ => {
+                if let Some((id, ..)) = self.packed_nba_base_slice(lhs) {
+                    out.push(id);
+                }
+            }
+        }
+    }
+
+    /// The backing signal slice a partial-NBA lvalue selects within:
+    /// `(signal_id, lsb, width)`.
+    ///
+    /// Mirrors the blocking member path (`packed_struct_member_slice` +
+    /// `get_local_or_signal`): the flat member name's longest registered
+    /// packed-struct base names the storage signal and the layout supplies
+    /// the member's offset/width. A head bound to a virtual interface
+    /// rewrites to the bound instance first (§25.9) so interface variables
+    /// resolve as well. A base that is a signal itself (a vector, an
+    /// unpacked-array element, an interface variable) resolves directly.
+    /// Everything else — locals, class properties, statics, collections —
+    /// declines.
+    fn packed_nba_base_slice(&mut self, base: &Expression) -> Option<(usize, u32, u32)> {
+        // Root guards: walk to the chain's root identifier.
+        let mut root = base;
+        loop {
+            root = match &root.kind {
+                ExprKind::Paren(i) => i,
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => expr,
+                _ => break,
+            };
+        }
+        let ExprKind::Ident(h) = &root.kind else {
+            return None;
+        };
+        if h.path.len() == 1 && h.path[0].selects.is_empty() {
+            let name = h.path[0].name.name.as_str();
+            if self
+                .local_stack
+                .last()
+                .is_some_and(|f| f.contains_key(name))
+                || self
+                    .ref_alias_stack
+                    .last()
+                    .is_some_and(|m| m.contains_key(name))
+                || self
+                    .ref_binding_stack
+                    .last()
+                    .is_some_and(|m| m.contains_key(name))
+                || self.bare_selected_storage_shadows_signal(h)
+            {
+                return None;
+            }
+        }
+        // In a method a RELATIVE receiver can name a class property; only an
+        // absolute name ($root-anchored — e.g. a virtual-interface target
+        // rebased upstream) or one rewritten through a vif binding (which
+        // then names the bound instance's own variable) may take the signal
+        // path.
+        let in_method = matches!(self.this_stack.last(), Some(Some(_)));
+        let mut flat = self.flat_member_name(base)?;
+        // §25.5: a modport-qualified member path names the instance's own
+        // variable — strip the modport segment so the layout walk below
+        // lands on the real base.
+        if !self.modport_names.is_empty()
+            && let Some(stripped) = self.strip_modport_segments(&flat)
+        {
+            flat = stripped;
+        }
+        let mut slice = self.packed_nba_flat_slice(&flat);
+        let mut rewritten = false;
+        if slice.is_none() {
+            if let Some((head, rest)) = flat.split_once('.') {
+                if let Some(bound) = self.nba_vif_bound_instance(head) {
+                    let cand = format!("{}.{}", bound, rest);
+                    if let Some(s) = self.packed_nba_flat_slice(&cand) {
+                        flat = cand;
+                        slice = Some(s);
+                        rewritten = true;
+                    }
+                }
+            }
+        }
+        // An unpacked-array element (`arr[0].vld`, `arr30[i].vld`) keeps its
+        // own per-element signal while the struct layout stays keyed by the
+        // ARRAY's base name — resolve through the storage/steps walk.
+        let mut arr_slice = None;
+        if slice.is_none() && h.root.is_none() {
+            if let Some((root, steps)) = self.packed_path_steps(base) {
+                arr_slice = self.packed_path_slice(&root, &steps);
+            }
+        }
+        if in_method && h.root.is_none() && !rewritten {
+            return None;
+        }
+        let (base_name, member_ow) = if let Some((b, o, w)) = slice {
+            (b, Some((o, w)))
+        } else if let Some((storage, o, w)) = arr_slice {
+            (storage, Some((o, w)))
+        } else {
+            // The base is a signal itself: a vector, an element of an
+            // unpacked array (`arr[1]`), an interface variable (`ci.bus_a`).
+            (flat, None)
+        };
+        let id = match self.signal_name_to_id.get(base_name.as_str()) {
+            Some(&id) => id,
+            None => self
+                .hint_scoped(&base_name)
+                .and_then(|s| self.signal_name_to_id.get(s.as_str()).copied())?,
+        };
+        if is_packed_id(id) {
+            // Packed-arena cells keep the queued path (`queue_packed_nba`).
+            return None;
+        }
+        let sig_w = self.signal_widths[id];
+        let (off, w) = member_ow.unwrap_or((0, sig_w));
+        if off.checked_add(w)? > sig_w {
+            return None;
+        }
+        Some((id, off, w))
+    }
+
+    /// The longest registered packed-struct base of a flat member name, as
+    /// `(base_name, bit_offset, width)` of the selected member within it —
+    /// the same longest-base-first walk `packed_struct_member_slice` uses
+    /// (a nested member is a flattened key of its own, so the split points
+    /// are tried from the longest base down).
+    fn packed_nba_flat_slice(&self, flat: &str) -> Option<(String, u32, u32)> {
+        for (i, _) in flat
+            .match_indices('.')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            let (b, prefix) = (&flat[..i], &flat[i + 1..]);
+            let Some(layout) = self.module.packed_struct_fields.get(b) else {
+                continue;
+            };
+            if let Some(&(_, o, w)) = layout.iter().find(|(k, _, _)| k.as_str() == prefix) {
+                return Some((b.to_string(), o, w));
+            }
+        }
+        None
+    }
+
+    /// §25.9: the interface instance a virtual-interface head is bound to —
+    /// a task formal (`local_iface_aliases`) or a class property of the
+    /// running method's `this` (`virtual_iface_bindings`).
+    fn nba_vif_bound_instance(&self, head: &str) -> Option<String> {
+        if let Some(frame) = self.local_iface_aliases.last() {
+            if let Some(bound) = frame.get(head) {
+                return Some(bound.clone());
+            }
+        }
+        if let Some(Some(this_h)) = self.this_stack.last().copied() {
+            let cls_name = self
+                .heap
+                .get(this_h)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.class_name.clone());
+            if cls_name
+                .as_ref()
+                .is_some_and(|cn| self.class_vif_decl(cn, head).is_some())
+            {
+                if let Some((bound, _)) =
+                    self.virtual_iface_bindings.get(&(this_h, head.to_string()))
+                {
+                    return Some(bound.clone());
+                }
+            }
+        }
+        None
     }
 
     /// JIT Stage 4 Tier C Path C1: drain the side queue populated by
@@ -3558,6 +4437,10 @@ impl Simulator {
         self.drain_jit_nba_side_queue();
         // Reset the per-window partial-NBA index.
         self.nba_fast_index.clear();
+        if !self.nba_queued_partial_ids.is_empty() {
+            self.nba_queued_partial_ids.clear();
+        }
+        self.nba_queue_noted = 0;
         let mut nba = std::mem::take(&mut self.nba_fast);
 
         for entry in nba.drain(..) {
@@ -3645,6 +4528,8 @@ impl Simulator {
                 if entry.this_handle.is_some() {
                     self.this_stack.pop();
                 }
+            } else if let Some(id) = entry.resolved_id {
+                self.apply_queued_whole_nba(id, entry.value);
             }
         }
         // §15.5.2 deferred `->>` triggers fire with the NBA flush.
@@ -3721,6 +4606,20 @@ impl Simulator {
         }
     }
 
+    /// A whole-signal update queued behind a partial one
+    /// (`nba_behind_queued_partial`). Out of line, so the `nba_fast` commit
+    /// loop keeps `apply_nba_entry` inlined.
+    #[cold]
+    #[inline(never)]
+    fn apply_queued_whole_nba(&mut self, id: usize, value: Value) {
+        self.apply_nba_entry(NbaFast {
+            block_index: 0,
+            signal_id: id,
+            value,
+        });
+    }
+
+    #[inline(always)]
     pub(super) fn apply_nba_entry(&mut self, entry: NbaFast) {
         // Defensive landing for a packed-arena id: the per-signal table
         // indexing below cannot take one (it would index far out of bounds).
@@ -3805,6 +4704,9 @@ impl Simulator {
             } else {
                 i += 1;
             }
+        }
+        if self.delayed_updates.is_empty() {
+            self.delayed_slice_chains = false;
         }
         applied
     }
@@ -3901,14 +4803,71 @@ impl Simulator {
 
     /// Schedule a delayed signal update with an explicit delay (inertial delay model).
     pub(super) fn schedule_delayed_with_delay(&mut self, id: usize, val: Value, delay: u64) {
+        self.schedule_delayed_transition(id, val, delay, None);
+    }
+
+    /// §10.3.3 / §28.16: the delay of a change from `old` to `new` with the
+    /// rise delay `rise` and the given fall and turn-off delays: fall for a
+    /// change to 0, turn-off for a change to z (with only two delays, the
+    /// smaller of rise and fall), and rise otherwise, except that a scalar
+    /// target (`vector` false) takes the smallest delay for a change to x.
+    pub(super) fn transition_delay(
+        new: &Value,
+        old: &Value,
+        rise: u64,
+        fall: Option<u64>,
+        off: Option<u64>,
+        vector: bool,
+    ) -> u64 {
+        // NB: `to_u64()` MASKS x/z to 0 rather than returning None, so it
+        // cannot distinguish a genuine 0 from z — use an explicit bit test.
+        // The initial x/z -> 0 settle counts as a fall as well, so the
+        // test is "the new value is a real 0 and the old one was not".
+        let all_zero = |v: &Value| -> bool {
+            !v.has_xz() && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Zero)
+        };
+        let all_z = |v: &Value| -> bool {
+            v.width > 0 && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Z)
+        };
+        if fall.is_none() && off.is_none() {
+            rise
+        } else if all_zero(new) && !all_zero(old) {
+            fall.unwrap_or(rise)
+        } else if all_z(new) {
+            // §10.3.3 / §28.16: to z uses the turn-off delay; with only
+            // two delays given, the smaller of rise and fall.
+            off.unwrap_or_else(|| fall.map_or(rise, |f| f.min(rise)))
+        } else if new.has_xz() && !vector {
+            // §28.16: scalar/gate to x uses the smallest delay. For a
+            // vector continuous assignment, §10.3.3 uses rise for every
+            // case other than nonzero -> all 0 or -> all z.
+            [Some(rise), fall, off]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(rise)
+        } else {
+            rise
+        }
+    }
+
+    /// §10.3.3 vector assignments use rise for x and mixed values;
+    /// scalar assignments and gate/net delays retain §28.16.
+    pub(super) fn schedule_delayed_transition(
+        &mut self,
+        id: usize,
+        val: Value,
+        delay: u64,
+        delay_target: Option<DelayTarget>,
+    ) {
         // §30.4 path-delayed net: the module paths pick the delay.
         if let Some(k) = self.module_paths.as_ref().and_then(|mp| mp.table_of(id)) {
             self.schedule_module_path(id, k, val);
             return;
         }
-        // §28.11: a gate declared `#(rise, fall)` uses the FALL value for a
+        // §28.16: a gate declared `#(rise, fall)` uses the FALL value for a
         // transition to 0. The lowered cont-assign only carries the rise
-        // delay, so consult the per-net fall map here — this is the single
+        // delay, so consult the per-driver fall map here — this is the single
         // choke point where both the target and the new value are known.
         // Scalar gate outputs are the case that matters; "to 0" is judged on
         // the whole value so a vector net keeps using the rise delay unless it
@@ -3917,36 +4876,25 @@ impl Simulator {
         {
             delay
         } else {
-            // NB: `to_u64()` MASKS x/z to 0 rather than returning None, so it
-            // cannot distinguish a genuine 0 from z — use an explicit bit test.
-            // The initial x/z -> 0 settle counts as a fall as well, so the
-            // test is "the new value is a real 0 and the old one was not".
-            let all_zero = |v: &Value| -> bool {
-                !v.has_xz() && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Zero)
-            };
+            // §10.3.3 / §28.16: select the transition delay from the
+            // original target bits, not z padding added for resolution.
+            let selected = delay_target
+                .filter(|target| target.lo != 0 || target.width != val.width)
+                .map(|target| {
+                    let hi = (target.lo + target.width - 1) as usize;
+                    (
+                        val.range_select(hi, target.lo as usize),
+                        self.signal_table[id].range_select(hi, target.lo as usize),
+                    )
+                });
+            let vector_assign = delay_target.is_some_and(|target| target.vector);
+            let new_value = selected.as_ref().map_or(&val, |(new, _)| new);
+            let old_value = selected
+                .as_ref()
+                .map_or(&self.signal_table[id], |(_, old)| old);
             let fall = self.gate_fall_delay_by_id.get(&id).copied();
             let off = self.gate_off_delay_by_id.get(&id).copied();
-            let all_z = |v: &Value| -> bool {
-                v.width > 0 && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Z)
-            };
-            if fall.is_none() && off.is_none() {
-                delay
-            } else if all_zero(&val) && !all_zero(&self.signal_table[id]) {
-                fall.unwrap_or(delay)
-            } else if all_z(&val) {
-                // §10.3.3 / §28.11: to z uses the turn-off delay; with only
-                // two delays given, the smaller of rise and fall.
-                off.unwrap_or_else(|| fall.map_or(delay, |f| f.min(delay)))
-            } else if val.has_xz() {
-                // To x: the smallest of the delays given.
-                [Some(delay), fall, off]
-                    .into_iter()
-                    .flatten()
-                    .min()
-                    .unwrap_or(delay)
-            } else {
-                delay
-            }
+            Self::transition_delay(new_value, old_value, delay, fall, off, vector_assign)
         };
         let target_time = self.time + delay;
         // Inertial delay: remove any pending update for this signal
@@ -3966,6 +4914,11 @@ impl Simulator {
     /// that reverts to the CURRENT value reduces the pending entry (cancelling
     /// it outright when nothing is left to change — the inertial glitch
     /// swallow, issues #143/#144).
+    ///
+    /// §10.3.3 / §28.16: select drivers of one net may choose different
+    /// delays (a bit falling beside a bit rising). An update due at another
+    /// time than the net's pending one joins it as a second update instead
+    /// of moving it (`schedule_delayed_slice_chain`).
     pub(super) fn schedule_delayed_slice(
         &mut self,
         id: usize,
@@ -3974,11 +4927,51 @@ impl Simulator {
         sel_val: &Value,
         delay: u64,
     ) {
-        let pending = self
-            .delayed_updates
-            .iter()
-            .find(|(_, sid, _)| *sid == id)
-            .map(|(_, _, v)| v.clone());
+        let target = self.time + delay;
+        let mut first = None;
+        let mut more = false;
+        if self.delayed_slice_chains {
+            for (k, (_, sid, _)) in self.delayed_updates.iter().enumerate() {
+                if *sid == id {
+                    if first.is_some() {
+                        more = true;
+                        break;
+                    }
+                    first = Some(k);
+                }
+            }
+        } else {
+            first = self
+                .delayed_updates
+                .iter()
+                .position(|(_, sid, _)| *sid == id);
+        }
+        // One pending update that only this slice changes (its own earlier
+        // change, the usual inertial reschedule) or that is due at `target`
+        // merges as before; anything else is a chain of updates.
+        if let Some(k) = first
+            && !self
+                .module_paths
+                .as_ref()
+                .is_some_and(|mp| mp.table_of(id).is_some())
+        {
+            let merges = !more && {
+                let (t, _, v) = &self.delayed_updates[k];
+                *t == target || {
+                    let current = &self.signal_table[id];
+                    let mut others = v.clone();
+                    for i in 0..sel_w as usize {
+                        others.set_bit_code(lo as usize + i, current.get_bit_code(lo as usize + i));
+                    }
+                    others == *current
+                }
+            };
+            if !merges {
+                self.schedule_delayed_slice_chain(id, lo as usize, sel_w as usize, sel_val, target);
+                return;
+            }
+        }
+        let pending = first.map(|k| self.delayed_updates[k].2.clone());
         let in_flight = pending.is_some();
         let mut merged = pending.unwrap_or_else(|| self.signal_table[id].clone());
         // The slice already holds these bits in the pending update: nothing
@@ -3997,6 +4990,81 @@ impl Simulator {
             self.cancel_delayed(id);
         } else {
             self.schedule_delayed_with_delay(id, merged, delay);
+        }
+    }
+
+    /// `schedule_delayed_slice` for a net with an update pending at another
+    /// time. The net's pending updates are kept as a chain ordered by time,
+    /// each holding the net's whole value from its time on, so the slice's
+    /// bits are its current bits in every update before `target` (an update
+    /// of its own pending there is descheduled, §10.3.3) and the new bits in
+    /// `target`'s update and every later one. An update that changes nothing
+    /// from the value before it is dropped.
+    #[cold]
+    #[inline(never)]
+    fn schedule_delayed_slice_chain(
+        &mut self,
+        id: usize,
+        lo: usize,
+        sel_w: usize,
+        sel_val: &Value,
+        target: u64,
+    ) {
+        let mut chain: Vec<(u64, usize)> = self
+            .delayed_updates
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, sid, _))| *sid == id)
+            .map(|(k, (t, _, _))| (*t, k))
+            .collect();
+        chain.sort_unstable();
+        // The slice is already scheduled to take these bits: keep its time.
+        if let Some(&(_, last)) = chain.last()
+            && (0..sel_w).all(|i| {
+                self.delayed_updates[last].2.get_bit_code(lo + i) == sel_val.get_bit_code(i)
+            })
+        {
+            return;
+        }
+        let current = self.signal_table[id].clone();
+        let mut base = current.clone();
+        for &(t, k) in &chain {
+            let v = &mut self.delayed_updates[k].2;
+            for i in 0..sel_w {
+                let bit = if t < target {
+                    current.get_bit_code(lo + i)
+                } else {
+                    sel_val.get_bit_code(i)
+                };
+                v.set_bit_code(lo + i, bit);
+            }
+            if t < target {
+                base = v.clone();
+            }
+        }
+        if !chain.iter().any(|&(t, _)| t == target) {
+            for i in 0..sel_w {
+                base.set_bit_code(lo + i, sel_val.get_bit_code(i));
+            }
+            chain.push((target, self.delayed_updates.len()));
+            self.delayed_updates.push((target, id, base));
+            chain.sort_unstable();
+        }
+        let mut prev = current;
+        let mut drop: Vec<usize> = Vec::new();
+        for &(_, k) in &chain {
+            if self.delayed_updates[k].2 == prev {
+                drop.push(k);
+            } else {
+                prev = self.delayed_updates[k].2.clone();
+            }
+        }
+        if chain.len() > drop.len() + 1 {
+            self.delayed_slice_chains = true;
+        }
+        drop.sort_unstable();
+        for k in drop.into_iter().rev() {
+            self.delayed_updates.remove(k);
         }
     }
 

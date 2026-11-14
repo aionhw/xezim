@@ -21,12 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn xezim_bin() -> std::path::PathBuf {
-    let mut p = std::env::current_exe().expect("test exe path");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("xezim")
+    // Cargo names the binary it built for the integration tests.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"))
 }
 
 fn run(src: &str) -> String {

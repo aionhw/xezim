@@ -94,6 +94,8 @@ mod nested_assoc_under_outer_dim;
 mod noparen_array_methods;
 #[path = "collections/pp_queue_slice.rs"]
 mod pp_queue_slice;
+#[path = "collections/packed_pattern_compare.rs"]
+mod packed_pattern_compare;
 #[path = "collections/property_queue_and_context.rs"]
 mod property_queue_and_context;
 #[path = "collections/queue_eq_unknown_elems.rs"]
@@ -275,6 +277,12 @@ mod coll_shape_iteration;
 
 #[path = "collections/review_coll_shape_rows.rs"]
 mod review_coll_shape_rows;
+#[path = "collections/review_aggregate_unknown_compare_1043.rs"]
+mod review_aggregate_unknown_compare_1043;
+#[path = "collections/review_packed_pattern_compare_1043.rs"]
+mod review_packed_pattern_compare_1043;
+#[path = "collections/review_packed_struct_member_select_1046.rs"]
+mod review_packed_struct_member_select_1046;
 
 #[path = "collections/string_key_escaping.rs"]
 mod string_key_escaping;
@@ -341,6 +349,10 @@ mod dyn_row_sized_new_copy;
 mod assoc_elem_select_read;
 #[path = "collections/assoc_packed_elem.rs"]
 mod assoc_packed_elem;
+#[path = "collections/packed_struct_member_idx_select.rs"]
+mod packed_struct_member_idx_select;
+#[path = "collections/unpacked_case_compare.rs"]
+mod unpacked_case_compare;
 #[path = "collections/unpacked_row_pattern_store.rs"]
 mod unpacked_row_pattern_store;
 #[path = "collections/unpacked_row_pattern_followups.rs"]
@@ -360,3 +372,22 @@ mod package_array_operand_in_method;
 
 #[path = "collections/unpacked_struct_concat_1035.rs"]
 mod unpacked_struct_concat_1035;
+
+#[path = "collections/call_returned_array_whole_value_1036.rs"]
+mod call_returned_array_whole_value_1036;
+
+#[path = "collections/struct_array_shape_copies_1057.rs"]
+mod struct_array_shape_copies_1057;
+
+#[path = "collections/queue_sort_packed_members_1059.rs"]
+mod queue_sort_packed_members_1059;
+
+#[path = "collections/paren_aggregate_compare_1085.rs"]
+mod paren_aggregate_compare_1085;
+#[path = "collections/queue_of_queues_push_concat.rs"]
+mod queue_of_queues_push_concat;
+#[path = "collections/review_queue_of_queues_push_1086.rs"]
+mod review_queue_of_queues_push_1086;
+
+#[path = "collections/assoc_struct_delete_1124.rs"]
+mod assoc_struct_delete_1124;

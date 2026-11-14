@@ -22,7 +22,7 @@ fn unique_so_path(stem: &str) -> PathBuf {
 #[test]
 fn dpi_import_in_child_modules_dispatches() {
     let so_path = unique_so_path("child_module_import");
-    let status = Command::new("cc")
+    let status = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .arg("-shared")
         .arg("-fPIC")
         .arg(manifest_path("tests/dpi/child_module_import.c"))

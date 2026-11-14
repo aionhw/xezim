@@ -12,7 +12,7 @@ fn run(mode: &str, same: bool) {
     std::fs::write(dir.join("clock.c"), CALLBACKS).unwrap();
     std::fs::write(dir.join("top.sv"), DESIGN).unwrap();
     let so = dir.join("clock.so");
-    let compiled = Command::new("cc")
+    let compiled = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-I"])
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("include"))
         .arg(dir.join("clock.c"))

@@ -517,12 +517,8 @@ end endmodule
 #[test]
 fn sdf_annotation_overrides_specify_and_paths_agree() {
     fn xezim_bin() -> std::path::PathBuf {
-        let mut p = std::env::current_exe().expect("current_exe");
-        p.pop();
-        if p.ends_with("deps") {
-            p.pop();
-        }
-        p.join("xezim")
+        // Cargo names the binary it built for the integration tests.
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"))
     }
     let dir = std::env::temp_dir().join(format!("xezim_sdf_specify_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

@@ -2189,6 +2189,17 @@ impl Simulator {
         args: &[Expression],
         type_args: Option<&[Expression]>,
     ) -> Value {
+        self.instantiate_class_in_scope(class_def, args, type_args, None)
+    }
+
+    /// §13.5.1: typed constructor actuals retain the caller's specialization.
+    pub(super) fn instantiate_class_in_scope(
+        &mut self,
+        class_def: &crate::compiler::elaborate::ElaboratedClass,
+        args: &[Expression],
+        type_args: Option<&[Expression]>,
+        caller_spec: Option<Option<(String, String)>>,
+    ) -> Value {
         // Per-specialization static initialization for a PARAMETERIZED
         // class: run its static-call initializers (e.g. callback registration
         // macro expansions: `static bit = callbacks#(T,CB)::m_register_pair(...)`)
@@ -2605,6 +2616,16 @@ impl Simulator {
                     if cdef.static_properties.contains(prop_name)
                         || cdef.assoc_properties.contains_key(prop_name)
                     {
+                        // §8.14: see `inst_template`.
+                        if cdef.static_properties.contains(prop_name)
+                            && leaf_declarer
+                                .get(prop_name.as_str())
+                                .is_some_and(|l| *l != cdef.name.as_str())
+                            && !self.shadowed_prop_names.contains(prop_name.as_str())
+                        {
+                            self.shadowed_prop_mask |= meta_key_bits(prop_name);
+                            self.shadowed_prop_names.insert(prop_name.clone());
+                        }
                         continue;
                     }
                     let seed = if leaf_declarer
@@ -3074,6 +3095,10 @@ impl Simulator {
                 }
             }
         }
+        // §8.25: retain typed defaults before parameter fields initialize.
+        if caller_spec.is_some() && instance.spec.is_none() {
+            instance.spec = computed_spec.clone();
+        }
         self.heap.push(Some(Box::new(instance)));
         // §8.25 / §6.20.2: the ELEMENT width of a fixed-array or queue member
         // follows this specialization too (`bit [W-1:0] a[2]`, `T q[$]`).
@@ -3220,7 +3245,9 @@ impl Simulator {
             .insert(handle, classes_to_init.to_vec());
         self.this_stack.pop();
         let saved_spec = self.clone_spec_pooled();
-        if computed_spec.is_some() {
+        if let Some(caller_spec) = caller_spec {
+            self.current_spec = caller_spec;
+        } else if computed_spec.is_some() {
             self.current_spec = computed_spec.clone();
         }
         self.exec_method_call(handle, "new", args);

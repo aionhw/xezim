@@ -546,6 +546,22 @@ impl Simulator {
                 return;
             }
         }
+        let value = self.eval_pattern_leaf_value(dt, e, None);
+        if value.is_real || Self::is_string_data_type(self.resolve_dt_ref(dt)) {
+            self.set_signal_value_by_name(target, value);
+        } else {
+            self.write_leaf_by_name(target, value);
+        }
+    }
+
+    /// Evaluate one scalar pattern item in its declared element type.
+    /// Shared by whole-array writes and slices, which snapshot the items.
+    pub(super) fn eval_pattern_leaf_value(
+        &mut self,
+        dt: &DataType,
+        e: &Expression,
+        width: Option<u32>,
+    ) -> Value {
         // A `string` leaf is stored as-is: the width resize below padded the
         // text with NULs to the element's nominal width, so a 2-D string
         // local's `'{'{"a","bb"},…}` read back as a run of blanks before
@@ -557,19 +573,19 @@ impl Simulator {
                 ..
             }
         ) {
-            let v = self.eval_expr(e);
-            self.set_signal_value_by_name(target, v);
-            return;
+            return self.eval_expr(e);
         }
         // §10.9.2: each item is evaluated in the context of the ELEMENT type —
         // `int d[]; d = '{1'b1 + 1'b1}` is 2, not a 1-bit wrap to 0, and a
         // signed narrower item sign-extends. Self-determined evaluation gave
         // the wrapped/zero-extended value.
-        let elem_w = super::elaborate::resolve_type_width(
-            dt,
-            Some(&self.module.parameters),
-            Some(&self.module.typedefs),
-        );
+        let elem_w = width.unwrap_or_else(|| {
+            super::elaborate::resolve_type_width(
+                dt,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+        });
         // §10.8: a pattern item takes the packed element type.
         let mut v = if let Some(v) = self.eval_in_packed_type(e, dt) {
             v
@@ -600,15 +616,13 @@ impl Simulator {
         // never flagged real (array elements are synthesized without the flag);
         // otherwise `real m[3] = '{1.5, ...}` truncates to integers.
         if matches!(self.resolve_dt(dt), DataType::Real { .. }) {
-            let rv = if v.is_real {
+            return if v.is_real {
                 v
             } else {
                 Value::from_f64(v.to_f64())
             };
-            self.set_signal_value_by_name(target, rv);
-            return;
         }
-        self.write_leaf_by_name(target, v);
+        v
     }
 
     /// §7.5/§7.8/§7.10: assign the collection-valued expression `e` to the
@@ -841,6 +855,10 @@ impl Simulator {
     /// exactly `src`'s entries.
     /// Reserved storage for an associative array a function returns.
     pub(super) const RET_ASSOC_SNAP: &'static str = "__xz_ret_aa__";
+
+    /// Reserved storage for a fixed array of unpacked structs a function
+    /// returns (see `snapshot_ret_fixed`).
+    pub(super) const RET_STRUCT_SNAP: &'static str = "__xz_ret_sa__";
 
     /// Copy the returned associative array `src` to the reserved snapshot,
     /// register it and hand it to the caller via `pending_ret_collection`.
@@ -1978,8 +1996,15 @@ impl Simulator {
                             continue;
                         }
                     }
-                    if let Some(v) = self.get_signal_value_by_name(&sname) {
-                        self.write_leaf_by_name(&d, v);
+                    if let Some(v) = self.struct_leaf_value(&sname) {
+                        let is_str = matches!(
+                            self.resolve_dt_ref(&m.data_type),
+                            DataType::Simple {
+                                kind: crate::ast::types::SimpleType::String,
+                                ..
+                            }
+                        );
+                        self.write_struct_leaf(&d, v, is_str);
                     }
                 } else if md.dimensions.iter().any(|dim| {
                     matches!(
@@ -2056,6 +2081,38 @@ impl Simulator {
                 }
             }
         }
+    }
+
+    /// The leaf `flat` of an unpacked struct, wherever it is stored: a signal,
+    /// or, for an element of a class property's fixed array of unpacked
+    /// structs (`<h>#fx[1].a`), the instance's own cell `fx[1].a`.
+    pub(super) fn struct_leaf_value(&self, flat: &str) -> Option<Value> {
+        if let Some(v) = self.get_signal_value_by_name(flat) {
+            return Some(v);
+        }
+        let (h, key) = flat.split_once('#')?;
+        let inst = self.heap.get(h.parse::<usize>().ok()?)?.as_ref()?;
+        inst.properties.get(key).cloned()
+    }
+
+    /// Store `v` into the struct leaf `flat` ([`Self::struct_leaf_value`]):
+    /// an instance cell that exists keeps its width (a string its length).
+    pub(super) fn write_struct_leaf(&mut self, flat: &str, v: Value, is_str: bool) {
+        if let Some((h, key)) = flat.split_once('#')
+            && let Ok(h) = h.parse::<usize>()
+            && let Some(Some(inst)) = self.heap.get_mut(h)
+            && let Some(old) = inst.properties.get_mut(key)
+        {
+            *old = if is_str || v.is_real || old.is_real {
+                v
+            } else {
+                let mut nv = v.resize(old.width);
+                nv.is_signed = old.is_signed;
+                nv
+            };
+            return;
+        }
+        self.write_leaf_by_name(flat, v);
     }
 
     /// The unpacked-struct element type of queue `obj_name`, if it has one.
@@ -2423,10 +2480,48 @@ impl Simulator {
         // A real variable is 64 bits wide; any other width is integral.
         if w == 64 && matches!(lvalue.kind, ExprKind::Ident(_)) && self.expr_is_real_static(lvalue)
         {
-            0
-        } else {
-            w
+            return 0;
         }
+        // §11.8.2: a REAL class property also lends only its storage width
+        // (64) — `infer_lhs_width` sizes it so a real NBA RHS Value survives
+        // the schedule-time resize — but a real target has no bit width to
+        // lend an integral RHS either: `r = u - 2` with `int unsigned u = 1`
+        // evaluates `u - 2` self-determined (32-bit wrap → 4294967295.0),
+        // not at 64, where the read of `u` widens and 1-2 wraps to 2^64-1.
+        // The flat tables above cannot see properties, so ask the declared
+        // types; a 64-bit INTEGRAL property (`logic [63:0]`) keeps the 64
+        // context, and only an Ident-shaped lvalue is consulted.
+        if w == 64
+            && let ExprKind::Ident(h) = &lvalue.kind
+            && h.root.is_none()
+            && h.path
+                .last()
+                .is_some_and(|s| self.may_name_real_class_prop(&s.name.name))
+        {
+            // Bare leaf in a method: this object's declared property.
+            if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                if let Some(&Some(handle)) = self.this_stack.last()
+                    && self.class_prop_is_real(handle, &h.path[0].name.name)
+                {
+                    return 0;
+                }
+            } else if h.path.len() > 1 && self.head_denotes_class_object(h) {
+                let prop = &h.path.last().unwrap().name.name;
+                let head = &h.path[0].name.name;
+                // Handle-qualified (`h.prop`): the head's live object.
+                if let Some(handle) = self.eval_ident_handle(head) {
+                    if self.class_prop_is_real(handle, prop) {
+                        return 0;
+                    }
+                } else if let Some(cn) = self.class_of_var(head) {
+                    // Owner-qualified static (`C::prop`): the class itself.
+                    if self.class_prop_is_real_in(&cn, prop, 0) {
+                        return 0;
+                    }
+                }
+            }
+        }
+        w
     }
 
     /// §11.8.2: true when `e` is REAL-typed by declaration — a real literal,
@@ -3221,15 +3316,20 @@ impl Simulator {
         }
     }
 
-    /// Whether the collections `a` and `b` hold the same elements (§7.2.1):
-    /// the same size and equal elements for a queue / dynamic array, the
-    /// same keys with equal values for an associative array. `None` when an
-    /// element carries x/z (the comparison is then unknown).
-    pub(super) fn coll_contents_eq(&mut self, a: &str, b: &str) -> Option<bool> {
+    /// Whether the collections `a` and `b` hold the same elements under
+    /// `mode` (§7.2.1, §11.4.5): the same size and equal elements for a
+    /// queue / dynamic array, the same keys with equal values for an
+    /// associative array.
+    pub(super) fn coll_contents_cmp(
+        &mut self,
+        a: &str,
+        b: &str,
+        mode: super::collection_methods::PatternCmpMode,
+    ) -> PatCmp {
         let a_ok = self.ensure_struct_member_coll(a);
         let b_ok = self.ensure_struct_member_coll(b);
         if !(a_ok && b_ok) {
-            return Some(true);
+            return PatCmp::Equal;
         }
         let pairs: Vec<(Option<Value>, Option<Value>)> = if self.is_associative_array(a) {
             let mut ka = self.assoc_key_strs(a);
@@ -3237,7 +3337,7 @@ impl Simulator {
             ka.sort();
             kb.sort();
             if ka != kb {
-                return Some(false);
+                return PatCmp::Unequal;
             }
             ka.iter()
                 .map(|k| {
@@ -3250,7 +3350,7 @@ impl Simulator {
         } else {
             let (na, nb) = (self.get_queue_size(a), self.get_queue_size(b));
             if na != nb {
-                return Some(false);
+                return PatCmp::Unequal;
             }
             (0..na)
                 .map(|i| {
@@ -3261,22 +3361,15 @@ impl Simulator {
                 })
                 .collect()
         };
-        let mut equal = true;
+        let mut acc = PatCmp::Equal;
         for (x, y) in pairs {
-            match (x, y) {
-                (Some(x), Some(y)) => {
-                    if x.has_unknown() || y.has_unknown() {
-                        return None;
-                    }
-                    if x != y {
-                        equal = false;
-                    }
-                }
-                (None, None) => {}
-                _ => equal = false,
-            }
+            acc = acc.and(match (x, y) {
+                (Some(x), Some(y)) => Self::coll_elem_cmp(&x, &y, None, mode),
+                (None, None) => PatCmp::Equal,
+                _ => PatCmp::Unequal,
+            });
         }
-        Some(equal)
+        acc
     }
 
     /// Rearrange a queue so that position `i` holds what used to be at
@@ -3390,6 +3483,15 @@ impl Simulator {
         }
     }
 
+    /// Whether `name` is a row of a declared collection whose row kind is a
+    /// queue or dynamic array (`qq[k]` of `int qq[$][$]`), not a fixed or
+    /// associative row.
+    fn is_queue_or_dyn_row(&self, name: &str) -> bool {
+        self.coll_shape_at(name).is_some_and(|(shape, depth)| {
+            depth >= 1 && matches!(shape.dims.get(depth), Some(Dim::Queue | Dim::Dyn))
+        })
+    }
+
     /// Store `arg` into queue element `elem`. An UNPACKED-STRUCT element keeps
     /// each member in its own signal, so writing one packed value (what
     /// `push_back` used to do) loses every member.
@@ -3458,6 +3560,38 @@ impl Simulator {
                 return;
             }
         }
+        // §7.10.2.2, §10.10: a concatenation (`{1, 2}`) or pattern
+        // (`'{3, 4, 5}`) pushed into a queue whose rows are queues or
+        // dynamic arrays is an unpacked-array value of the row type: each
+        // item is one element, and a collection operand contributes all of
+        // its elements. Evaluated as one packed value it left the row empty.
+        let pattern = self.unpacked_pattern(arg);
+        if matches!(
+            pattern.kind,
+            ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
+        ) && self.is_queue_or_dyn_row(elem)
+        {
+            let vals = match &pattern.kind {
+                // §10.9.1: a replicated item (`'{3{7}}`) is that many items.
+                ExprKind::AssignmentPattern(items) => {
+                    let items = self.pattern_ordered(items);
+                    Some(items.iter().map(|e| self.eval_expr(e)).collect::<Vec<_>>())
+                }
+                ExprKind::Concatenation(parts) => {
+                    Some(self.unpacked_concat_operand_values(parts.iter().collect()))
+                }
+                _ => None,
+            };
+            if let Some(vals) = vals {
+                let n = vals.len();
+                for (j, v) in vals.into_iter().enumerate() {
+                    let v = self.fit_queue_push_elem(elem, v);
+                    self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);
+                }
+                self.set_queue_size(elem, n as u64);
+                return;
+            }
+        }
         // §7.10 / §7.8: pushing an ASSOCIATIVE-array value (a queue of
         // associative arrays, `int q[$][string]`) copies the source's entries
         // into the new element, which becomes an associative array of the
@@ -3517,6 +3651,19 @@ impl Simulator {
                 self.set_signal_value_by_name(elem, v);
                 return;
             }
+        }
+        // §10.8, §10.9, §7.10.2: an assignment pattern pushed into a queue of
+        // packed elements takes the element type, so `q.push_back('{k, v})`
+        // of a packed struct sizes each item to its member; concatenated at
+        // 32 bits and cut to the element, every member but the last read 0.
+        if crate::compiler::packed_assignment_pattern_plan::has_pattern(arg)
+            && let Some(dt) = self.coll_elem_decl_type(obj_name)
+            && matches!(self.resolve_dt_ref(&dt), DataType::Struct(su) if su.packed)
+            && let Some(v) = self.eval_in_packed_type(arg, &dt)
+        {
+            let v = self.fit_queue_push_elem(obj_name, v);
+            self.set_signal_value_by_name(elem, v);
+            return;
         }
         let mut val = self.queue_eval_arg(obj_name, arg);
         // §5.7.1: an unsized fill (`q.push_back('1)`) takes the element's
@@ -4481,13 +4628,25 @@ impl Simulator {
         }
         // A collection formal's per-call key `@name#N` (see
         // `formal_dyn_key`): the formal's own declared type.
-        if let Some(bare) = name
-            .strip_prefix('@')
-            .and_then(|s| s.rsplit_once('#'))
-            .map(|(b, _)| b)
-            && let Some(dt) = self.module.var_decl_types.get(bare)
-        {
-            return Some(Cow::Borrowed(dt));
+        // Its elements (`@name#N[i]`) take the same entry, as below; a
+        // member of an element (`@d#9[1].d`) is not the element: it resolves
+        // through the declared member types, or a struct element's leaf
+        // `d` was taken for the struct and the write spread over it.
+        if let Some((bare, rest)) = name.strip_prefix('@').and_then(|s| s.rsplit_once('#')) {
+            let sel = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            if sel.len() < rest.len()
+                && sel.starts_with('[')
+                && sel
+                    .rfind(']')
+                    .is_some_and(|p| sel[p + 1..].starts_with('.'))
+            {
+                return self
+                    .flat_path_type(&format!("{bare}{sel}"))
+                    .map(|(d, _)| Cow::Owned(d));
+            }
+            if let Some(dt) = self.module.var_decl_types.get(bare) {
+                return Some(Cow::Borrowed(dt));
+            }
         }
         // A plain identifier without `[` or `.` already missed `var_decl_types`
         // above; skip `flat_single_base` (which would return `Some(name)` and

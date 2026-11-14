@@ -20,7 +20,7 @@ fn shared_lib(dir: &Path, src: &str) -> PathBuf {
     let so = dir.join("cb.so");
     std::fs::write(&c, src).unwrap();
     let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
-    let ok = Command::new("cc")
+    let ok = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .args(["-shared", "-fPIC", "-Wall", "-I"])
         .arg(&include)
         .arg(&c)
@@ -1172,4 +1172,38 @@ fn vpi_cb_value_change_of_a_routine_deposit_is_not_nested() {
         "V|change t=10 val=0 nested=0",
     ];
     assert_eq!(got, want, "{out}");
+}
+
+/// IEEE 1800-2023 §9.6.2 / §38.36: a callback registered by a killed
+/// child retains that process's identity when later children are spawned.
+/// One FORK_CB per disable follows xezim's `vpi_cb.rs` rule: a cbDisable
+/// on a system-task call belongs to the calling process, not an LRM count.
+#[test]
+fn finished_fork_children_keep_vpi_callback_identity() {
+    let (out, ok) = run(
+        "finished_children",
+        include_str!("../dpi/finished_process_callbacks.c"),
+        include_str!("../dpi/finished_process_callbacks.sv"),
+        &[],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(
+        lines_with(&out, &["FORK_CB ", "VPI_FORK_PASS"]),
+        [
+            "FORK_CB tag=1 t=2 type=57",
+            "FORK_CB tag=2 t=5 type=57",
+            "FORK_CB tag=3 t=8 type=57",
+            "FORK_CB tag=4 t=11 type=57",
+            "FORK_CB tag=5 t=14 type=57",
+            "VPI_FORK_PASS t=15",
+        ],
+        "{out}"
+    );
+    // vpiInitial is still the retained static process handle's type (§37).
+    assert!(
+        out.lines().any(
+            |line| line.starts_with("FORK_CB_END tags=5 ") && line.ends_with("initial_type=24")
+        ),
+        "{out}"
+    );
 }

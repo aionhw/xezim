@@ -394,7 +394,7 @@ void (*vlog_startup_routines[])(void) = { startup, 0 };
     let so = dir.join("peek.so");
     std::fs::write(&c, C).unwrap();
     let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
-    let ok = Command::new("cc")
+    let ok = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .args(["-shared", "-fPIC", "-I"])
         .arg(&include)
         .arg(&c)

@@ -30,7 +30,7 @@ fn setup(stem: &str) -> (PathBuf, PathBuf) {
     std::fs::create_dir_all(&dir).unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let so = dir.join(format!("{stem}.so"));
-    let ok = Command::new("cc")
+    let ok = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .args(["-shared", "-fPIC", "-Wall", "-Werror", "-I"])
         .arg(root.join("include"))
         .arg(root.join(format!("tests/dpi/{stem}.c")))

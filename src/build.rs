@@ -124,7 +124,7 @@ fn main() {
 
     // vpi_printf and friends are C-variadic, which Rust cannot define on
     // stable (`c_variadic` is unstable). Compile a small C shim and link it
-    // in. Invoked through `cc` directly rather than via the `cc` crate so
+    // in. Invoked through Clang directly rather than via the `cc` crate so
     // this adds no build dependency.
     // svdpi_shim.c holds the IEEE 1800 Annex H DPI-C utilities that work on
     // C memory (open arrays, bit/part selects, user data) — several of them
@@ -137,7 +137,9 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let lib = out_dir.join("libvpishim.a");
 
-    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=AR");
+    let cc = std::env::var("CC").unwrap_or_else(|_| "clang".to_string());
     let mut objs = Vec::new();
     for src in srcs {
         let stem = std::path::Path::new(src)
@@ -155,7 +157,7 @@ fn main() {
         objs.push(obj);
     }
 
-    let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
+    let ar = std::env::var("AR").unwrap_or_else(|_| "llvm-ar".to_string());
     let _ = std::fs::remove_file(&lib);
     let status = Command::new(&ar)
         .arg("crs")

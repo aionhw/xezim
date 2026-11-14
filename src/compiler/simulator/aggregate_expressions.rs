@@ -1201,12 +1201,11 @@ impl Simulator {
             if !unpacked.is_empty() {
                 return None;
             }
+            // §8.9/§7.2.1: a PACKED struct static is one integral cell too;
+            // its member and element selects slice it (an unpacked struct
+            // keeps its member-wise holder, `static_struct_holder`, and has
+            // no packed type here).
             let (element_type, dimensions, width) = self.declared_packed_type(&dt)?;
-            // Static structs have an aliased member holder; retain its existing
-            // read/write paths instead of creating a second backing value.
-            if matches!(element_type, DataType::Struct(_)) {
-                return None;
-            }
             Some(DeclaredPackedAccess {
                 storage: String::new(),
                 params: None,
@@ -1241,6 +1240,33 @@ impl Simulator {
                         DeclaredStaticAccess::Packed(value) => Some(value),
                         DeclaredStaticAccess::Other => None,
                     };
+                }
+                // §8.9: `Cls::sp.m…` / `obj.sp.m…` — the members of a static
+                // packed struct, below its static root.
+                if h.path.len() >= 3
+                    && h.root.is_none()
+                    && self
+                        .class_member_names()
+                        .statics
+                        .contains(h.path[1].name.name.as_str())
+                {
+                    let mut root = h.clone();
+                    root.path.truncate(2);
+                    root.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                    root.cached_resolved_name = crate::ast::cache::NameCache::new();
+                    let mut chain = Expression::new(ExprKind::Ident(root), expr.span);
+                    for seg in &h.path[2..] {
+                        chain = Expression::new(
+                            ExprKind::MemberAccess {
+                                expr: Box::new(chain),
+                                member: seg.name.clone(),
+                            },
+                            expr.span,
+                        );
+                    }
+                    if let Some(access) = self.declared_packed_access(&chain) {
+                        return Some(access);
+                    }
                 }
                 let name = self
                     .frame_bound_bare_name(h)
@@ -1552,6 +1578,10 @@ impl Simulator {
     pub(super) fn needs_static_packed_access(&self, expr: &Expression) -> bool {
         let mut base = match &expr.kind {
             ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => expr.as_ref(),
+            // §8.9: a member (not a whole-property) target of a static packed
+            // struct (`Cls::sp.m = v`, `sp.m = v` in a method).
+            ExprKind::MemberAccess { .. } => expr,
+            ExprKind::Ident(h) if h.path.len() >= 3 => expr,
             _ => return false,
         };
         // Values are seeded lazily: an empty value map must not discard the
@@ -1574,6 +1604,15 @@ impl Simulator {
                 _ => break,
             }
         }
+        // A member chain (`sp.a.b`, `Cls::sp.a`): the static is its root.
+        let mut in_member = false;
+        while let ExprKind::MemberAccess { expr, member } = &base.kind {
+            if candidate(&member.name) {
+                return true;
+            }
+            in_member = true;
+            base = expr;
+        }
         match &base.kind {
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 (self.class_context_stack.last().is_some_and(Option::is_some)
@@ -1581,7 +1620,9 @@ impl Simulator {
                     && candidate(&h.path[0].name.name)
             }
             ExprKind::Ident(h) if h.path.len() == 2 => candidate(&h.path[1].name.name),
-            ExprKind::MemberAccess { member, .. } => candidate(&member.name),
+            ExprKind::Ident(h) if h.path.len() >= 3 || in_member => {
+                h.path.len() >= 2 && candidate(&h.path[1].name.name)
+            }
             _ => false,
         }
     }
@@ -2527,6 +2568,22 @@ impl Simulator {
                 && let Some(n) = self.unpacked_slice_size(operand)
             {
                 return Value::from_u64(n as u64, 32);
+            }
+            // §20.7, §13.4.1: `$size` of a call returning an unpacked array
+            // counts the elements it returns, the call running once.
+            if name == "$size"
+                && args.len() == 1
+                && matches!(operand.kind, ExprKind::Call { .. })
+                && let Some(src) = self.ret_collection_operand(operand)
+            {
+                let n = match src {
+                    Some(s) if self.is_associative_array(&s) => {
+                        self.assoc_top_level_keys(&s).len() as u64
+                    }
+                    Some(s) => self.get_queue_size(&s),
+                    None => 0,
+                };
+                return Value::from_u64(n, 32);
             }
             if let ExprKind::Conditional {
                 then_expr,
@@ -3732,9 +3789,15 @@ impl Simulator {
             }
             "$urandom" => {
                 if let Some(seed_arg) = args.first() {
+                    // §18.13.1: `seed` is an input (`$urandom [(int seed)]`),
+                    // never written back, and it initializes the generator:
+                    // the calls without a seed that follow continue the
+                    // sequence that seed determines, in this thread only
+                    // (§18.14.2).
                     let s = self.eval_expr(seed_arg).to_u64().unwrap_or(0) as u32;
                     let next = Self::prng_next(s);
-                    self.assign_value(seed_arg, &Value::from_u64(next as u64, 32));
+                    self.proc_rng
+                        .insert(self.current_pid, SvRng::from_seed(u64::from(s)));
                     Value::from_u64(next as u64, 32)
                 } else {
                     Value::from_u64(self.rng_u32() as u64, 32)

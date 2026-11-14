@@ -29,7 +29,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--vpi-lib <path>` (`-m`) | Load a VPI module and run its `vlog_startup_routines`. Repeatable. See the [DPI and VPI guide](dpi-guide.md) |
 | `--module-timescale [mods=]<unit>/<prec>` | Assign a timescale to modules with no explicit source-level one. Repeatable. See the [user guide](user-guide.md#module-timescale-extension) |
 | `--dump-timescales` | Print every module's resolved timescale before the run (no source `$printtimescale` needed); modules with no `` `timescale `` are flagged |
-| `--max-time <N>[ps\|ns\|us\|ms\|s]` | Stop simulation after `N` of simulated time (default `100ms`) — **nanoseconds** when no unit is given. The cap is resolved to whole nanoseconds (a sub-ns value rounds to the nearest one; below half a nanosecond is rejected) and then converted to the design's tick, so the same `--max-time` covers the same simulated time whatever the precision |
+| `--max-time <N>[fs\|ps\|ns\|us\|ms\|s]` | Stop simulation after `N` of simulated time (default `100ms`) — **nanoseconds** when no unit is given. The cap is resolved to whole nanoseconds (a sub-ns value rounds to the nearest one; below half a nanosecond is rejected) and then converted to the design's tick, so the same `--max-time` covers the same simulated time whatever the precision |
 | `--save-at <time>[,<file>]` | Save a checkpoint at the end of the last time slot at or before `<time>` (`<n>[fs\|ps\|ns\|us\|ms\|s]`, **nanoseconds** when no unit is given) into `<file>` (default `xezim.ckpt`); repeatable, and the run continues. See the [user guide](user-guide.md#checkpoints) |
 | `--restore <file>` | Start from a checkpoint (`--save-at`, `$save`) of the same design written by the same xezim build |
 | `+trace`, `+<plusarg>` | Passed through to `$value$plusargs` / `$test$plusargs` |
@@ -129,7 +129,7 @@ unless noted.
 | `XEZIM_CODE_COVERAGE=<kinds>` | Same as `--code-coverage=<kinds>`; the flag wins |
 | `XEZIM_COV_DB=<path>` | Write the coverage results somewhere other than `xezim_cov.json` |
 | `XEZIM_MAX_INST_DEPTH=N` | Instantiation-depth cap (default 200) — turns unbounded recursive instantiation into a clean error instead of memory exhaustion |
-| `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread) |
+| `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread); if creation fails, the CLI retries smaller stacks (1024, 512, 256, 128, 64 MiB, below the requested size), then the current thread, and warns with the selected stack and remedy. |
 | `XEZIM_UVM_DIR=<dir>` | The UVM library `-uvm` adds: a `src` directory, a release root holding `src/`, or a checkout holding several releases (`1.1d`, `1.2`, `1800.2-2017`, `1800.2-2020`) |
 | `XEZIM_UVM_VERSION=<release>` | With a multi-release `XEZIM_UVM_DIR`, the release subdirectory to use (default: the newest present) |
 | `XEZIM_VALUE_TRACE=<substr>[,...]` | Print every committed change of signals whose hierarchical name contains a pattern: time, name, old→new value, dispatch phase, writing process origin (file:line). NBA commits are labeled `nba` |

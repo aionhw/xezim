@@ -6,6 +6,7 @@
 //! The cases now live one directory down and are included here as
 //! modules, so this group links ONCE. Tests, names and assertions are
 //! unchanged — only the link unit is.
+
 //!
 //! The explicit module paths below are required: a crate root resolves a
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
@@ -15,6 +16,15 @@
 mod always_member_struct_compare;
 #[path = "types/always_whole_unpacked_struct_copy.rs"]
 mod always_whole_unpacked_struct_copy;
+#[path = "types/constant_expression_contexts.rs"]
+mod constant_expression_contexts;
+#[path = "types/constant_real_math_1089.rs"]
+mod constant_real_math_1089;
+#[path = "types/deferred_type_contexts_721.rs"]
+mod deferred_type_contexts_721;
+#[path = "types/struct_array_continuous_sensitivity_1090.rs"]
+mod struct_array_continuous_sensitivity_1090;
+
 #[path = "types/ansi_port_name_with_unpacked_dim.rs"]
 mod ansi_port_name_with_unpacked_dim;
 #[path = "types/array_element_declared_signedness.rs"]
@@ -713,3 +723,16 @@ mod struct_array_member_elem_select;
 
 #[path = "types/packed_select_geometry_1002.rs"]
 mod packed_select_geometry_1002;
+#[path = "types/unpacked_slice_patterns_1045.rs"]
+mod unpacked_slice_patterns_1045;
+
+#[path = "types/package_nettype_import.rs"]
+mod package_nettype_import;
+#[path = "types/struct_pattern_keys_continuous_assign.rs"]
+mod struct_pattern_keys_continuous_assign;
+#[path = "types/ansi_port_inheritance_1078.rs"]
+mod ansi_port_inheritance_1078;
+#[path = "types/packed_struct_array_local_fill_1082.rs"]
+mod packed_struct_array_local_fill_1082;
+#[path = "types/packed_struct_array_member_reads_1088.rs"]
+mod packed_struct_array_member_reads_1088;

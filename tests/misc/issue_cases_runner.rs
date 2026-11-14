@@ -586,3 +586,148 @@ fn static_vif_local_shadow_433() {
     assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
 }
+
+/// #1050: the reporter's sweep of nonblocking-assignment shapes, simulated
+/// once and checked per topic below. Each test compares the `SHAPE` lines of
+/// its shapes with the reference simulator's transcript of the same file;
+/// a failed self-check prints a `FAIL: sNN` line, which never matches.
+const NBA_SHAPES_1050_REF: &[&str] = &[
+    r#"SHAPE s01: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s02: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s03: vld=1 wr=1 addr=000000ba0b tag=1 sz=1 len=03 attr=1 mode=10 hold=1"#,
+    r#"SHAPE s04: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s05: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s06: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s07: vec=c00000303792002 bit59=1"#,
+    r#"SHAPE s08: vec=c00000303792002 bits33_30=1100"#,
+    r#"SHAPE s09: hdr.vld=1 hdr.tag=5 addr=000000face"#,
+    r#"SHAPE s10: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s11: vld=1 addr=0000000ff1 len=07"#,
+    r#"SHAPE s12[0]: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s12[1]: vld=0 wr=1 addr=000000ba0b tag=1 sz=1 len=03 attr=1 mode=10 hold=1"#,
+    r#"SHAPE s13: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s13: a_vld_events=5"#,
+    r#"SHAPE s14: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s15: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s16: bus_b.vld=1 data=d00df00d strb=f last=1 b_vld_events=4"#,
+    r#"SHAPE s17: uni=deadbeef w=deadbeef want=deadbeef"#,
+    r#"SHAPE s18: n3=de000000face hdr2.vld=1 hdr2.tag=6"#,
+    r#"SHAPE s19: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s20: v20=c00000303792002 want=c00000303792002"#,
+    r#"SHAPE s21: v21=c00000303792002 want=c00000303792002"#,
+    r#"SHAPE s22: v22=c00000303792002 want=c00000303792002"#,
+    r#"SHAPE s23: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s24: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s25: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s26: vld=0 wr=0 addr=0000000000 tag=0 sz=0 len=00 attr=0 mode=00 hold=0"#,
+    r#"SHAPE s27: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=11 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s28: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s29: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s30: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s31: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s32: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s33: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s34: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s35: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s36: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s37: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s38: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s39: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s40: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s41: hdl2.vec=deadbeefcafef00d want=deadbeefcafef00d"#,
+    r#"SHAPE s42: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s43: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s44: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s45: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s46: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s47: wh.w32=ffffffff want=ffffffff"#,
+    r#"SHAPE s48: wh.w33=1ffffffff want=1ffffffff"#,
+    r#"SHAPE s49: wh.w64=0123456789abcdef want=0123456789abcdef"#,
+    r#"SHAPE s50: wh.r=-1.500000 want=-1.500000"#,
+    r#"SHAPE s51: wh.w64=0123456789abcdef wh.r=-1.500000 want=0123456789abcdef -1.500000"#,
+    r#"SHAPE s52: wh.r=-1.500000 want=-1.500000"#,
+    r#"SHAPE s53: static_holder::sv=0123456789abcdef want=0123456789abcdef"#,
+    r#"SHAPE s54: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s61: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s55: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s56: dh.bp=c00000303792002 want=c00000303792002"#,
+    r#"SHAPE s57: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s58: ci.bus_a=c00000303792002 ci.drv.bus_a=c00000303792002 want=c00000303792002"#,
+    r#"SHAPE s59: vld=1 wr=1 addr=000000c0de tag=2 sz=2 len=00 attr=0 mode=01 hold=0"#,
+    r#"SHAPE s60: static_holder::sp=c00000303792002 sp.vld=1 sp.wr=1 want=c00000303792002 1 1"#,
+];
+
+/// The `SHAPE`/`FAIL` lines of shapes `ids`: (simulated, reference).
+fn nba_shapes_1050(ids: &[&str]) -> (Vec<String>, Vec<String>) {
+    static OUT: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let msgs = OUT.get_or_init(|| {
+        outputs(
+            include_str!("../issue_cases/nba_struct_shapes_1050.sv"),
+            100_000,
+        )
+    });
+    let picked = |l: &str| {
+        l.strip_prefix("SHAPE ")
+            .or_else(|| l.strip_prefix("FAIL: "))
+            .map(|r| {
+                r.split(|c: char| !c.is_ascii_alphanumeric())
+                    .next()
+                    .unwrap_or("")
+            })
+            .is_some_and(|id| ids.contains(&id))
+    };
+    let got = msgs.iter().filter(|l| picked(l)).cloned().collect();
+    let want = NBA_SHAPES_1050_REF
+        .iter()
+        .filter(|l| picked(l))
+        .map(|l| l.to_string())
+        .collect();
+    (got, want)
+}
+
+/// §4.6 b), §10.4.2: nonblocking updates to one variable commit in the order
+/// they were scheduled, so a whole-variable update after a partial one (a
+/// member, a bit- or part-select, a concatenation piece) wins in every scope
+/// and statement context; the reverse order keeps the partial (#1050).
+#[test]
+fn nba_partial_then_whole_shapes_1050() {
+    let ids = [
+        "s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s10", "s11", "s12", "s13",
+        "s14", "s15", "s16", "s17", "s18", "s19", "s20", "s21", "s22", "s23", "s24", "s26", "s27",
+        "s28", "s29", "s30", "s31", "s32", "s33", "s34", "s35", "s36", "s37", "s38", "s39", "s44",
+        "s45", "s46",
+    ];
+    let (got, want) = nba_shapes_1050(&ids);
+    assert_eq!(got, want);
+}
+
+/// §10.4.2, §8.5: a nonblocking update of a class property is sized by the
+/// property's declared type — through a handle, `this`, `super` or the class
+/// name, wider than 32 bits or `real` — and lands in the property, not in a
+/// module signal of the same name (#1050).
+#[test]
+fn class_property_nba_shapes_1050() {
+    let ids = [
+        "s25", "s40", "s41", "s42", "s43", "s47", "s48", "s49", "s50", "s51", "s52", "s53", "s54",
+        "s55", "s56", "s57", "s61",
+    ];
+    let (got, want) = nba_shapes_1050(&ids);
+    assert_eq!(got, want);
+}
+
+/// §25.5: a reference through a modport of an interface instance
+/// (`ci.drv.bus_a`) names the instance's own variable, for a blocking write
+/// and for nonblocking updates (#1050).
+#[test]
+fn modport_qualified_reference_shapes_1050() {
+    let (got, want) = nba_shapes_1050(&["s58", "s59"]);
+    assert_eq!(got, want);
+}
+
+/// §8.9, §7.2.1: a member of a packed-struct static class property reads the
+/// static cell the whole property is written to (#1050).
+#[test]
+fn static_packed_member_read_shapes_1050() {
+    let (got, want) = nba_shapes_1050(&["s60"]);
+    assert_eq!(got, want);
+}

@@ -16,14 +16,15 @@ wire the SystemVerilog side to it.
 
 ```bash
 # xezim/tests/dpi/simple_dpi.c  ->  simple_dpi.so
-cc -shared -fPIC -I path/to/xezim/include simple_dpi.c -o simple_dpi.so
+clang -shared -fPIC -I path/to/xezim/include simple_dpi.c -o simple_dpi.so
 
 # Run
 xezim --dpi-lib ./simple_dpi.so simple_dpi_test.sv
 ```
 
-That's it. The same recipe works for `.cc`/`.cpp` files (use `g++` instead of `cc`) and
-for multi-file builds (list more sources / headers before `-o`).
+That's it. The same recipe works for `.cc`/`.cpp` files (use `clang++`
+instead of `clang`) and for multi-file builds (list more sources / headers
+before `-o`).
 
 ---
 
@@ -109,7 +110,7 @@ endmodule
 Build and run:
 
 ```bash
-cc -shared -fPIC -I . simple_dpi.c -o simple_dpi.so
+clang -shared -fPIC -I . simple_dpi.c -o simple_dpi.so
 xezim --dpi-lib ./simple_dpi.so simple_dpi_test.sv
 # DPI_RESULT=42
 # TEST_PASS
@@ -126,7 +127,7 @@ This is the exact recipe used by
 Same flags, swap the compiler and add `-std=c++17` (or whatever you need):
 
 ```bash
-g++ -shared -fPIC -std=c++17 -I path/to/xezim/include dpi_module.cc -o dpi_module.so
+clang++ -shared -fPIC -std=c++17 -I path/to/xezim/include dpi_module.cc -o dpi_module.so
 ```
 
 The `extern "C"` wrapper that surrounds your `import "DPI-C"` implementations is the
@@ -168,7 +169,7 @@ extensions, no VHPI. The simulator-specific `uvm_is_vhdl_path` and
 `uvm_register_*_vhdl` helpers are not part of IEEE 1800.2 and are not provided.
 
 ```bash
-g++ -shared -fPIC -std=c++17 -Wno-format-security \
+clang++ -shared -fPIC -std=c++17 -Wno-format-security \
     -I path/to/xezim/include -I path/to/uvm/src/dpi \
     path/to/xezim/include/uvm_dpi_xezim.cc \
     -o uvm.so
@@ -177,7 +178,7 @@ xezim ... --dpi-lib uvm.so
 
 - Add `-DXEZIM_UVM_POLLING=1` for a 2020 kit, to include its
   `uvm_hdl_polling.c`; 1800.2-2017 doesn't ship that file.
-- The driver also builds as C: `gcc -x c -shared -fPIC ...` with the same
+- The driver also builds as C: `clang -x c -shared -fPIC ...` with the same
   flags otherwise.
 - `-Wno-format-security` silences a warning from `uvm_hdl_polling.c`, which
   passes a non-literal format string to `sprintf`. The fix belongs upstream.
@@ -196,12 +197,12 @@ a regex engine, a compression codec. Pattern:
 
 ```bash
 # 1) Compile your shim to an object file
-g++ -shared -fPIC -std=c++17 -fPIC -DXEZIM_SPIKE_REAL=1 \
+clang++ -shared -fPIC -std=c++17 -fPIC -DXEZIM_SPIKE_REAL=1 \
     -I path/to/xezim/include -I $SPIKE_PREFIX/include \
     -c xezim_spike_dpi.cpp -o xezim_spike_dpi.o
 
 # 2) Link the shim + the external library into one .so
-g++ -shared -fPIC \
+clang++ -shared -fPIC \
     -L $SPIKE_PREFIX/lib -Wl,-rpath,$SPIKE_PREFIX/lib \
     xezim_spike_dpi.o \
     -lriscv -lfesvr -lsoftfloat \
@@ -250,7 +251,7 @@ my_project/
 ```
 
 ```bash
-cc -shared -fPIC -I path/to/xezim/include -I . my_dpi.c -o my_dpi.so
+clang -shared -fPIC -I path/to/xezim/include -I . my_dpi.c -o my_dpi.so
 xezim --dpi-lib ./my_dpi.so -I . tb_my_dpi.sv
 ```
 
@@ -264,7 +265,7 @@ dpi/
 ```
 
 ```bash
-g++ -shared -fPIC -I path/to/xezim/include -I dpi/include uvm_dpi.cc -o dpi/lib/libuvm_dpi.so
+clang++ -shared -fPIC -I path/to/xezim/include -I dpi/include uvm_dpi.cc -o dpi/lib/libuvm_dpi.so
 xezim --dpi-lib dpi/lib/libuvm_dpi.so -I dpi/include tb.sv
 ```
 
@@ -369,8 +370,8 @@ writes into its generated DPI header:
 
 | Platform | Shared-object ext. | Compiler | One-file recipe |
 |---|---|---|---|
-| Linux | `.so` | `cc` / `g++` | `cc -shared -fPIC -I . foo.c -o foo.so` |
-| macOS | `.dylib` | `cc` / `clang++` | `cc -shared -fPIC -I . foo.c -o foo.dylib` |
+| Linux | `.so` | `clang` / `clang++` | `clang -shared -fPIC -I . foo.c -o foo.so` |
+| macOS | `.dylib` | `clang` / `clang++` | `clang -shared -fPIC -I . foo.c -o foo.dylib` |
 | Windows | `.dll` | `cl.exe` (MSVC) or `gcc` (MinGW) | `cl /LD /I . foo.c /Fe:foo.dll` |
 
 xezim's `--dpi-lib` accepts the platform-correct extension automatically. On
@@ -381,7 +382,7 @@ it only `dlopen`s).
 
 On macOS, a library that calls exported SV subroutines must leave those
 symbols for the loader to resolve: add `-Wl,-undefined,dynamic_lookup` to the
-link (`cc -shared -fPIC -Wl,-undefined,dynamic_lookup ...`). On Linux with
+link (`clang -shared -fPIC -Wl,-undefined,dynamic_lookup ...`). On Linux with
 musl, build xezim with `RUSTFLAGS="-C target-feature=-crt-static"`: a static
 musl executable cannot load shared libraries at all.
 
@@ -420,8 +421,8 @@ exercises five patterns end-to-end:
 | `dpi_shortreal_string_test` | `shortreal_string_dpi.c` | `shortreal` plus C string returns |
 | `dpi_vpi_backdoor_compliance_test` | `vpi_backdoor_compliance.c` | VPI force/read of signal hierarchies |
 
-All six are built with the same `cc -shared -fPIC -I <xezim_dir>` invocation —
-no per-test build system, just six shell-out-to-`cc` calls inside the test
+All six are built with the same `clang -shared -fPIC -I <xezim_dir>` invocation —
+no per-test build system, just six shell-out-to-`clang` calls inside the test
 harness.
 
 ---
@@ -432,7 +433,7 @@ Besides serving as a DPI callee, xezim can load a *classic* VPI application —
 one that registers system tasks/functions and walks the design:
 
 ```bash
-cc -shared -fPIC -I <xezim_dir> -o my_vpi.so my_vpi.c
+clang -shared -fPIC -I <xezim_dir> -o my_vpi.so my_vpi.c
 xezim --vpi-lib my_vpi.so design.sv        # alias: -m my_vpi.so
 ```
 

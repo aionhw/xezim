@@ -974,9 +974,9 @@ impl Simulator {
                 self.vcd_dump_all();
             }
             "$dumpflush" => {
-                // §21.7.1.9: force everything buffered so far out to the file.
+                // §21.7.1.6: wait until preceding output is readable.
                 if let Some(w) = self.vcd_writer.as_mut() {
-                    let _ = w.flush();
+                    let _ = w.flush_sync();
                 }
             }
             "$dumplimit" => {
@@ -1059,6 +1059,7 @@ impl Simulator {
                     self.checkpoint_ops
                         .push(super::checkpoint::CheckpointOp::Restart(path));
                 } else {
+                    self.checkpoint_requested = true;
                     self.checkpoint_ops
                         .push(super::checkpoint::CheckpointOp::Save(path));
                 }
@@ -2752,6 +2753,17 @@ impl Simulator {
                                             continue;
                                         }
                                     }
+                                }
+                                // §21.2.1.7, §13.4.1: a call returning an
+                                // unpacked array prints the elements it
+                                // returns, as the same value in a variable.
+                                if let Some(src) = self.ret_collection_operand(arg) {
+                                    self.p_top_level = true;
+                                    let core = src
+                                        .and_then(|s| self.render_p_var(&s))
+                                        .unwrap_or_else(|| "'{}".to_string());
+                                    result.push_str(&core);
+                                    continue;
                                 }
                                 // §21.2.1.7: a call returning an unpacked struct.
                                 if let Some(core) = self.render_p_struct_call(arg) {

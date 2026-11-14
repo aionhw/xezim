@@ -907,6 +907,83 @@ impl Simulator {
                 return Some(r);
             }
         }
+        if Self::chain_root_is_super(e)
+            && let Some(r) = self.super_chain_as_this(e)
+        {
+            return Some(r);
+        }
+        Self::super_as_this(e)
+    }
+
+    /// Whether the member and select chain `e` starts at `super` — a walk
+    /// without allocation, so the reads that reach [`Self::super_rewrite`]
+    /// pay nothing for the chain rewrite.
+    fn chain_root_is_super(e: &Expression) -> bool {
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => cur = expr,
+                ExprKind::Ident(h) => {
+                    return h.path.first().is_some_and(|s| s.name.name == "super");
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// §8.15: `super.frame.lanes[0]` — a member or select chain rooted at
+    /// `super.m` reads and writes `this.m`'s chain, unless `m` is redeclared
+    /// (the select paths resolve a shadowed member themselves). `None` when
+    /// `e` is no such chain.
+    #[inline(never)]
+    fn super_chain_as_this(&self, e: &Expression) -> Option<Expression> {
+        let rebuilt = match &e.kind {
+            ExprKind::Index { expr, index } => ExprKind::Index {
+                expr: Box::new(self.super_chain_root(expr)?),
+                index: index.clone(),
+            },
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+            } => ExprKind::RangeSelect {
+                expr: Box::new(self.super_chain_root(expr)?),
+                left: left.clone(),
+                right: right.clone(),
+                kind: *kind,
+            },
+            ExprKind::MemberAccess { expr, member } if !matches!(expr.kind, ExprKind::Ident(_)) => {
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.super_chain_root(expr)?),
+                    member: member.clone(),
+                }
+            }
+            _ => return None,
+        };
+        Some(Expression::new(rebuilt, e.span))
+    }
+
+    /// The `this`-rooted spelling of the receiver `e` of a chain under
+    /// [`Self::super_chain_as_this`].
+    fn super_chain_root(&self, e: &Expression) -> Option<Expression> {
+        let first = match &e.kind {
+            ExprKind::Ident(h) if h.path.len() >= 2 && h.path[0].name.name == "super" => {
+                &h.path[1].name.name
+            }
+            ExprKind::MemberAccess { expr, member }
+                if matches!(&expr.kind, ExprKind::Ident(bh)
+                    if bh.path.len() == 1 && bh.path[0].name.name == "super") =>
+            {
+                &member.name
+            }
+            _ => return self.super_chain_as_this(e),
+        };
+        if self.shadowed_prop_names.contains(first.as_str()) {
+            return None;
+        }
         Self::super_as_this(e)
     }
 
@@ -933,7 +1010,39 @@ impl Simulator {
                     && h.path.iter().all(|s| s.selects.is_empty()) =>
             {
                 let m = h.path.last()?.name.name.as_str();
-                if !self.prop_maybe_shadowed(m) || h.path[0].name.name == "super" {
+                if h.path[0].name.name == "super" {
+                    return None;
+                }
+                if !self.prop_maybe_shadowed(m) {
+                    // §8.14: a shadowed property INSIDE the chain (`b.f.tag`
+                    // with `b` of the base type) names the base's copy too;
+                    // rewrite the chain up to it and hang the rest off the
+                    // rewritten handle.
+                    for k in (1..h.path.len() - 1).rev() {
+                        if !self.prop_maybe_shadowed(&h.path[k].name.name) {
+                            continue;
+                        }
+                        let mut head = h.clone();
+                        head.path.truncate(k + 1);
+                        head.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                        head.cached_resolved_name = crate::ast::cache::NameCache::new();
+                        let Some(mut out) = self.shadowed_member_rewrite(&Expression::new(
+                            ExprKind::Ident(head),
+                            e.span,
+                        )) else {
+                            continue;
+                        };
+                        for seg in &h.path[k + 1..] {
+                            out = Expression::new(
+                                ExprKind::MemberAccess {
+                                    expr: Box::new(out),
+                                    member: seg.name.clone(),
+                                },
+                                e.span,
+                            );
+                        }
+                        return Some(out);
+                    }
                     return None;
                 }
                 let p = hier_prefix(h);
@@ -946,7 +1055,23 @@ impl Simulator {
             }
             ExprKind::MemberAccess { expr: base, member } => {
                 if !self.prop_maybe_shadowed(member.name.as_str()) {
-                    return None;
+                    // §8.14: `this.f.n` / `b.f.inner.n` — a shadowed member
+                    // below the receiver selects the copy the receiver's
+                    // declared class sees, as the read of `this.f` does.
+                    if !matches!(
+                        base.kind,
+                        ExprKind::MemberAccess { .. } | ExprKind::Ident(_)
+                    ) {
+                        return None;
+                    }
+                    let rb = self.shadowed_member_rewrite(base)?;
+                    return Some(Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(rb),
+                            member: member.clone(),
+                        },
+                        e.span,
+                    ));
                 }
                 let prefix = match &base.kind {
                     ExprKind::Ident(bh)
@@ -1018,15 +1143,19 @@ impl Simulator {
             .filter(|&h| h != 0)?;
         let inst = self.heap.get(handle)?.as_ref()?;
         let leaf = declarer_from(&inst.class_name)?;
-        if leaf == target {
+        let tcd = self.module.classes.get(&target)?;
+        let target_static =
+            tcd.static_properties.contains(m) || tcd.param_defaults.iter().any(|(p, _)| p == m);
+        // A static the object's own class declares, hiding a base instance
+        // property, has no cell in the object either (`d.s.n`).
+        if leaf == target && !target_static {
             return None;
         }
         // §8.9/§8.14: the visible declaration is a static (or a constant)
         // that a derived class hides with an instance property: the
         // reference names the class's shared cell, never a copy in the
         // object (`this.s` in the base's method, `base_h.s`).
-        let tcd = self.module.classes.get(&target)?;
-        if tcd.static_properties.contains(m) || tcd.param_defaults.iter().any(|(p, _)| p == m) {
+        if target_static {
             if self.class_is_parameterized(&target) {
                 return None;
             }
@@ -1146,7 +1275,16 @@ impl Simulator {
         // this, `super.p` resolved to no handle and flattened to a phantom
         // name: reads returned 0 and writes vanished with no diagnostic, even
         // for a uniquely-named inherited property.
-        if name == "super" {
+        // `this` needs the same rung for the FLAT identifier form: a dotted
+        // lvalue frozen by the NBA scheduler (`super.bp <= v` normalizes to
+        // `Ident([super, bp])`, then `super_rewrite`/`super_as_this` rewrites
+        // it to `Ident([this, bp])`) reaches the §4c class-property write
+        // with the head spelled as a plain `this` segment. `ExprKind::This`
+        // is special-cased on the read path, but a bare `Ident([this])` is
+        // not, so the head evaluated to 0 and the scheduled write vanished.
+        // `this` is a reserved keyword: no local, signal or static can be
+        // named `this`, so short-circuiting to the active handle is exact.
+        if name == "super" || name == "this" {
             return self.this_stack.last().copied().flatten();
         }
         if let Some(locals) = self.local_stack.last() {
@@ -1184,7 +1322,15 @@ impl Simulator {
         if !is_static_prop {
             if let Some(Some(handle)) = self.this_stack.last() {
                 if let Some(Some(inst)) = self.heap.get(*handle) {
-                    if let Some(v) = inst.properties.get(name) {
+                    // §8.14: a property a derived class redeclares names the
+                    // copy the executing method's class sees.
+                    let shadowed = if self.shadowed_prop_mask != 0 && self.prop_maybe_shadowed(name)
+                    {
+                        self.shadowed_prop_key(name, false)
+                    } else {
+                        None
+                    };
+                    if let Some(v) = inst.properties.get(shadowed.as_deref().unwrap_or(name)) {
                         return v.to_u64().map(|h| h as usize);
                     }
                 }

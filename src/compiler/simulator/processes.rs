@@ -1521,6 +1521,22 @@ impl Simulator {
             self.run_fast_delay_always(pid);
         } else if stmts.is_empty() && self.proc_fsm.contains_key(&pid) {
             self.run_proc_fsm(pid);
+        } else if stmts.is_empty()
+            && !self.lazy_initial.is_empty()
+            && let Some(p) = self.lazy_initial.remove(&pid)
+        {
+            // An initial block queued by its pending form (see `compile`):
+            // its body is materialized for this instance now, with the
+            // block locals given storage of their own as an instance's
+            // always block gets (`materialize_pending_always`), and is
+            // dropped again when the process ends.
+            let mut ib = p.materialize();
+            Self::rename_instance_locals(&mut ib.stmt, &ib.scope);
+            let stmts = match ib.stmt.kind {
+                StatementKind::SeqBlock { stmts, .. } => stmts,
+                other => vec![Statement::new(other, ib.stmt.span)],
+            };
+            self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
         } else {
             self.run_process_stmts(pid, stmts);
         }
@@ -3459,11 +3475,28 @@ impl Simulator {
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
-                                    let mut cont: Vec<Statement> = td.items.to_vec();
-                                    cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
-                                    // Chain the caller's tail instead of copying it onto the end of
-                                    // the spliced body (ProcCont::pushed).
-                                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                                    let frame = if self.share_task_frames {
+                                        self.task_body_frame(&td, stmt.span)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(frame) = frame {
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed_frame(frame, pc.start + i + 1),
+                                        );
+                                    } else {
+                                        // Preserve first-call lifetimes and checkpoint numbering.
+                                        let mut cont: Vec<Statement> = td.items.to_vec();
+                                        cont.push(Statement::new(
+                                            StatementKind::ScopePop,
+                                            stmt.span,
+                                        ));
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed(cont, pc.start + i + 1),
+                                        );
+                                    }
                                     return;
                                 }
                             }
@@ -3524,9 +3557,28 @@ impl Simulator {
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
-                                    let mut cont: Vec<Statement> = td.items.to_vec();
-                                    cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
-                                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                                    let frame = if self.share_task_frames {
+                                        self.task_body_frame(&td, stmt.span)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(frame) = frame {
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed_frame(frame, pc.start + i + 1),
+                                        );
+                                    } else {
+                                        // Preserve first-call lifetimes and checkpoint numbering.
+                                        let mut cont: Vec<Statement> = td.items.to_vec();
+                                        cont.push(Statement::new(
+                                            StatementKind::ScopePop,
+                                            stmt.span,
+                                        ));
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed(cont, pc.start + i + 1),
+                                        );
+                                    }
                                     return;
                                 }
                             }
@@ -5278,7 +5330,7 @@ impl Simulator {
                         self.process_scope_hint.insert(pid_child, h);
                     }
                     self.process_origin
-                        .insert(pid_child, (s.span, "fork child"));
+                        .insert(pid_child, (s.span, FORK_CHILD_ORIGIN));
                     // §9.6.2: `disable <label>` where the label names this
                     // child's own top-level `begin : name` block terminates
                     // the child. `disable_labels` was populated ONLY for
@@ -5693,13 +5745,9 @@ impl Simulator {
                 // transitive closure made a `join_none` grandchild extend the
                 // wait arbitrarily — or forever, for a persistent monitor
                 // spawned by a child, which is exactly the shape UVM drivers
-                // use.
-                let children: HashSet<usize> = self
-                    .process_parents
-                    .iter()
-                    .filter(|&(_, &parent)| parent == pid)
-                    .map(|(&child, _)| child)
-                    .collect();
+                // use. A finished child's children, handed up to this process
+                // for `disable fork`, are not its own (`wait_fork_children`).
+                let children: HashSet<usize> = self.wait_fork_children(pid);
 
                 if children.is_empty() {
                     i += 1;
@@ -5757,6 +5805,20 @@ impl Simulator {
                         self.continue_flag = false;
                     }
                 }
+            }
+            // §9.6.2: a `disable` of the process's own top-level block ends
+            // with the process; leave no flag for the next activation.
+            if pc.next.is_none()
+                && self.break_flag
+                && !self.killed_pids.contains(&pid)
+                && self
+                    .disable_target
+                    .as_deref()
+                    .is_some_and(|t| self.is_process_top_label(pid, t))
+            {
+                self.disable_target = None;
+                self.break_flag = false;
+                self.continue_flag = false;
             }
             if let Some(frame) = pc.next.clone() {
                 self.run_process_stmts(pid, &frame);

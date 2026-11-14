@@ -1,6 +1,9 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+#[macro_use]
+mod stdio;
+
 // Opt-in end-of-run statistics footer (`--report-stats` / XEZIM_REPORT_STATS).
 // CLI-only plumbing, so it lives in the binary, not the library.
 mod report;
@@ -120,31 +123,36 @@ fn spawn_memory_watchdog() {
         _ => return, // /proc unavailable (non-Linux); skip silently
     };
     let limit_kb = total_kb / 4 * 3;
-    std::thread::spawn(move || {
-        let pid = std::process::id();
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            if let Some(rss_kb) = proc_kb("/proc/self/status", "VmRSS") {
-                if rss_kb > limit_kb {
-                    eprintln!(
-                        "[xezim][mem-watchdog] RSS {} MiB exceeds 3/4 of system memory ({} MiB of {} MiB) — killing pid {} to prevent OOM. Set XEZIM_NO_MEM_WATCHDOG=1 to disable.",
-                        rss_kb / 1024,
-                        limit_kb / 1024,
-                        total_kb / 1024,
-                        pid,
-                    );
-                    // SIGKILL self — bypasses panic handlers, no Drop runs,
-                    // but ensures the process actually exits even if a thread
-                    // is stuck inside a long allocation.
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
+    let watchdog = std::thread::Builder::new()
+        .name("xezim-memwatch".to_string())
+        .spawn(move || {
+            let pid = std::process::id();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if let Some(rss_kb) = proc_kb("/proc/self/status", "VmRSS") {
+                    if rss_kb > limit_kb {
+                        eprintln!(
+                            "[xezim][mem-watchdog] RSS {} MiB exceeds 3/4 of system memory ({} MiB of {} MiB) — killing pid {} to prevent OOM. Set XEZIM_NO_MEM_WATCHDOG=1 to disable.",
+                            rss_kb / 1024,
+                            limit_kb / 1024,
+                            total_kb / 1024,
+                            pid,
+                        );
+                        // SIGKILL self — bypasses panic handlers, no Drop runs,
+                        // but ensures the process actually exits even if a thread
+                        // is stuck inside a long allocation.
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGKILL);
+                        }
+                        // Fallback if libc isn't available somehow.
+                        std::process::exit(137);
                     }
-                    // Fallback if libc isn't available somehow.
-                    std::process::exit(137);
                 }
             }
-        }
-    });
+        });
+    if let Err(e) = watchdog {
+        eprintln!("Warning: cannot spawn memory watchdog ({e}); running without it");
+    }
 }
 
 /// `-xezim_env <file>`: set (or with `unsetenv`, remove) the `XEZIM_*`
@@ -205,7 +213,7 @@ fn print_usage() {
     eprintln!("  --dump-tokens    With --parse, print the token stream");
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!(
-        "  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100ms)"
+        "  --max-time <n>[fs|ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100ms)"
     );
     eprintln!("  --save-at <time>[,<file>]  Save a checkpoint at the end of the last time slot at");
     eprintln!(
@@ -521,14 +529,19 @@ fn parse_timescale_value(d: &str) -> Result<(i32, i32), String> {
 /// Build the `--module-timescale` configuration from raw option strings,
 /// validating units and detecting conflicting named assignments.
 /// Parse a `--max-time` value: a bare number is NANOSECONDS (historical
-/// default), an attached suffix selects the unit: `30000000ps`, `30us`,
+/// default), an attached suffix selects the unit: `925000000000fs`, `30us`,
 /// `1ms`, `2s` (case-insensitive; `us` or `µs`). Returns nanoseconds.
 /// A customer run set `--max-time 30000000` intending picoseconds under a
 /// 1ps timescale and got 30 ms — the unit was invisible and unspellable.
 fn parse_max_time(raw: &str) -> Result<u64, String> {
     let t = raw.trim();
     let lower = t.to_ascii_lowercase();
-    let (num_str, factor_ns): (&str, f64) = if let Some(n) = lower.strip_suffix("ps") {
+    let (num_str, factor_ns): (&str, f64) = if let Some(n) = lower
+        .strip_suffix("fs")
+        .filter(|n| n.trim().parse::<f64>().is_ok())
+    {
+        (n, 1e-6)
+    } else if let Some(n) = lower.strip_suffix("ps") {
         (n, 1e-3)
     } else if let Some(n) = lower.strip_suffix("ns") {
         (n, 1.0)
@@ -545,15 +558,32 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     };
     let num: f64 = num_str.trim().parse().map_err(|_| {
         format!(
-            "invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s])",
+            "invalid --max-time value '{}' (expected <n>[fs|ps|ns|us|ms|s])",
             raw
         )
     })?;
     if !(num > 0.0) {
         return Err(format!("--max-time must be positive, got '{}'", raw));
     }
-    let ns = num * factor_ns;
-    let rounded = ns.round();
+    // Keep integer femtoseconds exact above f64's 53-bit mantissa. Rounding
+    // to whole ns happens once, after the unit conversion (#1113).
+    if let Some(fs) = lower
+        .strip_suffix("fs")
+        .and_then(|value| value.trim().parse::<u128>().ok())
+    {
+        let ns = fs / 1_000_000 + u128::from(fs % 1_000_000 >= 500_000);
+        if ns >= u64::MAX as u128 {
+            return Ok(u64::MAX);
+        }
+        if ns == 0 {
+            return Err(format!(
+                "--max-time '{}' is below 1 ns; the cap is tracked in whole nanoseconds",
+                raw
+            ));
+        }
+        return Ok(ns as u64);
+    }
+    let rounded = (num * factor_ns).round();
     if rounded < 1.0 {
         return Err(format!(
             "--max-time '{}' is below 1 ns; the cap is tracked in whole nanoseconds",
@@ -564,7 +594,7 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
 }
 
 /// Parse a `--save-at` time: like `--max-time`, a bare number is
-/// nanoseconds, but `fs` is accepted and so is zero and anything below 1 ns.
+/// nanoseconds, but zero and anything below 1 ns are also accepted.
 /// Returns seconds.
 fn parse_save_time(raw: &str) -> Result<f64, String> {
     let lower = raw.trim().to_ascii_lowercase();
@@ -1994,11 +2024,46 @@ fn append_adopted_libs_to_merged(
     );
 }
 
+fn smaller_worker_stacks(requested_mb: usize) -> impl Iterator<Item = usize> {
+    [1024, 512, 256, 128, 64]
+        .into_iter()
+        .filter(move |&size_mb| size_mb < requested_mb)
+}
+
+#[test]
+fn smaller_worker_stack_ladder() {
+    for (requested, expected) in [
+        (1536, vec![1024, 512, 256, 128, 64]),
+        (1024, vec![512, 256, 128, 64]),
+        (512, vec![256, 128, 64]),
+        (256, vec![128, 64]),
+        (128, vec![64]),
+        (64, vec![]),
+        (32, vec![]),
+    ] {
+        // Exhausting this iterator selects the current-thread fallback.
+        assert_eq!(
+            smaller_worker_stacks(requested).collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
 fn main() {
     // `-xezim_env <file>` before anything reads an `XEZIM_*` variable (this
     // very function reads XEZIM_HUGEPAGE and XEZIM_STACK_MB). The process is
     // still single-threaded here, so setting the environment is sound.
     apply_xezim_env_files();
+    // Standalone informational commands need neither compilation nor a worker
+    // stack. Keep their output available even under a tight address-space limit.
+    if env::args().len() == 1
+        || matches!(
+            env::args().nth(1).as_deref(),
+            Some("-V" | "-h" | "--help" | "--show-env-avail")
+        )
+    {
+        std::process::exit(run_main());
+    }
     // FIRST thing, before any large allocation: a parent can disable transparent
     // huge pages for its whole descendant tree with prctl(PR_SET_THP_DISABLE, 1),
     // and the flag is inherited across fork+exec. While set, madvise(MADV_HUGEPAGE)
@@ -2021,7 +2086,6 @@ fn main() {
             libc::prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
         }
     }
-    spawn_memory_watchdog();
     // Install the SIGUSR1 hang-report handler before compile: a user poking a
     // seemingly-hung run during a long elaboration must not kill it (the
     // default SIGUSR1 action is termination).
@@ -2033,26 +2097,62 @@ fn main() {
     // aborts with "thread 'main' has overflowed its stack"). Do what rustc
     // does: run the whole compile+simulate on a worker thread with a large
     // stack. The memory is virtual — pages commit only if actually used —
-    // so the big default costs nothing. XEZIM_STACK_MB overrides.
+    // but the reservation still counts against address-space limits.
+    // XEZIM_STACK_MB overrides; retry smaller workers before the main stack.
     let stack_mb: usize = std::env::var("XEZIM_STACK_MB")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024);
     if stack_mb > 0 {
-        let code = std::thread::Builder::new()
-            .name("xezim-main".to_string())
-            .stack_size(stack_mb * 1024 * 1024)
-            .spawn(run_main)
-            .expect("spawn simulation thread")
-            .join()
-            .unwrap_or_else(|_| 101);
-        std::process::exit(code);
+        let mut first_error = None;
+        for size_mb in std::iter::once(stack_mb).chain(smaller_worker_stacks(stack_mb)) {
+            let Some(stack_bytes) = size_mb
+                .checked_mul(1024 * 1024)
+                .filter(|&bytes| bytes <= isize::MAX as usize)
+            else {
+                first_error.get_or_insert_with(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "requested stack size is too large",
+                    )
+                });
+                continue;
+            };
+            let warning = first_error.as_ref().map(|e| {
+                format!(
+                    "Warning: cannot spawn the simulation thread with a {stack_mb} MiB stack ({e}); running with a {size_mb} MiB stack (set XEZIM_STACK_MB to a size that fits)"
+                )
+            });
+            match std::thread::Builder::new()
+                .name(xezim::CLI_WORKER_THREAD.to_string())
+                .stack_size(stack_bytes)
+                .spawn(move || {
+                    if let Some(warning) = warning {
+                        eprintln!("{warning}");
+                    }
+                    spawn_memory_watchdog();
+                    run_main()
+                }) {
+                Ok(worker) => std::process::exit(worker.join().unwrap_or(101)),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        eprintln!(
+            "Warning: cannot spawn the simulation thread with a {stack_mb} MiB stack ({}); running on the current thread (set XEZIM_STACK_MB to a size that fits, or raise `ulimit -s`)",
+            first_error.unwrap()
+        );
+        // Keep simulate_multi here too, without changing what children inherit.
+        xezim::CLI_CURRENT_THREAD.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    spawn_memory_watchdog();
     let code = run_main();
     std::process::exit(code);
 }
 
 fn run_main() -> i32 {
+    let _oom_trace = xezim_core::oom_trace::session();
     let compile_wall_start = std::time::Instant::now();
 
     // Default to IEEE 1800-2023 mode. SV-2023 is additive over -2017, so
@@ -2157,6 +2257,7 @@ fn run_main() -> i32 {
     let mut vpi_libs: Vec<String> = Vec::new();
     let mut module_timescale_args: Vec<String> = Vec::new();
     let mut plusargs: Vec<String> = Vec::new();
+    let mut direct_plusarg_positions: Vec<usize> = Vec::new();
     let mut emit_hypergraph: Option<String> = None;
     let mut load_partition: Option<String> = None;
     let mut write_profile: Option<String> = None;
@@ -2455,6 +2556,7 @@ fn run_main() -> i32 {
                     xezim::compiler::simulator::set_warn_x(true);
                     xezim::compiler::simulator::set_warn_x_limit(n);
                 }
+                direct_plusarg_positions.push(i);
                 plusargs.push(arg.clone());
             }
             // `-v <file>` — a library FILE (traditional library semantics): its
@@ -3556,7 +3658,11 @@ suppressed but the explicit SDF annotation still applies."
                         // Pass the full CLI invocation (binary name +
                         // all args + plusargs) so vpi_get_vlog_info
                         // can hand the same argv back to UVM.
-                        sim.set_args(&args);
+                        sim.set_args(&cli_files::runtime_argv(
+                            &args,
+                            &plusargs,
+                            &direct_plusarg_positions,
+                        ));
                         let compilation_start = xezim::WallTimer::now();
                         sim.compile();
                         if !sim.compile_errors.is_empty() {
@@ -4165,5 +4271,18 @@ fn report_fatal_error(e: &str) {
         eprintln!("{}", e);
     } else {
         eprintln!("Simulation error: {}", e);
+    }
+}
+
+#[test]
+fn integer_femtosecond_limits_round_exactly() {
+    for (input, expected) in [
+        ("9007199255499999fs", 9_007_199_255),
+        ("9007199255500000fs", 9_007_199_256),
+        ("9007199256500001FS", 9_007_199_257),
+        ("18446744073709551614000000fs", u64::MAX - 1),
+        ("18446744073709551615000000fs", u64::MAX),
+    ] {
+        assert_eq!(parse_max_time(input).unwrap(), expected, "{input}");
     }
 }

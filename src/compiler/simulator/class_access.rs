@@ -623,7 +623,13 @@ impl Simulator {
             // Do NOT memoize through the shared-node cache here — go through
             // the generic top-prefix logic below on a rebuilt name instead.
             if let Some(rest) = stripped.strip_prefix(&format!("{}.", self.module.name)) {
-                if self.signal_name_to_id.contains_key(rest) || self.signals.contains_key(rest) {
+                // §7.2.1: a member of a packed struct of the design is a bit
+                // slice of its variable, never a signal of its own.
+                if self.signal_name_to_id.contains_key(rest)
+                    || self.signals.contains_key(rest)
+                    || self.unit_scope_decl_exists(rest)
+                    || self.packed_leaf_of_hier(rest).is_some()
+                {
                     let _ = hier.cached_resolved_name.set(rest.to_string());
                     return rest.to_string();
                 }
@@ -732,6 +738,45 @@ impl Simulator {
             .binary_search_by(|&idx| self.module.instances[idx].path.as_str().cmp(path))
             .ok()
             .map(|pos| &self.module.instances[self.instance_path_order[pos]])
+    }
+
+    /// §25.5: a modport-qualified hierarchical reference (`inst.mp.var`)
+    /// names the instance's own variable — the modport view only restricts
+    /// directions. Drop a path segment that names a modport of the interface
+    /// instance the preceding prefix resolves to, so the name lands on the
+    /// real variable instead of a phantom `inst.mp.var` copy that only the
+    /// writing path ever populated. `None` when no segment is dropped.
+    pub(super) fn strip_modport_segments(&self, raw: &str) -> Option<String> {
+        // Only an inner segment can be a modport; most names have none, and
+        // they leave here without allocating.
+        let n = raw.split('.').count();
+        if n < 3
+            || !raw
+                .split('.')
+                .skip(1)
+                .take(n - 2)
+                .any(|seg| self.modport_names.contains(seg))
+        {
+            return None;
+        }
+        let mut segs: Vec<&str> = raw.split('.').collect();
+        let mut changed = false;
+        let mut i = 1;
+        while i + 1 < segs.len() {
+            let prefix = segs[..i].join(".");
+            let is_modport = self.instance_by_path(&prefix).is_some_and(|inst| {
+                self.module
+                    .modport_member_dirs
+                    .contains_key(&(inst.def_name.clone(), segs[i].to_string()))
+            });
+            if is_modport {
+                segs.remove(i);
+                changed = true;
+            } else {
+                i += 1;
+            }
+        }
+        changed.then(|| segs.join("."))
     }
 
     /// §23.9: `scope` and its enclosing generate blocks, ending at the nearest
@@ -860,6 +905,13 @@ impl Simulator {
             .map(|s| s.name.name.as_str())
             .collect::<Vec<_>>()
             .join(".");
+        // §25.5: a modport-qualified reference names the instance's own
+        // variable; strip modport segments before any lookup.
+        let raw = if self.modport_names.is_empty() {
+            raw
+        } else {
+            self.strip_modport_segments(&raw).unwrap_or(raw)
+        };
         // §8/§23.9: in a method of a class declared inside a module, a
         // dotted name headed by an item of the object's instance (an
         // unpacked struct, an interface or module instance) is that
@@ -1117,7 +1169,10 @@ impl Simulator {
                     .local_stack
                     .last()
                     .is_some_and(|f| f.contains_key(head))
-                && (self.signal_name_to_id.contains_key(rest) || check_known_or_signal(rest, self))
+                && (self.signal_name_to_id.contains_key(rest)
+                    || check_known_or_signal(rest, self)
+                    // §23.6: `top.u.s.m` names member `m` of `u.s`.
+                    || (head == self.module.name && self.packed_leaf_of_hier(rest).is_some()))
             {
                 let out = rest.to_string();
                 if out.contains('.') {

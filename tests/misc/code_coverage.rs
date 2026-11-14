@@ -6,12 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn xezim() -> String {
-    let mut p = std::env::current_exe().expect("current_exe");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("xezim").to_string_lossy().into_owned()
+    // Cargo names the binary it built for the integration tests.
+    env!("CARGO_BIN_EXE_xezim").to_string()
 }
 
 fn scratch(tag: &str) -> PathBuf {
@@ -570,7 +566,7 @@ fn vpi_toggles(d: &Path, c: &str, src: &str, case: &str) -> (String, String) {
     if !so.exists() {
         std::fs::write(d.join("t0.c"), c).unwrap();
         let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
-        let ok = Command::new("cc")
+        let ok = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
             .args(["-shared", "-fPIC", "-I"])
             .arg(&include)
             .arg(d.join("t0.c"))

@@ -428,12 +428,7 @@ impl Simulator {
         let Some((owner, cont)) = self.dpi_park_target() else {
             return self.dpi_suspend();
         };
-        let children: HashSet<usize> = self
-            .process_parents
-            .iter()
-            .filter(|&(_, &p)| p == owner)
-            .map(|(&c, _)| c)
-            .collect();
+        let children: HashSet<usize> = self.wait_fork_children(owner);
         if children.is_empty() {
             return;
         }

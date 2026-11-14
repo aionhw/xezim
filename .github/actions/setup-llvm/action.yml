@@ -1,0 +1,32 @@
+name: Set up LLVM
+description: Install Clang and LLVM archive tools
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: "1"
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS" in
+          Linux)
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends clang llvm
+            ;;
+          macOS)
+            if ! brew list --versions llvm >/dev/null 2>&1; then
+              brew install llvm
+            fi
+            LLVM_PREFIX=$(brew --prefix llvm)
+            echo "$LLVM_PREFIX/bin" >> "$GITHUB_PATH"
+            export PATH="$LLVM_PREFIX/bin:$PATH"
+            ;;
+          *)
+            echo "Unsupported runner: $RUNNER_OS"
+            exit 1
+            ;;
+        esac
+        clang --version
+        clang++ --version
+        llvm-ar --version
+        llvm-ranlib --version

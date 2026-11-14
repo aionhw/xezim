@@ -5,6 +5,10 @@ on:
   pull_request:
 
 env:
+  CC: clang
+  CXX: clang++
+  AR: llvm-ar
+  RANLIB: llvm-ranlib
   CARGO_BUILD_JOBS: 1
 
 jobs:
@@ -13,16 +17,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # xezim-core is a git dependency in Cargo.toml (cargo clones it), but
-      # Cargo.lock is gitignored so it tracks a moving main — the build cache
-      # key still needs the core commit to avoid reusing a tree built against
-      # a different core.
-      - name: Resolve xezim-core HEAD
-        run: |
-          echo "CORE_SHA=$(git ls-remote https://github.com/aionhw/xezim-core.git refs/heads/main | cut -f1)" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-llvm
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Read the pinned toolchain and core revision
+        run: |
+          TASK_MSRV=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          CORE_SHA=$(sed -nE 's/^xezim-core = .*rev = "([0-9a-f]{40})".*/\1/p' Cargo.toml)
+          test -n "$TASK_MSRV"
+          test -n "$CORE_SHA"
+          echo "MSRV=$TASK_MSRV" >> "$GITHUB_ENV"
+          echo "CORE_SHA=$CORE_SHA" >> "$GITHUB_ENV"
+
+      - name: Install the MSRV toolchain
+        run: rustup toolchain install "$MSRV" --profile minimal
 
       - name: Cache cargo registry
         uses: actions/cache@v6
@@ -30,27 +37,17 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-msrv-cargoreg-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-msrv-cargoreg-${{ hashFiles('**/Cargo.toml', '.cargo/config.toml') }}
           restore-keys: ${{ runner.os }}-msrv-cargoreg-
 
-      # See the note in test.yml: Cargo.lock is gitignored, so the old key
-      # hashed to nothing and one shared `target/` was reused across every
-      # commit and every ../xezim-core revision.
       - name: Cache build artifacts
         uses: actions/cache@v6
         with:
           path: target
-          key: ${{ runner.os }}-msrv-target-${{ hashFiles('**/Cargo.toml') }}-${{ env.CORE_SHA }}
+          key: ${{ runner.os }}-msrv-${{ env.MSRV }}-target-${{ hashFiles('**/Cargo.toml', '.cargo/config.toml') }}-${{ env.CORE_SHA }}
 
-      - name: Install cargo-msrv
-        run: cargo install cargo-msrv --locked
-
-      - name: cargo msrv verify
-        run: cargo msrv verify
+      - name: Check default targets at MSRV
+        run: cargo +"$MSRV" check --all-targets
 
       - name: Check optional features at MSRV
-        run: |
-          TASK_MSRV=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
-          test -n "$TASK_MSRV"
-          rustup toolchain install "$TASK_MSRV" --profile minimal
-          cargo +"$TASK_MSRV" check --all-targets --features jit
+        run: cargo +"$MSRV" check --all-targets --features jit

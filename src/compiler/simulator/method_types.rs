@@ -369,6 +369,44 @@ impl Simulator {
                         }
                     }
                 }
+                // §10.4.2/§6.12.2: a MULTI-SEGMENT path rooted at a class
+                // object — a handle variable (`h.prop`) or a class name
+                // (`C::prop`, flattened by elaboration into a 2-segment
+                // path) — names a class property, so the signal lookup
+                // below must not capture it: `resolve_hier_name` falls
+                // back to the LEAF for names it cannot bind, and an
+                // unrelated module-scope signal of that leaf name then
+                // supplied the width AND poisoned the identifier's cached
+                // signal id, which rerouted the NBA itself to that signal
+                // — the property never saw the write (`hdl2.vec <= v`
+                // landed in a module `vec`, sized 60 against the 64-bit
+                // property). `class_prop_lvalue_width` walks the DECLARED
+                // types only — no object is read, no method runs — and
+                // answers None for every shape it cannot size, so
+                // non-class paths keep the flat-table lookups below. Only
+                // the leaf-capture shape is checked here: a name the
+                // resolver kept whole reaches its own signal or none.
+                //
+                // §6.12, §8.25: a `real` property of the handle's object —
+                // also one typed by a type parameter the object binds to
+                // `real` — keeps a real RHS whole (64), which the declared
+                // width walk cannot see through the parameter.
+                if h.path.len() == 2
+                    && h.path[1].selects.is_empty()
+                    && self.may_name_real_class_prop(&h.path[1].name.name)
+                    && let Some(handle) = self.eval_ident_handle(&h.path[0].name.name)
+                    && self.class_prop_is_real(handle, &h.path[1].name.name)
+                {
+                    return 64;
+                }
+                if h.path.len() > 1
+                    && name.as_ref() == h.path[h.path.len() - 1].name.name
+                    && !self.no_class_objects()
+                    && self.head_denotes_class_object(h)
+                    && let Some(w) = self.class_prop_lvalue_width(h).filter(|w| *w > 0)
+                {
+                    return w;
+                }
                 if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                     h.cached_signal_id.set(Some(id));
                     if let Some(k) = leaf_key {
@@ -429,6 +467,32 @@ impl Simulator {
                     if let Some(w) = self.heap_prop_width(handle, leaf) {
                         return w;
                     }
+                    // §6.12.2: a `real` property has no integral width for
+                    // `heap_prop_width`, but its NBA RHS must survive the
+                    // schedule-time resize untouched — 64 keeps a real Value
+                    // real (`resize` clones a real at width 64) and the
+                    // commit-side `fit_class_prop` does the real↔integral
+                    // conversion when the property is integral.
+                    if self.class_prop_is_real(handle, leaf) {
+                        return 64;
+                    }
+                }
+                // §10.4.2/§6.12.2: a class-property lvalue the flat tables
+                // above cannot see — HANDLE-qualified (`h.prop`) or
+                // owner-qualified STATIC (`C::prop`, flattened by
+                // elaboration into a 2-segment path) — is sized by its
+                // DECLARED width, and a `real` property is 64 bits. The NBA
+                // scheduler freezes the RHS at this width, so the 32-bit
+                // default below truncated every wider property (a 64-bit
+                // `h.vec`, a 33-bit `h.w33`, a whole 60-bit struct `h.p`)
+                // and turned a real RHS into an int32. `lrm_self_width`
+                // walks the DECLARED types — no object is read, no method
+                // runs — and answers None for every shape it cannot size,
+                // so non-class paths keep the leaf fallbacks below.
+                if !self.no_class_objects()
+                    && let Some(w) = self.lrm_self_width(expr).filter(|w| *w > 0)
+                {
+                    return w;
                 }
                 self.widths
                     .get(leaf)

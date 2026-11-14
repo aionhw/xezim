@@ -1509,6 +1509,46 @@ impl Simulator {
         }
     }
 
+    /// Does the subtree hold an expression statement other than a system
+    /// task call: a task enable in any spelling (`t(x);`, `t;`, `o.m;`), or
+    /// an expression that may call one? `stmt_is_blocking` decides those by
+    /// the callee's NAME, so its answer for them is only known once the
+    /// statement carries its instance's names.
+    pub(super) fn stmt_has_call_statement(stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::Expr(e) => !matches!(e.kind, ExprKind::SystemCall { .. }),
+            StatementKind::TimingControl { stmt: inner, .. } => {
+                Self::stmt_has_call_statement(inner)
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(Self::stmt_has_call_statement)
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::stmt_has_call_statement(then_stmt)
+                    || else_stmt
+                        .as_ref()
+                        .is_some_and(|e| Self::stmt_has_call_statement(e))
+            }
+            StatementKind::Case { items, .. } => items
+                .iter()
+                .any(|it| Self::stmt_has_call_statement(&it.stmt)),
+            StatementKind::RandCase { items } => items
+                .iter()
+                .any(|(_, st)| Self::stmt_has_call_statement(st)),
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. } => Self::stmt_has_call_statement(body),
+            _ => false,
+        }
+    }
+
     /// Does the subtree contain a statement-level task-enable / void call?
     /// (`pulse(x);` / `drv.step();`) — such a callee may hide waits that
     /// `count_timing_controls` cannot see.

@@ -5,7 +5,8 @@
 //! nested patterns and the element-type conversion of each item apply.
 //! The pattern used to evaluate to a packed concatenation compared with the
 //! array's nonexistent container signal, so `a == '{9, 5, 5, 5}` was 0.
-//! Expected values are the reference simulator's.
+//! Expected values are the reference simulator's, except an open relation
+//! (x/z elements and no differing one), which is x (§11.4.5).
 
 use xezim::simulate;
 
@@ -64,7 +65,9 @@ fn unpacked_aggregates_compare_with_assignment_patterns() {
         "T|m1 11110 101010 10100",
         "T|m2 if yes",
         "T|m3 k=0 tern=11 slice=1",
-        "T|m4 ds=10 stv=10 lx=0010",
+        // §11.4.5: `lx` holds an x bit no other element contradicts, so
+        // `==` and `!=` are x (the reference simulator prints 0 for both).
+        "T|m4 ds=10 stv=10 lx=xx10",
         "T|m5 key=10 by=11 m3=10 sn=100",
         "T|c1 11110 101010 10100",
         "T|c1 11110 101010 10100",

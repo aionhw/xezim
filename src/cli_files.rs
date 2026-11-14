@@ -127,3 +127,22 @@ pub(crate) fn env_files_in_args(args: &[String]) -> Result<Vec<String>, String> 
     }
     Ok(files)
 }
+
+/// Register the complete parsed runtime plusargs with VPI/DPI in their
+/// original order. Remove only positions the CLI parser classified as plusargs;
+/// option operands, including a filename equal to a plusarg, must survive.
+pub(crate) fn runtime_argv(
+    args: &[String],
+    plusargs: &[String],
+    direct_plusarg_positions: &[usize],
+) -> Vec<String> {
+    // The parser visits raw argument positions in increasing order.
+    let mut argv: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| direct_plusarg_positions.binary_search(index).is_err())
+        .map(|(_, arg)| arg.clone())
+        .collect();
+    argv.extend_from_slice(plusargs);
+    argv
+}

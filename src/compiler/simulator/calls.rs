@@ -19,6 +19,15 @@ impl Simulator {
         let lexical = self.lexical_spec();
         let extracted = self.resolve_call_spec_params(Self::extract_call_spec(func), &lexical);
         if let Some((ref base, ref sig)) = extracted {
+            // §8.8/§13.5.1: constructor actuals precede the callee scope.
+            if matches!(&func.kind, ExprKind::MemberAccess { member, .. } if member.name == "new") {
+                let normalized = Self::strip_spec_shape(func);
+                if Self::typed_ctor_call(&normalized).is_some_and(|(prefix, _)| prefix == base)
+                    && let Some(v) = self.construct_typed_ctor(&format!("{base}#({sig})"), args)
+                {
+                    return v;
+                }
+            }
             self.ensure_spec_statics(base, sig);
         }
         // Execute the callee with `current_spec` = the CALLER'S spec so an
@@ -3095,6 +3104,16 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §8.14: a member a derived class redeclares is the
+                        // copy the declared class of the chain so far sees.
+                        if self.shadowed_prop_mask != 0 && self.prop_maybe_shadowed(&seg.name.name)
+                        {
+                            let view = self.path_view_class(&hier.path[..loop_start + si]);
+                            handle = self
+                                .member_handle_viewed(handle, &seg.name.name, view.as_deref())
+                                .unwrap_or(0);
+                            continue;
+                        }
                         handle = self
                             .heap
                             .get(handle)
@@ -3687,6 +3706,16 @@ impl Simulator {
                 self.exec_task_call(&td, args);
                 return Value::zero(32);
             }
+            // §18.12: a bare `randomize(…)` outside a class is the scope
+            // randomize function with its optional `std::` prefix left out.
+            // It names no declared subroutine, so it returned 0 unsolved.
+            if hier.root.is_none()
+                && hier.path.len() == 1
+                && name == "randomize"
+                && self.bare_randomize_is_scope_randomize()
+            {
+                return self.exec_std_randomize(args);
+            }
             // A module-class method naming an instance subroutine that
             // resolved nowhere: report the skipped call instead of dropping
             // it silently.
@@ -3708,5 +3737,13 @@ impl Simulator {
             }
         }
         Value::zero(32)
+    }
+
+    /// Whether a bare `randomize` call here is the §18.12 scope randomize
+    /// function (`std::randomize`): it is outside every class method, where
+    /// a bare call is `this.randomize` (§18.11).
+    pub(super) fn bare_randomize_is_scope_randomize(&self) -> bool {
+        !matches!(self.class_context_stack.last(), Some(Some(_)))
+            && !matches!(self.this_stack.last(), Some(Some(_)))
     }
 }

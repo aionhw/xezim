@@ -20,12 +20,15 @@
 #   make help                   # print this text
 #
 # Environment overrides (standard make vars):
-#   CXX       compiler (default: g++)
+#   CXX       compiler (default: clang++)
 #   CXXFLAGS  extra flags appended after the defaults
 
 SHELL := /bin/bash
 
-CXX      ?= g++
+ifeq ($(origin CXX),default)
+CXX      = clang++
+endif
+CXX      ?= clang++
 CXXFLAGS ?=
 
 XEZIM_INCLUDE := ../include
@@ -114,5 +117,5 @@ help:
 	@echo '  clean       remove built .so files'
 	@echo '  distclean   also remove tarballs and extracted source dirs'
 	@echo 'Variables (overridable on the cmdline or via env):'
-	@echo '  CXX         compiler to use (default: g++)'
+	@echo '  CXX         compiler to use (default: clang++)'
 	@echo '  CXXFLAGS    extra compile flags'

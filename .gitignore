@@ -67,8 +67,8 @@ c10_tmp.txt
 
 Cargo.lock
 
-# Repo-local cargo config written by scripts/use-local-core.sh (per-machine)
-/.cargo/config.toml
+# Dependency overrides written by scripts/use-local-core.sh (per-machine)
+/.cargo/local-core.toml
 # A nested local xezim-core checkout used via use-local-core.sh
 /xezim-core/
 

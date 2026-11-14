@@ -3016,9 +3016,15 @@ impl Simulator {
             ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
                 self.sva_resolve_signals(operand)
             }
+            // A side compared with a bare pattern stays a name: the pattern
+            // takes that side's declared type (§10.9).
             ExprKind::Binary { left, right, .. } => {
-                self.sva_resolve_signals(left);
-                self.sva_resolve_signals(right);
+                if !has_pattern(right) {
+                    self.sva_resolve_signals(left);
+                }
+                if !has_pattern(left) {
+                    self.sva_resolve_signals(right);
+                }
             }
             ExprKind::Conditional {
                 condition,

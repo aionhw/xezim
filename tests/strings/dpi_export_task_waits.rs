@@ -35,7 +35,7 @@ fn shared_lib(dir: &Path, stem: &str, src: &str) -> PathBuf {
     let so = dir.join(format!("{stem}.so"));
     std::fs::write(&c, src).unwrap();
     let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
-    let mut cc = Command::new("cc");
+    let mut cc = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()));
     cc.args(["-shared", "-fPIC"]);
     if cfg!(target_os = "macos") {
         // The exported subroutines resolve when xezim loads the library.
@@ -571,5 +571,44 @@ endmodule
                 "{form:?} {stack:?}:\n{text}"
             );
         }
+    }
+}
+
+/// §9.6.1: `wait fork` in an exported task waits for the calling process's
+/// immediate children only. The child joined first has finished, so its
+/// `join_none` grandchild (handed up to the caller for `disable fork`) is
+/// not waited for. The reference simulator does not accept timing controls
+/// in an exported task, so these values follow the standard.
+#[test]
+fn exported_task_wait_fork_skips_a_finished_childs_grandchild() {
+    let sv = r#"
+`timescale 1ns/1ps
+module top;
+  int g = 0, sink = 0;
+  task automatic c_waitfork();
+    fork begin fork #700 g++; join_none end join
+    wait fork;
+    sink++;
+  endtask
+  export "DPI-C" task c_waitfork;
+  IMPORT from_c();
+  initial begin
+    from_c();
+    $display("R|wf t=%0t g=%0d sink=%0d", $time, g, sink);
+    #1000 $display("R|wfend g=%0d", g);
+    $finish;
+  end
+endmodule
+"#;
+    let c = r#"
+extern int c_waitfork(void);
+ENTRY from_c() {
+    c_waitfork();
+    DONE
+}
+"#;
+    for (form, stack) in forms_and_stacks(&[Import::Task, Import::Function]) {
+        let text = run_as("dpi_wait_fork_grandchild", form, stack, sv, c);
+        expect_all(&text, form, stack, &["R|wf t=0 g=0 sink=1", "R|wfend g=1"]);
     }
 }

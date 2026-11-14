@@ -209,13 +209,8 @@ fn stall_report_names_the_rtl_behind_each_spinner() {
     use std::process::Command;
 
     fn xezim_bin() -> std::path::PathBuf {
-        // target/release/deps/<test binary> -> target/release/xezim
-        let mut p = std::env::current_exe().expect("current_exe");
-        p.pop();
-        if p.ends_with("deps") {
-            p.pop();
-        }
-        p.join("xezim")
+        // Cargo names the binary it built for the integration tests.
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"))
     }
 
     let dir = std::env::temp_dir().join("xezim_stall_report_test");
@@ -295,12 +290,8 @@ fn stall_report_resolves_file_line_in_multi_file_designs() {
     use std::process::Command;
 
     fn xezim_bin() -> std::path::PathBuf {
-        let mut p = std::env::current_exe().expect("current_exe");
-        p.pop();
-        if p.ends_with("deps") {
-            p.pop();
-        }
-        p.join("xezim")
+        // Cargo names the binary it built for the integration tests.
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"))
     }
 
     let dir = std::env::temp_dir().join("xezim_stall_report_multifile_test");
@@ -420,13 +411,7 @@ fn zero_period_clock_gen_advances_to_reachable_setter() {
          initial begin #1 p = 100.0; #500 $display(\"ADV t=%0t\", $time); $finish; end\nendmodule\n",
     )
     .expect("write sv");
-
-    let mut bin = std::env::current_exe().unwrap();
-    bin.pop();
-    if bin.ends_with("deps") {
-        bin.pop();
-    }
-    let out = std::process::Command::new(bin.join("xezim"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
         .env("XEZIM_STALL_LIMIT", "1500")
         .arg(&sv)
         .output()

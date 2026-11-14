@@ -518,14 +518,7 @@ fn an_event_emits_a_pulse_at_every_trigger() {
 /// `--fst-scope top.gen` matches nothing.
 #[test]
 fn a_scope_that_selects_nothing_warns_and_writes_no_file() {
-    let bin = {
-        let mut p = std::env::current_exe().expect("current_exe");
-        p.pop();
-        if p.ends_with("deps") {
-            p.pop();
-        }
-        p.join("xezim")
-    };
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"));
     let dir = std::env::temp_dir().join(format!("xezim_fst_scope_none_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mkdir");
     let sv = dir.join("h.sv");

@@ -2945,7 +2945,7 @@ impl<'a> BytecodeCompiler<'a> {
             let &(_, m1_off, _) = fields.iter().find(|(n, _, _)| n == &m1.name)?;
             let (stride1, dim1) = self.packed_member_array_shape(&key, &hier, &m1.name)?;
             let elem = self.emit_packed_member_slice(v, idx1, dim1, stride1, m1_off, stride1)?;
-            let (_, mem_off, _) = Self::elem_zero_field(&fields, &m1.name, &member.name)?;
+            let (_, mem_off, _) = Self::elem_zero_field(&fields, &m1.name, &member.name, stride1)?;
             let rel = mem_off.checked_sub(m1_off)?;
             let nested = format!("{}.{}", m1.name, member.name);
             let (elem_w, dim2) = self.packed_member_array_shape(&key, &hier, &nested)?;
@@ -2982,27 +2982,38 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         };
         let (root_value, root_key, hier, fields) = self.compile_packed_struct_value(root)?;
-        let (_, field_offset, field_width) = Self::elem_zero_field(&fields, &member.name, leaf)?;
         let (elem_w, dim) = self.packed_member_array_shape(&root_key, &hier, &member.name)?;
+        let (_, field_offset, field_width) =
+            Self::elem_zero_field(&fields, &member.name, leaf, elem_w)?;
         self.emit_packed_member_slice(root_value, index, dim, elem_w, field_offset, field_width)
     }
 
-    /// Element-0 layout of `<member>[i].<leaf>`. Elaboration registers an
-    /// array-of-struct member under two conventions: element-relative
-    /// (`descriptors.region`, plain struct nets) or expanded per element
-    /// (`descriptors[0].region`, packed arrays of structs). Both put element
-    /// 0 at the member's base, so either key gives the stride origin.
+    /// Layout of `<member>[i].<leaf>` in the element at the member's base
+    /// (slot 0, the stride origin). Elaboration registers an array-of-struct
+    /// member under two conventions: element-relative (`descriptors.region`,
+    /// plain struct nets) or expanded per element (`descriptors[0].region`,
+    /// packed arrays of structs). §7.4.1: element 0 sits at the base only
+    /// for a descending range; in an ascending one (`hdr_t [0:2] slots`) it
+    /// is the most significant element, so the leaf's offset is reduced to
+    /// its place within one `stride`-bit element above the member's base.
     fn elem_zero_field(
         fields: &[(String, u32, u32)],
         member: &str,
         leaf: &str,
+        stride: u32,
     ) -> Option<(String, u32, u32)> {
         let rel = format!("{}.{}", member, leaf);
         let per_elem = format!("{}[0].{}", member, leaf);
-        fields
+        let (name, off, w) = fields
             .iter()
             .find(|(name, _, _)| name == &rel || name == &per_elem)
-            .cloned()
+            .cloned()?;
+        match fields.iter().find(|(n, _, _)| n == member) {
+            Some(&(_, base, _)) if stride > 0 && off >= base => {
+                Some((name, base + (off - base) % stride, w))
+            }
+            _ => Some((name, off, w)),
+        }
     }
 
     /// `<path>.<member>[i].<leaf>` where the container and member arrive as
@@ -3026,8 +3037,8 @@ impl<'a> BytecodeCompiler<'a> {
             seg.selects.clear();
         }
         let (root_key, fields) = self.packed_struct_layout_for_hier(&bare)?;
-        let (_, field_offset, field_width) = Self::elem_zero_field(&fields, member, leaf)?;
         let (elem_w, dim) = self.packed_member_array_shape(&root_key, &bare, member)?;
+        let (_, field_offset, field_width) = Self::elem_zero_field(&fields, member, leaf, elem_w)?;
         let root = if root_hier.path.iter().any(|s| !s.selects.is_empty()) {
             let e = Expression::new(ExprKind::Ident(root_hier.clone()), root_hier.span);
             self.compile_expr(&e, 0)?
@@ -4343,6 +4354,16 @@ impl<'a> BytecodeCompiler<'a> {
         let saved_local_arrays = std::mem::take(&mut self.local_var_array);
         let saved_local_elems = std::mem::take(&mut self.local_var_elem);
         let saved_local_structs = std::mem::take(&mut self.local_var_struct);
+        // §13.4: the body never sees the caller's unrolled loop constants or
+        // register banks, as for an inlined task. An unrolled loop variable
+        // shadows every same-named name, so a callee's own `for (int s ...)`
+        // tested the caller's `s` and never ended, and a module variable `s`
+        // read the caller's loop value.
+        let saved_banks = std::mem::take(&mut self.local_array_regs);
+        let saved_consts = std::mem::take(&mut self.local_const_vars);
+        let saved_const_kinds = std::mem::take(&mut self.local_const_kinds);
+        let saved_const_binds = std::mem::take(&mut self.const_var_binds);
+        let saved_decl_locals = std::mem::take(&mut self.decl_local_regs);
         for (n, sb) in struct_binds {
             if let Some(pfx) = &qpfx {
                 self.local_var_struct
@@ -4448,14 +4469,6 @@ impl<'a> BytecodeCompiler<'a> {
         self.loop_break_patches = saved_break_patches;
         self.loop_continue_patches = saved_continue_patches;
         self.named_block_patches = saved_named_block_patches;
-        if ok {
-            for (target, value, width) in &ref_writes {
-                if !self.compile_blocking_target(target, *value, *width) {
-                    ok = false;
-                    break;
-                }
-            }
-        }
         self.allow_ast_fallback = saved_fallback;
         self.inlining_stack.pop();
         self.local_var_regs = saved_locals;
@@ -4464,6 +4477,21 @@ impl<'a> BytecodeCompiler<'a> {
         self.local_var_array = saved_local_arrays;
         self.local_var_elem = saved_local_elems;
         self.local_var_struct = saved_local_structs;
+        self.local_array_regs = saved_banks;
+        self.local_const_vars = saved_consts;
+        self.local_const_kinds = saved_const_kinds;
+        self.const_var_binds = saved_const_binds;
+        self.decl_local_regs = saved_decl_locals;
+        // §13.5.3: copy-out assigns the caller's lvalues after return. Restore
+        // its locals and loop constants first, including for indexed targets.
+        if ok {
+            for (target, value, width) in &ref_writes {
+                if !self.compile_blocking_target(target, *value, *width) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
         if !ok {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
                 eprintln!(
@@ -13007,9 +13035,14 @@ impl<'a> BytecodeCompiler<'a> {
                 let explicit = matches!(lifetime, Some(Lifetime::Static));
                 let is_static = explicit || (!auto && lifetime.is_none());
                 is_static
-                    && declarators.iter().any(|d| match &d.init {
-                        Some(_) => explicit,
-                        None => Self::static_local_carries(&d.name.name, &stmts[i + 1..]),
+                    && declarators.iter().any(|d| {
+                        // Hoisted static cells are hierarchically observable
+                        // even when this call writes them before reading.
+                        (explicit && d.name.name.contains('.'))
+                            || match &d.init {
+                                Some(_) => explicit,
+                                None => Self::static_local_carries(&d.name.name, &stmts[i + 1..]),
+                            }
                     })
             }
             _ => nested(s, auto),
@@ -13558,7 +13591,9 @@ impl<'a> BytecodeCompiler<'a> {
             // jumps to the method's common exit (the prologue reads that
             // register's value and returns it to the caller). Trailing/jump
             // targets are back-patched like `inline_ret_jumps` below.
-            StatementKind::Return(e) if self.method_mode => {
+            // §13.4.1: a nested inline returns to its caller inside this
+            // method, using inline_ret below, rather than ending the method.
+            StatementKind::Return(e) if self.method_mode && self.inline_ret.is_none() => {
                 // class-perf collection-return: only `return '{…}` literals
                 // are admitted — each element lands in a contiguous arg slot
                 // and one `RetCollection` hands the range to the interpreter's
@@ -15589,6 +15624,21 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn compile_expr(&mut self, expr: &Expression, ctx_width: u32) -> Option<RegId> {
+        // §8.8: a bare typed constructor `C::new` constructs, as `C::new()`
+        // does, rather than reading a class-scope name.
+        if !matches!(expr.kind, ExprKind::Call { .. })
+            && let Some((prefix, _)) = crate::compiler::simulator::Simulator::typed_ctor_call(expr)
+            && self.scope_static_receivers.contains(prefix)
+        {
+            let call = Expression::new(
+                ExprKind::Call {
+                    func: Box::new(expr.clone()),
+                    args: Vec::new(),
+                },
+                expr.span,
+            );
+            return self.compile_expr_typed(&call, ctx_width, false);
+        }
         self.compile_expr_typed(expr, ctx_width, false)
     }
 

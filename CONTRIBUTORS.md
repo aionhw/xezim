@@ -37,7 +37,9 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   regression tests, and wildcard connections to non-ANSI module ports.
 - **[Chuanseng Ng](https://github.com/chuanseng-ng)** — array parameter shapes
   in generate scopes and compiled stores to multidimensional unpacked array
-  elements, with regressions for packed widths and branch-dependent indices.
+  elements, with regressions for packed widths and branch-dependent indices;
+  bare scope randomization, constant net drivers after release and root UPF
+  power-domain paths.
 - **Vrajesh Prakhya** — real-number modelling: Verilog-AMS `wreal` nets
   resolved by summing, user-defined nettypes across the hierarchy and in
   packages (§6.6.7, §6.6.8), real-ness of members projected from call results,
@@ -90,7 +92,8 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   command-line timescale, bind actuals the target does not declare, class
   associative-array keys sized per specialization, and specialization
   arguments written as expressions of package parameters keyed by their
-  value (§8.25).
+  value (§8.25); per-element clocking input history for unpacked arrays with
+  an explicit positive skew (§14.4, PR #1138).
 - **Taichi Ishitani** — constrained-random fixes (members of rand object array
   elements, `pre_randomize` before the rand and constraint modes are read,
   `this.` member paths in the joint solver, and `XEZIM_RAND_DIAG` reports of
@@ -134,7 +137,14 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
 - **[ds54e](https://github.com/ds54e)** — elaboration fixes in the core with
   a simulator test for each: casts sized by a value parameter inside constant
   functions (§6.24.1, §13.4.3), and element selects of packed localparams
-  declared in a child module's body (§7.4.1, §7.4.5).
+  declared in a child module's body (§7.4.1, §7.4.5); CLI operation under
+  address-space limits, femtosecond runtime caps, finished-fork metadata
+  reclamation and shared task continuations, with memory and checkpoint
+  regression tests; reports on constant-expression widths, real function
+  locals and compilation-unit parameter shadowing.
+- **[git-hevangel](https://github.com/git-hevangel)** — shared statement-list
+  numbering when restoring checkpoints of processes that have forked,
+  including suspended class tasks and condition or event waiters.
 - **[Philip Axer](https://github.com/philipaxer)** — nested collections typed
   by their declared shape at every level: the shape recorded in the core for
   every scope, rows created as their parent's kind allows, and `%p` and
@@ -186,5 +196,12 @@ work. Thank you in particular to
 [taichi-ishitani](https://github.com/taichi-ishitani),
 [urbanij](https://github.com/urbanij) and
 [vrajeshprakhya](https://github.com/vrajeshprakhya).
+
+The elaboration-memory investigation in [#721](https://github.com/aionhw/xezim/issues/721)
+uses synthetic reproducers, allocation profiles, controlled type-context
+comparisons and anonymized memory traces supplied by
+[amal-khailtash](https://github.com/amal-khailtash). Their net-initializer
+reproducer and sharing experiment identified the retained target-expression
+cost addressed by sharing declaration targets across child instances.
 
 New contributors are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).

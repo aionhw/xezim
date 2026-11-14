@@ -2664,7 +2664,7 @@ impl Simulator {
                 }
             }
 
-            // Phase 2a: execute parallel-eligible blocks with thread::scope.
+            // Phase 2a: execute parallel-eligible blocks in isolated chunks.
             //
             // Whether threading pays is NOT a property of the instruction count
             // alone — it depends on the machine (thread handoff + NBA merge cost
@@ -2676,8 +2676,9 @@ impl Simulator {
             // sequential, the next `PAR_CAL_TICKS` parallel, compare ns/insn, and
             // keep the winner for the rest of the run.
             //
-            // XEZIM_NO_PARALLEL=1 forces sequential; XEZIM_FORCE_PARALLEL=1 skips
-            // calibration and always threads (for A/B measurement).
+            // XEZIM_NO_PARALLEL=1 forces the regular sequential executor;
+            // XEZIM_FORCE_PARALLEL=1 forces eligible isolated dispatch without
+            // waiting for calibration. Its chunks run serially by default.
             const PAR_CAL_TICKS: u32 = 64;
             let parallel_disabled = parallel_disabled_by_env();
             let qualifies = parallel_blocks.len() >= 2 && parallel_insn_count >= 10_000;
@@ -2772,12 +2773,8 @@ impl Simulator {
                 }
 
                 let mut all_nba: Vec<Vec<NbaFast>> = Vec::new();
-                // XEZIM_PARALLEL_SERIALIZE=1: run exec_insns_isolated
-                // sequentially in the main thread (chunks processed in
-                // spawn order). Diagnoses whether the parallel-mode
-                // c910 stall is in exec_insns_isolated's behavior vs
-                // multi-thread scheduling. If it still fails with this
-                // set, the bug is in exec_insns_isolated itself.
+                // Execute isolated chunks serially by default, in spawn
+                // order. XEZIM_PARALLEL_SERIALIZE=0 enables worker threads.
                 let serialize = parallel_serialize_enabled();
                 if serialize {
                     for chunk in chunks.iter() {
@@ -2939,8 +2936,8 @@ impl Simulator {
             // cannot touch `prof_insns_executed` — so `insns=0`/`ns_per_insn=0`
             // used to be reported for the very path that was running, and a
             // profile that reads zero is worse than one that reads nothing.
-            // The workers' EXECUTED count is not recoverable without threading
-            // a counter through the whole worker protocol (and a block's static
+            // The isolated executor's EXECUTED count is not recoverable without
+            // a counter through the whole dispatch protocol (and a block's static
             // length is NOT its executed length — a `case` runs one arm), so
             // record the dispatch itself and let the PROF line say so.
             if use_parallel {

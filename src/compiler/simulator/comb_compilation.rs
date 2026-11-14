@@ -290,6 +290,7 @@ impl Simulator {
         self.comb_time0_idx = cache.time0_idx;
         self.comb_time0_deferred = cache.time0_deferred;
         self.cont_driven = cache.cont_driven;
+        self.initialize_continuously_driven_nets();
         self.gate_fall_delay_by_id
             .extend(cache.gate_fall_delay_by_id);
         self.gate_off_delay_by_id.extend(cache.gate_off_delay_by_id);
@@ -353,6 +354,68 @@ impl Simulator {
             Err(err) => {
                 let _ = std::fs::remove_file(&tmp);
                 eprintln!("[CACHE] prepared-comb store skipped: {}", err);
+            }
+        }
+    }
+
+    // Prepared tables store the program, not the initial signal values, so a
+    // cache hit replays this initialization of the cold path before the
+    // time-0 continuous assignments run.
+    fn initialize_continuously_driven_nets(&mut self) {
+        // §6.6.1 vs a DRIVEN net: an undriven net reads z, but a net that has a
+        // continuous driver is not undriven — its value is whatever that driver
+        // produces, and until the driver first resolves that is UNKNOWN, not
+        // high-impedance. The distinction is invisible for a zero-delay driver
+        // (the time-0 settle overwrites it immediately) but shows through the
+        // whole delay window of a DELAYED one, which is exactly a gate-level
+        // netlist: `and #(2,5) g(o, a, b);` leaves `o` readable for 5 ticks
+        // before it first resolves, and it should read x there.
+        //
+        // A combinational CYCLE (`assign p = q; assign q = p;`) keeps this
+        // x forever — measured: the reference does the SAME (cycles read x,
+        // driven or not). `alias` is NOT a cycle — it unifies names onto one
+        // net (see `alias_pairs`).
+        //
+        // Only all-z signals are touched, so a net given a real initial value
+        // (supply0/1) keeps it. A tri0/tri1 net is no different from a wire
+        // here: its pull is only the weak fallback where no driver drives, so
+        // with a driver it is x as well until that driver resolves (measured
+        // on the reference: `tri0 t; assign #2 t = a;` reads x until t=2).
+        let cont_driven: Vec<usize> = self.cont_driven.iter().copied().collect();
+        let has_pulled = self.module.resolved_net_kinds.values().any(|k| {
+            matches!(
+                k,
+                xezim_core::elaborate::ResolvedNetKind::Tri0
+                    | xezim_core::elaborate::ResolvedNetKind::Tri1
+            )
+        });
+        for id in cont_driven {
+            if self.signal_real[id] {
+                continue;
+            }
+            let w = self.signal_widths[id];
+            if w == 0 {
+                continue;
+            }
+            let cur = &self.signal_table[id];
+            let all_z = (0..w as usize).all(|i| cur.get_bit(i) == LogicBit::Z);
+            let pulled = has_pulled
+                && !all_z
+                && self
+                    .name_opt(id)
+                    .and_then(|n| self.module.resolved_net_kinds.get(n))
+                    .is_some_and(|k| {
+                        matches!(
+                            k,
+                            xezim_core::elaborate::ResolvedNetKind::Tri0
+                                | xezim_core::elaborate::ResolvedNetKind::Tri1
+                        )
+                    });
+            if all_z || pulled {
+                let mut v = Value::new(w); // all-x
+                v.is_signed = self.signal_signed[id];
+                self.signal_table[id] = v;
+                self.sync_mirror(id);
             }
         }
     }
@@ -845,12 +908,92 @@ impl Simulator {
             } else {
                 wids
             };
+            // §28.16: primitive fall delays have already had the structural
+            // delay-mode override applied. Keep that value when recording the
+            // assignment's per-driver transition delays below.
+            if ca.gate_delay_fall.is_some()
+                && ca.delay_fall.is_some()
+                && wids.len() == 1
+                && lhs_is_bare_ident
+                && self
+                    .module
+                    .gate_fall_delays
+                    .contains_key(self.name_for_id(wids[0]))
+            {
+                ca.delay_fall = self.gate_fall_delay_by_id.get(&wids[0]).copied();
+            }
             // Try fused-gate fast path first: recognizes yosys patterns like
             // `assign d[0] = a & b` or `assign d[0] = ~(a & b)` — executes
             // without VM dispatch, just bit reads + 4-state combinator + set_bit.
+            // §28.16: a primitive that is the only driver of its net keeps
+            // its fall delay in the name map alone, so one with a zero rise
+            // delay (`buf #(0, 5)`) shows no delay of its own here; it took
+            // the undelayed gate path and fell at once.
+            let primitive_fall = ca.gate_delay_fall.is_some()
+                && wids.len() == 1
+                && lhs_is_bare_ident
+                && self
+                    .gate_fall_delay_by_id
+                    .get(&wids[0])
+                    .is_some_and(|&d| d > 0);
+            // §28.16: a primitive keeps its fall delay apart from the
+            // assignment's own; like the per-driver map of a whole-net output
+            // it follows the structural delay mode.
+            let select_target = matches!(
+                ca.lhs.kind,
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+            );
+            let select_fall = ca.delay_fall.or_else(|| {
+                ca.gate_delay_fall
+                    .filter(|_| select_target && delay_mode() != 1)
+                    .map(apply_delay_mode)
+            });
             let has_transition_delay = explicit_delay > 0
+                || primitive_fall
                 || ca.delay_fall.is_some_and(|d| d > 0)
-                || ca.delay_off.is_some_and(|d| d > 0);
+                || ca.delay_off.is_some_and(|d| d > 0)
+                || (select_target && select_fall.is_some_and(|d| d > 0));
+            // §10.3.3 versus §28.16: use the assignment's origin, not the
+            // target's gate marker. Multi-driver lowering can give a gate
+            // and an assignment separate, unmarked driver nets.
+            let delay_target = if has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
+                ca.delay_select
+                    .or_else(|| {
+                        ca.origin.as_ref().and_then(|_| {
+                            xezim_core::elaborate::continuous_assign_delay_select(
+                                &ca.lhs,
+                                &self.module,
+                                Some(self.signal_widths[wids[0]]),
+                            )
+                        })
+                    })
+                    .map(|(lo, width, vector)| DelayTarget {
+                        lo,
+                        width,
+                        vector: ca.origin.is_some() && vector,
+                        select_delays: None,
+                    })
+            } else if has_transition_delay
+                && select_target
+                && (select_fall.is_some_and(|f| f != explicit_delay)
+                    || ca.delay_off.is_some_and(|t| t != explicit_delay))
+            {
+                // §10.3.3 / §28.16: a constant select keeps a select target
+                // (no other driver overlaps it), so the per-driver maps of
+                // its net cannot hold its fall and turn-off delays. A
+                // part-select is a vector target; a bit-select (or a gate
+                // output on one) takes the gate rules unless it selects a
+                // vector element.
+                Some(DelayTarget {
+                    lo: 0,
+                    width: 0,
+                    vector: ca.origin.is_some()
+                        && matches!(ca.lhs.kind, ExprKind::RangeSelect { .. }),
+                    select_delays: Some((select_fall, ca.delay_off)),
+                })
+            } else {
+                None
+            };
             let fused = if !has_transition_delay && cov_counter.is_none() {
                 self.try_build_fused_gate(&ca.lhs, &ca.rhs, scope_hint.as_deref())
             } else {
@@ -858,9 +1001,10 @@ impl Simulator {
             };
             // `assign #(rise, fall[, turnoff]) net = …` (§10.3.3): the lowered
             // item carries the rise delay; the fall / turn-off values go to
-            // the per-net maps consulted by `schedule_delayed_with_delay`,
+            // the per-driver maps consulted by `schedule_delayed_with_delay`,
             // the one point where both the target and the new value are
-            // known. Whole-net targets only, like the gate form (§28.11).
+            // known. Whole-net targets only, including widened overlapping
+            // selects, like the gate form (§28.16).
             if has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
                 if let Some(f) = ca.delay_fall {
                     if f != explicit_delay {
@@ -885,6 +1029,7 @@ impl Simulator {
                     lhs: Box::new(ca.lhs.clone()),
                     rhs: Box::new(ca.rhs.clone()),
                     delay: explicit_delay,
+                    delay_target: delay_target.map(Box::new),
                 }
             } else if let Some(op) = fused {
                 CombItem::FusedGate { op }
@@ -984,6 +1129,7 @@ impl Simulator {
                             lhs: Box::new(ca.lhs),
                             rhs: Box::new(ca.rhs),
                             delay: 0,
+                            delay_target: None,
                         }
                     }
                 }
@@ -1076,6 +1222,7 @@ impl Simulator {
                             lhs: Box::new(ca.lhs),
                             rhs: Box::new(ca.rhs),
                             delay: 0,
+                            delay_target: None,
                         }
                     }
                 }
@@ -1084,6 +1231,7 @@ impl Simulator {
                     lhs: Box::new(ca.lhs),
                     rhs: Box::new(ca.rhs),
                     delay: 0,
+                    delay_target: None,
                 }
             };
 
@@ -1392,6 +1540,19 @@ impl Simulator {
                     unresolved_count += 1;
                 }
             }
+            // §10.3.2, §7.2: a whole unpacked struct or struct-array
+            // operand changes when any member does. Array resolution above
+            // yields element containers; those never change on a member
+            // write, so depend on their registered leaves as well.
+            for i in 0..rids.len() {
+                if let Some(leaves) = self.unpacked_struct_sens.get(self.name_for_id(rids[i])) {
+                    for &id in leaves {
+                        if !rids.contains(&id) {
+                            rids.push(id);
+                        }
+                    }
+                }
+            }
             if dump_ca_reads {
                 let rn: Vec<&str> = rids.iter().map(|&i| self.name_for_id(i)).collect();
                 eprintln!(
@@ -1446,62 +1607,7 @@ impl Simulator {
             });
         }
 
-        // §6.6.1 vs a DRIVEN net: an undriven net reads z, but a net that has a
-        // continuous driver is not undriven — its value is whatever that driver
-        // produces, and until the driver first resolves that is UNKNOWN, not
-        // high-impedance. The distinction is invisible for a zero-delay driver
-        // (the time-0 settle overwrites it immediately) but shows through the
-        // whole delay window of a DELAYED one, which is exactly a gate-level
-        // netlist: `and #(2,5) g(o, a, b);` leaves `o` readable for 5 ticks
-        // before it first resolves, and it should read x there.
-        //
-        // A combinational CYCLE (`assign p = q; assign q = p;`) keeps this
-        // x forever — measured: the reference does the SAME (cycles read x,
-        // driven or not). `alias` is NOT a cycle — it unifies names onto one
-        // net (see `alias_pairs`).
-        //
-        // Only all-z signals are touched, so a net given a real initial value
-        // (supply0/1) keeps it. A tri0/tri1 net is no different from a wire
-        // here: its pull is only the weak fallback where no driver drives, so
-        // with a driver it is x as well until that driver resolves (measured
-        // on the reference: `tri0 t; assign #2 t = a;` reads x until t=2).
-        let cont_driven: Vec<usize> = self.cont_driven.iter().copied().collect();
-        let has_pulled = self.module.resolved_net_kinds.values().any(|k| {
-            matches!(
-                k,
-                xezim_core::elaborate::ResolvedNetKind::Tri0
-                    | xezim_core::elaborate::ResolvedNetKind::Tri1
-            )
-        });
-        for id in cont_driven {
-            if self.signal_real[id] {
-                continue;
-            }
-            let w = self.signal_widths[id];
-            if w == 0 {
-                continue;
-            }
-            let cur = &self.signal_table[id];
-            let all_z = (0..w as usize).all(|i| cur.get_bit(i) == LogicBit::Z);
-            let pulled = has_pulled
-                && !all_z
-                && self
-                    .name_opt(id)
-                    .and_then(|n| self.module.resolved_net_kinds.get(n))
-                    .is_some_and(|k| {
-                        matches!(
-                            k,
-                            xezim_core::elaborate::ResolvedNetKind::Tri0
-                                | xezim_core::elaborate::ResolvedNetKind::Tri1
-                        )
-                    });
-            if all_z || pulled {
-                let mut v = Value::new(w); // all-x
-                v.is_signed = self.signal_signed[id];
-                self.signal_table[id] = v;
-                self.sync_mirror(id);
-            }
-        }
+        self.initialize_continuously_driven_nets();
 
         // Always @* and always_comb blocks. Reuse `reads`/`writes` from the
         // continuous_assigns loop above (clear-not-realloc). always_latch is

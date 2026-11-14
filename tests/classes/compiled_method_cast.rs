@@ -259,10 +259,6 @@ endmodule
 }
 
 fn xezim_bin() -> String {
-    let mut p = std::env::current_exe().expect("current_exe");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("xezim").to_string_lossy().into_owned()
+    // Cargo names the binary it built for the integration tests.
+    env!("CARGO_BIN_EXE_xezim").to_string()
 }

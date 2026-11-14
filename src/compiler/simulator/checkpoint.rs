@@ -27,7 +27,10 @@ use serde::ser::{SerializeSeq, Serializer};
 
 /// File magic and format version; bump the last byte with any change to a
 /// state field's type.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x04";
+// §10.3.3 / §28.16: CombItem::ContAssign retains its original delay target.
+// §10.3.3 / §28.16: and the fall and turn-off delays of a select target.
+// Annex D.9 / §8.3: rebuild property-owner indexes from restored classes.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x09";
 
 #[derive(Default)]
 struct Session {
@@ -489,6 +492,10 @@ struct OpenFile {
     pos: u64,
 }
 
+/// `ContCacheEntry::node` of an entry whose key statement is not in its
+/// owner list: the entry is not restored.
+const NO_NODE: u32 = u32::MAX;
+
 /// One `blocking_cont_cache` entry: the statement its key names is found by
 /// its position in the owner list's walk.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -551,6 +558,12 @@ static COMMAND_LINE: std::sync::Mutex<CommandLine> = std::sync::Mutex::new(Comma
 /// `--save-at <time>[,<file>]`: checkpoints to take, as (seconds, path).
 pub fn set_save_at(save_at: Vec<(f64, String)>) {
     COMMAND_LINE.lock().unwrap().save_at = save_at;
+}
+
+/// Whether the driver can write or read a checkpoint in this run.
+pub(super) fn command_line_requested() -> bool {
+    let cl = COMMAND_LINE.lock().unwrap();
+    !cl.save_at.is_empty() || cl.restore.is_some()
 }
 
 /// Whether the run starts from a checkpoint.
@@ -687,6 +700,7 @@ impl Simulator {
             let cl = COMMAND_LINE.lock().unwrap();
             (cl.save_at.clone(), cl.restore.clone())
         };
+        self.checkpoint_requested |= !save_at.is_empty();
         self.checkpoint_muted = false;
         if let Some(path) = restore {
             if let Err(e) = self.checkpoint_restore(&path) {
@@ -823,6 +837,7 @@ impl Simulator {
     /// Write a checkpoint of the state at the end of the current slot.
     pub(super) fn checkpoint_save(&mut self, path: &str) -> Result<(), String> {
         use std::io::Write as _;
+        self.checkpoint_requested = true;
         self.flush_file_writes();
         self.flush_stdout();
         let files = self.checkpoint_files()?;
@@ -952,8 +967,18 @@ impl Simulator {
         self.reopen_files(file.files)?;
         // Caches keyed by an address in the run that wrote the checkpoint.
         self.recv_call_memo.clear();
+        // A checkpoint is taken at the end of a time slot, so every initial
+        // block of the saving run had started; the bodies this build queued
+        // for its own time 0 belong to no restored process.
+        self.lazy_initial.clear();
         self.method_plans.borrow_mut().clear();
         self.fsm_clobber_cache.clear();
+        // Annex D.9 / §8.3: this derived index borrows the class table.
+        // Serializing its Arc values duplicates every declaring class for
+        // every property. Rebuild it lazily from the restored shared table.
+        self.prop_owner_index.borrow_mut().clear();
+        self.task_frame_eligibility.clear();
+        self.task_frame_cache.clear();
         self.class_task_frame_cache.clear();
         // Serialized callable bodies restore with scope caches disabled.
         // Rebuild private runtime bodies on their next call (§13.3/§13.4);
@@ -1021,6 +1046,15 @@ impl Simulator {
         Ok(())
     }
 
+    /// The continuation cache as entries. Every list `stmts_ref` numbers
+    /// here is written in full the first time, and a restore numbers the
+    /// lists in the order it reads them, so an entry is never left out of
+    /// the stream once its owner is numbered: the lists after it would be
+    /// numbered one too high on restore, and a `Seen` reference would name
+    /// the wrong list or none. An entry whose key statement is not in its
+    /// owner list (a fork child's frame owns itself, and its key is the
+    /// statement the frame was cloned from) cannot be carried over, so it
+    /// gets `NO_NODE`, which a restore skips, and no frame.
     fn checkpoint_cont_cache(&self) -> Vec<ContCacheEntry> {
         let mut out = Vec::new();
         for (&(node, kind), (owner, frame)) in &self.blocking_cont_cache {
@@ -1029,19 +1063,21 @@ impl Simulator {
                 StmtsRef::New(..) => with(|s| s.saved.len() as u32 - 1),
                 StmtsRef::Seen(n) => *n,
             };
-            let Some(pos) = with(|s| {
+            let pos = with(|s| {
                 s.saved_stmts
                     .get(&node)
                     .filter(|(n, _)| *n == owner_n)
                     .map(|&(_, p)| p)
-            }) else {
-                continue;
+            });
+            let (node, frame) = match pos {
+                Some(p) => (p, stmts_ref(frame)),
+                None => (NO_NODE, StmtsRef::Seen(owner_n)),
             };
             out.push(ContCacheEntry {
                 owner,
-                node: pos,
+                node,
                 kind,
-                frame: stmts_ref(frame),
+                frame,
             });
         }
         out
@@ -1059,9 +1095,14 @@ impl Simulator {
             }
         }
         for e in entries {
+            // Both lists are admitted even for an entry that is then
+            // skipped: the saving run numbered them.
             let (Some(owner), Some(frame)) = (admit_ref(e.owner), admit_ref(e.frame)) else {
                 continue;
             };
+            if e.node == NO_NODE {
+                continue;
+            }
             let entry = with(|s| {
                 let (o, addrs) = &s.restored[owner as usize];
                 let node = *addrs.get(e.node as usize)?;
@@ -1117,6 +1158,7 @@ checkpoint_state!(
     active_force_skips,
     active_task_pids,
     active_union_tag,
+    adopted_pids,
     annex_n_seed,
     any_struct_formal_markers,
     armed_fast_skips,
@@ -1149,6 +1191,7 @@ checkpoint_state!(
     class_event_prop_names,
     class_gc_heap_len,
     class_gc_live,
+    class_gc_live_signals,
     class_gc_released,
     class_gc_runs,
     class_gc_scan_from,
@@ -1216,6 +1259,7 @@ checkpoint_state!(
     deferred_comb_pool,
     deferred_proc_entries,
     delayed_nba,
+    delayed_slice_chains,
     delayed_updates,
     dirty_any,
     dirty_list,
@@ -1460,7 +1504,6 @@ checkpoint_state!(
     program_initials_live,
     program_pid_scope,
     program_pids,
-    prop_owner_index,
     prop_raw_ty_cache,
     prop_width_memo,
     queue_frame_saves,
@@ -1900,3 +1943,7 @@ pub(super) mod audit {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "checkpoint_property_cache_tests.rs"]
+mod property_cache_tests;

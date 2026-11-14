@@ -35,6 +35,8 @@ mod class_descending_array_members;
 mod class_formal_named_like_struct;
 #[path = "classes/class_formal_typedef_widen.rs"]
 mod class_formal_typedef_widen;
+#[path = "classes/implicit_formal_width_1044.rs"]
+mod implicit_formal_width_1044;
 #[path = "classes/class_interface_same_name.rs"]
 mod class_interface_same_name;
 #[path = "classes/class_member_name_clash.rs"]
@@ -1211,3 +1213,28 @@ mod rand_sub_object_back_handle;
 
 #[path = "classes/rand_solver_sparse_1003.rs"]
 mod rand_solver_sparse_1003;
+
+#[path = "classes/rand_concat_field_equality.rs"]
+mod rand_concat_field_equality;
+
+#[path = "classes/rand_solver_bound_order.rs"]
+mod rand_solver_bound_order;
+
+#[path = "classes/typed_constructor_call.rs"]
+mod typed_constructor_call;
+
+#[path = "classes/typed_constructor_scope.rs"]
+mod typed_constructor_scope;
+
+#[path = "classes/gc_large_payload_reclamation_1054.rs"]
+mod gc_large_payload_reclamation_1054;
+#[path = "classes/class_property_nba_real_targets.rs"]
+mod class_property_nba_real_targets;
+#[path = "classes/static_packed_member_reads.rs"]
+mod static_packed_member_reads;
+#[path = "classes/type_param_struct_members_1082.rs"]
+mod type_param_struct_members_1082;
+#[path = "classes/redeclared_property_base_scope_1064.rs"]
+mod redeclared_property_base_scope_1064;
+#[path = "classes/static_packed_member_writes_1046.rs"]
+mod static_packed_member_writes_1046;

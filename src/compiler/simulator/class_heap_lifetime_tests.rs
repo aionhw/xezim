@@ -228,6 +228,53 @@ fn default_reclamation_bounds_live_objects_under_churn() {
     assert!(live < 25_000, "{live} objects still live after 60000 allocations");
 }
 
+// §8.7 (#1054): the elements of a fixed array member are name-keyed values
+// of their own, so objects far fewer than the allocation threshold can hold
+// most of the store. Their growth triggers a collection too.
+#[test]
+fn array_payloads_trigger_reclamation_below_the_allocation_count() {
+    if super::heap_gc::class_gc_mode() != super::heap_gc::ClassGcMode::On {
+        return;
+    }
+    let sim = crate::simulate(
+        r#"
+        class Item;
+          byte data[256];
+        endclass
+        module top;
+          Item h, kept;
+          initial begin
+            for (int n = 0; n < 2048; n++) begin
+              h = new();
+              h.data[0] = 7;
+              h.data[255] = n[6:0];
+              if (n == 17) kept = h;
+              h = null;
+              if (n % 64 == 63) #1;
+            end
+            if (kept.data[0] != 7 || kept.data[255] != 17) $fatal(1, "retained data lost");
+            $display("PAYLOAD_PASS");
+            $finish;
+          end
+        endmodule
+    "#,
+        100_000,
+    )
+    .expect("payload fixture");
+    assert_eq!(sim.error_count, 0);
+    assert!(
+        sim.output
+            .iter()
+            .any(|o| o.message.contains("PAYLOAD_PASS"))
+    );
+    assert!(sim.class_gc_runs > 0, "no collection ran");
+    let live = sim.heap.iter().filter(|o| o.is_some()).count();
+    assert!(
+        live < 1024,
+        "{live} objects still live after 2048 allocations"
+    );
+}
+
 /// §8.7 / §15.4.3: a captured pattern, rather than its tagged token, owns
 /// the object until a queued message is consumed.
 #[test]

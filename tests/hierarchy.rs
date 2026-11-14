@@ -407,6 +407,9 @@ mod vif_nested_instance_570;
 
 #[path = "hierarchy/nonansi_child_port_width_572.rs"]
 mod nonansi_child_port_width_572;
+
+#[path = "hierarchy/clocking_unpacked_array_input.rs"]
+mod clocking_unpacked_array_input;
 #[path = "hierarchy/nested_iface_vif_612.rs"]
 mod nested_iface_vif_612;
 #[path = "hierarchy/own_definition_name_assign_target.rs"]
@@ -467,3 +470,20 @@ mod struct_member_actuals;
 
 #[path = "hierarchy/package_header_shadow_995.rs"]
 mod package_header_shadow_995;
+
+#[path = "hierarchy/generate_child_label_refs.rs"]
+mod generate_child_label_refs;
+#[path = "hierarchy/review_tri_port_net_types.rs"]
+mod review_tri_port_net_types;
+#[path = "hierarchy/modport_qualified_access.rs"]
+mod modport_qualified_access;
+#[path = "hierarchy/defparam_targets_core_199.rs"]
+mod defparam_targets_core_199;
+#[path = "hierarchy/bind_instance_lists_core_200.rs"]
+mod bind_instance_lists_core_200;
+#[path = "hierarchy/bind_instance_names_core_201.rs"]
+mod bind_instance_names_core_201;
+#[path = "hierarchy/instance_struct_members_root_1046.rs"]
+mod instance_struct_members_root_1046;
+#[path = "hierarchy/shared_net_initializer_targets.rs"]
+mod shared_net_initializer_targets;

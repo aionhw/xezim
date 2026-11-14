@@ -88,9 +88,14 @@ impl Simulator {
 
     pub(super) fn mark_release_sources_dirty(&mut self, id: usize) {
         let mut sources: Vec<usize> = Vec::new();
+        let mut constant_drivers: Vec<CombEntry> = Vec::new();
         for entry in self.comb_entries.iter() {
             if entry.cold.write_signal_ids.contains(&id) {
-                sources.extend(entry.cold.read_signal_ids.iter().copied());
+                if entry.cold.read_signal_ids.is_empty() {
+                    constant_drivers.push(entry.clone());
+                } else {
+                    sources.extend(entry.cold.read_signal_ids.iter().copied());
+                }
             }
         }
         for src_id in sources {
@@ -100,6 +105,25 @@ impl Simulator {
                 self.dirty_any = true;
             }
         }
+        // §10.6.2: a driver that reads no signal (`wire w = 4'h5;`,
+        // `assign w = 4'h6;`) is never re-run by a dirty mark, so the
+        // released net kept the forced value. Re-run it here; its value does
+        // not depend on evaluation order.
+        for entry in &constant_drivers {
+            self.eval_released_comb_entry(entry);
+        }
+    }
+
+    /// §10.6.2 / §21.2.1.7: evaluating a net's driver uses its declaration
+    /// scope, then returns to the scope of the procedure doing the release.
+    pub(super) fn eval_released_comb_entry(&mut self, entry: &CombEntry) {
+        let scope = std::mem::take(&mut self.m_block_scope);
+        let scope_id = self.m_block_scope_id;
+        let active = self.m_block_active;
+        self.eval_comb_entry_full(entry);
+        self.m_block_scope = scope;
+        self.m_block_scope_id = scope_id;
+        self.m_block_active = active;
     }
 
     /// Level-BSP combinational settle (XEZIM_BSP_SETTLE=1). Reaches the SAME
@@ -607,10 +631,12 @@ impl Simulator {
                 lhs,
                 rhs,
                 delay: explicit_delay,
+                delay_target,
             } => {
                 if let Some(c) = entry.cold.cov {
                     self.cov_count(c);
                 }
+                let delay_target = delay_target.as_deref().copied();
                 let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = std::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
@@ -704,6 +730,7 @@ impl Simulator {
                     self.packed_array_copy_values.insert(ids, val.clone());
                 }
                 if delay > 0
+                    || delay_target.is_some_and(|t| t.select_delays.is_some())
                     || lhs_id.is_some_and(|id| {
                         self.gate_fall_delay_by_id.contains_key(&id)
                             || self.gate_off_delay_by_id.contains_key(&id)
@@ -712,7 +739,7 @@ impl Simulator {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {
                             if !self.delayed_update_pending_is(id, &val) {
-                                self.schedule_delayed_with_delay(id, val, delay);
+                                self.schedule_delayed_transition(id, val, delay, delay_target);
                             }
                         } else {
                             self.cancel_delayed(id);
@@ -723,6 +750,27 @@ impl Simulator {
                         // this used to DROP the write silently. Composes
                         // against the PENDING delayed value (issue #143).
                         let sel_val = val.resize(sel_w);
+                        // §10.3.3 / §28.16: the select's own transition
+                        // delay, from the selected bits' current value.
+                        let delay = match delay_target {
+                            Some(DelayTarget {
+                                vector,
+                                select_delays: Some((fall, off)),
+                                ..
+                            }) => {
+                                let hi = (lo + sel_w - 1) as usize;
+                                let old = self.signal_table[base_id].range_select(hi, lo as usize);
+                                Self::transition_delay(
+                                    &sel_val,
+                                    &old,
+                                    delay,
+                                    fall,
+                                    off,
+                                    vector || sel_w > 1,
+                                )
+                            }
+                            _ => delay,
+                        };
                         self.schedule_delayed_slice(base_id, lo, sel_w, &sel_val, delay);
                     }
                 } else if let Some(id) = lhs_id {

@@ -597,11 +597,12 @@ impl Simulator {
     pub(super) fn strength_bit(ds: &[(i8, i8, Option<bool>, Value)], i: usize) -> Option<(i8, i8)> {
         let mut acc: Option<(i8, i8)> = None;
         for (s0, s1, on, v) in ds {
-            let b = if i < v.width as usize {
-                v.get_bit(i)
-            } else {
-                LogicBit::Zero
-            };
+            // §5.7: an unsized `'1`/`'z`/`'x`/`'0` driver value is a FILL —
+            // `get_bit` replicates it into the wider context. The old
+            // bounds guard (`i < v.width else Zero`) instead clamped the
+            // fill's value to bit 0, so `assign (weak0,weak1) n = '1;` on an
+            // 8-bit net pulled only `n[0]` up (#1061).
+            let b = v.get_bit(i);
             let mut r = match b {
                 LogicBit::Zero => (-*s0, -*s0),
                 LogicBit::One => (*s1, *s1),
@@ -1142,6 +1143,110 @@ impl Simulator {
                 let bound =
                     self.bind_type_params_in(dt, &|name| self.obj_type_param(handle, cn, name));
                 return super::elaborate::is_type_two_state_resolved(
+                    bound.as_ref().unwrap_or(dt),
+                    &self.module.typedef_types,
+                );
+            }
+            if cd.properties.contains_key(prop) {
+                return false;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
+    /// Whether some class declares a property `prop` (or `C::prop`) that can
+    /// hold a `real`: one declared real, or one typed by a class type
+    /// parameter (`class_real_props`). Keeps the declared-type walks below
+    /// off the assignments that cannot name one.
+    #[inline]
+    pub(super) fn may_name_real_class_prop(&self, prop: &str) -> bool {
+        if self.class_real_props.is_empty() {
+            return false;
+        }
+        let leaf = prop.rsplit_once("::").map_or(prop, |(_, l)| l);
+        self.class_real_props.contains(leaf)
+    }
+
+    /// The `class_real_props` of a design: the class properties declared
+    /// `real`, `shortreal` or `realtime` (or a typedef of one), or typed by a
+    /// class type parameter, which a specialization can bind to one.
+    pub(super) fn collect_class_real_props(module: &ElaboratedModule) -> HashSet<String> {
+        let mut out = HashSet::default();
+        for cd in module.classes.values() {
+            for (name, dt) in &cd.property_types {
+                let real = match dt {
+                    DataType::TypeReference { name: tn, .. } => {
+                        cd.type_param_names.iter().any(|t| *t == tn.name.name)
+                            || cd.typedef_targets.get(&tn.name.name).is_some_and(|t| {
+                                super::elaborate::is_type_real_resolved(t, &module.typedef_types)
+                            })
+                            || super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
+                    }
+                    _ => super::elaborate::is_type_real_resolved(dt, &module.typedef_types),
+                };
+                if real {
+                    out.insert(name.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether property `prop` of the object `handle` is declared `real`
+    /// (or a typedef of one). The twin of `class_prop_two_state`: a real
+    /// property has no integral width, so `class_prop_width_impl` answers
+    /// None for it and a caller that must still size a store (an NBA
+    /// lvalue) needs the real-ness itself.
+    pub(super) fn class_prop_is_real(&self, handle: usize, prop: &str) -> bool {
+        let Some(Some(inst)) = self.heap.get(handle) else {
+            return false;
+        };
+        let (start, prop) = prop
+            .rsplit_once("::")
+            .unwrap_or((inst.class_name.as_str(), prop));
+        self.class_prop_is_real_in(start, prop, handle)
+    }
+
+    /// The declared-type walk behind `class_prop_is_real`, started from a
+    /// class NAME — for an owner-qualified static (`C::prop`) where no
+    /// object exists. `handle` 0 (null) leaves a type parameter unbound,
+    /// which a real declaration never is.
+    pub(super) fn class_prop_is_real_in(&self, start: &str, prop: &str, handle: usize) -> bool {
+        if !self.may_name_real_class_prop(prop) {
+            return false;
+        }
+        let mut cur = Some(start);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                return false;
+            };
+            if let Some(dt) = cd.property_types.get(prop) {
+                // A class-local typedef first, then the design's.
+                let dt = match dt {
+                    DataType::TypeReference { name, .. } => {
+                        cd.typedef_targets.get(&name.name.name).unwrap_or(dt)
+                    }
+                    _ => dt,
+                };
+                // §8.25: a type parameter the object binds to a real type.
+                // `bind_type_params_in` answers only integral bindings.
+                if let DataType::TypeReference { name, .. } = dt
+                    && !name.has_scope()
+                    && cd.type_param_names.iter().any(|t| *t == name.name.name)
+                    && let Some(b) = self.obj_type_param(handle, cn, &name.name.name)
+                {
+                    let b = b.trim();
+                    return matches!(b, "real" | "shortreal" | "realtime")
+                        || self.module.typedef_types.get(b).is_some_and(|t| {
+                            super::elaborate::is_type_real_resolved(t, &self.module.typedef_types)
+                        });
+                }
+                // §8.25: the state domain of a type parameter belongs to
+                // this object, including when another specialization calls it.
+                let bound =
+                    self.bind_type_params_in(dt, &|name| self.obj_type_param(handle, cn, name));
+                return super::elaborate::is_type_real_resolved(
                     bound.as_ref().unwrap_or(dt),
                     &self.module.typedef_types,
                 );

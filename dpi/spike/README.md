@@ -12,7 +12,7 @@ ISS-wrap module is a one-screen change.
 ## Two build modes
 
 ```bash
-# Stub mode — returns canned values, builds with just g++
+# Stub mode — returns canned values, builds with just clang++
 make
 # real Spike — links libriscv.so + libfesvr.a + libsoftfloat.so
 make real SPIKE_PREFIX=/path/to/spike/install
@@ -26,7 +26,7 @@ testbench wiring) without depending on Spike. `make real` enables the
 ## Smoke test (real Spike, end-to-end)
 
 ```bash
-make real SPIKE_PREFIX=/home/bondan/gnu      # build .so against libriscv
+make real SPIKE_PREFIX=/path/to/spike/install   # build .so against libriscv
 make test-elf RISCV_PREFIX=riscv64-unknown-elf-   # cross-compile asm test
 xezim -s tb -I . --dpi-lib ./xezim_spike_dpi.so test_spike_dpi.sv
 ```

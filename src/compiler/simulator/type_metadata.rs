@@ -2414,13 +2414,16 @@ impl Simulator {
     pub(super) fn packed_dims_are_literal(dt: &DataType) -> bool {
         use crate::ast::types::PackedDimension;
         match dt {
-            DataType::IntegerVector { dimensions, .. } => dimensions.iter().all(|d| match d {
-                PackedDimension::Range { left, right, .. } => {
-                    matches!(left.kind, ExprKind::Number(_))
-                        && matches!(right.kind, ExprKind::Number(_))
-                }
-                PackedDimension::Unsized(_) => false,
-            }),
+            DataType::Implicit { dimensions, .. } if dimensions.is_empty() => false,
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                dimensions.iter().all(|d| match d {
+                    PackedDimension::Range { left, right, .. } => {
+                        matches!(left.kind, ExprKind::Number(_))
+                            && matches!(right.kind, ExprKind::Number(_))
+                    }
+                    PackedDimension::Unsized(_) => false,
+                })
+            }
             _ => false,
         }
     }

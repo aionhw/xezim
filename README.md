@@ -13,7 +13,7 @@
   <a href="https://github.com/aionhw/xezim/actions/workflows/test.yml"><img alt="CI" src="https://github.com/aionhw/xezim/actions/workflows/test.yml/badge.svg"></a>
   <a href="https://github.com/aionhw/xezim/tags"><img alt="Release" src="https://img.shields.io/github/v/tag/aionhw/xezim?label=release&amp;color=informational"></a>
   <a href="https://github.com/chipsalliance/sv-tests"><img alt="sv-tests: 99.0%" src="https://img.shields.io/badge/sv--tests-99.0%25-brightgreen"></a>
-  <a href="docs/building.md#requirements"><img alt="Rust 1.92+" src="https://img.shields.io/badge/rust-1.92%2B-orange"></a>
+  <a href="docs/building.md#requirements"><img alt="Rust 1.100+" src="https://img.shields.io/badge/rust-1.100%2B-orange"></a>
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-blue"></a>
 </p>
 
@@ -76,6 +76,8 @@
 - DPI-C, the IEEE 1800 VPI (routines, callbacks and the design object
   model), and [cocotb](contrib/cocotb) Python testbenches
 - Diagnostics that name the file, line and macro a problem came from
+- Opt-in [memory tracing](docs/user-guide.md#diagnosing-memory-growth) during
+  parsing, elaboration and simulation setup
 
 </td>
 </tr>
@@ -94,7 +96,7 @@
 
 **Open**
 - Apache 2.0 licensed, developed in the open
-- More than 6,000 regression tests, many checked against a commercial
+- More than 7,000 regression tests, many checked against a commercial
   reference simulator
 - Built with AI assistance as part of the engineering workflow
 
@@ -186,6 +188,17 @@ own workload and keep the
 [Native compilation](docs/user-guide.md#native-compilation) pays on designs
 with few, very hot blocks, so measure it on yours.
 
+Xezim 0.11.6 also shares net-initializer targets across child instances.
+On the synthetic [#721 fixture](https://github.com/aionhw/xezim/issues/721#issuecomment-6863295230)
+(32,768 instances, 32 initialized nets each), median peak RSS fell from
+1,431 to 1,105 MiB (22.8%), and compile time from 8.40 to 7.89 seconds.
+These are three alternating runs per build with tracing and caches disabled,
+Rust 1.100, no LTO and 64 codegen units. The explicit-assignment control's
+memory and time changed by less than 1%. This measures one allocation cost;
+the original full-design OOM remains unverified. See
+[diagnosing memory growth](docs/user-guide.md#diagnosing-memory-growth) to
+investigate your own workload.
+
 ## Conformance
 
 - **sv-tests:** Xezim 0.11.0 passes 4,722 of 4,770 tests (99.0%) of the
@@ -193,7 +206,9 @@ with few, very hot blocks, so measure it on yours.
 - **UVM:** the mbits-mirafra AVIP base tests for AXI4, APB, I3C, SPI and
   AXI4-Lite print the same UVM messages as a commercial reference simulator,
   and 32 of 35 UVM 1800.2-2017 example testbenches pass.
-- **Regression suite:** 6,610 default tests and two JIT smoke tests run in CI. Many are differential tests whose expected values were measured on a
+- **Regression suite:** the default release suite passes 7,052 tests, with one
+  existing ignored test; CI also runs two JIT smoke tests. Many are
+  differential tests whose expected values were measured on a
   commercial reference simulator; see [CONTRIBUTING.md](CONTRIBUTING.md#test-suites).
 
 ## Documentation
@@ -201,7 +216,7 @@ with few, very hot blocks, so measure it on yours.
 | Guide | Contents |
 |---|---|
 | [Supported features](docs/features.md) | Language, UVM, coverage, debug and integration features in detail |
-| [User guide](docs/user-guide.md) | Running simulations, waveforms, checkpoints, design cache, native compilation, timescales, sources written for other simulators |
+| [User guide](docs/user-guide.md) | Running simulations, waveforms, checkpoints, design cache, memory diagnostics, native compilation, timescales, sources written for other simulators |
 | [Command-line reference](docs/command-line.md) | Every option and environment variable, and the spellings of other simulators that Xezim accepts |
 | [UVM guide](docs/uvm-guide.md) | Running UVM testbenches, supported features, UVM's DPI-C library |
 | [DPI and VPI guide](docs/dpi-guide.md) | Loading C and C++ libraries, the VPI surface |

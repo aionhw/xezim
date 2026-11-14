@@ -13,6 +13,10 @@ simulator".
    worker), so deep UVM elaborations work in either build — but older
    binaries without that guard overflow the default 8 MiB main stack in
    debug builds ("thread 'main' has overflowed its stack").
+   If worker creation fails, the CLI retries 1024, 512, 256, 128 and 64 MiB stacks
+   below the requested size, then the current thread, and warns with the
+   selected stack and a remedy (`XEZIM_STACK_MB`, or `ulimit -s` for the
+   current thread).
 2. **Minimize first.** Almost every bug in this repo's history fell to a
    <30-line single-file repro. Cut the design in half repeatedly; keep the
    `$display` markers.
@@ -30,6 +34,9 @@ simulator".
 
 ## Elaboration tracing (env vars)
 
+- `XEZIM_OOM_TRACE=memory.jsonl` — stream memory diagnostics to a JSONL file;
+  `1` writes to stderr and `0` disables tracing. See
+  [Tracing memory growth](#tracing-memory-growth) below.
 - `XEZIM_TRACE_TYPE=<substr>[,<substr>...]` — trace every typedef-width
   registration, overwrite, and resolution whose key contains a pattern.
   Answers "who set this type's width, and to what, in which pass?"
@@ -37,6 +44,55 @@ simulator".
   site is tagged with its source line).
 - `--elab-stats` style output and `[PHASE]` lines show where compile time
   and table sizes go.
+
+## Tracing memory growth
+
+Run the failing command with tracing enabled. Use `--no-cache` to capture
+parsing and elaboration even when a cached design exists:
+
+```sh
+XEZIM_OOM_TRACE=memory.jsonl xezim --compile --no-cache -f files.f -s top
+tail -n 20 memory.jsonl
+```
+
+The trace appends JSON records on entry to and exit from source work, at
+pipeline checkpoints, and once per second while work is active. Each record
+includes `phase`, `source` (file and line when available), `definition`,
+`instance`, elapsed time, current and peak RSS in KiB, the RSS change since
+the preceding record, and the latest table counts. Linux supplies the RSS
+fields; other platforms report `null`. The trace works with `--simulate`
+too, including simulator construction and bytecode compilation milestones.
+Array-storage records put the array name in `instance` and report its cell
+count and element width before allocating storage. Global reservation
+records report total cells or packed capacity bytes.
+
+To inspect growth alongside its active source:
+
+```sh
+jq -r '[.elapsed_ms,.rss_kib,.delta_rss_kib,.phase,.source,.instance] | @tsv' memory.jsonl
+```
+
+For #721, compare compilation-unit injection records (`unit_variables`,
+`unit_nets`, `unit_assertions`, `module_items`) with instance preparation
+records (`signals`, `parameters`, `prepared_bodies`) and retained contexts
+(`type_bindings`, `type_widths`, `type_queries`, `port_bindings`). Repeated
+signal growth for small repeated instances points to duplicated storage;
+many distinct prepared bodies or large retained maps suggest other paths.
+Counts are lengths of containers at the latest checkpoint, not heap bytes.
+
+Every record is written immediately, without retaining a history or copying
+the design. A kill may leave a partial final line; preceding complete lines
+remain usable. Files append across invocations, and each trace starts with
+`event: "start"` and sequence 1. An absent `finish` record alone does not
+prove an OOM: early process exits also bypass cleanup. Keep the memory
+watchdog enabled and check the exit status and kernel/container evidence.
+
+RSS measures the whole process, including allocator retention, so growth
+beside a source location identifies where to investigate rather than proving
+that the named object owns those bytes. Tracing adds I/O and sampling costs;
+disable it for performance measurements. `XEZIM_OOM_TRACE=1` writes JSONL
+to stderr alongside normal diagnostics. An unwritable destination disables
+tracing with a diagnostic and preserves the design's result.
 
 ## Runtime tracing
 

@@ -64,6 +64,7 @@ const SEQUENCES_TRAFFIC: Group = Group {
         uvm_integration_tests::uvm_2020_complete_bench_runs_traffic,
         uvm_integration_tests::uvm_2020_traffic_is_independent_of_method_policy,
         uvm_integration_tests::uvm_1_2_sequencer_driver_handshake,
+        uvm_integration_tests::uvm_1_2_user_sequencer_redeclares_req_fifo,
         uvm_integration_tests::uvm_2020_sequence_field_get_type_resolves_declared_type,
         uvm_integration_tests::stress_bench_items_flow_end_to_end_1_2,
     ],

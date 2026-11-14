@@ -339,7 +339,7 @@ fn sigint_during_a_blocked_dpi_call_flushes_the_fst() {
          void c_block(void) { fprintf(stderr, \"BLOCKING\\n\"); fflush(stderr); sleep(30); }\n",
     );
     let so = s.path("dpi", "so");
-    let ok = Command::new("cc")
+    let ok = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .args(["-shared", "-fPIC"])
         .arg(&c)
         .arg("-o")

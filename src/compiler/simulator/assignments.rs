@@ -226,6 +226,13 @@ impl Simulator {
                             .contains_key(h.path[0].name.name.as_str())
                         && !self.signals.contains_key(&h.path[0].name.name),
                 );
+                // §23.6: `$root.top.x` is the absolute `top.x`, which the
+                // top module's own storage spells `x`.
+                let skip = if h.path.len() >= 3 && h.path[0].name.name == "$root" {
+                    1 + usize::from(h.path[1].name.name == self.module.name)
+                } else {
+                    skip
+                };
                 let segs = &h.path[skip..];
                 // The overwhelmingly common shape is a single segment; the
                 // Vec + join below allocates twice for it. This is the
@@ -572,11 +579,14 @@ impl Simulator {
                     let drivers: Vec<CombEntry> = self
                         .comb_entries
                         .iter()
-                        .filter(|e| e.cold.write_signal_ids.contains(&id))
+                        .filter(|e| {
+                            e.cold.write_signal_ids.contains(&id)
+                                && !e.cold.read_signal_ids.is_empty()
+                        })
                         .cloned()
                         .collect();
                     for entry in &drivers {
-                        self.eval_comb_entry_full(entry);
+                        self.eval_released_comb_entry(entry);
                     }
                 }
             }
@@ -1262,8 +1272,18 @@ impl Simulator {
                     let ew = self.module.packed_signal_elem_widths.get(&mkey).copied();
                     let (step_w, slot) = if idxs.len() == 1 {
                         // A member with no element width is a plain vector:
-                        // the index is a bit select.
-                        (ew.unwrap_or(1), u32::try_from(idxs[0]).ok()?)
+                        // the index is a bit select. §7.4.1: an element of a
+                        // packed-array member is labelled by its declared
+                        // range, so `pair[0]` of `lane_t [0:1] pair` is the
+                        // MOST significant lane.
+                        let slot = match self.module.packed_full_dims.get(&mkey) {
+                            Some(dims) if ew.is_some() => Self::flatten_packed_slot_iter(
+                                idxs.iter().copied(),
+                                Some(dims.as_slice()),
+                            )?,
+                            _ => u32::try_from(idxs[0]).ok()?,
+                        };
+                        (ew.unwrap_or(1), slot)
                     } else {
                         let ew = ew?;
                         let dims = self.module.packed_full_dims.get(&mkey)?;

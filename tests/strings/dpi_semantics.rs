@@ -24,7 +24,7 @@ fn dpi_header_width_helpers_have_defined_c_shifts() {
         .as_nanos();
     let binary =
         std::env::temp_dir().join(format!("dpi_width_check_{}_{}", std::process::id(), nanos));
-    let built = Command::new("cc")
+    let built = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .args([
             "-fsanitize=undefined",
             "-fno-sanitize-recover=undefined",
@@ -66,7 +66,7 @@ fn compile(c_file: &str) -> PathBuf {
         .as_nanos();
     let stem = Path::new(c_file).file_stem().unwrap().to_string_lossy();
     let so = std::env::temp_dir().join(format!("{}_{}_{}.so", stem, std::process::id(), nanos));
-    let mut cc = Command::new("cc");
+    let mut cc = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()));
     cc.args(["-shared", "-fPIC"]);
     if cfg!(target_os = "macos") {
         // The exported subroutines resolve when xezim loads the library.

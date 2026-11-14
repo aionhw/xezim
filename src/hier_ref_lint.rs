@@ -1036,7 +1036,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
     for p in &elab.pending_cont_assign {
         if p.origin_span.is_some() {
             let mut refs = Vec::new();
-            expr_refs(&p.lhs_source, &mut refs);
+            expr_refs(&p.source_lhs(), &mut refs);
             expr_refs(&p.rhs_source, &mut refs);
             let scope = p.ctx.prefix.trim_end_matches('.').to_string();
             add(

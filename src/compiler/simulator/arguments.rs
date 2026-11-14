@@ -170,10 +170,11 @@ impl Simulator {
                 || val.less_equal(&self.eval_expr(hi)).is_true();
             return lo_ok && hi_ok;
         }
-        if let Some(nm) = self.array_operand_name(pat) {
-            let sz = self.get_queue_size(&nm);
-            for i in 0..sz {
-                if let Some(ev) = self.get_signal_value_by_name(&format!("{}[{}]", nm, i)) {
+        // An array item, also an associative one or a call returning an
+        // array (§11.4.13, §13.4.1), matches any of its elements.
+        if let Some(keys) = self.inside_operand_keys(pat) {
+            for key in keys {
+                if let Some(ev) = self.get_signal_value_by_name(&key) {
                     if val.wildcard_eq(&ev).is_true() {
                         return true;
                     }
@@ -736,8 +737,10 @@ impl Simulator {
     /// A formal no collection, struct, array or associative binder claims:
     /// no unpacked dimensions and a built-in integral, real or string type.
     pub(super) fn port_is_plain_scalar(port: &crate::ast::decl::FunctionPort) -> bool {
+        // §13.5.1: `[W-1:0] v` is an integral formal even when the
+        // declaration omits `logic`; its actual takes the declared width.
         port.dimensions.is_empty()
-            && matches!(
+            && (matches!(
                 port.data_type,
                 DataType::IntegerAtom { .. }
                     | DataType::IntegerVector { .. }
@@ -746,7 +749,7 @@ impl Simulator {
                         kind: crate::ast::types::SimpleType::String,
                         ..
                     }
-            )
+            ) || matches!(&port.data_type, DataType::Implicit { dimensions, .. } if !dimensions.is_empty()))
     }
 
     /// The SHAPE a call actual may be context-sized for: a plain scalar
@@ -818,15 +821,20 @@ impl Simulator {
             }
         }
         match dt {
-            DataType::IntegerVector { dimensions, .. } => dimensions.iter().all(|d| match d {
-                PackedDimension::Range { left, right, .. } => {
-                    name_free(left)
-                        && name_free(right)
-                        && crate::elaborate::const_eval_i64_with_params(left, None).is_some()
-                        && crate::elaborate::const_eval_i64_with_params(right, None).is_some()
-                }
-                PackedDimension::Unsized(_) => false,
-            }),
+            // An omitted formal type can inherit the preceding formal's
+            // type (§13.5.2); an empty placeholder is not a one-bit vector.
+            DataType::Implicit { dimensions, .. } if dimensions.is_empty() => false,
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                dimensions.iter().all(|d| match d {
+                    PackedDimension::Range { left, right, .. } => {
+                        name_free(left)
+                            && name_free(right)
+                            && crate::elaborate::const_eval_i64_with_params(left, None).is_some()
+                            && crate::elaborate::const_eval_i64_with_params(right, None).is_some()
+                    }
+                    PackedDimension::Unsized(_) => false,
+                })
+            }
             _ => false,
         }
     }
@@ -843,7 +851,9 @@ impl Simulator {
         }
         let mut width = self.actual_context_width(port);
         if width.is_none() && Self::actual_ctx_shape(port) {
-            if let DataType::IntegerVector { dimensions, .. } = &port.data_type {
+            if let DataType::IntegerVector { dimensions, .. }
+            | DataType::Implicit { dimensions, .. } = &port.data_type
+            {
                 if let [crate::ast::types::PackedDimension::Range { left, right, .. }] =
                     dimensions.as_slice()
                 {

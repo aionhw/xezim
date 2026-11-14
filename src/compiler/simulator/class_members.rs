@@ -2968,6 +2968,186 @@ impl Simulator {
         v
     }
 
+    /// §8.9, §7.2.1: a member of a class STATIC property whose declared type
+    /// is a PACKED struct — `Cls::sp.m`, `h.sp.m` through a handle of the
+    /// class, or `sp.m` inside the class, at any member depth, in either parse
+    /// shape (a flat dotted identifier, or the `MemberAccess` chain inside a
+    /// subroutine body). The whole property resolves through
+    /// `class_static_get`; the member slices that shared cell by the packed
+    /// layout. Without this the reference fell through every read arm and
+    /// returned a 32-bit 0 while the whole-property read was correct.
+    /// Unpacked-struct statics keep their holder-object storage
+    /// (`static_struct_names`) and are not claimed here.
+    pub(super) fn static_packed_member_value(&mut self, e: &Expression) -> Option<Value> {
+        // Cheap gate: some name before the last must be a static property
+        // that can be a struct (`static_struct_props`).
+        if self.static_struct_props.is_empty() {
+            return None;
+        }
+        let statics = &self.static_struct_props;
+        let candidate = match &e.kind {
+            ExprKind::Ident(h) if h.root.is_none() && h.path.len() >= 2 => {
+                h.path.iter().all(|s| s.selects.is_empty())
+                    && h.path[..h.path.len() - 1]
+                        .iter()
+                        .any(|s| statics.contains(s.name.name.as_str()))
+            }
+            ExprKind::MemberAccess { expr, .. } => {
+                let mut cur: &Expression = expr;
+                let mut hit = false;
+                loop {
+                    match &cur.kind {
+                        ExprKind::MemberAccess { expr, member } => {
+                            hit |= statics.contains(member.name.as_str());
+                            cur = expr;
+                        }
+                        ExprKind::Ident(h) if h.root.is_none() => {
+                            break hit
+                                || (h.path.iter().all(|s| s.selects.is_empty())
+                                    && h.path
+                                        .iter()
+                                        .any(|s| statics.contains(s.name.name.as_str())));
+                        }
+                        // `this.sp.m` in a method of the class.
+                        ExprKind::This => break hit,
+                        _ => return None,
+                    }
+                }
+            }
+            _ => false,
+        };
+        if !candidate {
+            return None;
+        }
+        // The dotted spelling, outermost name first.
+        let mut names: Vec<&str> = Vec::new();
+        match &e.kind {
+            ExprKind::Ident(h) => names.extend(h.path.iter().map(|s| s.name.name.as_str())),
+            _ => {
+                let mut cur = e;
+                while let ExprKind::MemberAccess { expr, member } = &cur.kind {
+                    names.push(member.name.as_str());
+                    cur = expr;
+                }
+                if let ExprKind::Ident(h) = &cur.kind {
+                    names.extend(h.path.iter().rev().map(|s| s.name.name.as_str()));
+                } else if !matches!(cur.kind, ExprKind::This) {
+                    return None;
+                }
+                names.reverse();
+            }
+        }
+        // `this.sp.m` names the running object's class's static.
+        if names.first() == Some(&"this") {
+            names.remove(0);
+        }
+        if names.len() < 2 {
+            return None;
+        }
+        let shadowed = |sim: &Self, n: &str| {
+            sim.signal_name_to_id.contains_key(n)
+                || sim.local_stack.last().is_some_and(|l| l.contains_key(n))
+        };
+        // The class whose static `prop` is named, and the member path below it.
+        let (cls, prop, members): (String, &str, &[&str]) = if names.len() >= 3
+            && let Some(cls) =
+                (if self.module.classes.contains_key(names[0]) && !shadowed(self, names[0]) {
+                    Some(names[0].to_string())
+                } else {
+                    self.class_of_var(names[0])
+                })
+            && self.static_prop_key(&cls, names[1]).is_some()
+        {
+            // `Cls::sp.m`, or `h.sp.m` through a handle of the class.
+            (cls, names[1], &names[2..])
+        } else if !shadowed(self, names[0])
+            && let Some(cls) = self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+                .map(|o| o.class_name.clone())
+                .or_else(|| self.class_context_stack.last().cloned().flatten())
+            && self.static_prop_key(&cls, names[0]).is_some()
+        {
+            // `sp.m` inside a method of the class.
+            (cls, names[0], &names[1..])
+        } else {
+            return None;
+        };
+        // The declaring class on the chain owns the property's type (an
+        // inherited static's declaration lives there).
+        let mut dt = {
+            let mut cur = self.module.classes.get(&cls);
+            let mut found = None;
+            for _ in 0..64 {
+                let Some(c) = cur else { break };
+                if let Some(dt) = self.class_prop_decl_type(c, prop) {
+                    found = Some(dt.clone());
+                    break;
+                }
+                cur = c
+                    .extends
+                    .as_deref()
+                    .and_then(|x| self.module.classes.get(x));
+            }
+            found?
+        };
+        // §6.20.3/§8.25: a static declared through a class type parameter
+        // (`static T sp;`) has the type its binding names.
+        if let Some(bound) = self
+            .type_param_concrete_in(&dt, &cls)
+            .and_then(|c| self.bound_typedef_dt(&c))
+        {
+            dt = bound;
+        }
+        // Walk the member path through the packed layouts: each level's
+        // offset is relative to the enclosing member's least significant bit.
+        let (mut off, mut w) = (0u32, 0u32);
+        for m in members {
+            let DataType::Struct(su) = self.resolve_dt(&dt) else {
+                return None;
+            };
+            if Self::spreads_member_wise(&su) {
+                return None;
+            }
+            let (fields, _) = self.packed_agg_layout_with(&su, &self.module.parameters);
+            let &(_, o, fw) = fields.iter().find(|(n, _, _)| n == m)?;
+            off += o;
+            w = fw;
+            dt = su
+                .members
+                .iter()
+                .find(|sm| sm.declarators.iter().any(|d| d.name.name == *m))?
+                .data_type
+                .clone();
+        }
+        let whole = self.class_static_get(&cls, prop)?;
+        if w == 0 || (off + w) as usize > whole.width as usize {
+            return None;
+        }
+        Some(whole.range_select((off + w - 1) as usize, off as usize))
+    }
+
+    /// The static class properties declared with a struct or a named type
+    /// (a typedef can name a packed struct): the names
+    /// `static_packed_member_value` can claim.
+    pub(super) fn collect_static_struct_props(module: &ElaboratedModule) -> HashSet<String> {
+        let mut out = HashSet::default();
+        for cd in module.classes.values() {
+            for name in &cd.static_properties {
+                if matches!(
+                    cd.property_types.get(name),
+                    Some(DataType::Struct(_) | DataType::TypeReference { .. })
+                ) {
+                    out.insert(name.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// §8.9: the class and specialization of the static `member` reached
     /// through property `prop` of object `owner` when that property holds
     /// null: the property's declared type decides.
@@ -3158,6 +3338,38 @@ impl Simulator {
             .map(|h| h as usize)
     }
 
+    /// `member_handle` of `handle.member` read through a reference whose
+    /// declared class is `view` (§8.14): a member a derived class redeclares
+    /// is the copy `view` sees, not the object's leaf copy.
+    pub(super) fn member_handle_viewed(
+        &self,
+        handle: usize,
+        member: &str,
+        view: Option<&str>,
+    ) -> Option<usize> {
+        if let Some(v) = view {
+            // The declaration `view` sees is a static: its class's cell.
+            if self.member_is_static_prop(v, member) {
+                return self
+                    .static_prop_key(v, member)
+                    .and_then(|k| self.class_statics.get(&k))
+                    .and_then(|x| x.to_u64())
+                    .map(|h| h as usize);
+            }
+            if let Some(key) = self.shadowed_prop_key_in(v, handle, member) {
+                return self
+                    .heap
+                    .get(handle)?
+                    .as_ref()?
+                    .properties
+                    .get(&key)?
+                    .to_u64()
+                    .map(|h| h as usize);
+            }
+        }
+        self.member_handle(handle, member)
+    }
+
     /// §13.3: selected object receivers must enter the suspend-aware task
     /// path, not execute a blocking task through the synchronous fallback.
     pub(super) fn eval_live_object_receiver(&mut self, expr: &Expression) -> Option<usize> {
@@ -3225,6 +3437,24 @@ impl Simulator {
                     }
                     Some(handle)
                 };
+                // §8.14: a member some class redeclares is the copy the
+                // declared class of the chain up to it sees.
+                if self.shadowed_prop_mask != 0
+                    && h.path[1..]
+                        .iter()
+                        .any(|s| self.prop_maybe_shadowed(&s.name.name))
+                {
+                    let mut handle = self.eval_ident_handle(&h.path[0].name.name);
+                    for k in 1..h.path.len() {
+                        handle = handle.filter(|&x| x != 0).and_then(|x| {
+                            let view = self.path_view_class(&h.path[..k]);
+                            self.member_handle_viewed(x, &h.path[k].name.name, view.as_deref())
+                        });
+                    }
+                    if handle.is_some() {
+                        return handle;
+                    }
+                }
                 if let Some(found) = self
                     .eval_ident_handle(&h.path[0].name.name)
                     .and_then(|handle| walk(handle, &h.path[1..]))
@@ -3275,6 +3505,10 @@ impl Simulator {
                 let bh = self.eval_handle_expr(base)?;
                 if bh == 0 {
                     return None;
+                }
+                if self.shadowed_prop_mask != 0 && self.prop_maybe_shadowed(&member.name) {
+                    let view = self.ref_view_class(base);
+                    return self.member_handle_viewed(bh, &member.name, view.as_deref());
                 }
                 self.member_handle(bh, &member.name)
             }
@@ -4473,6 +4707,79 @@ impl Simulator {
         self.spec_from_declared_type(decl)
     }
 
+    /// §8.8: the class prefix and actuals of a typed constructor call,
+    /// `C::new` or `C::new(args)`, in any of the shapes it reaches the
+    /// simulator in: the parser's `MemberAccess`, or a dotted `Ident`
+    /// `[C, new]` once flattened, each bare or as the callee of a `Call`.
+    /// A package-qualified `pkg::C::new` yields `C`, the name classes are
+    /// kept under. `super.new` and `this.new` are not typed constructor
+    /// calls.
+    pub(crate) fn typed_ctor_call(e: &Expression) -> Option<(&str, &[Expression])> {
+        let (callee, args): (&Expression, &[Expression]) = match &e.kind {
+            ExprKind::Call { func, args } => (func, args.as_slice()),
+            _ => (e, &[]),
+        };
+        let prefix = match &callee.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && (2..=3).contains(&h.path.len())
+                    && h.path.last().is_some_and(|s| s.name.name == "new")
+                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                h.path[h.path.len() - 2].name.name.as_str()
+            }
+            ExprKind::MemberAccess { expr, member } if member.name == "new" => match &expr.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                {
+                    h.path[0].name.name.as_str()
+                }
+                ExprKind::MemberAccess {
+                    expr: pkg,
+                    member: cls,
+                } if matches!(&pkg.kind, ExprKind::Ident(p)
+                        if p.root.is_none() && p.path.len() == 1 && p.path[0].selects.is_empty()) =>
+                {
+                    cls.name.as_str()
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        (prefix != "super" && prefix != "this").then_some((prefix, args))
+    }
+
+    /// §8.8: `lhs = C::new(...)` builds a `C`, whatever class `lhs` is
+    /// declared with. `C` may be a class, a class type parameter, or a
+    /// typedef of a class or of a specialization; a specialization
+    /// constructs with its parameters active. None when `prefix` names no
+    /// class scope or is a variable, so the caller keeps its other readings.
+    pub(super) fn construct_typed_ctor(
+        &mut self,
+        prefix: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|m| m.contains_key(prefix))
+            || self.signal_name_to_id.contains_key(prefix)
+            || self.signals.contains_key(prefix)
+        {
+            return None;
+        }
+        let (cls, spec) = self.resolve_class_scope_prefix(prefix)?;
+        let class_def = self.module.classes.get(&cls).cloned()?;
+        let saved = self.current_spec.clone();
+        if let Some(sig) = spec {
+            self.ensure_spec_statics(&cls, &sig);
+            self.current_spec = Some((cls, sig));
+        }
+        let v = self.instantiate_class_in_scope(&class_def, args, None, Some(saved.clone()));
+        self.current_spec = saved;
+        Some(v)
+    }
+
     /// `Name.method(args)` where `Name` names a CLASS-scope entity — the
     /// shared resolution for the AST member-call path and the compiled
     /// `Insn::CallStaticScoped` executor (class-perf Step 9h). Resolution
@@ -4488,6 +4795,14 @@ impl Simulator {
         mname: &str,
         args: &[Expression],
     ) -> Option<Value> {
+        // §8.8: `T::new(...)` from compiled code (`CallStaticScoped`)
+        // builds the class the prefix denotes; `exec_static_method`
+        // never runs `new`, so the type-parameter branch below gave null.
+        if mname == "new"
+            && let Some(v) = self.construct_typed_ctor(name, args)
+        {
+            return Some(v);
+        }
         // Type-parameter used as a class name: `Tregistry::get()`.
 
         // Resolve the type param to a concrete class/specialization
@@ -4806,6 +5121,42 @@ impl Simulator {
         None
     }
 
+    /// §8.25: the specialization of an object built without one recorded
+    /// (`C #(p::pkt_t) c; c = new();`), from its type-parameter bindings,
+    /// when `method` is declared by the object's own class and that class has
+    /// only type parameters. A static method called through the handle then
+    /// sees the bound types (`T loc;` in it was unsized and had no members).
+    fn type_bindings_spec(
+        &self,
+        handle: usize,
+        class_name: &str,
+        method: &str,
+    ) -> Option<(String, String)> {
+        let inst = self.heap.get(handle)?.as_ref()?;
+        if inst.type_bindings.is_empty() {
+            return None;
+        }
+        let origin = self.class_origin(&inst.class_name).to_string();
+        let cd = self.module.classes.get(&inst.class_name)?;
+        if !cd.methods.contains_key(method)
+            || self.class_origin(class_name) != origin
+            || cd.param_order.is_empty()
+            || cd
+                .param_order
+                .iter()
+                .any(|p| !cd.type_param_names.contains(p))
+        {
+            return None;
+        }
+        let sig = cd
+            .param_order
+            .iter()
+            .map(|p| inst.type_bindings.get(p).map(String::as_str))
+            .collect::<Option<Vec<_>>>()?
+            .join(",");
+        Some((origin.clone(), self.canonicalize_spec_sig(&origin, &sig)))
+    }
+
     /// §8.25 + §8.10: a static method called through an object handle
     /// (`c.depth()`) belongs to the object's specialization: `c` of type
     /// `St#(2)` runs `St#(2)::depth`, whose bare parameter `N` reads 2, not
@@ -4844,6 +5195,7 @@ impl Simulator {
                     self.inherited_method_spec(handle, &declaring)
                 }
             });
+        let spec = spec.or_else(|| self.type_bindings_spec(handle, class_name, method_name));
         match spec {
             Some(spec) => {
                 let saved = std::mem::replace(&mut self.current_spec, Some(spec));

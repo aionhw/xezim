@@ -105,6 +105,8 @@ mod delay_spike_warning;
 mod determinism_and_stall;
 #[path = "scheduling/disable_loop_label.rs"]
 mod disable_loop_label;
+#[path = "scheduling/disable_own_block_and_loop_jumps.rs"]
+mod disable_own_block_and_loop_jumps;
 #[path = "scheduling/edge_delivery.rs"]
 mod edge_delivery;
 #[path = "scheduling/edge_event_lsb.rs"]
@@ -195,6 +197,8 @@ mod null_mailbox_and_stall_location;
 mod oracle_timing_semantics;
 #[path = "scheduling/parallel_dispatch_expr_fallback.rs"]
 mod parallel_dispatch_expr_fallback;
+#[path = "scheduling/unit_assertion_contexts_721.rs"]
+mod unit_assertion_contexts_721;
 #[path = "scheduling/preprocessor_diagnostic_location.rs"]
 mod preprocessor_diagnostic_location;
 #[path = "scheduling/preprocessor_github_issues.rs"]
@@ -219,6 +223,8 @@ mod select_event_terms;
 mod sequential_event_waits;
 #[path = "scheduling/shared_edge_outputs.rs"]
 mod shared_edge_outputs;
+#[path = "scheduling/shared_task_frames.rs"]
+mod shared_task_frames;
 #[path = "scheduling/specify_delays_and_event_list.rs"]
 mod specify_delays_and_event_list;
 #[path = "scheduling/star_sensitivity_and_implicit_port_net.rs"]
@@ -321,6 +327,8 @@ mod package_and_unit_delays_scale_by_timescale;
 mod package_cli_timescale_delay;
 #[path = "scheduling/phase_jump_static_latch.rs"]
 mod phase_jump_static_latch;
+#[path = "scheduling/release_constant_driver_from_always.rs"]
+mod release_constant_driver_from_always;
 #[path = "scheduling/release_from_level_sensitive_block.rs"]
 mod release_from_level_sensitive_block;
 #[path = "scheduling/static_recursion_shared_cell.rs"]
@@ -483,3 +491,12 @@ mod clocking_edge_regressions;
 
 #[path = "scheduling/static_local_in_clocked_call.rs"]
 mod static_local_in_clocked_call;
+
+#[path = "scheduling/hierarchical_subroutine_static.rs"]
+mod hierarchical_subroutine_static;
+#[path = "scheduling/review_loop_jumps_and_block_disables.rs"]
+mod review_loop_jumps_and_block_disables;
+#[path = "scheduling/nba_partial_commit_order.rs"]
+mod nba_partial_commit_order;
+#[path = "scheduling/finished_process_metadata.rs"]
+mod finished_process_metadata;

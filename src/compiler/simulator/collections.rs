@@ -232,14 +232,20 @@ impl Simulator {
         let Some(dt) = self.module.var_decl_types.get(name) else {
             return val;
         };
-        // Integral element types only: a class handle or struct element
-        // keeps its own representation.
-        if !matches!(
-            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types),
+        // Integral element types only: a class handle or an unpacked struct
+        // element keeps its own representation. §6.11.1: a packed struct or
+        // union is integral, so its element is fitted too (§10.7);
+        // `a[0] = '0` kept the fill's one bit (§5.7.1) and a later member
+        // write read x.
+        let integral = match super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types)
+        {
             crate::ast::types::DataType::IntegerVector { .. }
-                | crate::ast::types::DataType::IntegerAtom { .. }
-                | crate::ast::types::DataType::Enum(_)
-        ) {
+            | crate::ast::types::DataType::IntegerAtom { .. }
+            | crate::ast::types::DataType::Enum(_) => true,
+            crate::ast::types::DataType::Struct(su) => su.packed,
+            _ => false,
+        };
+        if !integral {
             return val;
         }
         let mut fitted = if val.width != w {
@@ -599,6 +605,74 @@ impl Simulator {
             None
         };
         fields.filter(|f| !f.is_empty())
+    }
+
+    /// §7.2.2, §11.8.1: whether each packed member `fields` names
+    /// ([`Self::coll_packed_elem_fields`] of `arr`) is signed, so the slice
+    /// bound for `item.<member>` keeps its member's signedness: `sort() with
+    /// (item.lo)` of a `bit signed [3:0] lo` orders -8 first.
+    pub(super) fn coll_packed_elem_field_signs(
+        &self,
+        arr: &str,
+        fields: &[(String, u32, u32)],
+    ) -> Vec<bool> {
+        let elem = self.coll_elem_decl_type(arr);
+        fields
+            .iter()
+            .map(|(path, _, _)| {
+                let Some(mut cur) = elem.clone() else {
+                    return false;
+                };
+                for seg in path.split('.') {
+                    let DataType::Struct(su) = self.resolve_dt(&cur) else {
+                        return false;
+                    };
+                    let Some(m) = su
+                        .members
+                        .iter()
+                        .find(|m| m.declarators.iter().any(|d| d.name.name == seg))
+                    else {
+                        return false;
+                    };
+                    cur = m.data_type.clone();
+                }
+                super::elaborate::is_type_signed_resolved(&cur, &self.module.typedef_types)
+            })
+            .collect()
+    }
+
+    /// The declared element type of collection `arr`: a module, package or
+    /// local one (`var_decl_types` holds the element type), a class
+    /// member's (`<handle>#m`) from its declaring class, or a struct's
+    /// dynamic member's.
+    pub(super) fn coll_elem_decl_type(&self, arr: &str) -> Option<DataType> {
+        if let Some(dt) = self.p_elem_type_ref(arr) {
+            Some(dt.into_owned())
+        } else if let Some((h, prop)) = arr.split_once('#')
+            && let Ok(handle) = h.parse::<usize>()
+        {
+            let mut cls = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.class_name.clone());
+            let mut found = None;
+            for _ in 0..64 {
+                let Some(cd) = cls.as_deref().and_then(|c| self.module.classes.get(c)) else {
+                    break;
+                };
+                if let Some(dt) = self.class_prop_decl_type(cd, prop) {
+                    found = Some(dt.clone());
+                    break;
+                }
+                cls = cd.extends.clone();
+            }
+            found
+        } else if arr.contains('.') && self.struct_colls_possible() {
+            self.struct_member_coll_of(arr).map(|(_, dt, _)| dt)
+        } else {
+            None
+        }
     }
 
     pub(super) fn is_associative_array(&self, name: &str) -> bool {
@@ -4915,6 +4989,37 @@ impl Simulator {
             return self.eval_randomize_with(&call, constraints);
         }
         if let ExprKind::Call { func, args } = &call.kind {
+            // §18.12: outside a class the `std::` prefix of the scope
+            // randomize function may be omitted. Read a bare
+            // `randomize(…) with {…}` as `std::randomize(…) with {…}`; it fell
+            // through to the plain call and returned 0 without solving.
+            if let ExprKind::Ident(h) = &func.kind
+                && h.root.is_none()
+                && h.path.len() == 1
+                && h.path[0].selects.is_empty()
+                && h.path[0].name.name == "randomize"
+                && self.bare_randomize_is_scope_randomize()
+            {
+                let member = h.path[0].name.clone();
+                let mut std_expr = (**func).clone();
+                if let ExprKind::Ident(sh) = &mut std_expr.kind {
+                    sh.path[0].name.name = "std".to_string();
+                }
+                let std_call = Expression::new(
+                    ExprKind::Call {
+                        func: Box::new(Expression::new(
+                            ExprKind::MemberAccess {
+                                expr: Box::new(std_expr),
+                                member,
+                            },
+                            func.span,
+                        )),
+                        args: args.clone(),
+                    },
+                    call.span,
+                );
+                return self.eval_randomize_with(&std_call, constraints);
+            }
             if let ExprKind::MemberAccess { expr, member } = &func.kind {
                 if member.name == "randomize" {
                     // std::randomize(vars) with {...}

@@ -450,14 +450,22 @@ impl Simulator {
         let mut property_seed_keys = interleaved_seeds.then(|| vec![Vec::new(); chain.len()]);
         for (ci, cdef) in chain.iter().enumerate().rev() {
             for (prop_name, prop_sig) in cdef.properties.iter() {
-                if cdef.static_properties.contains(prop_name)
-                    || cdef.assoc_properties.contains_key(prop_name)
-                {
-                    continue;
-                }
                 let redeclared = leaf_declarer
                     .get(prop_name.as_str())
                     .is_some_and(|l| *l != cdef.name.as_str());
+                if cdef.static_properties.contains(prop_name)
+                    || cdef.assoc_properties.contains_key(prop_name)
+                {
+                    // §8.14: a static a derived class redeclares is still
+                    // what the base class's code and base handles name.
+                    if redeclared
+                        && cdef.static_properties.contains(prop_name)
+                        && !shadowed_props.contains(prop_name)
+                    {
+                        shadowed_props.push(prop_name.clone());
+                    }
+                    continue;
+                }
                 let key = if redeclared {
                     if !shadowed_props.contains(prop_name) {
                         shadowed_props.push(prop_name.clone());
@@ -1401,6 +1409,33 @@ impl Simulator {
         false
     }
 
+    /// §6.20.3/§8.25: the design typedef that a formal of a method of
+    /// `cname` declared through one of its class type parameters (`T item`)
+    /// names in the object `handle`, before the call's frame is entered.
+    pub(super) fn formal_bound_typedef(
+        &mut self,
+        handle: usize,
+        cname: &str,
+        dt: &DataType,
+    ) -> Option<DataType> {
+        let DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = dt
+        else {
+            return None;
+        };
+        if name.has_scope() || !dimensions.is_empty() || !type_args.is_empty() {
+            return None;
+        }
+        self.this_stack.push(Some(handle));
+        let binding = self.type_param_concrete_in(dt, cname);
+        self.this_stack.pop();
+        self.bound_typedef_dt(&binding?)
+    }
+
     pub(super) fn exec_method_in_class_hierarchy(
         &mut self,
         handle: usize,
@@ -1617,6 +1652,25 @@ impl Simulator {
                     };
                     let plain_class = class_ref.is_some();
                     let plain = plain_class || pp.plain_scalar;
+                    // §6.20.3/§8.25: a formal declared through a class type
+                    // parameter (`T item`, `T q[$]`) has the type its binding
+                    // names, for its metadata and for every binder below.
+                    // Under the bare `T` no member layout was registered and
+                    // `item.data` or `q[0].data` read 0.
+                    let bound_port;
+                    let port = match (!plain)
+                        .then(|| self.formal_bound_typedef(handle, cname, &port.data_type))
+                        .flatten()
+                    {
+                        Some(data_type) => {
+                            bound_port = crate::ast::decl::FunctionPort {
+                                data_type,
+                                ..port.clone()
+                            };
+                            &bound_port
+                        }
+                        None => port,
+                    };
                     if !plain && matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_))
                     {
                         self.register_formal_type_metadata(
@@ -1870,6 +1924,7 @@ impl Simulator {
                         // (and the partially-bound formals visible) so a
                         // `this`-dependent method default resolves instead
                         // of silently evaluating to the type's zero value.
+                        let saved_spec = self.seed_callee_spec_from_instance(handle, cname);
                         self.this_stack.push(Some(handle));
                         self.class_context_stack.push(Some(cname.clone()));
                         self.push_local_frame_typed(locals.clone(), frame_types.clone());
@@ -1880,6 +1935,7 @@ impl Simulator {
                         self.pop_local_frame();
                         self.class_context_stack.pop();
                         self.this_stack.pop();
+                        self.restore_spec_pooled(saved_spec);
                         v
                     } else {
                         Value::zero(32)
@@ -1951,12 +2007,10 @@ impl Simulator {
                             // `T=int` formal renders signed like the reference.
                             val.is_signed = true;
                         }
-                    } else if matches!(&port.data_type, DataType::IntegerAtom { .. })
-                        || Self::packed_dims_are_literal(&port.data_type)
-                    {
+                    } else if plan.ports[i].fixed_width.is_some() {
                         // A built-in integer formal (`int`, `byte`, ...) or a
-                        // packed vector with LITERAL bounds (`logic signed
-                        // [15:0]`) has a fixed width that no class
+                        // packed vector with constant bounds (`logic signed
+                        // [16-1:0]`) has a fixed width that no class
                         // type-parameter can alter, so widen the actual FIRST
                         // and stamp the signedness after: marking a 2-bit
                         // unsigned actual signed and letting the frame widen it
@@ -2673,12 +2727,14 @@ impl Simulator {
                         self.snapshot_ret_assoc(&n);
                         self.return_value = Some(Value::zero(32));
                     } else if self.module.dynamic_arrays.contains(&n) {
-                        if self.queue_elem_struct(&n).is_none() {
+                        if let Some(su) = self.queue_elem_struct(&n) {
+                            let len = self.get_queue_size(&n) as i64;
+                            let idx: Vec<i64> = (0..len).collect();
+                            self.snapshot_ret_structs(&n, &idx, &su);
+                        } else {
                             const RET_SNAP: &str = "__xz_ret_coll__";
                             self.copy_whole_queue(RET_SNAP, &n);
                             self.pending_ret_collection = Some(RET_SNAP.to_string());
-                        } else {
-                            self.pending_ret_collection = Some(n);
                         }
                         self.return_value = Some(Value::zero(32));
                     }

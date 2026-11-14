@@ -454,12 +454,82 @@ impl Simulator {
     /// Per-process state a killed process (`kill()`, `disable fork`,
     /// `disable <label>`) never releases through `child_finished`.
     pub(super) fn release_killed_process_state(&mut self, pid: usize) {
+        self.release_fork_process_metadata(pid);
+        // A killed fork child can still be unwinding on the current or a
+        // nested scheduler stack. Keep that path's scope metadata intact.
+        if self.proc_depth <= 1
+            && self.dpi_export_depth == 0
+            && self.dpi_tasks.is_empty()
+            && pid != self.current_pid
+            && self.process_parents.contains_key(&pid)
+            && !self.checkpoint_requested
+            && !self.warn_x
+            && self.value_trace_ids.is_none()
+            && self.trace_sched.is_none()
+        {
+            self.process_m_scope.remove(&pid);
+            self.process_m_label.remove(&pid);
+        }
         self.release_process_execution_caches(pid);
         self.fork_baselines.remove(&pid);
         self.fork_local_scopes.remove(&pid);
         self.release_fork_collections(pid);
         self.fork_signal_captures.remove(&pid);
         self.suspended_loop_frames.remove(&pid);
+        if !self.adopted_pids.is_empty() {
+            self.adopted_pids.remove(&pid);
+        }
+    }
+
+    /// IEEE 1800-2023 §9.3.2 / §9.6.2: a terminated fork child needs no
+    /// execution scope or stall origin. Keep the §9.7 terminal status and
+    /// monotonic pid: process handles and stale dispatches can still use it.
+    fn release_fork_process_metadata(&mut self, pid: usize) {
+        if !self.process_parents.contains_key(&pid) {
+            return;
+        }
+        // These diagnostics may attribute a queued write after its child
+        // ends. Annex D.9: a restart can also revive it; origins are not saved.
+        if self.checkpoint_requested
+            || self.warn_x
+            || self.value_trace_ids.is_some()
+            || self.trace_sched.is_some()
+        {
+            return;
+        }
+        // Native tasks can span arbitrarily many windows. A single sweep
+        // request avoids keeping a per-child backlog until they unwind.
+        if self.dpi_export_depth != 0 || !self.dpi_tasks.is_empty() {
+            self.retired_fork_sweep_needed = true;
+            return;
+        }
+        // Ordinary deferrals need only these IDs at the next safe reset,
+        // including children killed before their first activation (§9.6.2).
+        if self.stall_pid_hits.contains_key(&pid) || self.proc_depth > 1 || pid == self.current_pid
+        {
+            self.retired_fork_pids.push(pid);
+            return;
+        }
+        self.process_origin.remove(&pid);
+        self.process_scope_hint.remove(&pid);
+    }
+
+    /// §9.6.1: the children `wait fork` in process `pid` waits for: the
+    /// processes `pid` forked itself, not those handed up to it from a child
+    /// that has finished (`adopted_pids`).
+    pub(super) fn wait_fork_children(&self, pid: usize) -> HashSet<usize> {
+        self.process_parents
+            .iter()
+            .filter(|&(c, &p)| p == pid && !self.adopted_pids.contains(c))
+            .map(|(&c, _)| c)
+            .collect()
+    }
+
+    /// Whether `wait fork` in process `pid` still has a child to wait for.
+    pub(super) fn has_wait_fork_children(&self, pid: usize) -> bool {
+        self.process_parents
+            .iter()
+            .any(|(c, &p)| p == pid && !self.adopted_pids.contains(c))
     }
 
     fn release_process_execution_caches(&mut self, pid: usize) {
@@ -523,6 +593,7 @@ impl Simulator {
     }
 
     pub(super) fn child_finished(&mut self, child_pid: usize) {
+        self.release_fork_process_metadata(child_pid);
         self.finished_pids.insert(child_pid);
         self.release_process_execution_caches(child_pid);
         // A fork child's inherited `%m` chain (`inherit_fork_m_scope`) is
@@ -549,10 +620,16 @@ impl Simulator {
             self.wake_await_waiters(&terminated);
         }
 
+        if !self.adopted_pids.is_empty() {
+            self.adopted_pids.remove(&child_pid);
+        }
         // Reparent any still-running children of the completing process to its
-        // own parent, so the fork descendant tree stays connected (a `wait fork`
-        // higher up must still see grandchildren whose intermediate parent has
-        // finished). Without this, completing `X` would orphan its child `G`.
+        // own parent, so the fork descendant tree stays connected: a `disable
+        // fork` or `kill()` higher up still reaches grandchildren whose
+        // intermediate parent has finished (§9.6.3, §9.7). Without this,
+        // completing `X` would orphan its child `G`. They are marked adopted:
+        // they are not the new parent's immediate children, so its `wait fork`
+        // does not wait for them (§9.6.1).
         if let Some(&grandparent) = self.process_parents.get(&child_pid) {
             if self.process_parents.values().any(|&p| p == child_pid) {
                 let regrandkids: Vec<usize> = self
@@ -563,6 +640,7 @@ impl Simulator {
                     .collect();
                 for c in regrandkids {
                     self.process_parents.insert(c, grandparent);
+                    self.adopted_pids.insert(c);
                 }
             }
         }

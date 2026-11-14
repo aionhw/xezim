@@ -21,7 +21,7 @@ fn compile(stem: &str) -> PathBuf {
         stem,
         std::process::id()
     ));
-    let mut cc = Command::new("cc");
+    let mut cc = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()));
     cc.args(["-shared", "-fPIC"]);
     if cfg!(target_os = "macos") {
         // The exported subroutines resolve when xezim loads the library.

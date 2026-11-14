@@ -14,6 +14,20 @@ impl Simulator {
     pub(super) fn unpacked_concat_operand_values(&mut self, items: Vec<&Expression>) -> Vec<Value> {
         let mut all_vals: Vec<Value> = Vec::new();
         for expr in items {
+            // §10.10, §13.4.1: a call returning an unpacked array contributes
+            // the elements it returns, in order (the call runs once).
+            if matches!(expr.kind, ExprKind::Call { .. })
+                && let Some(src) = self.ret_collection_operand(expr)
+            {
+                if let Some(src) = src.filter(|s| !self.is_associative_array(s)) {
+                    for j in 0..self.get_queue_size(&src) {
+                        if let Some(v) = self.get_signal_value_by_name(&format!("{src}[{j}]")) {
+                            all_vals.push(v);
+                        }
+                    }
+                }
+                continue;
+            }
             // A queue/array operand — bare (`q`), an instance-
             // scoped member (`obj.q`, `arr[i].q`), or a nested
             // assoc-of-queue element (`assoc[key]`) —
@@ -1489,6 +1503,19 @@ impl Simulator {
                     }
                 }
             }
+            // §12.7.3, §7.2.1: `foreach (frame.lanes[k])` over a packed-array
+            // member of a packed-struct class property iterates the member's
+            // packed dimensions.
+            if prop_packed_dims.is_none()
+                && hier.path.len() >= 2
+                && hier.path[..hier.path.len() - 1]
+                    .iter()
+                    .any(|s| self.struct_prop_name_possible(&s.name.name))
+                && let Some(pd) = self.struct_member_packed_dims(array)
+                && pd.len() >= vars.len()
+            {
+                prop_packed_dims = Some(pd);
+            }
             // A bare array name inside a SUBMODULE process resolves
             // under the process's instance scope ("u_s.mem"), like
             // reads/writes already do — otherwise the collection
@@ -2033,8 +2060,16 @@ impl Simulator {
                         idx += step;
                     }
                 } else {
-                    // Bit-by-bit foreach over a packed vector.
-                    let size = self.lookup_signal_width(&name).unwrap_or(1) as u64;
+                    // §12.7.3: a formal's live value has the callee's width,
+                    // including class-specialized bounds. It shadows any
+                    // module signal or stale width entry with the same name.
+                    let size = self
+                        .local_stack
+                        .iter()
+                        .rev()
+                        .find_map(|frame| frame.get(&*name).map(|v| v.width))
+                        .or_else(|| self.lookup_signal_width(&name))
+                        .unwrap_or(1) as u64;
                     for i in 0..size {
                         if self.finished {
                             break;
@@ -2140,6 +2175,19 @@ impl Simulator {
             None
         };
         let tp_concrete = tp_param.or_else(|| tp_scoped.clone());
+        // §6.20.3/§8.25: a binding that names a design typedef (a packed
+        // struct, say) is the local's declared type for the metadata below:
+        // the member layout, member names and packed dimensions. Under the
+        // bare `T` none was registered, so `loc.data` read 0 while `loc`
+        // held the right bits.
+        // So is a struct whose members name a type parameter (`typedef
+        // struct packed { T inner; logic [3:0] tag; } wrap_t;`) with the
+        // members bound: `w.inner` had no width in its layout.
+        let bound_typedef = match tp_concrete.as_deref() {
+            Some(c) => self.bound_typedef_dt(c),
+            None => self.struct_with_bound_members(data_type),
+        };
+        let data_type: &DataType = bound_typedef.as_ref().unwrap_or(data_type);
         let tp_width = tp_concrete
             .as_deref()
             .and_then(|c| self.concrete_type_width(c));
@@ -3374,8 +3422,11 @@ impl Simulator {
                         crate::ast::types::DataType::Struct(su) if Self::spreads_member_wise(&su)
                     );
                 let v = if let Some(init_expr) = d.init.as_ref().filter(|_| !struct_init_later) {
-                    let mut produced: Option<Value> = None;
-                    if let Some(cn) = &class_name {
+                    // §8.8: `B h = C::new(...)` builds a `C`, not the
+                    // declared class (the `new` forms below).
+                    let mut produced: Option<Value> = Self::typed_ctor_call(init_expr)
+                        .and_then(|(prefix, args)| self.construct_typed_ctor(prefix, args));
+                    if let Some(cn) = class_name.as_ref().filter(|_| produced.is_none()) {
                         // `T x = new(...);` / `T x = new;` — detect the
                         // constructor form once; consumed by both the
                         // class and covergroup branches below.
@@ -4521,7 +4572,21 @@ impl Simulator {
                 }
                 if d == 0 {
                     let id_opt = self.resolve_nba_target(lvalue);
-                    if let Some(id) = id_opt {
+                    if let Some(id) = id_opt
+                        && self.nba_behind_queued_partial(id)
+                    {
+                        // §4.6 b): a partial update to this signal is already
+                        // queued; `nba_fast` would commit this one first.
+                        self.nba_queue.push(NbaEntry {
+                            lhs: None,
+                            value: val.resize_for_assign(w),
+                            resolved_id: Some(id),
+                            static_key: None,
+                            static_slice: None,
+                            this_handle: None,
+                            root_frame: None,
+                        });
+                    } else if let Some(id) = id_opt {
                         // Track via index map so subsequent partial-NBAs
                         // (NbaAssignRange / NbaAssignBitDyn from the
                         // bytecode VM) targeting the same signal merge into
@@ -5197,7 +5262,7 @@ impl Simulator {
                     if let Some(h) = self.process_scope_hint.get(&self.current_pid).cloned() {
                         self.process_scope_hint.insert(pid, h);
                     }
-                    self.process_origin.insert(pid, (s.span, "fork child"));
+                    self.process_origin.insert(pid, (s.span, FORK_CHILD_ORIGIN));
                     self.inherit_fork_child_context(pid);
                     self.inherit_fork_m_scope(pid, self.current_pid, block_name.as_ref());
                     let frame = self.fork_child_frame(s);
@@ -5585,16 +5650,17 @@ impl Simulator {
                             // collection before the caller's assignment
                             // consumes it (the recorded name read back size
                             // 0) — snapshot elements+size under a reserved
-                            // name that survives the pop, unless the element
-                            // type is an unpacked struct (that copy path is
-                            // keyed by the ORIGINAL name; module-scope
-                            // collections aren't wiped, so keep them live).
-                            if self.queue_elem_struct(&n).is_none() {
+                            // name that survives the pop; unpacked-struct
+                            // elements member by member under a store that
+                            // records their type (`snapshot_ret_structs`).
+                            if let Some(su) = self.queue_elem_struct(&n) {
+                                let len = self.get_queue_size(&n) as i64;
+                                let idx: Vec<i64> = (0..len).collect();
+                                self.snapshot_ret_structs(&n, &idx, &su);
+                            } else {
                                 const RET_SNAP: &str = "__xz_ret_coll__";
                                 self.copy_whole_queue(RET_SNAP, &n);
                                 self.pending_ret_collection = Some(RET_SNAP.to_string());
-                            } else {
-                                self.pending_ret_collection = Some(n.to_string());
                             }
                         } else if self
                             .fn_ret_collection_stack
@@ -5966,7 +6032,7 @@ impl Simulator {
                     self.dpi_wait_fork();
                 } else if self.dpi_export_depth > 0 {
                     let me = self.current_pid;
-                    self.run_nested_until(|sim| !sim.process_parents.values().any(|&p| p == me));
+                    self.run_nested_until(|sim| !sim.has_wait_fork_children(me));
                 }
             }
             StatementKind::RsReturn => {
