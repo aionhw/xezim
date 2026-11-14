@@ -2165,6 +2165,11 @@ pub struct BytecodeCompiler<'a> {
     /// Named-cast targets known at compile time: name -> (width, signed).
     /// See the simulator's `cast_widths`.
     cast_widths: Option<&'a HashMap<String, (u32, bool)>>,
+    /// `expr_signedness` of a dotted identifier (a hierarchical, interface,
+    /// package or member name), by name: an operator re-types its operand
+    /// subtrees, so a long expression asks for the same leaf many times.
+    /// Cleared with the scope hint, which name resolution depends on.
+    dotted_ident_sign: HashMap<String, Option<bool>>,
     /// Top-module name (e.g. "tb"). When a hierarchical identifier reads a
     /// signal whose absolute path is `<top>.<rest>` (e.g. xezim's
     /// port-rewriting baked the top name into a cross-hierarchical
@@ -2397,6 +2402,7 @@ impl<'a> BytecodeCompiler<'a> {
             local_var_struct: HashMap::default(),
             local_packed_types: HashMap::default(),
             cast_widths: None,
+            dotted_ident_sign: HashMap::default(),
             pattern_ctx: None,
             inline_ret_ty: None,
             local_const_vars: HashMap::default(),
@@ -3445,6 +3451,7 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     pub fn set_scope_hint(&mut self, scope: Option<String>) {
+        self.dotted_ident_sign.clear();
         self.scope_hint = scope;
     }
 
@@ -9319,7 +9326,69 @@ impl<'a> BytecodeCompiler<'a> {
         self.emit(Insn::LoadSignal(root, as_sig_id(base_id)));
         let dest = self.alloc_reg();
         self.emit(Insn::RangeSelectConst(dest, root, off + w - 1, off));
+        // §7.2.1: the member keeps its declared type's sign.
+        if self.packed_member_signed(&key, member) == Some(true) {
+            self.emit(Insn::SetSigned(dest));
+        }
         Some(dest)
+    }
+
+    /// §7.2.1, §6.11.3: the signedness of `member` (a dotted path) of the
+    /// packed structure or union variable `var` holds, from its declared
+    /// type. None when the declaration or the member cannot be resolved.
+    fn packed_member_signed(&self, var: &str, member: &str) -> Option<bool> {
+        use crate::ast::types::DataType as D;
+        let decls = self.var_decl_types?;
+        let types = self.typedef_types?;
+        let leaf_var = var.rsplit_once('.').map_or(var, |(_, leaf)| leaf);
+        let mut dt = decls.get(var).or_else(|| decls.get(leaf_var))?;
+        for segment in member.split('.') {
+            let D::Struct(su) = crate::compiler::elaborate::resolve_typedef_chain(dt, types) else {
+                return None;
+            };
+            if !su.packed {
+                return None;
+            }
+            dt = &su
+                .members
+                .iter()
+                .find(|m| m.declarators.iter().any(|d| d.name.name == segment))?
+                .data_type;
+        }
+        let resolved = crate::compiler::elaborate::resolve_typedef_chain(dt, types);
+        match resolved {
+            D::IntegerAtom { .. } | D::IntegerVector { .. } | D::Enum(_) | D::Struct(_) => Some(
+                crate::compiler::elaborate::is_type_signed_resolved(resolved, types),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The packed-structure variable and member path a dotted identifier
+    /// names (`s.f`, `s.inner.f`), as `compile_packed_member_read` reads it.
+    fn packed_member_of_hier(&self, hier: &HierarchicalIdentifier) -> Option<(String, String)> {
+        let fields_tbl = self.packed_struct_fields?;
+        if hier.root.is_some() || hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let raw = Self::hier_raw_name(hier);
+        let (base, member) = raw.rsplit_once('.')?;
+        let key = self
+            .scope_hint
+            .as_ref()
+            .map(|scope| format!("{}.{}", scope, base))
+            .filter(|q| self.signal_name_to_id.get(q.as_str()).is_some())
+            .or_else(|| {
+                self.signal_name_to_id
+                    .get(base)
+                    .is_some()
+                    .then(|| base.to_string())
+            })?;
+        let layout = fields_tbl.get(&key).or_else(|| fields_tbl.get(base))?;
+        layout
+            .iter()
+            .any(|(m, _, w)| m == member && *w > 0)
+            .then(|| (key, member.to_string()))
     }
 
     /// Does this statement read or write a register-bank local array? Such a
@@ -17910,12 +17979,21 @@ impl<'a> BytecodeCompiler<'a> {
                 // are already flattened in the layout table.
                 let direct_start = self.insns.len();
                 let direct_reg = self.next_reg;
-                if let Some((root, _, _, fields)) = self.compile_packed_struct_value(base)
+                if let Some((root, key, hier, fields)) = self.compile_packed_struct_value(base)
                     && let Some((_, off, width)) =
                         fields.iter().find(|(name, _, _)| name == &member.name)
                 {
                     let dest = self.alloc_reg();
                     self.emit(Insn::RangeSelectConst(dest, root, *off + *width - 1, *off));
+                    // §7.2.1: the member keeps its declared type's sign.
+                    let var = Self::hier_raw_name(&hier);
+                    if self
+                        .packed_member_signed(&key, &member.name)
+                        .or_else(|| self.packed_member_signed(&var, &member.name))
+                        == Some(true)
+                    {
+                        self.emit(Insn::SetSigned(dest));
+                    }
                     return Some(dest);
                 }
                 self.truncate_insns(direct_start);
@@ -21599,13 +21677,63 @@ impl<'a> BytecodeCompiler<'a> {
                     let class = self.method_class.as_deref()?;
                     return Some(self.class_field_signed(class, &h.path[0].name.name));
                 }
-                let id = self.lookup_signal_id(h)?;
-                Some(self.signal_signed[id])
+                self.named_operand_signedness(h)
+            }
+            // §11.8.1: a package parameter (`pkg::P`), an interface variable
+            // (`i0.u`), a hierarchical reference (`lf.u`) or a flattened
+            // unpacked-structure member (`unp.u`) has its declared type's
+            // signedness, so an unsigned one makes the expression unsigned.
+            ExprKind::Ident(h)
+                if h.path.len() > 1 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let name = Self::hier_raw_name(h);
+                if let Some(&known) = self.dotted_ident_sign.get(&name) {
+                    return known;
+                }
+                let sign = if self.lookup_signal_id(h).is_none()
+                    && let Some((key, member)) = self.packed_member_of_hier(h)
+                {
+                    // §7.2.1: a packed-structure member has its declared type.
+                    self.packed_member_signed(&key, &member)
+                } else {
+                    self.named_operand_signedness(h)
+                };
+                self.dotted_ident_sign.insert(name, sign);
+                sign
+            }
+            // §11.5, §13.4.1: a function call has its return type's sign.
+            ExprKind::Call { func, .. } => {
+                let ExprKind::Ident(h) = &func.kind else {
+                    return None;
+                };
+                if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    return None;
+                }
+                let name = self.scoped_callee_name(h.path[0].name.name.clone())?;
+                let fd = self.functions.and_then(|f| f.get(&name))?;
+                self.decl_signedness(&fd.return_type, Some(name.as_str()))
             }
             ExprKind::MemberAccess { expr: base, member } if self.method_mode => {
                 self.handle_member_width(base, &member.name)?;
                 let class = self.method_handle_chain_class(base)?;
                 Some(self.class_field_signed(&class, &member.name))
+            }
+            // §7.2.1: a member of a packed-structure element (`a[0].f`) has
+            // its declared type's sign, as the direct member read gives it.
+            ExprKind::MemberAccess { expr: base, member } => {
+                let mut root = base.as_ref();
+                while let ExprKind::Index { expr, .. } | ExprKind::Paren(expr) = &root.kind {
+                    root = &**expr;
+                }
+                let ExprKind::Ident(hier) = &root.kind else {
+                    return None;
+                };
+                let (key, fields) = self.packed_struct_layout_for_hier(hier)?;
+                if !fields.iter().any(|(name, _, _)| name == &member.name) {
+                    return None;
+                }
+                self.packed_member_signed(&key, &member.name)
+                    .or_else(|| self.packed_member_signed(&Self::hier_raw_name(hier), &member.name))
             }
             // Part-selects, concatenations and replications are UNSIGNED
             // regardless of their operands (§11.8.1).
@@ -21654,6 +21782,18 @@ impl<'a> BytecodeCompiler<'a> {
                 "$unsigned" => Some(false),
                 // §6.24.1: a SIZE cast preserves the operand's signedness.
                 "$__xz_size_cast" => args.get(1).and_then(|a| self.expr_signedness(a)),
+                // §6.24.1: a type cast (`u8_t'(x)`) has the type's sign; a
+                // size cast through a parameter (`N'(x)`) keeps the operand's.
+                "$__xz_named_cast" => {
+                    let key = self.named_cast_key(args.first()?)?;
+                    if let Some(&(_, signed)) = self.cast_widths.and_then(|m| m.get(&key)) {
+                        Some(signed)
+                    } else if self.params.is_some_and(|p| p.contains_key(&key)) {
+                        args.get(1).and_then(|a| self.expr_signedness(a))
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             },
             ExprKind::Unary { op, operand } => match op {
@@ -21705,6 +21845,39 @@ impl<'a> BytecodeCompiler<'a> {
                     (Some(false), _) | (_, Some(false)) => Some(false),
                     _ => None,
                 }
+            }
+            _ => None,
+        }
+    }
+
+    /// §11.8.1: the signedness of a named operand with no select: a signal
+    /// (module variable, interface variable, hierarchical reference or a
+    /// flattened unpacked member) has its declared sign, a parameter its
+    /// value's (§6.20.2). Unknown when the name resolves to neither.
+    fn named_operand_signedness(&self, h: &HierarchicalIdentifier) -> Option<bool> {
+        if let Some(id) = self.lookup_signal_id(h) {
+            return self.signal_signed.get(id).copied();
+        }
+        self.lookup_param_value(h)
+            .filter(|v| !v.is_real)
+            .map(|v| v.is_signed)
+    }
+
+    /// §6.11.3: the signedness a declared integral type gives its values;
+    /// None for a real, string or unresolved type.
+    fn decl_signedness(
+        &self,
+        dt: &crate::ast::types::DataType,
+        scope: Option<&str>,
+    ) -> Option<bool> {
+        use crate::ast::types::DataType as D;
+        let resolved = self.resolved_decl_type(dt, scope);
+        match resolved {
+            D::IntegerAtom { .. } | D::IntegerVector { .. } | D::Enum(_) | D::Implicit { .. } => {
+                Some(crate::compiler::elaborate::is_type_signed(resolved))
+            }
+            D::Struct(su) if su.packed => {
+                Some(crate::compiler::elaborate::is_type_signed(resolved))
             }
             _ => None,
         }
