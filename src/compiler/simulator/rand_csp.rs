@@ -431,6 +431,10 @@ struct Aux {
     /// A variable held as segments, or a select spanning several of them,
     /// without a dist of its own: fixed by its segments, never decided.
     composite: Vec<bool>,
+    /// A variable some unconditional `Fun` relation makes a function of
+    /// other variables (`tot == w * (n + 1)`): one value per assignment of
+    /// its inputs, so its narrowing is theirs and counts no solutions.
+    fun_var: Vec<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -3446,7 +3450,17 @@ impl Simulator {
                     // estimate, but the whole-`pkt` variable still narrows with
                     // it, and weighing `pkt.psel` by that narrowing draws the
                     // `psel` with the most `paddr` values every time.
-                    if u == v || after[u] || drawn[u] || seen[u] || aux.composite[u] {
+                    // §18.5.10: a function of other variables holds one value
+                    // per solution of its inputs; its narrowing is theirs. A
+                    // `$countones` count still counts: it stands for the
+                    // values of the variable it counts (`csp_log_size`).
+                    if u == v
+                        || after[u]
+                        || drawn[u]
+                        || seen[u]
+                        || aux.composite[u]
+                        || (aux.fun_var[u] && aux.pop_x[u].is_none())
+                    {
                         continue;
                     }
                     seen[u] = true;
@@ -3491,6 +3505,7 @@ impl Simulator {
             pop_x: vec![None; n],
             seg_hi: vec![Vec::new(); n],
             composite: vec![false; n],
+            fun_var: vec![false; n],
         };
         for (i, d) in csp.dists.iter().enumerate() {
             aux.dists[d.var].push(i);
@@ -3643,6 +3658,18 @@ impl Simulator {
         }
         for nd in &csp.nodes {
             funs(nd, &csp.srcs, &mut aux);
+        }
+        // §18.5.10: an unconditional function relation, at the top or under
+        // a conjunction only.
+        fn top_funs(n: &Node, aux: &mut Aux) {
+            match n {
+                Node::And(ns) => ns.iter().for_each(|m| top_funs(m, aux)),
+                Node::Fun { var, .. } => aux.fun_var[*var] = true,
+                _ => {}
+            }
+        }
+        for nd in &csp.nodes {
+            top_funs(nd, &mut aux);
         }
         // `x == k*y + c` (|k| > 1) defines `x` by the others: decided after
         // them it is narrowed to its value instead of guessed among the
