@@ -359,6 +359,7 @@ fn method_boost_enabled() -> bool {
 // §8.14: a base static that a derived class redeclares counts as a redeclared member.
 // §7.4.1: a member of an element of an ascending packed array of structs slices from slot 0.
 // §10.9.2: structure replication in scalarized function calls.
+// §6.16: a string-collection element read through a class handle compares as a string.
 // §7.4.2: an index into an array with a negative bound is sign-extended.
 const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3078;
 
