@@ -1,0 +1,9 @@
+idle d=z bus8=0zzzzzzz seen=z seen8=0zzzzzzz open=z 0zzzzzzz
+sv drives d=1 bus8=01011010 seen=1 seen8=01011010 open=z 0zzzzzzz
+released d=z bus8=0zzzzzzz seen=z seen8=0zzzzzzz open=z 0zzzzzzz
+vhdl drives d=1 bus8=10100111 seen=1 seen8=10100111 open=1 10100111
+both d=x bus8=10100111 seen=x seen8=10100111 open=1 10100111
+vhdl off d=0 bus8=00100111 seen=0 seen8=00100111 open=z 0zzzzzzz
+partial d=z bus8=0zzz1111 seen=z seen8=0zzz1111 open=z 0zzzzzzz
+agree d=1 bus8=00001111 seen=1 seen8=00001111 open=1 00001111
+fight d=0 bus8=1111xxxx seen=0 seen8=1111xxxx open=0 11110000

@@ -66,6 +66,12 @@ transaction.
 - Library IEEE also holds the Synopsys packages STD_LOGIC_ARITH,
   STD_LOGIC_UNSIGNED, STD_LOGIC_SIGNED and STD_LOGIC_MISC (as GHDL's
   `-fsynopsys` and Questa provide them).
+- The VITAL packages (IEEE 1076.4: VITAL_TIMING, VITAL_PRIMITIVES) are not
+  part of xezim, as their sources are not openly licensed. Give your copy
+  of them on the command line, analysed into IEEE:
+  `xezim --work=ieee timing_p.vhd timing_b.vhd --work=work model.vhd tb.sv`.
+- Subprograms nested in subprograms, which name the parameters, variables
+  and constants of the enclosing ones (§12.1).
 - Entities and architectures, processes (with or without sensitivity
   lists, `process (all)`), concurrent signal assignments (simple,
   conditional, selected), concurrent assertions and procedure calls, all
@@ -156,7 +162,8 @@ VHDL and SystemVerilog sources can be given together:
 
 - An SV module may instantiate a VHDL entity by its name (any case). The
   parameter overrides of the instance set the entity's generics; they must
-  be constant expressions of literals and the module's parameters
+  be constant expressions of literals, the module's parameters and the
+  parameters of packages (imported, or as `pkg::name`)
   (integer, real, string and bit values; a based literal gives a
   std_logic or std_logic_vector generic its bits, right-aligned). Ports
   connect by name or position.
@@ -183,7 +190,12 @@ the first field are the most significant bits, each `std_logic`, bit or
 boolean one bit and each integer 32 bits; a composite holding a real
 cannot cross. A slice as the actual of an SV module's port passes only the
 slice's elements. Such a port cannot connect to an SV port declared with
-an unpacked dimension or an unpacked struct. Hierarchical reads of the
+an unpacked dimension or an unpacked struct. An `inout` port of an entity
+instantiated from SystemVerilog is one net that both sides drive, when its
+type is std_logic or a std_logic_vector with static bounds: the entity's
+drivers drive the net (`'Z'` leaves it to SystemVerilog, `'W' 'L' 'H'`
+drive it weakly) and the entity reads the net's value. It may be left
+unconnected. Other `inout` ports cannot cross. Hierarchical reads of the
 entity's signals cover those up to 2048 bits (a larger memory is left out:
 its copy would be refreshed on every change).
 
@@ -192,7 +204,7 @@ ports of a VHDL top level are visible and drivable by name
 (`vpi_handle_by_name("top.d")`), and the simulation waits for the
 testbench as for SV. An input keeps its VHDL default until the testbench
 writes it a value other than z. A port that cannot cross (a mode view, an
-`inout` port, an input array of integers or reals, a type listed above as
+`inout` port of another type than those above, an input array of integers or reals, a type listed above as
 not crossing) is left out with a warning. The choice is made when the
 design is elaborated: with `--compile`, pass `--vpi-lib` there too.
 
@@ -268,8 +280,10 @@ calls of procedures that wait or assign signals from outside a process,
 forcing part of a signal,
 external variable names and package paths (`@lib.pkg`) in external names,
 ranges in the choices of `case?`, READ of a TEXT file (READLINE is
-supported), WRITE of a REAL with a FORMAT (VHDL-2019), and `inout` ports
-across the language boundary. A NUL character in a report message is
+supported), WRITE of a REAL with a FORMAT (VHDL-2019), `inout` ports
+across the language boundary that are not std_logic or a std_logic_vector,
+and a nested procedure that waits or assigns signals and names objects of
+its enclosing subprogram. A NUL character in a report message is
 dropped (GHDL prints it).
 
 ## Verification

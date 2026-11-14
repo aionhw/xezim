@@ -1,0 +1,4 @@
+image_index_concat.vhd:13:5:@0ms:(report note): c=r
+image_index_concat.vhd:14:5:@0ms:(report note): xr
+image_index_concat.vhd:15:5:@0ms:(report note): ry
+image_index_concat.vhd:16:5:@0ms:(report note): xrtz

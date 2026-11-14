@@ -587,3 +587,34 @@ fn assert_options() {
 fn value_attr() {
     check("value_attr");
 }
+
+/// §12.1 scope: a subprogram nested in another one names the enclosing
+/// subprogram's parameters, variables and constants, from two levels down,
+/// through a sibling and under recursion (xezim #1102).
+#[test]
+fn nested_subprogram_uplevel() {
+    check("nested_subprogram_uplevel");
+}
+
+/// §8.4, §8.5, §12.5: an element or a slice of an attribute's value
+/// (`T'image(x)(1)`) as an operand of the overloaded "&".
+#[test]
+fn image_index_concat() {
+    check("image_index_concat");
+}
+
+/// §10.5.2.2, §14.7.2: drivers of whole elements of arrays of vectors next
+/// to drivers of their bits and slices: source order within a process,
+/// one process per element, delayed transactions (xezim-core #208, #210).
+#[test]
+fn array_word_drivers() {
+    check("array_word_drivers");
+}
+
+/// NUMERIC_STD relational operators on operands with metavalues: the
+/// result and the warning of each overload; 'L' and 'H' compare as '0' and
+/// '1' (xezim-core #212).
+#[test]
+fn numeric_meta_compare() {
+    check("numeric_meta_compare");
+}

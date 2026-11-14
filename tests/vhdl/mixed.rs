@@ -121,3 +121,19 @@ fn mixed_array_of_arrays() {
 fn mixed_nested_record_port() {
     check("mixed_nested_record_port");
 }
+
+/// IEEE 1800-2017 §6.20.2, §26.3: a VHDL generic takes its value from a
+/// package parameter, imported by wildcard or by name, as `pkg::name`,
+/// through a local parameter and in an expression (xezim #1097).
+#[test]
+fn mixed_generic_package_param() {
+    check("mixed_generic_package_param");
+}
+
+/// IEEE 1800-2017 §23.3.3.2, IEEE 1076-2008 §14.7.3.3: `inout` ports of a
+/// VHDL entity instantiated from SystemVerilog are nets both sides drive;
+/// they may be left unconnected or out of the port list (xezim #1100).
+#[test]
+fn mixed_inout_port() {
+    check("mixed_inout_port");
+}
