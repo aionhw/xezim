@@ -739,3 +739,5 @@ mod negative_index_compiled_blocks;
 mod signed_literal_pattern_index;
 #[path = "types/literal_pattern_key_sites.rs"]
 mod literal_pattern_key_sites;
+#[path = "types/literal_pattern_key_params_1164.rs"]
+mod literal_pattern_key_params_1164;
