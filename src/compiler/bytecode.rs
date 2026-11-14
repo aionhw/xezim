@@ -16075,6 +16075,40 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(r) = self.compile_real_operator(*op, left, right) {
                     return r;
                 }
+                // §11.6.1: in a self-determined position (a concatenation
+                // operand, no context width) an arithmetic or bitwise
+                // operator is its own context: the wider operand's width,
+                // propagated down to both operands, so the narrower one is
+                // extended by its own sign before the operator. Without it
+                // the operands met at unequal widths and the two execution
+                // tiers extended them differently.
+                let ctx_width = if ctx_width == 0
+                    && matches!(
+                        op,
+                        BinaryOp::Add
+                            | BinaryOp::Sub
+                            | BinaryOp::Mul
+                            | BinaryOp::BitAnd
+                            | BinaryOp::BitOr
+                            | BinaryOp::BitXor
+                            | BinaryOp::BitXnor
+                    ) {
+                    // Only with both operands' widths (the two width oracles
+                    // agreeing) and signs known: anything else keeps the
+                    // run-time operator's own extension.
+                    // Equal widths need no extension.
+                    let (lw, rw) = (self.lrm_self_width(left), self.lrm_self_width(right));
+                    let known = lw > 0
+                        && rw > 0
+                        && lw != rw
+                        && lw == self.expr_max_width(left)
+                        && rw == self.expr_max_width(right)
+                        && self.expr_signedness(left).is_some()
+                        && self.expr_signedness(right).is_some();
+                    if known { lw.max(rw) } else { 0 }
+                } else {
+                    ctx_width
+                };
                 // Verilog operand-width rules: comparison and logical ops
                 // (==, !=, <, <=, >, >=, &&, ||, ===, !==, case-eq) are
                 // self-determined — their operands' widths are max(L,R) of
