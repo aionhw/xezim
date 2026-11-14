@@ -522,6 +522,12 @@ impl Simulator {
                 }
                 true
             }
+            // §7.5.1, §8.7: `new[n]` / `new[n](src)` parse as calls of
+            // `new` (see `sized_new_parts`). A collection target makes them
+            // the dynamic-array constructor, which the caller's sized-new
+            // store runs; evaluating them here would call the enclosing
+            // class's constructor on `this` (and the size expression twice).
+            ExprKind::Call { .. } if Self::sized_new_parts(e).is_some() => false,
             ExprKind::Call { .. } => {
                 self.pending_ret_collection = None;
                 let _ = self.eval_expr(e);
