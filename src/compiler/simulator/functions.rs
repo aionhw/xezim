@@ -546,9 +546,14 @@ impl Simulator {
         // `signed_signals`, so an unregistered signed return type (`function
         // integer f`) silently went unsigned and `f >>>= 3` shifted
         // logically (ivtest cfunc_assign_op_vec asr3).
+        // A typedef'd return type (`function lane_t f`) is signed through
+        // its definition (§6.18).
         let ret_signed = match &ret_tp {
             Some((_, c)) => self.concrete_type_signed(c).unwrap_or(false),
-            None => super::elaborate::is_type_signed(&fd.return_type),
+            None => super::elaborate::is_type_signed_resolved(
+                &fd.return_type,
+                &self.module.typedef_types,
+            ),
         };
         if ret_signed {
             self.signed_signals.insert(ret_name.clone());
@@ -919,7 +924,9 @@ impl Simulator {
             if w > 0 && w != result.width {
                 result = result.resize(w);
             }
-            result.is_signed = super::elaborate::is_type_signed(&fd.return_type);
+            // §13.4.1, §6.18: the result has the return type's sign, through
+            // a typedef too.
+            result.is_signed = ret_signed;
             result = Self::ret_two_state(result, ret_conv);
         }
         // Assoc / fixed-array formals copy element-wise, but the copy is
