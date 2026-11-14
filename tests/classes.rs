@@ -908,6 +908,8 @@ mod dynamic_array_new_in_method;
 mod spec_args_module_params;
 #[path = "classes/null_receiver_nonvirtual_call.rs"]
 mod null_receiver_nonvirtual_call;
+#[path = "classes/builtin_class_typedef_handles.rs"]
+mod builtin_class_typedef_handles;
 #[path = "classes/type_param_handle_not_struct.rs"]
 mod type_param_handle_not_struct;
 #[path = "classes/compiled_method_packed_elem_select.rs"]
