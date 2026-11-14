@@ -2050,6 +2050,28 @@ impl Simulator {
                 }
                 return self.exec_method_call(handle, &member.name, args);
             }
+            // §8.4: a non-virtual method through a null receiver runs on the
+            // declared class (see `call_on_null_receiver`); it returned a
+            // silent zero here and ran nothing.
+            let recv_var = match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    Some(h.path[0].name.name.clone())
+                }
+                _ => None,
+            };
+            // Only a receiver that is null: one whose value read as 0 here but
+            // that names a live object is left to the paths below.
+            if self.eval_handle_expr(expr).unwrap_or(0) == 0
+                && let Some(decl) = self.null_receiver_class(expr)
+                && let Some(v) = self.call_on_null_receiver_of(
+                    recv_var.as_deref(),
+                    &decl,
+                    &member.name,
+                    args,
+                )
+            {
+                return v;
+            }
         }
         // Handle hierarchical ident call: obj.f()
         if let ExprKind::Ident(hier) = &func.kind {
@@ -3160,6 +3182,12 @@ impl Simulator {
                                     return res;
                                 }
                             }
+                            // §8.4: a non-virtual method of the declared class.
+                            if let Some(v) =
+                                self.call_on_null_receiver(&decl_full, method_name, args)
+                            {
+                                return v;
+                            }
                         }
                     }
                     // The walked-to property may be a covergroup instance
@@ -3471,12 +3499,21 @@ impl Simulator {
                     // ran nothing; the reference simulator reports the null
                     // dereference. A static method never needs the object.
                     if h == 0
-                        && hier.path.len() == 2
-                        && let Some(decl) = self.class_of_var(&hier.path[0].name.name)
+                        && let Some(decl) = self.null_receiver_class(&recv_expr)
                     {
+                        let mname = hier.path.last().unwrap().name.name.clone();
+                        if let Some(v) = self.call_on_null_receiver_of(
+                            (hier.path.len() == 2).then(|| hier.path[0].name.name.as_str()),
+                            &decl,
+                            &mname,
+                            args,
+                        ) {
+                            return v;
+                        }
+                        // A virtual method: an illegal access (§8.4).
                         let base = decl.split('#').next().unwrap_or(&decl).to_string();
-                        let mname = hier.path[1].name.name.clone();
-                        if self.class_has_method(&base, &mname)
+                        if hier.path.len() == 2
+                            && self.class_has_method(&base, &mname)
                             && !self.is_static_method(&base, &mname)
                         {
                             self.report_null_handle_call(&mname);

@@ -2154,10 +2154,14 @@ impl Simulator {
                     // §8.23: a null receiver still has a legally callable
                     // STATIC target — a static method neither needs nor
                     // references `this` (§8.7), so it resolves on the
-                    // declared class. Anything else through a null handle
-                    // stays a silent zero.
-                    self.exec_static_method_via_object(start_class, method, &args, 0)
-                        .unwrap_or_else(|| Value::zero(32))
+                    // declared class. §8.4: so does a non-virtual instance
+                    // method (see `call_on_null_receiver`).
+                    match self.call_on_null_receiver(start_class, method, &args) {
+                        Some(v) => v,
+                        None => self
+                            .exec_static_method_via_object(start_class, method, &args, 0)
+                            .unwrap_or_else(|| Value::zero(32)),
+                    }
                 } else {
                     self.exec_method_in_class_hierarchy(handle, start_class, method, &args)
                 };

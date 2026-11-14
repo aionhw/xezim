@@ -3294,6 +3294,121 @@ impl Simulator {
         self.abort_run();
     }
 
+    /// §8.4: a method call through a null handle whose receiver is declared
+    /// `decl` (a class name, possibly specialized). Only an access to a
+    /// non-static member or a virtual method is illegal through null, so a
+    /// non-virtual method runs, bound to the declared class as §8.20 binds
+    /// it for a live object, with a null `this`. None when `decl` declares
+    /// no such method, a static one (it dispatches elsewhere) or a virtual
+    /// one (illegal through null; the caller reports it).
+    pub(super) fn call_on_null_receiver(
+        &mut self,
+        decl: &str,
+        method_name: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+        self.call_on_null_receiver_of(None, decl, method_name, args)
+    }
+
+    /// `call_on_null_receiver` for a receiver that is the variable `var`,
+    /// whose declaration names its specialization (`C #(8) h`).
+    pub(super) fn call_on_null_receiver_of(
+        &mut self,
+        var: Option<&str>,
+        decl: &str,
+        method_name: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+        let resolved = self.class_through_typedefs(decl)?;
+        let decl = resolved.as_str();
+        let base = decl.split('#').next().unwrap_or(decl).trim();
+        if method_name == "new"
+            || !self.class_has_method(base, method_name)
+            || self.is_static_method(base, method_name)
+        {
+            return None;
+        }
+        // A virtual method through null is illegal (§8.4); the caller's own
+        // handling (a report, or its later fallbacks) stays in charge.
+        let target = self.nonvirtual_target_class(base, method_name)?;
+        // §8.25: the declared specialization supplies the body's parameters.
+        let saved = self
+            .spec_for_null_receiver(var, decl)
+            .map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+        let v = self.exec_method_in_class_hierarchy(0, &target, method_name, args);
+        if let Some(prev) = saved {
+            self.current_spec = prev;
+        }
+        Some(v)
+    }
+
+    /// The declared class of a receiver expression whose value is null: a
+    /// variable, a property, an element of a collection of handles, a
+    /// function's return type.
+    pub(super) fn null_receiver_class(&mut self, expr: &Expression) -> Option<String> {
+        self.receiver_static_class(expr, 0)
+            .or_else(|| self.call_return_class(expr))
+            .or_else(|| self.get_expr_type_name(expr))
+            .and_then(|t| self.class_through_typedefs(&t))
+    }
+
+    /// The declared return class of a call receiver: a free function
+    /// (`get_null().m()`) or a method of a live object (`h.nullh().m()`).
+    fn call_return_class(&mut self, expr: &Expression) -> Option<String> {
+        let ExprKind::Call { func, .. } = &expr.kind else {
+            return None;
+        };
+        let dt = match &func.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => self
+                .fn_decl_rc(&h.path[0].name.name)
+                .map(|fd| fd.return_type.clone())?,
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let recv = Expression::new(ExprKind::Ident(hier_prefix(h)), func.span);
+                let cls = self.receiver_class_of(&recv)?;
+                self.class_method_return_type(&cls, &h.path.last()?.name.name)?
+            }
+            ExprKind::MemberAccess { expr: recv, member } => {
+                let cls = self.receiver_class_of(recv)?;
+                self.class_method_return_type(&cls, &member.name)?
+            }
+            _ => return None,
+        };
+        match dt {
+            crate::ast::types::DataType::TypeReference { name, .. } => Some(name.name.name),
+            _ => None,
+        }
+    }
+
+    /// The class of a receiver: its object's runtime class when it is live,
+    /// else its declared class.
+    fn receiver_class_of(&self, recv: &Expression) -> Option<String> {
+        let h = self.eval_handle_expr(recv).unwrap_or(0);
+        self.receiver_static_class(recv, h)
+            .or_else(|| self.get_expr_type_name(recv))
+            .map(|c| c.split('#').next().unwrap_or(&c).trim().to_string())
+    }
+
+    /// `t` when it names a class (possibly specialized), or the class a
+    /// typedef chain from it ends at (§6.18).
+    pub(super) fn class_through_typedefs(&self, t: &str) -> Option<String> {
+        let mut t = t.trim().to_string();
+        for _ in 0..8 {
+            let base = t.split('#').next().unwrap_or(&t).trim();
+            if self.module.classes.contains_key(base) {
+                return Some(t);
+            }
+            match self.module.typedef_types.get(base) {
+                Some(crate::ast::types::DataType::TypeReference { name, .. }) => {
+                    t = name.name.name.clone();
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     pub(super) fn exec_method_call(
         &mut self,
         handle: usize,
