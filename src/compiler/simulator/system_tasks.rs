@@ -889,12 +889,46 @@ impl Simulator {
                 );
                 let mut scopes: Vec<String> = Vec::new();
                 for a in args.iter().skip(1) {
-                    if let ExprKind::Ident(hier) = &a.kind {
-                        let s = self.resolve_hier_name(hier);
-                        if !s.is_empty() {
-                            scopes.push(s.to_string());
+                    // A plain identifier keeps the signal resolver, which knows
+                    // the current-scope and package binding of a bare name. An
+                    // INDEXED path is not an `ExprKind::Ident` at all — the
+                    // parser builds `Index`/`MemberAccess` around it — so it
+                    // used to be dropped here without a word and the dump fell
+                    // back to the whole design; `dump_scope_arg` is the
+                    // `$dumpvars` renderer for that spelling.
+                    let name = match &a.kind {
+                        ExprKind::Ident(hier)
+                            if hier.path.iter().all(|seg| seg.selects.is_empty()) =>
+                        {
+                            let s = self.resolve_hier_name(hier);
+                            (!s.is_empty()).then(|| s.to_string())
+                        }
+                        _ => self.dump_scope_arg(a),
+                    };
+                    match name {
+                        Some(s) => scopes.push(s),
+                        None => {
+                            let text = self.expr_snippet_in(a, None);
+                            self.warn_system_task_once(
+                                &format!("$fsdbDumpvars arg {text}"),
+                                &format!(
+                                    "Warning: $fsdbDumpvars argument '{text}' is not a scope or \
+                                     variable name and was ignored"
+                                ),
+                            );
                         }
                     }
+                }
+                // Same fail-closed rule as `$dumpvars`: an empty scope list
+                // means "no filter", not "select nothing".
+                self.fst_dump_none = false;
+                if args.len() > 1 && scopes.is_empty() {
+                    self.warn_system_task_once(
+                        "$fsdbDumpvars no usable argument",
+                        "Warning: no $fsdbDumpvars argument named a scope or variable, so the \
+                         dump selects nothing (an empty scope list would dump the whole design)",
+                    );
+                    self.fst_dump_none = true;
                 }
                 self.fst_scopes = scopes;
                 if self.fst_writer.is_none() {
@@ -915,6 +949,7 @@ impl Simulator {
                         self.vcd_file = Some("vcdplus.vcd".to_string());
                     }
                     self.vcd_filter_scopes = Vec::new();
+                    self.vcd_dump_none = false;
                     self.vcd_dump_depth = 0;
                     self.vcd_start_dump();
                 } else {
@@ -935,23 +970,39 @@ impl Simulator {
                     .unwrap_or(0) as u32;
                 let mut filter_scopes: Vec<String> = Vec::new();
                 for a in args.iter().skip(1) {
-                    if let ExprKind::Ident(hier) = &a.kind {
-                        // The argument names a SCOPE path. Join it verbatim —
-                        // `resolve_hier_name` is a SIGNAL resolver whose
-                        // scope-stripping heuristics collapsed
+                    match self.dump_scope_arg(a) {
+                        // The argument names a SCOPE or a VARIABLE. Join it
+                        // verbatim — `resolve_hier_name` is a SIGNAL resolver
+                        // whose scope-stripping heuristics collapsed
                         // `tb.u_m.u_i` to the leaf `u_i`, so a hierarchical
                         // `$dumpvars(0, top.a.b)` selected nothing.
                         // `dump_filter_prefixes` strips the top-module prefix.
-                        let s = hier
-                            .path
-                            .iter()
-                            .map(|seg| seg.name.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(".");
-                        if !s.is_empty() {
-                            filter_scopes.push(s);
+                        Some(s) => filter_scopes.push(s),
+                        None => {
+                            let text = self.expr_snippet_in(a, None);
+                            self.warn_system_task_once(
+                                &format!("$dumpvars arg {text}"),
+                                &format!(
+                                    "Warning: $dumpvars argument '{text}' is not a scope or \
+                                     variable name and was ignored"
+                                ),
+                            );
                         }
                     }
+                }
+                // An EMPTY filter list means "no filter" — the whole design. So
+                // when the user DID name arguments and not one of them survived
+                // as a name, the run must not fail open into a full dump: say
+                // so, and select nothing.
+                self.vcd_dump_none = false;
+                if args.len() > 1 && filter_scopes.is_empty() {
+                    self.warn_system_task_once(
+                        "$dumpvars no usable argument",
+                        "Warning: no $dumpvars argument named a scope or variable, so the dump \
+                         selects nothing (an empty $dumpvars filter would dump the whole \
+                         design)",
+                    );
+                    self.vcd_dump_none = true;
                 }
                 self.vcd_filter_scopes = filter_scopes;
                 self.vcd_dump_depth = depth;

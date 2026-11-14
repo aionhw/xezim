@@ -26,6 +26,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* `$dumpvars` and `$fsdbDumpvars` keep an indexed argument — a generated-block
+  instance (`g_lane[2].u_lane`) or an unpacked-array element (`vec[3]`) — and
+  select that subtree. An argument that names no scope or variable is reported
+  and ignored, and a dump whose every argument was rejected selects nothing
+  rather than failing open into a whole-design dump (§21.7.1.4, §27.6.1, #1103).
+  
 * Clocking inputs with an explicit positive skew retain history for each
   unpacked-array element, so indexed reads use the skewed sample (§14.4,
   #1137, PR #1138).

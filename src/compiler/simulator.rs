@@ -9414,6 +9414,13 @@ pub struct Simulator {
     /// strings are ABSOLUTE (they include the top module); `dump_filter_prefixes`
     /// rewrites them to the top-RELATIVE form the signal table uses.
     vcd_filter_scopes: Vec<String>,
+    /// `$dumpvars` named arguments but not one of them was a usable name, so
+    /// the VCD dump must select NOTHING. An empty `vcd_filter_scopes` means
+    /// "no filter" = the WHOLE design, so "select nothing" has to be said out
+    /// loud; without this a `$dumpvars` whose arguments all failed to parse
+    /// failed open into a whole-design dump. Set by `$dumpvars`, cleared by
+    /// `$vcdpluson` and by any `$dumpvars` that kept at least one argument.
+    vcd_dump_none: bool,
     /// §21.7.1.4 `$dumpvars` depth argument: 0 = every level below the given
     /// scope, N = N levels starting at it.
     vcd_dump_depth: u32,
@@ -9525,6 +9532,10 @@ pub struct Simulator {
     /// Optional hierarchical scope filters for FST (same semantics as
     /// `--xtrace-scope`): keep signals whose name equals or sits under a scope.
     pub fst_scopes: Vec<String>,
+    /// `$fsdbDumpvars` named arguments but not one of them was a usable name:
+    /// the FST dump must select nothing rather than fail open into a
+    /// whole-design dump. Same purpose as `vcd_dump_none`; see there.
+    pub fst_dump_none: bool,
     /// The FST body writer (post-header phase). `None` until `fst_start_dump`.
     /// Value packing, block compression and I/O run on a background thread
     /// (`XEZIM_DUMP_INLINE=1` keeps them here); see `fst_sink::FstSink`.
