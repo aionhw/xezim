@@ -426,12 +426,22 @@ impl Simulator {
         // A `real` leaf keeps its real value even when the element signal was
         // never flagged real (array elements are synthesized without the flag);
         // otherwise `real m[3] = '{1.5, ...}` truncates to integers.
+        // §6.12/§20.5: a SHORTREAL member holds a binary32 value — writing
+        // 16777216.25 rounds to IEEE float 16777216.0, not the f64 double.
         if matches!(self.resolve_dt(dt), DataType::Real { .. }) {
-            return if v.is_real {
-                v
+            let f = v.to_f64();
+            let rlim = if matches!(
+                self.resolve_dt(dt),
+                DataType::Real {
+                    kind: crate::ast::types::RealType::ShortReal,
+                    ..
+                }
+            ) {
+                f as f32 as f64
             } else {
-                Value::from_f64(v.to_f64())
+                f
             };
+            return Value::from_f64(rlim);
         }
         v
     }
