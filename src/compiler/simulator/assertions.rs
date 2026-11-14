@@ -571,6 +571,7 @@ impl Simulator {
             SvaNode::And(a, b)
             | SvaNode::Or(a, b)
             | SvaNode::Iff(a, b)
+            | SvaNode::Implies(a, b)
             | SvaNode::Until {
                 left: a, right: b, ..
             } => {
@@ -685,6 +686,13 @@ impl Simulator {
                     Box::new(self.sva_compile_node(right)),
                 )
             }
+            // §16.12.8 `p implies q`, kept by the parser as `$sva_implies(p, q)`.
+            ExprKind::SystemCall { name, args } if name == "$sva_implies" && args.len() == 2 => {
+                SvaNode::Implies(
+                    Box::new(self.sva_compile_node(&args[0])),
+                    Box::new(self.sva_compile_node(&args[1])),
+                )
+            }
             // §16.12.14 abort properties, `$sva_<operator>(cond, body)`.
             ExprKind::SystemCall { name, args }
                 if Self::sva_abort_marker(name) && args.len() == 2 =>
@@ -777,6 +785,11 @@ impl Simulator {
             (SvaNode::Iff(na, nb), SvaState::And { a, b, ra, rb }) => {
                 Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b)
             }
+            // §16.14.8 (z): `p implies q` is nonvacuous iff `p` holds
+            // nonvacuously and `q`'s attempt is nonvacuous.
+            (SvaNode::Implies(_, nb), SvaState::And { b, ra, rb, .. }) => {
+                *ra == Some(SvaOutcome::Pass) && Self::sva_op_nonvacuous(rb, nb, b)
+            }
             (SvaNode::Until { .. }, SvaState::Until { nonvacuous, .. }) => *nonvacuous,
             (SvaNode::Eventually(_), SvaState::Leaf(_))
             | (SvaNode::Always(_), SvaState::Leaf(_)) => true,
@@ -820,6 +833,9 @@ impl Simulator {
             }
             (SvaNode::Iff(na, nb), SvaState::And { a, b, ra, rb }) => {
                 Self::sva_op_fails(ra, na, a) != Self::sva_op_fails(rb, nb, b)
+            }
+            (SvaNode::Implies(na, nb), SvaState::And { a, b, ra, rb }) => {
+                !Self::sva_op_fails(ra, na, a) && Self::sva_op_fails(rb, nb, b)
             }
             (
                 SvaNode::Until {
@@ -909,7 +925,7 @@ impl Simulator {
             ExprKind::SystemCall { name, .. }
                 if matches!(
                     name.as_str(),
-                    "$sva_follow_overlap" | "$sva_follow_nonoverlap"
+                    "$sva_follow_overlap" | "$sva_follow_nonoverlap" | "$sva_implies"
                 ) || Self::sva_abort_marker(name) =>
             {
                 true
@@ -952,6 +968,7 @@ impl Simulator {
             SvaNode::And(a, b)
             | SvaNode::Or(a, b)
             | SvaNode::Iff(a, b)
+            | SvaNode::Implies(a, b)
             | SvaNode::Until {
                 left: a, right: b, ..
             } => Self::sva_has_async_abort(a) || Self::sva_has_async_abort(b),
@@ -990,7 +1007,7 @@ impl Simulator {
                 nonvacuous: false,
                 cons: Vec::new(),
             },
-            SvaNode::And(a, b) | SvaNode::Iff(a, b) => SvaState::And {
+            SvaNode::And(a, b) | SvaNode::Iff(a, b) | SvaNode::Implies(a, b) => SvaState::And {
                 a: Box::new(Self::sva_new_state(a, env)),
                 b: Box::new(Self::sva_new_state(b, env)),
                 ra: None,
@@ -1614,6 +1631,26 @@ impl Simulator {
                             SvaOutcome::Pass
                         })
                     }
+                    _ => None,
+                }
+            }
+            // §16.12.8: `p implies q` evaluates both from this tick. A
+            // failing `p` decides it as a vacuous success (§16.14.8 z);
+            // otherwise `q` decides it, nonvacuous only when both are.
+            (SvaNode::Implies(na, nb), SvaState::And { a, b, ra, rb }) => {
+                if ra.is_none() {
+                    *ra = self.sva_advance(na, a);
+                }
+                if *ra == Some(SvaOutcome::Fail) {
+                    return Some(SvaOutcome::Vacuous);
+                }
+                if rb.is_none() {
+                    *rb = self.sva_advance(nb, b);
+                }
+                match (*ra, *rb) {
+                    (Some(_), Some(SvaOutcome::Fail)) => Some(SvaOutcome::Fail),
+                    (Some(SvaOutcome::Pass), Some(SvaOutcome::Pass)) => Some(SvaOutcome::Pass),
+                    (Some(_), Some(_)) => Some(SvaOutcome::Vacuous),
                     _ => None,
                 }
             }

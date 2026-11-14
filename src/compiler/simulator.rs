@@ -4359,6 +4359,9 @@ enum SvaNode {
     And(Box<SvaNode>, Box<SvaNode>),
     Or(Box<SvaNode>, Box<SvaNode>),
     Iff(Box<SvaNode>, Box<SvaNode>),
+    /// §16.12.8 `p implies q`: both start at the same tick; holds when `p`
+    /// fails (vacuously, §16.14.8 z) or `q` holds. State: `SvaState::And`.
+    Implies(Box<SvaNode>, Box<SvaNode>),
     /// §16.12.12: arbitrary properties are started at each candidate tick.
     Until {
         left: Box<SvaNode>,
