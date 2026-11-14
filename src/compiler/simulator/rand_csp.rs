@@ -616,6 +616,26 @@ pub(crate) struct Csp {
     /// The problem is the size phase's relaxation: an item it cannot model
     /// is dropped rather than making the solve inapplicable.
     size_phase: bool,
+    /// `(x & M) == C` judged by the evaluator because `M` or `C` reads
+    /// other variables (`csp_note_mask`): once those are fixed, `x` is drawn
+    /// with the masked bits already equal to `C`'s.
+    masks: Vec<MaskHint>,
+}
+
+/// See `Csp::masks`.
+#[derive(Clone, Debug)]
+struct MaskHint {
+    /// The variable `x` names, and the bits (lsb, width) of it that `x` is.
+    var: usize,
+    lo: u32,
+    w: u32,
+    mask: Expression,
+    want: Expression,
+    /// The variables `mask` and `want` read, and a source carrying the
+    /// foreach bindings to evaluate them under.
+    deps: Vec<usize>,
+    src: usize,
+    guards: Vec<Node>,
 }
 
 /// One modular reduction of a relation being translated (see
@@ -940,12 +960,20 @@ struct Env {
     it: Option<(String, usize, i64)>,
     /// Conditions of the enclosing `if`/`->` items.
     guards: Vec<Node>,
+    /// `Some(false)` under a disjunct or soft item the solver may skip.
+    mask_note: Option<bool>,
 }
 
 impl Env {
     fn guarded(&self, g: &Node) -> Env {
         let mut e = self.clone();
         e.guards.push(g.clone());
+        e
+    }
+
+    fn optional_mask(&self) -> Env {
+        let mut e = self.clone();
+        e.mask_note = Some(false);
         e
     }
 }
@@ -2340,6 +2368,7 @@ impl Simulator {
             carry_base: None,
             sizes: HashMap::default(),
             size_phase: false,
+            masks: Vec::new(),
         };
         let dom_of = |w: u32, s: bool, members: &Option<Vec<u64>>| -> Dom {
             match members {
@@ -2560,6 +2589,7 @@ impl Simulator {
             carry_base: None,
             sizes: HashMap::default(),
             size_phase: false,
+            masks: Vec::new(),
         };
         let enum_dom = |me: &Self, tn: &str| -> Option<Dom> {
             let members = me.module.enum_members.get(tn)?;
@@ -2759,6 +2789,7 @@ impl Simulator {
         csp.carries.clear();
         csp.carry_accs.clear();
         csp.wraps.clear();
+        csp.masks.clear();
         match csp.carry_base {
             Some(b) => {
                 csp.vars.truncate(b);
@@ -3264,6 +3295,9 @@ impl Simulator {
                     return x;
                 }
             }
+        }
+        if let Some(x) = self.csp_mask_draw(csp, st, v) {
+            return x;
         }
         // A size bounded only below stays near that bound (see `SIZE_OPEN`).
         if st.bounds(v).1 == SIZE_TOP && csp.sizes.values().any(|&sv| sv == v) {
@@ -5562,7 +5596,7 @@ impl Simulator {
                 constraint,
                 ..
             } => {
-                let c = self.csp_bool(csp, condition, env, false)?;
+                let c = self.csp_bool(csp, condition, &env.optional_mask(), false)?;
                 let then = self.csp_item(csp, constraint, &env.guarded(&c))?;
                 self.csp_if(csp, condition, then, Node::True, env)
             }
@@ -5572,11 +5606,11 @@ impl Simulator {
                 else_item,
                 ..
             } => {
-                let c = self.csp_bool(csp, condition, env, false)?;
+                let c = self.csp_bool(csp, condition, &env.optional_mask(), false)?;
                 let then = self.csp_item(csp, then_item, &env.guarded(&c))?;
                 let els = match else_item {
                     Some(e) => {
-                        let nc = self.csp_bool(csp, condition, env, true)?;
+                        let nc = self.csp_bool(csp, condition, &env.optional_mask(), true)?;
                         self.csp_item(csp, e, &env.guarded(&nc))?
                     }
                     None => Node::True,
@@ -5831,7 +5865,12 @@ impl Simulator {
                 let dist_len = csp.dists.len();
                 let order_len = csp.order.len();
                 let opaque = csp.opaque;
-                let node = self.csp_item(csp, inner, env)?;
+                let mask_env = if enabled {
+                    env.clone()
+                } else {
+                    env.optional_mask()
+                };
+                let node = self.csp_item(csp, inner, &mask_env)?;
                 if enabled {
                     Some(node)
                 } else {
@@ -6216,6 +6255,7 @@ impl Simulator {
         els: Node,
         env: &Env,
     ) -> Option<Node> {
+        let env = &env.optional_mask();
         let c = self.csp_bool(csp, cond, env, false)?;
         match c {
             Node::True => return Some(then),
@@ -6252,8 +6292,13 @@ impl Simulator {
             } => self.csp_bool(csp, operand, env, !neg),
             ExprKind::Binary { op, left, right } => match op {
                 BinaryOp::LogAnd | BinaryOp::LogOr => {
-                    let l = self.csp_bool(csp, left, env, neg)?;
-                    let r = self.csp_bool(csp, right, env, neg)?;
+                    let e = if (*op == BinaryOp::LogOr) != neg {
+                        env.optional_mask()
+                    } else {
+                        env.clone()
+                    };
+                    let l = self.csp_bool(csp, left, &e, neg)?;
+                    let r = self.csp_bool(csp, right, &e, neg)?;
                     // De Morgan: a negated && is an || of the negations
                     Some(if (*op == BinaryOp::LogAnd) != neg {
                         Node::And(vec![l, r])
@@ -6271,8 +6316,13 @@ impl Simulator {
                 BinaryOp::BitAnd | BinaryOp::BitOr
                     if Self::csp_one_bit(left) && Self::csp_one_bit(right) =>
                 {
-                    let l = self.csp_bool(csp, left, env, neg)?;
-                    let r = self.csp_bool(csp, right, env, neg)?;
+                    let e = if (*op == BinaryOp::BitOr) != neg {
+                        env.optional_mask()
+                    } else {
+                        env.clone()
+                    };
+                    let l = self.csp_bool(csp, left, &e, neg)?;
+                    let r = self.csp_bool(csp, right, &e, neg)?;
                     Some(if (*op == BinaryOp::BitAnd) != neg {
                         Node::And(vec![l, r])
                     } else {
@@ -6285,7 +6335,8 @@ impl Simulator {
                         let r = self.csp_bool(csp, right, env, true)?;
                         Some(Node::And(vec![l, r]))
                     } else {
-                        let then = self.csp_bool(csp, right, env, false)?;
+                        let c = self.csp_bool(csp, left, &env.optional_mask(), false)?;
+                        let then = self.csp_bool(csp, right, &env.guarded(&c), false)?;
                         self.csp_if(csp, left, then, Node::True, env)
                     }
                 }
@@ -7011,6 +7062,8 @@ impl Simulator {
             {
                 return Some(n);
             }
+            self.csp_note_mask(csp, whole, left, right, env);
+            self.csp_note_mask(csp, whole, right, left, env);
         }
         let (Some(a), Some(b)) = (self.csp_ae(csp, left, env), self.csp_ae(csp, right, env)) else {
             return fallback(self, csp);
@@ -10360,6 +10413,223 @@ impl Simulator {
             return Some(Self::csp_and(nodes));
         }
         None
+    }
+
+    /// `(x & M) == C` where `M` or `C` reads other variables, such as
+    /// `(addr & ((1 << m) - 1)) == ((1 << m) - 1)`: the evaluator judges it
+    /// once `x` is fixed, and a uniform `x` meets `k` pinned bits one time in
+    /// 2**k. Noted in `Csp::masks` so the value of `x` is drawn with those
+    /// bits set (`csp_mask_draw`).
+    fn csp_note_mask(
+        &mut self,
+        csp: &mut Csp,
+        whole: &Expression,
+        masked: &Expression,
+        other: &Expression,
+        env: &Env,
+    ) {
+        if env.mask_note == Some(false) {
+            return;
+        }
+        let ExprKind::Binary {
+            op: BinaryOp::BitAnd,
+            left,
+            right,
+        } = &Self::unparen(masked).kind
+        else {
+            return;
+        };
+        for (x, m) in [(left, right), (right, left)] {
+            let mut konst = |me: &mut Self, y: &Expression| -> Option<i64> {
+                if !me.csp_free(csp, y, env) {
+                    return None;
+                }
+                me.csp_const(y, env)?.to_i64()
+            };
+            let Some((var, lo, w, _)) = self.csp_slice_base_k(csp, x, &mut konst) else {
+                continue;
+            };
+            // §5.7.1: a `'0`/`'1` takes the comparison's width. One that is
+            // a whole operand gets it in `csp_mask_draw`; a nested one would
+            // be evaluated at its own width.
+            let nested = |e: &Expression| Self::csp_fill(e).is_none() && Self::csp_has_fill(e);
+            if nested(m) || nested(other) {
+                return;
+            }
+            let mut deps = Vec::new();
+            if !self.csp_refs(csp, m, env, &mut deps) || !self.csp_refs(csp, other, env, &mut deps) {
+                return;
+            }
+            deps.sort_unstable();
+            deps.dedup();
+            let base_of = |d: usize| csp.aux_base.get(&d).map_or(d, |b| b.0);
+            if deps.is_empty()
+                || deps.iter().any(|&d| base_of(d) == var)
+                || csp.vars[var].signed
+                || csp.vars[var].width > 64
+            {
+                return;
+            }
+            let src = self.csp_src(csp, SrcItem::Expr(whole.clone()), env, deps.clone());
+            csp.masks.push(MaskHint {
+                var,
+                lo,
+                w,
+                mask: (**m).clone(),
+                want: other.clone(),
+                deps,
+                src,
+                guards: env.guards.clone(),
+            });
+            return;
+        }
+    }
+
+    /// The digit of `e` when it is an unbased unsized literal (`'1`).
+    fn csp_fill(e: &Expression) -> Option<char> {
+        match &Self::unparen(e).kind {
+            ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(c)) => Some(*c),
+            _ => None,
+        }
+    }
+
+    /// Whether `e` may contain an unbased unsized literal (`'0`, `'1`, ...).
+    /// A form not walked here counts as containing one.
+    fn csp_has_fill(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(n) => {
+                matches!(n, crate::ast::expr::NumberLiteral::UnbasedUnsized(_))
+            }
+            ExprKind::Ident(_) => false,
+            ExprKind::Index { expr, index } => {
+                Self::csp_has_fill(expr) || Self::csp_has_fill(index)
+            }
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => Self::csp_has_fill(x),
+            ExprKind::Binary { left, right, .. } => {
+                Self::csp_has_fill(left) || Self::csp_has_fill(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => [condition, then_expr, else_expr]
+                .iter()
+                .any(|x| Self::csp_has_fill(x)),
+            ExprKind::Concatenation(xs) => xs.iter().any(Self::csp_has_fill),
+            _ => true,
+        }
+    }
+
+    /// A value of `v` drawn uniformly from its domain with the bits that the
+    /// `Csp::masks` in force pin set to their values. In force: every guard
+    /// holds and `M` and `C` are fixed. None when no mask is in force or no
+    /// draw lands in the domain.
+    fn csp_mask_draw(&mut self, csp: &Csp, st: &St, v: usize) -> Option<i128> {
+        let (base, off, width) = csp
+            .aux_base
+            .get(&v)
+            .copied()
+            .unwrap_or((v, 0, csp.vars[v].width));
+        if csp.masks.is_empty() || width > 64 || csp.vars[v].signed {
+            return None;
+        }
+        let ones = |w: u32| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let (mut pin, mut val) = (0u64, 0u64);
+        for h in csp.masks.iter().filter(|h| h.var == base) {
+            if !st.all_fixed(&h.deps)
+                || !h
+                    .guards
+                    .iter()
+                    .all(|g| self.csp_status(csp, g, st) == Some(true))
+            {
+                continue;
+            }
+            let val_of = |me: &mut Self, e: &Expression| match Self::csp_fill(e) {
+                Some('0') => Some(0),
+                Some('1') => Some(ones(h.w)),
+                Some(_) => None,
+                None => me.csp_eval_in(csp, st, h.src, e).to_u64(),
+            };
+            let m = val_of(self, &h.mask)? & ones(h.w);
+            let c = val_of(self, &h.want)?;
+            if c & !m != 0 {
+                return None;
+            }
+            let (m, c) = (m.checked_shl(h.lo)?, c.checked_shl(h.lo)?);
+            let (m, c) = ((m >> off) & ones(width), (c >> off) & ones(width));
+            if (val ^ c) & pin & m != 0 {
+                return None;
+            }
+            pin |= m;
+            val = (val & !m) | (c & m);
+        }
+        if pin == 0 {
+            return None;
+        }
+        // The values in 0..=n whose pinned bits equal `val`.
+        let upto = |n: i128| -> u128 {
+            if n < 0 {
+                return 0;
+            }
+            let n = n as u64;
+            let mut c = 0u128;
+            for b in (0..64).rev() {
+                let free_below = (!pin & ones(b)).count_ones();
+                let pinned = pin >> b & 1 == 1;
+                if n >> b & 1 == 1 {
+                    if !pinned || val >> b & 1 == 0 {
+                        c += 1u128 << free_below;
+                    }
+                    if pinned && val >> b & 1 == 0 {
+                        return c;
+                    }
+                } else if pinned && val >> b & 1 == 1 {
+                    return c;
+                }
+            }
+            c + 1
+        };
+        let d = &st.d[v];
+        let n: u128 = d.iter().map(|&(l, h)| upto(h) - upto(l - 1)).sum();
+        if n == 0 {
+            return None;
+        }
+        let mut k = self.cur_rng().gen_range(0..n);
+        for &(l, h) in d {
+            let base = upto(l - 1);
+            let here = upto(h) - base;
+            if k >= here {
+                k -= here;
+                continue;
+            }
+            let (mut lo, mut hi) = (l, h);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if upto(mid) - base > k {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            return Some(lo);
+        }
+        None
+    }
+
+    /// The value of `e` (a part of source `src`'s constraint) with the fixed
+    /// variables written and the source's foreach indices bound.
+    fn csp_eval_in(&mut self, csp: &Csp, st: &St, src: usize, e: &Expression) -> Value {
+        let s = &csp.srcs[src];
+        for &v in &s.deps {
+            if let Some(x) = st.fixed(v) {
+                self.csp_write(csp, v, x);
+            }
+        }
+        let frame = self.csp_frame(&s.binds);
+        self.push_local_frame(frame);
+        let v = self.eval_expr(e);
+        self.pop_local_frame();
+        v
     }
 
     /// A select or field of a split scalar as its solver variable.
