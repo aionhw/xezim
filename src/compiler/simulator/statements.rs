@@ -416,11 +416,15 @@ impl Simulator {
                 }
                 suffixes = next;
             }
-            // §7.5.1: the element type's default (x when 4-state).
+            // §7.5.1: the element type's default (x when 4-state, real 0.0
+            // for real, §6.8).
             let four_state = self.coll_elem_starts_x(name);
+            let real = self.coll_elem_is_real(name);
             for i in keep..n {
                 for s in &suffixes {
-                    let v = if four_state {
+                    let v = if real {
+                        Value::from_f64(0.0)
+                    } else if four_state {
                         Value::new(w)
                     } else {
                         Value::zero(w)
@@ -440,8 +444,11 @@ impl Simulator {
                 .map(|&(_, _, w)| w)
                 .unwrap_or(32);
             // A class member (`<handle>#da`) has its type on the class.
+            // §6.8, Table 6-7: a real/shortreal element starts at real 0.0.
             let four_state = self.coll_elem_starts_x(name);
-            let fill = if four_state {
+            let fill = if self.coll_elem_is_real(name) {
+                Value::from_f64(0.0)
+            } else if four_state {
                 Value::new(w)
             } else {
                 Value::zero(w)
