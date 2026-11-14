@@ -3122,6 +3122,9 @@ impl Simulator {
                 // needs this — same shape as the §6.11.1 signedness loop.
                 if super::elaborate::is_type_real_resolved(dt, &module.typedef_types) {
                     for id in first_id..signal_table.len() {
+                        // §6.8, Table 6-7: real/shortreal cells start at real
+                        // 0.0; the value tag must agree with the metadata.
+                        signal_table[id] = Value::from_f64(0.0);
                         signal_real_vec[id] = true;
                     }
                 }
@@ -3145,7 +3148,11 @@ impl Simulator {
                 }
                 let n = (hi - lo + 1).max(0) as usize;
                 for id in first_id..first_id + n {
-                    signal_table[id] = Value::zero(signal_widths_vec[id]);
+                    // Reals also occur in two_state_signals; keep their
+                    // typed 0.0 from the real-inheritance loop (§6.8).
+                    if !signal_real_vec[id] {
+                        signal_table[id] = Value::zero(signal_widths_vec[id]);
+                    }
                 }
             }
         }
@@ -3314,6 +3321,7 @@ impl Simulator {
                 super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
                 }
             }
@@ -3377,6 +3385,7 @@ impl Simulator {
                 super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
                 }
             }
@@ -3397,7 +3406,7 @@ impl Simulator {
             }
             let prefix = format!("{}[", base);
             for (name, &id) in signal_name_to_id.iter() {
-                if name.starts_with(prefix.as_str()) {
+                if name.starts_with(prefix.as_str()) && !signal_real_vec[id] {
                     signal_table[id] = Value::zero(signal_widths_vec[id]);
                 }
             }
