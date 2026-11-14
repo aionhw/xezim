@@ -3400,7 +3400,51 @@ impl Simulator {
     /// interface) keeps the value as evaluated.
     #[inline(never)]
     pub(super) fn fit_queue_push_elem(&self, coll: &str, val: Value) -> Value {
-        let Some((w, signed, two_state)) = self.integral_queue_elem(coll) else {
+        Self::fit_queue_elem_to(self.integral_queue_elem(coll), val)
+    }
+
+    /// `fit_queue_push_elem` for a compiled element store (`StoreCollElem`).
+    /// The element type comes from a small cache of the last collections
+    /// stored to, so a store loop resolves it once per collection instead of
+    /// on every store (the lookup walks the object's class chain several
+    /// times). A class member's entry also keys on the object's class, and an
+    /// object with type-parameter bindings or a specialization is never
+    /// cached, so a reused handle cannot see another object's element type.
+    pub(super) fn fit_coll_store_elem(&mut self, coll: &str, val: Value) -> Value {
+        let inst = coll
+            .split_once('#')
+            .and_then(|(h, _)| h.parse::<usize>().ok())
+            .and_then(|h| self.heap.get(h)?.as_deref());
+        let cacheable = inst.is_none_or(|i| i.type_bindings.is_empty() && i.spec.is_none());
+        let class = inst.map(|i| i.class_name.as_str());
+        let hit = cacheable
+            .then(|| {
+                self.coll_store_fit_cache
+                    .iter()
+                    .flatten()
+                    .find(|(name, cls, _)| name == coll && cls.as_deref() == class)
+                    .map(|&(_, _, info)| info)
+            })
+            .flatten();
+        let info = match hit {
+            Some(info) => info,
+            None => {
+                let info = self.integral_queue_elem(coll);
+                if cacheable {
+                    let slot = self.coll_store_fit_next % self.coll_store_fit_cache.len();
+                    self.coll_store_fit_next = slot + 1;
+                    self.coll_store_fit_cache[slot] =
+                        Some((coll.to_string(), class.map(str::to_string), info));
+                }
+                info
+            }
+        };
+        Self::fit_queue_elem_to(info, val)
+    }
+
+    /// Fit `val` to the integral element type `info` (`integral_queue_elem`).
+    fn fit_queue_elem_to(info: Option<(u32, bool, bool)>, val: Value) -> Value {
+        let Some((w, signed, two_state)) = info else {
             return val;
         };
         // §6.12.2: a real argument rounds to the integral element type.

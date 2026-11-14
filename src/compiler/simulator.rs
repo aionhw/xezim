@@ -8473,6 +8473,12 @@ pub struct Simulator {
     /// elements live in the runtime map with no declared signedness of their
     /// own, so a store stamps it from here (`p.dyn[1] = 8'hff` reads -1).
     signed_class_colls: HashSet<String>,
+    /// Cache of `fit_coll_store_elem`, replaced round-robin from
+    /// `coll_store_fit_next`: (collection store name, the owning object's
+    /// class, `integral_queue_elem` of it).
+    #[allow(clippy::type_complexity)]
+    coll_store_fit_cache: [Option<(String, Option<String>, Option<(u32, bool, bool)>)>; 4],
+    coll_store_fit_next: usize,
     /// §8.25 / §8.3: classes whose base class depends on their own
     /// parameters — `class W #(type B = base) extends B;` (the base IS a type
     /// parameter) or `class W2 #(type B) extends W #(B);` (the base is such a

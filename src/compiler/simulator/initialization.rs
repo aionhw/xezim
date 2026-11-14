@@ -4240,6 +4240,8 @@ impl Simulator {
             constraint_scopes: HashMap::default(),
             inline_constraint_scope: None,
             signed_class_colls: HashSet::default(),
+            coll_store_fit_cache: Default::default(),
+            coll_store_fit_next: 0,
             dep_base: HashMap::default(),
             dep_default: HashMap::default(),
             dep_names: Vec::new(),
