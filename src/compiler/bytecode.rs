@@ -9338,6 +9338,88 @@ impl<'a> BytecodeCompiler<'a> {
         Some(dest)
     }
 
+    /// §7.4.3: the width of one element of the outer packed dimension of the
+    /// plain packed variable `base`, from its declared type and its signal
+    /// width — 1 for a vector, 11 for `lane_t [-9:9] x`. None for any other
+    /// shape (an unpacked array, a member, a local), which keeps its
+    /// interpreted path.
+    fn packed_part_select_elem_width(&self, base: &Expression) -> Option<u32> {
+        use crate::ast::types::{DataType as D, PackedDimension as P};
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.root.is_some()
+            || h.path.len() != 1
+            || !h.path[0].selects.is_empty()
+            || self.local_var_reg_of(h).is_some()
+            || self.lookup_array_name(h).is_some()
+            || self.is_multi_dim_array(h)
+        {
+            return None;
+        }
+        let total = *self.signal_widths.get(self.lookup_signal_id(h)?)?;
+        let raw = Self::hier_raw_name(h);
+        let scoped = self
+            .scope_hint
+            .as_ref()
+            .map(|scope| format!("{}.{}", scope, raw));
+        fn lookup<'m, V>(
+            m: &'m HashMap<String, V>,
+            scoped: Option<&str>,
+            raw: &str,
+        ) -> Option<&'m V> {
+            scoped.and_then(|q| m.get(q)).or_else(|| m.get(raw))
+        }
+        let (scoped, raw) = (scoped.as_deref(), raw.as_str());
+        let declared = self.var_decl_types.and_then(|m| lookup(m, scoped, raw));
+        let (Some(mut dt), Some(types)) = (declared, self.typedef_types) else {
+            // No declaration on record (a net, say): the packed shape tables
+            // decide, and a name in neither is a plain vector.
+            if let Some(&ew) = self.packed_elem_widths.and_then(|m| lookup(m, scoped, raw)) {
+                return (ew > 0).then_some(ew);
+            }
+            if self
+                .packed_full_dims
+                .and_then(|m| lookup(m, scoped, raw))
+                .is_some_and(|dims| dims.len() > 1)
+            {
+                return None;
+            }
+            return Some(1);
+        };
+        // The outer dimension: the declaration's first packed range, through
+        // plain typedef aliases; a declaration with none selects bits.
+        let mut outer: Option<&P> = None;
+        for _ in 0..64 {
+            match dt {
+                D::TypeReference {
+                    name, dimensions, ..
+                } => {
+                    if let Some(first) = dimensions.first() {
+                        outer = Some(first);
+                        break;
+                    }
+                    dt = crate::compiler::elaborate::lookup_scoped_type(name, types)?;
+                }
+                D::IntegerVector { dimensions, .. } | D::Implicit { dimensions, .. } => {
+                    outer = dimensions.first();
+                    break;
+                }
+                D::IntegerAtom { .. } | D::Struct(_) | D::Enum(_) => break,
+                _ => return None,
+            }
+        }
+        let count = match outer {
+            None => total,
+            Some(P::Range { left, right, .. }) => {
+                let (l, r) = (self.eval_const_bound(left)?, self.eval_const_bound(right)?);
+                (l - r).unsigned_abs() as u32 + 1
+            }
+            Some(_) => return None,
+        };
+        (count > 0 && total % count == 0).then(|| total / count)
+    }
+
     /// §7.4.1: whether `expr` (an index chain on a plain packed variable)
     /// selects an element whose type is a named signed type — see
     /// `signed_named_packed_elem_depth`.
@@ -17462,15 +17544,23 @@ impl<'a> BytecodeCompiler<'a> {
                             .lookup_signal_id(h)
                             .and_then(|id| self.signal_widths.get(id).copied())
                             .unwrap_or(0),
-                        // `x[hi:lo]` with constant bounds: hi - lo + 1.
+                        // `x[hi:lo]` with constant bounds: hi - lo + 1
+                        // ELEMENTS of `x`'s outer packed dimension, each as
+                        // wide as one element (§7.4.3, §11.4.14): a slice of
+                        // `lane_t [-9:9] x` is eleven bits per element.
                         ExprKind::RangeSelect {
+                            expr: base,
                             left,
                             right,
                             kind: RangeKind::Constant,
-                            ..
-                        } => match (self.eval_const_bound(left), self.eval_const_bound(right)) {
-                            (Some(hi), Some(lo)) if hi >= lo => (hi - lo + 1) as u32,
-                            (Some(hi), Some(lo)) => (lo - hi + 1) as u32,
+                        } => match (
+                            self.eval_const_bound(left),
+                            self.eval_const_bound(right),
+                            self.packed_part_select_elem_width(base),
+                        ) {
+                            (Some(hi), Some(lo), Some(ew)) => {
+                                ((hi - lo).unsigned_abs() as u32 + 1).saturating_mul(ew)
+                            }
                             _ => 0,
                         },
                         _ => 0,
