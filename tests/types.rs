@@ -101,6 +101,8 @@ mod declared_signedness_wins;
 mod default_assignment_pattern_packed;
 #[path = "types/default_real_array_cells.rs"]
 mod default_real_array_cells;
+#[path = "types/default_real_collection_cells.rs"]
+mod default_real_collection_cells;
 #[path = "types/defparam_override.rs"]
 mod defparam_override;
 #[path = "types/diag_kind_limit_env.rs"]
