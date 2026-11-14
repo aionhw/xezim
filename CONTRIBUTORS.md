@@ -197,8 +197,11 @@ work. Thank you in particular to
 [urbanij](https://github.com/urbanij) and
 [vrajeshprakhya](https://github.com/vrajeshprakhya).
 
-The elaboration-memory investigation in #721 uses synthetic reproducers,
-allocation profiles and controlled type-context comparisons supplied by
-[amal-khailtash](https://github.com/amal-khailtash).
+The elaboration-memory investigation in [#721](https://github.com/aionhw/xezim/issues/721)
+uses synthetic reproducers, allocation profiles, controlled type-context
+comparisons and anonymized memory traces supplied by
+[amal-khailtash](https://github.com/amal-khailtash). Their net-initializer
+reproducer and sharing experiment identified the retained target-expression
+cost addressed by sharing declaration targets across child instances.
 
 New contributors are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).

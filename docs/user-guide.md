@@ -11,6 +11,7 @@ of options and environment variables is in the
 * [Waveforms](#waveforms)
 * [Checkpoints](#checkpoints)
 * [Warm design cache](#warm-design-cache)
+* [Diagnosing memory growth](#diagnosing-memory-growth)
 * [Native compilation](#native-compilation)
 * [Reducing a multi-file build](#reducing-a-multi-file-build)
 * [Module-timescale extension](#module-timescale-extension)
@@ -144,6 +145,36 @@ The default directory is `$XEZIM_CACHE_DIR`, then
 `--cache-dir` for a workload-local cache or `--no-cache` for a cold run. With
 `--verbose`, xezim prints `[CACHE] miss`, `[CACHE] stored`, or `[CACHE] hit` on
 stderr.
+
+## Diagnosing memory growth
+
+For a large design that exhausts memory during compilation, capture a cold
+run with the same sources, top and options as the failing command:
+
+```bash
+XEZIM_OOM_TRACE=memory.jsonl xezim --compile --no-cache -f files.f -s top
+```
+
+Use `--simulate` instead when growth occurs during simulator setup or execution.
+The trace appends JSONL records with the active phase, source location,
+instance, latest table counts and process RSS. Periodic samples continue
+during long phases. RSS is available on Linux; other platforms report `null`.
+Complete records remain readable after a kill, although the last line may
+be incomplete. `XEZIM_OOM_TRACE=1` writes to stderr; `0` disables tracing.
+
+Trace files contain design names and source paths. Keep the raw trace private
+and share redacted phase/count summaries with the tested revisions, command
+options, peak RSS and exit or kill evidence. RSS is process-wide: a rise near
+one source location does not establish which allocation owns the memory.
+See the [tracing guide](DEBUGGING.md#tracing-memory-growth) for record fields
+and commands to inspect the largest jumps.
+
+Leave tracing off for performance measurements and compare equivalent cache
+conditions. Recent memory improvements apply automatically, including shared
+net-initializer targets across child instances; no new switch or source rewrite
+is required. Instance-specific destinations, delays and strengths are preserved.
+The synthetic results in the [README](../README.md#performance) do not establish
+that the original large-design OOM in #721 is resolved.
 
 ## Native compilation
 
