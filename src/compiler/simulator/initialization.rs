@@ -3900,6 +3900,7 @@ impl Simulator {
             sva_preponed: HashMap::default(),
             sva_preponed_slot: None,
             sva_owed: false,
+            sva_abort_step: false,
             sva_post_nba_busy: false,
             clocking_snapshots: HashMap::default(),
             clocking_array_leaves: HashSet::default(),

@@ -12,7 +12,8 @@ impl Simulator {
         ticks: &mut VecDeque<SvaUntilTick>,
         closed: &mut bool,
     ) -> Option<SvaOutcome> {
-        if !*closed {
+        // §16.12.14: an abort step between ticks starts no evaluation.
+        if !*closed && !self.sva_abort_step {
             ticks.push_back(SvaUntilTick {
                 left: Self::sva_new_state(left, env),
                 right: Self::sva_new_state(right, env),

@@ -4132,6 +4132,10 @@ struct SvaClockedSite {
     /// `node` holds an `accept_on` / `reject_on` (§16.12.14), whose
     /// condition is checked in every time step, not only at the ticks.
     async_abort: bool,
+    /// §16.12.14: attempts an asynchronous abort settled in a time step
+    /// between ticks, reported at the next tick (or at the end of
+    /// simulation) ahead of that tick's results.
+    settled: Vec<SvaOutcome>,
     /// §16.12 `disable iff (guard)`: while the guard holds, every attempt in
     /// flight is cancelled and no new one starts. Evaluated with the current
     /// (unsampled) values, as the LRM's asynchronous reset semantics require.
@@ -4430,14 +4434,10 @@ enum SvaState {
     },
     /// `s_eventually` / `s_always`, with the attempt's local variables.
     Leaf(SvaEnv),
-    /// An abort property's evaluation. `latched`: an asynchronous abort
-    /// condition held in a time step since the last tick, settled at the
-    /// next tick or at the end of simulation; `aborted`: an abort settled
-    /// the attempt.
+    /// An abort property's evaluation; `aborted`: its condition settled it.
     Abort {
         body: Box<SvaState>,
         env: SvaEnv,
-        latched: bool,
         aborted: bool,
     },
 }
@@ -7325,6 +7325,10 @@ pub struct Simulator {
     sva_preponed_slot: Option<u64>,
     /// A site's clock event is recorded (`fired`) and not evaluated yet.
     sva_owed: bool,
+    /// §16.12.14: `sva_advance` runs in a time step without a tick of the
+    /// site, so only asynchronous abort conditions are checked and nothing
+    /// else advances (`sva_abort_step_site`).
+    sva_abort_step: bool,
     /// `sva_post_nba` is running the slot's due cbReadWriteSynch batches.
     sva_post_nba_busy: bool,
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry

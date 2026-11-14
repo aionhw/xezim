@@ -30,6 +30,7 @@ use serde::ser::{SerializeSeq, Serializer};
 // §10.3.3 / §28.16: CombItem::ContAssign retains its original delay target.
 // §10.3.3 / §28.16: and the fall and turn-off delays of a select target.
 // Annex D.9 / §8.3: rebuild property-owner indexes from restored classes.
+// §16.12.14: abort properties in SvaNode/SvaState, settled attempts per site.
 const MAGIC: &[u8; 8] = b"XZCKPT\x00\x0a";
 
 #[derive(Default)]
