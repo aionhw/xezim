@@ -1448,7 +1448,7 @@ impl Simulator {
             .count();
         let widths: Vec<_> = leaves.iter().map(|l| l.2).collect();
         let pattern_vals = self
-            .eval_flat_struct_pattern(arg, leaf_count, &widths)
+            .eval_flat_struct_pattern(&su, arg, leaf_count, &widths)
             .or_else(|| {
                 let keys: Vec<_> = leaves.iter().map(|l| (l.0.clone(), l.2, l.3)).collect();
                 self.struct_pattern_leaf_values(port_name, &su, arg, &keys)
@@ -1646,6 +1646,7 @@ impl Simulator {
     /// a simple ordered pattern (caller falls back to member-access eval).
     pub(super) fn eval_flat_struct_pattern(
         &mut self,
+        su: &crate::ast::types::StructUnionType,
         arg: &Expression,
         n: usize,
         widths: &[u32],
@@ -1653,7 +1654,15 @@ impl Simulator {
         let ExprKind::AssignmentPattern(parts) = &self.unpacked_pattern(arg).kind else {
             return None;
         };
-        if parts.len() != n {
+        // §10.9.2: even a one-member replication needs member type
+        // context. Let the shared structure binder remove its inner braces.
+        if parts.len() != n
+            || (!super::elaborate::struct_pattern_has_array_member(
+                su,
+                &self.module.typedef_types,
+                &self.module.typedef_unpacked_dims,
+            ) && super::elaborate::struct_pattern_replication(parts, n).is_some())
+        {
             return None;
         }
         let mut out = Vec::with_capacity(n);
@@ -1806,7 +1815,7 @@ impl Simulator {
             locals.insert(format!("{}.", port_name), Value::zero(1));
             let widths: Vec<_> = leaves.iter().map(|l| l.2).collect();
             let pattern_vals = self
-                .eval_flat_struct_pattern(arg, leaves.len(), &widths)
+                .eval_flat_struct_pattern(&su, arg, leaves.len(), &widths)
                 .or_else(|| {
                     let keys: Vec<_> = leaves.iter().map(|l| (l.0.clone(), l.2, l.3)).collect();
                     self.struct_pattern_leaf_values(port_name, &su, arg, &keys)
@@ -1850,7 +1859,7 @@ impl Simulator {
             })
             .collect();
         let pattern_vals = self
-            .eval_flat_struct_pattern(arg, flat_names.len(), &widths)
+            .eval_flat_struct_pattern(&su, arg, flat_names.len(), &widths)
             .or_else(|| {
                 let mut keys = Vec::new();
                 for m in &su.members {

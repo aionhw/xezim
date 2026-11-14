@@ -358,7 +358,8 @@ fn method_boost_enabled() -> bool {
 // §25.5: a modport-qualified name resolves to the interface instance's own variable.
 // §8.14: a base static that a derived class redeclares counts as a redeclared member.
 // §7.4.1: a member of an element of an ascending packed array of structs slices from slot 0.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3077;
+// §10.9.2: structure replication in scalarized function calls.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3078;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1680,7 +1681,8 @@ struct CombEntryCold {
 // §10.3.3 / §28.16: retain each delayed entry's original transition target.
 // §10.3.3 / §28.16: and the fall and turn-off delays of a select target.
 // §7.4.1: compiled members of ascending packed arrays of structs slice from slot 0.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB035";
+// §10.9.2: scalarized resolver calls expand structure replication.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB036";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
