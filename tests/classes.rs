@@ -902,6 +902,8 @@ mod typedef_packed_return_prototype;
 mod inherited_type_param_create;
 #[path = "classes/dynamic_array_property_new_init.rs"]
 mod dynamic_array_property_new_init;
+#[path = "classes/dynamic_array_new_in_method.rs"]
+mod dynamic_array_new_in_method;
 #[path = "classes/type_param_handle_not_struct.rs"]
 mod type_param_handle_not_struct;
 #[path = "classes/compiled_method_packed_elem_select.rs"]
