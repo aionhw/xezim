@@ -715,6 +715,8 @@ mod struct_array_member_elem_select;
 mod packed_select_geometry_1002;
 #[path = "types/struct_pattern_replication.rs"]
 mod struct_pattern_replication;
+#[path = "types/struct_pattern_replication_constant_counts.rs"]
+mod struct_pattern_replication_constant_counts;
 #[path = "types/unpacked_slice_patterns_1045.rs"]
 mod unpacked_slice_patterns_1045;
 
