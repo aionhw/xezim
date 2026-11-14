@@ -155,6 +155,8 @@ mod iff_guard_module_scope;
 mod intra_assignment_delay;
 #[path = "scheduling/intra_assignment_event_identifier.rs"]
 mod intra_assignment_event_identifier;
+#[path = "scheduling/intra_delay_assignment_pattern.rs"]
+mod intra_delay_assignment_pattern;
 #[path = "scheduling/issue_237_mixed_clock_configs.rs"]
 mod issue_237_mixed_clock_configs;
 #[path = "scheduling/ivtest_always_cluster.rs"]
