@@ -15913,9 +15913,14 @@ impl<'a> BytecodeCompiler<'a> {
                         // sequence (uvm_complete_test: run_test silently
                         // produced nothing). Decline the body unless every
                         // such name was explicitly admitted.
+                        // VHDL kernel helpers (`vh_upd`, `vh_eager`, …) are
+                        // module-scope functions that legitimately read
+                        // module signals; only names with no signal binding
+                        // are package variables.
                         if self.free_function_mode
                             && !self.method_handle_names.contains(bare)
                             && !self.string_formal_names.contains(bare)
+                            && self.lookup_signal_id(hier).is_none()
                         {
                             self.bail("free_fn_pkg_variable");
                             return None;
@@ -18337,7 +18342,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // so `method_handle_chain_ok(base)` is false for them and
                 // that branch would bail. Not admitted (method/arity/receiver
                 // gate) => falls through to the pre-existing paths unchanged.
-                if self.method_mode
+                if (self.method_mode || self.free_function_mode)
                     && let ExprKind::MemberAccess { expr: base, member } = &func.kind
                     && let Some(r) = self.compile_coll_method_call(base, member.name.as_str(), args)
                 {

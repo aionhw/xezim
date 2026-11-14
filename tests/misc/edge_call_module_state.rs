@@ -150,3 +150,51 @@ endmodule
     );
     assert_eq!(lines(&src), vec!["x=2"]);
 }
+
+/// VHDL lowering calls module-scope helpers as `__free_fn__` bodies that read
+/// module queues (`vh_dt*.pop_front()`). Same shape as `XEZIM_VHDL_BUGS.md` §1.
+#[test]
+fn free_fn_compiles_module_queue_pop_front() {
+    let src = r#"
+module g;
+  logic tick = 0;
+  int qd[$];
+  int qq[$];
+  int qn;
+  int dv;
+  longint now;
+  function automatic void upd();
+    if (qn > 0 && qd[0] <= now) begin void'(qd.pop_front()); dv = qq.pop_front(); qn--; end
+  endfunction
+  initial begin
+    now = 10; qn = 2; qd.push_back(1); qd.push_back(2); qq.push_back(7); qq.push_back(9);
+    for (int j = 0; j < 3; j++) begin tick = 1; #1; tick = 0; #1; end
+    $display("dv=%0d qn=%0d", dv, qn);
+    $finish;
+  end
+  always @(tick) upd();
+endmodule
+"#;
+    assert_eq!(lines(src), vec!["dv=9 qn=0"]);
+}
+
+/// Module-scope function reading a module signal (VHDL `vh_upd` pattern).
+#[test]
+fn free_fn_reads_resolved_module_signal() {
+    let src = r#"
+module top;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  logic [7:0] a = 1, outv = 0;
+  function automatic void bump();
+    outv = a + 8'd1;
+  endfunction
+  always_ff @(posedge clk) bump();
+  initial begin
+    @(posedge clk);
+    #1 $display("outv=%0d", outv);
+  end
+endmodule
+"#;
+    assert_eq!(lines(src), vec!["outv=2"]);
+}
