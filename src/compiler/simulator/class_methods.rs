@@ -2186,6 +2186,10 @@ impl Simulator {
                             _ => self.unpacked_struct_of(&f.return_type),
                         };
                         if let Some(su) = su {
+                            // §13.4.1: and the return variable is a variable
+                            // of that type, so a whole-struct assignment to
+                            // it (`f = s;`, `f = '{...};`) writes its members.
+                            self.register_formal_type_metadata(rn, &f.return_type, true);
                             for (k, seed) in self.struct_return_leaf_seeds(rn, &su) {
                                 locals.insert(k, seed);
                             }

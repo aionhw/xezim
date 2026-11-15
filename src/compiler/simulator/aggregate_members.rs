@@ -1281,6 +1281,17 @@ impl Simulator {
         if leaf_is_real {
             out.is_real = true;
         }
+        // §6.16: a string member travels in a fixed-width slot; the member
+        // itself is the string it holds, not the slot.
+        let mut leaf_dt = Some(ret);
+        for part in &suffix {
+            if let Some(m) = part.strip_prefix('.') {
+                leaf_dt = leaf_dt.and_then(|d| self.member_decl_type(&d, m).map(|(t, _)| t));
+            }
+        }
+        if leaf_dt.is_some_and(|d| Self::is_string_data_type(self.resolve_dt_ref(&d))) {
+            out = Value::from_string(&out.to_sv_string());
+        }
         Some(out)
     }
 

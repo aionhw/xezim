@@ -837,6 +837,15 @@ impl Simulator {
             indices.extend(self.member_dim_indices(&dims[1..]).unwrap_or_default());
             return self.snapshot_aggregate_shape(expr, dt, &indices, true);
         }
+        // §10.9.1: a pattern for a queue or dynamic array member has one
+        // element per item.
+        if matches!(dims.first(), Some(UD::Queue { .. } | UD::Unsized(_)))
+            && let ExprKind::AssignmentPattern(items) = &Self::unparen(expr).kind
+        {
+            let mut indices = vec![(0..self.pattern_ordered(items).len() as i64).collect()];
+            indices.extend(self.member_dim_indices(&dims[1..]).unwrap_or_default());
+            return self.snapshot_aggregate_shape(Self::unparen(expr), dt, &indices, true);
+        }
         let indices = self.member_dim_indices(dims).unwrap_or_default();
         self.snapshot_aggregate_shape(expr, dt, &indices, false)
     }
@@ -981,8 +990,49 @@ impl Simulator {
             let ExprKind::Ident(h) = &held.kind else {
                 return None;
             };
-            sim.pack_unpacked_struct(&h.path[0].name.name, &su)
+            let v = sim.pack_unpacked_struct(&h.path[0].name.name, &su);
+            // §7.10, §7.5: queue, dynamic and associative members do not
+            // fit the packed transport; they are staged beside it.
+            if v.is_some() && sim.struct_colls_possible() {
+                sim.stage_ret_struct_colls(held);
+            }
+            v
         })?
+    }
+
+    /// §10.9, §13.4.1: execute `return e` for a pattern `e` returned as an
+    /// unpacked array or queue of unpacked structs. The pattern is built in
+    /// storage of the return type and that storage is returned, as a
+    /// variable of the type is. False for any other return.
+    pub(super) fn return_pattern_in_storage(
+        &mut self,
+        e: &Expression,
+        span: crate::ast::Span,
+    ) -> bool {
+        let e = self.unpacked_pattern(Self::unparen(e));
+        if !matches!(
+            e.kind,
+            ExprKind::AssignmentPattern(_) | ExprKind::Conditional { .. }
+        ) || !crate::compiler::packed_assignment_pattern_plan::has_pattern(e)
+        {
+            return false;
+        }
+        let Some(dt) = self.return_frame_type() else {
+            return false;
+        };
+        let Some((elem, dims)) = self.unpacked_type_shape(&dt) else {
+            return false;
+        };
+        if dims.is_empty() || self.unpacked_struct_of(&elem).is_none() {
+            return false;
+        }
+        self.with_pattern_storage(e, &dt, e.span, |sim, held| {
+            sim.exec_statement(&Statement::new(
+                StatementKind::Return(Some(held.clone())),
+                span,
+            ));
+        })
+        .is_some()
     }
 
     /// Remove what `store_conditional_aggregate` stored for `value`.

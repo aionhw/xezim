@@ -268,18 +268,33 @@ impl Simulator {
         if !has_pattern(e) {
             return None;
         }
-        match self.fn_ret_frames.last()?.clone() {
-            ReturnPatternType::NotPacked => None,
-            ReturnPatternType::Func(dt) => self
-                .eval_in_packed_type(e, &dt)
-                .or_else(|| self.unpacked_struct_pattern_value(e, &dt)),
+        let dt = self.return_frame_type()?;
+        // An unpacked `T'{...}` places its items as the pattern does.
+        let e = self.unpacked_pattern(e);
+        self.eval_in_packed_type(e, &dt)
+            .or_else(|| self.unpacked_struct_pattern_value(e, &dt))
+    }
+
+    /// The declared return type of the function or method being executed,
+    /// when a pattern can take it (§13.4.1). A class type parameter is
+    /// replaced by the type the specialization binds to it (§8.25).
+    pub(super) fn return_frame_type(&self) -> Option<DataType> {
+        let dt = match self.fn_ret_frames.last()? {
+            ReturnPatternType::NotPacked => return None,
+            ReturnPatternType::Func(dt) => (**dt).clone(),
             ReturnPatternType::Method(m) => match &m.kind {
-                crate::ast::decl::ClassMethodKind::Function(f) => self
-                    .eval_in_packed_type(e, &f.return_type)
-                    .or_else(|| self.unpacked_struct_pattern_value(e, &f.return_type)),
-                _ => None,
+                crate::ast::decl::ClassMethodKind::Function(f) => f.return_type.clone(),
+                _ => return None,
             },
+        };
+        let mut dt = dt;
+        if let Some(bound) = self.formal_type_param_binding(&dt)
+            && self.module.typedef_types.contains_key(&bound)
+            && let DataType::TypeReference { name, .. } = &mut dt
+        {
+            name.name.name = bound;
         }
+        Some(dt)
     }
 
     /// The value `e` assigns to the formal `port` when `e` holds a pattern

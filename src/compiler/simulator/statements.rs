@@ -5544,6 +5544,13 @@ impl Simulator {
                     ));
                     return;
                 }
+                // §10.9, §13.4.1: a pattern returned as an array or queue of
+                // unpacked structs is built in storage of the return type.
+                if let Some(rhs) = expr
+                    && self.return_pattern_in_storage(rhs, stmt.span)
+                {
+                    return;
+                }
 
                 if let Some(e) = expr {
                     // Parentheses do not change an unpacked return's shape.
