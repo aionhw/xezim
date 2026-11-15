@@ -2339,6 +2339,9 @@ impl Simulator {
             return self.bind_array_arg(port, &selected);
         }
         let arg = self.unpacked_pattern(arg);
+        // #1108: an array member of an instance-array element.
+        let folded = self.inst_array_member_canon(arg);
+        let arg = folded.as_ref().unwrap_or(arg);
         let params = Some(&self.module.parameters);
         let (lo, hi) = match dims.first()? {
             UD::Range { left, right, .. } => {

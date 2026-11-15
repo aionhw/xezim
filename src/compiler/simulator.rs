@@ -6911,6 +6911,9 @@ pub struct Simulator {
     /// `unpacked_struct_leaf_keys`); gates `frame_leaf_key_of`'s per-eval
     /// probe.
     any_struct_formal_markers: bool,
+    /// See `Simulator::has_indexed_scopes`.
+    #[serde(skip)]
+    indexed_scopes: std::cell::OnceCell<bool>,
     /// Scratch structs a pattern actual is spread into before its leaves bind
     /// to an unpacked-struct formal (`struct_pattern_leaf_values`). Recycled
     /// like the mailbox shadows.

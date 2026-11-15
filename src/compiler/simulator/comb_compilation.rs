@@ -126,6 +126,190 @@ impl Simulator {
         Some(flat)
     }
 
+    /// Whether any instance of the design sits in an indexed scope: an
+    /// element of an array of instances, or a generate-loop block.
+    #[inline]
+    pub(super) fn has_indexed_scopes(&self) -> bool {
+        *self
+            .indexed_scopes
+            .get_or_init(|| self.module.instances.iter().any(|i| i.path.contains('[')))
+    }
+
+    /// Whether `e` is a select chain over a member reached through a select
+    /// (`lane[0].payload`, `lane[0].payload[2]`, `lane[0].nest[1][j]`).
+    #[inline]
+    pub(crate) fn select_entered_member_shape(e: &Expression) -> bool {
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => cur = expr,
+                ExprKind::MemberAccess { expr, .. } => {
+                    return matches!(expr.kind, ExprKind::Index { .. });
+                }
+                // The same path as one identifier whose scope segment
+                // carries the select (`foreach (lane[0].payload[i])`).
+                ExprKind::Ident(h) => {
+                    return h.root.is_none()
+                        && h.path.len() >= 2
+                        && h.path[..h.path.len() - 1]
+                            .iter()
+                            .any(|s| !s.selects.is_empty());
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// §23.3.2, §7.4: an unpacked array that is a member of an element of
+    /// an array of instances (`lane[0].payload`) is named, where the
+    /// instance is not an array, by one identifier (`one.payload`), and
+    /// every array operation resolves it from that: a whole-array read or
+    /// assignment, a `foreach`, an array query, a subroutine actual, a
+    /// nonblocking element write, an element of a multidimensional member.
+    /// Through an array of instances the path stays a member access on a
+    /// select, which none of them take for an array. Rewrite such a path
+    /// (and a select chain over it) onto the array's stored name. `None`
+    /// for any other path.
+    pub(super) fn inst_array_member_canon(&self, e: &Expression) -> Option<Expression> {
+        if !self.has_indexed_scopes() || !Self::select_entered_member_shape(e) {
+            return None;
+        }
+        self.inst_array_member_canon_inner(e)
+    }
+
+    fn inst_array_member_canon_inner(&self, e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                let base = self.inst_array_member_canon_inner(expr)?;
+                let mut out = e.clone();
+                if let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } =
+                    &mut out.kind
+                {
+                    **expr = base;
+                }
+                Some(out)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let flat = self.select_entered_array_name(expr, member)?;
+                Some(Self::flat_name_ident(flat, e.span))
+            }
+            ExprKind::Ident(h) => {
+                let (last, scope) = h.path.split_last()?;
+                let flat = self.select_entered_array_name_of(scope.to_vec(), &last.name)?;
+                let ident = Self::flat_name_ident(flat, e.span);
+                // The array's own selects stay selects of the folded name.
+                Some(last.selects.iter().fold(ident, |base, sel| {
+                    Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(base),
+                            index: Box::new(sel.clone()),
+                        },
+                        e.span,
+                    )
+                }))
+            }
+            _ => None,
+        }
+    }
+
+    /// `inst_array_member_canon` for the member access `base.member`.
+    pub(super) fn inst_array_member_canon_parts(
+        &self,
+        base: &Expression,
+        member: &crate::ast::Identifier,
+    ) -> Option<Expression> {
+        if !matches!(base.kind, ExprKind::Index { .. }) || !self.has_indexed_scopes() {
+            return None;
+        }
+        let flat = self.select_entered_array_name(base, member)?;
+        Some(Self::flat_name_ident(flat, base.span))
+    }
+
+    /// The stored name of the unpacked array the member path `e` names when
+    /// it enters a scope through a select and the root of the path is not
+    /// itself a variable.
+    fn select_entered_array_name(
+        &self,
+        base: &Expression,
+        member: &crate::ast::Identifier,
+    ) -> Option<String> {
+        // An element of a variable (`arr[0].m` of an array of structures, a
+        // queue of handles) is not a scope. Checked first, on the borrowed
+        // root name: this runs for every such member read.
+        let root = Self::expr_root_first_seg(base)?;
+        if self.module.arrays.contains_key(root)
+            || self.module.dynamic_arrays.contains(root)
+            || self.module.queue_vars.contains(root)
+            || self.module.associative_arrays.contains_key(root)
+            || self
+                .local_stack
+                .last()
+                .is_some_and(|f| f.contains_key(root))
+        {
+            return None;
+        }
+        let mut path: Vec<crate::ast::expr::HierPathSegment> = Vec::new();
+        if !Self::fold_hier_path_segments(base, &mut path) {
+            return None;
+        }
+        self.select_entered_array_name_of(path, member)
+    }
+
+    /// `select_entered_array_name` for the scope segments `path` and the
+    /// member `member` below them.
+    fn select_entered_array_name_of(
+        &self,
+        mut path: Vec<crate::ast::expr::HierPathSegment>,
+        member: &crate::ast::Identifier,
+    ) -> Option<String> {
+        let root = path.first()?.name.name.as_str();
+        if self.module.arrays.contains_key(root)
+            || self.module.dynamic_arrays.contains(root)
+            || self.module.queue_vars.contains(root)
+            || self.module.associative_arrays.contains_key(root)
+            || self
+                .local_stack
+                .last()
+                .is_some_and(|f| f.contains_key(root))
+            || path.iter().any(|s| {
+                s.selects
+                    .iter()
+                    .any(|x| !matches!(x.kind, ExprKind::Number(_)))
+            })
+        {
+            return None;
+        }
+        path.push(crate::ast::expr::HierPathSegment {
+            name: member.clone(),
+            selects: Vec::new(),
+        });
+        if path.len() > 1
+            && !self.module.name.is_empty()
+            && path[0].selects.is_empty()
+            && path[0].name.name == self.module.name
+        {
+            path.remove(0);
+        }
+        let hier = crate::ast::expr::HierarchicalIdentifier {
+            root: None,
+            path,
+            span: member.span,
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
+        };
+        let flat = Self::resolve_hier_name_static(&hier, &self.module);
+        let is_array = |n: &str| {
+            self.module.arrays.contains_key(n)
+                || self.module.arrays_2d.contains_key(n)
+                || self.module.arrays_nd.contains_key(n)
+        };
+        if is_array(&flat) {
+            return Some(flat);
+        }
+        self.hint_scoped(&flat).filter(|s| is_array(s))
+    }
+
     /// Flatten `a`, `a.b`, `a[0].b`, `a[0].b[1]` into segments, pushing an
     /// index onto the segment it selects. `false` for anything that is not a
     /// pure path, a `$root`-qualified path, or a non-constant index.

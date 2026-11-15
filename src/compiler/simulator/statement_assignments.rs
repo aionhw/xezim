@@ -1473,6 +1473,18 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) {
+        // #1108: a whole array member of an instance-array element on either
+        // side (`w = lane[0].payload`, `lane[1].payload = '{...}`).
+        if self.has_indexed_scopes() {
+            let l = self.inst_array_member_canon(lvalue);
+            let r = self.inst_array_member_canon(rvalue);
+            if l.is_some() || r.is_some() {
+                let lvalue = l.as_ref().unwrap_or(lvalue);
+                let rvalue = r.as_ref().unwrap_or(rvalue);
+                self.exec_stmt_blocking_assign_body(stmt, lvalue, rvalue);
+                return;
+            }
+        }
         if let Some(pattern) = self.unpacked_typed_pattern(rvalue) {
             self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
             return;

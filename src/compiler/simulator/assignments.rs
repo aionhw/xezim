@@ -3920,6 +3920,15 @@ impl Simulator {
     }
 
     pub(super) fn assign_value_inner(&mut self, lhs: &Expression, val: &Value) -> bool {
+        // #1108: an array member of an instance-array element, or a select
+        // of it (`lane[0].nest[1][j] = v`).
+        if matches!(
+            lhs.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
+        ) && let Some(folded) = self.inst_array_member_canon(lhs)
+        {
+            return self.assign_value_inner(&folded, val);
+        }
         // §19.7 `cg.option.<name> = v` on a covergroup instance.
         if let ExprKind::Ident(h) = &lhs.kind {
             if h.path.len() == 3 && h.path[1].name.name == "option" {

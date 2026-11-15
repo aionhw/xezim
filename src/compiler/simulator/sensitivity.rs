@@ -811,11 +811,38 @@ impl Simulator {
             rev_indices.push(index);
             cur = expr;
         }
-        let ExprKind::Ident(h) = &cur.kind else {
-            return None;
+        let name = match &cur.kind {
+            ExprKind::Ident(h) => Self::resolve_hier_name_static(h, module),
+            // #1108: a multidimensional array member of an instance-array
+            // element (`lane[0].nest[1][2]`), named as its elements are
+            // stored.
+            ExprKind::MemberAccess { .. } => {
+                let mut path: Vec<crate::ast::expr::HierPathSegment> = Vec::new();
+                if !Self::fold_hier_path_segments(cur, &mut path)
+                    || !path.iter().any(|s| !s.selects.is_empty())
+                {
+                    return None;
+                }
+                if path.len() > 1
+                    && !module.name.is_empty()
+                    && path[0].selects.is_empty()
+                    && path[0].name.name == module.name
+                {
+                    path.remove(0);
+                }
+                let hier = HierarchicalIdentifier {
+                    root: None,
+                    path,
+                    span: cur.span,
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
+                };
+                Self::resolve_hier_name_static(&hier, module)
+            }
+            _ => return None,
         };
         rev_indices.reverse();
-        let name = Self::resolve_hier_name_static(h, module);
         let shape: Vec<(i64, i64)> = if let Some(&(a, b, _)) = module.arrays_2d.get(&name) {
             vec![a, b]
         } else {

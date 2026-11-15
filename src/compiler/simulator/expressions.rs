@@ -103,6 +103,11 @@ impl Simulator {
         member: &crate::ast::Identifier,
         ctx_width: u32,
     ) -> Value {
+        // #1108: a whole array member of an instance-array element
+        // (`lane[0].payload`).
+        if let Some(folded) = self.inst_array_member_canon_parts(expr, member) {
+            return self.eval_expr_ctx(&folded, ctx_width);
+        }
         // §18.7 — inside `obj.randomize() with { obj.member … }` the
         // receiver `obj` is a caller-scope handle that no longer evals
         // in the randomized frame, so `obj.member` would read 0 and
@@ -5055,6 +5060,18 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // #1108: an element of an array member of an instance-array
+                // element (`lane[0].nest[1][j]`).
+                if let Some(base) = self.inst_array_member_canon(expr) {
+                    let folded = Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(base),
+                            index: index.clone(),
+                        },
+                        expr.span,
+                    );
+                    return self.eval_expr_ctx(&folded, ctx_width);
+                }
                 if let Some(selected) = self.selected_aggregate_rhs(None, expr) {
                     let selected = Expression::new(
                         ExprKind::Index {

@@ -15770,6 +15770,16 @@ impl<'a> BytecodeCompiler<'a> {
         if matches!(
             expr.kind,
             ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
+        ) && Self::inst_array_multidim_elem(expr)
+        {
+            // #1108: an element of a multidimensional array member of an
+            // instance-array element (`lane[0].nest[1][2]`) is resolved by
+            // the interpreter, from the array's stored name.
+            return self.emit_expr_fallback(expr, ctx_width, "inst_array_member");
+        }
+        if matches!(
+            expr.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
         ) && crate::compiler::simulator::Simulator::select_mentions_dollar(expr)
         {
             let dest = self.emit_expr_fallback(expr, ctx_width, "dollar_select");
@@ -20259,7 +20269,21 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Whether `e` selects, through two or more indices, an array member
+    /// reached through a select (`lane[0].nest[1][2]`).
+    fn inst_array_multidim_elem(e: &Expression) -> bool {
+        let ExprKind::Index { expr: inner, .. } = &e.kind else {
+            return false;
+        };
+        matches!(inner.kind, ExprKind::Index { .. })
+            && crate::compiler::simulator::Simulator::select_entered_member_shape(inner)
+    }
+
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
+        if Self::inst_array_multidim_elem(lhs) {
+            self.bail("inst_array_member");
+            return false;
+        }
         // class-perf method-mode: `this.<member> = e` / `<classlocal>.<member> = e`
         // is an OBJECT-field store off the heap.
         if self.method_mode

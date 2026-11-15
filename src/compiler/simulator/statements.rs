@@ -536,6 +536,9 @@ impl Simulator {
         // (§12.7.3, §12.8), across every collection shape. Publish heat once
         // after the inner runner has restored loop and method scopes.
         let mut iterations = 0;
+        // #1108: `foreach (lane[0].payload[i])`.
+        let folded = self.inst_array_member_canon(array);
+        let array = folded.as_ref().unwrap_or(array);
         self.exec_stmt_foreach_inner(stmt, array, vars, body, &mut iterations);
         self.record_ast_loop_heat(iterations);
     }
@@ -4177,7 +4180,10 @@ impl Simulator {
                 // and `this` are live: the commit runs later in a context
                 // where neither is.
                 let lvalue_vif;
-                let lvalue: &Expression = match self.vif_rebase_expr(lvalue) {
+                let lvalue: &Expression = match self
+                    .vif_rebase_expr(lvalue)
+                    .or_else(|| self.inst_array_member_canon(lvalue))
+                {
                     Some(r) => {
                         lvalue_vif = r;
                         &lvalue_vif

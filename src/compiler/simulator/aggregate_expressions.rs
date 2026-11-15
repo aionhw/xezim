@@ -2561,6 +2561,12 @@ impl Simulator {
             while let ExprKind::Paren(inner) = &operand.kind {
                 operand = inner;
             }
+            // #1108: an array member of an instance-array element.
+            if let Some(folded) = self.inst_array_member_canon(operand) {
+                let mut args = args.clone();
+                args[0] = folded;
+                return self.eval_expr_system_call_body(expr, ctx_width, name, &args);
+            }
             // §7.4.6, §20.7: a slice of an unpacked array has the size of its
             // range, not its width in bits (#867).
             if name == "$size"
