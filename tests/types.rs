@@ -753,3 +753,5 @@ mod signed_packed_member_reads_1159;
 mod signed_named_packed_elements_1107;
 #[path = "types/package_typedef_negative_bound_1148.rs"]
 mod package_typedef_negative_bound_1148;
+#[path = "types/review_struct_pattern_return.rs"]
+mod review_struct_pattern_return;
