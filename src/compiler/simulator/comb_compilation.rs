@@ -77,6 +77,24 @@ impl Simulator {
         if !matches!(e.kind, ExprKind::MemberAccess { .. }) {
             return None;
         }
+        self.select_entered_stored_name(e)
+    }
+
+    /// #1108, §9.4.2: an element of an unpacked array in a scope entered
+    /// through a select (`lane[0].payload[2]`, an array of instances) as
+    /// the element's own stored signal. `fold_indexed_hier_path` folds only
+    /// up to a stored signal, and the array itself (`lane[0].payload`) is
+    /// none, so an event control on the element waited on nothing.
+    pub(super) fn fold_indexed_elem_path(&self, e: &Expression) -> Option<Expression> {
+        if !matches!(e.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+        let flat = self.select_entered_stored_name(e)?;
+        Some(Self::flat_name_ident(flat, e.span))
+    }
+
+    /// The stored name of path `e` when it enters a scope through a select.
+    fn select_entered_stored_name(&self, e: &Expression) -> Option<String> {
         let mut path: Vec<crate::ast::expr::HierPathSegment> = Vec::new();
         if !Self::fold_hier_path_segments(e, &mut path) || path.len() < 2 {
             return None;
@@ -1268,6 +1286,12 @@ impl Simulator {
             // port-connection source like `u.a = a` (where `a` is genuinely
             // the top signal, not `<scope>.a`).
             let entry_is_bytecode = matches!(&item, CombItem::CompiledContAssign { .. });
+            // The scope of the assignment's target (see the whole-array
+            // fallback below).
+            let ca_lhs_scope: Option<&str> = writes
+                .iter()
+                .next()
+                .and_then(|w| w.rsplit_once('.').map(|(head, _)| head));
             for r in &reads {
                 let mut found = false;
                 // Root-marked read: the name is absolute by construction —
@@ -1321,6 +1345,29 @@ impl Simulator {
                             rids.push(id);
                             found = true;
                         }
+                    }
+                }
+                // #1108, #1110: a dotted whole unpacked-array read
+                // (`u.lane[0].payload`, `top.a`, a generate block's `h.a`)
+                // stands for the array's element signals. The member-strip
+                // fallbacks below resolved it to an enclosing scope's proxy
+                // signal, which no write dirties, so the assignment kept its
+                // first value. An array of the packed arena has no per-cell
+                // ids: the read stays unresolved.
+                let mut packed_array_read = false;
+                if !found && r.contains('.') {
+                    let scopes = if read_is_rooted {
+                        [None, None]
+                    } else {
+                        [ca_lhs_scope, scope_hint.as_deref()]
+                    };
+                    match self.whole_array_read_ids(r, &scopes, &top_prefix) {
+                        Some(Some(ids)) => {
+                            Self::extend_new_ids(&mut rids, ids);
+                            found = true;
+                        }
+                        Some(None) => packed_array_read = true,
+                        None => {}
                     }
                 }
                 // Top-prefix strip fallback: `<top>.<rest>` → `<rest>`. Fixes
@@ -1527,7 +1574,7 @@ impl Simulator {
                 // #1126: a called function's loop variable or block local
                 // (`i` of `foreach (s[i])`) is frame state, not an operand
                 // (§10.3.2, §13.4).
-                if !found && !frame_local_reads.contains(r) {
+                if (!found && !frame_local_reads.contains(r)) || packed_array_read {
                     unresolved_count += 1;
                 }
             }
@@ -1706,6 +1753,8 @@ impl Simulator {
                 // input (fed by the port's continuous assign) settles later.
                 // Register BOTH: a superset sensitivity is always safe.
                 let mut rids: Vec<usize> = Vec::new();
+                // A whole read of an array of the packed arena (see below).
+                let mut packed_array_read = false;
                 for r in sens_reads.iter() {
                     if let Some(scope) = &scope_hint {
                         let q = format!("{}.{}", scope, r);
@@ -1733,6 +1782,26 @@ impl Simulator {
                         }
                     }
                     let before = rids.len();
+                    // #1108, §9.2.2.2: a dotted whole unpacked-array read
+                    // (`lane[0].payload` of an instance-array element,
+                    // `u.mem`, `top.a`) stands for the array's element
+                    // signals, as in a continuous assignment. The fallbacks
+                    // below resolved it only to an enclosing scope's proxy
+                    // signal, which no write dirties, so the block never ran
+                    // again. A packed-arena array has no per-cell ids: the
+                    // block then re-evaluates at every settle.
+                    if r.contains('.') && !self.signal_name_to_id.contains_key(r.as_str()) {
+                        let own = (!ab.scope.is_empty()).then_some(ab.scope.as_str());
+                        match self.whole_array_read_ids(
+                            r,
+                            &[scope_hint.as_deref(), own],
+                            &top_prefix,
+                        ) {
+                            Some(Some(ids)) => Self::extend_new_ids(&mut rids, ids),
+                            Some(None) => packed_array_read = true,
+                            None => {}
+                        }
+                    }
                     if let Some(id) = resolve_one(r.as_str()) {
                         if !rids.contains(&id) {
                             rids.push(id);
@@ -1856,9 +1925,10 @@ impl Simulator {
                 // re-evaluates on every settle — the way a continuous assign
                 // reading one is tracked (§10.3; `packed_store` keeps such
                 // settles running).
-                let has_unresolved_reads = sens_reads
-                    .iter()
-                    .any(|r| self.read_names_unnamed_cell(r, scope_hint.as_deref(), &ab.scope));
+                let has_unresolved_reads = packed_array_read
+                    || sens_reads
+                        .iter()
+                        .any(|r| self.read_names_unnamed_cell(r, scope_hint.as_deref(), &ab.scope));
                 // Try bytecode-compiling the comb always block. On success
                 // the settle path skips exec_statement entirely and runs
                 // the flat Insn stream via exec_insns.

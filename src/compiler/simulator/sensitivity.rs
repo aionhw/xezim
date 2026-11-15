@@ -926,6 +926,45 @@ impl Simulator {
         None
     }
 
+    /// #1108, #1110, §7.4, §10.3.2: the element signals of a whole
+    /// unpacked-array read `r` (`a`, `u.lane[0].payload`, `top.a`), looked
+    /// up qualified by each of `scopes`, then as `r`, then without the top
+    /// module's name (`top_prefix`: the signal table keys top-level names
+    /// bare). `Some(None)`: an array of the packed arena, which has no
+    /// per-cell signal ids to depend on.
+    pub(super) fn whole_array_read_ids(
+        &self,
+        r: &str,
+        scopes: &[Option<&str>],
+        top_prefix: &str,
+    ) -> Option<Option<Vec<usize>>> {
+        let qualified = scopes.iter().flatten().map(|s| format!("{s}.{r}"));
+        let bare =
+            std::iter::once(r.to_string()).chain(r.strip_prefix(top_prefix).map(str::to_string));
+        for cand in qualified.chain(bare) {
+            let Some(&(first_id, lo, hi)) = self.array_first_id.get(cand.as_str()) else {
+                continue;
+            };
+            if is_packed_id(first_id) {
+                return Some(None);
+            }
+            let count = (hi - lo + 1).max(0) as usize;
+            return Some(Some(
+                (first_id..first_id + count)
+                    .filter(|&id| id < self.signal_table.len())
+                    .collect(),
+            ));
+        }
+        None
+    }
+
+    /// Append the ids of `ids` that `rids` does not hold yet, in linear time
+    /// (a whole-array read can name thousands of element signals).
+    pub(super) fn extend_new_ids(rids: &mut Vec<usize>, ids: Vec<usize>) {
+        let have: HashSet<usize> = rids.iter().copied().collect();
+        rids.extend(ids.into_iter().filter(|id| !have.contains(id)));
+    }
+
     /// Names of ROOT-marked identifiers (`root = Some("$root")`) in an
     /// expression — substituted port actuals whose bare name collides with a
     /// child declaration (core rewrite_expr_impl, issue #128). These resolve
@@ -2819,7 +2858,10 @@ impl Simulator {
                     // flop inside a generate-array instance whose clock the
                     // parent substitutes as a hierarchical name was dead.
                     let ee_idx;
-                    let ee = match self.fold_indexed_hier_path(&ee.expr) {
+                    let ee = match self
+                        .fold_indexed_elem_path(&ee.expr)
+                        .or_else(|| self.fold_indexed_hier_path(&ee.expr))
+                    {
                         Some(folded) => {
                             ee_idx = crate::ast::stmt::EventExpr {
                                 edge: ee.edge,
