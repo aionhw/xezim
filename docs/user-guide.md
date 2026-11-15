@@ -7,16 +7,18 @@ of options and environment variables is in the
 [coverage](coverage-guide.md), [power intent (UPF)](upf-guide.md) and
 [debugging](DEBUGGING.md).
 
-* [Running a simulation](#running-a-simulation)
-* [Waveforms](#waveforms)
-* [Checkpoints](#checkpoints)
-* [Warm design cache](#warm-design-cache)
-* [Diagnosing memory growth](#diagnosing-memory-growth)
-* [Native compilation](#native-compilation)
-* [Reducing a multi-file build](#reducing-a-multi-file-build)
-* [Module-timescale extension](#module-timescale-extension)
-* [Sources written for other simulators](#sources-written-for-other-simulators)
-* [Non-standard extensions](#non-standard-extensions)
+- [xezim user guide](#xezim-user-guide)
+  - [Running a simulation](#running-a-simulation)
+  - [Waveforms](#waveforms)
+  - [Checkpoints](#checkpoints)
+  - [Warm design cache](#warm-design-cache)
+  - [Diagnosing memory growth](#diagnosing-memory-growth)
+  - [Native compilation](#native-compilation)
+  - [Reducing a multi-file build](#reducing-a-multi-file-build)
+  - [Module-timescale extension](#module-timescale-extension)
+    - [Inspecting resolved timescales](#inspecting-resolved-timescales)
+  - [Sources written for other simulators](#sources-written-for-other-simulators)
+  - [Non-standard extensions](#non-standard-extensions)
 
 ## Running a simulation
 
@@ -79,6 +81,21 @@ per-signal trace table. Pass `--wave` to enable `$dumpfile`/`$dumpvars`
 
 `--fst` and `--xtrace` imply `--wave`. The three formats are cross-checked
 against each other by decoding them.
+
+Every scope option above is an INCLUDE list; `--wave-suppress <entry>` is the
+other half, and one list serves all three formats. A bare name is a MODULE
+definition, so `--wave-suppress mem_bank` drops all 200 banks wherever they
+sit — the one line that replaces the 200 instance paths the include side needs
+for the same result. A dotted name is one hierarchical path, so
+`--wave-suppress tb_top.u_blk.u_bank0` drops exactly that subtree (the
+top-module prefix is optional). `--wave-suppress-module <name>` forces the
+module reading of a name that is also an instance, and
+`--wave-suppress-file <file>` reads the list from a file. Exclusion happens as
+the dump enumerates its signals, so a suppressed subtree never reaches the
+writer, the identifier tables or the per-step change detection, and each entry
+reports what it cost — or warns when it matched nothing. An `--fst-scope` or
+`--xtrace-scope` that names the subtree anyway is an explicit request for it
+and wins.
 
 Ctrl-C (SIGINT) or SIGTERM stops the run at the current time and closes the
 dumps normally; this includes a long loop inside one time slot. If the run

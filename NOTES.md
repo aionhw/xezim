@@ -8,6 +8,20 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+**Command line**
+
+* `--wave-suppress <entry>` excludes signals from the VCD, FST and XTrace dumps
+  from one list, so "everything except the behavioural memories" stops being
+  hundreds of hand-written instance paths: a bare name is a module definition
+  and removes every instance of it at any depth, a dotted name is one
+  hierarchical path (top-module prefix optional) and removes what sits beneath
+  it. `--wave-suppress-module` forces the module reading of a name that is also
+  an instance, and `--wave-suppress-file` reads the list from a file, including
+  from inside `-f`/`-F` args files. Exclusion runs while the dump enumerates its
+  signals, so a suppressed subtree reaches no header, identifier table or value
+  change, and an explicit `--fst-scope`/`--xtrace-scope` naming it is an
+  explicit request that wins (#1104).
+
 ### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
 
 **Performance**

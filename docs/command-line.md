@@ -5,9 +5,10 @@ in one step. This page lists the options, the environment variables, and the
 compile and simulate spellings of other simulators that xezim accepts. For
 how to use them together, see the [user guide](user-guide.md).
 
-* [Options](#options)
-* [Environment variables](#environment-variables)
-* [Command lines from other simulators](#command-lines-from-other-simulators)
+- [Command-line reference](#command-line-reference)
+  - [Options](#options)
+  - [Environment variables](#environment-variables)
+  - [Command lines from other simulators](#command-lines-from-other-simulators)
 
 ## Options
 
@@ -57,6 +58,9 @@ how to use them together, see the [user guide](user-guide.md).
 | `-xezim_env <file>` (also `--xezim-env`, `=` form) | Set `XEZIM_*` variables from a file before xezim reads any of them: `NAME=value`, `export NAME=value`, `setenv NAME value`, `NAME value`, `unsetenv NAME`; `#`/`//` comments, quoted values. Values override the shell; several files apply in order. Command line only (an args file is read too late) |
 | `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
+| `--wave-suppress <entry>` | EXCLUDE signals from the VCD, FST and XTrace dumps (repeatable, `=` form); the two entry forms may be mixed freely. A bare identifier names a MODULE definition and excludes every instance of it at any depth (`--wave-suppress mem_bank` replaces hundreds of hand-written paths); a dotted identifier names one hierarchical path and excludes exactly what sits beneath it — or, when it names a net, that net alone (`--wave-suppress tb_top.u_blk.u_bank0`, top-module prefix optional). The list is applied while the dump enumerates its signals, so a suppressed subtree reaches no header, identifier table or value change, and one list serves all three formats. An explicit `--fst-scope`/`--xtrace-scope` naming that subtree asks for it back |
+| `--wave-suppress-module <name>` | Like `--wave-suppress`, but reads `<name>` as a module definition even when an instance carries the same name (repeatable, `=` form) |
+| `-wave_suppress_file <file>` (also `--wave-suppress-file`, `=` form) | Exclusions from a file, one or more per line, separated by spaces or commas, with `#` or `//` comments. Each adds a `--wave-suppress`. Works in `-f`/`-F` files, where a relative path resolves as given, else next to the args file |
 | `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for third-party sources you cannot edit |
 | `--relax-driver-conflicts` | Report a variable with conflicting drivers — two continuous assigns, a continuous assign plus procedural writes, or an `always_comb`/`always_latch`/`always_ff` variable also written by another process (§6.5, §9.2.2) — as a warning instead of an error, so existing designs (e.g. an `initial` block that initializes an `always_ff` register) still run |
 | `--relax-duplicate-decls` | Ignore a second declaration of a name in a task, function, class method or `begin`/`fork` block, keeping the first's type and initializer (§3.13), with a warning — for sources written against tools that accept it |

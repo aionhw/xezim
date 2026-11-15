@@ -80,6 +80,9 @@ prints the seed for replay.
 xezim --simulate --fst wave.fst --fst-scope tb.dut ...        # GTKWave FST
 xezim --simulate --xtrace t.xt --xtrace-scope tb.dut \
       --xtrace-from 10000 --xtrace-to 20000 ...               # windowed text dump
+xezim --simulate --wave ... --wave-suppress mem_bank \
+      --wave-suppress tb.dut.u_bank0 ...      # exclude a module or one subtree
+                                              # from all three formats
 ```
 
 Dumping is OPT-IN: pass `--wave` to compile the model with waveform support.
