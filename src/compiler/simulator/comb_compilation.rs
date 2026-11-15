@@ -1516,6 +1516,10 @@ impl Simulator {
                         cands.push(format!("{}.{}", scope, r));
                     }
                     cands.push(r.clone());
+                    // #1110: `top.a` names the top module's `a`, keyed bare.
+                    if let Some(bare) = r.strip_prefix(top_prefix.as_str()) {
+                        cands.push(bare.to_string());
+                    }
                     for cand in &cands {
                         let Some(&(first_id, lo, hi)) = self.array_first_id.get(cand.as_str())
                         else {
@@ -1897,6 +1901,8 @@ impl Simulator {
                         scope_hint.as_ref().map(|s| format!("{s}.{r}")),
                         (!ab.scope.is_empty()).then(|| format!("{}.{}", ab.scope, r)),
                         Some(r.clone()),
+                        // #1110: `top.a` names the top module's `a`.
+                        r.strip_prefix(top_prefix.as_str()).map(str::to_string),
                     ];
                     for name in scoped.iter().flatten() {
                         for &lid in self.unpacked_struct_sens.get(name).into_iter().flatten() {

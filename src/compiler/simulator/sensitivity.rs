@@ -994,6 +994,9 @@ impl Simulator {
             }
             ExprKind::Unary { operand, .. } => Self::collect_rooted_ident_names(operand, out),
             ExprKind::Paren(inner) => Self::collect_rooted_ident_names(inner, out),
+            ExprKind::NamedArg {
+                expr: Some(inner), ..
+            } => Self::collect_rooted_ident_names(inner, out),
             ExprKind::Conditional {
                 condition,
                 then_expr,
@@ -1365,6 +1368,9 @@ impl Simulator {
                 }
             }
             ExprKind::Paren(e) => Self::collect_expr_reads(e, module, reads),
+            // #1110, §13.5.4: an argument bound by name (`f(.a(x))`) reads
+            // its actual as a positional one does.
+            ExprKind::NamedArg { expr: Some(e), .. } => Self::collect_expr_reads(e, module, reads),
             // §11.4.13: `v inside {a, [lo:hi]}` reads the tested expression
             // AND every set member — none were collected, so a comb/cont
             // assign with an `inside` RHS never re-fired and kept its time-0
