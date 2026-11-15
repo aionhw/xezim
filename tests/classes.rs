@@ -1258,3 +1258,5 @@ mod redeclared_property_base_scope_1064;
 mod static_packed_member_writes_1046;
 #[path = "classes/builtin_class_struct_members_1161.rs"]
 mod builtin_class_struct_members_1161;
+#[path = "classes/null_receiver_builtin_names_1139.rs"]
+mod null_receiver_builtin_names_1139;
