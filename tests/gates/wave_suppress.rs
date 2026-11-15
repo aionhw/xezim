@@ -5,7 +5,7 @@
 //! reach every instance of that definition wherever it sits (here `probe`
 //! appears both directly under `top` and one level deeper, inside `holder`),
 //! while a dotted identifier is a hierarchical PATH and must reach exactly the
-//! entries beneath it — `top.u_h2` takes a whole instance, `u_h3.h` takes one
+//! entries beneath it â `top.u_h2` takes a whole instance, `u_h3.h` takes one
 //! net of a sibling that must otherwise survive intact, and `u_h1` has to come
 //! through both unscathed.
 //! A single wrong `starts_with` either leaves a bank of memory in the dump or
@@ -45,6 +45,15 @@ module plain(input logic clk, input logic [7:0] d, output logic [7:0] q);
   always @(posedge clk) p <= d + 8'd3;
   assign q = p;
 endmodule
+module bank(input logic clk, input logic [7:0] d, output logic [7:0] q);
+  logic [7:0] m;
+  logic       g;
+  always @(posedge clk) begin
+    m <= d + 8'd4;
+    g <= ^d;
+  end
+  assign q = m;
+endmodule
 module top;
   logic clk = 1'b0;
   logic [7:0] din = 8'd0;
@@ -55,6 +64,16 @@ module top;
   holder u_h2(.clk(clk), .d(din), .q(qc));
   holder u_h3(.clk(clk), .d(din), .q(qd));
   plain  u_pl(.clk(clk), .d(din), .q(qe));
+  // Three generated lanes, each holding one `bank`. A generated instance is
+  // named by its INDEX (`g_lane[1].u_bank`), the spelling the signal table
+  // carries and that an exclusion entry has to match (#1103).
+  genvar gi;
+  generate
+    for (gi = 0; gi < 3; gi++) begin : g_lane
+      logic [7:0] qw;
+      bank u_bank(.clk(clk), .d(din), .q(qw));
+    end
+  endgenerate
   initial begin
     $dumpfile("@VCD@");
     $dumpvars(0, top);
@@ -83,8 +102,8 @@ const ABSENT: &[&str] = &[
     "top.u_h3.h",
 ];
 
-/// What must survive them: the sibling holders — all of `u_h1`, and all of
-/// `u_h3` except the one net — the plain instance, and top's own nets,
+/// What must survive them: the sibling holders â all of `u_h1`, and all of
+/// `u_h3` except the one net â the plain instance, and top's own nets,
 /// including `qa`, which an excluded instance drives.
 const PRESENT: &[&str] = &[
     "top.clk",
@@ -104,7 +123,7 @@ const PRESENT: &[&str] = &[
 /// path without it.
 const SUPPRESS: &[&str] = &["probe", "top.u_h2", "u_h3.h"];
 
-/// Fully-qualified names a VCD declares, rebuilt from the `$scope` stack —
+/// Fully-qualified names a VCD declares, rebuilt from the `$scope` stack â
 /// the writer nests the tree, it does not print dotted names flat.
 fn vcd_names(path: &std::path::Path) -> HashSet<String> {
     let text = fs::read_to_string(path).expect("read vcd");
@@ -246,8 +265,8 @@ fn suppress_args<'a>(entries: &'a [&'a str]) -> Vec<&'a str> {
     v
 }
 
-/// One module name and two paths — one written with its top-module prefix, one
-/// without — must remove exactly what they name and nothing else, from the VCD
+/// One module name and two paths â one written with its top-module prefix, one
+/// without â must remove exactly what they name and nothing else, from the VCD
 /// header, from the FST scope tree, and from the XTrace signal table.  The
 /// unfiltered run comes first so a fixture that never had the signal cannot
 /// pass by accident.
@@ -410,7 +429,7 @@ fn a_forced_module_entry_reaches_every_instance_and_reports_as_one() {
     args.push("--fst");
     let log = dump(&sv, &vcd, &fst, &xt, &args);
 
-    // The definition's own net, and the same nets of every instance of it —
+    // The definition's own net, and the same nets of every instance of it â
     // directly under top and one level down inside each of the three holders.
     const EVERYWHERE: &[&str] = &[
         "top.u_p1.s",
@@ -454,6 +473,92 @@ fn a_forced_module_entry_reaches_every_instance_and_reports_as_one() {
         !log.contains("matched no dumped signal"),
         "the forced entry matched nothing; log {log}"
     );
+
+    for p in [&sv, &vcd, &fst, &xt] {
+        let _ = fs::remove_file(p);
+    }
+}
+
+/// A generated instance is named by its INDEX â `g_lane[1].u_bank` â which is
+/// the spelling the signal table carries and the one a `$dumpvars` argument now
+/// survives in (#1103). The exclusion list matches those names like any other:
+/// the module reading must reach inside EVERY lane, and an indexed path must
+/// take exactly ONE lane and leave its siblings whole â the `g_lane[1]` vs
+/// `g_lane[10]` class of near miss, one index at a time.
+#[test]
+fn a_generated_instance_is_excluded_by_module_and_by_indexed_path() {
+    // One lane's bank, named by its index.
+    let sv = tmp("gn_src", "sv");
+    let vcd = tmp("gn_one", "vcd");
+    let fst = tmp("gn_one", "fst");
+    let xt = tmp("gn_one", "xtrace");
+    let mut args = suppress_args(&["top.g_lane[1].u_bank"]);
+    args.push("--fst");
+    let log = dump(&sv, &vcd, &fst, &xt, &args);
+    assert!(
+        !log.contains("matched no dumped signal"),
+        "the indexed path entry matched nothing; log {log}"
+    );
+    for (what, names) in [
+        ("VCD", vcd_names(&vcd)),
+        ("FST", fst_names(&fst)),
+        ("XTrace", xtrace_names(&xt)),
+    ] {
+        for n in ["top.g_lane[1].u_bank.m", "top.g_lane[1].u_bank.g"] {
+            assert!(
+                !names.contains(n),
+                "`{n}` survived an indexed path entry in the {what}"
+            );
+        }
+        // The two sibling lanes, and the lane-local net of the lane that lost
+        // its bank: none of them sits under `g_lane[1].u_bank`.
+        for n in [
+            "top.g_lane[0].u_bank.m",
+            "top.g_lane[2].u_bank.m",
+            "top.g_lane[0].qw",
+            "top.g_lane[1].qw",
+            "top.g_lane[2].qw",
+        ] {
+            assert!(names.contains(n), "`{n}` left the {what} unasked");
+        }
+    }
+    for p in [&sv, &vcd, &fst, &xt] {
+        let _ = fs::remove_file(p);
+    }
+
+    // The module reading of the same shape: every lane loses its bank, while
+    // the net the generate block itself declares stays.
+    let sv = tmp("gn2_src", "sv");
+    let vcd = tmp("gn_all", "vcd");
+    let fst = tmp("gn_all", "fst");
+    let xt = tmp("gn_all", "xtrace");
+    let mut args = suppress_args(&["bank"]);
+    args.push("--fst");
+    let log = dump(&sv, &vcd, &fst, &xt, &args);
+    assert!(
+        log.contains("instance(s) of module 'bank'"),
+        "no module report for the generated instances; log {log}"
+    );
+    for (what, names) in [
+        ("VCD", vcd_names(&vcd)),
+        ("FST", fst_names(&fst)),
+        ("XTrace", xtrace_names(&xt)),
+    ] {
+        for i in 0..3 {
+            for leaf in ["m", "g"] {
+                let n = format!("top.g_lane[{i}].u_bank.{leaf}");
+                assert!(
+                    !names.contains(n.as_str()),
+                    "`{n}` survived a module entry in the {what}"
+                );
+            }
+            let kept = format!("top.g_lane[{i}].qw");
+            assert!(
+                names.contains(kept.as_str()),
+                "lane {i} lost its own net to a module entry in the {what}"
+            );
+        }
+    }
 
     for p in [&sv, &vcd, &fst, &xt] {
         let _ = fs::remove_file(p);
