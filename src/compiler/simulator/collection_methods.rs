@@ -3133,8 +3133,12 @@ impl Simulator {
         // signal_id), since `self.module.signals` may not be the storage.
         // §6.19.6: first/last/num take no argument; next/prev take an OPTIONAL
         // count N (default 1) — `c.next(2)` steps two forward with wrapping.
-        if (matches!(bm, BuiltinM::First | BuiltinM::Last | BuiltinM::Num) && args.is_empty())
-            || (matches!(bm, BuiltinM::Next | BuiltinM::Prev) && args.len() <= 1)
+        // A queue, dynamic or associative array of enumeration elements has
+        // its own `num`, `first`, `last`, `next` and `prev` (§7.9, §7.10).
+        if ((matches!(bm, BuiltinM::First | BuiltinM::Last | BuiltinM::Num) && args.is_empty())
+            || (matches!(bm, BuiltinM::Next | BuiltinM::Prev) && args.len() <= 1))
+            && !self.is_associative_array(obj_name)
+            && !self.module.dynamic_arrays.contains(obj_name)
         {
             let step_n: u64 = if matches!(bm, BuiltinM::Next | BuiltinM::Prev) {
                 args.first()

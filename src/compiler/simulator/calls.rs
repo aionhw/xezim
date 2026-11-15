@@ -151,6 +151,30 @@ impl Simulator {
                 return value;
             }
         }
+        // §6.19.5: an enumeration method takes the enumeration from the
+        // receiver's declared type, whatever expression the receiver is.
+        match &func.kind {
+            ExprKind::MemberAccess { expr: recv, member }
+                if Self::is_enum_method(&member.name, args.len()) =>
+            {
+                if let Some(v) = self.enum_method_on_receiver(recv, &member.name, args) {
+                    return v;
+                }
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 2
+                    && h.path.last().is_some_and(|s| {
+                        s.selects.is_empty() && Self::is_enum_method(&s.name.name, args.len())
+                    }) =>
+            {
+                let recv = self.method_receiver_expr(h, h.path.len() - 1);
+                let m = h.path[h.path.len() - 1].name.name.as_str();
+                if let Some(v) = self.enum_method_on_receiver(&recv, m, args) {
+                    return v;
+                }
+            }
+            _ => {}
+        }
         // §7.5.2, §7.9.1, §7.10.2: a collection method on a function's
         // returned queue, dynamic or associative array (`f().size()`).
         if let ExprKind::MemberAccess { expr: recv, member } = &func.kind

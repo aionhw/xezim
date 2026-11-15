@@ -2556,6 +2556,16 @@ impl Simulator {
                         data_type,
                         &self.module.parameters,
                     ) {
+                        // §6.19: its member names are constants of the block.
+                        let base_w = super::elaborate::resolve_type_width(
+                            data_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        )
+                        .max(1);
+                        for (n, v) in &m {
+                            self.declare_enum_constant(n, Value::from_u64(*v, base_w));
+                        }
                         self.type_tables_gen += 1;
                         self.module.enum_members.insert(d.name.name.clone(), m);
                         if let Some(set) = self.plain_class_types.borrow_mut().as_mut() {
@@ -6467,9 +6477,7 @@ impl Simulator {
                             None => next,
                         };
                         next = v.wrapping_add(1);
-                        self.module
-                            .parameters
-                            .insert(m.name.name.clone(), Value::from_u64(v, base_w));
+                        self.declare_enum_constant(&m.name.name, Value::from_u64(v, base_w));
                         members.push((m.name.name.clone(), v));
                     }
                     self.module

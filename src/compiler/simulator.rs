@@ -3061,6 +3061,7 @@ mod construction;
 mod coverage;
 mod dpi_imports;
 mod edges;
+mod enum_receivers;
 mod event_loop;
 mod stall_progress;
 mod expression_types;
@@ -8940,6 +8941,12 @@ pub struct Simulator {
     /// Names the storage of each typed pattern value held at once.
     #[serde(skip)]
     typed_pattern_seq: u64,
+    /// §6.19.5: the enumeration a type name denotes, for method receivers
+    /// (`enum_receivers`), valid for `type_tables_gen` of the second field.
+    #[serde(skip)]
+    enum_recv_cache: HashMap<String, Option<std::rc::Rc<enum_receivers::EnumRecvType>>>,
+    #[serde(skip)]
+    enum_recv_cache_gen: u64,
     /// §13.5: the slice actuals of the `output`, `inout` and `ref` array
     /// formals of the calls running now, by caller key (`bind_slice_array_arg`):
     /// each formal index and the slice element it copies back to.

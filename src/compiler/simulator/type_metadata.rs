@@ -833,6 +833,24 @@ impl Simulator {
         name: &str,
         e: &Expression,
     ) -> Value {
+        // §6.19.5: the variable has its type before its initializer runs
+        // (`for (e_t s = s.first(); ...)`), in this frame only.
+        if let DataType::TypeReference { name: tref, .. } = data_type {
+            let tn = if tref.has_scope() {
+                tref.qualified()
+            } else {
+                tref.name.name.clone()
+            };
+            if self.module.enum_members.contains_key(&tn)
+                || self.module.typedef_types.contains_key(&tn)
+            {
+                self.record_local_typedef_type(name, &tn);
+            } else if self.module.enum_members.contains_key(&tref.name.name)
+                || self.module.typedef_types.contains_key(&tref.name.name)
+            {
+                self.record_local_typedef_type(name, &tref.name.name);
+            }
+        }
         let v = self.eval_expr(e);
         let w = super::elaborate::resolve_type_width(
             data_type,
