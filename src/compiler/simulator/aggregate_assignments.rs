@@ -1111,6 +1111,20 @@ impl Simulator {
         let Some((first, rest)) = lists.split_first() else {
             return;
         };
+        // IEEE 1800-2023 §10.9.1/§10.10.1: replication supplies a whole
+        // dimension, with each expression converted to its element's type.
+        // This helper checks the replication shape before evaluating counts
+        // or allocating, and leaves mismatched counts on the existing path.
+        if let Some(expanded) =
+            super::elaborate::struct_pattern_replication_with(sub, first.len(), &mut |count| {
+                super::elaborate::struct_pattern_count_value(&self.eval_expr(count))
+            })
+        {
+            for (idx, v) in first.iter().zip(expanded) {
+                self.assign_pattern_over_dims(&format!("{}[{}]", target, idx), dt, rest, v);
+            }
+            return;
+        }
         let mut per_elem: Vec<Option<&Expression>> = vec![None; first.len()];
         let mut dflt: Option<&Expression> = None;
         let mut pos = 0usize;
