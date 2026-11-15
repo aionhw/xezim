@@ -713,6 +713,8 @@ mod struct_array_member_elem_select;
 
 #[path = "types/packed_select_geometry_1002.rs"]
 mod packed_select_geometry_1002;
+#[path = "types/array_member_pattern_replication.rs"]
+mod array_member_pattern_replication;
 #[path = "types/struct_pattern_replication.rs"]
 mod struct_pattern_replication;
 #[path = "types/struct_pattern_replication_constant_counts.rs"]
