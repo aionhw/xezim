@@ -4584,6 +4584,7 @@ impl Simulator {
             fst_file: None,
             fst_scopes: Vec::new(),
             fst_dump_none: false,
+            wave_suppress: configured_wave_suppress(),
             fst_writer: None,
             cast_widths,
             packed_named_signed,

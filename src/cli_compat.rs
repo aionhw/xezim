@@ -33,6 +33,9 @@ pub(crate) struct CompatArgs {
     pub uvm: bool,
     /// `--fst-scope-file` files named inside args files (src/cli_files.rs).
     pub fst_scope_files: Vec<String>,
+    /// `--wave-suppress-file` files named inside args files: the waveform
+    /// exclusion list, one entry per line.
+    pub wave_suppress_files: Vec<String>,
 }
 
 /// The code coverage `+cover[=<letters>]` and `-coverage` ask for, as

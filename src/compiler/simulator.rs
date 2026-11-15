@@ -780,6 +780,38 @@ fn xtrace_options() -> XtraceOptions {
         .unwrap_or_default()
 }
 
+/// `--wave-suppress` / `--wave-suppress-file` / `--wave-suppress-module`: the
+/// waveform EXCLUDE list, shared by the VCD, FST and XTrace dumps.
+///
+/// Process-global for the same reason as `set_dpi_libs`: `simulate_multi`
+/// builds and runs the `Simulator` internally, and the exclusion applies to
+/// every dump format at once, so it is a run-wide setting rather than a
+/// per-format one. `Simulator::new` copies it into the public
+/// `wave_suppress` field, which a library user may also overwrite directly.
+fn wave_suppress_cell() -> &'static Mutex<Vec<String>> {
+    static WAVE_SUPPRESS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    WAVE_SUPPRESS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Set the waveform exclusion list. Each entry is either a hierarchical path
+/// (`tb_top.u_blk.u_bank0`, top-module prefix optional) or a bare module name
+/// (`mem_bank`), which excludes EVERY instance of that module at every depth.
+/// `--wave-suppress-module` entries are passed through with a `module:` prefix,
+/// which forces the module reading for an identifier that is also a path.
+pub fn set_wave_suppress(entries: &[String]) {
+    if let Ok(mut guard) = wave_suppress_cell().lock() {
+        *guard = entries.to_vec();
+    }
+}
+
+/// The exclusion list `Simulator::new` should start from.
+pub(crate) fn configured_wave_suppress() -> Vec<String> {
+    wave_suppress_cell()
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
 fn dpi_lib_paths() -> &'static Mutex<Vec<String>> {
     DPI_LIB_PATHS.get_or_init(|| Mutex::new(Vec::new()))
 }
@@ -9608,6 +9640,11 @@ pub struct Simulator {
     /// the FST dump must select nothing rather than fail open into a
     /// whole-design dump. Same purpose as `vcd_dump_none`; see there.
     pub fst_dump_none: bool,
+    /// The waveform EXCLUDE list (`--wave-suppress`), applied by every dump
+    /// format from one matcher — see `waveforms::WaveSuppressor`. Entries are
+    /// hierarchical paths or module names, resolved against the elaborated
+    /// instance tree at dump time.
+    pub wave_suppress: Vec<String>,
     /// The FST body writer (post-header phase). `None` until `fst_start_dump`.
     /// Value packing, block compression and I/O run on a background thread
     /// (`XEZIM_DUMP_INLINE=1` keeps them here); see `fst_sink::FstSink`.

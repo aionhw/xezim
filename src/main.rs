@@ -382,6 +382,15 @@ fn print_usage() {
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
     eprintln!("  -fst_scope_file <file>  (--fst-scope-file) FST scopes from a file: one or");
     eprintln!("                   more per line, '#' or '//' comments. Adds to --fst-scope.");
+    eprintln!("  --wave-suppress <entry>  EXCLUDE signals from the VCD, FST and XTrace dumps.");
+    eprintln!("                   Repeatable, and the two entry forms may be mixed: a bare name");
+    eprintln!("                   is a MODULE definition, so every instance of it at any depth");
+    eprintln!("                   goes; a dotted name is one hierarchical path, with or without");
+    eprintln!("                   the top-module prefix.");
+    eprintln!("  --wave-suppress-module <name>  --wave-suppress, reading <name> as a module");
+    eprintln!("                   definition even if an instance carries the same name.");
+    eprintln!("  -wave_suppress_file <file>  (--wave-suppress-file) Exclusions from a file: one");
+    eprintln!("                   per line, '#' or '//' comments. Adds to --wave-suppress.");
     eprintln!("  --fst-repack[=N] gzip-wrap the finished FST on a clean close (GTKWave's");
     eprintln!("                   repack-on-close; deflate level N, 1..9, default 6). About");
     eprintln!("                   1.5x smaller; readers inflate it on open.");
@@ -1056,6 +1065,20 @@ fn process_command_file(
                     };
                     if let Some(v) = v {
                         compat.fst_scope_files.push(resolve_rel(base, &v));
+                    }
+                }
+                // `-wave_suppress_file <file>` (path relative to this args
+                // file); one `--wave-suppress` entry per line.
+                _ if cli_files::option_value(t, cli_files::WAVE_SUPPRESS_FILE_NAMES).is_some() => {
+                    let v = match cli_files::option_value(t, cli_files::WAVE_SUPPRESS_FILE_NAMES) {
+                        Some(Some(v)) => Some(v.to_string()),
+                        _ => {
+                            i += 1;
+                            toks.get(i).map(|s| s.to_string())
+                        }
+                    };
+                    if let Some(v) = v {
+                        compat.wave_suppress_files.push(resolve_rel(base, &v));
                     }
                 }
                 // `-xezim_env` must be on the command line: the environment
@@ -2233,6 +2256,9 @@ fn run_main() -> i32 {
     let mut fst_file: Option<String> = None;
     let mut fst_repack: Option<u8> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
+    // `--wave-suppress` / `--wave-suppress-module` / `--wave-suppress-file`:
+    // the waveform EXCLUDE list, shared by VCD, FST and XTrace.
+    let mut wave_suppress: Vec<String> = Vec::new();
     let mut sim_debug = false;
     let mut dump_files_list = false;
     let mut dump_merged_sv: Option<String> = None;
@@ -2392,6 +2418,32 @@ fn run_main() -> i32 {
                     Ok(text) => fst_scopes.extend(cli_files::parse_scope_file(&text)),
                     Err(e) => {
                         eprintln!("Error: cannot read -fst_scope_file '{}': {}", path, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            // `--wave-suppress-file <file>`: one `--wave-suppress` entry per
+            // line — module names and hierarchical paths may be mixed freely.
+            // Ahead of the `-f<file>` args-file prefix form, which would
+            // otherwise take `-wave_suppress_file`.
+            _ if cli_files::option_value(arg, cli_files::WAVE_SUPPRESS_FILE_NAMES).is_some() => {
+                let path = match cli_files::option_value(arg, cli_files::WAVE_SUPPRESS_FILE_NAMES) {
+                    Some(Some(v)) => v.to_string(),
+                    _ => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.clone(),
+                            None => {
+                                eprintln!("Error: -wave_suppress_file requires a file");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                };
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => wave_suppress.extend(cli_files::parse_scope_file(&text)),
+                    Err(e) => {
+                        eprintln!("Error: cannot read -wave_suppress_file '{}': {}", path, e);
                         std::process::exit(1);
                     }
                 }
@@ -2930,6 +2982,33 @@ fn run_main() -> i32 {
             _ if arg.starts_with("--fst-scope=") => {
                 fst_scopes.push(arg["--fst-scope=".len()..].to_string());
             }
+            // ── `--wave-suppress`: the waveform EXCLUDE list ──────────────
+            // A bare identifier names a MODULE — every instance of it, at every
+            // depth — and a dotted name names one hierarchical subtree, with or
+            // without the top-module prefix. `--wave-suppress-module` forces the
+            // module reading, so the two rules are never ambiguous. The list is
+            // one matcher shared by the VCD, FST and XTrace dumps.
+            "--wave-suppress" => {
+                i += 1;
+                if i < args.len() {
+                    wave_suppress.push(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--wave-suppress=") && !arg.starts_with("--wave-suppress-m") => {
+                wave_suppress.push(arg["--wave-suppress=".len()..].to_string());
+            }
+            "--wave-suppress-module" => {
+                i += 1;
+                if i < args.len() {
+                    wave_suppress.push(format!("module:{}", args[i]));
+                }
+            }
+            _ if arg.starts_with("--wave-suppress-module=") => {
+                wave_suppress.push(format!(
+                    "module:{}",
+                    &arg["--wave-suppress-module=".len()..]
+                ));
+            }
             // `--sim_debug` kept as a compatibility alias for existing scripts.
             "--sim-debug" | "--sim_debug" => {
                 sim_debug = true;
@@ -3310,6 +3389,18 @@ fn run_main() -> i32 {
             Ok(text) => fst_scopes.extend(cli_files::parse_scope_file(&text)),
             Err(e) => {
                 eprintln!("Error: cannot read -fst_scope_file '{}': {}", f, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // `--wave-suppress-file` given inside an args file: the same list, the same
+    // rules, just read relative to the args file that named it.
+    for f in std::mem::take(&mut compat.wave_suppress_files) {
+        match std::fs::read_to_string(&f) {
+            Ok(text) => wave_suppress.extend(cli_files::parse_scope_file(&text)),
+            Err(e) => {
+                eprintln!("Error: cannot read -wave_suppress_file '{}': {}", f, e);
                 std::process::exit(1);
             }
         }
@@ -4044,6 +4135,12 @@ suppressed but the explicit SDF annotation still applies."
             && profile_input.is_none()
             && std::env::var("XEZIM_KEEP_PORTS").ok().as_deref() != Some("1"),
     );
+
+    // `--wave-suppress[-file|-module]`: the waveform EXCLUDE list. It reaches
+    // the dump setup the same way the include lists do, and the same list is
+    // consulted by the VCD, FST and XTrace writers, so one design cannot get
+    // three different answers.
+    xezim::compiler::simulator::set_wave_suppress(&wave_suppress);
 
     match xezim::simulate_multi(
         &sources,
