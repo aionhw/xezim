@@ -2102,6 +2102,32 @@ impl Simulator {
             let path = &hier.path;
             let len = path.len();
 
+            // §8.4: a class method named like a built-in array, string or
+            // enumeration method (`size`, `num`, `delete`), called through a
+            // null handle. The built-in dispatch below goes by the method's
+            // name and took the call for a method of a collection.
+            if len >= 2
+                && path[len - 1].selects.is_empty()
+                && Self::builtin_method_name(&path[len - 1].name.name)
+                && self
+                    .class_member_names()
+                    .methods
+                    .contains(path[len - 1].name.name.as_str())
+            {
+                let recv = self.method_receiver_expr(hier, len - 1);
+                if self.eval_handle_expr(&recv).unwrap_or(0) == 0
+                    && let Some(decl) = self.null_receiver_class(&recv)
+                    && let Some(v) = self.call_on_null_receiver_of(
+                        (len == 2).then(|| path[0].name.name.as_str()),
+                        &decl,
+                        &path[len - 1].name.name,
+                        args,
+                    )
+                {
+                    return v;
+                }
+            }
+
             // §6.18/§8.23: resolve a plain typedef receiver before dispatching
             // Alias::member_type::method (or pkg::Alias::member_type::method).
             // Following the real class's member typedef executes the registry

@@ -3346,10 +3346,30 @@ impl Simulator {
     /// variable, a property, an element of a collection of handles, a
     /// function's return type.
     pub(super) fn null_receiver_class(&mut self, expr: &Expression) -> Option<String> {
-        self.receiver_static_class(expr, 0)
+        // With no object, a bare name is a property of the class in scope;
+        // the general lookups answer with that class itself.
+        let in_class_scope = self.this_stack.last().copied().flatten().is_none();
+        in_class_scope
+            .then(|| self.context_class_prop_class(expr))
+            .flatten()
+            .or_else(|| self.receiver_static_class(expr, 0))
             .or_else(|| self.call_return_class(expr))
             .or_else(|| self.get_expr_type_name(expr))
             .and_then(|t| self.class_through_typedefs(&t))
+    }
+
+    /// The declared class of a bare property of the class whose scope is
+    /// current when no object is (`sp` in `static int y = sp.m();`, a
+    /// static property initializer).
+    fn context_class_prop_class(&self, expr: &Expression) -> Option<String> {
+        let ExprKind::Ident(h) = &expr.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let ctx = self.class_context_stack.last()?.as_deref()?;
+        self.class_prop_type_named(ctx, &h.path[0].name.name)
     }
 
     /// The declared return class of a call receiver: a free function

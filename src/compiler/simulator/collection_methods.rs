@@ -1459,6 +1459,7 @@ impl Simulator {
         let saved_alias = self.item_alias.take();
         let saved_iter = self.locator_iter.clone();
         self.locator_iter = iter_name.unwrap_or("item").to_string();
+        let with_class = self.bind_with_iter_class(arr, iter_name);
 
         // §7.12/§7.2.1: a PACKED-struct element binds its fields too, so
         // `find with (item.lo > 2)` slices them out of `item`.
@@ -1538,6 +1539,7 @@ impl Simulator {
         }
         self.item_alias = saved_alias;
         self.locator_iter = saved_iter;
+        self.unbind_with_iter_class(with_class);
         if let Some(f) = self.local_stack.last_mut() {
             match saved_item {
                 Some(v) => {
@@ -1895,6 +1897,7 @@ impl Simulator {
         let saved_alias = self.item_alias.take();
         let saved_iter = self.locator_iter.clone();
         self.locator_iter = iter.unwrap_or("item").to_string();
+        let with_class = self.bind_with_iter_class(arr, iter);
 
         // §7.12.2: `q.sort/.rsort with (item.expr)` sorts by the value of the
         // filter expression. When that expression is STRING-valued (e.g.
@@ -1971,6 +1974,7 @@ impl Simulator {
 
         self.item_alias = saved_alias;
         self.locator_iter = saved_iter;
+        self.unbind_with_iter_class(with_class);
         if let Some(f) = self.local_stack.last_mut() {
             if let Some(nm) = iter {
                 f.remove(nm);
@@ -2061,6 +2065,50 @@ impl Simulator {
         AssocKeyTy::Int { width, signed }
     }
 
+    /// §7.12: the iterator of an array method's `with` clause (`item`, or
+    /// the declared name) has the type of the collection's element. For a
+    /// collection of class handles, record that class in the frame, so a
+    /// method called through a null element is bound to it (§8.4). Returns
+    /// the entries displaced, for `unbind_with_iter_class`.
+    pub(super) fn bind_with_iter_class(
+        &mut self,
+        arr: &str,
+        iter: Option<&str>,
+    ) -> Option<Vec<(String, Option<String>)>> {
+        if self.module.classes.is_empty() {
+            return None;
+        }
+        let class = self.coll_elem_class(arr)?;
+        let frame = self.local_type_stack.last_mut()?;
+        Some(
+            std::iter::once("item")
+                .chain(iter.filter(|nm| *nm != "item"))
+                .map(|nm| {
+                    (
+                        nm.to_string(),
+                        frame.0.insert(nm.to_string(), class.clone()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub(super) fn unbind_with_iter_class(&mut self, saved: Option<Vec<(String, Option<String>)>>) {
+        let (Some(saved), Some(frame)) = (saved, self.local_type_stack.last_mut()) else {
+            return;
+        };
+        for (name, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(c) => {
+                    frame.0.insert(name, c);
+                }
+                None => {
+                    frame.0.remove(&name);
+                }
+            }
+        }
+    }
+
     pub(super) fn reduce_with(
         &mut self,
         arr: &str,
@@ -2096,6 +2144,7 @@ impl Simulator {
             .last()
             .and_then(|f| f.get("item.index").cloned());
         let iter_index = iter.map(|nm| format!("{}.index", nm));
+        let with_class = self.bind_with_iter_class(arr, iter);
         // §7.12.3/§7.2.1: a packed-struct element binds its fields, as for
         // the locators: `sum() with (item.code)` read 0 for every element.
         let pfields = self.coll_packed_elem_fields(arr);
@@ -2177,6 +2226,7 @@ impl Simulator {
                 f.remove(&format!("{}.{}", it, fname));
             }
         }
+        self.unbind_with_iter_class(with_class);
         // Restore the prior `item` binding (if any); drop the iterator's.
         if let Some(f) = self.local_stack.last_mut() {
             if let Some(nm) = iter {

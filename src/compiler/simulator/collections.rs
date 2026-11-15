@@ -134,6 +134,32 @@ impl Simulator {
         )
     }
 
+    /// The class of the elements of the collection of handles `name`.
+    pub(super) fn coll_elem_class(&self, name: &str) -> Option<String> {
+        let leaf = name.rsplit('.').next().unwrap_or(name);
+        let root = name.split('[').next().unwrap_or(name);
+        if let Some(c) = [name, leaf, root]
+            .iter()
+            .find_map(|n| self.module.array_elem_class.get(*n))
+        {
+            return Some(c.clone());
+        }
+        let dt = self
+            .module
+            .var_decl_types
+            .get(name)
+            .or_else(|| self.module.var_decl_types.get(leaf))
+            .or_else(|| self.module.var_decl_types.get(root))?;
+        match self.resolve_dt_ref(dt) {
+            DataType::TypeReference { name: tn, .. }
+                if self.module.classes.contains_key(&tn.name.name) =>
+            {
+                Some(tn.name.name.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// The live size of row `name` when the dimension its next select
     /// indexes is a queue or dynamic one, from the declared shape. None for a
     /// fixed row (`raw[0]` of `T raw[][2]`), which is registered as dynamic
@@ -4930,6 +4956,45 @@ impl Simulator {
                 | "exists"
                 | "num"
         )
+    }
+
+    /// Whether `m` names a built-in method of a collection, a string or an
+    /// enumeration, which the call dispatch recognizes by name.
+    pub(super) fn builtin_method_name(m: &str) -> bool {
+        Self::is_array_builtin_method(m)
+            || Self::is_parenless_zero_arg_builtin(m)
+            || matches!(
+                m,
+                "delete"
+                    | "insert"
+                    | "push_back"
+                    | "push_front"
+                    | "find"
+                    | "find_index"
+                    | "find_first"
+                    | "find_first_index"
+                    | "find_last"
+                    | "find_last_index"
+                    | "unique"
+                    | "unique_index"
+                    | "getc"
+                    | "putc"
+                    | "substr"
+                    | "compare"
+                    | "icompare"
+                    | "toupper"
+                    | "tolower"
+                    | "atoi"
+                    | "atohex"
+                    | "atooct"
+                    | "atobin"
+                    | "atoreal"
+                    | "itoa"
+                    | "hextoa"
+                    | "octtoa"
+                    | "bintoa"
+                    | "realtoa"
+            )
     }
 
     pub(super) fn is_parenless_zero_arg_builtin(m: &str) -> bool {
