@@ -755,3 +755,5 @@ mod signed_named_packed_elements_1107;
 mod package_typedef_negative_bound_1148;
 #[path = "types/review_struct_pattern_return.rs"]
 mod review_struct_pattern_return;
+#[path = "types/enum_receiver_types_1132.rs"]
+mod enum_receiver_types_1132;
