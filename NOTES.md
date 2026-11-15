@@ -17,6 +17,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   9.35 G instructions instead of 79.4 G with the same coverage (§19.5.1.1,
   #1135, contributed by auty1395).
 
+* A continuous assignment that calls a function is evaluated when an operand
+  changes. The called function's own name, its loop variables and the locals
+  of its nested blocks counted as unresolved reads, so the assignment was
+  evaluated at every settle: two such assignments beside a free-running clock
+  took 60,002 evaluations and 40.45 G instructions for 10,000 cycles, now 3
+  evaluations and 84.7 M instructions (§10.3.2, §13.4, #1126, reported by
+  ds54e).
+
 **Command line**
 
 * `$dumpvars` and `$fsdbDumpvars` accept indexed scope arguments: a
@@ -125,6 +133,140 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * A compiled method compares a string-collection element read through a class
   handle (`a.q[i] != p[i]`) as a string (§6.16, §7.10, #1157, contributed by
   Thomasb81).
+
+* An assignment-pattern key is evaluated as the self-determined expression it
+  is, with its literals' widths and signs: `'{(2'sb11 & 4): v, default: 0}`
+  sets element 4 (it set element 0), in an unpacked pattern, a structure
+  member's pattern, a parameter array and a packed target (§10.9.1, §5.7.1,
+  §11.8.2, #1164, contributed by ds54e). A parameter operand of a key has its
+  declared type too, so `'{(F + 4'd1): v}` over a 4-bit `F` of 15 sets
+  element 0, not 16 (§10.9.1, §11.6.1, §6.20.2, #1164).
+
+* Constant expressions keep the types the typed constant evaluator lost:
+  `$clog2`, `$bits`, the array queries and the bit counts are signed
+  `integer`/`int` results; a condition with a known 1 bit takes the first
+  arm; `$isunknown`, `$countones` and `$countbits` count every bit, x and z
+  included; a typed parameter (also in a class or a generate block) and a
+  package variable take their declared signedness and two-state value; an
+  `inside` operand and a function call give an untyped parameter their own
+  width; a real exponent makes `**` real; a constant wider than 64 bits
+  converts to real with its high bits; a constant array query over a typed
+  parameter answers from its declared shape, in a child module too; a
+  constant function's `case` compares its items at their common width; and
+  an override of a body `parameter unsigned` is unsigned (§20.6.2, §20.7,
+  §20.8.1, §20.9, §11.4.11, §6.20.2, §6.11.2, §6.11.3, §11.4.13, §11.4.5,
+  §6.12.2, §12.5, #1143).
+
+* An unsigned operand makes an expression unsigned in compiled code whatever
+  its kind: a package or module parameter, a function result, an interface
+  variable, a hierarchical reference, an unpacked-structure or union member
+  and a typedef cast now zero-extend the signed operand next to them, as a
+  plain variable did (§11.8.1, #1158).
+
+* A signed member of a packed structure is read signed in continuous
+  assignments and `always` blocks, so it sign-extends into a wider target;
+  and inside a concatenation an arithmetic or bitwise operator extends its
+  narrower operand by its own sign before operating, alike with and without
+  `XEZIM_JIT=1` (§7.2.1, §11.6.1, §11.8.2, #1159).
+
+* An element of a packed array of a named signed type (`lane_t [0:8] q;
+  q[1]`, also a structure member declared that way) is signed, in
+  procedural and compiled code; a function returning a signed typedef
+  returns a signed value; and a compiled streaming
+  concatenation of a part-select of such an array (`{<< 11 {q[0:4]}}`) sizes
+  each element at its element width, so the slices reverse (§7.4.1, §13.4.1,
+  §11.4.14, #1107).
+
+* A negative package constant in a package typedef's range keeps its value
+  when the type is used as `pkg::T` without an import, also when another
+  module declares a parameter of the same name, and a typed constant there
+  has its declared type's value (§26.3, §6.18, §6.20.2, #1148).
+
+* A dynamic-array `new[n]` (or `new[n](src)`) that sizes one row of an array
+  of dynamic arrays, or a dynamic member of a struct, inside a class method
+  (`d[i] = new[n]`, `this.d[i] = new[n]`, `s.q = new[n]`) no longer runs the
+  constructor of the enclosing class again on the same object, with the size
+  as its argument; a size expression that is a call runs once. A UVM
+  component that sized rows in `build_phase` was renamed and the build
+  failed (§7.5.1, §8.7, #1167, reported by git-hevangel).
+
+* A `ref` formal reads and writes its actual while the subroutine runs, for
+  every kind of actual: a property of an object (`t(h.p)`, `t(o.in.p)`, a
+  bare property in a method), a member of a struct, an element of a queue,
+  dynamic or associative array, a hierarchical or package name, and a
+  `string`. The formal kept the value the actual had at the call, so a task
+  parked on a delay or `wait` never saw a later write by another process,
+  and its own writes reached the actual only when it returned. A method of
+  an aliased handle formal (`mb.num()`), a built-in method of an aliased
+  string (`s.len()`), a member of an aliased packed struct (`s.a`), and
+  `@(x)` or `wait (x == v)` on a formal aliased to a property follow the
+  actual too (§13.5.2, #1160, reported by Ganesh-TNL).
+
+* A non-virtual method called through a null handle runs, bound to the
+  declared class of the receiver with a null `this`, wherever the receiver
+  comes from: a formal, a local, a property, an element of a collection of
+  handles, a struct member, a hierarchical name, a function's return value.
+  It returned a silent 0 (or aborted the run at the top level) without
+  running. A virtual method through a null handle is still reported, and
+  aborts the run at the top level (§8.4, §8.20, #1139, reported by
+  Ganesh-TNL).
+
+* A specialization of a parameterized class written in a module with the
+  module's parameters (`C#(W)::f()`, `C#(W*2)::N`, `C#(.P(W))`) names that
+  instance's specialization: every instance of the module ran the static
+  methods of one specialization, chosen by instantiation order, and read its
+  static members (§8.25, §23.10, #1129, #1130, reported by Ganesh-TNL).
+
+* `mailbox`, `semaphore` and `process` are classes of package `std` in
+  every scope: a module-scope typedef of one, an inline `mailbox` formal of a
+  module or interface subroutine and `#(mailbox)` as a type parameter are
+  accepted; a handle of one starts null; and `new()` constructs a mailbox or
+  semaphore declared through a typedef (also of a typedef or a package's),
+  reached through a chain of handles (`o.in.mb = new()`) or named through
+  its class (`C::sm = new()`). `put()` then `num()` read 0 on such a handle
+  (§6.18, §8.4, §15.3, §15.4, #1161, reported by Ganesh-TNL).
+
+* `randomize()` draws a value that only a few solutions allow: the joint
+  solver weighed a condition variable's values by the solutions each leaves,
+  and also counted the narrowing of a variable that is a function of others
+  (`tot == w * (n + 1)`), so with `solve ... before` a value that narrows
+  `n` was never drawn (§18.5.10, #1166, reported by philipaxer).
+
+* A continuous assignment that calls a function of `$time`, `$random` or
+  static state takes a new value only when an operand changes: before, it
+  was evaluated again on unrelated activity, so `assign y = f(x)` with
+  `return $time + x;` followed the clock instead of keeping the time of the
+  last change of `x`. A function's formal, local or loop variable named like
+  a module parameter indexes an array as itself: `always_comb c = pick(sel)`
+  with `return mem[idx];` and `parameter int idx` depended on `mem[idx]` of
+  the parameter's value only, and read x (§10.3.2, §9.2.2.2.1, §13.4,
+  #1126, reported by ds54e).
+
+* The list of continuous-assignment reads that a procedural write defers
+  holds each signal once. A long initial block at time 0 keeps the list from
+  being consumed until its start batch ends, and every blocking write after
+  the first deferral deferred the same entries again, so the list grew by
+  their reads on every write, without bound: a UVM `run_test` that builds a
+  large register model at time 0 kept growing its resident memory. The
+  propagation order and timing are unchanged (§10.3, §4.4, #1149, reported
+  by git-hevangel).
+
+* An `always_comb`, `always @*`, `always_latch` or continuous assignment that
+  reads an element of an unpacked array that is a member of an element of an
+  array of instances or interfaces (`lane[0].payload[2]`, also through a
+  child instance, a generate block or an interface) is evaluated again when
+  the element changes, and an event control naming the element waits on it.
+  The read was resolved to the instance array's own proxy signal, which no
+  write changes, so the process kept its time-0 value (§9.2.2.2, §10.3.2,
+  §23.6, #1108, reported by Ganesh-TNL).
+
+* A continuous assignment or `always_comb` that passes a whole unpacked
+  struct array to a function is evaluated again on a member write when the
+  actual is bound by name (`f(.a(a))`), spelled through `$root` or the
+  module's own name (`top.a`), or names a generate block of a child module.
+  A name in a child module that starts with one of its own generate blocks
+  (`h.a`, `h.x`) names the child's block: it read a same-named block of the
+  top module (§10.3.2, §13.5.4, §23.9, §27.5, #1110, reported by ds54e).
 
 ### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
 
