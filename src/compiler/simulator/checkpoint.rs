@@ -973,6 +973,8 @@ impl Simulator {
         // block of the saving run had started; the bodies this build queued
         // for its own time 0 belong to no restored process.
         self.lazy_initial.clear();
+        // #1149: the listed-once bits of the restored deferred reads.
+        self.rebuild_deferred_proc_seen();
         self.method_plans.borrow_mut().clear();
         self.fsm_clobber_cache.clear();
         // Annex D.9 / §8.3: this derived index borrows the class table.

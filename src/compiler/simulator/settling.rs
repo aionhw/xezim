@@ -1322,6 +1322,54 @@ impl Simulator {
         }
     }
 
+    /// #35 / #1149: list the reads of a cont-assign entry that a deferring
+    /// (post-proc-write) settle skipped, for the next full settle to
+    /// re-dirty. Each id is listed once: the drain re-dirties an id only if
+    /// it is not dirty yet, so a second copy changes nothing, and an entry
+    /// that re-triggers on every settle (one with an unresolved read) is
+    /// skipped again on every blocking write of the process. `marker` lists
+    /// the out-of-range `u32::MAX` entry, which only keeps the list
+    /// non-empty; an id out of range of `dirty_signals` (the drain skips it)
+    /// is listed as that marker too.
+    fn defer_proc_reads(&mut self, ids: &[usize], mut marker: bool) {
+        let n = self.dirty_signals.len();
+        if self.deferred_proc_seen.len() < n.div_ceil(64) {
+            self.deferred_proc_seen.resize(n.div_ceil(64), 0);
+        }
+        for &id in ids {
+            if id >= n {
+                marker = true;
+                continue;
+            }
+            let (w, b) = (id >> 6, 1u64 << (id & 63));
+            if self.deferred_proc_seen[w] & b == 0 {
+                self.deferred_proc_seen[w] |= b;
+                self.deferred_proc_entries.push(id as u32);
+            }
+        }
+        if marker && !self.deferred_proc_unres {
+            self.deferred_proc_unres = true;
+            self.deferred_proc_entries.push(u32::MAX);
+        }
+    }
+
+    /// #1149: the listed-once bits of `deferred_proc_entries`, rebuilt from
+    /// the list (a restored checkpoint holds only the list).
+    pub(super) fn rebuild_deferred_proc_seen(&mut self) {
+        let n = self.dirty_signals.len();
+        self.deferred_proc_seen.clear();
+        self.deferred_proc_seen.resize(n.div_ceil(64), 0);
+        self.deferred_proc_unres = false;
+        for &sid in &self.deferred_proc_entries {
+            let sid = sid as usize;
+            if sid < n {
+                self.deferred_proc_seen[sid >> 6] |= 1u64 << (sid & 63);
+            } else {
+                self.deferred_proc_unres = true;
+            }
+        }
+    }
+
     pub(super) fn settle_combinatorial_inner(&mut self) {
         if !self.ts_sleep.is_empty() {
             self.ts_wake_sleepers();
@@ -1429,14 +1477,23 @@ impl Simulator {
             && (self.time != 0 || self.t0_starts_remaining == 0)
             && !self.deferred_proc_entries.is_empty()
         {
-            let deferred = std::mem::take(&mut self.deferred_proc_entries);
-            for sid in deferred {
+            let mut deferred = std::mem::take(&mut self.deferred_proc_entries);
+            for &sid in &deferred {
                 let sid = sid as usize;
-                if sid < self.dirty_signals.len() && !self.dirty_signals[sid] {
-                    self.dirty_signals[sid] = true;
-                    self.dirty_list.push(sid);
+                if sid < self.dirty_signals.len() {
+                    if let Some(w) = self.deferred_proc_seen.get_mut(sid >> 6) {
+                        *w &= !(1u64 << (sid & 63));
+                    }
+                    if !self.dirty_signals[sid] {
+                        self.dirty_signals[sid] = true;
+                        self.dirty_list.push(sid);
+                    }
                 }
             }
+            self.deferred_proc_unres = false;
+            // The list keeps its allocation for the next deferral.
+            deferred.clear();
+            self.deferred_proc_entries = deferred;
             self.dirty_any = true;
         }
         // First time-0 settle pass: don't fire `always @(list)` blocks that
@@ -2032,22 +2089,15 @@ impl Simulator {
                             | CombItem::FusedAndFanout { .. }
                     ) || self.gate_entry_is_assign_origin(&entries[eidx]))
                 {
-                    self.deferred_proc_entries.extend(
-                        entries[eidx]
-                            .cold
-                            .read_signal_ids
-                            .iter()
-                            .map(|&id| id as u32),
-                    );
                     // An entry with no resolvable read (one reading only
                     // memory cells without element names) has no id to
                     // re-dirty: an out-of-range marker still makes the next
                     // full settle run, which seeds every unresolved entry.
-                    if entries[eidx].has_unresolved_reads
-                        && entries[eidx].cold.read_signal_ids.is_empty()
-                    {
-                        self.deferred_proc_entries.push(u32::MAX);
-                    }
+                    let reads = &entries[eidx].cold.read_signal_ids;
+                    self.defer_proc_reads(
+                        reads,
+                        entries[eidx].has_unresolved_reads && reads.is_empty(),
+                    );
                     continue;
                 }
                 evaluated_any = true;

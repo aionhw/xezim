@@ -7552,6 +7552,15 @@ pub struct Simulator {
     /// normal dependency machinery — entry INDICES would go stale across the
     /// topo reorder / lazy materialization of `comb_entries`.
     deferred_proc_entries: Vec<u32>,
+    /// (#1149) One bit per signal id listed in `deferred_proc_entries`, so
+    /// each id is listed once; the drain clears the bits it consumes. An
+    /// entry that re-triggers on every settle (an unresolved read) is
+    /// deferred again on every blocking write of a process, and a long
+    /// time-0 block holds the drain back until its start batch ends.
+    deferred_proc_seen: Vec<u64>,
+    /// (#1149) Whether the `u32::MAX` marker (an entry with no resolvable
+    /// read) is in `deferred_proc_entries`.
+    deferred_proc_unres: bool,
     /// (#t0-comb-defer) Compile-time process starts still unrun in the
     /// time-0 slot. A commercial simulator queues the cont-assign /
     /// port-connect update events that a time-0 process write schedules
