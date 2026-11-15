@@ -1260,3 +1260,5 @@ mod static_packed_member_writes_1046;
 mod builtin_class_struct_members_1161;
 #[path = "classes/null_receiver_builtin_names_1139.rs"]
 mod null_receiver_builtin_names_1139;
+#[path = "classes/static_call_in_param_initializer_1130.rs"]
+mod static_call_in_param_initializer_1130;
