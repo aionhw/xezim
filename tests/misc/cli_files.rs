@@ -1,5 +1,6 @@
 //! Options that read their values from a file (src/cli_files.rs):
-//! `-fst_scope_file <file>` adds FST dump scopes, and `-xezim_env <file>`
+//! `-fst_scope_file <file>` adds FST dump scopes, `-wave_suppress_file <file>`
+//! excludes signals from all three dump formats, and `-xezim_env <file>`
 //! sets `XEZIM_*` variables before xezim reads any of them.
 
 use std::path::{Path, PathBuf};
@@ -103,6 +104,22 @@ fn option_spellings() {
         Some(Some("s.txt"))
     );
     assert_eq!(option_value("-f", cli_files::FST_SCOPE_FILE_NAMES), None);
+    // The exclusion file, and the `-f` args-file prefix must not match it.
+    assert_eq!(
+        option_value(
+            "-wave_suppress_file=w.txt",
+            cli_files::WAVE_SUPPRESS_FILE_NAMES
+        ),
+        Some(Some("w.txt"))
+    );
+    assert_eq!(
+        option_value("--wave-suppress-file", cli_files::WAVE_SUPPRESS_FILE_NAMES),
+        Some(None)
+    );
+    assert_eq!(
+        option_value("-f", cli_files::WAVE_SUPPRESS_FILE_NAMES),
+        None
+    );
     let args: Vec<String> = ["a.sv", "-xezim_env", "one.env", "--xezim-env=two.env"]
         .iter()
         .map(|s| s.to_string())
@@ -266,5 +283,67 @@ fn fst_scope_depth_limits_levels() {
     );
     assert_eq!(rc, 0, "{}", out);
     assert_eq!(fst_count(&out), 1, "{}", out);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The other half of `src/cli_files.rs`: the exclusion list all three dump
+/// formats share (tests/gates/wave_suppress.rs covers what it removes, this
+/// covers how it is read).
+#[test]
+fn wave_suppress_file_excludes_scopes() {
+    let d = scratch("supfile");
+    std::fs::write(d.join("tb.sv"), DESIGN).unwrap();
+    let fst = |extra: &[&str]| {
+        let mut args = vec!["--fst", "s.fst"];
+        args.extend(extra.iter().copied());
+        args.extend(["-s", "top", "tb.sv"]);
+        let (rc, out) = run(&d, &[], &args);
+        assert_eq!(rc, 0, "{:?}: {}", extra, out);
+        fst_count(&out)
+    };
+    // `top.a` plus the two registers of each of the two `sub` instances.
+    assert_eq!(fst(&[]), 5, "baseline");
+    // A module definition name drops both instances at once; `#`/`//` comments
+    // and several entries on one line work exactly as in the include-side file.
+    std::fs::write(
+        d.join("mods.txt"),
+        "# the behavioural memory\nsub   // both\n\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("paths.txt"), "top.u1, top.u2  // the instances\n").unwrap();
+    for file in ["mods.txt", "paths.txt"] {
+        let eq = format!("--wave-suppress-file={}", file);
+        for args in [vec!["-wave_suppress_file", file], vec![eq.as_str()]] {
+            assert_eq!(fst(&args), 1, "{:?} should leave only top.a", args);
+        }
+    }
+    // Inside an args file, the file path resolves as given and else next to the
+    // args file, like every other path in it.
+    std::fs::create_dir_all(d.join("cfg")).unwrap();
+    std::fs::write(d.join("cfg/sup.txt"), "sub\n").unwrap();
+    std::fs::write(d.join("cfg/run.f"), "--wave-suppress-file sup.txt\n").unwrap();
+    let (rc, out) = run(
+        &d,
+        &[],
+        &["--fst", "t.fst", "-f", "cfg/run.f", "-s", "top", "tb.sv"],
+    );
+    assert_eq!(rc, 0, "{}", out);
+    assert_eq!(fst_count(&out), 1, "{}", out);
+    // A file that cannot be read is an error, not a silently empty list.
+    let (rc, out) = run(
+        &d,
+        &[],
+        &[
+            "--fst",
+            "u.fst",
+            "-wave_suppress_file",
+            "missing.txt",
+            "-s",
+            "top",
+            "tb.sv",
+        ],
+    );
+    assert_eq!(rc, 1, "{}", out);
+    assert!(out.contains("missing.txt"), "{}", out);
     let _ = std::fs::remove_dir_all(&d);
 }
