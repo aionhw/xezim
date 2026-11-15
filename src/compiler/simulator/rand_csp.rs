@@ -9026,32 +9026,32 @@ impl Simulator {
             let name = self.dyn_name_lookup(name).unwrap_or(name);
             (
                 self.module.var_decl_types.get(name)?.clone(),
-                self.module.parameters.clone(),
+                std::borrow::Cow::Borrowed(&self.module.parameters),
             )
         } else {
             let (owner, name) = Self::csp_owner(csp, name);
             (
                 self.csp_prop_decl_type(owner, name)?,
-                self.instance_param_scope(owner),
+                std::borrow::Cow::Owned(self.instance_param_scope(owner)),
             )
         };
         if let Some(su) = self.packed_struct_with_dims(&dt) {
             if !su.packed || su.dimensions.is_empty() {
                 return None;
             }
-            let dims = Self::packed_range_bounds(&su.dimensions, &params)?;
-            let (mut fields, elem_w) = self.packed_agg_layout_with(&su, &params);
-            let total = Self::packed_struct_array_width(&su, elem_w.max(1), &params)?;
+            let dims = Self::packed_range_bounds(&su.dimensions, params.as_ref())?;
+            let (mut fields, elem_w) = self.packed_agg_layout_with(&su, params.as_ref());
+            let total = Self::packed_struct_array_width(&su, elem_w.max(1), params.as_ref())?;
             if total != width {
                 return None;
             }
             let top = fields.clone();
-            self.csp_nested_walk(&su, &params, "", 0, &top, &mut fields, 0);
+            self.csp_nested_walk(&su, params.as_ref(), "", 0, &top, &mut fields, 0);
             return Some((dims, Some(fields)));
         }
         let dims = crate::compiler::elaborate::packed_full_dims_chained(
             &dt,
-            &params,
+            params.as_ref(),
             &self.module.typedef_types,
         )?;
         let bits = dims.iter().try_fold(1u64, |acc, &(l, r)| {

@@ -630,7 +630,10 @@ impl Simulator {
         use crate::ast::types::{SimpleType, UnpackedDimension as UD};
         let mut classes: Vec<String> = module.classes.keys().cloned().collect();
         classes.sort();
-        let params = module.parameters.clone();
+        // Borrow the live parameter table (only read for const bounds here);
+        // the sole writer in this function is `module.classes`, a disjoint
+        // field, so no copy is needed.
+        let params = &module.parameters;
         for cn in classes {
             let Some(cd) = module.classes.get(&cn) else {
                 continue;
@@ -682,7 +685,7 @@ impl Simulator {
                         // (see `static_fixed_arrays` in elaborate.rs).
                         Some(UD::Expression { expr, .. }) => {
                             if let Some(n) =
-                                super::elaborate::const_eval_i64_with_params(expr, Some(&params))
+                                super::elaborate::const_eval_i64_with_params(expr, Some(params))
                             {
                                 if n > 0 {
                                     cd.static_fixed_arrays.push((pname, 0, n - 1, w));
@@ -691,8 +694,8 @@ impl Simulator {
                         }
                         Some(UD::Range { left, right, .. }) => {
                             if let (Some(l), Some(r)) = (
-                                super::elaborate::const_eval_i64_with_params(left, Some(&params)),
-                                super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                                super::elaborate::const_eval_i64_with_params(left, Some(params)),
+                                super::elaborate::const_eval_i64_with_params(right, Some(params)),
                             ) {
                                 cd.static_fixed_arrays.push((pname, l.min(r), l.max(r), w));
                             }
@@ -708,8 +711,8 @@ impl Simulator {
                         .iter()
                         .map(|dm| match dm {
                             UD::Range { left, right, .. } => match (
-                                super::elaborate::const_eval_i64_with_params(left, Some(&params)),
-                                super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                                super::elaborate::const_eval_i64_with_params(left, Some(params)),
+                                super::elaborate::const_eval_i64_with_params(right, Some(params)),
                             ) {
                                 (Some(l), Some(r)) => Some((l.min(r), l.max(r))),
                                 _ => None,
@@ -717,7 +720,7 @@ impl Simulator {
                             UD::Expression { expr, .. } => {
                                 match super::elaborate::const_eval_i64_with_params(
                                     expr,
-                                    Some(&params),
+                                    Some(params),
                                 ) {
                                     Some(n) if n > 0 => Some((0, n - 1)),
                                     _ => None,
@@ -751,7 +754,7 @@ impl Simulator {
                         let cap = max_size
                             .as_ref()
                             .and_then(|e| {
-                                super::elaborate::const_eval_i64_with_params(e, Some(&params))
+                                super::elaborate::const_eval_i64_with_params(e, Some(params))
                             })
                             .map(|n| (n + 1).max(1) as u32);
                         cd.queue_properties.insert(pname, (w, cap));
@@ -760,7 +763,7 @@ impl Simulator {
                         cd.queue_properties.insert(pname, (w, None));
                     }
                     Some(UD::Expression { expr, .. }) => {
-                        match super::elaborate::const_eval_i64_with_params(expr, Some(&params)) {
+                        match super::elaborate::const_eval_i64_with_params(expr, Some(params)) {
                             Some(n) if n > 0 => {
                                 cd.array_properties.insert(pname, (0, n - 1, w));
                             }
@@ -771,8 +774,8 @@ impl Simulator {
                     }
                     Some(UD::Range { left, right, .. }) => {
                         if let (Some(l), Some(r)) = (
-                            super::elaborate::const_eval_i64_with_params(left, Some(&params)),
-                            super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                            super::elaborate::const_eval_i64_with_params(left, Some(params)),
+                            super::elaborate::const_eval_i64_with_params(right, Some(params)),
                         ) {
                             cd.array_properties.insert(pname, (l.min(r), l.max(r), w));
                         }
