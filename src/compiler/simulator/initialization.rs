@@ -808,7 +808,7 @@ impl Simulator {
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
-                Value::from_str_radix(value, r, w).to_u64()
+                Value::from_literal_text(value, r, w).to_u64()
             }
             ExprKind::Paren(inner) => Self::const_expr_u64(inner, params),
             ExprKind::Ident(h) => params
@@ -3122,6 +3122,9 @@ impl Simulator {
                 // needs this — same shape as the §6.11.1 signedness loop.
                 if super::elaborate::is_type_real_resolved(dt, &module.typedef_types) {
                     for id in first_id..signal_table.len() {
+                        // §6.8, Table 6-7: real/shortreal cells start at real
+                        // 0.0; the value tag must agree with the metadata.
+                        signal_table[id] = Value::from_f64(0.0);
                         signal_real_vec[id] = true;
                     }
                 }
@@ -3145,7 +3148,11 @@ impl Simulator {
                 }
                 let n = (hi - lo + 1).max(0) as usize;
                 for id in first_id..first_id + n {
-                    signal_table[id] = Value::zero(signal_widths_vec[id]);
+                    // Reals also occur in two_state_signals; keep their
+                    // typed 0.0 from the real-inheritance loop (§6.8).
+                    if !signal_real_vec[id] {
+                        signal_table[id] = Value::zero(signal_widths_vec[id]);
+                    }
                 }
             }
         }
@@ -3314,6 +3321,7 @@ impl Simulator {
                 super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
                 }
             }
@@ -3377,6 +3385,7 @@ impl Simulator {
                 super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
                 }
             }
@@ -3397,7 +3406,7 @@ impl Simulator {
             }
             let prefix = format!("{}[", base);
             for (name, &id) in signal_name_to_id.iter() {
-                if name.starts_with(prefix.as_str()) {
+                if name.starts_with(prefix.as_str()) && !signal_real_vec[id] {
                     signal_table[id] = Value::zero(signal_widths_vec[id]);
                 }
             }
@@ -3900,6 +3909,7 @@ impl Simulator {
             sva_preponed: HashMap::default(),
             sva_preponed_slot: None,
             sva_owed: false,
+            sva_abort_step: false,
             sva_post_nba_busy: false,
             clocking_snapshots: HashMap::default(),
             clocking_array_leaves: HashSet::default(),
@@ -4230,6 +4240,8 @@ impl Simulator {
             constraint_scopes: HashMap::default(),
             inline_constraint_scope: None,
             signed_class_colls: HashSet::default(),
+            coll_store_fit_cache: Default::default(),
+            coll_store_fit_next: 0,
             dep_base: HashMap::default(),
             dep_default: HashMap::default(),
             dep_names: Vec::new(),
@@ -4513,7 +4525,10 @@ impl Simulator {
             vcd_last_time: u64::MAX,
             vcd_prev_signals: Vec::new(),
             vcd_filter_scopes: Vec::new(),
+            vcd_dump_none: false,
             vcd_dump_depth: 0,
+            vcd_earlier_selections: Vec::new(),
+            vcd_start_time: u64::MAX,
             vcd_var_kinds: Vec::new(),
             vcd_event_last: Vec::new(),
             vcd_limit: None,
@@ -4540,6 +4555,7 @@ impl Simulator {
             xtrace_to_t: u64::MAX,
             fst_file: None,
             fst_scopes: Vec::new(),
+            fst_dump_none: false,
             wave_suppress: configured_wave_suppress(),
             fst_writer: None,
             cast_widths,

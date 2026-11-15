@@ -72,9 +72,11 @@ fn c16_12_12_until() {
 // §16.6, §16.12.4, §16.12.5, §16.12.15: property operators, followed-by, $onehot/$isunknown
 #[test]
 fn c16_12_property_operators() {
-    // Known gap (§16.12): `b[+]`, `nexttime [n]`, `eventually [m:n]`, `s_eventually [m:n]`, `s_always [m:n]`,
-    // `until_with`, `accept_on`/`reject_on` (and sync_), `#-#` and `#=#` do not parse; those
+    // Known gap (§16.12): `b[+]`, `until_with`, `#-#` and `#=#` do not parse; those
     // assertions are commented out (XZFAIL) and their reference lines left out.
+    // `accept_on`/`reject_on` (and sync_) stay commented out: the reference simulator runs
+    // the pass action of an accepted attempt, which §16.14.8 makes vacuous, and rejects at
+    // its first tick an implication whose antecedent matches there, where F.5.3.1 does not.
     // Known gap (§16.9.2): `q_repstar` reference `P t=105`, xezim `P t=205`
     // Assertions that complete in the same time step report from separate processes; IEEE 1800 §4.7 leaves their order open.
     check(
@@ -283,6 +285,50 @@ fn c16_12_property_operators() {
             "T|q_suntil|P t=235",
             "T|q_suntil|P t=35",
             "T|q_suntil|P t=35",
+            "T|q_salways|P t=25",
+            "T|q_salways|P t=35",
+            "T|q_sev_range|P t=35",
+            "T|q_sev_range|P t=35",
+            "T|q_ev_range|P t=35",
+            "T|q_ev_range|P t=35",
+            "T|q_nextn|P t=35",
+            "T|q_nextn|P t=45",
+            "T|q_salways|P t=65",
+            "T|q_nextn|F t=75",
+            "T|q_sev_range|F t=85",
+            "T|q_ev_range|F t=85",
+            "T|q_salways|P t=95",
+            "T|q_nextn|P t=105",
+            "T|q_salways|P t=105",
+            "T|q_sev_range|P t=105",
+            "T|q_sev_range|P t=105",
+            "T|q_ev_range|P t=105",
+            "T|q_ev_range|P t=105",
+            "T|q_salways|F t=115",
+            "T|q_nextn|F t=115",
+            "T|q_nextn|F t=125",
+            "T|q_salways|P t=135",
+            "T|q_sev_range|F t=135",
+            "T|q_ev_range|F t=135",
+            "T|q_nextn|F t=145",
+            "T|q_sev_range|P t=155",
+            "T|q_ev_range|P t=155",
+            "T|q_salways|F t=175",
+            "T|q_salways|F t=175",
+            "T|q_nextn|F t=185",
+            "T|q_salways|P t=195",
+            "T|q_sev_range|F t=195",
+            "T|q_ev_range|F t=195",
+            "T|q_nextn|F t=195",
+            "T|q_sev_range|P t=205",
+            "T|q_sev_range|P t=205",
+            "T|q_ev_range|P t=205",
+            "T|q_ev_range|P t=205",
+            "T|q_nextn|P t=205",
+            "T|q_salways|P t=225",
+            "T|q_nextn|P t=235",
+            "T|q_ev_range|P t=235",
+            "T|q_sev_range|P t=235",
         ],
         &[
             "T|q_repstar|P t=105",

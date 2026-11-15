@@ -969,6 +969,10 @@ impl Simulator {
             }
         }
 
+        if let Some(expanded) = self.struct_replication_items(su, items, members.len()) {
+            ordered = expanded;
+        }
+
         members
             .into_iter()
             .enumerate()
@@ -978,6 +982,41 @@ impl Simulator {
                 (mname, mdt, dims, e, explicit.is_some())
             })
             .collect()
+    }
+
+    /// IEEE 1800-2023 §10.9.2: the member expressions of a replicated
+    /// structure pattern `'{n{a, b}}` that sets exactly the `members` members
+    /// of `su`, in declaration order. The count is a constant expression
+    /// (A.6.7.1), so a parameter or localparam count is evaluated here; an
+    /// integer literal needs no evaluation. None for any other pattern, a
+    /// count other than the member count, or a structure with an unpacked
+    /// array member, which keeps the existing binding.
+    pub(super) fn struct_replication_items<'a>(
+        &mut self,
+        su: &crate::ast::types::StructUnionType,
+        items: &'a [AssignmentPatternItem],
+        members: usize,
+    ) -> Option<Vec<&'a Expression>> {
+        // Decide "not a replication" first: every structure pattern
+        // assignment comes through here, and the member scan below allocates.
+        let [AssignmentPatternItem::Ordered(e)] = items else {
+            return None;
+        };
+        if !matches!(e.kind, ExprKind::Replication { .. }) {
+            return None;
+        }
+        let expanded =
+            super::elaborate::struct_pattern_replication_with(items, members, &mut |count| {
+                super::elaborate::struct_pattern_count_value(&self.eval_expr(count))
+            })?;
+        if super::elaborate::struct_pattern_has_array_member(
+            su,
+            &self.module.typedef_types,
+            &self.module.typedef_unpacked_dims,
+        ) {
+            return None;
+        }
+        Some(expanded)
     }
 
     /// Spread an assignment pattern across the members of the UNPACKED struct
@@ -3390,7 +3429,51 @@ impl Simulator {
     /// interface) keeps the value as evaluated.
     #[inline(never)]
     pub(super) fn fit_queue_push_elem(&self, coll: &str, val: Value) -> Value {
-        let Some((w, signed, two_state)) = self.integral_queue_elem(coll) else {
+        Self::fit_queue_elem_to(self.integral_queue_elem(coll), val)
+    }
+
+    /// `fit_queue_push_elem` for a compiled element store (`StoreCollElem`).
+    /// The element type comes from a small cache of the last collections
+    /// stored to, so a store loop resolves it once per collection instead of
+    /// on every store (the lookup walks the object's class chain several
+    /// times). A class member's entry also keys on the object's class, and an
+    /// object with type-parameter bindings or a specialization is never
+    /// cached, so a reused handle cannot see another object's element type.
+    pub(super) fn fit_coll_store_elem(&mut self, coll: &str, val: Value) -> Value {
+        let inst = coll
+            .split_once('#')
+            .and_then(|(h, _)| h.parse::<usize>().ok())
+            .and_then(|h| self.heap.get(h)?.as_deref());
+        let cacheable = inst.is_none_or(|i| i.type_bindings.is_empty() && i.spec.is_none());
+        let class = inst.map(|i| i.class_name.as_str());
+        let hit = cacheable
+            .then(|| {
+                self.coll_store_fit_cache
+                    .iter()
+                    .flatten()
+                    .find(|(name, cls, _)| name == coll && cls.as_deref() == class)
+                    .map(|&(_, _, info)| info)
+            })
+            .flatten();
+        let info = match hit {
+            Some(info) => info,
+            None => {
+                let info = self.integral_queue_elem(coll);
+                if cacheable {
+                    let slot = self.coll_store_fit_next % self.coll_store_fit_cache.len();
+                    self.coll_store_fit_next = slot + 1;
+                    self.coll_store_fit_cache[slot] =
+                        Some((coll.to_string(), class.map(str::to_string), info));
+                }
+                info
+            }
+        };
+        Self::fit_queue_elem_to(info, val)
+    }
+
+    /// Fit `val` to the integral element type `info` (`integral_queue_elem`).
+    fn fit_queue_elem_to(info: Option<(u32, bool, bool)>, val: Value) -> Value {
+        let Some((w, signed, two_state)) = info else {
             return val;
         };
         // §6.12.2: a real argument rounds to the integral element type.

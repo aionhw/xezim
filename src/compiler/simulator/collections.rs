@@ -161,11 +161,16 @@ impl Simulator {
 
     /// §7.8.6: the value a read of a NONEXISTENT associative-array element
     /// yields — the element type's default, x for a 4-state integral type and
-    /// 0 for a 2-state one, at the element's width and signedness. `None`
-    /// when the element type is unknown or not integral; the caller keeps its
-    /// own fallback.
+    /// 0 for a 2-state one, at the element's width and signedness, and real
+    /// 0.0 for a real one. `None` when the element type is unknown or neither
+    /// integral nor real; the caller keeps its own fallback.
     pub(super) fn assoc_missing_elem_value(&self, name: &str) -> Option<Value> {
         use crate::ast::types::{IntegerAtomType as IAT, IntegerVectorType as IVT};
+        // §6.8, Table 6-7: a real/shortreal element's default is real 0.0
+        // (`assoc_elem_decl_type` gives integral element types only).
+        if self.coll_elem_is_real(name) {
+            return Some(Value::from_f64(0.0));
+        }
         let dt = self.assoc_elem_decl_type(name)?;
         let four_state = match self.resolve_dt_ref(dt) {
             DataType::IntegerVector { kind, .. } => !matches!(kind, IVT::Bit),

@@ -657,7 +657,10 @@ impl Simulator {
             DataType::Struct(su) if Self::spreads_member_wise(su) => Some(su.clone()),
             _ => None,
         };
-        let fill = if su.is_none() && self.type_starts_x(dt) {
+        let fill = if su.is_none() && super::elaborate::is_type_real(self.resolve_dt_ref(dt)) {
+            // §6.8, Table 6-7: a real/shortreal element starts at real 0.0.
+            Value::from_f64(0.0)
+        } else if su.is_none() && self.type_starts_x(dt) {
             Value::new(width)
         } else {
             Value::zero(width)
@@ -738,6 +741,17 @@ impl Simulator {
         }
         self.p_elem_type_ref(name)
             .is_some_and(|dt| self.type_starts_x(&dt))
+    }
+
+    /// §6.8, Table 6-7: whether the elements of the collection stored at
+    /// `name` (a class member's `<handle>#<member>` or a declared array)
+    /// are `real`/`shortreal`, so a new element starts at real 0.0.
+    pub(super) fn coll_elem_is_real(&self, name: &str) -> bool {
+        if let Some(dt) = self.class_member_coll_type(name) {
+            return super::elaborate::is_type_real(self.resolve_dt_ref(dt));
+        }
+        self.p_elem_type_ref(name)
+            .is_some_and(|dt| super::elaborate::is_type_real(self.resolve_dt_ref(&dt)))
     }
 
     /// The declared element type of the class-member collection stored at
@@ -1296,9 +1310,19 @@ impl Simulator {
         }
         let mut signals: Vec<String> = Vec::new();
         self.string_signals_removed.push(Vec::new());
+        // A formal's string-ness must resolve a TYPE PARAMETER bound to
+        // `string` (e.g. `uvm_pool#(string,..)::first(ref KEY key)`), or a
+        // multi-byte string key written through the formal is sized by the
+        // formal's fallback width and truncates (the report-handler pool
+        // iteration never terminates when a key like "ID207" reads back
+        // "207"). Same resolution `method_return_is_string` already does for
+        // return types.
+        let port_is_string = |me: &Self, dt: &crate::ast::types::DataType| -> bool {
+            me.method_return_is_string(dt)
+        };
         if is_function {
             for port in ports.iter() {
-                if !Self::is_string_data_type(&port.data_type) {
+                if !port_is_string(self, &port.data_type) {
                     self.forget_string_flag(&port.name.name);
                 }
             }
@@ -1309,7 +1333,7 @@ impl Simulator {
             }
         }
         for port in ports.iter() {
-            if Self::is_string_data_type(&port.data_type) {
+            if port_is_string(self, &port.data_type) {
                 if self.string_signals.insert(port.name.name.clone()) {
                     signals.push(port.name.name.clone());
                 }

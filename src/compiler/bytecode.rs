@@ -47,6 +47,12 @@ pub(crate) struct MethodAdmission {
     /// The `instance_fields` that are strings (§6.16), so a dotted read
     /// through a handle of that class is a string operand.
     pub instance_string_fields: HashMap<String, HashSet<String>>,
+    /// The `instance_fields` that are STRING QUEUE / dynamic / associative
+    /// arrays (§6.16 + §7.10/§7.11), keyed by declared class: a dotted
+    /// element read `obj.m_q[i]` through a handle of that class is a
+    /// string operand (`string_cmp`/`StrOp` typing, not the integral
+    /// fallback).
+    pub instance_string_colls: HashMap<String, HashSet<String>>,
     /// §8.20: declared class -> method -> the class whose body a call
     /// through a handle of that declared type binds to, for every
     /// NON-virtual method that some subclass redeclares (the only case where
@@ -3116,6 +3122,32 @@ impl<'a> BytecodeCompiler<'a> {
         Some(Box::new(ArrayOperand::Named(name)))
     }
 
+    /// `array_operand` with the index register the element instruction
+    /// reads. §7.4.2: an index into an array whose range has a negative
+    /// bound addresses elements by its signed value, but the element
+    /// instructions read the register's bits as an unsigned number, so
+    /// `arr[-1]` of `int arr[-1:1]`, or `arr[k]` with `int k = -1`, missed its
+    /// element in every compiled block (a read gave x, a write was lost).
+    /// Widen the index to 64 bits first: `MoveResize` sign-extends a signed
+    /// index and zero-extends an unsigned one, which stays out of range.
+    fn array_operand_index(
+        &mut self,
+        name: String,
+        idx_reg: RegId,
+    ) -> Option<(Box<ArrayOperand>, RegId)> {
+        let array = self.array_operand(name)?;
+        let lowest = match array.as_ref() {
+            ArrayOperand::Dense { lo, hi, .. } => (*lo).min(*hi),
+            ArrayOperand::Named(name) => self.arrays.get(name).map_or(0, |&(lo, hi, _)| lo.min(hi)),
+        };
+        if lowest >= 0 {
+            return Some((array, idx_reg));
+        }
+        let wide = self.alloc_reg();
+        self.emit(Insn::MoveResize(wide, idx_reg, 64));
+        Some((array, wide))
+    }
+
     pub fn set_params(&mut self, params: &'a HashMap<String, Value>) {
         self.params = Some(params);
     }
@@ -3667,7 +3699,26 @@ impl<'a> BytecodeCompiler<'a> {
             }
             (!out.is_empty()).then_some(out)
         };
-        let (sfd, sargs) = super::struct_sra::scalarize_member_call(fd, args, member, &members)?;
+        // §7.4.2/§10.9.2: typedef array members keep the existing scalarizer
+        // handling; only the new replication expansion is disabled for them.
+        let replication_allowed = |ms: &super::struct_sra::Members| {
+            !ms.iter().any(|(_, dt)| {
+                let DataType::TypeReference { name, .. } = dt else {
+                    return false;
+                };
+                self.typedef_unpacked_dims.is_some_and(|dims| {
+                    self.typedef_entry(dims, name, scope)
+                        .is_some_and(|(_, d)| !d.is_empty())
+                })
+            })
+        };
+        let (sfd, sargs) = super::struct_sra::scalarize_member_call(
+            fd,
+            args,
+            member,
+            &members,
+            &replication_allowed,
+        )?;
         let start = self.insns.len();
         let next = self.next_reg;
         let saved_reason = self.bail_reason;
@@ -6783,15 +6834,13 @@ impl<'a> BytecodeCompiler<'a> {
             crate::ast::expr::ExprKind::MemberAccess { expr: base, member } => {
                 let m = member.name.as_str();
                 // A receiver of another declared class (`p.contents` with
-                // `pattern p`) is admitted by THAT class's collections.
-                let admitted = match self.foreign_colls(base) {
-                    Some(colls) => colls.members.contains(m),
-                    None => {
-                        self.method_handle_chain_class(base).is_some()
-                            && self.coll_member_names.contains(m)
-                    }
-                };
-                admitted.then(|| (member.name.clone(), false, Some((**base).clone())))
+                // `pattern p`) is admitted by THAT class's collections. A
+                // STRING collection (`obj.m_q[i]`) is admitted by the
+                // class's string-collection set (kept separate — see
+                // `instance_string_colls`); its element loads as a real
+                // string Value, so `StrOp` typing works.
+                self.foreign_coll_admitted(base, m)
+                    .then(|| (member.name.clone(), false, Some((**base).clone())))
             }
             // The parser's spelling of a dotted foreach array: `p.contents`.
             crate::ast::expr::ExprKind::Ident(h)
@@ -6801,12 +6850,33 @@ impl<'a> BytecodeCompiler<'a> {
             {
                 let base = Self::dotted_head_expr(h);
                 let m = h.path[1].name.name.as_str();
-                self.foreign_colls(&base)?
-                    .members
-                    .contains(m)
+                self.foreign_coll_admitted(&base, m)
                     .then(|| (m.to_string(), false, Some(base)))
             }
             _ => None,
+        }
+    }
+
+    /// `obj.m_q` — is `m_q` a collection member (integral OR string) of
+    /// `obj`'s DECLARED class, resolvable through a handle chain?
+    /// Returns true for the plan's integral `instance_colls` members and
+    /// for string collections (`instance_string_colls`).
+    fn foreign_coll_admitted(&self, base: &Expression, m: &str) -> bool {
+        match self.foreign_colls(base) {
+            Some(colls) => {
+                colls.members.contains(m)
+                    || self
+                        .method_admission
+                        .as_ref()
+                        .and_then(|a| {
+                            self.method_handle_chain_class(base)
+                                .and_then(|c| a.instance_string_colls.get(&c))
+                        })
+                        .is_some_and(|sc| sc.contains(m))
+            }
+            None => {
+                self.method_handle_chain_class(base).is_some() && self.coll_member_names.contains(m)
+            }
         }
     }
 
@@ -8338,7 +8408,13 @@ impl<'a> BytecodeCompiler<'a> {
             // (`q[0]` on `string q[$]`), local or instance member, is a
             // string.
             ExprKind::Index { expr: base, .. } => {
-                self.local_string_coll(base) || self.member_string_coll(base)
+                if self.local_string_coll(base) || self.member_string_coll(base) {
+                    return true;
+                }
+                // `obj.m_q[i]`: a referenced object's string-collection
+                // element is a string too (§6.16/§7.10) — the member
+                // collection may be on a class other than the method's own.
+                self.foreign_string_coll_member(base).is_some()
             }
             ExprKind::Paren(inner) => self.expr_is_string_static(inner),
             ExprKind::SystemCall { name, args } => match name.as_str() {
@@ -8459,6 +8535,55 @@ impl<'a> BytecodeCompiler<'a> {
                     .is_some_and(|fields| fields.contains(member))
             })
         })
+    }
+
+    /// Method mode: is `base.member` a STRING-COLLECTION member (queue /
+    /// dynamic / associative array of `string`) of `base`'s DECLARED class,
+    /// read through an admitted handle chain? Mirrors `dotted_string_member`
+    /// for collection members, so `obj.m_q[i]` (a referenced object's string
+    /// collection element) is typed as a string by `string_cmp` instead of
+    /// falling to the integral X-padded compare (§6.16/§7.10).
+    fn dotted_string_coll(&self, base: &Expression, member: &str) -> bool {
+        if !self.method_handle_chain_ok(base) || !self.method_instance_field_ok(base, member) {
+            return false;
+        }
+        let class = self.method_handle_chain_class(base);
+        if class.as_deref() == Some(self.method_class.as_deref().unwrap_or("")) {
+            return false;
+        }
+        class.is_some_and(|class| {
+            self.method_admission.as_ref().is_some_and(|admission| {
+                admission
+                    .instance_string_colls
+                    .get(&class)
+                    .is_some_and(|colls| colls.contains(member))
+            })
+        })
+    }
+
+    /// If `expr` is an admitted, select-free reference to a foreign
+    /// object's string-collection member (`a1.q`, `this.holder.q`), return
+    /// the member name; else None. Consumes the two AST spellings a dotted
+    /// collection element (`a1.q[i]`) reaches: `MemberAccess { expr: a1,
+    /// member: q }` and the dotted two-segment Ident `a1.q`.
+    fn foreign_string_coll_member(&self, expr: &Expression) -> Option<String> {
+        match &expr.kind {
+            ExprKind::MemberAccess { expr: base, member } => self
+                .dotted_string_coll(base, member.name.as_str())
+                .then(|| member.name.clone()),
+            ExprKind::Ident(h)
+                if self.method_mode
+                    && h.root.is_none()
+                    && h.path.len() == 2
+                    && h.path.iter().all(|seg| seg.selects.is_empty()) =>
+            {
+                let base = Self::dotted_head_expr(h);
+                let member = h.path[1].name.name.as_str();
+                self.dotted_string_coll(&base, member)
+                    .then(|| h.path[1].name.name.to_string())
+            }
+            _ => None,
+        }
     }
 
     /// `recv.method(args)` where the receiver is a statically-known STRING
@@ -16675,7 +16800,7 @@ impl<'a> BytecodeCompiler<'a> {
                             ));
                             return Some(dest);
                         }
-                        let array = self.array_operand(name)?;
+                        let (array, idx_reg) = self.array_operand_index(name, idx_reg)?;
                         self.emit(Insn::LoadArrayElem(dest, array, idx_reg));
                         return Some(dest);
                     }
@@ -18669,7 +18794,8 @@ impl<'a> BytecodeCompiler<'a> {
             lo_reg,
             Box::new(Value::from_u64(off as u64, 32)),
         ));
-        Some((self.array_operand(name)?, idx_reg, hi_reg, lo_reg, resized))
+        let (array, idx_reg) = self.array_operand_index(name, idx_reg)?;
+        Some((array, idx_reg, hi_reg, lo_reg, resized))
     }
 
     /// A packed lvalue PATH that mixes several dynamic steps:
@@ -19047,7 +19173,8 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            let Some(array) = self.array_operand(name) else {
+                            let Some((array, idx_reg)) = self.array_operand_index(name, idx_reg)
+                            else {
                                 return false;
                             };
                             self.emit(Insn::NbaAssignArray(array, idx_reg, val_reg, width));
@@ -19353,7 +19480,9 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                 };
                                 if let Some((hi_reg, lo_reg)) = regs {
-                                    let Some(array) = self.array_operand(name) else {
+                                    let Some((array, idx_reg)) =
+                                        self.array_operand_index(name, idx_reg)
+                                    else {
                                         return false;
                                     };
                                     self.emit(Insn::NbaAssignArrayRange(
@@ -19630,7 +19759,7 @@ impl<'a> BytecodeCompiler<'a> {
                     b_reg,
                     Box::new(Value::from_u64(b as u64, 32)),
                 ));
-                let Some(array) = self.array_operand(name) else {
+                let Some((array, idx_reg)) = self.array_operand_index(name, idx_reg) else {
                     return Some(false);
                 };
                 self.emit(Insn::BlockingAssignArrayRange(
@@ -20251,7 +20380,8 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            let Some(array) = self.array_operand(name) else {
+                            let Some((array, idx_reg)) = self.array_operand_index(name, idx_reg)
+                            else {
                                 return false;
                             };
                             self.emit(Insn::BlockingAssignArray(array, idx_reg, val_reg, width));
@@ -20677,7 +20807,9 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                 };
                                 if let Some((hi_reg, lo_reg)) = regs {
-                                    let Some(array) = self.array_operand(name) else {
+                                    let Some((array, idx_reg)) =
+                                        self.array_operand_index(name, idx_reg)
+                                    else {
                                         return false;
                                     };
                                     self.emit(Insn::BlockingAssignArrayRange(
@@ -21223,7 +21355,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // §5.7 (issue #31): compiled-path literals warn here — once
                 // per literal string, deduped with the elaboration/AST sites.
                 crate::compiler::elaborate::warn_unsized_decimal_wrap(*size, base, value);
-                let mut v = Value::from_str_radix(value, r, w);
+                let mut v = Value::from_literal_text(value, r, w);
                 // Same inline cache the AST evaluator keeps on this node: a
                 // literal in a declared range is re-evaluated for every
                 // reference to the signal.

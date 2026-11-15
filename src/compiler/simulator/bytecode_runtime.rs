@@ -2610,7 +2610,8 @@ impl Simulator {
                     let elem_name = Self::name_with_key(&an, &key);
                     // Keep the established queue-unpack growth behavior in
                     // sync with the AST path.
-                    if !self.is_associative_array(&an) {
+                    let is_assoc = self.is_associative_array(&an);
+                    if !is_assoc {
                         let kval = idx_val.to_i64().unwrap_or(0);
                         if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
                             self.set_queue_size(&an, kval as u64 + 1);
@@ -2618,10 +2619,31 @@ impl Simulator {
                     }
                     // §10.7: fit to the DECLARED element width when one
                     // was recorded; otherwise store as-is.
-                    let fitted = match self.assoc_elem_width(&an) {
+                    let mut fitted = match self.assoc_elem_width(&an) {
                         Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
                         _ => val.clone(),
                     };
+                    // The element takes its declared signedness, not the RHS's
+                    // (`byte m[int]; m[k] = 8'hF0` is -16) — mirror the AST
+                    // store (`assignments.rs::assign_queue_elem_value`). The
+                    // compiled path dropped this, so a byte array element
+                    // written as a negative RHS stored unsigned 8'hFF and
+                    // later sign-RE-ad to 255.
+                    if is_assoc {
+                        if !fitted.is_real
+                            && let Some(sg) = self.assoc_elem_signed(&an)
+                        {
+                            fitted.is_signed = sg;
+                        }
+                    } else {
+                        // §7.10/§10.7: a queue or dynamic-array element takes
+                        // the element type (an `int unsigned` element of -1
+                        // is 2**32-1).
+                        fitted = self.fit_coll_store_elem(&an, fitted);
+                        if !fitted.is_real && !fitted.is_signed && self.signed_class_coll(&an) {
+                            fitted = self.fit_signed_class_coll_elem(&an, fitted);
+                        }
+                    }
                     let changed = self.signals.get(&elem_name) != Some(&fitted);
                     self.signals.insert(elem_name, fitted);
                     if changed {

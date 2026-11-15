@@ -155,6 +155,8 @@ mod iff_guard_module_scope;
 mod intra_assignment_delay;
 #[path = "scheduling/intra_assignment_event_identifier.rs"]
 mod intra_assignment_event_identifier;
+#[path = "scheduling/intra_delay_assignment_pattern.rs"]
+mod intra_delay_assignment_pattern;
 #[path = "scheduling/issue_237_mixed_clock_configs.rs"]
 mod issue_237_mixed_clock_configs;
 #[path = "scheduling/ivtest_always_cluster.rs"]
@@ -402,6 +404,8 @@ mod sampled_action_468;
 #[path = "scheduling/sampled_action_array_509.rs"]
 mod sampled_action_array_509;
 
+#[path = "scheduling/sva_abort_properties.rs"]
+mod sva_abort_properties;
 #[path = "scheduling/sva_until_properties.rs"]
 mod sva_until_properties;
 
@@ -445,6 +449,8 @@ mod class_collection_named_wait;
 
 #[path = "scheduling/class_or_value_change.rs"]
 mod class_or_value_change;
+#[path = "scheduling/event_control_class_prop_expr.rs"]
+mod event_control_class_prop_expr;
 
 #[path = "scheduling/preprocessor_linear_join.rs"]
 mod preprocessor_linear_join;
@@ -492,3 +498,11 @@ mod review_loop_jumps_and_block_disables;
 mod nba_partial_commit_order;
 #[path = "scheduling/finished_process_metadata.rs"]
 mod finished_process_metadata;
+#[path = "scheduling/review_intra_delay_capture_1162.rs"]
+mod review_intra_delay_capture_1162;
+#[path = "scheduling/review_sva_abort_order_1155.rs"]
+mod review_sva_abort_order_1155;
+#[path = "scheduling/review_sva_property_operators_220.rs"]
+mod review_sva_property_operators_220;
+#[path = "scheduling/review_sva_abort_first_tick_1155.rs"]
+mod review_sva_abort_first_tick_1155;

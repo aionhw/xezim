@@ -59,7 +59,7 @@ impl Simulator {
                 // above returns first), and the shared dedupe means a literal
                 // already reported at elaboration stays quiet.
                 super::elaborate::warn_unsized_decimal_wrap(*size, base, value);
-                let mut v = Value::from_str_radix(value, r, w);
+                let mut v = Value::from_literal_text(value, r, w);
                 // Cache inline values (width <= 64)
                 if w <= 64 {
                     if let Some((vb, xz)) = v.inline_bits() {

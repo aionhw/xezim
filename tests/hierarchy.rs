@@ -481,3 +481,5 @@ mod bind_instance_names_core_201;
 mod instance_struct_members_root_1046;
 #[path = "hierarchy/shared_net_initializer_targets.rs"]
 mod shared_net_initializer_targets;
+#[path = "hierarchy/negative_genvar_cached.rs"]
+mod negative_genvar_cached;

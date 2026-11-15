@@ -31,6 +31,13 @@ mod dump_formats_agree;
 mod dump_merged_sv;
 #[path = "gates/dumpflush.rs"]
 mod dumpflush;
+#[path = "gates/enum_continuous_delay.rs"]
+mod enum_continuous_delay;
+
+#[path = "gates/dumpvars_generate_scope.rs"]
+mod dumpvars_generate_scope;
+#[path = "gates/dumpvars_repeated_calls.rs"]
+mod dumpvars_repeated_calls;
 #[path = "gates/fn_return_member_inlines.rs"]
 mod fn_return_member_inlines;
 #[path = "gates/fst_roundtrip.rs"]

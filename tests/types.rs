@@ -99,6 +99,10 @@ mod copy_ctor_type_mismatch;
 mod declared_signedness_wins;
 #[path = "types/default_assignment_pattern_packed.rs"]
 mod default_assignment_pattern_packed;
+#[path = "types/default_real_array_cells.rs"]
+mod default_real_array_cells;
+#[path = "types/default_real_collection_cells.rs"]
+mod default_real_collection_cells;
 #[path = "types/defparam_override.rs"]
 mod defparam_override;
 #[path = "types/diag_kind_limit_env.rs"]
@@ -709,6 +713,10 @@ mod struct_array_member_elem_select;
 
 #[path = "types/packed_select_geometry_1002.rs"]
 mod packed_select_geometry_1002;
+#[path = "types/struct_pattern_replication.rs"]
+mod struct_pattern_replication;
+#[path = "types/struct_pattern_replication_constant_counts.rs"]
+mod struct_pattern_replication_constant_counts;
 #[path = "types/unpacked_slice_patterns_1045.rs"]
 mod unpacked_slice_patterns_1045;
 
@@ -722,3 +730,8 @@ mod ansi_port_inheritance_1078;
 mod packed_struct_array_local_fill_1082;
 #[path = "types/packed_struct_array_member_reads_1088.rs"]
 mod packed_struct_array_member_reads_1088;
+
+#[path = "types/struct_negative_array_pattern.rs"]
+mod struct_negative_array_pattern;
+#[path = "types/negative_index_compiled_blocks.rs"]
+mod negative_index_compiled_blocks;

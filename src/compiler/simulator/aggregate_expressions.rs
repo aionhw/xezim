@@ -2615,6 +2615,16 @@ impl Simulator {
                     .remove(&idx)
                     .unwrap_or_else(|| Value::zero(32))
             }
+            INTRA_KEPT_MARKER => {
+                let idx = args
+                    .first()
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(0))
+                    .unwrap_or(0);
+                self.intra_saved
+                    .get(&idx)
+                    .cloned()
+                    .unwrap_or_else(|| Value::zero(32))
+            }
             VIF_VALUE_MARKER => {
                 let token = args.first().map_or(0, |a| self.vif_handle_value(a));
                 Value::from_u64(token, 32)

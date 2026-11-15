@@ -8,6 +8,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+**Performance**
+
+* Sampling a covergroup whose bins have a `with` filter that compares `item`
+  with constants works from the ranges between the filter's cut points
+  instead of testing each value of a bin's range. A class covergroup with
+  three filtered coverpoints and a cross, sampled 100,000 times, runs in
+  9.35 G instructions instead of 79.4 G with the same coverage (§19.5.1.1,
+  #1135, contributed by auty1395).
+
 **Command line**
 
 * `--wave-suppress <entry>` excludes signals from the VCD, FST and XTrace dumps
@@ -21,6 +30,113 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   signals, so a suppressed subtree reaches no header, identifier table or value
   change, and an explicit `--fst-scope`/`--xtrace-scope` naming it is an
   explicit request that wins (#1104).
+  
+* `$dumpvars` and `$fsdbDumpvars` accept indexed scope arguments: a
+  generate-block instance (`tb.u.g_lane[2].u_lane`), the generate block
+  itself, an instance-array element and an unpacked-array element, with the
+  same selection as `--fst-scope`. An argument that names no object is
+  reported, and a call whose arguments all fail dumps nothing instead of the
+  whole design (§21.7.1.2, #1103, contributed by Ganesh-TNL). Every
+  `$dumpvars` call made at the time the dump starts adds its objects, each
+  with its own level count (§21.7.1.2, #1103).
+
+**Correctness**
+
+* A blocking assignment with an intra-assignment delay or event control
+  stores an assignment pattern for an unpacked array, unpacked struct or
+  queue target, and evaluates an expression at the target's width:
+  `wa = #1 '{3, 4};` stored nothing and `y = #1 a + b` lost its carry. A
+  pattern for a packed target is evaluated once, so a function called in it
+  runs once, and a conditional of unpacked patterns selects its operand when
+  the statement runs (§9.4.5, §10.9, §11.6.1, §11.4.11, #1162, contributed by
+  chuanseng-ng).
+
+* The abort properties `accept_on`, `reject_on`, `sync_accept_on` and
+  `sync_reject_on` parse and run; they failed to parse. An asynchronous
+  condition is checked with sampled values in every time step, and the
+  attempt it settles is reported at the next tick. Nested aborts take effect
+  in lexical order, so an inner abort that ended the evaluation first decides
+  it; an accepted attempt is a vacuous success; and at an attempt's first
+  tick an abort follows Annex F, so `reject_on (rst) req |=> ack` does not
+  fail the attempts that start during a reset with `req` low (§16.12.14,
+  §16.14.8, F.5.3.1, #1155, core #223, contributed by chuanseng-ng).
+
+* `p implies q`, `nexttime [n]`, `s_nexttime [n]`, the ranged `always`,
+  `s_always`, `eventually` and `s_eventually`, and the property `case` parse
+  and run; they failed to parse. `implies` starts both operands at the same
+  tick and is vacuous when `p` fails, so it runs no pass action then. A
+  ranged form the lowering cannot express, such as a ranged `always` of a
+  sequence, is reported (§16.12.8, §16.12.10, §16.12.11, §16.12.13,
+  §16.12.16, §16.14.8, core #220, contributed by chuanseng-ng).
+
+* A task, function or method local, or a class property, whose element type
+  is an unpacked-array typedef and which has unpacked dimensions of its own
+  (`typedef int q_t[$]; q_t l[$];`, also `p::q_t pq[$];`) has the
+  declarator's dimensions and then the typedef's; each row held one scalar
+  (§7.4.5, §6.18, §26.3, #1140, core #216, contributed by chuanseng-ng).
+
+* A covergroup bin's `with` filter reads the covergroup's class parameters
+  and constructor arguments, and a filter that compares `item` only with
+  constants keeps every value of a wide range: `bins others[32] =
+  {[0:32'hffff_ffff]} with (...)` was sized from its first 2^20 values, and a
+  filter naming a class parameter admitted every value (§19.5.1.1, #1135,
+  contributed by auty1395).
+
+* A rand variable in `(x & M) == C`, where `M` or `C` reads other rand
+  variables, is drawn with the masked bits already equal to `C`'s once those
+  variables are fixed, so randomize() finds the solution that exists; it
+  failed or ran without end while it guessed the bits. Seeded results of
+  constraint sets with such an equality change (§18.3, §18.6.1, #1133,
+  contributed by auty1395).
+
+* Default cells of `real` and `shortreal` unpacked arrays start as real 0.0,
+  so arithmetic on an untouched cell is real: `1/(a[0]+2)` is 0.5, not 0
+  (§6.8, §11.3.1, #1153, contributed by ds54e). So do the elements of class
+  property arrays, of dynamic arrays sized by `new[]` and a read of a
+  nonexistent associative-array entry (§6.8, §7.5.1, §7.8.6, #1153).
+
+* A delayed continuous assignment to a net or variable whose type is an enum
+  with a packed vector base (`enum logic [0:0]`, signed, wide, typedef and
+  package enums) uses the vector delay rule: a change to x waits for the rise
+  delay, as for `wire [0:0]`. A scalar base keeps the scalar rule
+  (§10.3.3, §6.19, #1151, core #222, contributed by ds54e).
+
+* A replicated structure pattern `'{2{x}}` sets every member in procedural,
+  nonblocking and `always_comb` assignments, resolved nettype drivers, class
+  properties, function arguments and constant structures, each item in its
+  member's assignment context; a parameter, localparam or constant-expression
+  count works like a literal one (§10.9.2, #1144, core #219, contributed by
+  ds54e).
+
+* A continuous assignment of a structure pattern keeps the element of an array
+  member at a negative index, for index keys, `default:`, ordered and
+  replicated items (§7.4.2, §10.9.1, #1141, core #218, contributed by ds54e).
+  Compiled blocks (continuous assignments, `always_comb`, `always @*`,
+  `always_ff`) read and write an unpacked array at a negative index, and a
+  negative genvar value keeps its value after a design-cache or artifact load
+  (§7.4.2, §27.4, #1141).
+
+* An event control on an expression of non-signal class properties,
+  `@(a || b)` or `@(negedge (v[0] & a))`, waits for a change of the value or
+  edge of the whole expression instead of waking every time step (§9.4.2,
+  #1157, contributed by Thomasb81).
+
+* `first`/`next` on an associative array keyed by a type parameter bound to
+  `string` write the whole string key into the `ref` formal (§7.9.4, §8.25,
+  #1157, contributed by Thomasb81).
+
+* A compiled class method stores a dynamic or fixed array element with the
+  element's declared signedness: `byte ba[]; ba[i] = -i;` reads back -1, not
+  255 (§7.5, §10.7, #1157, contributed by Thomasb81).
+
+* A block-local declared in an immediate assertion's pass or fail statement
+  of a file-scope class method elaborates (§16.3, §9.3.1, #1157, core #225,
+  contributed by Thomasb81), and a member access through it is checked for
+  visibility like one in an `if` block (§8.18, #1157).
+
+* A compiled method compares a string-collection element read through a class
+  handle (`a.q[i] != p[i]`) as a string (§6.16, §7.10, #1157, contributed by
+  Thomasb81).
 
 ### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
 

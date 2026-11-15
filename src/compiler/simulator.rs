@@ -358,7 +358,10 @@ fn method_boost_enabled() -> bool {
 // §25.5: a modport-qualified name resolves to the interface instance's own variable.
 // §8.14: a base static that a derived class redeclares counts as a redeclared member.
 // §7.4.1: a member of an element of an ascending packed array of structs slices from slot 0.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3077;
+// §10.9.2: structure replication in scalarized function calls.
+// §6.16: a string-collection element read through a class handle compares as a string.
+// §7.4.2: an index into an array with a negative bound is sign-extended.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3078;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -562,6 +565,11 @@ const RPS_TRAMPOLINE_DEPTH: usize = 300;
 /// Internal marker retrieving a §9.4.5 intra-assignment RHS value captured in
 /// `Simulator::intra_saved` (see `make_intra_saved_expr`). Never user-visible.
 const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
+/// §9.4.5, §10.9: an item of an intra-assignment pattern, captured when the
+/// statement ran. Read without being taken (a `default:` item is read once
+/// per element); `INTRA_RELEASE_MARKER` frees the items after the store.
+const INTRA_KEPT_MARKER: &str = "$__xz_intra_kept";
+const INTRA_RELEASE_MARKER: &str = "$__xz_intra_release";
 /// Internal `$__xz_vc_changed(idx, expr)`: true once `expr` differs from the
 /// value stashed in `Simulator::vc_saved[idx]` when a value-change event
 /// control (`@prop` on a non-event class property) was armed. Never
@@ -1712,7 +1720,9 @@ struct CombEntryCold {
 // §10.3.3 / §28.16: retain each delayed entry's original transition target.
 // §10.3.3 / §28.16: and the fall and turn-off delays of a select target.
 // §7.4.1: compiled members of ascending packed arrays of structs slice from slot 0.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB035";
+// §10.9.2: scalarized resolver calls expand structure replication.
+// §7.4.2: compiled blocks sign-extend an index into an array with a negative bound.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB036";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -4156,6 +4166,13 @@ struct SvaClockedSite {
     past_names: Vec<String>,
     /// The body compiled to an evaluable property tree (see `SvaNode`).
     node: std::sync::Arc<SvaNode>,
+    /// `node` holds an `accept_on` / `reject_on` (§16.12.14), whose
+    /// condition is checked in every time step, not only at the ticks.
+    async_abort: bool,
+    /// §16.12.14: attempts an asynchronous abort settled in a time step
+    /// between ticks, reported at the next tick (or at the end of
+    /// simulation) ahead of that tick's results.
+    settled: Vec<SvaOutcome>,
     /// §16.12 `disable iff (guard)`: while the guard holds, every attempt in
     /// flight is cancelled and no new one starts. Evaluated with the current
     /// (unsampled) values, as the LRM's asynchronous reset semantics require.
@@ -4379,6 +4396,9 @@ enum SvaNode {
     And(Box<SvaNode>, Box<SvaNode>),
     Or(Box<SvaNode>, Box<SvaNode>),
     Iff(Box<SvaNode>, Box<SvaNode>),
+    /// §16.12.8 `p implies q`: both start at the same tick; holds when `p`
+    /// fails (vacuously, §16.14.8 z) or `q` holds. State: `SvaState::And`.
+    Implies(Box<SvaNode>, Box<SvaNode>),
     /// §16.12.12: arbitrary properties are started at each candidate tick.
     Until {
         left: Box<SvaNode>,
@@ -4389,6 +4409,15 @@ enum SvaNode {
     Eventually(Expression),
     /// §16.12.6 `s_always e`: fails the first tick `e` samples false.
     Always(Expression),
+    /// §16.12.14 `accept_on (cond) body` / `reject_on (cond) body`
+    /// (`accept`), and their `sync_` forms (`sync`): `cond` holding during
+    /// the evaluation of `body` aborts it, with success or failure.
+    Abort {
+        cond: Expression,
+        accept: bool,
+        sync: bool,
+        body: Box<SvaNode>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4445,6 +4474,14 @@ enum SvaState {
     },
     /// `s_eventually` / `s_always`, with the attempt's local variables.
     Leaf(SvaEnv),
+    /// An abort property's evaluation; `started`: its first tick is past;
+    /// `aborted`: its condition settled it.
+    Abort {
+        body: Box<SvaState>,
+        env: SvaEnv,
+        started: bool,
+        aborted: bool,
+    },
 }
 
 /// One candidate start point of a property-valued until operand.
@@ -7330,6 +7367,10 @@ pub struct Simulator {
     sva_preponed_slot: Option<u64>,
     /// A site's clock event is recorded (`fired`) and not evaluated yet.
     sva_owed: bool,
+    /// §16.12.14: `sva_advance` runs in a time step without a tick of the
+    /// site, so only asynchronous abort conditions are checked and nothing
+    /// else advances (`sva_abort_step_site`).
+    sva_abort_step: bool,
     /// `sva_post_nba` is running the slot's due cbReadWriteSynch batches.
     sva_post_nba_busy: bool,
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
@@ -8467,6 +8508,12 @@ pub struct Simulator {
     /// elements live in the runtime map with no declared signedness of their
     /// own, so a store stamps it from here (`p.dyn[1] = 8'hff` reads -1).
     signed_class_colls: HashSet<String>,
+    /// Cache of `fit_coll_store_elem`, replaced round-robin from
+    /// `coll_store_fit_next`: (collection store name, the owning object's
+    /// class, `integral_queue_elem` of it).
+    #[allow(clippy::type_complexity)]
+    coll_store_fit_cache: [Option<(String, Option<String>, Option<(u32, bool, bool)>)>; 4],
+    coll_store_fit_next: usize,
     /// §8.25 / §8.3: classes whose base class depends on their own
     /// parameters — `class W #(type B = base) extends B;` (the base IS a type
     /// parameter) or `class W2 #(type B) extends W #(B);` (the base is such a
@@ -9446,9 +9493,23 @@ pub struct Simulator {
     /// strings are ABSOLUTE (they include the top module); `dump_filter_prefixes`
     /// rewrites them to the top-RELATIVE form the signal table uses.
     vcd_filter_scopes: Vec<String>,
+    /// `$dumpvars` named arguments but not one of them was a usable name, so
+    /// the VCD dump must select NOTHING. An empty `vcd_filter_scopes` means
+    /// "no filter" = the WHOLE design, so "select nothing" has to be said out
+    /// loud; without this a `$dumpvars` whose arguments all failed to parse
+    /// failed open into a whole-design dump. Set by `$dumpvars`, cleared by
+    /// `$vcdpluson` and by any `$dumpvars` that kept at least one argument.
+    vcd_dump_none: bool,
     /// §21.7.1.4 `$dumpvars` depth argument: 0 = every level below the given
     /// scope, N = N levels starting at it.
     vcd_dump_depth: u32,
+    /// §21.7.1.2: the `(scopes, depth)` selections of the `$dumpvars` calls
+    /// executed before the latest one at the time the dump started. Each call
+    /// adds its objects to the dump (`vcd_filter_scopes` and `vcd_dump_depth`
+    /// hold the latest call's).
+    vcd_earlier_selections: Vec<(Vec<String>, u32)>,
+    /// The simulation time the VCD dump started at (`u64::MAX` before).
+    vcd_start_time: u64,
     /// §21.7.2.1 var type per `vcd_trace` entry (parallel vector). Drives both
     /// the `$var` declaration and the runtime record shape (an `event` emits a
     /// bare `1<id>` pulse, a `real` an `r<decimal>` record).
@@ -9557,6 +9618,10 @@ pub struct Simulator {
     /// Optional hierarchical scope filters for FST (same semantics as
     /// `--xtrace-scope`): keep signals whose name equals or sits under a scope.
     pub fst_scopes: Vec<String>,
+    /// `$fsdbDumpvars` named arguments but not one of them was a usable name:
+    /// the FST dump must select nothing rather than fail open into a
+    /// whole-design dump. Same purpose as `vcd_dump_none`; see there.
+    pub fst_dump_none: bool,
     /// The waveform EXCLUDE list (`--wave-suppress`), applied by every dump
     /// format from one matcher — see `waveforms::WaveSuppressor`. Entries are
     /// hierarchical paths or module names, resolved against the elaborated

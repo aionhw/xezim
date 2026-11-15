@@ -200,6 +200,67 @@ impl Simulator {
         Some(out)
     }
 
+    /// The `[N]` an indexed path segment carries in a signal-table name, or
+    /// `None` when the select is not a known integer the table could be named
+    /// by — an x/z index, a range, a non-constant expression.
+    fn dump_index_suffix(&mut self, index: &Expression) -> Option<String> {
+        Some(format!("[{}]", self.eval_expr(index).to_index()?))
+    }
+
+    /// Render a `$dumpvars` / `$fsdbDumpvars` argument into the dotted,
+    /// top-qualified spelling the signal table uses — the same spelling
+    /// `--fst-scope` takes as a raw string and `dump_name_selected` matches.
+    ///
+    /// The argument arrives as an EXPRESSION, and the parser does not keep an
+    /// indexed path inside `ExprKind::Ident`: `top.g[2].u` parses as
+    /// `MemberAccess(Index(Ident(top.g), 2), u)` and `top.vec[3]` as
+    /// `Index(Ident(top.vec), 3)`. Matching only `ExprKind::Ident` — all this
+    /// used to do — threw away every argument naming a generate-block instance
+    /// or an unpacked-array element, i.e. the only way to name ONE generated
+    /// instance, and did it silently: the filter list came back empty, which
+    /// means "no filter", and the run dumped the whole design.
+    ///
+    /// `None` means the argument is not a name at all (an arithmetic
+    /// expression, a part-select, a call). Callers must say so out loud rather
+    /// than drop it.
+    pub(super) fn dump_scope_arg(&mut self, e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.dump_scope_arg(inner),
+            ExprKind::Ident(hier) => {
+                // A package- or `$unit`-qualified root is not a signal-table
+                // path; `$root` is a marker the table's names do not carry.
+                if hier.root.is_some() {
+                    return None;
+                }
+                let skip_root =
+                    usize::from(hier.path.first().is_some_and(|s| s.name.name == "$root"));
+                let mut out = String::new();
+                for (i, seg) in hier.path.iter().enumerate().skip(skip_root) {
+                    if i > skip_root {
+                        out.push('.');
+                    }
+                    out.push_str(&seg.name.name);
+                    for sel in &seg.selects {
+                        out.push_str(&self.dump_index_suffix(sel)?);
+                    }
+                }
+                (!out.is_empty()).then_some(out)
+            }
+            ExprKind::Index { expr, index } => {
+                let mut base = self.dump_scope_arg(expr)?;
+                base.push_str(&self.dump_index_suffix(index)?);
+                Some(base)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let mut base = self.dump_scope_arg(expr)?;
+                base.push('.');
+                base.push_str(&member.name);
+                Some(base)
+            }
+            _ => None,
+        }
+    }
+
     /// Whether a top-relative signal name is selected by a normalized filter
     /// list and the `$dumpvars` depth (§21.7.1.4: 0 = all levels below the
     /// scope, N = N levels starting at the scope; a filter that names a SIGNAL
@@ -717,18 +778,43 @@ impl Simulator {
         // per entry so the user sees what the exclusion cost — and which entry
         // never matched anything.
         let mut sup = self.wave_suppressor();
-        let sig_names =
-            self.dump_signal_names(&self.vcd_filter_scopes, self.vcd_dump_depth, sup.as_mut());
-        if let Some(s) = &sup {
-            let whole =
-                self.vcd_dump_depth == 0 && self.dump_covers_whole_design(&self.vcd_filter_scopes);
-            s.report("[VCD]", whole);
+        let mut sig_names = if self.vcd_dump_none {
+            Vec::new()
+        } else {
+            self.dump_signal_names(&self.vcd_filter_scopes, self.vcd_dump_depth, sup.as_mut())
         };
+        // §21.7.1.2: the objects of every `$dumpvars` call made at the start
+        // time, each with its own depth.
+        let mut earlier = String::new();
+        for (scopes, depth) in &self.vcd_earlier_selections {
+            sig_names.extend(self.dump_signal_names(scopes, *depth, sup.as_mut()));
+            earlier.push_str(&format!("; filter_scopes={:?}, depth={}", scopes, depth));
+        }
+        if !self.vcd_earlier_selections.is_empty() {
+            sig_names.sort();
+            sig_names.dedup();
+        }
+        if let Some(s) = &sup {
+            // The arguments named no object, so nothing was enumerated and the
+            // entries never had a chance to match.
+            if !self.vcd_dump_none {
+                let whole = self.vcd_dump_depth == 0
+                    && self.dump_covers_whole_design(&self.vcd_filter_scopes);
+                s.report("[VCD]", whole);
+            }
+        }
         eprintln!(
-            "[VCD] dumping {} signals (filter_scopes={:?}, depth={})",
+            "[VCD] dumping {} signals ({}, depth={}{})",
             sig_names.len(),
-            self.vcd_filter_scopes,
-            self.vcd_dump_depth
+            // `filter_scopes=[]` alone cannot tell "no filter was given" from
+            // "every filter was thrown away" — say which.
+            if self.vcd_dump_none {
+                "no $dumpvars argument named a scope or variable".to_string()
+            } else {
+                format!("filter_scopes={:?}", self.vcd_filter_scopes)
+            },
+            self.vcd_dump_depth,
+            earlier
         );
 
         // Assign VCD identifier codes. Codes are Arc<str> so the per-change
@@ -965,6 +1051,7 @@ impl Simulator {
         self.vcd_var_kinds = kinds;
         self.vcd_prev_signals = prev;
         self.vcd_writer = Some(w);
+        self.vcd_start_time = self.time;
         self.vcd_enabled = true;
         self.vcd_bytes = 0;
         self.vcd_limit_hit = false;
@@ -2123,7 +2210,9 @@ impl Simulator {
         // level below the scope, N = N levels starting at it). Scopes with the
         // same depth are selected together; the union keeps first-seen order.
         let mut sup = self.wave_suppressor();
-        let mut sig_names: Vec<String> = if self.fst_scopes.is_empty() {
+        let mut sig_names: Vec<String> = if self.fst_dump_none {
+            Vec::new()
+        } else if self.fst_scopes.is_empty() {
             self.dump_signal_names(&self.fst_scopes, 0, sup.as_mut())
         } else {
             let mut groups: Vec<(u32, Vec<String>)> = Vec::new();
@@ -2172,7 +2261,11 @@ impl Simulator {
             self.fst_scopes.len()
         );
         if let Some(s) = &sup {
-            s.report("[FST]", self.dump_covers_whole_design(&self.fst_scopes));
+            // `$fsdbDumpvars` named no usable argument, so nothing was
+            // enumerated and the entries never had a chance to match.
+            if !self.fst_dump_none {
+                s.report("[FST]", self.dump_covers_whole_design(&self.fst_scopes));
+            }
         }
 
         // Name every `--fst-scope` that selected nothing. The common cause is a
