@@ -1510,7 +1510,7 @@ impl Simulator {
     ) -> Option<Value> {
         let cd = self.get_class_def(cname)?;
         let tn = cd.properties.get(prop)?.type_name.clone()?;
-        if let Some(kind) = Self::container_base(&tn) {
+        if let Some(kind) = self.builtin_container_kind(&tn) {
             let h = self.alloc_builtin_container(kind, args);
             return Some(Value::from_u64(h as u64, 32));
         }

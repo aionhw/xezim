@@ -1090,7 +1090,9 @@ impl Simulator {
             } else if super::elaborate::is_type_two_state_resolved(
                 &m.data_type,
                 &self.module.typedef_types,
-            ) {
+            ) || Self::dt_is_class_handle(&m.data_type, &self.module)
+            {
+                // §8.4: a class handle member starts null.
                 Value::zero(mw)
             } else {
                 Value::new(mw)

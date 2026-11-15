@@ -5261,6 +5261,108 @@ impl Simulator {
         self.get_expr_type_name(lvalue)
             .as_deref()
             .and_then(|t| self.builtin_container_kind(t))
+            // 4. a member of an unpacked struct, whatever holds the struct.
+            .or_else(|| match self.lvalue_static_type(lvalue)? {
+                DataType::TypeReference { name, .. } => {
+                    self.builtin_container_kind(&name.name.name)
+                }
+                _ => None,
+            })
+    }
+
+    /// §7.2, §8.4: the declared type of the member path `e` (`s.mb`,
+    /// `s.in.mb`, `h.s.mb`, `C::s.mb`, `q[0].mb`, `this.s.mb`), walked from
+    /// its root through struct members and class properties. The leaves of
+    /// an unpacked struct carry no type name of their own, so a member that
+    /// is a handle of a built-in class (`mailbox`, `semaphore`) was not
+    /// known to be one and `s.mb = new()` constructed nothing. None when
+    /// the path is not such a chain.
+    pub(super) fn lvalue_static_type(&self, e: &Expression) -> Option<DataType> {
+        fn collect<'a>(e: &'a Expression, out: &mut Vec<&'a str>) -> bool {
+            match &e.kind {
+                ExprKind::Ident(h) if h.root.is_none() => {
+                    out.extend(h.path.iter().map(|s| s.name.name.as_str()));
+                    true
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    collect(expr, out) && {
+                        out.push(member.name.as_str());
+                        true
+                    }
+                }
+                ExprKind::Index { expr, .. } => collect(expr, out),
+                ExprKind::This => {
+                    out.push("this");
+                    true
+                }
+                _ => false,
+            }
+        }
+        enum At {
+            Class(String),
+            Type(DataType),
+        }
+        let mut segs: Vec<&str> = Vec::new();
+        if !collect(e, &mut segs) || segs.len() < 2 {
+            return None;
+        }
+        let ctx_class = || self.class_context_stack.last().cloned().flatten();
+        let is_struct = |dt: &DataType| matches!(self.resolve_dt_ref(dt), DataType::Struct(_));
+        let root = segs[0];
+        // The struct variable may be named through its scope (`g_blk.s` of
+        // a generate block, `u.s` of an instance): the longest declared
+        // prefix of the path is the variable.
+        let struct_var = (1..segs.len()).rev().find_map(|k| {
+            let name = segs[..k].join(".");
+            let scoped = self.hint_scoped(&name);
+            scoped
+                .as_deref()
+                .and_then(|s| self.module.var_decl_types.get(s))
+                .or_else(|| self.module.var_decl_types.get(name.as_str()))
+                .filter(|dt| is_struct(dt))
+                .map(|dt| (dt.clone(), k))
+        });
+        let (mut at, rest) = if root == "this" {
+            (At::Class(ctx_class()?), &segs[1..])
+        } else if let Some((dt, k)) = struct_var {
+            (At::Type(dt), &segs[k..])
+        } else if let Some(c) = self.class_of_var(root) {
+            (At::Class(c), &segs[1..])
+        } else {
+            // A bare property of the running method's object.
+            (At::Class(ctx_class()?), &segs[..])
+        };
+        for seg in rest {
+            let class = match &at {
+                At::Class(c) => Some(c.clone()),
+                At::Type(dt) => match self.resolve_dt_ref(dt) {
+                    DataType::Struct(su) => {
+                        let m = su
+                            .members
+                            .iter()
+                            .find(|m| m.declarators.iter().any(|d| d.name.name == *seg))?;
+                        at = At::Type(m.data_type.clone());
+                        None
+                    }
+                    DataType::TypeReference { name, .. }
+                        if self.module.classes.contains_key(&name.name.name) =>
+                    {
+                        Some(name.name.name.clone())
+                    }
+                    _ => return None,
+                },
+            };
+            if let Some(c) = class {
+                let base = c.split('#').next().unwrap_or(&c).trim();
+                let owners = self.prop_owners(base);
+                let (_, cd) = owners.get(*seg)?;
+                at = At::Type(cd.property_types.get(*seg)?.clone());
+            }
+        }
+        match at {
+            At::Type(dt) => Some(dt),
+            At::Class(_) => None,
+        }
     }
 
     /// §7.2/§8.4: the class a CLASS-HANDLE member of an unpacked struct

@@ -687,7 +687,7 @@ impl Simulator {
                 .get(&cn)
                 .and_then(|cd| cd.properties.get(&prop))
                 .and_then(|s| s.type_name.as_deref())
-                .and_then(Self::container_base);
+                .and_then(|t| self.builtin_container_kind(t));
             let (is_new, ctor_args): (bool, Vec<Expression>) = match &init.kind {
                 ExprKind::Call { func, args }
                     if matches!(&func.kind, ExprKind::Ident(h)

@@ -1395,6 +1395,12 @@ impl Simulator {
                     DT::Struct(inner) => {
                         self.collect_two_state_leaves(inner, &leaf, out);
                     }
+                    // §8.4: a class handle starts null; it has no x state.
+                    DT::TypeReference { .. }
+                        if Self::dt_is_class_handle(&resolved, &self.module) =>
+                    {
+                        out.insert(leaf);
+                    }
                     DT::IntegerVector { kind: IVT::Bit, .. }
                     | DT::IntegerAtom {
                         kind: IAT::Byte | IAT::ShortInt | IAT::Int | IAT::LongInt,

@@ -3957,7 +3957,10 @@ impl Simulator {
                 // container. Clear any stale same-named entry from another
                 // frame (var_container_types is a flat map like
                 // var_class_types) when this decl isn't a container.
-                match class_name.as_deref().and_then(Self::container_base) {
+                match class_name
+                    .as_deref()
+                    .and_then(|t| self.builtin_container_kind(t))
+                {
                     Some(k) => {
                         self.var_container_types
                             .insert(d.name.name.clone(), k.to_string());

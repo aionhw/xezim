@@ -889,6 +889,9 @@ impl Simulator {
                 Value::zero(0)
             } else if super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type)) {
                 Value::from_f64(0.0)
+            } else if Self::dt_is_class_handle(&m.data_type, &self.module) {
+                // §8.4: a class handle member starts null.
+                Value::zero(32)
             } else if !matches!(
                 self.resolve_dt_ref(&m.data_type),
                 DataType::IntegerVector { .. }
