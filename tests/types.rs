@@ -351,6 +351,8 @@ mod unpacked_struct_array_members;
 mod unpacked_struct_func_arg;
 #[path = "types/unpacked_struct_multidim_members.rs"]
 mod unpacked_struct_multidim_members;
+#[path = "types/unpacked_struct_pattern_return.rs"]
+mod unpacked_struct_pattern_return;
 #[path = "types/untyped_param_width.rs"]
 mod untyped_param_width;
 #[path = "types/valparam_spec_cycle.rs"]
