@@ -1,6 +1,8 @@
 //! Options that take their values from a file:
 //! - `--fst-scope-file <file>` / `-fst_scope_file <file>`: FST dump scopes,
 //!   the same as one `--fst-scope` per entry;
+//! - `--wave-suppress-file <file>` / `-wave_suppress_file <file>`: waveform
+//!   exclusions, the same as one `--wave-suppress` per entry;
 //! - `-xezim_env <file>` / `--xezim-env <file>`: `XEZIM_*` environment
 //!   settings, applied before xezim reads any of them.
 //!
@@ -106,6 +108,9 @@ pub(crate) fn option_value<'a>(arg: &'a str, names: &[&str]) -> Option<Option<&'
 pub(crate) const XEZIM_ENV_NAMES: &[&str] = &["xezim_env", "xezim-env"];
 /// Spellings of the FST scope-file option.
 pub(crate) const FST_SCOPE_FILE_NAMES: &[&str] = &["fst_scope_file", "fst-scope-file"];
+/// Spellings of the waveform exclusion-file option: one `--wave-suppress`
+/// entry per line (module names and hierarchical paths may be mixed).
+pub(crate) const WAVE_SUPPRESS_FILE_NAMES: &[&str] = &["wave_suppress_file", "wave-suppress-file"];
 
 /// The env files named on the command line, in order.
 pub(crate) fn env_files_in_args(args: &[String]) -> Result<Vec<String>, String> {

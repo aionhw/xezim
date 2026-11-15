@@ -4540,6 +4540,7 @@ impl Simulator {
             xtrace_to_t: u64::MAX,
             fst_file: None,
             fst_scopes: Vec::new(),
+            wave_suppress: configured_wave_suppress(),
             fst_writer: None,
             cast_widths,
             fn_decl_cache: HashMap::default(),
