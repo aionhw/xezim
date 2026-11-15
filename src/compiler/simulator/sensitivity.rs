@@ -11,6 +11,85 @@ thread_local! {
     /// While a function body's reads are collected: the reads of the
     /// functions it calls, kept apart from its own (`collect_callee_reads`).
     static CALLEE_READS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+    /// While a function body's reads are collected: every name its frame
+    /// declares (formals, the return variable, locals at any depth, loop
+    /// variables). An index naming one is frame state, not the module
+    /// parameter of the same name (`constant_array_index`).
+    static FRAME_SHADOW: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+    /// When `Some`: the reads of called functions' frame state that survive
+    /// the frame filter (a block-local or loop variable, a select of a
+    /// formal or local), in every spelling registered. Such a read that
+    /// resolves to no signal is not an unresolved operand (§10.3.2, §13.4).
+    static FRAME_LOCAL_READS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+}
+
+/// The names a function body declares below its top-level statement list:
+/// a `for` loop's own variables, `foreach` loop variables and the locals of
+/// nested blocks (§12.7, §13.4). Top-level locals are `local_names`'.
+fn nested_frame_names(st: &Statement, top: bool, out: &mut HashSet<String>) {
+    match &st.kind {
+        StatementKind::VarDecl { declarators, .. } => {
+            if !top {
+                out.extend(declarators.iter().map(|d| d.name.name.clone()));
+            }
+        }
+        StatementKind::SeqBlock { stmts, .. } => {
+            for s in stmts {
+                nested_frame_names(s, false, out);
+            }
+        }
+        StatementKind::ParBlock { stmts, .. } => {
+            for s in stmts {
+                nested_frame_names(s, false, out);
+            }
+        }
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            nested_frame_names(then_stmt, false, out);
+            if let Some(e) = else_stmt {
+                nested_frame_names(e, false, out);
+            }
+        }
+        StatementKind::Case { items, .. } => {
+            for it in items {
+                nested_frame_names(&it.stmt, false, out);
+            }
+        }
+        StatementKind::For { init, body, .. } => {
+            for i in init {
+                if let ForInit::VarDecl { name, .. } = i {
+                    out.insert(name.name.clone());
+                }
+            }
+            nested_frame_names(body, false, out);
+        }
+        StatementKind::Foreach { vars, body, .. } => {
+            out.extend(vars.iter().flatten().map(|v| v.name.clone()));
+            nested_frame_names(body, false, out);
+        }
+        StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body } => nested_frame_names(body, false, out),
+        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+            nested_frame_names(stmt, false, out)
+        }
+        StatementKind::RandCase { items } => {
+            for (_, s) in items {
+                nested_frame_names(s, false, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The name a read is rooted at: `s` for `s[3]`, `s.m` or `s`.
+fn read_root(r: &str) -> &str {
+    let end = r.find(['[', '.']).unwrap_or(r.len());
+    &r[..end]
 }
 
 #[derive(Default)]
@@ -464,6 +543,50 @@ impl Simulator {
         }
     }
 
+    /// Whether a call's `func` names a function with a body in the design
+    /// (`module.functions`), as the call-site walk in `collect_expr_reads`
+    /// looks it up: the scoped name, the bare name, or an instance's
+    /// `<inst>.<name>` registration. A DPI import or a method is not one.
+    fn names_user_function(func: &Expression, module: &ElaboratedModule) -> bool {
+        let ExprKind::Ident(hier) = &func.kind else {
+            return false;
+        };
+        let Some(seg) = hier.path.last() else {
+            return false;
+        };
+        if hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return false;
+        }
+        let bare = seg.name.name.as_str();
+        if module.dpi_imports.contains_key(bare) {
+            return false;
+        }
+        if hier.path.len() == 1 && module.functions.contains_key(bare) {
+            return true;
+        }
+        let full = Self::resolve_hier_name_static(hier, module);
+        if module.functions.contains_key(&full) {
+            return true;
+        }
+        hier.path.len() == 1 && {
+            let suffix = format!(".{}", bare);
+            module
+                .functions
+                .keys()
+                .any(|k| k.ends_with(suffix.as_str()))
+        }
+    }
+
+    /// #1126: collect with `FRAME_LOCAL_READS` armed; returns the frame-state
+    /// reads of the functions `f` reached (see `collect_function_reads`).
+    pub(super) fn with_frame_local_reads(f: impl FnOnce()) -> HashSet<String> {
+        let outer = FRAME_LOCAL_READS.with(|c| c.replace(Some(HashSet::default())));
+        f();
+        FRAME_LOCAL_READS
+            .with(|c| c.replace(outer))
+            .unwrap_or_default()
+    }
+
     pub(super) fn collect_function_reads(
         name: &str,
         module: &ElaboratedModule,
@@ -513,10 +636,6 @@ impl Simulator {
                 Self::collect_expr_reads(def, module, &mut body_reads);
             }
         }
-        for item in &fdecl.items {
-            Self::collect_stmt_reads(item, module, &mut body_reads, &mut scratch_writes);
-        }
-        let callee_reads = CALLEE_READS.with(|c| c.replace(outer)).unwrap_or_default();
         // §13.4: the formals, the return variable and the block locals are
         // frame state, not module signals the caller can be sensitive to. A
         // formal named like a design net (`uj_imm(logic [31:0] instruction_i)`
@@ -525,19 +644,82 @@ impl Simulator {
         let leaf = name.rsplit('.').next().unwrap_or(name);
         let mut frame: HashSet<&str> = fdecl.ports.iter().map(|p| p.name.name.as_str()).collect();
         frame.insert(leaf);
-        fn local_names<'a>(items: &'a [Statement], out: &mut HashSet<&'a str>) {
+        // A top-level local's initializer may read a design variable that
+        // a LATER local (or itself: `int i = i;`) names: the read is the
+        // design's (§6.8), so it stays.
+        let mut keep: HashSet<String> = HashSet::default();
+        fn local_names<'a>(
+            items: &'a [Statement],
+            module: &ElaboratedModule,
+            out: &mut HashSet<&'a str>,
+            keep: &mut HashSet<String>,
+        ) {
             for st in items {
                 match &st.kind {
                     StatementKind::VarDecl { declarators, .. } => {
-                        out.extend(declarators.iter().map(|d| d.name.name.as_str()));
+                        for d in declarators {
+                            if let Some(init) = &d.init {
+                                // The initializer's own reads: a call in it
+                                // is not followed into its callee here (the
+                                // body walk below does that once), so a chain
+                                // of such calls is not walked twice per level.
+                                let mut got: HashSet<String> = HashSet::default();
+                                let skip = SKIP_FN_BODY_READS.with(|c| c.replace(true));
+                                Simulator::collect_expr_reads(init, module, &mut got);
+                                SKIP_FN_BODY_READS.with(|c| c.set(skip));
+                                keep.extend(got.into_iter().filter(|r| !out.contains(r.as_str())));
+                            }
+                            out.insert(d.name.name.as_str());
+                        }
                     }
-                    StatementKind::SeqBlock { stmts, .. } => local_names(stmts, out),
                     _ => {}
                 }
             }
         }
-        local_names(&fdecl.items, &mut frame);
-        body_reads.retain(|r| !frame.contains(r.as_str()));
+        // The top-level statements: a body written as one `begin ... end`
+        // block declares its locals for the whole body. A block among other
+        // statements declares them for itself only, and a design variable
+        // of the same name may be read outside it: its locals are nested.
+        let body: &[Statement] = match fdecl.items.as_slice() {
+            [
+                Statement {
+                    kind: StatementKind::SeqBlock { stmts, .. },
+                    ..
+                },
+            ] => stmts,
+            items => items,
+        };
+        local_names(body, module, &mut frame, &mut keep);
+        // #1126: the names declared below the top level (loop variables,
+        // nested-block locals). They may also name a design signal read
+        // elsewhere in the body, so they are not filtered; a read of one
+        // that names no signal is frame state (`FRAME_LOCAL_READS`).
+        let mut nested: HashSet<String> = HashSet::default();
+        for item in body {
+            nested_frame_names(item, true, &mut nested);
+        }
+        let shadow: HashSet<String> = frame
+            .iter()
+            .map(|n| n.to_string())
+            .chain(nested.iter().cloned())
+            .collect();
+        let outer_shadow = FRAME_SHADOW.with(|c| c.replace(Some(shadow)));
+        for item in &fdecl.items {
+            Self::collect_stmt_reads(item, module, &mut body_reads, &mut scratch_writes);
+        }
+        FRAME_SHADOW.with(|c| c.replace(outer_shadow));
+        let callee_reads = CALLEE_READS.with(|c| c.replace(outer)).unwrap_or_default();
+        body_reads.retain(|r| !frame.contains(r.as_str()) || keep.contains(r));
+        // The reads that remain rooted at frame state: `s[3]` of a formal
+        // `s`, `i` of a loop variable.
+        let frame_local: Vec<String> = body_reads
+            .iter()
+            .filter(|r| {
+                let root = read_root(r);
+                root.len() != r.len() && frame.contains(root) || nested.contains(root)
+            })
+            .cloned()
+            .collect();
         body_reads.extend(callee_reads);
         // A bare read in the body of an INSTANCE's function names that
         // instance's variable (`internal_func_dep` inside
@@ -546,6 +728,18 @@ impl Simulator {
         // the sensitivity set. Qualify it wherever only the scoped one exists.
         let scope = name.rsplit_once('.').map(|(s, _)| s);
         WHOLE_READS.with(|c| c.replace(outer_origins));
+        FRAME_LOCAL_READS.with(|c| {
+            if let Some(sink) = c.borrow_mut().as_mut() {
+                for r in frame_local {
+                    if let Some(scope) = scope
+                        && !r.contains('.')
+                    {
+                        sink.insert(format!("{}.{}", scope, r));
+                    }
+                    sink.insert(r);
+                }
+            }
+        });
         for r in body_reads {
             if let Some(scope) = scope {
                 // The body may be unrewritten (bare spellings), and a same-named
@@ -573,10 +767,13 @@ impl Simulator {
         fn is_constant(expr: &Expression, module: &ElaboratedModule) -> bool {
             match &expr.kind {
                 ExprKind::Number(_) => true,
-                ExprKind::Ident(hier) => hier
-                    .path
-                    .last()
-                    .is_some_and(|seg| module.parameters.contains_key(seg.name.name.as_str())),
+                ExprKind::Ident(hier) => hier.path.last().is_some_and(|seg| {
+                    let n = seg.name.name.as_str();
+                    module.parameters.contains_key(n)
+                        && !(hier.path.len() == 1
+                            && FRAME_SHADOW
+                                .with(|c| c.borrow().as_ref().is_some_and(|f| f.contains(n))))
+                }),
                 ExprKind::Paren(inner) => is_constant(inner, module),
                 ExprKind::Unary { operand, .. } => is_constant(operand, module),
                 ExprKind::Binary { left, right, .. } => {
@@ -1075,7 +1272,13 @@ impl Simulator {
                 }
             }
             ExprKind::Call { func, args } => {
-                Self::collect_expr_reads(func, module, reads);
+                // #1126: the name of a called user function is not an
+                // operand (§10.3.2, §13.4.1); as a read it resolves to no
+                // signal, and a continuous assignment with an unresolved
+                // read is evaluated at every settle.
+                if !Self::names_user_function(func, module) {
+                    Self::collect_expr_reads(func, module, reads);
+                }
                 for a in args {
                     Self::collect_expr_reads(a, module, reads);
                 }

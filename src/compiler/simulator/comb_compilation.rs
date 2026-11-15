@@ -714,7 +714,9 @@ impl Simulator {
             }
             reads.clear();
             writes.clear();
-            Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
+            let frame_local_reads = Self::with_frame_local_reads(|| {
+                Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads)
+            });
             Self::collect_lhs_writes(&ca.lhs, &self.module, &mut writes);
             // Substituted port actuals whose bare name collides with a child
             // declaration arrive ROOT-marked (core rewrite_expr_impl, issue
@@ -1522,7 +1524,10 @@ impl Simulator {
                         );
                     }
                 }
-                if !found {
+                // #1126: a called function's loop variable or block local
+                // (`i` of `foreach (s[i])`) is frame state, not an operand
+                // (§10.3.2, §13.4).
+                if !found && !frame_local_reads.contains(r) {
                     unresolved_count += 1;
                 }
             }
