@@ -13,6 +13,10 @@ const REF_PIN_PREFIX: &str = "__xz_ref_obj";
 /// the class-scope name reaches the one shared cell from any scope (§8.9).
 const REF_STATIC_PREFIX: &str = "__xz_ref_static:";
 
+/// Alias-frame key whose value is the generation of the local frame that
+/// owns the frame's aliased struct leaves (see `ref_frame_leaves`).
+const REF_LEAF_FRAME_KEY: &str = "\u{1}leaf_frame";
+
 impl Simulator {
     /// `(handle, property)` of an alias storage name that pins a property.
     pub(super) fn ref_pin_parts(storage: &str) -> Option<(usize, &str)> {
@@ -54,6 +58,185 @@ impl Simulator {
             cached_resolved_name: crate::ast::cache::NameCache::new(),
             bound: crate::ast::binding::Bound::UNSET,
         })
+    }
+
+    /// Whether `name` is a class-handle formal of the running frame aliased
+    /// to one ELEMENT of an array (`st` bound to `s[3]`). The storage
+    /// spelling `s[3]` is not a variable's name, so a member path through
+    /// the formal cannot be rewritten onto it; the frame slot is refreshed
+    /// from the element instead and the member is reached through the
+    /// handle it holds.
+    pub(super) fn ref_elem_handle_formal(&self, name: &str) -> bool {
+        self.ref_alias_stack
+            .last()
+            .and_then(|m| m.get(name))
+            .is_some_and(|storage| storage.ends_with(']'))
+            && self.frame_class_handle(name).is_some()
+    }
+
+    /// §13.5.2: alias storage of one leaf of a `ref` unpacked struct or
+    /// union formal: the member of the actual it copies (`caller_leaf`),
+    /// resolved in the CALLER's scope. A member of a property of a live
+    /// object is pinned through the object; a member of module-visible
+    /// storage is named by its flattened name. None keeps the copy.
+    pub(super) fn ref_leaf_alias_target(&mut self, caller_leaf: &Expression) -> Option<String> {
+        if let ExprKind::MemberAccess { expr, member } = &caller_leaf.kind
+            && let Some(ClassAggRef::Unpacked { handle, key, .. }) =
+                self.class_agg_member_parts(expr, &member.name)
+        {
+            return (handle != 0).then(|| format!("{REF_PIN_PREFIX}{handle}.{key}"));
+        }
+        let root = Self::expr_root_first_seg(caller_leaf)?;
+        // A struct of the caller's own frame (a local, or its own formal).
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|f| f.contains_key(root) || f.contains_key(format!("{root}.").as_str()))
+            || self
+                .ref_binding_stack
+                .last()
+                .is_some_and(|m| m.contains_key(root))
+            || self.this_stack.last().copied().flatten().is_some_and(|h| {
+                self.heap.get(h).and_then(|o| o.as_ref()).is_some_and(|i| {
+                    i.properties.keys().any(|k| {
+                        k.strip_prefix(root)
+                            .is_some_and(|r| r.is_empty() || r.starts_with('.'))
+                    })
+                })
+            })
+        {
+            return None;
+        }
+        let flat = self.flat_member_name(caller_leaf)?;
+        let exists = |sim: &Self, n: &str| {
+            sim.signal_name_to_id.contains_key(n) || sim.signals.contains_key(n)
+        };
+        if exists(self, &flat) {
+            return Some(flat);
+        }
+        self.hint_scoped(&flat).filter(|s| exists(self, s))
+    }
+
+    /// The aliased struct leaves of the running frame, `(frame key,
+    /// storage)`; empty unless the innermost alias frame belongs to the
+    /// innermost local frame.
+    fn ref_frame_leaves(&self) -> Vec<(String, String)> {
+        let Some(m) = self.ref_alias_stack.last() else {
+            return Vec::new();
+        };
+        let Some(owner) = m.get(REF_LEAF_FRAME_KEY) else {
+            return Vec::new();
+        };
+        if self
+            .local_gen_stack
+            .last()
+            .is_none_or(|g| g.to_string() != *owner)
+        {
+            return Vec::new();
+        }
+        m.iter()
+            .filter(|(k, _)| k.as_str() != REF_LEAF_FRAME_KEY && k.contains('.'))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// The alias-frame entry that names the local frame owning the aliased
+    /// struct leaves beside it.
+    pub(super) fn ref_leaf_frame_marker(&self) -> Option<(String, String)> {
+        Some((
+            REF_LEAF_FRAME_KEY.to_string(),
+            self.local_gen_stack.last()?.to_string(),
+        ))
+    }
+
+    /// The running process is about to leave its frame (it parks, or the
+    /// call returns): write every aliased struct leaf whose frame copy
+    /// differs to the actual. A leaf write goes through at once; this
+    /// covers the writers that fill the frame directly (a whole-struct
+    /// assignment to the formal).
+    pub(super) fn ref_frame_flush(&mut self) {
+        if !self.ref_redirect_possible() {
+            return;
+        }
+        for (key, storage) in self.ref_frame_leaves() {
+            let Some(v) = self.local_stack.last().and_then(|f| f.get(&key)).cloned() else {
+                continue;
+            };
+            if self.ref_alias_peek(&storage).as_ref() != Some(&v) {
+                self.ref_alias_write(&storage, &v);
+            }
+        }
+    }
+
+    /// The running process is back in its frame (it resumed, or a callee
+    /// returned): the frame copies of the aliased struct leaves, and of the
+    /// handle formals aliased to an element, take the actual's value, which
+    /// another process may have written meanwhile.
+    pub(super) fn ref_frame_refresh(&mut self) {
+        if !self.ref_redirect_possible() {
+            return;
+        }
+        for (key, storage) in self.ref_frame_leaves() {
+            if let Some(v) = self.ref_alias_peek(&storage)
+                && let Some(slot) = self.local_stack.last_mut().and_then(|f| f.get_mut(&key))
+            {
+                *slot = v;
+            }
+        }
+        let handles: Vec<String> = self
+            .ref_alias_stack
+            .last()
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, s)| s.ends_with(']'))
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for name in handles {
+            if self.frame_class_handle(&name).is_some() {
+                self.ref_alias_refresh_slot(&name);
+            }
+        }
+    }
+
+    /// §7.8.7: an associative-array entry that does not exist is allocated
+    /// when it is the actual of a `ref` argument, with the array's default
+    /// or the element type's. Run in the caller's scope, before the element
+    /// is frozen as the formal's storage.
+    fn ref_alloc_assoc_actual(&mut self, arg: &Expression) {
+        let ExprKind::Index { expr: base, index } = &arg.kind else {
+            return;
+        };
+        let ExprKind::Ident(bh) = &base.kind else {
+            return;
+        };
+        if bh.root.is_some() || bh.path.len() != 1 || !bh.path[0].selects.is_empty() {
+            return;
+        }
+        let bname = bh.path[0].name.name.as_str();
+        if !self.module.associative_arrays.contains_key(bname)
+            || self
+                .local_stack
+                .last()
+                .is_some_and(|f| f.contains_key(bname))
+            || self
+                .ref_binding_stack
+                .last()
+                .is_some_and(|m| m.contains_key(bname))
+        {
+            return;
+        }
+        let iv = self.eval_expr(index);
+        if iv.has_xz() {
+            return;
+        }
+        let cell = format!("{}[{}]", bname, self.assoc_key_str(bname, &iv));
+        if self.signals.contains_key(&cell) || self.signal_name_to_id.contains_key(cell.as_str()) {
+            return;
+        }
+        let v = self.eval_expr(arg);
+        self.assign_value(arg, &v);
     }
 
     /// Current value of an aliased formal's storage, read without running
@@ -239,10 +422,23 @@ impl Simulator {
         while let ExprKind::Paren(inner) = &arg.kind {
             arg = inner;
         }
+        if !self.module.associative_arrays.is_empty() {
+            self.ref_alloc_assoc_actual(arg);
+        }
         let (handle, prop): (usize, &str) = match &arg.kind {
-            ExprKind::MemberAccess { expr, member } => {
-                (self.eval_handle_expr(expr)?, member.name.as_str())
-            }
+            ExprKind::MemberAccess { expr, member } => match self.eval_handle_expr(expr) {
+                Some(h) => (h, member.name.as_str()),
+                // A member of an element of an instance array
+                // (`u_ifa[1].iv`) parses as a member access too.
+                None => {
+                    return self.ref_leaf_alias_target(arg).filter(|flat| {
+                        !(self.module.arrays.contains_key(flat.as_str())
+                            || self.module.dynamic_arrays.contains(flat)
+                            || self.module.queue_vars.contains(flat)
+                            || self.module.associative_arrays.contains_key(flat))
+                    });
+                }
+            },
             ExprKind::Ident(h)
                 if h.root.is_none()
                     && h.path.len() >= 2
@@ -394,7 +590,8 @@ impl Simulator {
         let mut cur = dt;
         for _ in 0..8 {
             match cur {
-                DataType::Struct(s) => return !s.packed,
+                // An untagged union is one piece of storage (§7.3).
+                DataType::Struct(s) => return Self::spreads_member_wise(s),
                 DataType::TypeReference {
                     name, dimensions, ..
                 } => {

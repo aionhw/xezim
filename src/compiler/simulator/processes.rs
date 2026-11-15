@@ -100,6 +100,9 @@ impl Simulator {
     }
 
     pub(super) fn take_process_context(&mut self) -> ProcessContext {
+        // §13.5.2: the aliased leaves of a `ref` struct formal reach their
+        // actuals before another process runs.
+        self.ref_frame_flush();
         // The ref stacks leave with the context; nothing can redirect until
         // a context is restored or a new ref frame is pushed.
         self.ref_redirect_hot = false;
@@ -166,6 +169,10 @@ impl Simulator {
         if !self.local_meta_cache.is_empty() && !self.local_meta_claims.is_empty() {
             self.reapply_local_meta();
         }
+        if !self.task_cleanup.is_empty() {
+            self.reinstall_struct_formal_meta();
+        }
+        self.ref_frame_refresh();
     }
 
     /// Capture the current process context, including the current

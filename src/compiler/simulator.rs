@@ -5347,6 +5347,11 @@ struct TaskCleanup {
     pushed_method_this: bool,
     saved_spec: Option<(String, String)>,
     formal_metadata: Vec<FormalMetadataSnapshot>,
+    /// The name-keyed select metadata this activation registered for its
+    /// packed struct and packed array formals, installed again when the
+    /// process resumes (see `Simulator::reinstall_struct_formal_meta`).
+    #[serde(default)]
+    struct_formal_meta: Vec<(String, FormalMetaParts)>,
     /// The method task of a class declared inside a module runs in its
     /// object's instance (see `Simulator::modclass_depth`): the process's
     /// activation scope while this frame is on top.

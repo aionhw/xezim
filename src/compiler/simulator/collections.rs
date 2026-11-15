@@ -3200,8 +3200,21 @@ impl Simulator {
                     Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                     _ => val,
                 };
+                let through = if self.ref_redirect_possible() {
+                    self.ref_alias_stack
+                        .last()
+                        .and_then(|m| m.get(name))
+                        .cloned()
+                        .map(|storage| (storage, fitted.clone()))
+                } else {
+                    None
+                };
                 if let Some(frame) = self.local_stack.last_mut() {
                     frame.insert(name.to_string(), fitted);
+                }
+                // §13.5.2: an aliased leaf of a `ref` struct formal.
+                if let Some((storage, v)) = through {
+                    self.ref_alias_write(&storage, &v);
                 }
                 return;
             }

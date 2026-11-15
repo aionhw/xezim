@@ -1627,7 +1627,10 @@ impl Simulator {
             // identifier to itself, and the evaluator re-entered this
             // redirect on the rewritten node until the stack overflowed.
             // Plain resolution of the name already reaches that storage.
-            if storage == name || member_wise_struct(self) {
+            if storage == name
+                || member_wise_struct(self)
+                || (hier.path.len() >= 2 && self.ref_elem_handle_formal(name))
+            {
                 return None;
             }
             // A pinned property (`<pin>.<prop>`): the formal's selects go on
@@ -1838,6 +1841,11 @@ impl Simulator {
                             return None;
                         }
                     }
+                }
+                // A handle formal aliased to an element is read from its
+                // refreshed frame slot (see `ref_elem_handle_formal`).
+                if Self::expr_root_first_seg(expr).is_some_and(|r| self.ref_elem_handle_formal(r)) {
+                    return None;
                 }
                 self.ref_formal_redirect_inner(expr, true).map(|ne| {
                     Expression::new(
@@ -3970,6 +3978,14 @@ impl Simulator {
         // §13.5.2: a selected write through a `ref` formal lands on the
         // caller's actual; an aliased formal's local copy is refreshed so
         // any unredirected read path stays coherent.
+        if self.ref_redirect_possible()
+            && matches!(lhs.kind, ExprKind::MemberAccess { .. } | ExprKind::Ident(_))
+            && let Some(root) = Self::expr_root_first_seg(lhs)
+            && self.ref_elem_handle_formal(root)
+        {
+            let root = root.to_string();
+            self.ref_alias_refresh_slot(&root);
+        }
         if let Some(rewritten) = self.ref_formal_redirect_expr(lhs) {
             let changed = self.assign_value(&rewritten, val);
             let mut root = lhs;
@@ -4398,8 +4414,22 @@ impl Simulator {
                     _ => val.clone(),
                 };
                 let changed = prev.as_ref() != Some(&fitted);
+                // §13.5.2: a leaf of a `ref` struct formal aliased to the
+                // actual's member is written through at once.
+                let through = if self.ref_redirect_possible() {
+                    self.ref_alias_stack
+                        .last()
+                        .and_then(|m| m.get(key.as_str()))
+                        .cloned()
+                        .map(|storage| (storage, fitted.clone()))
+                } else {
+                    None
+                };
                 if let Some(frame) = self.local_stack.last_mut() {
                     frame.insert(key, fitted);
+                }
+                if let Some((storage, v)) = through {
+                    self.ref_alias_write(&storage, &v);
                 }
                 return changed;
             }
