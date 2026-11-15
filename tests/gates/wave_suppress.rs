@@ -222,7 +222,19 @@ fn dump(
     xt: &std::path::Path,
     extra: &[&str],
 ) -> String {
-    fs::write(sv, SRC.replace("@VCD@", &vcd.to_string_lossy())).unwrap();
+    dump_of(SRC, sv, vcd, fst, xt, extra)
+}
+
+/// `dump` for another source text.
+fn dump_of(
+    src: &str,
+    sv: &std::path::Path,
+    vcd: &std::path::Path,
+    fst: &std::path::Path,
+    xt: &std::path::Path,
+    extra: &[&str],
+) -> String {
+    fs::write(sv, src.replace("@VCD@", &vcd.to_string_lossy())).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
     cmd.arg("--no-cache")
         .arg("--wave")
@@ -563,4 +575,274 @@ fn a_generated_instance_is_excluded_by_module_and_by_indexed_path() {
     for p in [&sv, &vcd, &fst, &xt] {
         let _ = fs::remove_file(p);
     }
+}
+
+/// A second design for the entry shapes the first has none of: unpacked
+/// array variables, an instance array, a generate loop holding a variable,
+/// and an instance whose name is also a module name.
+const SRC_ARRAYS: &str = r#"
+`timescale 1ns/1ps
+module ram(input logic clk, input logic [1:0] a, input logic [7:0] d, output logic [7:0] q);
+  logic [7:0] mem [0:3];
+  logic [7:0] rq;
+  assign q = rq;
+  always @(posedge clk) begin mem[a] <= d; rq <= mem[a]; end
+endmodule
+module leaf(input logic clk, input logic [7:0] d, output logic [7:0] q);
+  logic [7:0] r;
+  logic [3:0] tbl [0:1][0:1];
+  always @(posedge clk) begin r <= d + 8'd1; tbl[d[0]][d[1]] <= d[3:0]; end
+  assign q = r;
+endmodule
+module mid(input logic clk, input logic [7:0] d, output logic [7:0] q);
+  logic [7:0] w;
+  leaf u_leaf(.clk(clk), .d(d), .q(w));
+  ram  u_ram(.clk(clk), .a(d[1:0]), .d(w), .q(q));
+endmodule
+module top;
+  logic clk = 1'b0;
+  logic [7:0] din = 8'd0;
+  logic [7:0] q0, q1;
+  logic [7:0] tmem [0:3];
+  logic [7:0] tmem2 [0:1];
+  always #5 clk = ~clk;
+  always @(posedge clk) begin din <= din + 8'd3; tmem[din[1:0]] <= din; tmem2[din[0]] <= din; end
+  mid  u_mid(.clk(clk), .d(din), .q(q0));
+  leaf u_leaf(.clk(clk), .d(din), .q(q1));
+  leaf u_arr [1:0] (.clk(clk), .d(din), .q());
+  leaf u_arr2 [1:0] (.clk(clk), .d(din), .q());
+  genvar gi;
+  for (gi = 0; gi < 2; gi++) begin : g
+    logic [7:0] gw;
+    ram u_ram(.clk(clk), .a(din[1:0]), .d(din), .q(gw));
+  end
+  initial begin
+    $dumpfile("@VCD@");
+    $dumpvars(0, top);
+    #60;
+    $finish;
+  end
+endmodule
+"#;
+
+/// The names of all three sinks for one run of `SRC_ARRAYS`, with xezim's
+/// stderr. `stem` keeps the files of concurrently running tests apart.
+fn dump_arrays(stem: &str, extra: &[&str]) -> ([HashSet<String>; 3], String) {
+    let sv = tmp(&format!("{stem}_src"), "sv");
+    let vcd = tmp(stem, "vcd");
+    let fst = tmp(stem, "fst");
+    let xt = tmp(stem, "xtrace");
+    let mut args = extra.to_vec();
+    args.push("--fst");
+    let log = dump_of(SRC_ARRAYS, &sv, &vcd, &fst, &xt, &args);
+    let names = [vcd_names(&vcd), fst_names(&fst), xtrace_names(&xt)];
+    for p in [&sv, &vcd, &fst, &xt] {
+        let _ = fs::remove_file(p);
+    }
+    (names, log)
+}
+
+const SINKS: [&str; 3] = ["VCD", "FST", "XTrace"];
+
+fn assert_names(names: &[HashSet<String>; 3], absent: &[&str], present: &[&str]) {
+    for (set, sink) in names.iter().zip(SINKS) {
+        for n in absent {
+            assert!(!set.contains(*n), "`{n}` survived in the {sink}");
+        }
+        for n in present {
+            assert!(set.contains(*n), "`{n}` is missing from the {sink}");
+        }
+    }
+}
+
+/// A path entry that names an unpacked array variable takes every element
+/// of it, and one that names an instance array or a generate loop takes
+/// every element instance. A name that only starts the same is untouched.
+#[test]
+fn a_path_entry_covers_array_elements_instance_arrays_and_generate_loops() {
+    let (all, _) = dump_arrays("ar_full", &[]);
+    let gone = [
+        "top.tmem[0]",
+        "top.tmem[3]",
+        "top.u_mid.u_ram.mem[2]",
+        "top.u_arr[0].r",
+        "top.u_arr[1].tbl[1][0]",
+        "top.g[0].gw",
+        "top.g[1].u_ram.rq",
+        "top.u_leaf.tbl[1][0]",
+        "top.u_leaf.tbl[1][1]",
+    ];
+    let kept = [
+        "top.tmem2[0]",
+        "top.u_mid.u_ram.rq",
+        "top.u_arr2[0].r",
+        "top.u_leaf.tbl[0][1]",
+        "top.u_leaf.r",
+        "top.clk",
+    ];
+    assert_names(&all, &[], &gone);
+    assert_names(&all, &[], &kept);
+    let (names, log) = dump_arrays(
+        "ar_cut",
+        &suppress_args(&[
+            "top.tmem",
+            "u_mid.u_ram.mem",
+            "top.u_arr",
+            "top.g",
+            "top.u_leaf.tbl[1]",
+        ]),
+    );
+    assert_names(&names, &gone, &kept);
+    assert!(!log.contains("matched no dumped signal"), "log {log}");
+    assert!(
+        log.contains("[VCD] Suppressed 4 signals under scope 'top.tmem'"),
+        "log {log}"
+    );
+}
+
+/// A bare name that is no module definition is a path below the top module,
+/// as a bare `--fst-scope` name is. A bare name that is a module stays one,
+/// even when an instance carries it too.
+#[test]
+fn a_bare_name_that_is_no_module_is_a_path_below_the_top() {
+    let (names, log) = dump_arrays("bn_inst", &suppress_args(&["u_mid", "tmem2"]));
+    assert_names(
+        &names,
+        &["top.u_mid.w", "top.u_mid.u_leaf.r", "top.tmem2[1]"],
+        &["top.u_leaf.r", "top.tmem[0]", "top.q0"],
+    );
+    assert!(!log.contains("matched no dumped signal"), "log {log}");
+    let (names, log) = dump_arrays("bn_mod", &suppress_args(&["leaf"]));
+    assert_names(
+        &names,
+        &["top.u_leaf.r", "top.u_mid.u_leaf.r", "top.u_arr[1].r"],
+        &["top.u_mid.w", "top.u_mid.u_ram.rq"],
+    );
+    assert!(
+        log.contains("under 6 instance(s) of module 'leaf'"),
+        "log {log}"
+    );
+}
+
+/// An include scope inside an excluded subtree brings back what it names,
+/// not the rest of the subtree that another include scope selects.
+#[test]
+fn an_include_scope_brings_back_only_what_it_names() {
+    let mut args = suppress_args(&["top.u_mid.u_ram"]);
+    args.extend([
+        "--fst-scope",
+        "top.u_mid",
+        "--fst-scope",
+        "top.u_mid.u_ram.rq",
+    ]);
+    let (names, _) = dump_arrays("rd_one", &args);
+    let fst = &names[1];
+    assert!(fst.contains("top.u_mid.u_ram.rq"), "{fst:?}");
+    assert!(fst.contains("top.u_mid.w"), "{fst:?}");
+    assert!(!fst.contains("top.u_mid.u_ram.q"), "{fst:?}");
+    assert!(!fst.contains("top.u_mid.u_ram.mem[0]"), "{fst:?}");
+    // An element of an excluded array, asked for by name.
+    let mut args = suppress_args(&["top.g"]);
+    args.extend(["--fst-scope", "top.g[1]"]);
+    let (names, _) = dump_arrays("rd_elem", &args);
+    let fst = &names[1];
+    assert!(fst.contains("top.g[1].gw"), "{fst:?}");
+    assert!(!fst.contains("top.g[0].gw"), "{fst:?}");
+}
+
+/// What the report says: the top module by name, and no "matched nothing"
+/// for an entry that lies inside what another entry already excluded.
+#[test]
+fn the_report_names_the_top_module_and_skips_covered_entries() {
+    let sv = tmp("rp_top_src", "sv");
+    let vcd = tmp("rp_top", "vcd");
+    let xt = tmp("rp_top", "xtrace");
+    let log = dump_of(SRC_ARRAYS, &sv, &vcd, &vcd, &xt, &suppress_args(&["top"]));
+    let names = vcd_names(&vcd);
+    assert!(names.is_empty(), "{names:?}");
+    assert!(
+        log.contains("signals under the top module 'top'"),
+        "log {log}"
+    );
+    for p in [&sv, &vcd, &xt] {
+        let _ = fs::remove_file(p);
+    }
+    let (_, log) = dump_arrays(
+        "rp_cov",
+        &suppress_args(&["leaf", "top.u_leaf.r", "top.u_mid"]),
+    );
+    assert!(!log.contains("matched no dumped signal"), "log {log}");
+    let (_, log) = dump_arrays("rp_none", &[]);
+    assert!(!log.contains("Suppressed"), "log {log}");
+}
+
+/// The list applies to the dumps of a compiled artifact, given when it runs.
+#[test]
+fn a_compiled_artifact_takes_the_exclusion_list() {
+    let sv = tmp("art_src", "sv");
+    let vcd = tmp("art", "vcd");
+    let art = tmp("art", "art");
+    fs::write(&sv, SRC_ARRAYS.replace("@VCD@", &vcd.to_string_lossy())).unwrap();
+    let bin = env!("CARGO_BIN_EXE_xezim");
+    let o = Command::new(bin)
+        .arg("--compile")
+        .arg(&sv)
+        .args(["-s", TOP, "-o"])
+        .arg(&art)
+        .output()
+        .expect("compile");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = Command::new(bin)
+        .arg(&art)
+        .args([
+            "--wave",
+            "--wave-suppress",
+            "ram",
+            "--wave-suppress",
+            "top.tmem",
+        ])
+        .output()
+        .expect("run");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let got = vcd_names(&vcd);
+    assert!(!got.contains("top.u_mid.u_ram.rq"), "{got:?}");
+    assert!(!got.contains("top.g[0].u_ram.mem[1]"), "{got:?}");
+    assert!(!got.contains("top.tmem[2]"), "{got:?}");
+    assert!(got.contains("top.u_mid.w"), "{got:?}");
+    for p in [&sv, &vcd, &art] {
+        let _ = fs::remove_file(p);
+    }
+}
+
+/// Two runs with the same list write the same dump: the VCD apart from its
+/// `$date`, the XTrace byte for byte, and the same FST hierarchy.
+#[test]
+fn a_suppressed_dump_is_the_same_on_every_run() {
+    let run = |stem: &str| {
+        let sv = tmp("det_src", "sv");
+        let vcd = tmp(stem, "vcd");
+        let fst = tmp(stem, "fst");
+        let xt = tmp(stem, "xtrace");
+        let mut args = suppress_args(&["ram", "u_arr", "top.tmem"]);
+        args.push("--fst");
+        dump_of(SRC_ARRAYS, &sv, &vcd, &fst, &xt, &args);
+        let text = fs::read_to_string(&vcd)
+            .expect("vcd")
+            // Every run writes to its own file, named in no record.
+            .lines()
+            .skip_while(|l| !l.starts_with("$version"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = (text, fst_names(&fst), fs::read(&xt).expect("xtrace"));
+        for p in [&sv, &vcd, &fst, &xt] {
+            let _ = fs::remove_file(p);
+        }
+        out
+    };
+    let a = run("det_a");
+    let b = run("det_b");
+    assert!(a.0.contains("$var"), "{}", a.0);
+    assert_eq!(a.0, b.0, "the VCD differs between two runs");
+    assert_eq!(a.1, b.1, "the FST hierarchy differs between two runs");
+    assert_eq!(a.2, b.2, "the XTrace differs between two runs");
 }
