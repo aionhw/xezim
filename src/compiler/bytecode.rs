@@ -15770,7 +15770,7 @@ impl<'a> BytecodeCompiler<'a> {
         if matches!(
             expr.kind,
             ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
-        ) && Self::inst_array_multidim_elem(expr)
+        ) && self.inst_array_multidim_elem(expr)
         {
             // #1108: an element of a multidimensional array member of an
             // instance-array element (`lane[0].nest[1][2]`) is resolved by
@@ -20271,16 +20271,29 @@ impl<'a> BytecodeCompiler<'a> {
 
     /// Whether `e` selects, through two or more indices, an array member
     /// reached through a select (`lane[0].nest[1][2]`).
-    fn inst_array_multidim_elem(e: &Expression) -> bool {
+    fn inst_array_multidim_elem(&self, e: &Expression) -> bool {
         let ExprKind::Index { expr: inner, .. } = &e.kind else {
             return false;
         };
-        matches!(inner.kind, ExprKind::Index { .. })
-            && crate::compiler::simulator::Simulator::select_entered_member_shape(inner)
+        if !matches!(inner.kind, ExprKind::Index { .. })
+            || !crate::compiler::simulator::Simulator::select_entered_member_shape(inner)
+        {
+            return false;
+        }
+        // An element of a variable (`sa[1].f0[3][7]` of an array of
+        // structures) is not a scope; it compiles as before.
+        let Some(root) = crate::compiler::simulator::Simulator::expr_root_first_seg(inner) else {
+            return false;
+        };
+        !self.arrays.contains_key(root)
+            && !self.scope_hint.as_ref().is_some_and(|scope| {
+                self.arrays
+                    .contains_key(format!("{}.{}", scope, root).as_str())
+            })
     }
 
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
-        if Self::inst_array_multidim_elem(lhs) {
+        if self.inst_array_multidim_elem(lhs) {
             self.bail("inst_array_member");
             return false;
         }

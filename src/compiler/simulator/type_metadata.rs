@@ -2316,7 +2316,7 @@ impl Simulator {
 
     /// The first path segment of the identifier at the root of a
     /// member/index chain (`s` in `s.mm[1][0]`, `arr` in `arr[2].x`).
-    pub(super) fn expr_root_first_seg(e: &Expression) -> Option<&str> {
+    pub(crate) fn expr_root_first_seg(e: &Expression) -> Option<&str> {
         match &e.kind {
             ExprKind::Ident(h) => h.path.first().map(|s| s.name.name.as_str()),
             ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {

@@ -2124,7 +2124,10 @@ impl Simulator {
                 })
             {
                 let recv = self.method_receiver_expr(hier, len - 1);
+                // Null for certain: the receiver's value itself (a chain
+                // through a static property has no handle to walk).
                 if self.eval_handle_expr(&recv).unwrap_or(0) == 0
+                    && self.eval_expr(&recv).to_u64() == Some(0)
                     && let Some(decl) = self.null_receiver_class(&recv)
                     && let Some(v) = self.call_on_null_receiver_of(
                         (len == 2).then(|| path[0].name.name.as_str()),
