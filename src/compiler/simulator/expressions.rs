@@ -2072,6 +2072,24 @@ impl Simulator {
             selects += 1;
             root = base;
         }
+        // A class property (`h.m_amb[1]`, or `m_amb[1]` in a method): its
+        // declared type is its class's.
+        if !self.packed_named_signed_props.is_empty() {
+            let prop = match &root.kind {
+                ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                ExprKind::Ident(h) if h.root.is_none() => h
+                    .path
+                    .last()
+                    .filter(|s| s.selects.is_empty())
+                    .map(|s| s.name.name.as_str()),
+                _ => None,
+            };
+            if prop.is_some_and(|p| self.packed_named_signed_props.get(p) == Some(&selects))
+                && self.class_prop_named_signed_depth(root) == Some(selects)
+            {
+                return true;
+            }
+        }
         let ExprKind::Ident(h) = &root.kind else {
             return false;
         };
@@ -2087,6 +2105,33 @@ impl Simulator {
             && !self.module.arrays.contains_key(name)
             && !self.module.arrays_2d.contains_key(name)
             && !self.module.arrays_nd.contains_key(name)
+    }
+
+    /// §7.4.1: the select depth at which the class property `e` names
+    /// reaches a named signed element type, from the property's declaration
+    /// in its class.
+    fn class_prop_named_signed_depth(&self, e: &Expression) -> Option<usize> {
+        let dt = match &e.kind {
+            // A bare property of the running method's object.
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                let name = h.path[0].name.name.as_str();
+                if self
+                    .local_stack
+                    .last()
+                    .is_some_and(|f| f.contains_key(name))
+                {
+                    return None;
+                }
+                let th = self.this_stack.last().copied().flatten()?;
+                let class = &self.heap.get(th)?.as_ref()?.class_name;
+                let base = class.split('#').next().unwrap_or(class).trim();
+                let owners = self.prop_owners(base);
+                let (_, cd) = owners.get(name)?;
+                cd.property_types.get(name)?.clone()
+            }
+            _ => self.lvalue_static_type(e)?,
+        };
+        super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
     }
 
     /// Declared expression signedness without executing conditional arms or
@@ -2369,7 +2414,7 @@ impl Simulator {
         // §7.4.1: an element of a packed array of a named signed type is
         // signed; the slice that reads it is not. One length test when no
         // variable is declared that way.
-        if !self.packed_named_signed.is_empty()
+        if (!self.packed_named_signed.is_empty() || !self.packed_named_signed_props.is_empty())
             && matches!(expr.kind, ExprKind::Index { .. })
             && self.packed_named_sign_guard != expr as *const Expression as usize
             && self.packed_named_select_signed(expr)

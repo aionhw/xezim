@@ -9676,6 +9676,10 @@ pub struct Simulator {
     /// keeps the element-read check to one length test.
     #[serde(skip)]
     packed_named_signed: HashMap<String, usize>,
+    /// The same for class properties, by property name: the names some
+    /// class declares as a packed array of a named signed type.
+    #[serde(skip)]
+    packed_named_signed_props: HashMap<String, usize>,
     /// The `Index` expression whose signed element read is in progress (its
     /// address), so the re-entrant evaluation reads the slice itself.
     #[serde(skip)]

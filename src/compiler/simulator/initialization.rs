@@ -3763,6 +3763,15 @@ impl Simulator {
             }
             m
         };
+        let packed_named_signed_props: HashMap<String, usize> = module
+            .classes
+            .values()
+            .flat_map(|cd| cd.property_types.iter())
+            .filter_map(|(p, dt)| {
+                super::bytecode::signed_named_packed_elem_depth(dt, &module.typedef_types)
+                    .map(|depth| (p.clone(), depth))
+            })
+            .collect();
         let packed_named_signed: HashMap<String, usize> = {
             let types = &module.typedef_types;
             let mut m: HashMap<String, usize> = HashMap::default();
@@ -4591,6 +4600,7 @@ impl Simulator {
             fst_writer: None,
             cast_widths,
             packed_named_signed,
+            packed_named_signed_props,
             packed_named_sign_guard: 0,
             fn_decl_cache: HashMap::default(),
             free_fn_table: None,
