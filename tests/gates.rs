@@ -83,6 +83,8 @@ mod vcd_lrm_compliance;
 mod wave_flag_gates_dumping;
 #[path = "gates/zero_delay_path_edge_ordering.rs"]
 mod zero_delay_path_edge_ordering;
+#[path = "gates/wave_suppress.rs"]
+mod wave_suppress;
 #[path = "gates/udp_unnamed_after_delay_579.rs"]
 mod udp_unnamed_after_delay_579;
 #[path = "gates/udp_delay_forms.rs"]
