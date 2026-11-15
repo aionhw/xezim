@@ -512,5 +512,7 @@ mod deferred_assign_reads_1149;
 mod function_call_assign_reads_1126;
 #[path = "scheduling/instance_array_member_reads_1108.rs"]
 mod instance_array_member_reads_1108;
+#[path = "scheduling/instance_array_member_arrays_1108.rs"]
+mod instance_array_member_arrays_1108;
 #[path = "scheduling/struct_array_actual_paths_1110.rs"]
 mod struct_array_actual_paths_1110;
