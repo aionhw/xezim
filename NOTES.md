@@ -36,6 +36,20 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `$dumpvars` call made at the time the dump starts adds its objects, each
   with its own level count (§21.7.1.2, #1103).
 
+* `--wave-suppress <entry>` excludes signals from the VCD, FST and XTrace
+  dumps: a bare name is a module definition and removes every instance of it
+  at any depth, a dotted name is one hierarchical path (an instance, an
+  instance array or generate loop, or a variable with its array elements; the
+  top-module name is optional), and a bare name that is not a module is a path
+  below the top module. `--wave-suppress-module <name>` forces the module
+  reading and `--wave-suppress-file <file>` (`-wave_suppress_file` in an args
+  file) reads the list from a file. Excluded signals are dropped while the
+  dump collects its signals, so a dump without a design's memories is faster
+  and smaller than the whole-design dump; each entry reports what it removed,
+  an include scope naming something inside an excluded scope dumps what it
+  names, and a compiled artifact takes the options when it runs (#1104,
+  contributed by Ganesh-TNL).
+
 **Correctness**
 
 * A blocking assignment with an intra-assignment delay or event control
@@ -267,6 +281,87 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   A name in a child module that starts with one of its own generate blocks
   (`h.a`, `h.x`) names the child's block: it read a same-named block of the
   top module (§10.3.2, §13.5.4, §23.9, §27.5, #1110, reported by ds54e).
+
+* An assignment pattern returned directly from a function or method whose
+  return type is an unpacked struct is distributed member by member, as the
+  same pattern assigned to a struct variable is: `return '{ "one", "two" };`
+  for a struct of two strings came back with the first member empty and both
+  strings in the last (§10.9, §13.4.1, #1170, contributed by shabbarvejlani).
+  The same holds for a return type named by a class type parameter, for a
+  pattern returned as a queue or dynamic array of unpacked structs, for struct
+  members that are queues or dynamic arrays, and for a pattern assigned to the
+  function name inside a method; a string member selected directly from the
+  call (`f().a`) is the string, not its padded transport slot (§8.25, §6.16).
+
+* The enumeration methods `first`, `last`, `next`, `prev`, `num` and `name`
+  take the enumeration from the receiver's declared type, whatever expression
+  the receiver is: a variable declared through a typedef alias or an array
+  typedef, an array element, a struct or union member at any depth, a property
+  reached through class handles or `this`, a function result or a member of
+  one, and the result of another enumeration method. `name()` of a value that
+  is not a member, or that has x or z bits, is the empty string; it named a
+  member of another enumeration that held the value. A variable declared in a
+  `for` header has its type in its own initializer and no longer takes the
+  type of a same-named variable of the caller, the members of an enumeration
+  declared in a procedural block are constants of that block, and an
+  associative array or queue of enumeration elements keeps its own `num()`
+  (§6.19.5, §6.19, §7.9, #1132, reported by Ganesh-TNL).
+
+* A `ref` formal that is an unpacked struct or an untagged unpacked union
+  reads and writes its actual while the subroutine runs, member by member,
+  for a property of an object and a module variable; it copied the actual at
+  the call and wrote it back at the return. An untagged union formal has a
+  member layout, so `u.iv` no longer reads 0 for any direction. A `ref`
+  handle formal bound to an element of an array or queue (`t(x, s[3])` with
+  `task t(ref int x, st_c st)`, where `st` inherits `ref`) reaches the
+  object. A member of an element of an array of interface instances
+  (`u_ifa[1].iv`) is aliased. An associative-array entry that does not exist
+  is allocated, with the array's default, when it is the actual of a `ref`
+  argument (§13.5.2, §7.8.7, §7.3, #1160).
+
+* Two activations of a task parked at once, or two tasks with a formal of
+  the same name, each keep the select layout of their own packed struct or
+  packed array formal. The layout is kept by the formal's name, and the
+  first return removed the one the other activation still needed, so
+  `s.a` read 0 (§13.5.2, §13.3.1, #1160, reported by Ganesh-TNL).
+
+* An unpacked array that is a member of an element of an array of instances
+  (`lane[0].payload`) is an array in every use: a nonblocking write to an
+  element stores the whole element (it stored one bit), a whole-array read,
+  assignment and subroutine actual carry every element, `foreach` and
+  `$size` see its dimension, and an element of a multidimensional member
+  (`lane[0].nest[1][j]`) is read, written and, in an `always_comb`, depended
+  on (§23.3.2, §7.4, §10.4.2, §12.7.3, #1108, reported by Ganesh-TNL).
+
+* A `mailbox` or `semaphore` member of an unpacked struct is constructed by
+  `new()`, with its bound or key count, wherever the struct is: a module,
+  interface, program or generate scope, a block, task or function local, a
+  class property (static, inherited, in an array, queue or associative
+  array), a formal. A handle of a built-in class that is a struct member, an
+  array element or a member of a local struct starts null, not x; so does a
+  user class handle member of a local struct. A property whose declaration
+  initializer is `new()` and whose type is a typedef of a built-in class is
+  constructed (§7.2, §8.4, §15.3, §15.4, §6.18, #1161).
+
+* An unpacked struct declared in a generate block is stored member by
+  member. It was one vector, so a 4-state or handle member kept x through
+  every write (§7.2, §27, #1161, reported by Ganesh-TNL).
+
+* A non-virtual method called through a null handle runs also when it is
+  named like a built-in array, string or enumeration method (`size`, `num`,
+  `delete`), when the call is a static property initializer, and when the
+  receiver is the iterator of an array method's `with` clause; these three
+  returned 0 and ran nothing (§8.4, §8.20, #1139, reported by Ganesh-TNL).
+
+* A static function of a class, or of a specialization named with a module
+  parameter (`localparam int L = C#(PW)::id();`), called in a parameter
+  initializer is folded as a constant function, per module instance. The
+  parameter read 0 (§13.8, §13.4.3, §8.25, #1130, reported by Ganesh-TNL).
+
+* An element of a packed array of a named signed type is signed when the
+  array is a class property (`h.m_amb[1]`) or an input port of a child
+  module, as it is for a module variable (§7.4.1, #1107, reported by
+  Ganesh-TNL).
 
 ### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
 
