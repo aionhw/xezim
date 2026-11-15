@@ -481,6 +481,8 @@ mod pure_fn_loops_compiled;
 mod queue_ref_formal_shadowing;
 #[path = "misc/ref_formal_actual_storage.rs"]
 mod ref_formal_actual_storage;
+#[path = "misc/ref_formal_struct_union_elements.rs"]
+mod ref_formal_struct_union_elements;
 #[path = "misc/rare_constraint_branches.rs"]
 mod rare_constraint_branches;
 #[path = "misc/recursive_function_in_continuous_assign.rs"]
