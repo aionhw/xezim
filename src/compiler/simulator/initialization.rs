@@ -3844,6 +3844,7 @@ impl Simulator {
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
             csp_cache: std::cell::RefCell::new(HashMap::default()),
             any_struct_formal_markers: false,
+            ref_park_flags: 0,
             indexed_scopes: std::cell::OnceCell::new(),
             pattern_scratch_seq: 0,
             pattern_scratch_free: Vec::new(),

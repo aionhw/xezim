@@ -1475,9 +1475,16 @@ impl Simulator {
     ) {
         // #1108: a whole array member of an instance-array element on either
         // side (`w = lane[0].payload`, `lane[1].payload = '{...}`).
-        if self.has_indexed_scopes() {
-            let l = self.inst_array_member_canon(lvalue);
-            let r = self.inst_array_member_canon(rvalue);
+        // An element select is folded where it is read or written.
+        let whole =
+            |e: &Expression| matches!(e.kind, ExprKind::MemberAccess { .. } | ExprKind::Ident(_));
+        if self.has_indexed_scopes() && (whole(lvalue) || whole(rvalue)) {
+            let l = whole(lvalue)
+                .then(|| self.inst_array_member_canon(lvalue))
+                .flatten();
+            let r = whole(rvalue)
+                .then(|| self.inst_array_member_canon(rvalue))
+                .flatten();
             if l.is_some() || r.is_some() {
                 let lvalue = l.as_ref().unwrap_or(lvalue);
                 let rvalue = r.as_ref().unwrap_or(rvalue);

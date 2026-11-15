@@ -6911,6 +6911,11 @@ pub struct Simulator {
     /// `unpacked_struct_leaf_keys`); gates `frame_leaf_key_of`'s per-eval
     /// probe.
     any_struct_formal_markers: bool,
+    /// Sticky bits (`REF_PARK_*`): a task has bound a formal with select
+    /// metadata, an aliased leaf of a `ref` struct formal, or a handle
+    /// formal aliased to an element. Each gates the work a process switch
+    /// does for it.
+    ref_park_flags: u8,
     /// See `Simulator::has_indexed_scopes`.
     #[serde(skip)]
     indexed_scopes: std::cell::OnceCell<bool>,

@@ -13,6 +13,13 @@ const REF_PIN_PREFIX: &str = "__xz_ref_obj";
 /// the class-scope name reaches the one shared cell from any scope (§8.9).
 const REF_STATIC_PREFIX: &str = "__xz_ref_static:";
 
+/// `Simulator::ref_park_flags`: a task bound a formal with select metadata.
+pub(super) const REF_PARK_META: u8 = 1;
+/// ... an aliased leaf of a `ref` struct formal.
+pub(super) const REF_PARK_LEAVES: u8 = 2;
+/// ... a handle formal aliased to an element of an array.
+pub(super) const REF_PARK_ELEMS: u8 = 4;
+
 /// Alias-frame key whose value is the generation of the local frame that
 /// owns the frame's aliased struct leaves (see `ref_frame_leaves`).
 const REF_LEAF_FRAME_KEY: &str = "\u{1}leaf_frame";
@@ -155,7 +162,7 @@ impl Simulator {
     /// covers the writers that fill the frame directly (a whole-struct
     /// assignment to the formal).
     pub(super) fn ref_frame_flush(&mut self) {
-        if !self.ref_redirect_possible() {
+        if self.ref_park_flags & REF_PARK_LEAVES == 0 || !self.ref_redirect_possible() {
             return;
         }
         for (key, storage) in self.ref_frame_leaves() {
@@ -173,15 +180,22 @@ impl Simulator {
     /// handle formals aliased to an element, take the actual's value, which
     /// another process may have written meanwhile.
     pub(super) fn ref_frame_refresh(&mut self) {
-        if !self.ref_redirect_possible() {
+        if self.ref_park_flags & (REF_PARK_LEAVES | REF_PARK_ELEMS) == 0
+            || !self.ref_redirect_possible()
+        {
             return;
         }
-        for (key, storage) in self.ref_frame_leaves() {
-            if let Some(v) = self.ref_alias_peek(&storage)
-                && let Some(slot) = self.local_stack.last_mut().and_then(|f| f.get_mut(&key))
-            {
-                *slot = v;
+        if self.ref_park_flags & REF_PARK_LEAVES != 0 {
+            for (key, storage) in self.ref_frame_leaves() {
+                if let Some(v) = self.ref_alias_peek(&storage)
+                    && let Some(slot) = self.local_stack.last_mut().and_then(|f| f.get_mut(&key))
+                {
+                    *slot = v;
+                }
             }
+        }
+        if self.ref_park_flags & REF_PARK_ELEMS == 0 {
+            return;
         }
         let handles: Vec<String> = self
             .ref_alias_stack

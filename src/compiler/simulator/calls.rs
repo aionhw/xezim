@@ -2113,6 +2113,15 @@ impl Simulator {
                     .class_member_names()
                     .methods
                     .contains(path[len - 1].name.name.as_str())
+                // A plain variable receiver is a handle only when it is
+                // declared with a class type.
+                && (len > 2 || {
+                    let root = path[0].name.name.as_str();
+                    !self.module.queue_vars.contains(root)
+                        && !self.module.dynamic_arrays.contains(root)
+                        && !self.module.associative_arrays.contains_key(root)
+                        && self.class_of_var(root).is_some()
+                })
             {
                 let recv = self.method_receiver_expr(hier, len - 1);
                 if self.eval_handle_expr(&recv).unwrap_or(0) == 0

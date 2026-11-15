@@ -1538,10 +1538,11 @@ impl Simulator {
     /// struct formal read nothing. Install this process's own again,
     /// outermost frame first.
     pub(super) fn reinstall_struct_formal_meta(&mut self) {
-        if !self
-            .task_cleanup
-            .iter()
-            .any(|c| !c.struct_formal_meta.is_empty())
+        if self.ref_park_flags & super::ref_aliases::REF_PARK_META == 0
+            || !self
+                .task_cleanup
+                .iter()
+                .any(|c| !c.struct_formal_meta.is_empty())
         {
             return;
         }
@@ -2813,11 +2814,16 @@ impl Simulator {
         // `TaskCleanup::struct_formal_meta`).
         let mut struct_formal_meta: Vec<(String, FormalMetaParts)> = Vec::new();
         for port in td.ports.iter().filter(|p| p.dimensions.is_empty()) {
+            // A built-in scalar registers no layout.
+            if Self::type_is_plain_scalar(&port.data_type) {
+                continue;
+            }
             let name = port.name.name.as_str();
             if self.formal_meta_has_selects(name)
                 && !struct_formal_meta.iter().any(|(n, _)| n == name)
             {
                 struct_formal_meta.push((name.to_string(), self.snapshot_formal_parts(name)));
+                self.ref_park_flags |= super::ref_aliases::REF_PARK_META;
             }
         }
         self.commit_formal_dyn(formal_dyn);
@@ -2902,6 +2908,10 @@ impl Simulator {
         {
             alias_map.extend(leaf_aliases);
             alias_map.extend([marker]);
+            self.ref_park_flags |= super::ref_aliases::REF_PARK_LEAVES;
+        }
+        if alias_map.values().any(|s| s.ends_with(']')) {
+            self.ref_park_flags |= super::ref_aliases::REF_PARK_ELEMS;
         }
         // An aliased ref writes through during the call — a return copy-out
         // would CLOBBER writes other processes made to the actual while this

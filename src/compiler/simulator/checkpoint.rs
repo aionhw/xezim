@@ -1536,6 +1536,7 @@ checkpoint_state!(
     ref_alias_stack,
     ref_binding_stack,
     ref_identity_stack,
+    ref_park_flags,
     ref_redirect_hot,
     return_flag,
     return_value,
