@@ -1256,3 +1256,5 @@ mod type_param_struct_members_1082;
 mod redeclared_property_base_scope_1064;
 #[path = "classes/static_packed_member_writes_1046.rs"]
 mod static_packed_member_writes_1046;
+#[path = "classes/builtin_class_struct_members_1161.rs"]
+mod builtin_class_struct_members_1161;
