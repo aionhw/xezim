@@ -3269,6 +3269,10 @@ impl Simulator {
             if w != 0 && !is_str && !resized.is_real {
                 resized.is_signed = self.signal_signed[id];
             }
+            if let Some(cap) = self.pattern_nba_capture.as_mut() {
+                cap.push((id, resized));
+                return;
+            }
             if self.signal_table[id] != resized {
                 self.mark_dirty_id(id);
                 write_sig!(self, id, resized);
@@ -3309,6 +3313,10 @@ impl Simulator {
             // later read sign-extended it (barr[i] read back as -7).
             if !is_str && !resized.is_real {
                 resized.is_signed = self.signal_signed[id];
+            }
+            if let Some(cap) = self.pattern_nba_capture.as_mut() {
+                cap.push((id, resized));
+                return;
             }
             if self.signal_table[id] != resized {
                 self.mark_dirty_id(id);

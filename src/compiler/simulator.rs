@@ -3086,6 +3086,7 @@ mod process_control;
 mod process_scopes;
 mod processes;
 mod profiling;
+mod pattern_nba;
 mod sensitivity;
 mod settling;
 mod setup;
@@ -7677,6 +7678,12 @@ pub struct Simulator {
     delayed_nba: Vec<(u64, usize, Value)>,
     /// Future NBA writes whose targets require captured declaration context.
     delayed_nba_queue: Vec<(u64, NbaEntry)>,
+    /// §10.4.2: while a nonblocking assignment spreads an assignment pattern
+    /// over the member signals of an unpacked aggregate, the leaf writes are
+    /// collected here as `(signal id, fitted value)` instead of being stored,
+    /// and are then posted as nonblocking updates. `None` outside that
+    /// spread, so it never outlives one statement.
+    pattern_nba_capture: Option<Vec<(usize, Value)>>,
     /// NBA writes into PACKED-ARENA cells (issue #147). A packed cell has no
     /// `signal_table` slot, so it cannot ride `nba_fast` (apply indexes the
     /// per-signal tables) — and committing immediately gave NBAs into big

@@ -4036,6 +4036,7 @@ impl Simulator {
             delayed_slice_chains: false,
             delayed_nba: Vec::new(),
             delayed_nba_queue: Vec::new(),
+            pattern_nba_capture: None,
             packed_nba: Vec::new(),
             udp_runtime: Vec::new(),
             has_udp: false,

@@ -4310,24 +4310,13 @@ impl Simulator {
                 let rvalue = self.unpacked_pattern(rvalue);
                 // §10.9.2/§10.10: a pattern written to an aggregate whose
                 // leaves are separate signals (unpacked struct, unpacked array
-                // of them, associative array) is spread member-wise.
-                if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
-                    if packed_pattern.is_none() {
-                        let spread = if matches!(&lvalue.kind, ExprKind::Ident(_)) {
-                            self.pattern_aggregate_names(lvalue)
-                                .into_iter()
-                                .any(|n| self.assign_pattern_aggregate(&n, items))
-                        } else {
-                            self.assign_pattern_element(lvalue, rvalue)
-                                || match self.flat_member_name(lvalue) {
-                                    Some(flat) => self.assign_pattern_flat(&flat, items),
-                                    None => false,
-                                }
-                        };
-                        if spread {
-                            return;
-                        }
-                    }
+                // of them, associative array) is spread member-wise, each leaf
+                // a nonblocking update of its own (§10.4.2).
+                if let ExprKind::AssignmentPattern(items) = &rvalue.kind
+                    && packed_pattern.is_none()
+                    && self.spread_pattern_nba(lvalue, rvalue, items, intra_d, delay.as_ref())
+                {
+                    return;
                 }
                 // §10.4.2: a whole UNPACKED struct has no storage of its own —
                 // its member leaves are the storage — so it is updated as one
@@ -4337,13 +4326,7 @@ impl Simulator {
                     .or_else(|| self.unpacked_row_nba_leaves(lvalue, rvalue))
                     .or_else(|| self.unpacked_struct_nba_leaves(lvalue, rvalue))
                 {
-                    let d = match intra_d {
-                        Some(d) => d,
-                        None => delay
-                            .as_ref()
-                            .map(|de| self.eval_expr(de).to_u64().unwrap_or(0))
-                            .unwrap_or(0),
-                    };
+                    let d = self.nba_delay_ticks(intra_d, delay.as_ref());
                     let delay_expr = (d > 0).then(|| {
                         Expression::new(
                             ExprKind::Number(NumberLiteral::Integer {
@@ -4563,13 +4546,7 @@ impl Simulator {
                 // variables, not this frame's.
                 let rebound = !std::ptr::eq(lvalue, written);
                 let w = self.infer_lhs_width(lvalue);
-                let d = match intra_d {
-                    Some(d) => d,
-                    None => delay
-                        .as_ref()
-                        .map(|de| self.eval_expr(de).to_u64().unwrap_or(0))
-                        .unwrap_or(0),
-                };
+                let d = self.nba_delay_ticks(intra_d, delay.as_ref());
                 // §10.4.2 / §6.21: capture persistent storage before the
                 // call frame is restored. Every write still commits in NBA.
                 if let Some(key) = self.nba_static_key_for_lvalue(lvalue) {
@@ -4591,34 +4568,8 @@ impl Simulator {
                     return;
                 }
                 if d == 0 {
-                    let id_opt = self.resolve_nba_target(lvalue);
-                    if let Some(id) = id_opt
-                        && self.nba_behind_queued_partial(id)
-                    {
-                        // §4.6 b): a partial update to this signal is already
-                        // queued; `nba_fast` would commit this one first.
-                        self.nba_queue.push(NbaEntry {
-                            lhs: None,
-                            value: val.resize_for_assign(w),
-                            resolved_id: Some(id),
-                            static_key: None,
-                            static_slice: None,
-                            this_handle: None,
-                            root_frame: None,
-                        });
-                    } else if let Some(id) = id_opt {
-                        // Track via index map so subsequent partial-NBAs
-                        // (NbaAssignRange / NbaAssignBitDyn from the
-                        // bytecode VM) targeting the same signal merge into
-                        // this entry rather than re-seeding from
-                        // signal_table — same invariant as the bytecode
-                        // NbaAssign Insn.
-                        self.nba_fast_index.insert(id, self.nba_fast.len());
-                        self.nba_fast.push(NbaFast {
-                            block_index: 0,
-                            signal_id: id,
-                            value: val.resize_for_assign(w),
-                        });
+                    if let Some(id) = self.resolve_nba_target(lvalue) {
+                        self.post_signal_nba(id, val.resize_for_assign(w), 0);
                     } else if self.try_schedule_packed_index_nba(lvalue, &val) {
                         // The packed slice has already been merged into the
                         // pending whole-signal value.
@@ -4649,29 +4600,7 @@ impl Simulator {
                         });
                     }
                 } else if let Some(id) = self.resolve_nba_target(lvalue) {
-                    // Delayed NBA is transport, not inertial: push directly
-                    // so pending same-signal updates are NOT cancelled.
-                    // §4.9.4: matures in the target slot's NBA REGION — the
-                    // separate queue commits inside apply_nba, so Active
-                    // reads at the same time still see the old value.
-                    //
-                    // Reference-parity (#145): a delayed NBA whose captured
-                    // value equals the CURRENT value is elided at SCHEDULE
-                    // time (`q = 0; q <= #5 0; #1 q = 1;` leaves q at 1 —
-                    // the reference never lands the update). Elide only when
-                    // no delayed NBA is already pending for the id: a
-                    // pending entry, not the register, is the truth then
-                    // (the #142 rule).
-                    let mut v = val.resize_for_assign(w);
-                    // Normalize signedness to the TARGET before comparing —
-                    // the apply site does the same at maturity, and without
-                    // it the elision compare saw identical bits as unequal
-                    // Values and always pushed.
-                    v.is_signed = self.signal_signed[id];
-                    let pending_here = self.delayed_nba.iter().any(|(_, sid, _)| *sid == id);
-                    if pending_here || self.signal_table[id] != v {
-                        self.delayed_nba.push((self.time + d, id, v));
-                    }
+                    self.post_signal_nba(id, val.resize_for_assign(w), d);
                 } else {
                     let frozen = self.freeze_lvalue_indices(lvalue);
                     let qval = if self.nba_target_is_assoc_elem(lvalue) {
