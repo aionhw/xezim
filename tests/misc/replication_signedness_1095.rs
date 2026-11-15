@@ -85,3 +85,34 @@ fn keeps_signed_input_port_from_unsigned_replication() {
         false,
     );
 }
+
+/// §23.3.3.8 (whole-net cousin, both directions): the implied connection copy
+/// from a WHOLE-NET actual of the opposite sign must re-interpret the bits
+/// through the formal's own declared type. Collapsing the copy onto the actual
+/// reads the actual's bits with the actual's sign (signed formal -> unsigned
+/// actual zero-extends 0xffff_fffb to 4294967291 instead of -5).
+#[test]
+fn keeps_signed_input_port_from_unsigned_whole_net() {
+    check(
+        include_str!(
+            "replication_signedness_1095/keeps_signed_input_port_from_unsigned_whole_net.sv"
+        ),
+        &["PASS signed-formal q=-5"],
+        false,
+    );
+}
+
+/// §23.3.3.8 (mirror whole-net direction): an UNSIGNED `input [31:0] p` bound
+/// to a SIGNED `int s` actual must read as the unsigned value inside the child;
+/// re-pointing the formal onto the signed actual would sign-extend -5 to -5
+/// instead of 4294967291.
+#[test]
+fn keeps_unsigned_input_port_from_signed_whole_net() {
+    check(
+        include_str!(
+            "replication_signedness_1095/keeps_unsigned_input_port_from_signed_whole_net.sv"
+        ),
+        &["PASS unsigned-formal q=4294967291"],
+        false,
+    );
+}
