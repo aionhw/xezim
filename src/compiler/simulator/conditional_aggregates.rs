@@ -907,8 +907,25 @@ impl Simulator {
         let ExprKind::TypedPattern { ty, pattern } = &e.kind else {
             return None;
         };
+        self.with_pattern_storage(pattern, ty, e.span, f)
+    }
+
+    /// §10.9: run `f` on storage holding the value of `pattern` taken in
+    /// the unpacked type `ty` — a variable of type `ty` initialized with
+    /// the pattern — then release it. None when `ty` is not an unpacked
+    /// aggregate type or the pattern cannot be snapshotted against it.
+    /// The snapshot goes through `snapshot_aggregate_operand`, so a
+    /// conditional pattern is selected arm by arm, as an assignment's
+    /// conditional aggregate is.
+    fn with_pattern_storage<R>(
+        &mut self,
+        pattern: &Expression,
+        ty: &DataType,
+        span: crate::ast::Span,
+        f: impl FnOnce(&mut Self, &Expression) -> R,
+    ) -> Option<R> {
         let (dt, dims) = self.unpacked_type_shape(ty)?;
-        let value = self.snapshot_aggregate_operand_body(
+        let value = self.snapshot_aggregate_operand(
             pattern,
             Some(AggregateContext::Declared(&dt, &dims)),
         )?;
@@ -919,11 +936,11 @@ impl Simulator {
             vec![crate::ast::expr::HierPathSegment {
                 name: crate::ast::Identifier {
                     name: name.clone(),
-                    span: e.span,
+                    span,
                 },
                 selects: Vec::new(),
             }],
-            e.span,
+            span,
         );
         let out = f(self, &held);
         self.release_conditional_aggregate(&name, &value);
@@ -939,6 +956,30 @@ impl Simulator {
         };
         let su = self.unpacked_struct_of(ty)?;
         self.with_typed_pattern_storage(e, |sim, held| {
+            let ExprKind::Ident(h) = &held.kind else {
+                return None;
+            };
+            sim.pack_unpacked_struct(&h.path[0].name.name, &su)
+        })?
+    }
+
+    /// The packed transport value of the pattern `pattern` taken in the
+    /// unpacked struct type `dt` (§10.9, §13.4.1): a pattern returned from
+    /// a function or method of that type, carried as an unpacked struct
+    /// return carries a struct variable. None when `dt` is not an unpacked
+    /// struct, or carries unpacked dimensions of its own (an array of
+    /// structs is a collection return, not a struct return).
+    pub(super) fn unpacked_struct_pattern_value(
+        &mut self,
+        pattern: &Expression,
+        dt: &DataType,
+    ) -> Option<Value> {
+        let su = self.unpacked_struct_of(dt)?;
+        let (_, dims) = self.unpacked_type_shape(dt)?;
+        if !dims.is_empty() {
+            return None;
+        }
+        self.with_pattern_storage(pattern, dt, pattern.span, |sim, held| {
             let ExprKind::Ident(h) = &held.kind else {
                 return None;
             };

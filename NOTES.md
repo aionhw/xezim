@@ -268,6 +268,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (`h.a`, `h.x`) names the child's block: it read a same-named block of the
   top module (§10.3.2, §13.5.4, §23.9, §27.5, #1110, reported by ds54e).
 
+* An assignment pattern returned directly from a function or method whose
+  return type is an unpacked struct is now distributed member by member
+  (§10.9, §13.4.1), as the same pattern assigned to a struct variable is.
+  It previously fell through to the generic evaluator, which concatenated
+  the items into one flat value, so the members came back shifted — with
+  string members, every string landed concatenated in the last member and
+  the earlier members read empty.
+
 ### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
 
 **Performance**

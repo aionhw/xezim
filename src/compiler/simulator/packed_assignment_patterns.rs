@@ -260,17 +260,23 @@ impl Simulator {
     }
 
     /// The value `return e` yields when `e` holds a pattern (§13.4.1).
+    /// A packed return type takes the slice plan; an unpacked struct takes
+    /// the pattern member by member, as a typed pattern does (§10.9) —
+    /// without that route the generic evaluator concatenates the items
+    /// into one flat value and the members are lost.
     pub(super) fn ret_pattern_value(&mut self, e: &Expression) -> Option<Value> {
         if !has_pattern(e) {
             return None;
         }
         match self.fn_ret_frames.last()?.clone() {
             ReturnPatternType::NotPacked => None,
-            ReturnPatternType::Func(dt) => self.eval_in_packed_type(e, &dt),
+            ReturnPatternType::Func(dt) => self
+                .eval_in_packed_type(e, &dt)
+                .or_else(|| self.unpacked_struct_pattern_value(e, &dt)),
             ReturnPatternType::Method(m) => match &m.kind {
-                crate::ast::decl::ClassMethodKind::Function(f) => {
-                    self.eval_in_packed_type(e, &f.return_type)
-                }
+                crate::ast::decl::ClassMethodKind::Function(f) => self
+                    .eval_in_packed_type(e, &f.return_type)
+                    .or_else(|| self.unpacked_struct_pattern_value(e, &f.return_type)),
                 _ => None,
             },
         }
