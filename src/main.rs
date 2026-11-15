@@ -386,11 +386,15 @@ fn print_usage() {
     eprintln!("                   Repeatable, and the two entry forms may be mixed: a bare name");
     eprintln!("                   is a MODULE definition, so every instance of it at any depth");
     eprintln!("                   goes; a dotted name is one hierarchical path, with or without");
-    eprintln!("                   the top-module prefix.");
+    eprintln!("                   the top-module prefix: an instance, an instance array, a");
+    eprintln!("                   generate block or one variable. A bare name that is no module");
+    eprintln!("                   is a path below the top module.");
     eprintln!("  --wave-suppress-module <name>  --wave-suppress, reading <name> as a module");
     eprintln!("                   definition even if an instance carries the same name.");
     eprintln!("  -wave_suppress_file <file>  (--wave-suppress-file) Exclusions from a file: one");
-    eprintln!("                   per line, '#' or '//' comments. Adds to --wave-suppress.");
+    eprintln!(
+        "                   or more per line, '#' or '//' comments. Adds to --wave-suppress."
+    );
     eprintln!("  --fst-repack[=N] gzip-wrap the finished FST on a clean close (GTKWave's");
     eprintln!("                   repack-on-close; deflate level N, 1..9, default 6). About");
     eprintln!("                   1.5x smaller; readers inflate it on open.");
@@ -3636,6 +3640,9 @@ suppressed but the explicit SDF annotation still applies."
                         xezim::compiler::simulator::set_dump_timescales(dump_timescales);
                         xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
                         xezim::compiler::simulator::set_vpi_libs(&vpi_libs);
+                        // The exclusion list applies to a compiled artifact's
+                        // dumps as well.
+                        xezim::compiler::simulator::set_wave_suppress(&wave_suppress);
                         let mut sim = xezim::compiler::Simulator::new(elab, max_time);
                         if let Some(limit) = settle_limit {
                             sim.settle_limit = limit;

@@ -65,22 +65,32 @@ impl WaveSuppressor {
                 return Some((i, 0));
             }
         }
+        // A prefix that ends in element selects (`u_arr[1]`, `g[0]`) is
+        // also under an entry naming the array itself, and so is an element
+        // of an unpacked array variable (`mem[3]` under `mem`).
+        let covering = |end: usize| -> Option<(usize, usize)> {
+            let mut e = end;
+            loop {
+                if let Some(&i) = self.owner.get(&name[..e])
+                    && free(e)
+                {
+                    return Some((i, e));
+                }
+                if !name[..e].ends_with(']') {
+                    return None;
+                }
+                e = name[..e].rfind('[')?;
+            }
+        };
         let mut cut = 0usize;
         while let Some(p) = name[cut..].find('.') {
             let end = cut + p;
-            if let Some(&i) = self.owner.get(&name[..end]) {
-                if free(end) {
-                    return Some((i, end));
-                }
+            if let Some(hit) = covering(end) {
+                return Some(hit);
             }
             cut = end + 1;
         }
-        if let Some(&i) = self.owner.get(name) {
-            if free(name.len()) {
-                return Some((i, name.len()));
-            }
-        }
-        None
+        covering(name.len())
     }
 
     /// Include wins over exclude for an EXPLICIT request: a whitelist entry
@@ -92,8 +102,14 @@ impl WaveSuppressor {
         filters.iter().any(|f| {
             f.len() >= plen
                 && f.starts_with(prefix)
-                // `top.u_h1` re-admits `top.u_h1` and `top.u_h1.a`, not `top.u_h10`.
-                && (f.len() == plen || f.as_bytes()[plen] == b'.')
+                // `top.u_h1` re-admits `top.u_h1`, `top.u_h1.a` and the
+                // element `top.u_h1[2]`, not `top.u_h10`.
+                && (f.len() == plen || matches!(f.as_bytes()[plen], b'.' | b'['))
+                // The request brings back what it names, not its siblings
+                // under the same entry.
+                && name
+                    .strip_prefix(f.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
         })
     }
 
@@ -115,21 +131,34 @@ impl WaveSuppressor {
     /// nothing mean a typo, so only then is it worth a warning.  With a
     /// whitelist, an entry that never fired may simply have had nothing to do.
     pub(crate) fn report(&self, tag: &str, whole_design: bool) {
-        for s in &self.scopes {
+        for (idx, s) in self.scopes.iter().enumerate() {
+            let module = s.entry.strip_prefix("module:").unwrap_or(s.entry.as_str());
             if s.dropped == 0 {
-                if whole_design {
+                // An entry inside what an earlier entry already excludes
+                // had nothing left to match; that is no typo.
+                let covered = self.all.is_some_and(|i| i != idx)
+                    || s.paths.iter().any(|p| {
+                        self.owner_of(p, None).is_some_and(|(i, _)| i != idx)
+                            || self.owner.get(p).is_some_and(|&i| i != idx)
+                    });
+                if whole_design && !covered {
                     eprintln!(
                         "Warning: --wave-suppress '{}' matched no dumped signal",
                         s.entry
                     );
                 }
+            } else if self.all == Some(idx) {
+                eprintln!(
+                    "{} Suppressed {} signals under the top module '{}'",
+                    tag, s.dropped, module
+                );
             } else if s.by_module {
                 eprintln!(
                     "{} Suppressed {} signals under {} instance(s) of module '{}'",
                     tag,
                     s.dropped,
                     s.paths.len(),
-                    s.entry.strip_prefix("module:").unwrap_or(s.entry.as_str()),
+                    module,
                 );
             } else {
                 eprintln!(
@@ -336,6 +365,11 @@ impl Simulator {
             };
             let idx = s.scopes.len();
             let mut paths: Vec<String> = Vec::new();
+            // A bare name that is no module definition is a path below the
+            // top module, as a bare `--fst-scope` name is: an instance or a
+            // variable of the top module.
+            let by_module = by_module
+                && (text.starts_with("module:") || body == top || instances_of.contains_key(body));
             if by_module {
                 if body == top {
                     // Suppressing the top module excludes the whole design.
@@ -381,10 +415,8 @@ impl Simulator {
     ///
     /// `scopes`/`depth` are the INCLUDE side (`--fst-scope` + `LEVEL:`, or the
     /// `$dumpvars` arguments): `None` means the whole design, `Some(list)` keeps
-    /// a name that is one of them or lives under one of them, where a scope
-    /// `a.b` also covers the flattened array elements `a.b[0]`, `a.b[1]`, … of
-    /// an instance array `b` (a generate block is one too — `genblk[3]` is an
-    /// instance, so `--fst-scope tb_top.dut.genblk[3]` must reach its signals).
+    /// a name that is one of them or lives under one of them (one generated
+    /// or arrayed instance is named with its index, `tb_top.dut.genblk[3]`).
     /// `depth` counts levels below the scope itself, so `depth == 1` keeps only
     /// the scope's own variables; `0` means unlimited, and the writer applies
     /// the writer's own depth limit.

@@ -80,20 +80,27 @@ per-signal trace table. Pass `--wave` to enable `$dumpfile`/`$dumpvars`
 `--fst` and `--xtrace` imply `--wave`. The three formats are cross-checked
 against each other by decoding them.
 
-Every scope option above is an INCLUDE list; `--wave-suppress <entry>` is the
-other half, and one list serves all three formats. A bare name is a MODULE
-definition, so `--wave-suppress mem_bank` drops all 200 banks wherever they
-sit — the one line that replaces the 200 instance paths the include side needs
-for the same result. A dotted name is one hierarchical path, so
-`--wave-suppress tb_top.u_blk.u_bank0` drops exactly that subtree (the
-top-module prefix is optional). `--wave-suppress-module <name>` forces the
-module reading of a name that is also an instance, and
-`--wave-suppress-file <file>` reads the list from a file. Exclusion happens as
-the dump enumerates its signals, so a suppressed subtree never reaches the
-writer, the identifier tables or the per-step change detection, and each entry
-reports what it cost — or warns when it matched nothing. An `--fst-scope` or
-`--xtrace-scope` that names the subtree anyway is an explicit request for it
-and wins.
+The scope options above select what to dump; `--wave-suppress <entry>`
+excludes, and one list applies to all three formats. A bare name is a module
+definition: `--wave-suppress mem_bank` drops every instance of `mem_bank` at
+any depth. A dotted name is one hierarchical path, with or without the
+top-module name: `--wave-suppress tb_top.u_blk.u_bank0` drops that instance
+and everything below it. A path can also name an instance array or a generate
+loop (all of its elements, or one as `g_lane[1]`) or a variable (an unpacked
+array with all of its elements, or one element). A bare name that is not a
+module is read as a path below the top module, so `--wave-suppress u_blk`
+works like `--fst-scope u_blk`; `--wave-suppress-module <name>` forces the
+module reading when an instance has the same name as a module.
+`--wave-suppress-file <file>` reads entries from a file.
+
+Excluded signals are dropped while the dump collects its signals, so they
+cost nothing in the header, the identifier tables or the per-step change
+detection. Each entry reports how many signals it removed, and an entry that
+removed nothing is reported with a warning when the whole design was
+selected. An `--fst-scope`, `--xtrace-scope` or `$dumpvars` argument that
+names an excluded scope, or something inside it, dumps what it names; other
+entries still apply inside it. A compiled artifact takes the options when it
+is run.
 
 Ctrl-C (SIGINT) or SIGTERM stops the run at the current time and closes the
 dumps normally; this includes a long loop inside one time slot. If the run
