@@ -32,7 +32,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // Annex D.9 / §8.3: rebuild property-owner indexes from restored classes.
 // §16.12.14: abort properties in SvaNode/SvaState, settled attempts per site.
 // §16.12.8: SvaNode::Implies.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x0a";
+// §13.5.2: TaskCleanup::struct_formal_meta, Simulator::ref_park_flags.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x0b";
 
 #[derive(Default)]
 struct Session {
