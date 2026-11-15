@@ -3580,7 +3580,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// Does `stmt` declare a variable anywhere (a block-local `VarDecl`)?
     fn stmt_declares(stmt: &Statement) -> bool {
         match &stmt.kind {
-            StatementKind::VarDecl { .. } => true,
+            StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. } => true,
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                 stmts.iter().any(Self::stmt_declares)
             }
@@ -4382,12 +4382,447 @@ impl<'a> BytecodeCompiler<'a> {
     /// become register-backed locals; a `return <expr>` assigns the return
     /// register (only valid as the final statement, which is the shape any
     /// combinational helper uses).
+    fn untyped_param_effective_dt(
+        &self,
+        signing: &Option<crate::ast::types::Signing>,
+        init: Option<&Expression>,
+        span: crate::ast::Span,
+    ) -> crate::ast::types::DataType {
+        use crate::ast::types::{
+            DataType, IntegerVectorType, PackedDimension, RealType, Signing, SimpleType,
+        };
+        if let Some(e) = init {
+            if self.expr_is_real_static(e) {
+                return DataType::Real {
+                    kind: RealType::Real,
+                    span,
+                };
+            }
+            if self.expr_is_string_static(e) {
+                return DataType::Simple {
+                    kind: SimpleType::String,
+                    span,
+                };
+            }
+        }
+        let w = self
+            .params
+            .and_then(|p| init.and_then(|e| crate::compiler::elaborate::untyped_param_width(e, p)))
+            .unwrap_or(32)
+            .max(1);
+        let eff_signing = match signing {
+            Some(s) => Some(*s),
+            None => match (self.params, init) {
+                (Some(p), Some(e)) => Some(
+                    if crate::compiler::elaborate::untyped_param_is_signed(e, p) {
+                        Signing::Signed
+                    } else {
+                        Signing::Unsigned
+                    },
+                ),
+                _ => Some(Signing::Signed),
+            },
+        };
+        let int_lit = |val: String| {
+            Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                    size: Some(32),
+                    signed: false,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: val,
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                }),
+                span,
+            )
+        };
+        DataType::IntegerVector {
+            kind: IntegerVectorType::Logic,
+            signing: eff_signing,
+            dimensions: vec![PackedDimension::Range {
+                left: Box::new(int_lit((w - 1).to_string())),
+                right: Box::new(int_lit("0".to_string())),
+                span,
+            }],
+            span,
+        }
+    }
+
+    fn compile_stmt_decl_item(
+        &mut self,
+        stmt_span: crate::ast::Span,
+        data_type: &crate::ast::types::DataType,
+        lifetime: &Option<crate::ast::types::Lifetime>,
+        decl: &crate::ast::stmt::VarDeclarator,
+    ) -> bool {
+        // §6.18: a local declared through a typedef that carries
+        // unpacked dims is a collection too. A queue / unsized
+        // array without an initializer takes the local-collection
+        // path below; any other shape stays on the AST path.
+        if decl.dimensions.is_empty()
+            && let crate::ast::types::DataType::TypeReference { name: tn, .. } = data_type
+            && let Some(dims) = self.typedef_coll_dims.get(&type_name_key(tn))
+        {
+            use crate::ast::types::UnpackedDimension as UD;
+            if self.method_mode
+                && decl.init.is_none()
+                && dims.len() == 1
+                && matches!(dims[0], UD::Queue { .. } | UD::Unsized(_))
+            {
+                let synth = Statement::new(
+                    StatementKind::VarDecl {
+                        data_type: data_type.clone(),
+                        lifetime: lifetime.clone(),
+                        declarators: vec![decl.clone()],
+                    },
+                    stmt_span,
+                );
+                self.emit(Insn::InitLocalColl(Box::new((
+                    Arc::new(synth),
+                    Arc::from("VarDecl_local_coll"),
+                ))));
+                self.local_coll_names.insert(decl.name.name.clone());
+                // §6.16: `typedef string q_t[$]` elements are
+                // strings, as a `string q[$]` local's are.
+                if self.typedef_coll_strings.contains(&type_name_key(tn)) {
+                    self.local_coll_strings.insert(decl.name.name.clone());
+                } else {
+                    self.local_coll_strings.remove(&decl.name.name);
+                }
+                return true;
+            }
+            self.bail("VarDecl_typedef_array");
+            return false;
+        }
+        if !decl.dimensions.is_empty() {
+            use crate::ast::types::UnpackedDimension as UD;
+            if self.method_mode
+                && decl.init.is_none()
+                && decl.dimensions.len() == 1
+                && matches!(decl.dimensions[0], UD::Queue { .. } | UD::Unsized(_))
+            {
+                let synth = Statement::new(
+                    StatementKind::VarDecl {
+                        data_type: data_type.clone(),
+                        lifetime: lifetime.clone(),
+                        declarators: vec![decl.clone()],
+                    },
+                    stmt_span,
+                );
+                self.emit(Insn::InitLocalColl(Box::new((
+                    Arc::new(synth),
+                    Arc::from("VarDecl_local_coll"),
+                ))));
+                self.local_coll_names.insert(decl.name.name.clone());
+                if Self::dt_is_string(data_type) {
+                    self.local_coll_strings.insert(decl.name.name.clone());
+                } else {
+                    self.local_coll_strings.remove(&decl.name.name);
+                }
+                return true;
+            }
+            // One constant-bounded unpacked dimension, small: a
+            // register bank. (`logic [7:0] tmp [0:15]` in an
+            // inlined AES shift_rows / rcon table.) Every access
+            // must fold to a constant index or the enclosing
+            // compile fails and rolls back.
+            let bounds = if decl.dimensions.len() == 1 {
+                match &decl.dimensions[0] {
+                    UD::Range { left, right, .. } => {
+                        let l = self.fold_const(left).and_then(|v| v.to_u64());
+                        let r = self.fold_const(right).and_then(|v| v.to_u64());
+                        match (l, r) {
+                            (Some(l), Some(r)) => {
+                                let (lo, hi) = (l.min(r) as i64, l.max(r) as i64);
+                                Some((lo, (hi - lo + 1) as usize))
+                            }
+                            _ => None,
+                        }
+                    }
+                    UD::Expression { expr, .. } => self
+                        .fold_const(expr)
+                        .and_then(|v| v.to_u64())
+                        .filter(|&n| n > 0)
+                        .map(|n| (0i64, n as usize)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let Some((lo, len)) = bounds.filter(|&(_, n)| n <= 64) else {
+                self.bail("VarDecl_array");
+                return false;
+            };
+            if decl.init.is_some() {
+                self.bail("VarDecl_array_init");
+                return false;
+            }
+            let ew = self.decl_width(data_type);
+            let base = self.next_reg;
+            for _ in 0..len {
+                let slot = self.alloc_reg();
+                let init = self.type_default_value(data_type, ew);
+                self.emit(Insn::LoadConst(slot, Box::new(init)));
+            }
+            let Ok(base) = RegId::try_from(base) else {
+                self.bail("VarDecl_array");
+                return false;
+            };
+            self.local_array_regs
+                .insert(decl.name.name.clone(), (base, ew, len, lo));
+            return true;
+        }
+        // §6.16 string local: no declared width — bind at width
+        // 0 so no Resize ever lands on it, and mark it for the
+        // %s / string-assign paths.
+        let is_string = self.decl_is_string(data_type, None);
+        let decl_width = if is_string {
+            0
+        } else {
+            self.decl_width(data_type)
+        };
+        // §6.21: a STATIC local persists across calls — its
+        // declaration runs ONCE. A declarator WITH an initializer
+        // has run-once semantics the block cannot express — bail
+        // the whole method to the AST path.
+        if self.method_mode
+            && matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+        {
+            if decl.init.is_some() {
+                self.bail("static_local_init");
+                return false;
+            }
+            let slot = self.alloc_reg();
+            let is_real = self.decl_is_real(data_type, None);
+            let is_string = self.decl_is_string(data_type, None);
+            let is_class_handle = self.class_local_names.contains(&decl.name.name);
+            let (w, default) = if is_class_handle {
+                (0, Value::zero(32))
+            } else if is_real {
+                (0, Value::from_f64(0.0))
+            } else {
+                let w = if is_string {
+                    0
+                } else {
+                    self.decl_width(data_type)
+                };
+                (w, self.type_default_value(data_type, w))
+            };
+            if is_class_handle {
+                self.method_handle_names.insert(decl.name.name.clone());
+            } else {
+                if is_real {
+                    self.local_var_is_real.insert(decl.name.name.clone());
+                }
+                if is_string {
+                    self.local_var_is_string.insert(decl.name.name.clone());
+                }
+                if let Some(k) = self.local_kind_of(data_type, None) {
+                    self.local_kinds.insert(slot, k);
+                }
+            }
+            self.local_var_regs
+                .insert(decl.name.name.clone(), (slot, w));
+            self.decl_local_regs.insert(decl.name.name.clone());
+            self.method_static_locals
+                .push((decl.name.name.clone(), slot, default));
+            return true;
+        }
+        // Step 6: a CLASS-typed local holds a heap HANDLE in a register.
+        if self.method_mode && self.class_local_names.contains(&decl.name.name) {
+            let slot = self.alloc_reg();
+            let new_cls = decl
+                .init
+                .as_ref()
+                .filter(|e| Self::is_new_shape(e))
+                .and_then(|_| self.new_type_map.get(&decl.name.name))
+                .filter(|cls| {
+                    matches!(data_type, crate::ast::types::DataType::TypeReference { name, .. }
+                        if name.name.name.rsplit("::").next() == Some(cls.as_str()))
+                })
+                .cloned();
+            match &decl.init {
+                Some(expr) if new_cls.is_some() => {
+                    let cls = new_cls.expect("checked");
+                    let Some(value) = self.compile_new_construct(expr, &cls) else {
+                        self.bail("VarDecl_init");
+                        return false;
+                    };
+                    self.emit(Insn::Move(slot, value));
+                }
+                Some(expr) => {
+                    let Some(value) = self.compile_expr(expr, 0) else {
+                        self.bail("VarDecl_init");
+                        return false;
+                    };
+                    self.emit(Insn::Move(slot, value));
+                }
+                None => {
+                    self.emit(Insn::LoadConst(slot, Box::new(Value::zero(32))));
+                }
+            }
+            if self.method_bound_names.contains(&decl.name.name)
+                && self.local_var_regs.contains_key(&decl.name.name)
+            {
+                self.method_shadowing_regs.insert(slot);
+            }
+            self.local_var_regs
+                .insert(decl.name.name.clone(), (slot, 0));
+            self.method_handle_names.insert(decl.name.name.clone());
+            self.decl_local_regs.insert(decl.name.name.clone());
+            return true;
+        }
+        // §6.12: a `real` local holds a real, whatever its
+        // initializer (or its default, 0.0) is.
+        let is_real = self.decl_is_real(data_type, None);
+        let kind = if is_string {
+            Some(LocalKind::Str)
+        } else {
+            self.local_kind_of(data_type, None)
+        };
+        let slot = self.alloc_reg();
+        match kind {
+            Some(k) => {
+                self.local_kinds.insert(slot, k);
+            }
+            None => {
+                self.local_kinds.remove(&slot);
+            }
+        }
+        let width = decl_width;
+        match &decl.init {
+            Some(expr) => {
+                let Some(value) = self.compile_expr(expr, width) else {
+                    self.bail("VarDecl_init");
+                    return false;
+                };
+                self.emit(Insn::Move(slot, value));
+            }
+            None => {
+                let value = if is_real {
+                    Value::from_f64(0.0)
+                } else {
+                    self.type_default_value(data_type, width)
+                };
+                self.emit(Insn::LoadConst(slot, Box::new(value)));
+            }
+        }
+        let name = &decl.name.name;
+        if is_real {
+            self.emit_to_real(slot);
+            self.local_var_is_real.insert(name.clone());
+        } else {
+            self.local_var_is_real.remove(name);
+            if width > 0 {
+                self.emit(Insn::Resize(slot, width));
+                self.emit_local_fit(slot);
+            }
+        }
+        if is_string {
+            self.local_var_is_string.insert(name.clone());
+        } else {
+            self.local_var_is_string.remove(name);
+        }
+        self.local_var_regs.insert(name.clone(), (slot, width));
+        self.record_local_packed_type(slot, data_type);
+        self.decl_local_regs.insert(name.clone());
+        true
+    }
+
+    fn compile_pure_decl(
+        &mut self,
+        data_type: &crate::ast::types::DataType,
+        d: &crate::ast::stmt::VarDeclarator,
+    ) -> bool {
+        // Step 6: a CLASS-typed local holds a heap HANDLE in a
+        // register — default null (0), no resize (handles
+        // round-trip untouched), and the name joins
+        // `method_handle_names` so `.member` is a heap access.
+        if self.class_local_names.contains(&d.name.name) && d.dimensions.is_empty() {
+            let slot = self.alloc_reg();
+            match &d.init {
+                Some(e) => {
+                    let Some(v) = self.compile_expr(e, 0) else {
+                        return false;
+                    };
+                    self.emit(Insn::Move(slot, v));
+                }
+                None => {
+                    self.emit(Insn::LoadConst(slot, Box::new(Value::zero(32))));
+                }
+            }
+            self.local_var_regs.insert(d.name.name.clone(), (slot, 0));
+            self.method_handle_names.insert(d.name.name.clone());
+            return true;
+        }
+        let is_real = self.decl_is_real(data_type, None);
+        if !d.dimensions.is_empty() {
+            // A SMALL fixed-shape local array (`real row
+            // [0:3]`) — the working-buffer shape every
+            // interpolation helper uses — becomes one
+            // register per element; a dynamic index selects
+            // by compare/branch chain (see
+            // `compile_local_array_read`). Anything else
+            // (queues, big or non-constant shapes) keeps the
+            // AST path.
+            if d.init.is_some()
+                || !self.bind_local_array(&d.name.name, &d.dimensions, data_type, is_real)
+            {
+                self.bail("Expr_Call_local_array");
+                return false;
+            }
+            return true;
+        }
+        let is_string = self.decl_is_string(data_type, None);
+        let w = if is_string {
+            0
+        } else {
+            self.decl_width(data_type)
+        };
+        let slot = self.alloc_reg();
+        match &d.init {
+            Some(e) => {
+                let Some(v) = self.compile_expr(e, w) else {
+                    return false;
+                };
+                self.emit(Insn::Move(slot, v));
+            }
+            None => {
+                let init = self.type_default_value(data_type, w);
+                self.emit(Insn::LoadConst(slot, Box::new(init)));
+            }
+        }
+        if is_real {
+            self.local_var_is_real.insert(d.name.name.clone());
+            self.emit_to_real(slot);
+        } else if w > 0 {
+            self.emit(Insn::Resize(slot, w));
+        }
+        if is_string {
+            self.local_var_is_string.insert(d.name.name.clone());
+        }
+        if let Some(ew) = self.decl_elem_width(data_type) {
+            if ew > 0 && w > ew && w % ew == 0 {
+                if self.decl_outer_dim_unnormalized(data_type) {
+                    self.bail("Expr_Call_packed_outer_dim");
+                    return false;
+                }
+                self.local_var_elem.insert(d.name.name.clone(), ew);
+            }
+        }
+        if let Some(k) = self.local_kind_of(data_type, None) {
+            self.local_kinds.insert(slot, k);
+            self.emit_local_fit(slot);
+        }
+        self.local_var_regs.insert(d.name.name.clone(), (slot, w));
+        self.record_local_packed_type(slot, data_type);
+        true
+    }
+
     fn compile_pure_body(&mut self, items: &[Statement]) -> bool {
         for st in items {
             match &st.kind {
                 StatementKind::VarDecl {
                     data_type,
-                    lifetime,
                     declarators,
                     ..
                 } => {
@@ -4396,116 +4831,37 @@ impl<'a> BytecodeCompiler<'a> {
                         return false;
                     }
                     for d in declarators {
-                        // Step 6: a CLASS-typed local holds a heap HANDLE in a
-                        // register — default null (0), no resize (handles
-                        // round-trip untouched), and the name joins
-                        // `method_handle_names` so `.member` is a heap access.
-                        if self.class_local_names.contains(&d.name.name) && d.dimensions.is_empty()
+                        if !self.compile_pure_decl(data_type, d) {
+                            return false;
+                        }
+                    }
+                }
+                StatementKind::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
+                } => {
+                    if self.method_mode && self.class_alias_dynamic_width(data_type) {
+                        self.bail("class_alias_runtime_width");
+                        return false;
+                    }
+                    let untyped = matches!(
+                        data_type,
+                        crate::ast::types::DataType::Implicit { dimensions, .. }
+                            if dimensions.is_empty()
+                    );
+                    for d in declarators {
+                        let eff_dt = if untyped
+                            && let crate::ast::types::DataType::Implicit { signing, .. } = data_type
                         {
-                            let slot = self.alloc_reg();
-                            match &d.init {
-                                Some(e) => {
-                                    let Some(v) = self.compile_expr(e, 0) else {
-                                        return false;
-                                    };
-                                    self.emit(Insn::Move(slot, v));
-                                }
-                                None => {
-                                    self.emit(Insn::LoadConst(slot, Box::new(Value::zero(32))));
-                                }
-                            }
-                            self.local_var_regs.insert(d.name.name.clone(), (slot, 0));
-                            self.method_handle_names.insert(d.name.name.clone());
-                            continue;
-                        }
-                        let is_real = self.decl_is_real(data_type, None);
-                        if !d.dimensions.is_empty() {
-                            // A SMALL fixed-shape local array (`real row
-                            // [0:3]`) — the working-buffer shape every
-                            // interpolation helper uses — becomes one
-                            // register per element; a dynamic index selects
-                            // by compare/branch chain (see
-                            // `compile_local_array_read`). Anything else
-                            // (queues, big or non-constant shapes) keeps the
-                            // AST path.
-                            if d.init.is_some()
-                                || !self.bind_local_array(
-                                    &d.name.name,
-                                    &d.dimensions,
-                                    data_type,
-                                    is_real,
-                                )
-                            {
-                                self.bail("Expr_Call_local_array");
-                                return false;
-                            }
-                            continue;
-                        }
-                        let is_string = self.decl_is_string(data_type, None);
-                        // §6.20.2: an UNTYPED block-scope `localparam`/`parameter`
-                        // is SELF-DETERMINED from its initializer — the parser
-                        // marks it `Static`+`Implicit`. Size it from the RHS (`4'd0-4'd1`
-                        // = 4-bit 15), not the 1-bit implicit logic `decl_width`
-                        // returns for an untyped Implicit or the old 32-bit `int`.
-                        let self_determined_lp = matches!(
-                            lifetime,
-                            Some(crate::ast::types::Lifetime::Static)
-                        ) && matches!(
-                            data_type,
-                            crate::ast::types::DataType::Implicit {
-                                dimensions, ..
-                            } if dimensions.is_empty()
-                        );
-                        let w = if is_string {
-                            0
-                        } else if self_determined_lp {
-                            match (self.params, &d.init) {
-                                (Some(p), Some(e)) => {
-                                    crate::compiler::elaborate::untyped_param_width(e, p)
-                                        .unwrap_or(32)
-                                }
-                                _ => 32,
-                            }
+                            Some(self.untyped_param_effective_dt(signing, d.init.as_ref(), st.span))
                         } else {
-                            self.decl_width(data_type)
+                            None
                         };
-                        let slot = self.alloc_reg();
-                        match &d.init {
-                            Some(e) => {
-                                let Some(v) = self.compile_expr(e, w) else {
-                                    return false;
-                                };
-                                self.emit(Insn::Move(slot, v));
-                            }
-                            None => {
-                                let init = self.type_default_value(data_type, w);
-                                self.emit(Insn::LoadConst(slot, Box::new(init)));
-                            }
+                        let dt = eff_dt.as_ref().unwrap_or(data_type);
+                        if !self.compile_pure_decl(dt, d) {
+                            return false;
                         }
-                        if is_real {
-                            self.local_var_is_real.insert(d.name.name.clone());
-                            self.emit_to_real(slot);
-                        } else if w > 0 {
-                            self.emit(Insn::Resize(slot, w));
-                        }
-                        if is_string {
-                            self.local_var_is_string.insert(d.name.name.clone());
-                        }
-                        if let Some(ew) = self.decl_elem_width(data_type) {
-                            if ew > 0 && w > ew && w % ew == 0 {
-                                if self.decl_outer_dim_unnormalized(data_type) {
-                                    self.bail("Expr_Call_packed_outer_dim");
-                                    return false;
-                                }
-                                self.local_var_elem.insert(d.name.name.clone(), ew);
-                            }
-                        }
-                        if let Some(k) = self.local_kind_of(data_type, None) {
-                            self.local_kinds.insert(slot, k);
-                            self.emit_local_fit(slot);
-                        }
-                        self.local_var_regs.insert(d.name.name.clone(), (slot, w));
-                        self.record_local_packed_type(slot, data_type);
                     }
                 }
                 // `return` — early or final — compiles via compile_stmt's
@@ -5060,7 +5416,8 @@ impl<'a> BytecodeCompiler<'a> {
         }
         match &stmt.kind {
             StatementKind::Null => true,
-            StatementKind::VarDecl { declarators, .. } => declarators
+            StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } => declarators
                 .iter()
                 .all(|decl| decl.init.as_ref().map(&expr_simple).unwrap_or(true)),
             StatementKind::NonblockingAssign { lvalue, rvalue, .. }
@@ -5583,7 +5940,10 @@ impl<'a> BytecodeCompiler<'a> {
         // A declaration run by the interpreter would live in the carried
         // frame and vanish with it, while the statements after it still
         // need the variable.
-        if matches!(stmt.kind, StatementKind::VarDecl { .. }) {
+        if matches!(
+            stmt.kind,
+            StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. }
+        ) {
             return Err("fb_decl_escapes");
         }
         let scan = self.fb_scan_with(|s| s.stmt(stmt));
@@ -6057,7 +6417,7 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::TimingControl { .. } => "Stmt_Timing",
             StatementKind::Wait { .. } => "Stmt_Wait",
             StatementKind::Assertion(_) => "Stmt_Assertion",
-            StatementKind::VarDecl { .. } => "Stmt_VarDecl",
+            StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. } => "Stmt_VarDecl",
             _ => "Stmt_other",
         }
     }
@@ -7849,7 +8209,8 @@ impl<'a> BytecodeCompiler<'a> {
                     lifetime: Some(crate::ast::types::Lifetime::Static),
                     ..
                 } => false,
-                StatementKind::VarDecl { declarators, .. } => {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => {
                     for d in declarators {
                         if let Some(e) = &d.init {
                             if !expr_ok(e, bound, me, ext) {
@@ -13263,7 +13624,7 @@ impl<'a> BytecodeCompiler<'a> {
                     // A block redeclaring the name is another variable:
                     // judge conservatively.
                     let redeclares = stmts.iter().any(|c| {
-                        matches!(&c.kind, StatementKind::VarDecl { declarators, .. }
+                        matches!(&c.kind, StatementKind::VarDecl { declarators, .. } | StatementKind::ParamDecl { declarators, .. }
                             if declarators.iter().any(|d| d.name.name == name))
                     });
                     if redeclares {
@@ -13358,7 +13719,9 @@ impl<'a> BytecodeCompiler<'a> {
         // module variable). Failing WITHOUT fallback here makes the enclosing
         // SeqBlock's own wrapper roll back and emit a single whole-block
         // StmtFallback instead.
-        if let StatementKind::VarDecl { declarators, .. } = &stmt.kind {
+        if let StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } = &stmt.kind
+        {
             if declarators.iter().any(|d| {
                 self.signal_name_to_id.contains_key(d.name.name.as_str())
                     || self.process_local_names.contains(d.name.name.as_str())
@@ -13827,351 +14190,38 @@ impl<'a> BytecodeCompiler<'a> {
                     return false;
                 }
                 for decl in declarators {
-                    // §6.18: a local declared through a typedef that carries
-                    // unpacked dims is a collection too. A queue / unsized
-                    // array without an initializer takes the local-collection
-                    // path below; any other shape stays on the AST path.
-                    if decl.dimensions.is_empty()
-                        && let crate::ast::types::DataType::TypeReference { name: tn, .. } =
-                            data_type
-                        && let Some(dims) = self.typedef_coll_dims.get(&type_name_key(tn))
-                    {
-                        use crate::ast::types::UnpackedDimension as UD;
-                        if self.method_mode
-                            && decl.init.is_none()
-                            && dims.len() == 1
-                            && matches!(dims[0], UD::Queue { .. } | UD::Unsized(_))
-                        {
-                            let synth = Statement::new(
-                                StatementKind::VarDecl {
-                                    data_type: data_type.clone(),
-                                    lifetime: lifetime.clone(),
-                                    declarators: vec![decl.clone()],
-                                },
-                                stmt.span,
-                            );
-                            self.emit(Insn::InitLocalColl(Box::new((
-                                Arc::new(synth),
-                                Arc::from("VarDecl_local_coll"),
-                            ))));
-                            self.local_coll_names.insert(decl.name.name.clone());
-                            // §6.16: `typedef string q_t[$]` elements are
-                            // strings, as a `string q[$]` local's are.
-                            if self.typedef_coll_strings.contains(&type_name_key(tn)) {
-                                self.local_coll_strings.insert(decl.name.name.clone());
-                            } else {
-                                self.local_coll_strings.remove(&decl.name.name);
-                            }
-                            continue;
-                        }
-                        self.bail("VarDecl_typedef_array");
+                    if !self.compile_stmt_decl_item(stmt.span, data_type, lifetime, decl) {
                         return false;
                     }
-                    if !decl.dimensions.is_empty() {
-                        // class-perf row 3: a LOCAL queue / dynamic array
-                        // (single queue / unsized unpacked dimension, no
-                        // initializer). Storage and every bit of queue
-                        // bookkeeping (the per-call `@name#id` key, the
-                        // arrays / dynamic_arrays / queue_vars / widths /
-                        // size-shadow / element-type registrations) live in
-                        // the interpreter; re-running the DECLARATION there
-                        // (a StmtFallback of the single-declarator statement
-                        // — `exec_stmt_var_decl` verbatim) keeps all those
-                        // table writes in one place, and the method's own
-                        // queue frame (pushed by the dispatch before the
-                        // block runs) scopes and cleans up the per-call key
-                        // on return. Every later use in this body resolves
-                        // the bare name through the interpreter's own
-                        // precedence (`dyn_name_lookup` → @key, marked via
-                        // `local_coll_names`), so ops are byte-identical to
-                        // the AST path. Decls WITH initializers keep the
-                        // VarDecl_array_init bail: the init lowering
-                        // (pattern spreads, element seeding) is deep and
-                        // stays interpreter-owned in this row.
-                        use crate::ast::types::UnpackedDimension as UD;
-                        if self.method_mode
-                            && decl.init.is_none()
-                            && decl.dimensions.len() == 1
-                            && matches!(decl.dimensions[0], UD::Queue { .. } | UD::Unsized(_))
-                        {
-                            let synth = Statement::new(
-                                StatementKind::VarDecl {
-                                    data_type: data_type.clone(),
-                                    lifetime: lifetime.clone(),
-                                    declarators: vec![decl.clone()],
-                                },
-                                stmt.span,
-                            );
-                            // Direct emission — NOT emit_fallback: the decl
-                            // reads no registers (init is None), so neither
-                            // the decl_local_regs nor the loop-var hazard
-                            // applies; it must survive even where plain
-                            // fallbacks are barred. class-perf: emitted as the
-                            // dedicated `InitLocalColl` opcode (not a
-                            // `StmtFallback`) so the enclosing block stays
-                            // eligible for the fast-call admission gate — a
-                            // `VarDecl_local_coll` StmtFallback pessimized
-                            // otherwise-blink functions like `uvm_re_match`.
-                            self.emit(Insn::InitLocalColl(Box::new((
-                                Arc::new(synth),
-                                Arc::from("VarDecl_local_coll"),
-                            ))));
-                            self.local_coll_names.insert(decl.name.name.clone());
-                            if Self::dt_is_string(data_type) {
-                                self.local_coll_strings.insert(decl.name.name.clone());
-                            } else {
-                                self.local_coll_strings.remove(&decl.name.name);
-                            }
-                            continue;
-                        }
-                        // One constant-bounded unpacked dimension, small: a
-                        // register bank. (`logic [7:0] tmp [0:15]` in an
-                        // inlined AES shift_rows / rcon table.) Every access
-                        // must fold to a constant index or the enclosing
-                        // compile fails and rolls back.
-                        let bounds = if decl.dimensions.len() == 1 {
-                            match &decl.dimensions[0] {
-                                UD::Range { left, right, .. } => {
-                                    let l = self.fold_const(left).and_then(|v| v.to_u64());
-                                    let r = self.fold_const(right).and_then(|v| v.to_u64());
-                                    match (l, r) {
-                                        (Some(l), Some(r)) => {
-                                            let (lo, hi) = (l.min(r) as i64, l.max(r) as i64);
-                                            Some((lo, (hi - lo + 1) as usize))
-                                        }
-                                        _ => None,
-                                    }
-                                }
-                                UD::Expression { expr, .. } => self
-                                    .fold_const(expr)
-                                    .and_then(|v| v.to_u64())
-                                    .filter(|&n| n > 0)
-                                    .map(|n| (0i64, n as usize)),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-                        let Some((lo, len)) = bounds.filter(|&(_, n)| n <= 64) else {
-                            self.bail("VarDecl_array");
-                            return false;
-                        };
-                        if decl.init.is_some() {
-                            self.bail("VarDecl_array_init");
-                            return false;
-                        }
-                        let ew = self.decl_width(data_type);
-                        let base = self.next_reg;
-                        for _ in 0..len {
-                            let slot = self.alloc_reg();
-                            let init = self.type_default_value(data_type, ew);
-                            self.emit(Insn::LoadConst(slot, Box::new(init)));
-                        }
-                        let Ok(base) = RegId::try_from(base) else {
-                            self.bail("VarDecl_array");
-                            return false;
-                        };
-                        self.local_array_regs
-                            .insert(decl.name.name.clone(), (base, ew, len, lo));
-                        continue;
-                    }
-                    // §6.16 string local: no declared width — bind at width
-                    // 0 so no Resize ever lands on it, and mark it for the
-                    // %s / string-assign paths.
-                    let is_string = self.decl_is_string(data_type, None);
-                    // §6.20.2: an UNTYPED block-scope localparam is
-                    // SELF-DETERMINED from its initializer (the parser marks
-                    // it `Static`+`Implicit`). Its width is computed per
-                    // declarator from the RHS below; this is the declared
-                    // width used for a typed / var / real / string decl.
-                    let decl_width = if is_string {
-                        0
-                    } else {
-                        self.decl_width(data_type)
-                    };
-                    // §6.21: a STATIC local persists across calls — its
-                    // declaration runs ONCE. The compiled path must NOT
-                    // seed the register (a compile-time default folds
-                    // `m_inst == null` to true and a fresh singleton is
-                    // constructed on every call); the dispatch shell seeds
-                    // it from the persistent store instead and copies the
-                    // final register back at exit. A declarator WITH an
-                    // initializer has run-once semantics the block cannot
-                    // express — bail the whole method to the AST path.
-                    if self.method_mode
-                        && matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+                }
+                true
+            }
+            StatementKind::ParamDecl {
+                data_type,
+                declarators,
+                ..
+            } => {
+                if self.method_mode && self.class_alias_dynamic_width(data_type) {
+                    self.bail("class_alias_runtime_width");
+                    return false;
+                }
+                let untyped = matches!(
+                    data_type,
+                    crate::ast::types::DataType::Implicit { dimensions, .. }
+                        if dimensions.is_empty()
+                );
+                for decl in declarators {
+                    let eff_dt = if untyped
+                        && let crate::ast::types::DataType::Implicit { signing, .. } = data_type
                     {
-                        if decl.init.is_some() {
-                            self.bail("static_local_init");
-                            return false;
-                        }
-                        let slot = self.alloc_reg();
-                        let is_real = self.decl_is_real(data_type, None);
-                        let is_string = self.decl_is_string(data_type, None);
-                        let is_class_handle = self.class_local_names.contains(&decl.name.name);
-                        let (w, default) = if is_class_handle {
-                            (0, Value::zero(32))
-                        } else if is_real {
-                            (0, Value::from_f64(0.0))
-                        } else {
-                            let w = if is_string {
-                                0
-                            } else {
-                                self.decl_width(data_type)
-                            };
-                            (w, self.type_default_value(data_type, w))
-                        };
-                        if is_class_handle {
-                            self.method_handle_names.insert(decl.name.name.clone());
-                        } else {
-                            if is_real {
-                                self.local_var_is_real.insert(decl.name.name.clone());
-                            }
-                            if is_string {
-                                self.local_var_is_string.insert(decl.name.name.clone());
-                            }
-                            if let Some(k) = self.local_kind_of(data_type, None) {
-                                self.local_kinds.insert(slot, k);
-                            }
-                        }
-                        self.local_var_regs
-                            .insert(decl.name.name.clone(), (slot, w));
-                        self.decl_local_regs.insert(decl.name.name.clone());
-                        self.method_static_locals
-                            .push((decl.name.name.clone(), slot, default));
-                        continue;
-                    }
-                    // Step 6: a CLASS-typed local holds a heap HANDLE in a
-                    // register — default null (0), no resize (handles
-                    // round-trip untouched), and the name joins
-                    // `method_handle_names` so `.member` is a heap access.
-                    if self.method_mode && self.class_local_names.contains(&decl.name.name) {
-                        let slot = self.alloc_reg();
-                        // §8.8: `C h = new(...)` constructs the local's
-                        // declared class, as `h = new(...)` does.
-                        // The map is keyed by name, so a declaration that
-                        // shadows another of a different class (a member, a
-                        // sibling block's local) keeps the general lowering.
-                        let new_cls = decl
-                            .init
-                            .as_ref()
-                            .filter(|e| Self::is_new_shape(e))
-                            .and_then(|_| self.new_type_map.get(&decl.name.name))
-                            .filter(|cls| {
-                                matches!(data_type, crate::ast::types::DataType::TypeReference { name, .. }
-                                    if name.name.name.rsplit("::").next() == Some(cls.as_str()))
-                            })
-                            .cloned();
-                        match &decl.init {
-                            Some(expr) if new_cls.is_some() => {
-                                let cls = new_cls.expect("checked");
-                                let Some(value) = self.compile_new_construct(expr, &cls) else {
-                                    self.bail("VarDecl_init");
-                                    return false;
-                                };
-                                self.emit(Insn::Move(slot, value));
-                            }
-                            Some(expr) => {
-                                let Some(value) = self.compile_expr(expr, 0) else {
-                                    self.bail("VarDecl_init");
-                                    return false;
-                                };
-                                self.emit(Insn::Move(slot, value));
-                            }
-                            None => {
-                                self.emit(Insn::LoadConst(slot, Box::new(Value::zero(32))));
-                            }
-                        }
-                        if self.method_bound_names.contains(&decl.name.name)
-                            && self.local_var_regs.contains_key(&decl.name.name)
-                        {
-                            self.method_shadowing_regs.insert(slot);
-                        }
-                        self.local_var_regs
-                            .insert(decl.name.name.clone(), (slot, 0));
-                        self.method_handle_names.insert(decl.name.name.clone());
-                        self.decl_local_regs.insert(decl.name.name.clone());
-                        continue;
-                    }
-                    // §6.12: a `real` local holds a real, whatever its
-                    // initializer (or its default, 0.0) is.
-                    let is_real = self.decl_is_real(data_type, None);
-                    let kind = if is_string {
-                        Some(LocalKind::Str)
+                        Some(self.untyped_param_effective_dt(signing, decl.init.as_ref(), stmt.span))
                     } else {
-                        self.local_kind_of(data_type, None)
+                        None
                     };
-                    let slot = self.alloc_reg();
-                    match kind {
-                        Some(k) => {
-                            self.local_kinds.insert(slot, k);
-                        }
-                        None => {
-                            self.local_kinds.remove(&slot);
-                        }
+                    let dt = eff_dt.as_ref().unwrap_or(data_type);
+                    if !self.compile_stmt_decl_item(stmt.span, dt, &None, decl) {
+                        return false;
                     }
-                    // §6.20.2: an UNTYPED block-scope `localparam`/`parameter`
-                    // is SELF-DETERMINED from its initializer — size the
-                    // per-declarator width from the RHS (`4'd0-4'd1` = 4-bit 15)
-                    // rather than the 1-bit implicit `decl_width`.
-                    let self_det_lp = matches!(
-                        lifetime,
-                        Some(crate::ast::types::Lifetime::Static)
-                    ) && matches!(
-                        data_type,
-                        crate::ast::types::DataType::Implicit {
-                            dimensions, ..
-                        } if dimensions.is_empty()
-                    );
-                    let width = if is_string {
-                        0
-                    } else if self_det_lp {
-                        match (self.params, decl.init.as_ref()) {
-                            (Some(p), Some(e)) => {
-                                crate::compiler::elaborate::untyped_param_width(e, p)
-                                    .unwrap_or(32)
-                            }
-                            _ => 32,
-                        }
-                    } else {
-                        decl_width
-                    };
-                    match &decl.init {
-                        Some(expr) => {
-                            let Some(value) = self.compile_expr(expr, width) else {
-                                self.bail("VarDecl_init");
-                                return false;
-                            };
-                            self.emit(Insn::Move(slot, value));
-                        }
-                        None => {
-                            let value = if is_real {
-                                Value::from_f64(0.0)
-                            } else {
-                                self.type_default_value(data_type, width)
-                            };
-                            self.emit(Insn::LoadConst(slot, Box::new(value)));
-                        }
-                    }
-                    let name = &decl.name.name;
-                    if is_real {
-                        self.emit_to_real(slot);
-                        self.local_var_is_real.insert(name.clone());
-                    } else {
-                        self.local_var_is_real.remove(name);
-                        if width > 0 {
-                            self.emit(Insn::Resize(slot, width));
-                            self.emit_local_fit(slot);
-                        }
-                    }
-                    if is_string {
-                        self.local_var_is_string.insert(name.clone());
-                    } else {
-                        self.local_var_is_string.remove(name);
-                    }
-                    self.local_var_regs.insert(name.clone(), (slot, width));
-                    self.record_local_packed_type(slot, data_type);
-                    self.decl_local_regs.insert(name.clone());
                 }
                 true
             }
@@ -15624,6 +15674,7 @@ impl<'a> BytecodeCompiler<'a> {
                     StatementKind::Assertion(_) => "Assertion",
                     StatementKind::ProceduralContinuous(_) => "ProceduralContinuous",
                     StatementKind::VarDecl { .. } => "VarDecl",
+                    StatementKind::ParamDecl { .. } => "ParamDecl",
                     StatementKind::Coverpoint { .. } => "Coverpoint",
                     StatementKind::Cross { .. } => "Cross",
                     _ => "Other",
@@ -22736,7 +22787,9 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_bound_names.insert(rname.to_string());
         }
         for st in body {
-            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &st.kind
+            {
                 self.method_bound_names
                     .extend(declarators.iter().map(|d| d.name.name.clone()));
             }
@@ -22768,7 +22821,9 @@ impl<'a> BytecodeCompiler<'a> {
             self.cast_reg_ok_locals.insert(rname.to_string());
         }
         for st in body {
-            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &st.kind
+            {
                 for d in declarators {
                     self.cast_reg_ok_locals.insert(d.name.name.clone());
                 }
@@ -22960,7 +23015,10 @@ impl<'a> BytecodeCompiler<'a> {
         // anything else fails the whole body.
         let mut ok = true;
         for stmt in body {
-            if matches!(stmt.kind, StatementKind::VarDecl { .. }) {
+            if matches!(
+                stmt.kind,
+                StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. }
+            ) {
                 // Body locals bind themselves into `local_var_regs` via the
                 // existing VarDecl arm; only a shadowing/signal collision
                 // fails it.

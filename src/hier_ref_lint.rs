@@ -852,7 +852,8 @@ impl Walker {
                     self.expr(x)
                 }
             },
-            StatementKind::VarDecl { declarators, .. } => {
+            StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } => {
                 for d in declarators {
                     // In scope from its declarator on, its initializer included.
                     if let Some(l) = self.locals.last_mut() {

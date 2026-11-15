@@ -842,6 +842,11 @@ impl<'a> Ck<'a> {
                 data_type,
                 declarators,
                 ..
+            }
+            | StatementKind::ParamDecl {
+                data_type,
+                declarators,
+                ..
             } = &s.kind
             {
                 for d in declarators {
@@ -2647,8 +2652,6 @@ impl<'a> Ck<'a> {
                         self.walk_expr(init);
                         self.check_value(&vt, init, || format!("'{}'", d.name.name));
                     }
-                    // A block-level `localparam` parses as a `static`
-                    // declaration, so such a name may be a constant.
                     if *lifetime == Some(Lifetime::Static) {
                         self.declare_unsure(&d.name.name, vt);
                     } else {
@@ -2657,6 +2660,22 @@ impl<'a> Ck<'a> {
                     if auto {
                         self.mark_auto(&d.name.name);
                     }
+                }
+            }
+            StatementKind::ParamDecl {
+                data_type,
+                declarators,
+                ..
+            } => {
+                let t = self.resolve(data_type);
+                for d in declarators {
+                    self.check_const_dims(&d.name.name, data_type, &d.dimensions);
+                    let vt = with_dims(t.clone(), &d.dimensions);
+                    if let Some(init) = &d.init {
+                        self.walk_expr(init);
+                        self.check_value(&vt, init, || format!("'{}'", d.name.name));
+                    }
+                    self.declare_unsure(&d.name.name, vt);
                 }
             }
             StatementKind::Typedef(td) => self.declare_typedef(td),

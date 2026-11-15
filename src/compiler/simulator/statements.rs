@@ -6,7 +6,6 @@ use crate::{log_eprintln as eprintln, log_println as println};
 
 struct VarDeclShape {
     w: u32,
-    self_det_lp: bool,
     class_ref: Option<bool>,
     plain_class: bool,
     plain: bool,
@@ -2172,7 +2171,6 @@ impl Simulator {
     fn resolve_var_decl_shape<'a>(
         &mut self,
         data_type: &'a DataType,
-        lifetime: &Option<crate::ast::types::Lifetime>,
     ) -> (std::borrow::Cow<'a, DataType>, VarDeclShape) {
         // §6.20.2 / §8.25: a local typed by a TYPE PARAMETER of the method's
         // class (`T tmp;`) has the type bound in this specialization.
@@ -2220,19 +2218,6 @@ impl Simulator {
         // may report as 0 for a class with only methods/statics).
         // A 0 width is never valid for a variable.
         let w = if w0 == 0 { 32 } else { w0 };
-        // §6.20.2: an UNTYPED block-scope `localparam`/`parameter` is
-        // self-determined from its initializer (the parser marks it
-        // `Static`+`Implicit`, no dims). Its width is the initializer's
-        // self-determined width (`4'd0-4'd1` = 4-bit 15), NOT the 1-bit
-        // implicit `logic` that `resolve_type_width` reports for an
-        // untyped Implicit — folding it at 1/32 bits was the `localparam
-        // Q = f();` bug (#1143). A `var`/`static var`/typed decl keeps
-        // its declared width.
-        let self_det_lp = matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
-            && matches!(
-                data_type,
-                crate::ast::types::DataType::Implicit { dimensions, .. } if dimensions.is_empty()
-            );
         // A built-in scalar or a plain class type: the packed-layout,
         // struct, enum, typedef and type-parameter probes below all come
         // back empty for it (a plain class resolves to itself).
@@ -2327,7 +2312,6 @@ impl Simulator {
         default_v.is_signed = decl_signed;
         let shape = VarDeclShape {
             w,
-            self_det_lp,
             class_ref,
             plain_class,
             plain,
@@ -2690,11 +2674,10 @@ impl Simulator {
                 self.claim_local_meta(&d.name.name, stmt);
             }
         }
-        let (resolved_dt, shape) = self.resolve_var_decl_shape(data_type, lifetime);
+        let (resolved_dt, shape) = self.resolve_var_decl_shape(data_type);
         let data_type: &DataType = resolved_dt.as_ref();
         let VarDeclShape {
             w,
-            self_det_lp,
             class_ref,
             plain_class,
             plain,
@@ -3707,20 +3690,7 @@ impl Simulator {
                         self.resolve_dt(data_type),
                         crate::ast::types::DataType::Struct(su) if Self::spreads_member_wise(&su)
                     );
-                // §6.20.2: a self-determined UNTYPED localparam/parameter
-                // takes its width from the initializer (`4'd0-4'd1` = 4-bit
-                // 15), not the 1-bit implicit fallback.
-                let eff_w = if self_det_lp {
-                    d.init
-                        .as_ref()
-                        .and_then(|e| {
-                            super::elaborate::untyped_param_width(e, &self.module.parameters)
-                        })
-                        .or_else(|| Some(32u32))
-                        .unwrap_or(w)
-                } else {
-                    w
-                };
+                let eff_w = w;
                 let v = if let Some(init_expr) = d.init.as_ref().filter(|_| !struct_init_later) {
                     let produced = self.init_class_or_covergroup_local(
                         data_type,
@@ -4041,6 +4011,82 @@ impl Simulator {
                     self.static_local_keys.insert(key);
                 }
             }
+        }
+    }
+
+    fn exec_stmt_param_decl(
+        &mut self,
+        stmt: &Statement,
+        data_type: &DataType,
+        declarators: &[crate::ast::stmt::VarDeclarator],
+    ) {
+        if let crate::ast::types::DataType::Implicit {
+            signing,
+            dimensions,
+            ..
+        } = data_type
+            && dimensions.is_empty()
+        {
+            for d in declarators {
+                if !self.local_stack.is_empty() {
+                    self.claim_local_meta(&d.name.name, stmt);
+                }
+                let mut v = match &d.init {
+                    Some(init_expr) => {
+                        let mut val = self.eval_expr(init_expr);
+                        if val.is_fill {
+                            val.is_fill = false;
+                        }
+                        val
+                    }
+                    None => Value::new(32),
+                };
+                if !v.is_real {
+                    match signing {
+                        Some(crate::ast::types::Signing::Signed) => v.is_signed = true,
+                        Some(crate::ast::types::Signing::Unsigned) => v.is_signed = false,
+                        None => {}
+                    }
+                }
+                let eff_w = v.width;
+                let is_real = v.is_real;
+                let is_signed = !is_real && v.is_signed;
+                let is_string = d
+                    .init
+                    .as_ref()
+                    .is_some_and(|e| self.expr_is_string_valued(e));
+                match self.widths.get_mut(d.name.name.as_str()) {
+                    Some(slot) => *slot = eff_w,
+                    None => {
+                        self.widths.insert(d.name.name.clone(), eff_w);
+                    }
+                }
+                if is_signed {
+                    if !self.signed_signals.contains(d.name.name.as_str()) {
+                        self.signed_signals.insert(d.name.name.clone());
+                    }
+                } else {
+                    self.signed_signals.remove(&d.name.name);
+                }
+                if is_real {
+                    self.real_signals.insert(d.name.name.clone());
+                } else {
+                    self.real_signals.remove(&d.name.name);
+                }
+                if is_string {
+                    self.string_signals.insert(d.name.name.clone());
+                } else {
+                    self.forget_string_flag(&d.name.name);
+                }
+                self.record_frame_string_kind(&d.name.name, is_string);
+                if let Some(frame) = self.local_stack.last_mut() {
+                    frame.insert(d.name.name.clone(), v);
+                } else {
+                    self.signals.insert(d.name.name.clone(), v);
+                }
+            }
+        } else {
+            self.exec_stmt_var_decl(stmt, data_type, &None, declarators);
         }
     }
 
@@ -5152,7 +5198,8 @@ impl Simulator {
                 // one scan and no allocation.
                 let shadow_frame = self.local_stack.last().is_none()
                     && stmts.iter().any(|s| match &s.kind {
-                        StatementKind::VarDecl { declarators, .. } => declarators
+                        StatementKind::VarDecl { declarators, .. }
+                        | StatementKind::ParamDecl { declarators, .. } => declarators
                             .iter()
                             .any(|d| self.signal_name_to_id.contains_key(d.name.name.as_str())),
                         _ => false,
@@ -6454,6 +6501,11 @@ impl Simulator {
                 lifetime,
                 declarators,
             } => self.exec_stmt_var_decl(stmt, data_type, lifetime, declarators),
+            StatementKind::ParamDecl {
+                data_type,
+                declarators,
+                ..
+            } => self.exec_stmt_param_decl(stmt, data_type, declarators),
             StatementKind::EventTrigger {
                 name,
                 nonblocking,

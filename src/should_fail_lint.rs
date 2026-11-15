@@ -1164,6 +1164,11 @@ fn check_stmt_stream(
         data_type,
         declarators,
         ..
+    }
+    | StatementKind::ParamDecl {
+        data_type,
+        declarators,
+        ..
     } = &s.kind
     {
         for decl in declarators {
@@ -1687,6 +1692,7 @@ fn is_leading_nonexec(s: &Statement) -> bool {
     matches!(
         s.kind,
         StatementKind::VarDecl { .. }
+            | StatementKind::ParamDecl { .. }
             | StatementKind::Typedef(_)
             | StatementKind::Null
             | StatementKind::ScopePop
@@ -2110,7 +2116,8 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
     fn block_members(stmts: &[Statement], out: &mut HashSet<String>) {
         for st in stmts {
             for_each_stmt(st, &mut |s| match &s.kind {
-                StatementKind::VarDecl { declarators, .. } => {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => {
                     out.extend(declarators.iter().map(|d| d.name.name.clone()));
                 }
                 StatementKind::SeqBlock { name: Some(n), .. }
@@ -2228,7 +2235,9 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
     for st in &stmts {
         note_stmt(st, &mut blocks);
         for_each_stmt(st, &mut |s| {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 data.extend(declarators.iter().map(|d| d.name.name.clone()));
             }
         });
@@ -2928,7 +2937,9 @@ fn check_subroutine_range_idents(
     let check = |sub: &str, dts: Vec<&DataType>, body: &[Statement], errs: &mut Vec<String>| {
         let mut locals = HashSet::new();
         for st in body {
-            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &st.kind
+            {
                 locals.extend(declarators.iter().map(|d| d.name.name.as_str()));
             }
         }
@@ -3143,7 +3154,8 @@ fn check_foreach_dims(items: &[ModuleItem], errs: &mut Vec<String>) {
     let mut loops: Vec<(String, usize)> = Vec::new();
     for st in &stmts {
         for_each_stmt(st, &mut |s| match &s.kind {
-            StatementKind::VarDecl { declarators, .. } => {
+            StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } => {
                 locals.extend(declarators.iter().map(|d| d.name.name.clone()))
             }
             StatementKind::Foreach { array, vars, .. } => {
@@ -3255,7 +3267,9 @@ fn check_select_depth(items: &[ModuleItem], errs: &mut Vec<String>) {
     }
     for st in &stmts {
         for_each_stmt(st, &mut |s| {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 for d in declarators {
                     dims.remove(d.name.name.as_str());
                 }
@@ -3933,7 +3947,9 @@ fn note_function_names(f: &xezim_core::ast::decl::FunctionDeclaration, out: &mut
     }
     note_data_type_names(&f.return_type, out);
     for st in f.items.iter() {
-        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+        if let StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } = &st.kind
+        {
             note_declarator_names(declarators, out);
         }
     }
@@ -3946,7 +3962,9 @@ fn note_task_names(t: &xezim_core::ast::decl::TaskDeclaration, out: &mut HashSet
         note_data_type_names(&p.data_type, out);
     }
     for st in t.items.iter() {
-        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+        if let StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } = &st.kind
+        {
             note_declarator_names(declarators, out);
         }
     }
@@ -4667,7 +4685,9 @@ fn check_wildcard_import_conflicts(
             _ => continue,
         };
         for_each_stmt(st, &mut |s| {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 locals.extend(declarators.iter().map(|d| d.name.name.clone()));
             }
         });
@@ -4885,7 +4905,9 @@ fn check_inherited_local_access(
             let mut locals: HashSet<String> = ports.iter().map(|p| p.name.name.clone()).collect();
             for st in body {
                 for_each_stmt(st, &mut |s| {
-                    if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                    if let StatementKind::VarDecl { declarators, .. }
+                    | StatementKind::ParamDecl { declarators, .. } = &s.kind
+                    {
                         locals.extend(declarators.iter().map(|d| d.name.name.clone()));
                     }
                 });
@@ -5050,7 +5072,8 @@ fn check_member_access_roots(items: &[ModuleItem], errs: &mut Vec<String>) {
         let mut names: HashSet<String> = ports.iter().map(|p| p.name.name.clone()).collect();
         for st in body {
             for_each_stmt(st, &mut |s| match &s.kind {
-                StatementKind::VarDecl { declarators, .. } => {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => {
                     names.extend(declarators.iter().map(|d| d.name.name.clone()))
                 }
                 StatementKind::SeqBlock { name: Some(n), .. }
@@ -5075,7 +5098,9 @@ fn check_member_access_roots(items: &[ModuleItem], errs: &mut Vec<String>) {
         };
         for st in stmts {
             for_each_stmt(st, &mut |s| {
-                if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                if let StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } = &s.kind
+                {
                     locals.extend(declarators.iter().map(|d| d.name.name.clone()));
                 }
             });
@@ -5439,6 +5464,13 @@ fn monitor_stmt(
                 }
             }
         }
+        StatementKind::ParamDecl { declarators, .. } => {
+            if let Some(top) = scopes.last_mut() {
+                for d in declarators {
+                    top.push((d.name.name.clone(), false));
+                }
+            }
+        }
         StatementKind::Expr(e) => {
             if let ExprKind::SystemCall { name, args } = &e.kind
                 && matches!(
@@ -5566,7 +5598,9 @@ fn check_unpacked_pattern_counts(items: &[ModuleItem], errs: &mut Vec<String>) {
         .collect();
     for s in &procs {
         for_each_stmt(s, &mut |st| {
-            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &st.kind
+            {
                 for d in declarators {
                     shadowed.insert(d.name.name.clone());
                 }

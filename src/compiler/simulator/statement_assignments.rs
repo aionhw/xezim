@@ -256,7 +256,9 @@ impl Simulator {
         let saved_auto_len = self.auto_loop_vars.len();
         let mut processes = Vec::with_capacity(stmts.len());
         for s in stmts {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 self.exec_statement(s);
                 for d in declarators {
                     self.auto_loop_vars.push(d.name.name.clone());

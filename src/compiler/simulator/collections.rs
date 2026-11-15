@@ -1453,6 +1453,11 @@ impl Simulator {
                     data_type,
                     declarators,
                     ..
+                }
+                | SK::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
                 } => {
                     if is_class_data_type(data_type, sim) {
                         for d in declarators {

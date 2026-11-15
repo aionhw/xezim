@@ -2632,7 +2632,7 @@ impl Simulator {
                 self.sva_collect_action_sampled_expr(lvalue, out, sels);
                 self.sva_collect_action_sampled_expr(rvalue, out, sels);
             }
-            SK::VarDecl { declarators, .. } => {
+            SK::VarDecl { declarators, .. } | SK::ParamDecl { declarators, .. } => {
                 for d in declarators {
                     if let Some(init) = &d.init {
                         self.sva_collect_action_sampled_expr(init, out, sels);

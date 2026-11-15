@@ -80,3 +80,15 @@ fn typed_remains_signed() {
         &["PASS typed P=-1"],
     );
 }
+
+/// §6.20.2: block-scope untyped `localparam`s with explicit signing and mixed
+/// declarators (`A = 1.5, B = 2`) resolve per declarator across const-fn,
+/// compiled runtime, and interpreter paths, while `static` variables keep their
+/// declared type.
+#[test]
+fn mixed_signed_real_param_decl() {
+    check_sim(
+        include_str!("localparam_self_determined_1143/mixed_signed_real_param_decl.sv"),
+        &["PASS blk C=47", "PASS ret=48", "PASS rt Q=15 S=-1 A=1.5 B=2"],
+    );
+}

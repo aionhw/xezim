@@ -345,6 +345,11 @@ impl Simulator {
                 data_type: DataType::TypeReference { name: tn, .. },
                 declarators,
                 ..
+            }
+            | StatementKind::ParamDecl {
+                data_type: DataType::TypeReference { name: tn, .. },
+                declarators,
+                ..
             } = &st.kind
                 && declarators.iter().any(|d| d.dimensions.is_empty())
             {

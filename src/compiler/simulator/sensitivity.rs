@@ -28,7 +28,8 @@ thread_local! {
 /// nested blocks (§12.7, §13.4). Top-level locals are `local_names`'.
 fn nested_frame_names(st: &Statement, top: bool, out: &mut HashSet<String>) {
     match &st.kind {
-        StatementKind::VarDecl { declarators, .. } => {
+        StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } => {
             if !top {
                 out.extend(declarators.iter().map(|d| d.name.name.clone()));
             }
@@ -656,7 +657,8 @@ impl Simulator {
         ) {
             for st in items {
                 match &st.kind {
-                    StatementKind::VarDecl { declarators, .. } => {
+                    StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } => {
                         for d in declarators {
                             if let Some(init) = &d.init {
                                 // The initializer's own reads: a call in it
@@ -1909,7 +1911,8 @@ impl Simulator {
                     );
                 }
             }
-            StatementKind::VarDecl { declarators, .. } => {
+            StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } => {
                 for d in declarators {
                     // A block-local is written by this block, never an external
                     // trigger — but its INITIALIZER reads are real inputs.

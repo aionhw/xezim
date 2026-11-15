@@ -604,7 +604,8 @@ impl FbScan<'_> {
                 }
                 self.blocks.truncate(depth);
             }
-            StatementKind::VarDecl { declarators, .. } => {
+            StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } => {
                 for d in declarators {
                     self.decls.push(d.name.name.clone());
                     if let Some(i) = &d.init {
