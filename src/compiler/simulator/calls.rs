@@ -3775,6 +3775,30 @@ impl Simulator {
                     return self.call_scoped_subroutine(&full, args);
                 }
             }
+            // §26.3: a bare call in a method of a class DECLARED inside a
+            // package binds to that package's own function/task — the class
+            // body scopes through its declaring package before the module
+            // instance scope (mirrors the ident fix in
+            // `resolve_hier_name_uncached`).
+            if hier.path.len() == 1
+                && let Some(pkg) = self
+                    .class_context_stack
+                    .last()
+                    .and_then(|c| c.as_ref())
+                    .and_then(|ctx| self.module.class_decl_pkg.get(ctx.as_str()))
+                    .map(ToOwned::to_owned)
+            {
+                let qual = format!("{}::{}", pkg, name);
+                if let Some(fd) = self.fn_decl_rc(&qual) {
+                    self.pending_pkg_scope = Some(pkg.clone());
+                    return self.exec_function_call(&fd, args);
+                }
+                if let Some(td) = self.task_decl_rc(&qual) {
+                    self.pending_pkg_scope = Some(pkg.clone());
+                    self.exec_task_call(&td, args);
+                    return Value::zero(32);
+                }
+            }
             // Module-level function call
             if let Some(fd) = self.fn_decl_rc(name) {
                 self.pending_pkg_scope = self.bare_call_pkg_scope(name, hier.path.len());

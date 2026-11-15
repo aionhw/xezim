@@ -397,6 +397,10 @@ impl Simulator {
                     }
                 } else if !self.contested_pkg_vars.is_empty()
                     && self.contested_pkg_vars.contains(leaf)
+                    // A module-local declaration that SHADOWS the wildcard
+                    // import (§26.3) wins: the runtime must not redirect the
+                    // shadowing bare name to the package var.
+                    && !self.module.wildcard_shadowed.contains(leaf)
                 {
                     if let Some(qual) = self.contested_pkg_var_in_scope(leaf) {
                         return std::borrow::Cow::Owned(qual);
@@ -540,6 +544,10 @@ impl Simulator {
                     }
                 } else if !self.contested_pkg_vars.is_empty()
                     && self.contested_pkg_vars.contains(leaf)
+                    // A module-local declaration that SHADOWS the wildcard
+                    // import (§26.3) wins: the runtime must not redirect the
+                    // shadowing bare name to the package var.
+                    && !self.module.wildcard_shadowed.contains(leaf)
                 {
                     if let Some(qual) = self.contested_pkg_var_in_scope(leaf) {
                         return qual;
@@ -1048,14 +1056,82 @@ impl Simulator {
         // declaration resolves a simple name DOWNWARD into the instance
         // — illegal per §23.6 — which the per-hier cache then
         // froze, silently retargeting the parent's NBAs into the child.
-        // Mirrors the bytecode compiler's lookup_signal_id scope-first
-        // order, gated on `activation_scope`: the own-scope lookup uses
-        // the ACTIVATION's scope (never the ratcheted hint, never a stale
-        // current_pid), and compile-time evals — which leave
-        // activation_scope None and deliberately install the correct
-        // scope through the resolve hint — keep their hint-first
-        // order.
+        // §26.3: a bare name inside a method of a class declared in a
+        // package resolves to that package's own parameter or package
+        // variable, even without the running module importing it. The
+        // class's declaring package scope is searched before the module or
+        // instance activation scope, so it fires here — before the
+        // `activation_scope` own-module lookup below — but after the
+        // class-member check (a class property beats the package name;
+        // class properties resolve on their own path before this resolver).
+        // (The contested-variable case is handled earlier via
+        // `contested_pkg_var_in_scope`.)
+        if hier.path.len() == 1 && !raw.contains('.') {
+            let pkg: Option<String> = self
+                .class_context_stack
+                .last()
+                .and_then(|c| c.as_ref())
+                .and_then(|ctx| self.module.class_decl_pkg.get(ctx.as_str()))
+                .map(|s| s.as_str())
+                // §26.3: a bare name inside a package FUNCTION/task body
+                // (no class) names that package's own parameter or variable
+                // too — `p2::helper` returning `Q` reads `p2::Q`.
+                .or_else(|| {
+                    self.pkg_scope_stack.last().and_then(|p| p.as_ref()).map(|p| p.as_str())
+                })
+                .map(ToOwned::to_owned);
+            if let Some(pkg) = pkg {
+                let qual = format!("{}::{}", pkg, raw);
+                if self.module.parameters.get(&qual).is_some()
+                    || self.signal_name_to_id.contains_key(qual.as_str())
+                {
+                    return qual;
+                }
+                // §26.3: `raw` may be IMPORTED into the class's declaring
+                // package (`import gp::*;` inside `p`, class method reading
+                // bare `raw`). The package declares no `p::raw`; resolve
+                // through `p`'s imports to the exporting package's own name.
+                if let Some(imports) = self.module.def_pkg_imports.get(&pkg) {
+                    let mut wildcard: Option<String> = None;
+                    for (src, item) in imports {
+                        match item.as_deref() {
+                            Some(leaf) if leaf == raw => {
+                                let q = format!("{}::{}", src, raw);
+                                if self.module.parameters.get(&q).is_some()
+                                    || self.signal_name_to_id.contains_key(q.as_str())
+                                {
+                                    return q;
+                                }
+                            }
+                            None if self.module.parameters.get(&format!("{}::{}", src, raw)).is_some()
+                                || self.signal_name_to_id.contains_key(&format!("{}::{}", src, raw))
+                            => {
+                                // §26.3: refuse to guess when two wildcard
+                                // imports could both supply it; fall through to
+                                // ordinary resolution instead.
+                                if wildcard.is_some() {
+                                    wildcard = None;
+                                    break;
+                                }
+                                wildcard = Some(src.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(src) = wildcard {
+                        return format!("{}::{}", src, raw);
+                    }
+                }
+            }
+        }
         if !raw.contains('.') {
+            // Mirrors the bytecode compiler's lookup_signal_id scope-first
+            // order, gated on `activation_scope`: the own-scope lookup uses
+            // the ACTIVATION's scope (never the ratcheted hint, never a stale
+            // current_pid), and compile-time evals — which leave
+            // activation_scope None and deliberately install the correct
+            // scope through the resolve hint — keep their hint-first
+            // order.
             let activation = self.activation_scope.borrow();
             match activation.as_deref() {
                 // Top-scope activation: its own module's names are the

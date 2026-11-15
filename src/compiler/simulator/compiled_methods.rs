@@ -2906,7 +2906,7 @@ impl Simulator {
                                 // a parameterized class's element width can
                                 // differ between them (§8.25).
                                 if let Some(w) = w.filter(|&w| w > 0)
-                                    && cd.param_defaults.is_empty()
+                                    && !self.class_chain_has_value_params(&c)
                                 {
                                     colls.elem_widths.insert(m.clone(), w);
                                 }
@@ -2914,6 +2914,65 @@ impl Simulator {
                             cur = cd.extends.clone();
                         }
                         facts.instance_colls.insert(class.clone(), colls);
+                        // Fixed scalar integral return types of methods in
+                        // this class's hierarchy (walked from leaf to base so
+                        // overrides win).
+                        let mut mcur = Some(class.clone());
+                        let mut mseen = HashSet::default();
+                        let class_has_vparams = self.class_chain_has_value_params(class);
+                        while let Some(mc) = mcur {
+                            if !mseen.insert(mc.clone()) {
+                                break;
+                            }
+                            let Some(mcd) = self
+                                .module
+                                .classes
+                                .get(&mc)
+                                .or_else(|| self.module.classes.get(mc.split('#').next().unwrap_or(&mc)))
+                            else {
+                                break;
+                            };
+                            for method in mcd.methods.values() {
+                                use crate::ast::decl::ClassMethodKind as Kind;
+                                let (Kind::Function(f) | Kind::Extern(f) | Kind::PureVirtual(f)) =
+                                    &method.kind
+                                else {
+                                    continue;
+                                };
+                                let mname = &f.name.name.name;
+                                if facts.method_return_types.contains_key(&(class.clone(), mname.clone())) {
+                                    continue;
+                                }
+                                let is_type_param = matches!(
+                                    &f.return_type,
+                                    DataType::TypeReference { name, .. }
+                                        if name.scopes.is_empty()
+                                            && mcd.type_param_names.contains(&name.name.name)
+                                );
+                                if is_type_param
+                                    || (class_has_vparams
+                                        && !Self::packed_dims_are_constant(&f.return_type))
+                                {
+                                    continue;
+                                }
+                                if let Some((w, signed)) = self
+                                    .scalar_formal_integral(&f.return_type)
+                                    .or_else(|| self.enum_type_info(&f.return_type))
+                                    .filter(|&(w, _)| w > 0)
+                                {
+                                    let base = class.split('#').next().unwrap_or(class).to_string();
+                                    facts
+                                        .method_return_types
+                                        .entry((class.clone(), mname.clone()))
+                                        .or_insert((w, signed));
+                                    facts
+                                        .method_return_types
+                                        .entry((base, mname.clone()))
+                                        .or_insert((w, signed));
+                                }
+                            }
+                            mcur = mcd.extends.clone();
+                        }
                         // §8.23 static methods of this class, for the
                         // null-handle dispatch at the call site. Keyed by the
                         // elaborated name AND its specialization-stripped base
@@ -3167,6 +3226,23 @@ impl Simulator {
                     }
                     compiler.set_local_typedef_types(local_typedef_types);
                     compiler.set_unresolved_type_names(unresolved_type_names);
+                    if handle != 0 && self.class_chain_has_value_params(cname) {
+                        let owners = self.prop_owners(cname);
+                        for f in &member_safe {
+                            if let Some(w) = self.class_prop_width_impl(cname, Some(handle), f)
+                                && w > 0
+                            {
+                                compiler.this_field_widths.insert(f.clone(), w);
+                                if owners
+                                    .get(f.as_str())
+                                    .and_then(|(_, cd)| cd.properties.get(f.as_str()))
+                                    .is_some_and(|sig| sig.is_signed)
+                                {
+                                    compiler.this_field_signed.insert(f.clone());
+                                }
+                            }
+                        }
+                    }
                     compiler.method_admission = Some(admission);
                     // issue-301 plan fact: multi-dim packed coll elements.
                     compiler.coll_elem_packed_dims = (*pre.coll_elem_packed_dims).clone();
