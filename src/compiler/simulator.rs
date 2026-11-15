@@ -1690,7 +1690,10 @@ struct CombEntryCold {
 // §7.4.1: compiled members of ascending packed arrays of structs slice from slot 0.
 // §10.9.2: scalarized resolver calls expand structure replication.
 // §7.4.2: compiled blocks sign-extend an index into an array with a negative bound.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB036";
+// §10.3.2, §13.4, §23.6: a called function's name and frame names are not
+// unresolved reads; whole arrays through an instance-array element, named and
+// top-spelled struct-array actuals depend on their elements and members.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB037";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
