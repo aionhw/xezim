@@ -186,6 +186,298 @@ endmodule
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Run `src` with `BIN` replaced by a scratch file holding `bytes`; return
+/// the simulator and its `T|` display lines.
+fn run_with_file(
+    tag: &str,
+    name: &str,
+    bytes: &[u8],
+    src: &str,
+) -> (xezim::compiler::Simulator, Vec<String>) {
+    let dir = std::env::temp_dir().join(format!("xezim_{}_{}", tag, std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    let sim =
+        simulate(&src.replace("BIN", &path.display().to_string()), 1000).expect("simulate failed");
+    let lines = sim
+        .output
+        .iter()
+        .map(|o| o.message.trim_end().to_string())
+        .filter(|l| l.starts_with("T|"))
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    (sim, lines)
+}
+
+const FOO_MEM: &str = "module foo;\n  logic [7:0] b [4];\nendmodule\n";
+
+#[test]
+fn fread_scalar_does_not_alias_submodule_memory() {
+    let src = format!(
+        "{FOO_MEM}{}",
+        r#"
+module tb;
+  foo u_foo();
+  byte b;
+  integer fd, n;
+  initial begin
+    fd = $fopen("BIN", "rb");
+    n = $fread(b, fd);
+    $fclose(fd);
+  end
+endmodule
+"#
+    );
+    let (sim, _) = run_with_file("fread_scalar", "in.bin", &[0x11, 0x22, 0x33, 0x44], &src);
+    assert_eq!(u(&sim, "n"), 1, "$fread into byte reads one byte");
+    assert_eq!(u(&sim, "b"), 0x11);
+    assert_eq!(u(&sim, "u_foo.b[0]"), 0, "submodule memory untouched");
+}
+
+#[test]
+fn fread_local_scalar_shadows_module_and_submodule_memory() {
+    let src = format!(
+        "{FOO_MEM}{}",
+        r#"
+module tb;
+  foo u_foo();
+  logic [7:0] b [4];
+  initial f();
+  function automatic void f;
+    byte b;
+    integer fd, n;
+    begin
+      fd = $fopen("BIN", "rb");
+      n = $fread(b, fd);
+      $fclose(fd);
+      $display("T|n=%0d b=%h", n, b);
+    end
+  endfunction
+endmodule
+"#
+    );
+    let (sim, lines) = run_with_file("fread_local", "in.bin", &[0x11, 0x22, 0x33, 0x44], &src);
+    assert_eq!(lines, ["T|n=1 b=11"]);
+    assert_eq!(u(&sim, "b[0]"), 0, "module memory untouched");
+    assert_eq!(u(&sim, "u_foo.b[0]"), 0, "submodule memory untouched");
+}
+
+#[test]
+fn fread_class_scalar_does_not_alias_child_memory() {
+    // A bare property inside a method and a qualified `c.b` from the module.
+    let src = format!(
+        "{FOO_MEM}{}",
+        r#"
+class C;
+  byte b;
+  function void run(integer fd);
+    integer n;
+    begin
+      n = $fread(b, fd);
+      $display("T|method n=%0d b=%h", n, b);
+    end
+  endfunction
+endclass
+module tb;
+  foo u_foo();
+  logic [7:0] b [2];
+  integer fd, n;
+  initial begin
+    C c = new;
+    fd = $fopen("BIN", "rb");
+    c.run(fd);
+    n = $fread(c.b, fd);
+    $display("T|qualified n=%0d b=%h", n, c.b);
+    $fclose(fd);
+  end
+endmodule
+"#
+    );
+    let (sim, lines) = run_with_file("fread_class", "in.bin", &[0x11, 0x22, 0x33], &src);
+    assert_eq!(lines, ["T|method n=1 b=11", "T|qualified n=1 b=22"]);
+    assert_eq!(u(&sim, "u_foo.b[0]"), 0, "child memory untouched");
+    assert_eq!(u(&sim, "b[0]"), 0, "module memory untouched");
+}
+
+#[test]
+fn fread_class_virtual_interface_memory_is_reachable() {
+    let src = r#"
+interface ifc;
+  logic [7:0] m [2];
+endinterface
+class C;
+  virtual ifc vif;
+endclass
+module tb;
+  ifc i();
+  integer fd, n;
+  initial begin
+    C c = new;
+    c.vif = i;
+    fd = $fopen("BIN", "rb");
+    n = $fread(c.vif.m, fd);
+    $fclose(fd);
+    $display("T|n=%0d m=%h%h", n, i.m[0], i.m[1]);
+  end
+endmodule
+"#;
+    let (_, lines) = run_with_file("fread_vif", "in.bin", &[0x11, 0x22], src);
+    assert_eq!(lines, ["T|n=2 m=1122"]);
+}
+
+#[test]
+fn fread_struct_scalar_member_does_not_alias_child_memory() {
+    let src = format!(
+        "{FOO_MEM}{}",
+        r#"
+module tb;
+  foo u_foo();
+  initial begin
+    struct { byte b; } s;
+    integer fd, n;
+    fd = $fopen("BIN", "rb");
+    n = $fread(s.b, fd);
+    $fclose(fd);
+    $display("T|n=%0d b=%h", n, s.b);
+  end
+endmodule
+"#
+    );
+    let (sim, lines) = run_with_file("fread_struct", "in.bin", &[0x11, 0x22], &src);
+    assert_eq!(lines, ["T|n=1 b=11"]);
+    assert_eq!(u(&sim, "u_foo.b[0]"), 0, "child memory untouched");
+}
+
+#[test]
+fn fread_local_array_shadows_module_scalar_for_readmem() {
+    let src = r#"
+module tb;
+  byte b;
+  task load;
+    logic [7:0] b [2];
+    begin
+      $readmemh("BIN", b);
+      $display("T|local=%h", b[0]);
+    end
+  endtask
+  initial load;
+endmodule
+"#;
+    let (sim, lines) = run_with_file("fread_arrb", "m.hex", b"ee\n", src);
+    assert_eq!(lines, ["T|local=ee"]);
+    assert_eq!(u(&sim, "b"), 0, "module scalar untouched");
+}
+
+#[test]
+fn fread_local_array_shadows_module_array() {
+    let src = r#"
+module tb;
+  logic [7:0] b [2];
+  task load;
+    logic [7:0] b [2];
+    begin
+      $readmemh("BIN", b);
+      $display("T|local=%h", b[0]);
+    end
+  endtask
+  initial load;
+endmodule
+"#;
+    let (sim, lines) = run_with_file("fread_arrarr", "m.hex", b"ee\n", src);
+    assert_eq!(lines, ["T|local=ee"]);
+    assert_eq!(u(&sim, "b[0]"), 0, "module array untouched");
+}
+
+#[test]
+fn fread_class_method_local_array_shadows_property_scalar() {
+    let src = r#"
+class C;
+  byte b;
+  function void load;
+    logic [7:0] b [2];
+    begin
+      $readmemh("BIN", b);
+      $display("T|local=%h", b[0]);
+    end
+  endfunction
+endclass
+module tb;
+  initial begin
+    C c = new;
+    c.load();
+    $display("T|prop=%h", c.b);
+  end
+endmodule
+"#;
+    let (_, lines) = run_with_file("fread_carr", "m.hex", b"33\n", src);
+    assert_eq!(lines, ["T|local=33", "T|prop=00"]);
+}
+
+#[test]
+fn fread_local_scalar_mem_does_not_block_hierarchical_r_mem() {
+    let src = r#"
+module ram;
+  logic [7:0] mem [2];
+endmodule
+module tb;
+  ram r();
+  task load;
+    byte mem;
+    integer fd, n;
+    begin
+      fd = $fopen("BIN", "rb");
+      n = $fread(r.mem, fd);
+      $fclose(fd);
+      $display("T|n=%0d mem=%h", n, mem);
+    end
+  endtask
+  initial load;
+endmodule
+"#;
+    let (sim, lines) = run_with_file("fread_lmem", "in.bin", &[0x11, 0x22], src);
+    assert_eq!(lines, ["T|n=2 mem=00"]);
+    assert_eq!(u(&sim, "r.mem[0]"), 0x11);
+    assert_eq!(u(&sim, "r.mem[1]"), 0x22);
+}
+
+#[test]
+fn fread_instance_memory_loads_sibling_instances_independently() {
+    // `u.m` inside the wrapper's task names that wrapper's own memory; the
+    // two wrappers hold same-named memories and must not cross-load.
+    let src = r#"
+module leaf;
+  logic [7:0] m [2];
+endmodule
+module wrap;
+  leaf u();
+  task load(input integer fd);
+    integer n;
+    begin
+      n = $fread(u.m, fd);
+      $display("T|%m n=%0d", n);
+    end
+  endtask
+endmodule
+module tb;
+  wrap w0(), w1();
+  integer fd;
+  initial begin
+    fd = $fopen("BIN", "rb");
+    w0.load(fd);
+    w1.load(fd);
+    $fclose(fd);
+  end
+endmodule
+"#;
+    let (sim, lines) = run_with_file("fread_sib", "in.bin", &[0xaa, 0xbb, 0xcc, 0xdd], src);
+    assert_eq!(lines, ["T|tb.w0.load n=2", "T|tb.w1.load n=2"]);
+    assert_eq!(u(&sim, "w0.u.m[0]"), 0xaa);
+    assert_eq!(u(&sim, "w0.u.m[1]"), 0xbb);
+    assert_eq!(u(&sim, "w1.u.m[0]"), 0xcc);
+    assert_eq!(u(&sim, "w1.u.m[1]"), 0xdd);
+}
+
 // ---------------------------------------------------------------- group 5
 
 #[test]
