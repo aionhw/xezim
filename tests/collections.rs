@@ -350,6 +350,8 @@ mod package_array_operand_in_method;
 
 #[path = "collections/unpacked_struct_concat_1035.rs"]
 mod unpacked_struct_concat_1035;
+#[path = "collections/struct_concat_registered.rs"]
+mod struct_concat_registered;
 
 #[path = "collections/call_returned_array_whole_value_1036.rs"]
 mod call_returned_array_whole_value_1036;
@@ -376,3 +378,6 @@ mod review_typedef_row_class_properties_216;
 
 #[path = "collections/dyn_array_of_dyn_array_rows.rs"]
 mod dyn_array_of_dyn_array_rows;
+
+#[path = "collections/struct_concat_forms.rs"]
+mod struct_concat_forms;
