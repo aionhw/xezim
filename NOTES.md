@@ -10,6 +10,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
+* Module bodies containing only declarations and continuous assignments reuse
+  their prepared syntax across value-parameter overrides, avoiding repeated
+  cloning and content comparison. Each instance still resolves its own
+  widths, initializers and connections; generate and procedural bodies keep
+  parameter-sensitive preparation (§6.20, §23.10, #721).
+
 * Sampling a covergroup whose bins have a `with` filter that compares `item`
   with constants works from the ranges between the filter's cut points
   instead of testing each value of a bin's range. A class covergroup with
