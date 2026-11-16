@@ -29,14 +29,14 @@ module top;
   leaf #(.W(4), .V(3)) u2(c);
   initial begin
     #1;
-    $display("T|%0d %0d %0d", a, b, c);
+    $display("T|%h %h %h", a, b, c);
     $display("T|%0d %0d %0d", $bits(u0.data), $bits(u1.data), $bits(u2.data));
     $display("T|%0d %0d %0d", u0.data, u1.data, u2.data);
     $finish;
   end
 endmodule
 "#)]);
-    fixture.check_all_paths("design.sv", &["T|12 504 12", "T|4 9 4", "T|-4 -8 -4"]);
+    fixture.check_all_paths("design.sv", &["T|c 1f8 c", "T|4 9 4", "T|-4 -8 -4"]);
 }
 
 struct Fixture(PathBuf);
