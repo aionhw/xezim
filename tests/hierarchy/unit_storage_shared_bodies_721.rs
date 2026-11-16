@@ -9,6 +9,36 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// §6.20 / §23.10: sharing symbolic preparation must preserve each
+/// instance's widths, signed initializer, net drivers and parameter values.
+#[test]
+fn symbolic_preparation_preserves_instance_values() {
+    let fixture = Fixture::new(&[("design.sv", r#"
+module leaf #(parameter W=4, V=3)(output wire [W-1:0] out);
+  localparam K=V+1;
+  logic signed [W-1:0] data = -K;
+  wire [W-1:0] n = data;
+  assign out = n;
+endmodule
+module top;
+  wire [3:0] a, c;
+  wire [8:0] b;
+  leaf #(.W(4), .V(3)) u0(a);
+  leaf #(.W(9), .V(7)) u1(b);
+  leaf #(.W(4), .V(3)) u2(c);
+  initial begin
+    #1;
+    $display("T|%0d %0d %0d", a, b, c);
+    $display("T|%0d %0d %0d", $bits(u0.data), $bits(u1.data), $bits(u2.data));
+    $display("T|%0d %0d %0d", u0.data, u1.data, u2.data);
+    $finish;
+  end
+endmodule
+"#)]);
+    fixture.check_all_paths("design.sv", &["T|12 504 12", "T|4 9 4", "T|-4 -8 -4"]);
+}
+
 struct Fixture(PathBuf);
 impl Fixture {
     fn new(files: &[(&str, &str)]) -> Self {
