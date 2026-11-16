@@ -35,10 +35,11 @@ from typing import List, Mapping, Sequence, Union
 import cocotb_tools.config
 from cocotb_tools.runner import VHDL, Runner, Verilog
 
-try:  # cocotb 2.0's runners convert a define's value to a literal.
-    from cocotb_tools.runner import _as_sv_literal as _define_value
-except ImportError:  # cocotb 2.1's runners take it as written.
-    _define_value = format
+# cocotb 2.1.0 promoted `_as_sv_literal` to public `as_sv_literal`.
+try:
+    from cocotb_tools.runner import as_sv_literal
+except ImportError:
+    from cocotb_tools.runner import _as_sv_literal as as_sv_literal
 
 PathLike = Union[str, os.PathLike]
 _Command = List[str]
@@ -107,7 +108,7 @@ class Xezim(Runner):
             for name, value in defines.items()
             for arg in (
                 "-D",
-                name if value is None else f"{name}={_define_value(value)}",
+                name if value is None else f"{name}={as_sv_literal(value)}",
             )
         ]
 
@@ -132,8 +133,14 @@ class Xezim(Runner):
 
     @property
     def _vpi_lib(self) -> Path:
-        # lib_name_path exists in cocotb 2.0 and 2.1 (2.1 removed lib_name).
-        return cocotb_tools.config.lib_name_path("vpi", _VPI_LIB_FLAVOUR)
+        # cocotb 2.1.0 removed `config.lib_name` in favor of `config.lib_name_path`
+        # (also available in 2.0.1); fall back for earlier 2.0.x releases.
+        lib_name_path = getattr(cocotb_tools.config, "lib_name_path", None)
+        if lib_name_path is not None:
+            return Path(lib_name_path("vpi", _VPI_LIB_FLAVOUR))
+        return Path(cocotb_tools.config.libs_dir) / cocotb_tools.config.lib_name(
+            "vpi", _VPI_LIB_FLAVOUR
+        )
 
     def _waves_file(self) -> str:
         return str(self.build_dir / f"{self.sim_hdl_toplevel}.fst")
@@ -233,11 +240,14 @@ class Xezim(Runner):
 def register() -> None:
     """Teach ``cocotb_tools.runner.get_runner`` about ``"xezim"``.
 
-    Wraps the stock ``get_runner`` rather than editing its table, so it keeps
-    working for every simulator cocotb already supports and stays correct if
-    that table changes.
+    Registers in ``SUPPORTED_RUNNERS`` when cocotb exposes it (2.1+) and wraps
+    ``get_runner`` so earlier cocotb 2.0.x releases work too.
     """
     import cocotb_tools.runner as _runner
+
+    supported = getattr(_runner, "SUPPORTED_RUNNERS", None)
+    if isinstance(supported, dict):
+        supported["xezim"] = Xezim
 
     if getattr(_runner.get_runner, "_xezim_wrapped", False):
         return
