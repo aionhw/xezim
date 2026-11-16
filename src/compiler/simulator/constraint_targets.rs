@@ -4560,6 +4560,9 @@ impl Simulator {
                 self.randomize_budget_exhausted = true;
                 let mut failed_names = Vec::new();
                 for constraint in constraints {
+                    if constraint.name.name == "__back_ref__" {
+                        continue;
+                    }
                     if constraint.items.iter().any(|item| {
                         !Self::constraint_unmodeled(item)
                             && !self.check_constraint_item(handle, item)
@@ -4568,6 +4571,36 @@ impl Simulator {
                     }
                 }
                 failed_names.extend(self.failed_child_constraint_names(handle));
+                // §18.5.9: a sub-object's solve that ran out with nothing
+                // of its own failing was not the cause: its items that read
+                // an enclosing object are judged by the call's outermost
+                // solve, so that object and its view are reported.
+                let mut class_name = class_name.to_string();
+                if failed_names.is_empty()
+                    && let Some(&root) = self.rand_solve_chain.first()
+                    && root != handle
+                    && let Some(root_class) = self
+                        .heap
+                        .get(root)
+                        .and_then(|o| o.as_ref())
+                        .map(|o| o.class_name.clone())
+                {
+                    self.class_context_stack.push(Some(root_class.clone()));
+                    for constraint in self.active_constraints(root) {
+                        if constraint.name.name == "__back_ref__" {
+                            continue;
+                        }
+                        if constraint.items.iter().any(|item| {
+                            !Self::constraint_unmodeled(item)
+                                && !self.check_constraint_item(root, item)
+                        }) {
+                            failed_names.push(constraint.name.name.clone());
+                        }
+                    }
+                    self.class_context_stack.pop();
+                    failed_names.extend(self.failed_child_constraint_names(root));
+                    class_name = root_class;
+                }
                 failed_names.sort();
                 failed_names.dedup();
                 let names = failed_names.join(", ");

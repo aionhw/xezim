@@ -71,6 +71,20 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A constraint of an element of a rand queue or array of handles that reads
+  the randomized object's rand variables through a handle back to it
+  (`item.addr` in a policy class of constraint layering, the policies held in
+  `rand policy_base policy[$]`) is solved together with that object, at any
+  depth of policy lists. Each element was solved alone against the value the
+  variable held before the call, so `randomize()` failed with its budget
+  exhausted, and with the item under a `foreach` over state it returned 1
+  with values that broke the constraint. Such an item is now left to the
+  enclosing solve, which solves it jointly and checks it on the final values;
+  the element's `post_randomize` runs once the call has succeeded. In the
+  joint solve, an `inside` range read from a sub-object that is an array
+  element (`[0 : ranges.size() - 1]`) is evaluated on that element instead of
+  reading as 0 (§18.5.9, §18.6.2, #1184).
+
 * A blocking assignment with an intra-assignment delay or event control
   stores an assignment pattern for an unpacked array, unpacked struct or
   queue target, and evaluates an expression at the target's width:

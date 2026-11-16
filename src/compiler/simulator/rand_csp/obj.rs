@@ -92,8 +92,50 @@ impl Simulator {
         let mut elems_in = false;
         // §18.8: element handles whose rand_mode is off are not solved.
         let off = self.rand_mode_disabled.get(&handle);
-        for p in rand_obj_props {
-            if !Self::csp_constraints_read(p, constraints) && !self.csp_points_back(handle, p) {
+        let mut included = vec![false; rand_obj_props.len()];
+        for (i, p) in rand_obj_props.iter().enumerate() {
+            included[i] = Self::csp_constraints_read(p, constraints) || self.csp_points_back(handle, p);
+        }
+        // §18.5.9: a back-referencing sub-object may also constrain a sibling
+        // `rand` sub-object through the owner (`item.other.x`), even when the
+        // owner's own constraints never mention `other` and `other` has no
+        // back-reference of its own. Pull in any `rand_obj_props` reached via
+        // `handle` from already-included subtrees until closure.
+        let mut checked_subtrees = vec![false; rand_obj_props.len()];
+        loop {
+            let mut added = false;
+            for i in 0..rand_obj_props.len() {
+                if !included[i] || checked_subtrees[i] {
+                    continue;
+                }
+                checked_subtrees[i] = true;
+                for (_, o) in self.csp_prop_subtree(handle, &rand_obj_props[i]) {
+                    let cs = self.active_constraints(o);
+                    for c in &cs {
+                        for it in &c.items {
+                            Self::csp_item_exprs(it, &mut |expr| {
+                                Self::walk_operands(expr, &mut |e| {
+                                    if let Some(next) =
+                                        self.csp_path_next_after_target(o, e, handle)
+                                        && let Some(j) =
+                                            rand_obj_props.iter().position(|p| p == &next)
+                                        && !included[j]
+                                    {
+                                        included[j] = true;
+                                        added = true;
+                                    }
+                                });
+                            });
+                        }
+                    }
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        for (i, p) in rand_obj_props.iter().enumerate() {
+            if !included[i] {
                 continue;
             }
             let scoped = format!("{}#{}", handle, p);
@@ -136,7 +178,8 @@ impl Simulator {
                         if sub == handle || !seen.insert(sub) {
                             return None;
                         }
-                        out.push((name, sub));
+                        out.push((name.clone(), sub));
+                        self.rand_csp_nested_subs(&name, sub, handle, &mut seen, &mut out, 0)?;
                     }
                 }
                 None => {
@@ -156,24 +199,240 @@ impl Simulator {
         if elems_in && seen.len() != out.len() {
             return None;
         }
+        // An object array held by a sub-object joins element by element
+        // (`a.q[k]`). A constraint that names such an array (`foreach
+        // (q[i]) q[i].x …`, `q.size()`) picks its elements in a way the
+        // rewrite through `a` does not follow. Match exact `(owner, arr)`
+        // targets so an unrelated same-named property on the owner or another
+        // sub-object does not falsely reject the joint solve.
+        let mut nested_arrays: Vec<(usize, String)> = Vec::new();
+        for (path, _) in &out {
+            if let Some((parent_path, seg)) = path.rsplit_once('.')
+                && let Some((arr, _)) = seg.split_once('[')
+                && let Some(&(_, owner)) = out.iter().find(|(p, _)| p == parent_path)
+            {
+                let key = (owner, arr.to_string());
+                if !nested_arrays.contains(&key) {
+                    nested_arrays.push(key);
+                }
+            }
+        }
+        if !nested_arrays.is_empty() {
+            if self.csp_constraints_read_nested(handle, constraints, &nested_arrays) {
+                return None;
+            }
+            for &(_, o) in &out {
+                if self.csp_constraints_read_nested(o, &self.active_constraints(o), &nested_arrays) {
+                    return None;
+                }
+            }
+        }
         Some(out)
+    }
+
+    /// Collect `(path, handle)` for `p` (a plain handle or handle array of
+    /// `handle`) and all its reachable `rand` sub-objects.
+    fn csp_prop_subtree(&self, handle: usize, p: &str) -> Vec<(String, usize)> {
+        let direct: Vec<usize> = match self.rand_child_collection_keys(handle, p) {
+            Some(keys) => keys
+                .iter()
+                .filter_map(|k| self.read_coll_elem(k))
+                .filter_map(|v| v.to_u64())
+                .map(|v| v as usize)
+                .filter(|&o| o != 0 && self.heap.get(o).and_then(|x| x.as_ref()).is_some())
+                .collect(),
+            None => vec![self.member_handle(handle, p).unwrap_or(0)],
+        };
+        let mut seen = HashSet::default();
+        let mut subtree: Vec<(String, usize)> = Vec::new();
+        for sub in direct {
+            if sub == 0 {
+                continue;
+            }
+            subtree.push((String::new(), sub));
+            let _ = self.rand_csp_nested_subs(p, sub, handle, &mut seen, &mut subtree, 0);
+        }
+        subtree
     }
 
     /// Whether a constraint of the object in `p`, or of a rand sub-object under
     /// it at any depth, reads through handle members back to `handle`.
     fn csp_points_back(&self, handle: usize, p: &str) -> bool {
-        let sub = self.member_handle(handle, p).unwrap_or(0);
-        let (mut seen, mut subtree) = (HashSet::default(), vec![(String::new(), sub)]);
-        let _ = self.rand_csp_nested_subs(p, sub, handle, &mut seen, &mut subtree, 0);
+        let subtree = self.csp_prop_subtree(handle, p);
         subtree.iter().any(|&(_, o)| {
             let leaf = |e: &Expression| self.csp_path_reaches(o, e, handle);
             Self::csp_constraints_match(&self.active_constraints(o), &leaf, &|_| false)
         })
     }
 
+    /// If `e`, read from `from`, passes through `target` before its last
+    /// segment, return the member name immediately following `target`.
+    fn csp_path_next_after_target(&self, from: usize, e: &Expression, target: usize) -> Option<String> {
+        let mut path = match &e.kind {
+            ExprKind::Ident(h) => h.path.iter().map(|s| s.name.name.clone()).collect(),
+            ExprKind::MemberAccess { .. } => Self::csp_member_path(e).unwrap_or_default(),
+            _ => return None,
+        };
+        if path.first().is_some_and(|m| m == "this") {
+            path.remove(0);
+        }
+        if path.len() < 2 {
+            return None;
+        }
+        let mut cur = from;
+        for i in 0..path.len() - 1 {
+            cur = self.csp_class_handle(cur, &path[i]);
+            if cur == 0 {
+                return None;
+            }
+            if cur == target {
+                return Some(path[i + 1].clone());
+            }
+        }
+        None
+    }
+
+    /// Whether any constraint in `cs` (evaluated from `from`) reads a nested
+    /// object array `(owner, arr)` in `nested_arrays`.
+    fn csp_constraints_read_nested(
+        &self,
+        from: usize,
+        cs: &[ClassConstraint],
+        nested_arrays: &[(usize, String)],
+    ) -> bool {
+        for (owner, arr) in nested_arrays {
+            if *owner == from && Self::csp_constraints_read(arr, cs) {
+                return true;
+            }
+        }
+        let leaf = |e: &Expression| self.csp_expr_reads_nested(from, e, nested_arrays);
+        Self::csp_constraints_match(cs, &leaf, &|_| false)
+    }
+
+    fn csp_expr_reads_nested(
+        &self,
+        from: usize,
+        e: &Expression,
+        nested_arrays: &[(usize, String)],
+    ) -> bool {
+        let mut segs: Vec<(String, bool)> = Vec::new();
+        let mut cur_e = e;
+        loop {
+            match &cur_e.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    segs.push((member.name.clone(), false));
+                    cur_e = expr;
+                }
+                ExprKind::Index { expr, .. } => {
+                    if let Some(last) = segs.last_mut() {
+                        last.1 = true;
+                    }
+                    cur_e = expr;
+                }
+                ExprKind::Ident(h) if h.root.is_none() => {
+                    for s in h.path.iter().rev() {
+                        segs.push((s.name.name.clone(), !s.selects.is_empty()));
+                    }
+                    break;
+                }
+                ExprKind::This => {
+                    segs.push(("this".to_string(), false));
+                    break;
+                }
+                _ => return false,
+            }
+        }
+        segs.reverse();
+        if segs.first().is_some_and(|(m, _)| m == "this") {
+            segs.remove(0);
+        }
+        if segs.is_empty() {
+            return false;
+        }
+        self.csp_walk_nested_segs(from, &segs, nested_arrays)
+    }
+
+    fn csp_walk_nested_segs(
+        &self,
+        cur: usize,
+        segs: &[(String, bool)],
+        nested_arrays: &[(usize, String)],
+    ) -> bool {
+        let Some(((name, has_sel), rest)) = segs.split_first() else {
+            return false;
+        };
+        if nested_arrays.iter().any(|(o, a)| *o == cur && a == name) {
+            return true;
+        }
+        if rest.is_empty() {
+            return false;
+        }
+        if *has_sel
+            && let Some(keys) = self.rand_child_collection_keys(cur, name)
+        {
+            return keys.iter().any(|k| {
+                self.read_coll_elem(k)
+                    .and_then(|v| v.to_u64())
+                    .map(|v| v as usize)
+                    .filter(|&h| h != 0)
+                    .is_some_and(|h| self.csp_walk_nested_segs(h, rest, nested_arrays))
+            });
+        }
+        if let Some((arr, idx_str)) = name.split_once('[')
+            && let Some(idx_str) = idx_str.strip_suffix(']')
+        {
+            let next = self
+                .read_coll_elem(&format!("{cur}#{arr}[{idx_str}]"))
+                .and_then(|v| v.to_u64())
+                .map(|v| v as usize)
+                .unwrap_or(0);
+            return next != 0 && self.csp_walk_nested_segs(next, rest, nested_arrays);
+        }
+        let next = self.csp_class_handle(cur, name);
+        next != 0 && self.csp_walk_nested_segs(next, rest, nested_arrays)
+    }
+
+    /// Resolve a member-path expression starting at `from` through handle
+    /// members (including single-segment `a[k]` object-array elements) to the
+    /// owning `(object_handle, leaf_member_name)`.
+    pub(crate) fn csp_resolve_member_owner(
+        &self,
+        from: usize,
+        e: &Expression,
+    ) -> Option<(usize, String)> {
+        let mut path = Self::csp_member_path(e)?;
+        if path.first().is_some_and(|m| m == "this") {
+            path.remove(0);
+        }
+        let (leaf, hops) = path.split_last()?;
+        let h = hops.iter().try_fold(from, |h, m| {
+            if let Some((arr, k)) = m.split_once('[') {
+                let k = k.strip_suffix(']')?;
+                return self
+                    .read_coll_elem(&format!("{h}#{arr}[{k}]"))
+                    .and_then(|v| v.to_u64())
+                    .map(|v| v as usize)
+                    .filter(|&h| h != 0);
+            }
+            let next = self.csp_class_handle(h, m);
+            (next != 0).then_some(next)
+        })?;
+        Some((h, leaf.clone()))
+    }
+
     /// Whether the member path `e` spells, read from the object `from`, passes
     /// through `target` before its last member (`owner.p.x`, `p.sum()`).
     fn csp_path_reaches(&self, from: usize, e: &Expression, target: usize) -> bool {
+        self.csp_path_reaches_any(from, e, &[target])
+    }
+
+    /// The same for any object of `targets`.
+    pub(crate) fn csp_path_reaches_any(
+        &self,
+        from: usize,
+        e: &Expression,
+        targets: &[usize],
+    ) -> bool {
         let mut path = match &e.kind {
             ExprKind::Ident(h) => h.path.iter().map(|s| s.name.name.clone()).collect(),
             ExprKind::MemberAccess { .. } => Self::csp_member_path(e).unwrap_or_default(),
@@ -188,7 +447,7 @@ impl Simulator {
         let mut cur = from;
         hops.iter().any(|m| {
             cur = self.csp_class_handle(cur, m);
-            cur == target
+            cur != 0 && targets.contains(&cur)
         })
     }
 
@@ -234,8 +493,19 @@ impl Simulator {
 
     /// Whether `leaf` holds for some expression node of `constraints`, or
     /// `name` for a name a `solve` item lists.
-    fn csp_constraints_match(
+    pub(crate) fn csp_constraints_match(
         constraints: &[ClassConstraint],
+        leaf: &dyn Fn(&Expression) -> bool,
+        name: &dyn Fn(&str) -> bool,
+    ) -> bool {
+        constraints
+            .iter()
+            .any(|c| c.items.iter().any(|it| Self::csp_item_match(it, leaf, name)))
+    }
+
+    /// `csp_constraints_match` for one item.
+    pub(crate) fn csp_item_match(
+        it: &ConstraintItem,
         leaf: &dyn Fn(&Expression) -> bool,
         name: &dyn Fn(&str) -> bool,
     ) -> bool {
@@ -245,9 +515,7 @@ impl Simulator {
             hit
         };
         let mut hit = false;
-        for c in constraints {
-            for it in &c.items {
-                Self::csp_item_walk(it, &mut |i| {
+        Self::csp_item_walk(it, &mut |i| {
                     hit |= match i {
                         ConstraintItem::Expr(e) => reads(e),
                         ConstraintItem::Inside {
@@ -280,10 +548,8 @@ impl Simulator {
                         }
                         ConstraintItem::Unique { exprs, .. } => exprs.iter().any(reads),
                         ConstraintItem::Soft(_) | ConstraintItem::Block(_) => false,
-                    }
-                });
             }
-        }
+        });
         hit
     }
 
@@ -310,6 +576,7 @@ impl Simulator {
             .unwrap_or_default();
         let mut cur = self.heap.get(sub)?.as_ref().map(|i| i.class_name.clone());
         let mut members: Vec<String> = Vec::new();
+        let mut arrays: Vec<String> = Vec::new();
         let mut hops = 0;
         while let Some(cn) = cur {
             hops += 1;
@@ -321,25 +588,59 @@ impl Simulator {
                 let Some(sig) = cd.properties.get(&m) else {
                     continue;
                 };
+                // A fixed, dynamic or queue array of handles joins element
+                // by element, as one of the solved object does; its element
+                // type may be a class specialization (`policy #(T) q[$]`).
+                let is_arr =
+                    cd.array_properties.contains_key(&m) || cd.queue_properties.contains_key(&m);
                 let is_obj = sig
                     .type_name
                     .as_ref()
-                    .is_some_and(|tn| self.module.classes.contains_key(tn));
+                    .is_some_and(|tn| self.module.classes.contains_key(tn))
+                    || (is_arr && self.prop_class_type(sub, &m).is_some());
                 if !is_obj {
                     continue;
                 }
-                if cd.array_properties.contains_key(&m)
-                    || cd.array_nd_properties.contains_key(&m)
-                    || cd.queue_properties.contains_key(&m)
-                    || cd.assoc_properties.contains_key(&m)
+                if cd.array_nd_properties.contains_key(&m) || cd.assoc_properties.contains_key(&m)
                 {
                     return None;
                 }
-                if !members.contains(&m) {
+                if is_arr {
+                    if !arrays.contains(&m) {
+                        arrays.push(m);
+                    }
+                } else if !members.contains(&m) {
                     members.push(m);
                 }
             }
             cur = cd.extends.clone();
+        }
+        for m in arrays {
+            let keys = self.rand_child_collection_keys(sub, &m)?;
+            let scoped = format!("{}#{}[", sub, m);
+            for k in keys {
+                let idx = k
+                    .strip_prefix(&scoped)
+                    .and_then(|r| r.strip_suffix(']'))
+                    .and_then(|r| r.parse::<i64>().ok())?;
+                let h = self
+                    .read_coll_elem(&k)
+                    .and_then(|v| v.to_u64())
+                    .unwrap_or(0) as usize;
+                if h == 0 || self.heap.get(h).and_then(|o| o.as_ref()).is_none() {
+                    continue;
+                }
+                // §18.8: an element whose rand_mode is off is not solved.
+                if rand_disabled.contains(&format!("{}[{}]", m, idx)) {
+                    continue;
+                }
+                if h == root || !seen.insert(h) {
+                    return None;
+                }
+                let path = format!("{}.{}[{}]", prefix, m, idx);
+                out.push((path.clone(), h));
+                self.rand_csp_nested_subs(&path, h, root, seen, out, depth + 1)?;
+            }
         }
         for m in members {
             let h = self.member_handle(sub, &m).unwrap_or(0);
@@ -742,13 +1043,34 @@ impl Simulator {
             span,
         );
         for s in &h.path[j + 1..] {
+            // An element of an object array a sub-object holds
+            // (`a[0].q[1].x`) gets its select back too.
+            let (name, elem) = match csp_obj_split(&s.name.name) {
+                Some((arr, k)) => (
+                    crate::ast::Identifier {
+                        name: arr,
+                        span: s.name.span,
+                    },
+                    Some(k),
+                ),
+                None => (s.name.clone(), None),
+            };
             out = Expression::new(
                 ExprKind::MemberAccess {
                     expr: Box::new(out),
-                    member: s.name.clone(),
+                    member: name,
                 },
                 span,
             );
+            if let Some(k) = elem {
+                out = Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(out),
+                        index: Box::new(Self::literal_of(&Self::signed_loop_val(k), span)),
+                    },
+                    span,
+                );
+            }
             for x in &s.selects {
                 out = Expression::new(
                     ExprKind::Index {
@@ -815,7 +1137,7 @@ impl Simulator {
     /// (a sub-object's own items, to be rewritten through its handle) every
     /// loop is. The indices come from the loop's array: an object array, a
     /// solver array, or a fixed-shape member of `handle`.
-    pub(super) fn csp_unroll_item(
+    pub(crate) fn csp_unroll_item(
         &mut self,
         handle: usize,
         parent: Option<(&Csp, &HashSet<String>)>,
@@ -840,7 +1162,12 @@ impl Simulator {
             } => {
                 let names: Vec<String> = vars.iter().flatten().map(|v| v.name.clone()).collect();
                 let unroll = match parent {
-                    None => true,
+                    None => {
+                        // A `foreach` over a path through another handle (such
+                        // as `item.arr[i]` on the owner) stays as a `Foreach`
+                        // item to be prefixed and resolved in the joint `Csp`.
+                        Self::foreach_plain_member(array) || Self::csp_member_path(array).is_none()
+                    }
                     Some((_, obj)) => Self::csp_obj_picked_by(item, &names, obj),
                 };
                 if !unroll {
@@ -965,6 +1292,21 @@ impl Simulator {
             if let Some(a) = csp.arrays.get(&name) {
                 return Some(a.elems.iter().map(|e| e.0).collect());
             }
+        }
+        // A sub-object's state collection of handles (`foreach (ranges[i])
+        // … ranges[i].min`) loops over its current elements; a rand one is
+        // kept out by `rand_csp_subs`.
+        if parent.is_none()
+            && Self::foreach_plain_member(array)
+            && self.prop_class_type(handle, &name).is_some()
+            && !self.is_associative_array(&format!("{handle}#{name}"))
+            && let Some(keys) = self.rand_child_collection_keys(handle, &name)
+        {
+            let prefix = format!("{handle}#{name}[");
+            return keys
+                .iter()
+                .map(|k| k.strip_prefix(&prefix)?.strip_suffix(']')?.parse().ok())
+                .collect();
         }
         self.csp_foreach_indices_of(handle, array, &name)
     }

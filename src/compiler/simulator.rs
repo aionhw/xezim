@@ -8029,6 +8029,24 @@ pub struct Simulator {
     /// for `rand` class-handle members (a cyclic object graph would otherwise
     /// recurse forever).
     randomize_depth: usize,
+    /// §18.5.9: the objects of the randomize() call being solved, outermost
+    /// first: the object `randomize()` was called on, then each rand
+    /// sub-object whose own solve is running under it. A sub-object's
+    /// constraint that reads a rand variable of an object earlier in the
+    /// chain through a handle member (`item.addr`, `item` the handle back
+    /// to the enclosing object) belongs to that object's solve.
+    rand_solve_chain: Vec<usize>,
+    /// Set by `randomize_nested_with` for the solve it starts, which then
+    /// extends `rand_solve_chain` instead of starting a chain of its own.
+    rand_solve_nested: bool,
+    /// §18.6.2: the sub-objects of the running call whose `post_randomize`
+    /// waits for the whole call to succeed. A sub-object with an item left
+    /// to an enclosing solve (see `rand_solve_chain`) is done before the
+    /// variables that item constrains have their final values, which its
+    /// `post_randomize` may read (`hist.push_back(item.addr)`).
+    rand_post_deferred: Vec<usize>,
+    /// The solve in progress left an item to an enclosing solve.
+    rand_post_defer_self: bool,
     /// Failed randomize() calls reported so far, per class or
     /// `std::randomize` call site (`rand_fail_warn`).
     rand_fail_reports: HashMap<String, u32>,
