@@ -15,24 +15,35 @@ impl Simulator {
     pub(super) fn register_dyn_member_shape(
         &mut self,
         cdef: &crate::compiler::elaborate::ElaboratedClass,
-        params: &HashMap<String, Value>,
+        overrides: &HashMap<String, Value>,
         prop: &str,
         scoped: &str,
         width: u32,
     ) {
+        let params = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: overrides,
+        };
         let fixed_tail: Option<Vec<(i64, i64)>> =
             cdef.dynamic_tail_properties.get(prop).and_then(|tail| {
                 tail.iter()
                     .map(|d| match d {
                         crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
-                            let l =
-                                super::elaborate::const_eval_i64_with_params(left, Some(params))?;
-                            let r =
-                                super::elaborate::const_eval_i64_with_params(right, Some(params))?;
+                            let l = super::elaborate::const_eval_i64_with_params_env(
+                                left,
+                                Some(&params),
+                            )?;
+                            let r = super::elaborate::const_eval_i64_with_params_env(
+                                right,
+                                Some(&params),
+                            )?;
                             Some((l.min(r), l.max(r)))
                         }
                         crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
-                            match super::elaborate::const_eval_i64_with_params(expr, Some(params)) {
+                            match super::elaborate::const_eval_i64_with_params_env(
+                                expr,
+                                Some(&params),
+                            ) {
                                 Some(n) if n > 0 => Some((0, n - 1)),
                                 _ => None,
                             }
@@ -2833,13 +2844,13 @@ impl Simulator {
                 self.module.dynamic_arrays.insert(scoped.clone());
                 // The object is not on the heap yet: its value parameters
                 // are read from the instance being built.
-                let mut params = self.module.parameters.clone();
+                let mut overrides: HashMap<String, Value> = HashMap::default();
                 for (pn, _) in &cdef.param_defaults {
                     if let Some(v) = instance.properties.get(pn) {
-                        params.insert(pn.clone(), v.clone());
+                        overrides.insert(pn.clone(), v.clone());
                     }
                 }
-                self.register_dyn_member_shape(cdef, &params, prop, &scoped, width);
+                self.register_dyn_member_shape(cdef, &overrides, prop, &scoped, width);
                 if let Some(m) = max {
                     self.module.queue_max_sizes.insert(scoped.clone(), m);
                 }

@@ -364,12 +364,12 @@ impl Simulator {
                     .find(|(n, ..)| n == leaf)
                     .map(|&(_, l, h, w)| (l, h, w))
             })?;
-        let mut params = self.module.parameters.clone();
+        let mut param_overrides: HashMap<String, Value> = HashMap::default();
         for (name, _) in &cd.param_defaults {
             if !cd.array_properties.contains_key(name)
                 && let Some(v) = self.resolve_value_param_in_current(name)
             {
-                params.insert(name.clone(), v);
+                param_overrides.insert(name.clone(), v);
             }
         }
         let mut descending = cd
@@ -403,10 +403,17 @@ impl Simulator {
                     if let DataType::TypeReference { name, .. } = dt.as_ref() {
                         let scoped = name.qualified();
                         let value = if name.has_scope() {
-                            params.get(&scoped).cloned()
+                            param_overrides
+                                .get(&scoped)
+                                .or_else(|| self.module.parameters.get(&scoped))
+                                .cloned()
                         } else {
-                            self.resolve_value_param_in_current(&name.name.name)
-                                .or_else(|| params.get(&name.name.name).cloned())
+                            self.resolve_value_param_in_current(&name.name.name).or_else(|| {
+                                param_overrides
+                                    .get(&name.name.name)
+                                    .or_else(|| self.module.parameters.get(&name.name.name))
+                                    .cloned()
+                            })
                         };
                         value
                             .filter(|v| !v.has_xz())
@@ -430,9 +437,13 @@ impl Simulator {
             .bind_type_params_in(&dt, &|n| self.resolve_type_param_binding(n))
             .unwrap_or(dt);
         let resolved = self.resolve_dt(&dt);
-        let width = super::elaborate::resolve_type_width(
+        let env = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: &param_overrides,
+        };
+        let width = super::elaborate::resolve_type_width_env(
             &resolved,
-            Some(&params),
+            Some(&env),
             Some(&self.module.typedefs),
         );
         Some(ClassArrayLayout {

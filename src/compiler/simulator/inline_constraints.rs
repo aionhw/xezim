@@ -1500,7 +1500,7 @@ impl Simulator {
             .filter(|(k, _)| is_root(&self.module.var_decl_types, k, &[]))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let params = self.module.parameters.clone();
+        let params = &self.module.parameters;
         let fixed = |d: &UD| -> Option<(i64, i64)> {
             match d {
                 UD::Range { left, right, .. } => {

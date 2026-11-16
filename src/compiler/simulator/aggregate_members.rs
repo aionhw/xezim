@@ -1583,10 +1583,10 @@ impl Simulator {
     /// [`packed_agg_layout`] against an explicit parameter scope — pass
     /// [`instance_param_scope`] output so member widths that reference CLASS
     /// parameters (`bit [W-1:0] f;` in an inline-struct property) resolve.
-    pub(super) fn packed_agg_layout_with(
+    pub(super) fn packed_agg_layout_with<P: super::elaborate::ParamLookup>(
         &self,
         su: &crate::ast::types::StructUnionType,
-        params: &HashMap<String, Value>,
+        params: &P,
     ) -> (Vec<(String, u32, u32)>, u32) {
         use crate::ast::types::StructUnionKind;
         let is_union = matches!(su.kind, StructUnionKind::Union);
@@ -1599,8 +1599,12 @@ impl Simulator {
             su.members.iter().rev().collect()
         };
         for m in members {
-            let fw =
-                resolve_type_width(&m.data_type, Some(params), Some(&self.module.typedefs)).max(1);
+            let fw = super::elaborate::resolve_type_width_env(
+                &m.data_type,
+                Some(params),
+                Some(&self.module.typedefs),
+            )
+            .max(1);
             // §7.2.1: reverse declarations within a member group too; the
             // first name in `bit a, b;` is more significant than the second.
             for d in m.declarators.iter().rev() {
@@ -2659,16 +2663,17 @@ impl Simulator {
         {
             return Rc::clone(layout);
         }
-        let params = if value_params.is_empty() {
-            std::borrow::Cow::Borrowed(&self.module.parameters)
+        let vp_map: HashMap<String, Value>;
+        let layout = if value_params.is_empty() {
+            Rc::new(self.packed_agg_layout_with(su, &self.module.parameters))
         } else {
-            let mut params = self.module.parameters.clone();
-            for (name, value) in value_params {
-                params.entry(name.clone()).or_insert_with(|| value.clone());
-            }
-            std::borrow::Cow::Owned(params)
+            vp_map = value_params.iter().cloned().collect();
+            let params = super::elaborate::ParamEnv::Overlay {
+                base: &vp_map,
+                top: &self.module.parameters,
+            };
+            Rc::new(self.packed_agg_layout_with(su, &params))
         };
-        let layout = Rc::new(self.packed_agg_layout_with(su, &params));
         self.aggregate_type_work[1].set(self.aggregate_type_work[1].get() + 1);
         self.class_packed_layout_cache
             .borrow_mut()
@@ -2698,17 +2703,18 @@ impl Simulator {
         rest: &[MemberSel],
     ) -> Option<ClassAggRef> {
         let value_params = self.instance_value_params(handle);
-        let inst_params = if value_params.is_empty() {
-            std::borrow::Cow::Borrowed(&self.module.parameters)
-        } else {
-            let mut params = self.module.parameters.clone();
-            for (name, value) in &value_params {
-                params.entry(name.clone()).or_insert_with(|| value.clone());
-            }
-            std::borrow::Cow::Owned(params)
-        };
         let layout = self.class_packed_layout(su, &value_params);
         let elem_w = layout.1.max(1);
+        let vp_map: HashMap<String, Value>;
+        let inst_params = if value_params.is_empty() {
+            super::elaborate::ParamEnv::Single(&self.module.parameters)
+        } else {
+            vp_map = value_params.into_iter().collect();
+            super::elaborate::ParamEnv::Overlay {
+                base: &vp_map,
+                top: &self.module.parameters,
+            }
+        };
         // §7.4.1: a struct type with packed dimensions (`cand_t [0:2] a`) is
         // a packed array of structs; the property holds every element.
         let total = Self::packed_struct_array_width(su, elem_w, &inst_params)?;
@@ -2729,10 +2735,10 @@ impl Simulator {
     /// Width of the packed struct `su` with its packed `dimensions` (§7.4.1):
     /// `elem_w` — the width of ONE struct — times every dimension's element
     /// count. `None` when a bound does not const-evaluate under `params`.
-    pub(super) fn packed_struct_array_width(
+    pub(super) fn packed_struct_array_width<P: super::elaborate::ParamLookup>(
         su: &crate::ast::types::StructUnionType,
         elem_w: u32,
-        params: &HashMap<String, Value>,
+        params: &P,
     ) -> Option<u32> {
         if su.dimensions.is_empty() {
             return Some(elem_w);
@@ -2756,7 +2762,7 @@ impl Simulator {
     /// sub-array is not modelled here. `root` decides the mixed 2-state rule
     /// for the leaf.
     #[allow(clippy::too_many_arguments)]
-    fn packed_member_walk(
+    fn packed_member_walk<P: super::elaborate::ParamLookup>(
         &self,
         handle: usize,
         prop: &str,
@@ -2764,7 +2770,7 @@ impl Simulator {
         level: &crate::ast::types::StructUnionType,
         layout: &[(String, u32, u32)],
         elem_w: u32,
-        params: &HashMap<String, Value>,
+        params: &P,
         rest: &[MemberSel],
         mut off: u32,
         total: u32,
@@ -2855,10 +2861,10 @@ impl Simulator {
     /// `Member` below a leaf is not a select this resolves. Slot order
     /// matches `class_packed_elem_ref`: a descending `[1:0]` puts index 1
     /// at the MS end, an ascending `[0:1]` puts index 0 there (§7.4.1).
-    pub(super) fn packed_array_slice(
+    pub(super) fn packed_array_slice<P: super::elaborate::ParamLookup>(
         &self,
         dt: &DataType,
-        params: &HashMap<String, Value>,
+        params: &P,
         total_w: u32,
         rest: &[MemberSel],
     ) -> Option<(u32, u32)> {
@@ -2931,10 +2937,10 @@ impl Simulator {
     /// one, or a type with no packed dimensions (an integer atom
     /// contributes its own width as one range so bit-selects on it still
     /// resolve; a `real` never does).
-    pub(super) fn packed_dim_bounds(
+    pub(super) fn packed_dim_bounds<P: super::elaborate::ParamLookup>(
         &self,
         dt: &DataType,
-        params: &HashMap<String, Value>,
+        params: &P,
     ) -> Option<Vec<(i64, i64)>> {
         use crate::ast::types::DataType as DT;
         // Follow a typedef chain, collecting each level's PACKED dimensions
@@ -2978,9 +2984,9 @@ impl Simulator {
 
     /// Const-resolved `(left, right)` of each of `dims`, in order; `None` for
     /// an unsized dimension or a bound that does not const-evaluate.
-    pub(super) fn packed_range_bounds(
+    pub(super) fn packed_range_bounds<P: super::elaborate::ParamLookup>(
         dims: &[crate::ast::types::PackedDimension],
-        params: &HashMap<String, Value>,
+        params: &P,
     ) -> Option<Vec<(i64, i64)>> {
         use crate::ast::types::PackedDimension;
         let mut out = Vec::with_capacity(dims.len());
@@ -2988,8 +2994,8 @@ impl Simulator {
             let PackedDimension::Range { left, right, .. } = d else {
                 return None;
             };
-            let l = super::elaborate::const_eval_i64_with_params(left, Some(params))?;
-            let r = super::elaborate::const_eval_i64_with_params(right, Some(params))?;
+            let l = super::elaborate::const_eval_i64_with_params_env(left, Some(params))?;
+            let r = super::elaborate::const_eval_i64_with_params_env(right, Some(params))?;
             out.push((l, r));
         }
         Some(out)
@@ -3856,11 +3862,11 @@ impl Simulator {
     /// is the order the slot arithmetic in [`Self::class_packed_elem_ref`]
     /// walks. An integral atom or an unbased enum contributes its single
     /// implicit dimension, so `byte b; b[3]` selects a bit of it.
-    fn decl_packed_dim_bounds(
+    fn decl_packed_dim_bounds<P: super::elaborate::ParamLookup>(
         dt: &crate::ast::types::DataType,
         local: Option<&super::elaborate::ElaboratedClass>,
         typedefs: &HashMap<String, crate::ast::types::DataType>,
-        params: &HashMap<String, Value>,
+        params: &P,
     ) -> Option<Vec<(i64, i64)>> {
         use crate::ast::types::{DataType, IntegerAtomType};
         let mut out: Vec<(i64, i64)> = Vec::new();
@@ -3934,18 +3940,18 @@ impl Simulator {
         None
     }
 
-    fn push_dim_bounds(
+    fn push_dim_bounds<P: super::elaborate::ParamLookup>(
         out: &mut Vec<(i64, i64)>,
         dims: &[crate::ast::types::PackedDimension],
-        params: &HashMap<String, Value>,
+        params: &P,
     ) -> Option<()> {
         for d in dims {
             let crate::ast::types::PackedDimension::Range { left, right, .. } = d else {
                 return None;
             };
             out.push((
-                crate::elaborate::const_eval_i64_with_params(left, Some(params))?,
-                crate::elaborate::const_eval_i64_with_params(right, Some(params))?,
+                crate::elaborate::const_eval_i64_with_params_env(left, Some(params))?,
+                crate::elaborate::const_eval_i64_with_params_env(right, Some(params))?,
             ));
         }
         Some(())
@@ -4028,20 +4034,20 @@ impl Simulator {
             return None;
         }
         // Only now is a parameter scope needed.
-        let params: std::borrow::Cow<'_, HashMap<String, Value>> = if param_overrides.is_empty() {
-            std::borrow::Cow::Borrowed(&self.module.parameters)
+        let ov_map: HashMap<String, Value>;
+        let params = if param_overrides.is_empty() {
+            super::elaborate::ParamEnv::Single(&self.module.parameters)
         } else {
-            let mut m = self.module.parameters.clone();
-            // Leaf class first (§8.25): the walk pushed leaf overrides before
-            // ancestors, and the original merge let a LATER (ancestor) insert
-            // win, so replay in the same order.
-            for (k, v) in &param_overrides {
-                m.insert(k.clone(), v.clone());
+            // Leaf class first (§8.25): later (ancestor) entries overwrite
+            // earlier ones, matching the sequential insert loop.
+            ov_map = param_overrides.into_iter().collect();
+            super::elaborate::ParamEnv::Overlay {
+                base: &self.module.parameters,
+                top: &ov_map,
             }
-            std::borrow::Cow::Owned(m)
         };
         let dims =
-            Self::decl_packed_dim_bounds(decl, declarer, &self.module.typedef_types, &*params)?;
+            Self::decl_packed_dim_bounds(decl, declarer, &self.module.typedef_types, &params)?;
         // A SINGLE packed dimension is a plain vector, whose element is one
         // bit. Reads of `obj.v[i]` fell through to a generic bit-select and
         // were fine, but the WRITE had no handler at all and was silently

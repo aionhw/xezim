@@ -686,9 +686,11 @@ impl Simulator {
         {
             return Some(v);
         }
-        let mut all = self.module.parameters.clone();
-        all.extend(params);
-        super::elaborate::const_eval_i64_with_params(e, Some(&all))
+        let all = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: &params,
+        };
+        super::elaborate::const_eval_i64_with_params_env(e, Some(&all))
     }
 
     /// The names a bin bound or option of covergroup instance `inst` sees

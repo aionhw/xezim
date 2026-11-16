@@ -3907,17 +3907,15 @@ impl Simulator {
                 }
             }
         }
-        let mut full: Option<HashMap<String, Value>> = None;
-        let mut ev = |e: &Expression| -> Option<i64> {
+        let ev = |e: &Expression| -> Option<i64> {
             if let Some(v) = super::elaborate::const_eval_i64_with_params(e, Some(&m)) {
                 return Some(v);
             }
-            let f = full.get_or_insert_with(|| {
-                let mut f = self.module.parameters.clone();
-                f.extend(m.iter().map(|(k, v)| (k.clone(), v.clone())));
-                f
-            });
-            super::elaborate::const_eval_i64_with_params(e, Some(f))
+            let f = super::elaborate::ParamEnv::Overlay {
+                base: &self.module.parameters,
+                top: &m,
+            };
+            super::elaborate::const_eval_i64_with_params_env(e, Some(&f))
         };
         dims.iter()
             .map(|d| match d {
@@ -3946,24 +3944,28 @@ impl Simulator {
         else {
             return None;
         };
-        let mut m = self.module.parameters.clone();
+        let mut overrides: HashMap<String, Value> = HashMap::default();
         let mut bound: HashSet<&str> = HashSet::default();
         for c in chain {
             for (pn, _) in &c.param_defaults {
                 if let Some(v) = instance.properties.get(pn)
                     && bound.insert(pn.as_str())
                 {
-                    m.insert(pn.clone(), v.clone());
+                    overrides.insert(pn.clone(), v.clone());
                 }
             }
         }
+        let m = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: &overrides,
+        };
         let mut w: u64 = 1;
         for d in dimensions {
             let crate::ast::types::PackedDimension::Range { left, right, .. } = d else {
                 return None;
             };
-            let l = super::elaborate::const_eval_i64_with_params(left, Some(&m))?;
-            let r = super::elaborate::const_eval_i64_with_params(right, Some(&m))?;
+            let l = super::elaborate::const_eval_i64_with_params_env(left, Some(&m))?;
+            let r = super::elaborate::const_eval_i64_with_params_env(right, Some(&m))?;
             w = w.checked_mul(l.abs_diff(r) + 1)?;
         }
         u32::try_from(w).ok().filter(|&w| w > 0)
