@@ -9074,7 +9074,11 @@ pub struct Simulator {
     /// `type_option.f = v;` items on first access.
     cg_type_options: HashMap<String, HashMap<String, Value>>,
     /// Per-call-site receiver expressions for `obj.coll.method()` dispatch.
-    method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
+    /// Keyed by `(span.start, span.end, keep, hint_id, path_hash)` with a
+    /// bucket verified against the exact receiver path, because synthetic
+    /// nodes (e.g. generate-block rewrites carrying `Span::dummy()`) share a
+    /// span across sibling members.
+    method_receiver_cache: HashMap<(usize, usize, usize, u32, u64), Vec<std::rc::Rc<Expression>>>,
     /// Reused buffer for the `<hint>.<name>` probe in `get_signal_value_by_name` (a `&self` path).
     hint_key_scratch: std::cell::RefCell<String>,
     /// One-entry cache of `decl_param_scope`: the instance prefix last asked
@@ -9271,7 +9275,7 @@ pub struct Simulator {
     sync_name_pool: Vec<String>,
     /// Scratch key for `cleanup_dyn_storage`.
     dyn_key_scratch: String,
-    /// Interned scope hints and head identifiers for `method_receiver_cache` keys (see there).
+    /// Interned scope hints for `method_receiver_cache` keys (see there).
     method_receiver_hint_ids: HashMap<String, u32>,
     /// class-perf Step 4b: cache of fully-lowered class-FUNCTION `CompiledBlock`s,
     /// keyed by an INTERNED (class, method) id pair PLUS the resolved width

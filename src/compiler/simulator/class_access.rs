@@ -167,15 +167,31 @@ impl Simulator {
     }
 
     /// The receiver of `a.b.method(...)` as an expression, built ONCE per
-    /// call site (keyed by the identifier's span) and reused: rebuilding it
-    /// per call cloned every path segment string and, worse, discarded the
-    /// identifier's resolved-name cache, so each call re-resolved from
-    /// scratch. Same context-insensitive caching the AST node itself uses.
+    /// call site + receiver path and reused: rebuilding it per call cloned
+    /// every path segment string and discarded the identifier's resolved-name
+    /// cache, so each call re-resolved from scratch.
     pub(super) fn method_receiver_expr(
         &mut self,
         hier: &HierarchicalIdentifier,
         keep: usize,
     ) -> std::rc::Rc<Expression> {
+        let make_receiver = || {
+            let base = HierarchicalIdentifier {
+                root: hier.root.clone(),
+                path: hier.path[..keep].to_vec(),
+                span: hier.span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            };
+            std::rc::Rc::new(Expression::new(ExprKind::Ident(base), hier.span))
+        };
+        // Skip caching when any kept segment carries select expressions (e.g.
+        // unrolled generate-for indices sharing one span), so distinct selects
+        // cannot alias in the cache.
+        if hier.path[..keep].iter().any(|s| !s.selects.is_empty()) {
+            return make_receiver();
+        }
         // The cached receiver node carries its own resolution cells, which
         // the first evaluation fills under ITS scope hint. Keyed by span
         // alone, every instance of a module executing the same source line
@@ -194,41 +210,48 @@ impl Simulator {
                 }
             },
         };
-        // The hint alone is not enough: a loop body or a display runs with
-        // NO hint, and every instance's inlined copy of the same source line
-        // shares one span. The inliner already prefixed the head identifier
-        // per instance (`u0.q` / `u1.q`), so interning it too keeps the
-        // entry per instance — `q.size()` inside a `for` in ten siblings
-        // otherwise read the first sibling's queue.
-        let head = hier.path[0].name.name.as_str();
-        let head_id = match self.method_receiver_hint_ids.get(head) {
-            Some(&id) => id,
-            None => {
-                let id = self.method_receiver_hint_ids.len() as u32 + 1;
-                self.method_receiver_hint_ids.insert(head.to_string(), id);
-                id
+        // Include `root` and every kept segment name (not only `path[0]`):
+        // generate-block rewrites can carry `Span::dummy()` (0..0) on every
+        // member reference, so sibling members (`g.a.q` vs `g.a.aa`) share
+        // both `(0, 0)` and `path[0]`. Verifying the bucket entry against the
+        // exact path avoids any hash-collision aliasing too.
+        let path_hash = {
+            use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
+            let mut hasher = xezim_core::hasher::DeterministicState::default().build_hasher();
+            hier.root.hash(&mut hasher);
+            for seg in &hier.path[..keep] {
+                seg.name.name.hash(&mut hasher);
             }
+            hasher.finish()
         };
         let key = (
             hier.span.start as usize,
             hier.span.end as usize,
             keep,
             hint_id,
-            head_id,
+            path_hash,
         );
-        if let Some(e) = self.method_receiver_cache.get(&key) {
-            return e.clone();
+        if let Some(bucket) = self.method_receiver_cache.get(&key) {
+            if let Some(e) = bucket.iter().find(|cand| {
+                let ExprKind::Ident(base) = &cand.kind else {
+                    return false;
+                };
+                base.root == hier.root
+                    && base.path.len() == keep
+                    && base
+                        .path
+                        .iter()
+                        .zip(&hier.path[..keep])
+                        .all(|(a, b)| a.name.name == b.name.name)
+            }) {
+                return e.clone();
+            }
         }
-        let base = HierarchicalIdentifier {
-            root: hier.root.clone(),
-            path: hier.path[..keep].to_vec(),
-            span: hier.span,
-            cached_signal_id: crate::ast::cache::SignalCache::new(None),
-            cached_resolved_name: crate::ast::cache::NameCache::new(),
-            bound: crate::ast::binding::Bound::UNSET,
-        };
-        let e = std::rc::Rc::new(Expression::new(ExprKind::Ident(base), hier.span));
-        self.method_receiver_cache.insert(key, e.clone());
+        let e = make_receiver();
+        self.method_receiver_cache
+            .entry(key)
+            .or_default()
+            .push(e.clone());
         e
     }
 
