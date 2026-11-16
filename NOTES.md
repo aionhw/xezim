@@ -81,6 +81,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A declaration whose type nothing in the design declares is an error, as is
+  an `extends` clause naming a class nothing declares: `my_txn t = new();`
+  with no class `my_txn` in the compiled files elaborated as an untyped
+  handle, so `randomize()` did nothing, every member read `x` and the run
+  finished normally. A second class of the same name in one scope (the
+  compilation unit across all source files, a package, a module or a class)
+  is an error too; one of the two definitions used to be dropped silently.
+  Both errors give the file, line and column, and the duplicate names where
+  the first definition is (§3.13, §6.18, §8.3, §8.13).
+
 * A blocking assignment with an intra-assignment delay or event control
   stores an assignment pattern for an unpacked array, unpacked struct or
   queue target, and evaluates an expression at the target's width:
