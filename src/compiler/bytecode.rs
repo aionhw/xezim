@@ -68,6 +68,9 @@ pub(crate) struct MethodAdmission {
     /// elements load as one plain value join: string and multi-dimensional
     /// packed elements need facts the compiler keeps for `this` alone.
     pub instance_colls: HashMap<String, ClassColls>,
+    /// Fixed scalar integral return (width, signed) of class methods, keyed by
+    /// `(class, method_name)` including inherited methods.
+    pub method_return_types: HashMap<(String, String), (u32, bool)>,
     /// Free-function facts the method compiles keep asking for; the function
     /// table they come from is the same for every method compile.
     pub fn_facts: FnFacts,
@@ -1930,6 +1933,11 @@ pub struct BytecodeCompiler<'a> {
     /// receivers. See `method_handle_chain_class`.
     handle_member_types: Option<&'a HashMap<String, HashMap<String, String>>>,
     pub(crate) method_admission: Option<std::rc::Rc<MethodAdmission>>,
+    /// Per-specialization instance field widths and signedness for `this` when
+    /// the class chain has value parameters (where `MethodAdmission` cannot
+    /// hold one global fixed width).
+    pub(crate) this_field_widths: HashMap<String, u32>,
+    pub(crate) this_field_signed: HashSet<String>,
     /// Formal declarations supply the same local select metadata as body locals.
     method_formal_types: Option<&'a [crate::ast::decl::FunctionPort]>,
     /// The implicit result is a local of the declared return type too.
@@ -2360,6 +2368,8 @@ impl<'a> BytecodeCompiler<'a> {
             method_class: None,
             handle_member_types: None,
             method_admission: None,
+            this_field_widths: HashMap::default(),
+            this_field_signed: HashSet::default(),
             method_formal_types: None,
             method_return_type: None,
             method_result_reg: None,
@@ -16487,7 +16497,29 @@ impl<'a> BytecodeCompiler<'a> {
                 // before evaluation, including nested arithmetic, not only shifts.
                 let left_unsigned = joint_unsigned;
                 let right_unsigned = joint_unsigned;
-                let l = self.compile_expr_typed(left, sub_ctx, left_unsigned)?;
+                let l_sub_ctx = if matches!(
+                    op,
+                    BinaryOp::Div
+                        | BinaryOp::Mod
+                        | BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
+                        | BinaryOp::ArithShiftLeft
+                        | BinaryOp::ArithShiftRight
+                        | BinaryOp::Power
+                ) && self.lrm_self_width(left) == 0
+                {
+                    0
+                } else {
+                    sub_ctx
+                };
+                let r_sub_ctx = if matches!(op, BinaryOp::Div | BinaryOp::Mod)
+                    && self.lrm_self_width(right) == 0
+                {
+                    0
+                } else {
+                    sub_ctx
+                };
+                let l = self.compile_expr_typed(left, l_sub_ctx, left_unsigned)?;
                 // §11.4.10: a shift's RIGHT operand is SELF-DETERMINED — its
                 // width never affects the result, so it keeps its own.
                 let is_shift = matches!(
@@ -16500,7 +16532,7 @@ impl<'a> BytecodeCompiler<'a> {
                 let r = if is_shift || matches!(op, BinaryOp::Power) {
                     self.compile_expr(right, self.expr_max_width(right))?
                 } else {
-                    self.compile_expr_typed(right, sub_ctx, right_unsigned)?
+                    self.compile_expr_typed(right, r_sub_ctx, right_unsigned)?
                 };
                 // Context width resizing for arithmetic / bitwise ops only.
                 // For self-determined comparisons we must NOT resize to
@@ -16549,9 +16581,15 @@ impl<'a> BytecodeCompiler<'a> {
                         // widths, so `smin / sm1` divided at 8 bits (wrapping
                         // -128/-1) and a divide-by-zero produced x at 8 bits.
                         // §11.8.1 signedness applies exactly as for +/-.
-                        let opw = ctx_width
-                            .max(self.lrm_self_width(left))
-                            .max(self.lrm_self_width(right));
+                        // When either operand's static width is unknown (0),
+                        // do not resize before the runtime Div/Mod — `opw`
+                        // could be narrower than the operand's runtime width
+                        // and truncate high bits before the division/modulo,
+                        // whereas `Value::div`/`Value::modulo` already widens
+                        // both operands to `max(l.width, r.width)` at runtime.
+                        let lw = self.lrm_self_width(left);
+                        let rw = self.lrm_self_width(right);
+                        let opw = ctx_width.max(lw).max(rw);
                         let ls = self.expr_signedness(left);
                         let rs = self.expr_signedness(right);
                         if ls == Some(false) || rs == Some(false) {
@@ -16562,7 +16600,7 @@ impl<'a> BytecodeCompiler<'a> {
                                 self.emit(Insn::ClearSigned(r));
                             }
                         }
-                        if opw > 0 {
+                        if lw > 0 && rw > 0 && opw > 0 {
                             self.emit(Insn::Resize(l, opw));
                             self.emit(Insn::Resize(r, opw));
                         }
@@ -16652,10 +16690,12 @@ impl<'a> BytecodeCompiler<'a> {
                         // operation width — ctx joined with the operand's own
                         // LRM width (never the carry-aware estimate, which
                         // shifted dropped carries back into range).
-                        // An operand of unknown width (0) in a self-determined
-                        // context keeps the width its load produced.
-                        let opw = ctx_width.max(self.lrm_self_width(left));
-                        if opw > 0 {
+                        // An operand of unknown width (0) keeps the width its
+                        // load produced so a narrower target context cannot
+                        // truncate bits before the shift.
+                        let lw = self.lrm_self_width(left);
+                        let opw = ctx_width.max(lw);
+                        if lw > 0 && opw > 0 {
                             self.emit(Insn::Resize(l, opw));
                         }
                         self.emit(Insn::Shl(dest, l, r));
@@ -16666,9 +16706,12 @@ impl<'a> BytecodeCompiler<'a> {
                         // produced: a signed 8-bit value in a 32-bit context
                         // shifted at 8 bits then zero-extended (00000013 for
                         // 1ffffff3), and `(a+a) >> 1` shifted the carry back
-                        // in (0xa3 for 0x23).
-                        let opw = ctx_width.max(self.lrm_self_width(left));
-                        if opw > 0 {
+                        // in (0xa3 for 0x23). When `lw == 0`, keep the loaded
+                        // width so a narrower target cannot truncate high bits
+                        // before shifting them into range.
+                        let lw = self.lrm_self_width(left);
+                        let opw = ctx_width.max(lw);
+                        if lw > 0 && opw > 0 {
                             self.emit(Insn::Resize(l, opw));
                         }
                         if matches!(op, BinaryOp::ShiftRight) {
@@ -16708,8 +16751,9 @@ impl<'a> BytecodeCompiler<'a> {
                             // to the operation width first; `a ** 2` in a
                             // 32-bit context computed at 8 bits (0x90) and
                             // then bailed the whole block to the interpreter.
-                            let opw = sub_ctx.max(self.expr_max_width(left));
-                            if opw > 0 {
+                            let lw = self.expr_max_width(left);
+                            let opw = sub_ctx.max(lw);
+                            if lw > 0 && opw > 0 {
                                 self.emit(Insn::Resize(l, opw));
                             }
                             self.emit(Insn::Pow(dest, l, r));
@@ -22020,6 +22064,9 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // §11.5, §13.4.1: a function call has its return type's sign.
             ExprKind::Call { func, .. } => {
+                if let Some((_, signed)) = self.class_method_return_type(func) {
+                    return Some(signed);
+                }
                 let ExprKind::Ident(h) = &func.kind else {
                     return None;
                 };
@@ -22242,7 +22289,10 @@ impl<'a> BytecodeCompiler<'a> {
         if self.local_var_regs.contains_key(name) || !self.bare_member_names.contains(name) {
             return None;
         }
-        self.class_field_width(self.method_class.as_deref()?, name)
+        self.this_field_widths
+            .get(name)
+            .copied()
+            .or_else(|| self.class_field_width(self.method_class.as_deref()?, name))
     }
 
     /// Method mode: the declared width of `base.member` through an admitted
@@ -22251,16 +22301,22 @@ impl<'a> BytecodeCompiler<'a> {
         if !self.method_handle_chain_ok(base) || !self.method_instance_field_ok(base, member) {
             return None;
         }
+        if matches!(base.kind, ExprKind::This)
+            && let Some(&w) = self.this_field_widths.get(member)
+        {
+            return Some(w);
+        }
         self.class_field_width(&self.method_handle_chain_class(base)?, member)
     }
 
     fn class_field_signed(&self, class: &str, field: &str) -> bool {
-        self.method_admission.as_ref().is_some_and(|admission| {
-            admission
-                .instance_field_signed
-                .get(class)
-                .is_some_and(|fields| fields.contains(field))
-        })
+        (self.method_class.as_deref() == Some(class) && self.this_field_signed.contains(field))
+            || self.method_admission.as_ref().is_some_and(|admission| {
+                admission
+                    .instance_field_signed
+                    .get(class)
+                    .is_some_and(|fields| fields.contains(field))
+            })
     }
 
     fn class_field_width(&self, class: &str, field: &str) -> Option<u32> {
@@ -22270,6 +22326,55 @@ impl<'a> BytecodeCompiler<'a> {
             .get(class)?
             .get(field)
             .copied()
+    }
+
+    fn class_method_return_type(&self, func: &Expression) -> Option<(u32, bool)> {
+        if !self.method_mode {
+            return None;
+        }
+        let admission = self.method_admission.as_ref()?;
+        match &func.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && self.class_method_names.contains(h.path[0].name.name.as_str()) =>
+            {
+                let class = self.method_class.as_ref()?;
+                let base = class.split('#').next().unwrap_or(class.as_str());
+                admission
+                    .method_return_types
+                    .get(&(class.clone(), h.path[0].name.name.clone()))
+                    .or_else(|| {
+                        admission
+                            .method_return_types
+                            .get(&(base.to_string(), h.path[0].name.name.clone()))
+                    })
+                    .copied()
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                let class = if matches!(&base.kind, ExprKind::Ident(h)
+                    if h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && h.path[0].name.name == "super")
+                {
+                    self.method_class_parent.clone()?
+                } else {
+                    self.method_handle_chain_class(base)?
+                };
+                let base_cls = class.split('#').next().unwrap_or(class.as_str());
+                admission
+                    .method_return_types
+                    .get(&(class.clone(), member.name.clone()))
+                    .or_else(|| {
+                        admission
+                            .method_return_types
+                            .get(&(base_cls.to_string(), member.name.clone()))
+                    })
+                    .copied()
+            }
+            _ => None,
+        }
     }
 
     /// §6.24.1 / §11.6.1: a cast is self-determined at its target width.
@@ -22440,6 +22545,11 @@ impl<'a> BytecodeCompiler<'a> {
                 // §11.6.1: a function call is as wide as its return type; its
                 // arguments are sized by the formals, not by the call's
                 // context (`f(16'(a))` with an 8-bit result is 8 bits).
+                if let Some((w, _)) = self.class_method_return_type(func)
+                    && w > 0
+                {
+                    return w;
+                }
                 if let ExprKind::Ident(h) = &func.kind
                     && h.root.is_none()
                     && h.path.len() == 1

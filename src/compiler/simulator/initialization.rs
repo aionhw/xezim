@@ -1723,6 +1723,63 @@ impl Simulator {
         let phase_materialize = crate::WallTimer::now();
         Self::materialize_implicit_contassign_nets(&mut module);
         event_bits::complete_ascending_ranges(&mut module);
+        // §26.3: the runtime bare-name resolver may qualify an in-scope
+        // reference to a package parameter/variable as `pkg::name`, while
+        // packed geometry is registered under the bare name and the dot
+        // spelling the bytecode compiler uses (`pkg.name`). Mirror the
+        // geometry onto the `pkg::name` key so `pkg::Q[i]` reads slice an
+        // ELEMENT instead of degenerating to a flat bit-select
+        // (`packed_package_parameter_element`). Only for keys backed by a
+        // `::`-qualified parameter, so module-scoped dotted signals are
+        // untouched.
+        {
+            let colon_keys: Vec<String> = module
+                .parameters
+                .keys()
+                .filter(|k| k.contains("::"))
+                .map(|k| k.replace("::", "."))
+                .collect();
+            for dotted in colon_keys {
+                if let Some(&ew) = module.packed_signal_elem_widths.get(&dotted).or_else(|| {
+                    dotted
+                        .rfind('.')
+                        .and_then(|i| module.packed_signal_elem_widths.get(&dotted[i + 1..]))
+                }) {
+                    let colon = dotted.replace('.', "::");
+                    module.packed_signal_elem_widths.insert(colon, ew);
+                }
+                // The full multi-dim bounds must match the ELEM WIDTH source,
+                // so resolve the same (exact-then-bare) way.
+                if let Some(fd) = module
+                    .packed_full_dims
+                    .get(&dotted)
+                    .or_else(|| {
+                        dotted
+                            .rfind('.')
+                            .and_then(|i| module.packed_full_dims.get(&dotted[i + 1..]))
+                    })
+                    .cloned()
+                {
+                    module.packed_full_dims.insert(dotted.replace('.', "::"), fd);
+                }
+                // `var_decl_types` is consulted alongside geometry for struct
+                // members; mirror it the same way.
+                if let Some(dt) = module
+                    .var_decl_types
+                    .get(&dotted)
+                    .or_else(|| {
+                        dotted
+                            .rfind('.')
+                            .and_then(|i| module.var_decl_types.get(&dotted[i + 1..]))
+                    })
+                    .cloned()
+                {
+                    module
+                        .var_decl_types
+                        .insert(dotted.replace('.', "::"), dt);
+                }
+            }
+        }
         // §7.8: the packed type of an associative array describes its
         // ELEMENTS; the array's name is never a packed vector itself. These
         // two maps make the name read and write as one (`p[1]` of
