@@ -804,9 +804,11 @@ impl Simulator {
                     self.settle_prev_values
                         .push((id, self.signal_table[id].clone()));
                 }
-                // $time/%t in the body scales to the BLOCK's module timescale.
+                // §20.3.1, §20.3.3: time calls use the block's module.
+                // An absent name hint still needs an explicit top override;
+                // None would inherit the last scheduled process's timescale.
                 let saved_ts = self.timescale_scope_override.take();
-                self.timescale_scope_override = scope_hint.clone();
+                self.timescale_scope_override = Some(scope_hint.clone().unwrap_or_default());
                 self.exec_statement(stmt);
                 self.timescale_scope_override = saved_ts;
                 *self.name_resolve_hint.borrow_mut() = saved_hint;
@@ -850,7 +852,19 @@ impl Simulator {
                         compiled.instructions.len(),
                     )
                 };
+                // §20.3.1, §20.3.3: statement fallbacks in top blocks need the top unit.
+                let saved_ts = if compiled.has_fallback
+                    && entry.cold.scope_hint.is_none()
+                    && matches!(entry.item, CombItem::CompiledAlwaysBlock { .. })
+                {
+                    Some(self.timescale_scope_override.replace(String::new()))
+                } else {
+                    None
+                };
                 self.exec_insns(insns);
+                if let Some(saved_ts) = saved_ts {
+                    self.timescale_scope_override = saved_ts;
+                }
             }
             CombItem::FusedGate { op } => {
                 self.exec_fused_gate(op);
@@ -2512,9 +2526,15 @@ impl Simulator {
                             }
                         }
                         CombItem::CompiledAlwaysBlock { compiled, .. } => {
-                            // P5: X-free evaluations run on u64 words (a lowered
-                            // block has no fallbacks, so none of the scope /
-                            // timescale bookkeeping below applies to it).
+                            // §20.3.1, §20.3.3: native statements can also fall
+                            // back to the interpreter. Only top needs an override
+                            // before native dispatch; the VM and two-state hooks
+                            // install theirs when reached. Non-native builds do
+                            // no time-scope work on the plan's hot path.
+                            #[cfg(feature = "jit")]
+                            let saved_ts = (compiled.has_fallback
+                                && entries[eidx].cold.scope_hint.is_none())
+                            .then(|| self.timescale_scope_override.replace(String::new()));
                             if self.dispatch_comb_plan(eidx, compiled) {
                                 n_ab += 1;
                                 if self.proc_depth > 0 {
@@ -2556,11 +2576,6 @@ impl Simulator {
                                             compiled.instructions.len(),
                                         )
                                     };
-                                    // $time/%t in a fallback stmt scales to the BLOCK's
-                                    // module timescale (mirrors the edge-block dispatch).
-                                    let saved_ts = self.timescale_scope_override.take();
-                                    self.timescale_scope_override =
-                                        entries[eidx].cold.scope_hint.clone();
                                     // …and `%m` in that fallback names the BLOCK's instance.
                                     self.set_m_block_scope(
                                         entries[eidx].cold.scope_hint.as_deref(),
@@ -2571,6 +2586,10 @@ impl Simulator {
                                     // resolved the bare array name, found nothing, and
                                     // dropped every write. Pure-bytecode blocks pre-resolve
                                     // their ids, so this costs them one bool test.
+                                    // has_fallback counts statement fallbacks only. Comb blocks
+                                    // have no expression fallbacks (only edge blocks enable
+                                    // them), so without statement fallbacks this block never
+                                    // re-enters the interpreter here.
                                     let saved_hint = if compiled.has_fallback {
                                         let prev = self.name_resolve_hint.borrow().clone();
                                         *self.name_resolve_hint.borrow_mut() = entries[eidx].cold.scope_hint.clone();
@@ -2578,16 +2597,31 @@ impl Simulator {
                                     } else {
                                         None
                                     };
+                                    let saved_vm_ts = compiled.has_fallback.then(|| {
+                                        self.timescale_scope_override.replace(
+                                            entries[eidx]
+                                                .cold
+                                                .scope_hint
+                                                .clone()
+                                                .unwrap_or_default(),
+                                        )
+                                    });
                                     self.exec_insns(insns);
+                                    if let Some(prev) = saved_vm_ts {
+                                        self.timescale_scope_override = prev;
+                                    }
                                     if let Some(prev) = saved_hint {
                                         *self.name_resolve_hint.borrow_mut() = prev;
                                     }
-                                    self.timescale_scope_override = saved_ts;
                                     n_ab += 1;
                                     if self.proc_depth > 0 {
                                         self.note_comb_ran_in_process(eidx, &entries[eidx]);
                                     }
                                 }
+                            }
+                            #[cfg(feature = "jit")]
+                            if let Some(saved_ts) = saved_ts {
+                                self.timescale_scope_override = saved_ts;
                             }
                         }
                         // The three fused arms are the settle loop's highest-volume

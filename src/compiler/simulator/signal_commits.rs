@@ -2791,7 +2791,12 @@ impl Simulator {
         hint: Option<&str>,
     ) -> bool {
         let saved_ts = self.timescale_scope_override.take();
-        self.timescale_scope_override = hint.map(|h| h.to_string());
+        // §20.3.1, §20.3.3: comb dispatch explicitly selects top with "".
+        // The native name hint omits top; retain that opt-in time scope.
+        // Other callers keep the existing nullable-hint behavior.
+        self.timescale_scope_override = hint
+            .map(|h| h.to_string())
+            .or_else(|| saved_ts.as_ref().filter(|scope| scope.is_empty()).cloned());
         // `%m` wants the instance-relative scope the interpreter's edge path
         // records; a root block's hint is the top module's name.
         let m_scope = hint.map(|h| self.instance_relative_scope(h));
