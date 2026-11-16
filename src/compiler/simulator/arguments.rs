@@ -2129,6 +2129,8 @@ impl Simulator {
             return Some((caller.clone(), caller, prior));
         }
         let key = self.formal_dyn_key(&param, &port.data_type);
+        // §13.5.1: copied associative elements retain their packed fields.
+        self.register_packed_leaf_layout(&key, &port.data_type);
         self.register_formal_shape(&key, &port.dimensions);
         if !matches!(port.direction, PortDirection::Output) {
             // §13.5.1: copy every element in, including unpacked-struct

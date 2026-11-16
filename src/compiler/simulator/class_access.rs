@@ -933,6 +933,14 @@ impl Simulator {
         } else {
             self.strip_modport_segments(&raw).unwrap_or(raw)
         };
+        // §23.6: a declared aggregate head is already bound. Its missing
+        // leaf may use the aggregate fallback, but must not be searched for
+        // beneath an unrelated hinted or generated scope.
+        let declared_aggregate_head = hier.path.len() >= 2
+            && self.module.var_decl_types.get(&hier.path[0].name.name).is_some_and(|dt| {
+                matches!(super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types),
+                    DataType::Struct(_))
+            });
         // §8/§23.9: in a method of a class declared inside a module, a
         // dotted name headed by an item of the object's instance (an
         // unpacked struct, an interface or module instance) is that
@@ -1189,7 +1197,7 @@ impl Simulator {
                     return scoped;
                 }
             }
-        } else if !self.signal_name_to_id.contains_key(raw.as_str()) {
+        } else if !declared_aggregate_head && !self.signal_name_to_id.contains_key(raw.as_str()) {
             // A DOTTED reference from a hinted scope (`core.seq` inside a
             // class method of an object built in `u_w`, or inside a
             // nested block of `u_w`) names a sibling instance's member:
@@ -1428,7 +1436,7 @@ impl Simulator {
         // last `.`-segment matches the leaf — turns the O(N) scan over
         // 35M signals into O(M) where M is the number of signals sharing
         // that leaf name (usually small).
-        if hier.path.len() > 1 {
+        if hier.path.len() > 1 && !declared_aggregate_head {
             let suffix = format!(".{}", raw);
             let candidates: Vec<&str> = if let Some(ids) = self.leaf_name_to_ids.get(leaf.as_str())
             {

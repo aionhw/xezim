@@ -1315,8 +1315,18 @@ impl Simulator {
                 } else {
                     0
                 };
+                // §23.6: keep an absolute top-level access absolute after
+                // resolving its declaration; a later scope hint must not
+                // redirect the storage lookup to a same-named child variable.
+                let storage = if !name.contains('.')
+                    && (h.root.is_some() || h.path.len() > 1)
+                {
+                    format!("{}.{}", self.module.name, name)
+                } else {
+                    name
+                };
                 Some(DeclaredPackedAccess {
-                    storage: name,
+                    storage,
                     params: scope,
                     is_signed: super::elaborate::is_type_signed_resolved(
                         dt,

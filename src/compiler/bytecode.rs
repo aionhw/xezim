@@ -3395,8 +3395,15 @@ impl<'a> BytecodeCompiler<'a> {
     fn packed_full_dims_of(&self, hier: &HierarchicalIdentifier) -> Option<&'a Vec<(i64, i64)>> {
         let raw = Self::hier_raw_cow(hier);
         let m = self.packed_full_dims?;
-        m.get(raw.as_ref())
+        // §23.6 / §7.4.1: absolute names use the same top-prefix
+        // normalization as signal lookup, including their packed geometry.
+        let top_rest = self.top_module_name.as_ref()
+            .and_then(|top| raw.strip_prefix(top.as_str()).and_then(|s| s.strip_prefix('.')));
+        let rooted = hier.root.is_some() || top_rest.is_some();
+        let raw = top_rest.unwrap_or(raw.as_ref());
+        m.get(raw)
             .or_else(|| {
+                if rooted { return None; }
                 self.scope_hint
                     .as_ref()
                     .and_then(|sc| with_dotted(sc, &raw, |k| m.get(k)))
@@ -12743,13 +12750,18 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn packed_elem_width_of(&self, hier: &HierarchicalIdentifier) -> Option<u32> {
         let raw = Self::hier_raw_cow(hier);
+        let top_rest = self.top_module_name.as_ref()
+            .and_then(|top| raw.strip_prefix(top.as_str()).and_then(|s| s.strip_prefix('.')));
+        let rooted = hier.root.is_some() || top_rest.is_some();
+        let raw = top_rest.unwrap_or(raw.as_ref());
         self.packed_elem_widths
             .and_then(|m| {
-                m.get(raw.as_ref())
+                m.get(raw)
                     .copied()
                     // Inside an inlined instance the name is spelled bare
                     // while the table holds it under the instance path.
                     .or_else(|| {
+                        if rooted { return None; }
                         self.scope_hint
                             .as_ref()
                             .and_then(|sc| with_dotted(sc, &raw, |k| m.get(k).copied()))
