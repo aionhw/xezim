@@ -155,6 +155,49 @@ impl Simulator {
         }
     }
 
+    /// Row key for `d[i] = new[n]` when the row's element type is not a class
+    /// handle (§7.5.1). Class properties use [`class_array_of_coll_key`]; module
+    /// or automatic locals use the same storage keys as reads.
+    pub(super) fn sized_new_row_lvalue(&mut self, lvalue: &Expression) -> Option<String> {
+        let ExprKind::Index { expr: base, index } = &lvalue.kind else {
+            return None;
+        };
+        if self.lvalue_container_kind(lvalue).is_some() {
+            return None;
+        }
+        let key = match &base.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                self.resolve_locator_storage(&self.resolve_hier_name(h))
+            }
+            _ => self.expr_assoc_name(base)?,
+        };
+        if !self.module.dynamic_arrays.contains(&key)
+            && self.class_dyn_row_width(&key).is_none()
+            && self
+                .coll_shape_at(&key)
+                .is_none_or(|(shape, _)| shape.dims.len() < 2)
+        {
+            return None;
+        }
+        let dt = self
+            .class_member_coll_type(&key)
+            .or_else(|| self.module.var_decl_types.get(&key))?;
+        if matches!(
+            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types),
+            DataType::TypeReference { .. }
+        ) {
+            return None;
+        }
+        // Associative outers (`int aa[string][]`) are sized by the caller's
+        // collection `new[n]` store; the early row path only runs `fill_sized_new`
+        // after `ensure_row`, which does not allocate a missing assoc entry.
+        if self.is_associative_array(&key) {
+            return None;
+        }
+        let i = self.eval_expr(index).to_i64()?;
+        Some(format!("{}[{}]", key, i))
+    }
+
     /// The declared associative tail below a dynamic outer array, scoped to
     /// a local, object property, or unpacked-struct member (§7.4.5).
     #[cold]

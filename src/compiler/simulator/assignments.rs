@@ -2390,6 +2390,100 @@ impl Simulator {
                 return changed;
             }
         }
+
+        // §7.4.2: `m[i][j] = v` on a class-property dynamic array of dynamic
+        // arrays writes element `j` of row `<h>#m[i]`, the key reads use. The
+        // arms below took `[j]` for a bit-select of the row's own cell.
+        if matches!(expr.kind, ExprKind::Index { .. })
+            && !self.no_class_objects()
+            && let Some(row) = self.coll_elem_expr_key(expr)
+            && row.contains('#')
+            && self.module.dynamic_arrays.contains(&row)
+            && self.coll_shape_at(&row).is_some_and(|(shape, depth)| {
+                matches!(shape.dims.get(depth), Some(Dim::Dyn))
+            })
+        {
+            let Some(j) = self.eval_expr(index).to_i64() else {
+                return false;
+            };
+            if j < 0 || j as u64 >= self.get_queue_size(&row) {
+                return false;
+            }
+            let key = format!("{}[{}]", row, j);
+            let elem_is_string = self.is_string_collection(&row)
+                || self.is_string_collection(&key)
+                || self
+                    .p_elem_type_ref(&row)
+                    .is_some_and(|dt| Self::is_string_data_type(&dt));
+            let prev = self.signals.get(&key);
+            let elem_dt = || {
+                self.p_elem_type_ref(&row)
+                    .or_else(|| self.class_member_coll_type(&row).map(std::borrow::Cow::Borrowed))
+            };
+            let declared_slot = || -> Option<Value> {
+                let w = self
+                    .module
+                    .arrays
+                    .get(&row)
+                    .map(|&(_, _, w)| w)
+                    .or_else(|| self.assoc_store_ctx_width(&row))?;
+                let signed = self
+                    .p_elem_type_ref(&row)
+                    .or_else(|| self.class_member_coll_type(&row).map(std::borrow::Cow::Borrowed))
+                    .is_some_and(|dt| {
+                        super::elaborate::is_type_signed_resolved(&dt, &self.module.typedef_types)
+                    });
+                let mut p = Value::zero(w.max(1));
+                p.is_signed = signed;
+                Some(p)
+            };
+            let mut v = if elem_is_string {
+                val.clone()
+            } else if val.is_real {
+                if let Some(p) = prev {
+                    if p.is_real {
+                        Value::from_f64(val.to_f64())
+                    } else {
+                        Self::real_into_slot(p, val.to_f64())
+                    }
+                } else if elem_dt().is_some_and(|dt| super::elaborate::is_type_real(&dt)) {
+                    Value::from_f64(val.to_f64())
+                } else if let Some(p) = declared_slot() {
+                    Self::real_into_slot(&p, val.to_f64())
+                } else {
+                    val.clone()
+                }
+            } else if let Some(p) = prev {
+                if !p.is_real && p.width > 0 {
+                    val.resize(p.width)
+                } else if p.is_real {
+                    Value::from_f64(val.to_f64())
+                } else {
+                    val.clone()
+                }
+            } else if let Some(w) = self
+                .module
+                .arrays
+                .get(&row)
+                .map(|&(_, _, w)| w)
+                .or_else(|| self.assoc_store_ctx_width(&row))
+            {
+                val.resize(w.max(1))
+            } else {
+                val.clone()
+            };
+            if let Some(dt) = elem_dt() {
+                if super::elaborate::is_type_two_state_resolved(&dt, &self.module.typedef_types) {
+                    v = v.to_two_state();
+                }
+            }
+            let changed = self.signals.get(&key) != Some(&v);
+            if changed {
+                self.write_coll_elem(&key, v);
+                self.touch_queue(&row);
+            }
+            return changed;
+        }
         // Element write into an ARRAY-OF-COLLECTIONS class property
         // (`expected[1][0][k] = v`, `dq[1][2] = v`, `aa[0][key] = v`):
         // the base names one element collection (see

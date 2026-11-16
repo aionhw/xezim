@@ -1558,14 +1558,6 @@ impl Simulator {
         }
         // (A side-effecting lvalue index is folded first, below, and
         // comes back through here.)
-        if self.indexed_colls_live()
-            && (self.may_name_indexed_coll(lvalue) || self.may_name_indexed_coll(rvalue))
-            && !Self::lvalue_has_incdec_index(lvalue)
-            && self.try_indexed_coll_assign(lvalue, rvalue)
-        {
-            self.settle_after_proc_write();
-            return;
-        }
         if (matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
             || self.lvalue_may_name_struct_coll(lvalue))
             && self.try_struct_aggregate_assign(stmt, lvalue, rvalue)
@@ -1611,6 +1603,20 @@ impl Simulator {
                 self.exec_stmt_blocking_assign_body(stmt, &new_lhs, &new_rhs);
                 return;
             }
+        }
+        let sized_new = Self::sized_new_parts(rvalue);
+        let row_sized_new: Option<String> = sized_new
+            .is_some()
+            .then(|| self.sized_new_row_lvalue(lvalue))
+            .flatten();
+        if self.indexed_colls_live()
+            && row_sized_new.is_none()
+            && (self.may_name_indexed_coll(lvalue) || self.may_name_indexed_coll(rvalue))
+            && !Self::lvalue_has_incdec_index(lvalue)
+            && self.try_indexed_coll_assign(lvalue, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
         }
         // LRM §25.8 virtual-interface binding. When the LHS is a
         // class-property write whose property is declared
@@ -1716,7 +1722,21 @@ impl Simulator {
         // min(n, src.size()) elements and default-initialises the rest.
         // A `d[i] = new[n]` lvalue sizes the ELEMENT of an array of
         // dynamic arrays.
-        if let Some((n_expr, src_expr)) = Self::sized_new_parts(rvalue) {
+        if let Some((n_expr, src_expr)) = sized_new {
+            if let Some(row) = row_sized_new {
+                if !self.ensure_row(&row) {
+                    let _ = self.eval_expr(n_expr);
+                    if let Some(src) = src_expr {
+                        let _ = self.eval_expr(src);
+                    }
+                    self.settle_after_proc_write();
+                    return;
+                }
+                self.module.dynamic_arrays.insert(row.clone());
+                self.fill_sized_new(&row, n_expr, src_expr);
+                self.settle_after_proc_write();
+                return;
+            }
             let target = match &lvalue.kind {
                 ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh)),
                 // `dq[1] = new[n]` on an array-of-dynamic-arrays
