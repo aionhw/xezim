@@ -528,10 +528,24 @@ impl Simulator {
                 *owners.entry(base).or_default() += 1;
             }
         }
+        let package_arrays: HashSet<&str> = module
+            .pkg_var_decls
+            .keys()
+            .filter_map(|key| {
+                (module.arrays.contains_key(key)
+                    || module.arrays_2d.contains_key(key)
+                    || module.arrays_nd.contains_key(key)
+                    || module.dynamic_arrays.contains(key)
+                    || module.associative_arrays.contains_key(key))
+                .then(|| key.split_once("::").map(|(_, leaf)| leaf))
+                .flatten()
+            })
+            .collect();
         let contested: HashSet<String> = owners
             .into_iter()
             .filter(|(base, n)| {
                 *n >= 2
+                    || package_arrays.contains(*base)
                     || module.wildcard_shadowed.contains(*base)
                     || module.foreign_displaced.contains(*base)
                     // A package first hoisted after the local declaration

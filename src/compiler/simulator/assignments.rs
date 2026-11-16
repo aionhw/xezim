@@ -233,6 +233,17 @@ impl Simulator {
                 } else {
                     skip
                 };
+                if skip == 1
+                    && h.path.len() >= 2
+                    && let Some(mut key) =
+                        self.pkg_qual_collection_key(&h.path[0].name.name, &h.path[1].name.name)
+                {
+                    for seg in &h.path[2..] {
+                        key.push('.');
+                        key.push_str(&seg.name.name);
+                    }
+                    return Some(key);
+                }
                 let segs = &h.path[skip..];
                 // The overwhelmingly common shape is a single segment; the
                 // Vec + join below allocates twice for it. This is the

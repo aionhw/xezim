@@ -238,6 +238,12 @@ impl Simulator {
             {
                 let mut stripped = hier.clone();
                 stripped.path.remove(0);
+                if let Some(key) =
+                    self.pkg_qual_collection_key(&hier.path[0].name.name, &hier.path[1].name.name)
+                {
+                    stripped.path[0].name.name = key;
+                }
+                stripped.cached_resolved_name = crate::ast::cache::NameCache::new();
                 stripped.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                 let f = Expression::new(ExprKind::Ident(stripped), func.span);
                 return self.eval_call_inner(&f, args);

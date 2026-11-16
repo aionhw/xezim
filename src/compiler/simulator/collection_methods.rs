@@ -3090,6 +3090,21 @@ impl Simulator {
         if bm == BuiltinM::Other {
             return None;
         }
+        let package_store = if !obj_name.contains([':', '.', '#', '['])
+            && self.contested_pkg_vars.contains(obj_name)
+            && !self.frame_scalar_shadows(obj_name)
+            && self.dyn_name_lookup(obj_name).is_none()
+            && self.instance_assoc_member(obj_name).is_none()
+        {
+            if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
+                self.pkg_qual_collection_key(pkg, obj_name)
+            } else {
+                self.contested_pkg_var_in_scope(obj_name)
+            }
+        } else {
+            None
+        };
+        let obj_name = package_store.as_deref().unwrap_or(obj_name);
         // Per-specialization keying for STATIC collection properties of
         // parameterized classes (e.g. `static T m_q[$]` in `uvmq#(T)`):
         // rewrite the bare member name to the spec-aware storage key so each

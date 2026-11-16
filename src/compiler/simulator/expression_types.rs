@@ -438,6 +438,24 @@ impl Simulator {
                         }
                     }
                 }
+                // §7.2.2/§8.8: an anonymous struct-array element has no
+                // typedef name, but its field still supplies the constructor
+                // type. Query the declaration without evaluating selectors.
+                if matches!(base.kind, ExprKind::Index { .. }) {
+                    let mut root = base.as_ref();
+                    while let ExprKind::Index { expr, .. } = &root.kind {
+                        root = expr;
+                    }
+                    if let ExprKind::Ident(h) = &root.kind {
+                        let key = self.resolve_hier_name(h);
+                        if let Some(dt) = self.module.var_decl_types.get(key.as_ref())
+                            && let Some((field_type, _)) = self.member_decl_type(dt, &member.name)
+                            && let Some(name) = self.declared_typeref_name(&field_type)
+                        {
+                            return Some(name);
+                        }
+                    }
+                }
                 // A member of one element of an interface instance array
                 // (`B[0].proxy`): the element's members are signals under
                 // `B[0].`, carrying their declared type. Without this, the

@@ -367,7 +367,8 @@ fn method_boost_enabled() -> bool {
 // §6.20: procedural parameters retain their own type and declaration kind.
 // Scope-specific combinational dependency resolution (§23.6).
 // Absolute packed references retain declaration geometry (§23.6, §7.4.1).
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_307d;
+// Class aggregate ownership and struct-field constructor typing (§8.8/§8.11).
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_307e;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never

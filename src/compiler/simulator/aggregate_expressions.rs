@@ -1268,6 +1268,16 @@ impl Simulator {
                         return Some(access);
                     }
                 }
+                // §8.11: a current-object property precedes a same-named
+                // module declaration. Its packed layout belongs to the class.
+                if (h.path.len() == 1 && self.this_prop_hides(&h.path[0].name.name))
+                    || (h.path.len() > 1
+                        && (matches!(h.path[0].name.name.as_str(), "this" | "super")
+                            || self.bare_name_is_class_channel(&h.path[0].name.name)
+                            || self.hier_parent_handle(h).is_some()))
+                {
+                    return None;
+                }
                 let name = self
                     .frame_bound_bare_name(h)
                     .map(str::to_owned)
