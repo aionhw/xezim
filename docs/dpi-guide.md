@@ -469,7 +469,8 @@ Each library's `vlog_startup_routines` entries run before simulation.
   enable/disable selects the attempt by its start time; DisableStep takes
   no step-mode argument; controls share enable/disable and lock state with `$asserton`,
   `$assertoff`, `$assertkill` and `$assertcontrol`; VPI Kill leaves the
-  assertion enabled; SysKill disables new attempts and retains callbacks).
+  assertion enabled; SysKill disables new attempts and retains callbacks;
+  SysEnd prevents subsequent restart and callback registration).
 - `vpi_chk_error`, `vpi_printf`, `vpi_flush`, `vpi_compare_objects`,
   `vpi_get64`.
 - Callbacks: `vpi_register_cb` for every reason of IEEE 1800-2017 §38.36

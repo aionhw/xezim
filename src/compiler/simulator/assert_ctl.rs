@@ -417,6 +417,10 @@ impl Simulator {
 
     /// Append one control to the log, with its immediate effects.
     fn assert_ctl_push(&mut self, entry: CtlEntry) {
+        // §39.5.1: system termination also prevents task-based re-enabling.
+        if self.vpi_assert.ended {
+            return;
+        }
         if self.assert_ctl.is_none() {
             let mut c = AssertCtl {
                 multi_top: self.root_is_multi_top(),

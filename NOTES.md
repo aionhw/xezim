@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Preserve top-level combinational time units, resolve memory task destinations by scope, and size and write dynamic-array rows (#1202, #1206, #1207).
+
 - **Compatibility:** Add VPI assertion objects, callbacks, coverage queries and controls (#1191).
 
 - **Correctness:** Diagnose undeclared type names and duplicate class definitions (#1186, core #229).

@@ -150,6 +150,7 @@ pub(super) struct VpiAssertState {
     /// `sva_sites.len()` when the targets were last matched with sites.
     sites_seen: usize,
     next_id: u64,
+    pub(super) ended: bool,
     depth: u32,
     /// Attempts with step callbacks enabled via `vpiAssertionEnableStep`,
     /// independent of whether any callback is registered yet.
@@ -486,6 +487,9 @@ impl Simulator {
         aref: Option<AssertRef>,
         at: Option<u64>,
     ) -> Result<(), String> {
+        if self.vpi_assert.ended {
+            return Err("the assertion system has ended".into());
+        }
         let now = self.time;
         match op {
             OP_SYS_ON | OP_SYS_OFF => {
@@ -529,6 +533,8 @@ impl Simulator {
                 return Ok(());
             }
             OP_SYS_END => {
+                // §39.5.1: ending the system discards every pending attempt.
+                self.assert_ctl_vpi(assert_ctl::CTL_UNLOCK, None, 15, 7);
                 for i in 0..self.sva_sites.len() {
                     if self.assert_ctl_on && self.sva_site_ctl(i).locked() {
                         continue;
@@ -543,6 +549,7 @@ impl Simulator {
                 self.vpi_assert.step_enabled.clear();
                 self.vpi_assert.step_any = false;
                 self.vpi_assert_on = false;
+                self.vpi_assert.ended = true;
                 return Ok(());
             }
             _ => {}
@@ -651,6 +658,9 @@ pub extern "C" fn vpi_register_assertion_cb(
     let id = try_active_sim("vpi_register_assertion_cb", |sim| {
         let (obj, aref) = vpi_model::assert_ref(sim, h)?;
         let st = &mut *sim.vpi_assert;
+        if st.ended {
+            return None;
+        }
         let ti = match st.targets.iter().position(|t| t.obj == obj) {
             Some(ti) => ti,
             None => {
