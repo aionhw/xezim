@@ -200,7 +200,18 @@ impl Simulator {
         // per instance (`u0.q` / `u1.q`), so interning it too keeps the
         // entry per instance — `q.size()` inside a `for` in ten siblings
         // otherwise read the first sibling's queue.
-        let head = hier.path[0].name.name.as_str();
+        // §7.9 / §23.6: generated calls may share a dummy span and head
+        // (`g.s.q.push_back`, `g.s.aa.num`). Keep the entire receiver in
+        // the key; its first segment alone aliases distinct members.
+        let receiver;
+        let head = if keep == 1 && hier.root.is_none() {
+            hier.path[0].name.name.as_str()
+        } else {
+            receiver = format!("{}{}", if hier.root.is_some() { "$root." } else { "" },
+                hier.path[..keep].iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join("."));
+            receiver.as_str()
+        };
+        let cacheable = hier.path[..keep].iter().all(|s| s.selects.is_empty());
         let head_id = match self.method_receiver_hint_ids.get(head) {
             Some(&id) => id,
             None => {
@@ -216,7 +227,7 @@ impl Simulator {
             hint_id,
             head_id,
         );
-        if let Some(e) = self.method_receiver_cache.get(&key) {
+        if cacheable && let Some(e) = self.method_receiver_cache.get(&key) {
             return e.clone();
         }
         let base = HierarchicalIdentifier {
@@ -228,7 +239,9 @@ impl Simulator {
             bound: crate::ast::binding::Bound::UNSET,
         };
         let e = std::rc::Rc::new(Expression::new(ExprKind::Ident(base), hier.span));
-        self.method_receiver_cache.insert(key, e.clone());
+        if cacheable {
+            self.method_receiver_cache.insert(key, e.clone());
+        }
         e
     }
 

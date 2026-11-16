@@ -2032,9 +2032,7 @@ impl Simulator {
                             bound: crate::ast::binding::Bound::UNSET,
                         };
                         let saved = self.name_resolve_hint.borrow().clone();
-                        if !ab.scope.is_empty() {
-                            *self.name_resolve_hint.borrow_mut() = Some(ab.scope.clone());
-                        }
+                        *self.name_resolve_hint.borrow_mut() = (!ab.scope.is_empty()).then(|| ab.scope.clone());
                         let resolved = self.resolve_hier_name(&ident);
                         *self.name_resolve_hint.borrow_mut() = saved;
                         if resolved != *r {

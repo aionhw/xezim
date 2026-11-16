@@ -640,9 +640,8 @@ impl Simulator {
                 let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = std::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
-                if let Some(hint) = &scope_hint {
-                    *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
-                }
+                // §23.6: top-scope work must clear the caller's instance hint.
+                *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                 let mut lhs_id = self.get_lhs_signal_id(lhs);
                 if scope_hint.is_none() {
                     // The bare-lhs resolve above can itself need the hint
@@ -798,9 +797,8 @@ impl Simulator {
                 let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = std::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
-                if let Some(hint) = &scope_hint {
-                    *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
-                }
+                // §23.6: top-scope work must clear the caller's instance hint.
+                *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                 self.settle_prev_values.clear();
                 for &id in &entry.cold.write_signal_ids {
                     self.settle_prev_values
@@ -2471,9 +2469,7 @@ impl Simulator {
                                         let prev_ts = self.timescale_scope_override.take();
                                         let sc = entries[eidx].cold.scope_hint.clone();
                                         self.set_m_block_scope(sc.as_deref());
-                                        if sc.is_some() {
-                                            *self.name_resolve_hint.borrow_mut() = sc.clone();
-                                        }
+                                        *self.name_resolve_hint.borrow_mut() = sc.clone();
                                         self.timescale_scope_override = sc;
                                         Some((prev_hint, prev_ts))
                                     } else {
@@ -2577,9 +2573,7 @@ impl Simulator {
                                     // their ids, so this costs them one bool test.
                                     let saved_hint = if compiled.has_fallback {
                                         let prev = self.name_resolve_hint.borrow().clone();
-                                        if let Some(sc) = entries[eidx].cold.scope_hint.as_ref() {
-                                            *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
-                                        }
+                                        *self.name_resolve_hint.borrow_mut() = entries[eidx].cold.scope_hint.clone();
                                         Some(prev)
                                     } else {
                                         None

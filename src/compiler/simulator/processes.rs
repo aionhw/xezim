@@ -943,9 +943,7 @@ impl Simulator {
                     self.timescale_scope_override = entry.cold.scope_hint.clone();
                     let saved_hint = if compiled.has_fallback {
                         let prev = self.name_resolve_hint.borrow().clone();
-                        if let Some(sc) = entry.cold.scope_hint.as_ref() {
-                            *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
-                        }
+                        *self.name_resolve_hint.borrow_mut() = entry.cold.scope_hint.clone();
                         Some(prev)
                     } else {
                         None
