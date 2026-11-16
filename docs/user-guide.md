@@ -8,6 +8,8 @@ of options and environment variables is in the
 [debugging](DEBUGGING.md).
 
 * [Running a simulation](#running-a-simulation)
+* [Cocotb Python testbenches](#cocotb-python-testbenches)
+* [VPI assertion integration](#vpi-assertion-integration)
 * [Random seeds and weighted distributions](#random-seeds-and-weighted-distributions)
 * [Waveforms](#waveforms)
 * [Checkpoints](#checkpoints)
@@ -60,6 +62,73 @@ let time advance, an SDF file `$sdf_annotate` cannot read), a
 `--dpi-lib` library that cannot be loaded, and an `-s` that names no module
 (`--no-strict-top` falls back to finding tops automatically). `$error` exits 0
 unless `--error-exit` is given.
+
+Current `main` also diagnoses undeclared type names and duplicate class
+definitions. Declare or import the intended type before using it, and keep
+one class definition per name in a scope. A forward class typedef is not a
+second class definition.
+
+## Cocotb Python testbenches
+
+The runner in `contrib/cocotb/xezim_runner.py` supports cocotb 2.0.x and 2.1.0;
+its integration tests cover 2.0.1 and 2.1.0. The 2.1 compatibility changes are
+available on `main` after 0.11.6.
+
+From the repository root, make the runner importable and select your binary:
+
+```bash
+export PYTHONPATH="$PWD/contrib/cocotb${PYTHONPATH:+:$PYTHONPATH}"
+export XEZIM_BIN="$PWD/target/release/xezim"
+python run_test.py
+```
+
+A minimal `run_test.py`, with your `dut.sv` and cocotb `test_dut.py` beside it:
+
+```python
+import xezim_runner  # registers the xezim backend
+from cocotb_tools.runner import get_runner
+
+runner = get_runner("xezim")
+runner.build(sources=["dut.sv"], hdl_toplevel="dut", build_dir="sim_build")
+runner.test(hdl_toplevel="dut", test_module="test_dut")
+```
+
+`build()` records the source files and options; `test()` invokes xezim to
+elaborate and simulate them. Use `parameters={"WIDTH": 8}` for parameter
+overrides and `waves=True` for an FST waveform in the build directory.
+
+Macro values follow the installed cocotb version. For a macro that expands
+to the SystemVerilog string literal `"hi"`, use `defines={"MSG": "hi"}` with
+2.0, or `defines={"MSG": '"hi"'}` with 2.1. Version 2.1 takes HDL text as
+written; it does not add quotes. In either version, `None` defines a macro
+without a value. See the [runner documentation](../contrib/cocotb/xezim_runner.py)
+for option and parameter-rebuild behavior.
+
+## VPI assertion integration
+
+On `main` after 0.11.6, VPI clients can discover concurrent assertion objects,
+register callbacks with `vpi_register_assertion_cb`, query assertion coverage,
+and control assertions through `vpi_control`. Build the client against
+`include/vpi_user.h` and `include/sv_vpi_user.h`, then load its shared library:
+
+```bash
+xezim --vpi-lib ./assertion_monitor.so top.sv
+```
+
+Step controls select an attempt by its start time. `vpiAssertionEnableStep`
+takes the assertion handle, a time pointer and `vpiAssertionClockSteps`;
+`vpiAssertionDisableStep` takes only the handle and time pointer after its
+operation code. `vpiAssertionSysKill` discards pending attempts and disables
+new ones while retaining callbacks. `vpiAssertionSysOn` allows new attempts
+to start again; it does not revive discarded attempts.
+`vpiAssertionSysEnd` removes callbacks and ends the assertion system; later
+controls or callback registrations cannot restart it.
+
+This is the Phase 1 interface. Phase 2 action and lock callbacks are not
+supported. Step callbacks report clock-level progress, callback `detail` is
+NULL, and some coverage counts are approximations. See the
+[DPI and VPI guide](dpi-guide.md#classic-vpi-modules---vpi-lib) for the supported
+objects, callback semantics, coverage limits and checkpoint behavior.
 
 ## Random seeds and weighted distributions
 
