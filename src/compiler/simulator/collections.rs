@@ -3077,7 +3077,23 @@ impl Simulator {
                     && name.as_bytes()[top.len()] == b'.'
                     && name.starts_with(top)
                 {
-                    if let Some(v) = self.get_signal_value_by_name(&name[top.len() + 1..]) {
+                    let bare = &name[top.len() + 1..];
+                    // `<top>.<sig>` is an ABSOLUTE reference to the top
+                    // module's own variable — never re-scope it under the
+                    // resolve hint (that would bind top's `sig` to a
+                    // same-named net inside the hinted instance: `$root.top.n`
+                    // read a leaf's `l.n` when a hint named `l` was active,
+                    // forwarding x for a 0). Read the stripped key directly;
+                    // array elements and packed leaves fall back to the
+                    // recursion below.
+                    if let Some(&id) = self.signal_name_to_id.get(bare) {
+                        let mut v = self.signal_table[id].clone();
+                        if self.signal_signed[id] {
+                            v.is_signed = true;
+                        }
+                        return Some(v);
+                    }
+                    if let Some(v) = self.get_signal_value_by_name(bare) {
                         return Some(v);
                     }
                 }

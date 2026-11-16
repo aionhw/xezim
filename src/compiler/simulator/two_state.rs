@@ -4376,6 +4376,7 @@ impl Simulator {
                 };
                 if cid == pid
                     || self.signal_widths[cid] != self.signal_widths[pid]
+                    || self.signal_signed[cid] != self.signal_signed[pid]
                     || self.signal_real[cid] != self.signal_real[pid]
                 {
                     continue;
@@ -4513,6 +4514,7 @@ impl Simulator {
                     };
                     if lid == rid
                         || self.signal_widths[lid] != self.signal_widths[rid]
+                        || self.signal_signed[lid] != self.signal_signed[rid]
                         || self.signal_real[lid] != self.signal_real[rid]
                         || self.signal_two_state[lid] != self.signal_two_state[rid]
                         || self.signal_gate_driven.get(lid).copied().unwrap_or(false)

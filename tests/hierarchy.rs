@@ -281,6 +281,9 @@ mod instance_task_in_forever_loop;
 mod interface_port_inside;
 #[path = "hierarchy/interface_same_name_drive_1123.rs"]
 mod interface_same_name_drive_1123;
+
+#[path = "hierarchy/explicit_dollar_root_read_1124.rs"]
+mod explicit_dollar_root_read_1124;
 #[path = "hierarchy/interface_task_lexical_scope.rs"]
 mod interface_task_lexical_scope;
 #[path = "hierarchy/library_dir_on_demand.rs"]
