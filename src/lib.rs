@@ -189,8 +189,9 @@ fn design_cache_key(
 ) {
     let mut hash = CacheHash::new();
     hash.bytes(XEZIM_BYTECODE_MAGIC);
-    // Qualified package-array storage changes elaborated names (§26.3).
-    hash.text("qualified-package-array-storage-v1");
+    // Re-elaborate designs validated before duplicate-class diagnostics (§8.3),
+    // scoped memory destinations and dynamic-row lowering were added.
+    hash.text("qualified-package-array-storage-and-pr-validation-v2");
     hash.text(env!("CARGO_PKG_VERSION"));
     hash.text(&config.semantic_salt);
     hash.text(top_module_name.unwrap_or(""));
