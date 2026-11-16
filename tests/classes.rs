@@ -1226,8 +1226,14 @@ mod rand_dyn_array_of_unpacked_structs;
 #[path = "classes/class_scoped_assoc_queue_element.rs"]
 mod class_scoped_assoc_queue_element;
 
+#[path = "classes/rand_sub_object_array_back_handle.rs"]
+mod rand_sub_object_array_back_handle;
+
 #[path = "classes/rand_sub_object_back_handle.rs"]
 mod rand_sub_object_back_handle;
+
+#[path = "classes/rand_sub_object_back_handle_edges.rs"]
+mod rand_sub_object_back_handle_edges;
 
 #[path = "classes/rand_solver_sparse_1003.rs"]
 mod rand_solver_sparse_1003;
