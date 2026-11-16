@@ -1,5 +1,42 @@
 //! §7.5 / §7.4.2: `d[i] = new[n]` sizes row `d[i]` and `d[i][j] = v` writes one
 //! element of that row for a class property and for a local.
+
+/// §7.4.6 / §11.4.1: selectors run once, including a discarded row sizing.
+#[test]
+fn dynamic_rows_evaluate_selectors_once() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+ int calls=0;
+ function int index_value(); calls++; return 0; endfunction
+ class rows;
+  typedef bit [7:0] octet;
+  octet data[][];
+ endclass
+ rows r;
+ int sizes=0;
+ function int size_value(); sizes++; return 3; endfunction
+ initial begin
+  r=new(); r.data=new[1];
+  r.data[index_value()]=new[size_value()];
+  r.data[index_value()][index_value()]=8'hac;
+  r.data[4]=new[size_value()];
+  $display("rows=%0d value=%h calls=%0d sizes=%0d",r.data[0].size(),r.data[0][0],calls,sizes);
+ end
+endmodule
+"#,
+        10,
+    )
+    .expect("dynamic rows");
+    let out = sim
+        .output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(out.contains("rows=3 value=ac calls=3 sizes=2"), "{out}");
+}
+
 #[test]
 fn dyn_array_of_dyn_array_rows_size_and_write() {
     let result = xezim::simulate(

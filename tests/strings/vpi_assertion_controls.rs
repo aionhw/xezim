@@ -8,6 +8,88 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// §39.5.1: system kill disables new attempts but retains callbacks for SysOn.
+#[test]
+fn vpi_assertion_system_kill_preserves_callbacks() {
+    let c = r#"
+static PLI_INT32 t_setup(PLI_BYTE8 *ud) {
+    (void)ud;
+    vpiHandle a = vpi_handle_by_name("top.A", NULL);
+    PLI_INT32 rs[] = {cbAssertionStart, cbAssertionKill, cbAssertionFailure};
+    for (unsigned i=0; i<sizeof rs/sizeof rs[0]; i++)
+        CHECK(vpi_register_assertion_cb(a, rs[i], on_cb, NULL) != NULL, "register");
+    return 0;
+}
+static PLI_INT32 t_kill(PLI_BYTE8 *ud) {
+    (void)ud;
+    CHECK(vpi_control(vpiAssertionSysKill, NULL) == 1, "system kill");
+    return 0;
+}
+static PLI_INT32 t_resume(PLI_BYTE8 *ud) {
+    (void)ud;
+    CHECK(vpi_control(vpiAssertionSysOn, NULL) == 1, "system on");
+    vpi_printf("ERRORS=%d\n", errors);
+    return 0;
+}
+static void reg_all(void) {
+    reg_task("$t_setup", t_setup);
+    reg_task("$t_kill", t_kill);
+    reg_task("$t_resume", t_resume);
+}
+void (*vlog_startup_routines[])(void) = { reg_all, 0 };
+"#;
+    let sv = r#"
+module top;
+ timeunit 1ns; timeprecision 1ns;
+ bit clk=0; bit b=1,c=0;
+ always #5 clk=~clk;
+ A: assert property (@(posedge clk) b |-> ##2 c);
+ initial begin $t_setup; #12 $t_kill; #10 $t_resume; #26 $finish; end
+endmodule
+"#;
+    let log = run_vpi_common("system_kill", c, sv);
+    assert!(log.contains("ERRORS=0"), "{log}");
+    assert!(log.contains("CB A KILL t=12 start=5"), "{log}");
+    assert!(!log.contains("CB A START t=15"), "{log}");
+    assert!(!log.contains("CB A FAILURE t=25 start=5"), "{log}");
+    assert!(log.contains("CB A START t=25 start=25"), "{log}");
+    assert!(log.contains("CB A FAILURE t=45 start=25"), "{log}");
+}
+
+/// §39.5.2: enabling one attempt must not enable overlapping attempts.
+#[test]
+fn vpi_assertion_step_selects_attempt() {
+    let c = r#"static PLI_INT32 t_setup(PLI_BYTE8 *ud) {
+    (void)ud;
+    vpiHandle a = vpi_handle_by_name("top.A", NULL);
+    s_vpi_time t = {vpiSimTime, 0, 5, 0.0};
+    CHECK(vpi_register_assertion_cb(a, cbAssertionStepSuccess, on_cb, NULL) != NULL, "register");
+    CHECK(vpi_control(vpiAssertionEnableStep, a, &t, vpiAssertionClockSteps) == 1, "enable");
+    vpi_printf("ERRORS=%d\n", errors);
+    return 0;
+}
+static void reg_all(void) { reg_task("$t_setup", t_setup); }
+void (*vlog_startup_routines[])(void) = { reg_all, 0 };
+"#;
+    let sv = r#"
+module top;
+ timeunit 1ns; timeprecision 1ns;
+ bit clk=0; bit b=1,c=0;
+ always #5 clk=~clk;
+ A: assert property (@(posedge clk) b |-> ##3 c);
+ initial begin $t_setup; #28 $finish; end
+endmodule
+"#;
+    let log = run_vpi_common("step_attempt", c, sv);
+    assert!(log.contains("ERRORS=0"), "{log}");
+    assert!(log.contains("CB A STEP_OK t=15 start=5"), "{log}");
+    assert!(
+        !log.lines()
+            .any(|l| l.contains("STEP_OK") && l.contains("start=15")),
+        "{log}"
+    );
+}
+
 fn scratch(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("xezim_vpiassert_{}_{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -155,17 +237,19 @@ static PLI_INT32 va2_ctl(PLI_BYTE8 *ud) {
 
 static PLI_INT32 va2_enable_step(PLI_BYTE8 *ud) {
     (void)ud;
-    s_vpi_time t = {vpiSimTime, 0, 0, 0.0};
+    s_vpi_time t = {vpiSimTime, 0, 15, 0.0};
     CHECK(vpi_control(vpiAssertionEnableStep, a1, &t, 999) == 0, "bad step rejected");
     vpi_chk_error(NULL);
     CHECK(vpi_control(vpiAssertionEnableStep, a1, &t, vpiAssertionClockSteps) == 1, "enable step");
+    t.low = 45;
+    CHECK(vpi_control(vpiAssertionEnableStep, a1, &t, vpiAssertionClockSteps) == 1, "enable future attempt");
     return 0;
 }
 
 static PLI_INT32 va2_disable_step(PLI_BYTE8 *ud) {
     (void)ud;
-    s_vpi_time t = {vpiSimTime, 0, 0, 0.0};
-    CHECK(vpi_control(vpiAssertionDisableStep, a1, &t, vpiAssertionClockSteps) == 1, "disable step");
+    s_vpi_time t = {vpiSimTime, 0, 45, 0.0};
+    CHECK(vpi_control(vpiAssertionDisableStep, a1, &t) == 1, "disable step");
     return 0;
 }
 
@@ -546,7 +630,9 @@ static PLI_INT32 t_setup(PLI_BYTE8 *ud) {
         CHECK(vpi_register_assertion_cb(a, rs[i], on_cb, NULL) != NULL, "reg a");
         CHECK(vpi_register_assertion_cb(s, rs[i], on_cb, NULL) != NULL, "reg s");
     }
+    t.low = 5;
     CHECK(vpi_control(vpiAssertionEnableStep, a, &t, vpiAssertionClockSteps) == 1, "step a");
+    t.low = 35;
     CHECK(vpi_control(vpiAssertionEnableStep, s, &t, vpiAssertionClockSteps) == 1, "step s");
     return 0;
 }
@@ -1095,12 +1181,12 @@ static PLI_INT32 t_setup(PLI_BYTE8 *ud) {
     vpiHandle a2 = vpi_handle_by_name("top.A2", NULL);
     vpiHandle a3 = vpi_handle_by_name("top.A3", NULL);
     CHECK(a1 && a2 && a3, "handles");
-    s_vpi_time t = {vpiSimTime, 0, 0, 0.0};
+    s_vpi_time t = {vpiSimTime, 0, 5, 0.0};
     CHECK(vpi_control(vpiAssertionEnableStep, a3, &t, vpiAssertionClockSteps) == 1, "en step a3");
     CHECK(vpi_control(vpiAssertionSysReset) == 1, "sys reset clears step");
     CHECK(vpi_control(vpiAssertionEnableStep, a1, &t, vpiAssertionClockSteps) == 1, "en step a1");
     CHECK(vpi_control(vpiAssertionEnableStep, a2, &t, vpiAssertionClockSteps) == 1, "en step a2");
-    CHECK(vpi_control(vpiAssertionDisableStep, a2, &t, vpiAssertionClockSteps) == 1, "dis step a2");
+    CHECK(vpi_control(vpiAssertionDisableStep, a2, &t) == 1, "dis step a2");
     PLI_INT32 rs[] = {cbAssertionStart, cbAssertionStepSuccess, cbAssertionSuccess};
     for (unsigned i = 0; i < sizeof rs / sizeof rs[0]; i++) {
         CHECK(vpi_register_assertion_cb(a1, rs[i], on_cb, NULL) != NULL, "reg a1");
