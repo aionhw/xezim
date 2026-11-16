@@ -61,6 +61,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   the statement runs (§9.4.5, §10.9, §11.6.1, §11.4.11, #1162, contributed by
   chuanseng-ng).
 
+* A nonblocking assignment of an assignment pattern to an unpacked array or
+  unpacked struct updates it in the NBA region, and with an intra-assignment
+  delay in the NBA region of the later time step: the target changed at
+  once, so `a <= '{b[0], b[1]}; b <= '{a[0], a[1]};` copied one side onto
+  the other (§10.4.2, §4.9.4, §9.4.5, #1199).
+
 * The abort properties `accept_on`, `reject_on`, `sync_accept_on` and
   `sync_reject_on` parse and run; they failed to parse. An asynchronous
   condition is checked with sampled values in every time step, and the
