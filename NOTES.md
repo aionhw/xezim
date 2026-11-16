@@ -14,7 +14,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   their prepared syntax across value-parameter overrides, avoiding repeated
   cloning and content comparison. Each instance still resolves its own
   widths, initializers and connections; generate and procedural bodies keep
-  parameter-sensitive preparation (§6.20, §23.10, #721).
+  parameter-sensitive preparation (§6.20, §23.10, #721). A synthetic case
+  with 1,024 parameter values and 4,096-term initializers compiles in a
+  three-run median of 3.08 seconds instead of 7.56 seconds, with identical
+  artifacts. Peak RSS is 64.1 MiB versus 62.6 MiB; this change reduces
+  compilation work rather than demonstrating a peak-memory reduction.
 
 * Sampling a covergroup whose bins have a `with` filter that compares `item`
   with constants works from the ranges between the filter's cut points
