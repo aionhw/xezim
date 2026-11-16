@@ -28,6 +28,13 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 }
 
 const SRC: &str = r#"
+// A stand-in base: the design used to extend a `uvm_sequence_item` that
+// nothing declared, which is an error (§8.13).
+class uvm_sequence_item;
+  function new(string name="");
+  endfunction
+endclass
+
 class base_class extends uvm_sequence_item;
   rand int a;
   function new(string name="base_class");
