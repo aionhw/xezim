@@ -89,7 +89,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Assignment indexes with side effects are captured before aggregate probes;
   a part-select RHS no longer evaluates `array[index++]` twice (§11.4.1,
   #1182). Hierarchical reads preserve their target despite a same-named
-  local, including packed-select observers (#1183).
+  local, including packed-select observers (#1183). Associative-array input
+  copies retain their packed element fields without aliasing the caller
+  (§13.5.1). Enum body dimensions preserve typedef base widths (§6.19).
 
 * Constant evaluation preserves parameter overrides across function calls,
   typed patterns and array sizing. Compiled artifacts and method caches
