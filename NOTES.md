@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Preserve input-port indices around UDP instances, schedule fixed-array and record assignment-pattern leaves in the NBA region, and combine root and descendant waveform scopes with independent depth limits (#1201, #1199, #1195).
+
 **Performance**
 
 * Module bodies containing only declarations and continuous assignments reuse

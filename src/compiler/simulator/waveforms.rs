@@ -217,8 +217,14 @@ impl Simulator {
         let top_dot = format!("{}.", top);
         let mut out = Vec::with_capacity(scopes.len());
         for s in scopes {
+            if s.is_empty() {
+                continue;
+            }
             if s == top {
-                return None;
+                // §21.7.1.2: depth applies independently to every scope.
+                // Keep the root alongside descendants instead of dropping them.
+                out.push(String::new());
+                continue;
             }
             out.push(
                 s.strip_prefix(top_dot.as_str())
@@ -314,6 +320,9 @@ impl Simulator {
         match filters {
             None => level_ok(name),
             Some(fs) => fs.iter().any(|f| {
+                if f.is_empty() {
+                    return level_ok(name);
+                }
                 if name == f.as_str() {
                     return true;
                 }

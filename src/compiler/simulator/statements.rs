@@ -4301,6 +4301,24 @@ impl Simulator {
                 // of them, associative array) is spread member-wise.
                 if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
                     if packed_pattern.is_none() {
+                        // Fixed arrays and records use stable leaf storage. Runtime-sized
+                        // collections retain their own size/default update path.
+                        let mut root = lvalue;
+                        while let ExprKind::Index { expr, .. }
+                        | ExprKind::MemberAccess { expr, .. } = &root.kind
+                        {
+                            root = expr;
+                        }
+                        let capture = if let ExprKind::Ident(h) = &root.kind {
+                            let name = self.resolve_hier_name(h);
+                            !self.module.dynamic_arrays.contains(name.as_ref())
+                                && !self.module.queue_vars.contains(name.as_ref())
+                                && !self.is_associative_array(name.as_ref())
+                        } else {
+                            true
+                        };
+                        let previous_capture =
+                            std::mem::replace(&mut self.pattern_nba_leaves, capture.then(Vec::new));
                         let spread = if matches!(&lvalue.kind, ExprKind::Ident(_)) {
                             self.pattern_aggregate_names(lvalue)
                                 .into_iter()
@@ -4312,7 +4330,35 @@ impl Simulator {
                                     None => false,
                                 }
                         };
+                        let leaves = self.pattern_nba_leaves.take().unwrap_or_default();
+                        self.pattern_nba_leaves = previous_capture;
                         if spread {
+                            // §10.4.2, §9.4.5: evaluate every item now, then
+                            // route the captured leaves through normal NBA scheduling.
+                            let d = intra_d.unwrap_or_else(|| {
+                                delay
+                                    .as_ref()
+                                    .map(|e| self.eval_expr(e).to_u64().unwrap_or(0))
+                                    .unwrap_or(0)
+                            });
+                            for (name, value) in leaves {
+                                let split = name.find(['.', '[']).unwrap_or(name.len());
+                                let base =
+                                    Self::flat_name_ident(name[..split].to_string(), stmt.span);
+                                let target = Self::append_leaf_path(&base, &name[split..]);
+                                let saved = self.make_intra_saved_expr(value, rvalue.span);
+                                let delay = (d > 0).then(|| {
+                                    self.make_intra_saved_expr(Value::from_u64(d, 64), stmt.span)
+                                });
+                                self.exec_statement(&Statement::new(
+                                    StatementKind::NonblockingAssign {
+                                        lvalue: target,
+                                        delay,
+                                        rvalue: saved,
+                                    },
+                                    stmt.span,
+                                ));
+                            }
                             return;
                         }
                     }

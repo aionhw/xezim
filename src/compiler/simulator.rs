@@ -8723,6 +8723,10 @@ pub struct Simulator {
     class_event_prop_names: Option<std::rc::Rc<HashSet<String>>>,
     /// Fast-path NBA buffer: pre-resolved (signal_id, value) pairs.
     nba_fast: Vec<NbaFast>,
+    /// Pattern target writes collected before scheduling their NBA updates.
+    /// Empty at scheduling boundaries; never part of a checkpoint.
+    #[serde(skip)]
+    pattern_nba_leaves: Option<Vec<(String, Value)>>,
     /// Reverse index: signal_id → most recent index in `nba_fast` for that
     /// signal during the *current* NBA accumulation window. Used by the
     /// partial-range/bit NBA Insns (NbaAssignRange, NbaAssignRangeDyn,

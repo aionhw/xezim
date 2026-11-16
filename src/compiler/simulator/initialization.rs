@@ -4390,6 +4390,7 @@ impl Simulator {
             static_struct_props,
             modport_names,
             nba_fast: Vec::new(),
+            pattern_nba_leaves: None,
             // Named signals stay on the dense hot path. Unnamed large-array
             // elements use NbaFastIndex's sparse tail.
             nba_fast_index: NbaFastIndex::with_dense_prefix(named_count),

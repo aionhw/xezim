@@ -329,10 +329,12 @@ impl Simulator {
     /// `e` is itself an assignment pattern and `dt` an unpacked struct, recurse
     /// member-wise; otherwise evaluate and write the leaf.
     pub(super) fn assign_pattern_or_leaf(&mut self, target: &str, dt: &DataType, e: &Expression) {
+        let capture = self.pattern_nba_leaves.take();
         if let ExprKind::AssignmentPattern(sub) = &self.unpacked_pattern(e).kind {
             if !sub.is_empty() {
                 if let DataType::Struct(su) = self.resolve_dt(dt) {
                     if Self::spreads_member_wise(&su) {
+                        self.pattern_nba_leaves = capture;
                         self.assign_pattern_into_struct(target, &su, sub);
                         return;
                     }
@@ -340,7 +342,8 @@ impl Simulator {
                 // §10.9.2: a pattern for a packed element takes the
                 // element's type.
                 if let Some(v) = self.eval_in_packed_type(e, dt) {
-                    self.write_leaf_by_name(target, v);
+                    self.pattern_nba_leaves = capture;
+                    self.write_pattern_leaf(target, v);
                     return;
                 }
             }
@@ -353,13 +356,27 @@ impl Simulator {
             // everything. Re-enter the spread with a synthetic default item.
             if Self::spreads_member_wise(&su) {
                 let synthetic = [AssignmentPatternItem::Default(e.clone())];
+                self.pattern_nba_leaves = capture;
                 self.assign_pattern_into_struct(target, &su, &synthetic);
                 return;
             }
         }
         let value = self.eval_pattern_leaf_value(dt, e, None);
-        if value.is_real || Self::is_string_data_type(self.resolve_dt_ref(dt)) {
+        self.pattern_nba_leaves = capture;
+        if self.pattern_nba_leaves.is_none()
+            && (value.is_real || Self::is_string_data_type(self.resolve_dt_ref(dt)))
+        {
             self.set_signal_value_by_name(target, value);
+        } else {
+            self.write_pattern_leaf(target, value);
+        }
+    }
+
+    /// §10.4.2: collect target writes only; RHS function side effects remain
+    /// immediate because item evaluation runs outside the capture context.
+    fn write_pattern_leaf(&mut self, target: &str, value: Value) {
+        if let Some(leaves) = &mut self.pattern_nba_leaves {
+            leaves.push((target.to_string(), value));
         } else {
             self.write_leaf_by_name(target, value);
         }
@@ -1045,9 +1062,14 @@ impl Simulator {
             if dims.is_empty() {
                 // §10.9.2: the type and default keys reach a packed member
                 // no other key sets.
-                if !explicit && let Some(v) = self.eval_default_in_packed_type(items, &mdt) {
-                    self.write_leaf_by_name(&target, v);
-                    continue;
+                if !explicit {
+                    let capture = self.pattern_nba_leaves.take();
+                    let value = self.eval_default_in_packed_type(items, &mdt);
+                    self.pattern_nba_leaves = capture;
+                    if let Some(v) = value {
+                        self.write_pattern_leaf(&target, v);
+                        continue;
+                    }
                 }
                 self.assign_pattern_or_leaf(&target, &mdt, e);
                 continue;
@@ -4170,7 +4192,9 @@ impl Simulator {
         if !Self::spreads_member_wise(&su) {
             return false;
         }
+        let capture = self.pattern_nba_leaves.take();
         let iv = self.eval_expr(index);
+        self.pattern_nba_leaves = capture;
         let key = if self.module.associative_arrays.contains_key(&*bname) {
             self.assoc_key_str(&bname, &iv)
         } else {
