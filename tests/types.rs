@@ -761,3 +761,6 @@ mod review_struct_pattern_return;
 mod enum_receiver_types_1132;
 #[path = "types/signed_named_packed_props_ports_1107.rs"]
 mod signed_named_packed_props_ports_1107;
+
+#[path = "types/owned_aggregate_storage_1132_1147.rs"]
+mod owned_aggregate_storage_1132_1147;
