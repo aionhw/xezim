@@ -517,6 +517,21 @@ impl Simulator {
                 || enum_lits.contains(name)
                 || scope_names.contains(name)
                 || expanded_bases.contains(name)
+                // Syntax 21-20 (§21.7.2.1) uses reference identifiers (§5.6),
+                // naming the variable in its model scope (§21.7.2.3 d)).
+                // Check the exact parameter key: a same-named variable can
+                // change an alias's dump kind. After the last ::, a dot
+                // keeps members and parameters below escaped scopes
+                // (§5.6.1), and [ keeps array elements on their existing
+                // path (§7.4), including real-valued elements.
+                // Own escaped parameters (§5.6.1) with neither . nor [ after
+                // the last :: (\p::W, \a.b::c) are also left out of VCD, FST
+                // and XTrace; \a::b.c and \a::b[0] are kept.
+                || (name.contains(':')
+                    && name
+                        .rsplit_once("::")
+                        .is_some_and(|(_, leaf)| !leaf.contains(['.', '[']))
+                    && self.module.parameters.contains_key(name))
                 || xezim_core::elaborate::is_delay_stage_net(name)
                 || event_bits::is_edge_alias_net(name))
                 && Self::dump_name_selected(name, filters.as_deref(), depth)
