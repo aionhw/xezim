@@ -456,7 +456,7 @@ fn active_sim_ptr() -> *mut Simulator {
 
 /// A `vpiSimTime` / `vpiScaledRealTime` record as a tick count, scaled by the
 /// time unit of the registration obj.
-fn time_to_ticks(t: &s_vpi_time, ticks_per_unit: f64) -> u64 {
+pub(super) fn time_to_ticks(t: &s_vpi_time, ticks_per_unit: f64) -> u64 {
     if t.type_ == vpi::SCALED_REAL_TIME {
         let v = t.real * ticks_per_unit;
         if v > 0.0 { v.round() as u64 } else { 0 }
@@ -468,7 +468,7 @@ fn time_to_ticks(t: &s_vpi_time, ticks_per_unit: f64) -> u64 {
 /// Ticks per time unit of `obj` for vpiScaledRealTime: a module's own
 /// timeunit, else (NULL or any other object) the simulation's, which is the
 /// tick. Matches `vpi_get(vpiTimeUnit, obj)`.
-fn ticks_per_unit_of(sim: &Simulator, obj: *mut c_void) -> f64 {
+pub(super) fn ticks_per_unit_of(sim: &Simulator, obj: *mut c_void) -> f64 {
     let def = unsafe { vpi_deref(obj) }
         .filter(|h| h.kind == VpiKind::Module)
         .map(|h| h.def_name.clone());
@@ -627,7 +627,7 @@ impl Simulator {
 
     /// Flush `$display` output (only if anything was written since the last
     /// flush) and file writes, so a callback's `vpi_printf` lands after them.
-    fn vpi_sync_output(&mut self) {
+    pub(super) fn vpi_sync_output(&mut self) {
         if self.stdout_unsynced {
             self.stdout_unsynced = false;
             self.flush_stdout();
@@ -1794,7 +1794,10 @@ pub extern "C" fn vpi_remove_cb(cb_obj: *mut c_void) -> c_int {
     let sp = active_sim_ptr();
     if !sp.is_null() {
         let sim = unsafe { &mut *sp };
-        if sim.vpi_cb.entries.get(&id).is_some_and(|e| !e.internal) {
+        // An assertion callback (Clause 39.4.2, `vpi_assert.rs`).
+        if id & vpi_assert::CB_ID_BASE != 0 {
+            sim.vpi_assert_remove_cb(id);
+        } else if sim.vpi_cb.entries.get(&id).is_some_and(|e| !e.internal) {
             sim.vpi_cb_delete(id);
         }
     }

@@ -28,6 +28,11 @@
 #include <stddef.h>
 #include <stdarg.h>
 
+/* C linkage for a C++ client, as in the standard header (Annex K). */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* PLI type definitions (IEEE 1800-2017 Annex K.1). */
 typedef int32_t  PLI_INT32;
 typedef uint32_t PLI_UINT32;
@@ -898,6 +903,10 @@ void vpi_put_delays(vpiHandle object, p_vpi_delay delay_p);
  * vpi_chk_error. */
 PLI_INT32 vpi_get_data(PLI_INT32 id, PLI_BYTE8 *dataLoc, PLI_INT32 numOfBytes);
 PLI_INT32 vpi_put_data(PLI_INT32 id, PLI_BYTE8 *dataLoc, PLI_INT32 numOfBytes);
+
+#ifdef __cplusplus
+}
+#endif
 
 /* DPI scope/runtime primitives live in svdpi.h with their proper
  * `svScope` type. Included here so both are visible together. */

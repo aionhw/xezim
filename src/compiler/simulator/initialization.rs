@@ -4917,6 +4917,8 @@ impl Simulator {
             elem_rel_bound: Vec::new(),
             rand_tight_mode: false,
             vpi_cb: Box::default(),
+            vpi_assert: Box::default(),
+            vpi_assert_on: false,
             vpi_cb_mask: 0,
             vpi_slot_started: u64::MAX,
             stdout_unsynced: false,

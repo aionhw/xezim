@@ -129,4 +129,143 @@
 #define vpiAssignmentPatternOp 75
 #define vpiInsideOp           95
 
+/* --- Assertion API (IEEE 1800-2017 Clause 39, Annex M) ------------------ */
+
+/* Assertion object types. */
+#define vpiPropertyDecl      655
+#define vpiPropertySpec      656
+#define vpiPropertyExpr      657
+#define vpiPropertyInst      660
+#define vpiSequenceDecl      661
+#define vpiSequenceInst      664
+#define vpiImmediateAssert   665
+#define vpiAssert            686
+#define vpiAssume            687
+#define vpiCover             688
+#define vpiDisableCondition  689
+#define vpiClockingEvent     690
+#define vpiImmediateAssume   694
+#define vpiImmediateCover    695
+
+/* Relations. */
+#define vpiProperty          718
+#define vpiConcurrentAssertion 740
+#define vpiAssertion         744   /* a scope's assertions, property instances
+                                      and property declarations */
+
+/* Properties. */
+#define vpiIsCoverSequence   659
+
+/* Assertion coverage properties (Clause 40). */
+#define vpiAssertAttemptCovered        770
+#define vpiAssertSuccessCovered        771
+#define vpiAssertFailureCovered        772
+#define vpiAssertVacuousSuccessCovered 773
+#define vpiAssertDisableCovered        774
+#define vpiAssertKillCovered           777
+
+/* Callback reasons of vpi_register_assertion_cb. */
+#define cbAssertionStart                606
+#define cbAssertionSuccess              607
+#define cbAssertionFailure              608
+#define cbAssertionStepSuccess          609
+#define cbAssertionStepFailure          610
+#define cbAssertionDisable              611
+#define cbAssertionEnable               612
+#define cbAssertionReset                613
+#define cbAssertionKill                 614
+#define cbAssertionEnablePassAction     645
+#define cbAssertionEnableFailAction     646
+#define cbAssertionDisablePassAction    647
+#define cbAssertionDisableFailAction    648
+#define cbAssertionEnableNonvacuousAction 649
+#define cbAssertionDisableVacuousAction 650
+#define cbAssertionVacuousSuccess       657
+#define cbAssertionDisabledEvaluation   658
+#define cbAssertionLock                 661
+#define cbAssertionUnlock               662
+
+/* Assertion system callback reasons (vpi_register_cb). */
+#define cbAssertionSysInitialized       615
+#define cbAssertionSysOn                616
+#define cbAssertionSysOff               617
+#define cbAssertionSysEnd               618
+#define cbAssertionSysReset             619
+#define cbAssertionSysKill              631
+#define cbAssertionSysEnablePassAction  651
+#define cbAssertionSysEnableFailAction  652
+#define cbAssertionSysDisablePassAction 653
+#define cbAssertionSysDisableFailAction 654
+#define cbAssertionSysEnableNonvacuousAction 655
+#define cbAssertionSysDisableVacuousAction 656
+#define cbAssertionSysLock              659
+#define cbAssertionSysUnlock            660
+
+/* Assertion operations of vpi_control. */
+#define vpiAssertionDisable             620
+#define vpiAssertionEnable              621
+#define vpiAssertionReset               622
+#define vpiAssertionKill                623
+#define vpiAssertionEnableStep          624
+#define vpiAssertionDisableStep         625
+#define vpiAssertionClockSteps          626   /* the step control constant */
+#define vpiAssertionSysOn               627
+#define vpiAssertionSysOff              628
+#define vpiAssertionSysEnd              629
+#define vpiAssertionSysReset            630
+#define vpiAssertionSysKill             632
+#define vpiAssertionDisablePassAction   633
+#define vpiAssertionEnablePassAction    634
+#define vpiAssertionDisableFailAction   635
+#define vpiAssertionEnableFailAction    636
+#define vpiAssertionDisableVacuousAction 637
+#define vpiAssertionEnableNonvacuousAction 638
+#define vpiAssertionSysDisablePassAction 639
+#define vpiAssertionSysEnablePassAction 640
+#define vpiAssertionSysDisableFailAction 641
+#define vpiAssertionSysEnableFailAction 642
+#define vpiAssertionSysDisableVacuousAction 643
+#define vpiAssertionSysEnableNonvacuousAction 644
+#define vpiAssertionLock                645
+#define vpiAssertionUnlock              646
+#define vpiAssertionSysLock             647
+#define vpiAssertionSysUnlock           648
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Attempt information passed to an assertion callback. */
+typedef struct t_vpi_assertion_step_info {
+    PLI_INT32 matched_expression_count;
+    vpiHandle *matched_exprs;          /* array of expressions */
+    PLI_INT32 stateFrom, stateTo;      /* identify transition */
+} s_vpi_assertion_step_info, *p_vpi_assertion_step_info;
+
+typedef struct t_vpi_attempt_info {
+    union {
+        vpiHandle failExpr;
+        p_vpi_assertion_step_info step;
+    } detail;
+    s_vpi_time attemptStartTime;       /* time attempt triggered */
+} s_vpi_attempt_info, *p_vpi_attempt_info;
+
+typedef PLI_INT32 (vpi_assertion_callback_func)(
+    PLI_INT32 reason,                  /* callback reason */
+    p_vpi_time cb_time,                /* callback time */
+    vpiHandle assertion,               /* handle to assertion */
+    p_vpi_attempt_info info,           /* attempt related information */
+    PLI_BYTE8 *user_data);             /* user data entered upon registration */
+
+/* Returns a callback handle, removed with vpi_remove_cb. */
+vpiHandle vpi_register_assertion_cb(
+    vpiHandle assertion,               /* handle to assertion */
+    PLI_INT32 reason,                  /* reason for which callbacks needed */
+    vpi_assertion_callback_func *cb_rtn,
+    PLI_BYTE8 *user_data);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* SV_VPI_USER_H */

@@ -333,6 +333,14 @@ pub(super) mod c {
     pub const EDGE1X: c_int = 0x10;
     pub const EDGEX0: c_int = 0x20;
     pub const UNDEFINED: c_int = -1;
+    // Assertion objects and relations (sv_vpi_user.h, Clause 39).
+    pub const PROPERTY_DECL: c_int = 655;
+    pub const PROPERTY_INST: c_int = 660;
+    pub const ASSERT: c_int = 686;
+    pub const ASSUME: c_int = 687;
+    pub const COVER: c_int = 688;
+    pub const CONCURRENT_ASSERTION: c_int = 740;
+    pub const ASSERTION: c_int = 744;
 }
 
 /// `vpi_get_str(vpiType, h)`: the standard spelling of every type code the
@@ -430,6 +438,11 @@ pub(super) fn type_name(code: c_int) -> Option<&'static str> {
         c::PACKED_ARRAY_NET => "vpiPackedArrayNet",
         c::EVENT_TS => "vpiEventTypespec",
         c::VIRTUAL_INTERFACE_VAR => "vpiVirtualInterfaceVar",
+        c::PROPERTY_DECL => "vpiPropertyDecl",
+        c::PROPERTY_INST => "vpiPropertyInst",
+        c::ASSERT => "vpiAssert",
+        c::ASSUME => "vpiAssume",
+        c::COVER => "vpiCover",
         _ => return None,
     })
 }
@@ -697,6 +710,9 @@ pub(super) enum OData {
         dir: c_int,
         expr: u32,
     },
+    /// IEEE 1800-2017 Clause 39: a concurrent assertion, the property it
+    /// instantiates, or a property declaration (see `vpi_assert.rs`).
+    Assertion(vpi_assert::AssertRef),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1123,6 +1139,33 @@ struct Ctx {
     automatic: bool,
     /// Body parameters are local (the definition has a parameter port list).
     body_params_local: bool,
+    /// Names declared by `PropertyDeclaration` anywhere in this definition.
+    props: std::rc::Rc<HashSet<String>>,
+}
+
+/// Names declared by `ModuleItem::PropertyDeclaration` anywhere in `items`
+/// (including generate bodies, excluding nested module definitions).
+fn collect_prop_decls(items: &[ModuleItem], out: &mut HashSet<String>) {
+    for it in items {
+        match it {
+            ModuleItem::PropertyDeclaration(pd) => {
+                out.insert(pd.name.name.clone());
+            }
+            ModuleItem::GenerateRegion(gr) => collect_prop_decls(&gr.items, out),
+            ModuleItem::GenerateFor(gf) => collect_prop_decls(&gf.items, out),
+            ModuleItem::GenerateIf(gi) => {
+                for (_, branch) in &gi.branches {
+                    collect_prop_decls(branch, out);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in &gc.arms {
+                    collect_prop_decls(&arm.items, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Port information gathered before the port objects are made.
@@ -1140,6 +1183,10 @@ struct Builder<'a> {
     /// §23.11 `bind` directives, with their source file.
     binds: Vec<(&'a BindDirective, u32)>,
     typedefs: HashMap<String, (&'a TypedefDeclaration, u32)>,
+    /// Names declared by `PropertyDeclaration` per definition name.
+    def_props: HashMap<String, std::rc::Rc<HashSet<String>>>,
+    /// Names declared by `PackageItem::Property` in active packages or `$unit`.
+    pkg_props: HashSet<String>,
     inst_by_path: HashMap<&'a str, InstIdx>,
     attached: Vec<bool>,
     /// Parameters grouped by their flat scope prefix.
@@ -1214,6 +1261,8 @@ impl<'a> Builder<'a> {
             packages: Vec::new(),
             binds: Vec::new(),
             typedefs: HashMap::default(),
+            def_props: HashMap::default(),
+            pkg_props: HashSet::default(),
             inst_by_path: HashMap::default(),
             attached: vec![false; sim.module.instances.len()],
             params_by_prefix: HashMap::default(),
@@ -1291,14 +1340,21 @@ impl<'a> Builder<'a> {
                     }
                     D::Package(p) => {
                         self.packages.push((p, fi));
+                        let pkg_used = self.sim.module.packages.contains(&p.name.name);
                         for it in &p.items {
-                            if let PackageItem::Typedef(td) = it {
-                                self.typedefs
-                                    .entry(format!("{}::{}", p.name.name, td.name.name))
-                                    .or_insert((td, fi));
-                                self.typedefs
-                                    .entry(td.name.name.clone())
-                                    .or_insert((td, fi));
+                            match it {
+                                PackageItem::Typedef(td) => {
+                                    self.typedefs
+                                        .entry(format!("{}::{}", p.name.name, td.name.name))
+                                        .or_insert((td, fi));
+                                    self.typedefs
+                                        .entry(td.name.name.clone())
+                                        .or_insert((td, fi));
+                                }
+                                PackageItem::Property(pd) if pkg_used => {
+                                    self.pkg_props.insert(pd.name.name.clone());
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -1308,6 +1364,9 @@ impl<'a> Builder<'a> {
                     }
                     D::PackageItem(PackageItem::Typedef(td)) => {
                         self.typedefs.insert(td.name.name.clone(), (td, fi));
+                    }
+                    D::PackageItem(PackageItem::Property(pd)) => {
+                        self.pkg_props.insert(pd.name.name.clone());
                     }
                     _ => {}
                 }
@@ -1656,6 +1715,15 @@ impl<'a> Builder<'a> {
             return s;
         }
         self.depth += 1;
+        let props = self
+            .def_props
+            .entry(def_name.clone())
+            .or_insert_with(|| {
+                let mut set = HashSet::default();
+                collect_prop_decls(items, &mut set);
+                std::rc::Rc::new(set)
+            })
+            .clone();
         let ctx = Ctx {
             scope: s,
             file: fi,
@@ -1665,6 +1733,7 @@ impl<'a> Builder<'a> {
             params: self.params_for(&flat_prefix),
             automatic: lifetime == Some(Lifetime::Automatic),
             body_params_local: !params.is_empty(),
+            props,
         };
         for p in params {
             self.param_decl(p, false, &ctx);
@@ -1753,6 +1822,7 @@ impl<'a> Builder<'a> {
             params: std::rc::Rc::new(self.global_params.clone()),
             automatic: p.lifetime == Some(Lifetime::Automatic),
             body_params_local: false,
+            props: std::rc::Rc::default(),
         };
         for it in &p.items {
             match it {
@@ -1922,9 +1992,123 @@ impl<'a> Builder<'a> {
                 ModuleItem::DPIImport(di) => self.dpi_import(di, ctx),
                 ModuleItem::SpecifyBlock(sb) => self.specify(sb, ctx),
                 ModuleItem::ModportDeclaration(md) => self.modports(md, ctx),
+                ModuleItem::AssertionItem(a) => self.assertion(a, ctx),
+                ModuleItem::PropertyDeclaration(pd) => {
+                    self.assertion_obj(
+                        c::PROPERTY_DECL,
+                        &pd.name.name,
+                        pd.span,
+                        vpi_assert::AssertRole::PropertyDecl,
+                        None,
+                        0,
+                        0,
+                        ctx,
+                    );
+                }
                 _ => {}
             }
         }
+    }
+
+    /// IEEE 1800-2017 Clause 39: a labelled concurrent assertion item, and
+    /// the property instance it names when its property is a declared one.
+    /// (An assertion without a label has no name to report or to control
+    /// it by, and is not an object.)
+    fn assertion(&mut self, a: &'a crate::ast::stmt::AssertionStatement, ctx: &Ctx) {
+        use crate::ast::stmt::AssertionKind;
+        use vpi_assert::AssertRole;
+        if !a.is_property || a.deferred.is_some() {
+            return;
+        }
+        let Some(label) = &a.label else {
+            return;
+        };
+        let (ty, kind) = match a.kind {
+            AssertionKind::Assert => (c::ASSERT, 0),
+            AssertionKind::Assume => (c::ASSUME, 1),
+            AssertionKind::Cover => (c::COVER, 2),
+        };
+        let lab = Some(label.name.clone());
+        self.assertion_obj(
+            ty,
+            &label.name,
+            a.span,
+            AssertRole::Directive,
+            lab.clone(),
+            a.span.start,
+            kind,
+            ctx,
+        );
+        // `assert property (p)` or `assert property (p(actuals))`, with
+        // optional leading clocking event(s).
+        let mut expr = &a.expr;
+        while let ExprKind::SvaClocked { body, .. } = &expr.kind {
+            expr = body;
+        }
+        let prop = match &expr.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                Some(h.path[0].name.name.clone())
+            }
+            ExprKind::Call { func, .. } => match &func.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    Some(h.path[0].name.name.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(p) = prop.filter(|p| ctx.props.contains(p) || self.pkg_props.contains(p)) {
+            self.assertion_obj(
+                c::PROPERTY_INST,
+                &p,
+                a.span,
+                AssertRole::PropertyInst,
+                lab,
+                a.span.start,
+                kind,
+                ctx,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assertion_obj(
+        &mut self,
+        ty: c_int,
+        name: &str,
+        span: Span,
+        role: vpi_assert::AssertRole,
+        label: Option<String>,
+        span_key: usize,
+        kind: u8,
+        ctx: &Ctx,
+    ) {
+        let (file, line) = self.loc(span, ctx.file);
+        let scope = self.m.scopes[ctx.scope as usize].full.clone();
+        let full = format!("{scope}.{name}");
+        // A property instance shares its declaration's name: the name
+        // resolves to the declaration.
+        let register = role != vpi_assert::AssertRole::PropertyInst;
+        self.m.add_obj(
+            MObj {
+                type_code: ty,
+                name: name.to_string(),
+                full,
+                scope: ctx.scope,
+                parent: NONE,
+                file,
+                line,
+                d: OData::Assertion(vpi_assert::AssertRef {
+                    role,
+                    scope,
+                    label,
+                    span_key,
+                    kind,
+                }),
+            },
+            register,
+            true,
+        );
     }
 
     /// Flat prefix of the instance a walk is in.
@@ -3386,6 +3570,7 @@ impl<'a> Builder<'a> {
             params,
             automatic: ctx.automatic,
             body_params_local: false,
+            props: ctx.props.clone(),
         }
     }
 
@@ -4518,6 +4703,35 @@ fn ident(m: &VpiModel, h: &VpiHandle) -> Option<MRef> {
     }
 }
 
+/// The assertion an object handle stands for (Clause 39), with its object
+/// index.
+pub(super) fn assert_ref(
+    sim: &mut Simulator,
+    h: &VpiHandle,
+) -> Option<(usize, vpi_assert::AssertRef)> {
+    if h.kind != VpiKind::Obj {
+        return None;
+    }
+    with_model(sim, |m, _| match ident(m, h) {
+        Some(MRef::Obj(o)) => match &m.objs[o as usize].d {
+            OData::Assertion(r) => Some((o as usize, r.clone())),
+            _ => None,
+        },
+        _ => None,
+    })
+    .flatten()
+}
+
+/// Definition name of the instance enclosing object `obj`.
+pub(super) fn obj_instance_def(sim: &mut Simulator, obj: usize) -> Option<String> {
+    with_model(sim, |m, _| {
+        let sc = m.objs.get(obj)?.scope;
+        let inst = m.instance_of(sc);
+        (inst != NONE).then(|| m.scopes[inst as usize].def_name.clone())
+    })
+    .flatten()
+}
+
 /// A bit or element handle (`w[3]`, `mem[1]`): its base object and index.
 fn split_select(full: &str) -> Option<(&str, i64)> {
     let s = full.strip_suffix(']')?;
@@ -5287,6 +5501,20 @@ fn scope_iter(m: &mut VpiModel, sim: &mut Simulator, rel: c_int, s: u32) -> Opti
         | c::INITIAL
         | c::FINAL
         | c::MODPORT => objs_where(m, sim, &|_, ob| ob.type_code == rel),
+        // IEEE 1800-2017 Clause 39.3: the assertions of a scope, with the
+        // property instances and declarations; or its concurrent assertions;
+        // or the objects of one assertion type.
+        c::ASSERTION => objs_where(m, sim, &|_, ob| matches!(ob.d, OData::Assertion(_))),
+        c::CONCURRENT_ASSERTION => objs_where(
+            m,
+            sim,
+            &|_, ob| matches!(&ob.d, OData::Assertion(r) if r.role == vpi_assert::AssertRole::Directive),
+        ),
+        c::ASSERT | c::ASSUME | c::COVER | c::PROPERTY_DECL | c::PROPERTY_INST => {
+            objs_where(m, sim, &|_, ob| {
+                ob.type_code == rel && matches!(ob.d, OData::Assertion(_))
+            })
+        }
         // A specific variable or net type (vpiReg, vpiIntVar, vpiNetArray,
         // vpiRegArray/vpiArrayVar, vpiStructVar, ...).
         _ if type_name(rel).is_some() => objs_where(m, sim, &|_, ob| {
@@ -5876,6 +6104,13 @@ fn obj_get(
         c::LINE_NO => line,
         c::PROTECTED | c::IS_PROTECTED => 0,
         _ => match &m.objs[o as usize].d {
+            // Assertion coverage (IEEE 1800-2017 Clause 40).
+            OData::Assertion(r) => match prop {
+                vpi_assert::ATTEMPT_COVERED
+                | vpi_assert::SUCCESS_COVERED
+                | vpi_assert::FAILURE_COVERED => sim.vpi_assert_covered(r, prop),
+                _ => c::UNDEFINED,
+            },
             OData::Var(v) => {
                 let t = m.tdescs[v.td as usize].clone();
                 let array = !t.unpacked.is_empty();

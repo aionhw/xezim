@@ -3122,6 +3122,7 @@ mod ts_x;
 mod typename;
 mod uvm_dpi;
 mod vpi_api;
+mod vpi_assert;
 mod vpi_cb;
 mod vpi_model;
 use assert_ctl::{AssertCtl, CtlIdent, CtlSite};
@@ -4193,6 +4194,15 @@ struct SvaClockedSite {
     fired: bool,
     /// Attempts still in flight, oldest first.
     attempts: Vec<SvaState>,
+    /// IEEE 1800-2017 Clause 39 (assertion API): what the VPI reports of
+    /// each attempt in `attempts`, in the same order (`sva_take_meta` pads
+    /// it, so the engine never depends on it). Not saved: an attempt
+    /// restored from a checkpoint reports the restore time as its start.
+    #[serde(skip)]
+    attempt_meta: Vec<SvaAttemptMeta>,
+    /// The same for the attempts in `settled`.
+    #[serde(skip)]
+    settled_meta: Vec<SvaAttemptMeta>,
     /// LRM §16.9.3 `$past(<signal>, N)` per-signal value history.
     /// Each entry is `signal_name → ring of sampled values (index 0 =
     /// this cycle, index N = N cycles ago)`. Refreshed at every clock fire
@@ -4429,6 +4439,16 @@ enum SvaNode {
         sync: bool,
         body: Box<SvaNode>,
     },
+}
+
+/// IEEE 1800-2017 Clause 39: the per-attempt data of the assertion API
+/// (`s_vpi_attempt_info`), kept beside the attempt's evaluation state.
+#[derive(Debug, Clone, Copy, Default)]
+struct SvaAttemptMeta {
+    /// Simulation time (ticks) of the clock tick that started the attempt.
+    start_time: u64,
+    /// Clock ticks the attempt has been evaluated at.
+    clock_steps: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -10530,6 +10550,15 @@ pub struct Simulator {
     /// client registers callbacks.
     #[serde(skip)]
     vpi_cb: Box<vpi_cb::VpiCbState>,
+    /// Assertion callback registry (IEEE 1800-2017 Clause 39,
+    /// `vpi_assert.rs`). Untouched unless a VPI client registers assertion
+    /// callbacks.
+    #[serde(skip)]
+    vpi_assert: Box<vpi_assert::VpiAssertState>,
+    /// An assertion callback is registered: the gate every assertion hook
+    /// tests first, so a run without them pays one load and branch.
+    #[serde(skip)]
+    vpi_assert_on: bool,
     /// Bit `r` set while a callback of reason `r` is registered (plus
     /// `vpi_cb::MASK_PENDING`): the gate every callback hook tests first, so
     /// a run without VPI callbacks pays one load and branch per hook site.
