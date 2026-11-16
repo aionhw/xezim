@@ -7464,6 +7464,14 @@ pub struct Simulator {
     /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
     /// resolved net). The snapshot/meta store the NET; reads and drives use
     /// the clocking name, so they translate through this first.
+    /// §14.16: a clocking OUTPUT clockvar drives a stage of its own when
+    /// the net it is bound to has another driver: (block name, net) →
+    /// stage signal. The clockvar drives the stage, and the stage joins the
+    /// net's other drivers in the resolution fold.
+    clocking_output_stages: HashMap<(String, String), String>,
+    /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
+    /// resolved net). The snapshot/meta store the NET; reads and drives use
+    /// the clocking name, so they translate through this first.
     clocking_sig_alias: HashMap<String, HashMap<String, String>>,
     /// §14.5 a clockvar bound to a select of a net (`input a = bus[3:0];`):
     /// cb → (clocking name → the bound expression). The meta/alias store the

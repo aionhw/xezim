@@ -2672,7 +2672,10 @@ impl Simulator {
         }
         // §10.11 alias unification: repoint each aliased name at the
         // canonical net's slot — ONE storage, N names. Width agreement was
-        // checked at elaboration.
+        // checked at elaboration. This runs BEFORE the identity port-net
+        // collapse (see below): the collapse re-points a name it merges onto
+        // the slot the name has NOW, so a name that lands on an alias
+        // member lands on the group's slot too.
         for (canon, other) in module.alias_pairs.iter() {
             let (Some(&cid), Some(&oid)) = (
                 signal_name_to_id.get(canon.as_str()),
@@ -3960,6 +3963,7 @@ impl Simulator {
             clocking_edge_drive_dirty: false,
             clocking_cycle_pending: HashMap::default(),
             clocking_sig_alias: HashMap::default(),
+            clocking_output_stages: HashMap::default(),
             clocking_sig_bound_sel: HashMap::default(),
             clocking_out_skew: HashMap::default(),
             clocking_sig_out_skew: HashMap::default(),

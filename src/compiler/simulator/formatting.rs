@@ -488,6 +488,24 @@ impl Simulator {
                 "St"
             }
         }
+        // §10.6.2: a force overrides every driver of the net, so the net
+        // shows the forced value and the forced strength. The force
+        // statement carries no strength of its own, so the forced drive is
+        // strong (§28.7 default). The names of one alias group share the
+        // net's storage, so they share the force too (§10.11).
+        if let ExprKind::Ident(h) = &arg.kind {
+            let name = self.resolve_hier_name(h).into_owned();
+            if let Some(&id) = self.signal_name_to_id.get(name.as_str())
+                && let Some(fv) = self.forced_signals.get(&id)
+            {
+                return match fv.get_bit(0) {
+                    LogicBit::One => "St1".to_string(),
+                    LogicBit::Zero => "St0".to_string(),
+                    LogicBit::Z => "HiZ".to_string(),
+                    LogicBit::X => "StX".to_string(),
+                };
+            }
+        }
         // §28.12: a net several drivers resolve reports the strength they
         // resolve to (bit 0, like the value letter below).
         if let ExprKind::Ident(h) = &arg.kind

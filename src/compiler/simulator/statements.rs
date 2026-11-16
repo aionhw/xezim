@@ -4428,6 +4428,17 @@ impl Simulator {
                             });
                             if let Some((net, _)) = out_net {
                                 let net = net.clone();
+                                // §14.16: a clocking output creates a driver on
+                                // the net. Where the net has another driver, the
+                                // clockvar drives a stage of its own and the
+                                // stage joins the net's other drivers in the
+                                // resolution fold — so the drive goes to the
+                                // stage, not to the net.
+                                let stage = self
+                                    .clocking_output_stages
+                                    .get(&(cb.to_string(), net.clone()))
+                                    .cloned();
+                                let drive_net = stage.clone().unwrap_or_else(|| net.clone());
                                 let last_sels = &hier.path[hier.path.len() - 1].selects;
                                 // §14.5: a clockvar bound to a select of the
                                 // net drives through that select (#823).
@@ -4457,7 +4468,7 @@ impl Simulator {
                                             root: None,
                                             path: vec![crate::ast::expr::HierPathSegment {
                                                 name: crate::ast::Identifier {
-                                                    name: net.clone(),
+                                                    name: drive_net.clone(),
                                                     span: lvalue.span,
                                                 },
                                                 selects: last_sels.clone(),
@@ -4486,7 +4497,7 @@ impl Simulator {
                                         self.clocking_cycle_pending.entry(cb).or_default().push((
                                             n,
                                             raw_sig.to_string(),
-                                            net,
+                                            drive_net.clone(),
                                             val,
                                             target,
                                         ));
@@ -4513,21 +4524,21 @@ impl Simulator {
                                         self.clocking_edge_out_pending
                                             .entry(cb)
                                             .or_default()
-                                            .push((net, val, edge, d, target));
+                                            .push((drive_net.clone(), val, edge, d, target));
                                         return;
                                     }
                                     if let Some(t) = &target {
                                         self.drive_clocking_select(t, val, skew);
                                         return;
                                     }
-                                    if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
+                                    if let Some(&id) = self.signal_name_to_id.get(drive_net.as_str()) {
                                         self.schedule_clocking_update(id, &val, skew);
                                         return;
                                     }
                                 }
                                 self.clocking_output_pending.entry(cb).or_default().push((
                                     raw_sig.to_string(),
-                                    net,
+                                    drive_net,
                                     val,
                                     target,
                                 ));

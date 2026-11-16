@@ -4448,6 +4448,16 @@ impl Simulator {
                 n.rsplit('.').next().unwrap_or(n)
             }
             let mut buf_collapsed = 0usize;
+            // §10.11: an alias member is ONE physical net with the other
+            // members of its group. Merging it into an unrelated net (or
+            // merging another net INTO it) would give the group a second
+            // storage, so no alias member takes part in the collapse.
+            let alias_members: HashSet<&str> = self
+                .module
+                .alias_pairs
+                .iter()
+                .flat_map(|(canon, member)| [canon.as_str(), member.as_str()])
+                .collect();
             // Whole-net identity assigns and their resolved names: fixed
             // across passes, taken once in assign order.
             let buf_candidates: Vec<(Cow<'_, str>, Cow<'_, str>)> = self
@@ -4467,7 +4477,13 @@ impl Simulator {
                     {
                         return None;
                     }
-                    Some((flat_name(lh, &self.module), flat_name(rh, &self.module)))
+                    let (ln, rn) = (flat_name(lh, &self.module), flat_name(rh, &self.module));
+                    if alias_members.contains(ln.as_ref())
+                        || alias_members.contains(rn.as_ref())
+                    {
+                        return None;
+                    }
+                    Some((ln, rn))
                 })
                 .collect();
             // The name-only conditions do not change between passes.
