@@ -41,3 +41,44 @@ endmodule
         sim.output
     );
 }
+
+/// §13.5.1 / §7.2.1: associative input copies retain packed element fields.
+#[test]
+fn associative_packed_members_survive_input_copy() {
+    let sim = xezim::simulate(
+        r#"
+typedef struct packed { logic [63:0] data; } chunk;
+class Writer;
+  chunk a[int];
+  task run();
+    int i=0;
+    logic [127:0] src=128'hc0de000000000000;
+    #1;
+    a[int'(i++)].data=src[63:0];
+    if(i!=1 || a.num()!=1 || a[0].data!==64'hc0de000000000000)
+      $fatal(1,"associative assignment failed");
+  endtask
+endclass
+module top;
+  function automatic logic [63:0] read_array(chunk a[int]);
+    a[0].data[7:0]=8'h5a;
+    return a[0].data;
+  endfunction
+  initial begin
+    Writer w=new;
+    w.run();
+    if(read_array(w.a)!==64'hc0de00000000005a || w.a[0].data!==64'hc0de000000000000)
+      $fatal(1,"input copy lost layout or aliased caller");
+    $display("T|PASS"); $finish;
+  end
+endmodule
+"#,
+        1000,
+    )
+    .expect("simulate");
+    assert!(
+        sim.output.iter().any(|line| line.message == "T|PASS"),
+        "{:?}",
+        sim.output
+    );
+}
