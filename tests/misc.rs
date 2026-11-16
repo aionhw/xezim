@@ -657,3 +657,5 @@ mod interconnect_array_drivers_1098;
 mod replication_signedness_1095;
 #[path = "misc/localparam_self_determined_1143.rs"]
 mod localparam_self_determined_1143;
+#[path = "misc/comb_timescale.rs"]
+mod comb_timescale;
