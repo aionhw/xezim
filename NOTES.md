@@ -81,6 +81,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* The cocotb runner (`contrib/cocotb/xezim_runner.py`) loads with cocotb 2.1,
+  which renamed `_as_sv_literal` and removed `cocotb_tools.config.lib_name`, and
+  passes `defines` the way cocotb 2.1's own runners do, as written; with
+  cocotb 2.0 a string define is still written as a string literal (#1180).
+
 * A blocking assignment with an intra-assignment delay or event control
   stores an assignment pattern for an unpacked array, unpacked struct or
   queue target, and evaluates an expression at the target's width:
