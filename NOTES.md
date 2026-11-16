@@ -81,6 +81,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+
+* The cocotb runner (`contrib/cocotb/xezim_runner.py`) works with both
+  cocotb 2.0.x and 2.1.0: it resolves `as_sv_literal` with a fallback to
+  `_as_sv_literal`, uses `cocotb_tools.config.lib_name_path` when present
+  with a fallback to `libs_dir / lib_name(...)`, and registers `xezim` in
+  `SUPPORTED_RUNNERS` on 2.1+.
 * A blocking assignment with an intra-assignment delay or event control
   stores an assignment pattern for an unpacked array, unpacked struct or
   queue target, and evaluates an expression at the target's width:
