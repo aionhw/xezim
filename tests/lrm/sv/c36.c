@@ -2,18 +2,12 @@
 #include <string.h>
 #include "vpi_user.h"
 #include "sv_vpi_user.h"
-#ifndef cbAssertionFailure
-#define cbAssertionFailure 608
-#define cbAssertionSuccess 607
-#define vpiAssert 686
-typedef PLI_INT32 (vpi_assertion_callback_func)(PLI_INT32 reason, p_vpi_time cb_time, vpiHandle assertion, void *info, PLI_BYTE8 *user_data);
-#endif
 extern vpiHandle vpi_register_assertion_cb(vpiHandle assertion, PLI_INT32 reason, vpi_assertion_callback_func *cb_rtn, PLI_BYTE8 *user_data) __attribute__((weak));
 static void say(const char *s) { vpi_printf("V|%s\n", s); }
 static PLI_INT32 vc_cb(p_cb_data d) {
   char b[128]; snprintf(b, sizeof b, "valuechange %s t=%u val=%d", vpi_get_str(vpiName, d->obj), d->time->low, d->value->value.integer); say(b); return 0;
 }
-static PLI_INT32 assert_cb(PLI_INT32 reason, p_vpi_time t, vpiHandle a, void *info, PLI_BYTE8 *ud) {
+static PLI_INT32 assert_cb(PLI_INT32 reason, p_vpi_time t, vpiHandle a, p_vpi_attempt_info info, PLI_BYTE8 *ud) {
   char b[128]; snprintf(b, sizeof b, "assertcb reason=%s name=%s t=%u", reason == cbAssertionFailure ? "fail" : "other", vpi_get_str(vpiName, a), t ? t->low : 0); say(b); return 0;
 }
 static PLI_INT32 step = 0;
