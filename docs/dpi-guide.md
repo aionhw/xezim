@@ -460,11 +460,28 @@ Each library's `vlog_startup_routines` entries run before simulation.
   `vpi_get_value`/`vpi_put_value`.
 - `vpi_control`: `vpiStop`/`vpiFinish` end the run once the calling routine
   returns; `vpiSetInteractiveScope` takes a module handle; `vpiReset` is
-  refused (xezim cannot rewind a run).
+  refused (xezim cannot rewind a run); and the Clause 39.5 assertion controls
+  `vpiAssertionDisable`, `vpiAssertionEnable`, `vpiAssertionReset`,
+  `vpiAssertionKill`, `vpiAssertionEnableStep`, `vpiAssertionDisableStep`
+  (`vpiAssertionClockSteps`), `vpiAssertionSysOn`, `vpiAssertionSysOff`,
+  `vpiAssertionSysEnd` and `vpiAssertionSysReset` act on concurrent assertion
+  directives (a property declaration or instance handle is refused; step
+  enable/disable applies to the whole assertion and ignores the attempt-time
+  argument; controls share enable/disable and lock state with `$asserton`,
+  `$assertoff`, `$assertkill` and `$assertcontrol`; VPI Kill leaves the
+  assertion enabled).
 - `vpi_chk_error`, `vpi_printf`, `vpi_flush`, `vpi_compare_objects`,
   `vpi_get64`.
 - Callbacks: `vpi_register_cb` for every reason of IEEE 1800-2017 §38.36
-  (see below), `vpi_get_cb_info`, `vpi_remove_cb`.
+  (see below), `vpi_register_assertion_cb` (Clause 39.4.2) for concurrent
+  assertions (`cbAssertionStart`, `Success`, `Failure`, `VacuousSuccess`,
+  `DisabledEvaluation`, `StepSuccess`, `StepFailure`, `Disable`, `Enable`,
+  `Reset`, `Kill`; action and lock reasons are refused; `info` is always
+  non-NULL with `detail` NULL and, for `Disable`/`Enable`/`Reset`,
+  `attemptStartTime` set to the callback time; `cbAssertionStepSuccess` fires
+  for each tick an attempt remains in flight including its start tick, and
+  `cbAssertionStepFailure` accompanies each failure), `vpi_get_cb_info`,
+  `vpi_remove_cb`.
 - Multichannel descriptors: `vpi_mcd_open`, `vpi_mcd_close`, `vpi_mcd_flush`,
   `vpi_mcd_name`, `vpi_mcd_printf`/`vpi_mcd_vprintf`. They share the channel
   table of `$fopen`, so a descriptor opened in C can be written from
@@ -633,15 +650,24 @@ hook.
   `vpi_chk_error`.
 
 **Not implemented:** every routine of IEEE 1800-2017 clause 38 is declared in
-`include/vpi_user.h` and implemented as described above. The one gap is the
+`include/vpi_user.h` and implemented as described above. The Clause 39
+assertion API covers labelled concurrent assertions (`vpiAssert`, `vpiAssume`,
+`vpiCover`, `vpiPropertyDecl`, `vpiPropertyInst`),
+`vpi_register_assertion_cb` (refusing action and lock reasons), the
+enable/disable/reset/kill/step/system operations of `vpi_control`, and the
+`vpiAssert*Covered` counts in `vpi_get` (see "Assertions" below;
+`detail.failExpr` and `detail.step` are NULL, and attempt metadata is not
+checkpointed so after `$restart` attempts in flight report the restore time
+as their start). System assertion callbacks (`cbAssertionSys*`), action/lock
+controls, immediate/deferred assertions, `vpi_get_assertion_info`, and the
 SystemVerilog thread, frame and class-object callback reasons of
-`sv_vpi_user.h` (`cbStartOfThread` … `cbEndOfObject`): xezim has no thread,
-frame or class-object VPI objects, and `vpi_register_cb` rejects them.
+`sv_vpi_user.h` (`cbStartOfThread` … `cbEndOfObject`) are not implemented.
 
 Worked examples: `tests/dpi/vpi_object_model.{c,sv}`,
-`tests/dpi/vpi_systf.{c,sv}`, `tests/strings/vpi_routines.rs` (user data,
-systf info, arrays, delays and every value format), and the design walks in
-`tests/strings/vpi_object_model_walk.rs`.
+`tests/dpi/vpi_systf.{c,sv}`, `tests/dpi/vpi_assertion.{c,sv}`,
+`tests/strings/vpi_assertion_controls.rs`, `tests/strings/vpi_routines.rs`
+(user data, systf info, arrays, delays and every value format), and the
+design walks in `tests/strings/vpi_object_model_walk.rs`.
 
 ### VPI object model
 
@@ -778,9 +804,26 @@ and reports a `vpi_chk_error` error, as it does for a named event, a scope, a
 process and the other objects without a value. `vpi_put_value` rejects all of
 them the same way.
 
+**Assertions.** `vpiAssertion` iterates a scope's labelled concurrent
+assertions (`vpiAssert`, `vpiAssume`, `vpiCover`), property instances
+(`vpiPropertyInst`) and property declarations (`vpiPropertyDecl`);
+`vpiConcurrentAssertion` iterates the assertion statements only. Directives
+and property declarations resolve by `vpi_handle_by_name`, whereas
+`vpiPropertyInst` is reached by iteration only (`vpi_handle_by_name` on the
+shared name returns the declaration). Each answers `vpiType`, `vpiName`,
+`vpiFullName`, `vpiFile`, `vpiLineNo`, `vpiScope`/`vpiInstance` and
+`vpiAssertAttemptCovered` / `vpiAssertSuccessCovered` /
+`vpiAssertFailureCovered`. Coverage counts are per source location (shared by
+all instances of the module); on an `assert` or `assume`,
+`vpiAssertSuccessCovered` includes vacuous successes; on a `cover`,
+`vpiAssertFailureCovered` is always 0 (cover failures are not tallied); and
+`vpiAssertAttemptCovered` is successes + failures (an approximation; on a
+`cover` it equals the success count).
+
 **Not modelled** in the object model: statements (a process's `vpiStmt` is
 only its named block, when it is one), classes and their objects, clocking
-blocks, concurrent assertions, `let` and `checker` declarations,
+blocks, immediate/deferred assertions and sequence declarations, `let` and
+`checker` declarations,
 typedef and import objects (`vpiTypedef`, `vpiImport`), `vpiDriver` and
 `vpiLoad`, attributes, `vpiParamAssign`/`vpiDefParam`, `vpiGenVar`,
 `vpiSpecParam`, array objects for instance and primitive arrays

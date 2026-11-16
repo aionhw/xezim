@@ -81,6 +81,31 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+
+* VPI assertion API (IEEE 1800-2017 Clause 39, Clause 40): `vpi_iterate(vpiAssertion, ...)`
+  enumerates labelled concurrent assertions (`vpiAssert`, `vpiAssume`,
+  `vpiCover`), property declarations (`vpiPropertyDecl`) and property
+  instances (`vpiPropertyInst`), and `vpi_iterate(vpiConcurrentAssertion, ...)`
+  enumerates the assertion statements only; directives and declarations
+  resolve by name while `vpiPropertyInst` is reached by iteration only.
+  `vpi_register_assertion_cb` delivers attempt and control callbacks
+  (`cbAssertionStart`, `cbAssertionSuccess`, `cbAssertionFailure`,
+  `cbAssertionVacuousSuccess`, `cbAssertionDisabledEvaluation`,
+  `cbAssertionStepSuccess`, `cbAssertionStepFailure`, `cbAssertionDisable`,
+  `cbAssertionEnable`, `cbAssertionReset`, `cbAssertionKill`) with
+  non-NULL `s_vpi_attempt_info` and is removable with `vpi_remove_cb`.
+  `vpi_control` supports `vpiAssertionDisable`, `vpiAssertionEnable`,
+  `vpiAssertionReset`, `vpiAssertionKill`, `vpiAssertionEnableStep`,
+  `vpiAssertionDisableStep` (`vpiAssertionClockSteps`) on directives and the
+  system ops `vpiAssertionSysOn`, `vpiAssertionSysOff`, `vpiAssertionSysEnd`
+  and `vpiAssertionSysReset`, sharing enable/disable state with `$asserton`,
+  `$assertoff` and `$assertkill`. `vpi_get` answers
+  `vpiAssertAttemptCovered`, `vpiAssertSuccessCovered` and
+  `vpiAssertFailureCovered`. `include/sv_vpi_user.h` declares the Clause 39
+  constants, `s_vpi_attempt_info`, `s_vpi_assertion_step_info` and
+  `vpi_register_assertion_cb`; see [docs/dpi-guide.md](docs/dpi-guide.md)
+  for the assertion API limits (step delivery, coverage approximations,
+  refused lock/action reasons and checkpointing) (§39.3–§39.5, §40).
 * A blocking assignment with an intra-assignment delay or event control
   stores an assignment pattern for an unpacked array, unpacked struct or
   queue target, and evaluates an expression at the target's width:
