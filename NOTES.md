@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Diagnose undeclared type names and duplicate class definitions (#1186, core #229).
+
 - **Compatibility:** Support cocotb 2.0.x and 2.1.0 runner APIs (#1189).
 
 - **Maintenance:** Move two-state bytecode lowering and its existing compiler tests into dedicated modules, preserving the compiler's public paths (#961).
