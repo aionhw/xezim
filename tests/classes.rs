@@ -1273,3 +1273,8 @@ mod back_reference_completion;
 
 #[path = "classes/part_select_index_once.rs"]
 mod part_select_index_once;
+
+#[path = "classes/undeclared_type_name.rs"]
+mod undeclared_type_name;
+#[path = "classes/duplicate_class_definition.rs"]
+mod duplicate_class_definition;
