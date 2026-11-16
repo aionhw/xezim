@@ -123,6 +123,8 @@ mod uvm_dpi_driver_linkage;
 mod uvm_dpi_user_library_wins;
 #[path = "strings/vpi_array_ports.rs"]
 mod vpi_array_ports;
+#[path = "strings/vpi_assertion_controls.rs"]
+mod vpi_assertion_controls;
 #[path = "strings/vpi_callbacks.rs"]
 mod vpi_callbacks;
 #[path = "strings/vpi_mcd_and_time_queries.rs"]

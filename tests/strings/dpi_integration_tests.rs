@@ -399,6 +399,80 @@ fn vpi_object_model_test() {
     );
 }
 
+/// IEEE 1800-2017 Clause 39 / Clause 40: `vpi_iterate(vpiAssertion, ...)`,
+/// `vpi_register_assertion_cb`, `vpi_remove_cb` on assertion callback handles,
+/// `vpi_control` assertion operations (`vpiAssertionDisable`,
+/// `vpiAssertionEnable`, `vpiAssertionKill`), and assertion coverage queries.
+/// See `tests/dpi/vpi_assertion.c`.
+#[test]
+fn vpi_assertion_test() {
+    let so = compile_dpi_lib("tests/dpi/vpi_assertion.c", "vpi_assertion");
+    let log = run_xezim_with_vpi_timeout(&so, "tests/dpi/vpi_assertion.sv", 60);
+    assert!(
+        log.contains("VA_ERRORS: 0"),
+        "vpi_assertion reported C-side failures:\n{}",
+        log
+    );
+    assert!(
+        log.contains("RESULT: DONE"),
+        "vpi_assertion missing RESULT: DONE:\n{}",
+        log
+    );
+    for expected in [
+        "OBJ vpiPropertyDecl top.p_a",
+        "OBJ vpiAssert top.A1",
+        "OBJ vpiPropertyInst top.p_a",
+        "OBJ vpiAssert top.A2",
+        "OBJ vpiCover top.C1",
+        "COVER C1 success=10 failure=0",
+    ] {
+        assert_eq!(
+            log.matches(expected).count(),
+            1,
+            "vpi_assertion expected single {:?}:\n{}",
+            expected,
+            log
+        );
+    }
+    assert_eq!(
+        log.lines().filter(|l| l.starts_with("OBJ ")).count(),
+        5,
+        "unexpected OBJ count:\n{}",
+        log
+    );
+    let cbs: Vec<&str> = log.lines().filter(|l| l.starts_with("CB ")).collect();
+    assert_eq!(
+        cbs,
+        [
+            "CB A1 START t=5 start=5",
+            // `vpi_remove_cb` on `extra` ensures A1 reports SUCCESS once, not twice.
+            "CB A1 SUCCESS t=5 start=5",
+            "CB A1 START t=15 start=15",
+            "CB A1 SUCCESS t=15 start=15",
+            "CB A1 START t=25 start=25",
+            "CB A1 FAILURE t=25 start=25",
+            "CB A1 DISABLE t=28 start=28",
+            "CB A1 ENABLE t=48 start=48",
+            "CB A1 START t=55 start=55",
+            "CB A1 SUCCESS t=55 start=55",
+            "CB A1 START t=65 start=65",
+            "CB A1 SUCCESS t=65 start=65",
+            "CB A2 KILL t=70 start=65",
+            "CB A1 START t=75 start=75",
+            "CB A1 SUCCESS t=75 start=75",
+            "CB A1 START t=85 start=85",
+            "CB A1 SUCCESS t=85 start=85",
+            "CB A1 START t=95 start=95",
+            "CB A1 SUCCESS t=95 start=95",
+            "CB A1 START t=105 start=105",
+            "CB A1 SUCCESS t=105 start=105",
+            "CB A2 SUCCESS t=105 start=85",
+        ],
+        "unexpected CB transcript:\n{}",
+        log
+    );
+}
+
 /// The rest of IEEE 1800-2017 clause 38: a registered `$systf` reading its own
 /// arguments (`vpiSysTfCall` / `vpiArgument`), writing an output argument,
 /// system FUNCTIONS returning a value (including `vpiSizedFunc` sizing itself
