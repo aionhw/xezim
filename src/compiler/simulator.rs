@@ -1004,6 +1004,18 @@ macro_rules! write_sig {
         if !__wsig_val.is_real && __wsig_id < $self.signal_signed.len() {
             __wsig_val.is_signed = $self.signal_signed[__wsig_id];
         }
+        // §6.12/§20.5: a SHORTREAL holds an IEEE binary32 value, so a write
+        // rounds to binary32 (16777216.25 -> 16777216.0). A `real` (binary64)
+        // keeps every bit. Only a REAL write pays the type-name lookup.
+        if __wsig_val.is_real
+            && $self
+                .signal_type_names
+                .get(&__wsig_id)
+                .is_some_and(|tn| tn == "shortreal")
+        {
+            let __wsig_f = __wsig_val.to_f64() as f32 as f64;
+            __wsig_val = Value::from_f64(__wsig_f);
+        }
         // LRM §9.3.1: skip writes to forced signals. The `is_empty` guard
         // keeps the common no-force case to one branch — `contains_key`
         // hashes the id even when the map is empty, and this macro runs on
