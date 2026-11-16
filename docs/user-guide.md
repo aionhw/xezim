@@ -8,6 +8,7 @@ of options and environment variables is in the
 [debugging](DEBUGGING.md).
 
 * [Running a simulation](#running-a-simulation)
+* [Random seeds and weighted distributions](#random-seeds-and-weighted-distributions)
 * [Waveforms](#waveforms)
 * [Checkpoints](#checkpoints)
 * [Warm design cache](#warm-design-cache)
@@ -59,6 +60,31 @@ let time advance, an SDF file `$sdf_annotate` cannot read), a
 `--dpi-lib` library that cannot be loaded, and an `-s` that names no module
 (`--no-strict-top` falls back to finding tops automatically). `$error` exits 0
 unless `--error-exit` is given.
+
+## Random seeds and weighted distributions
+
+Use `+seed=<integer>` to reproduce a randomized run. Compare the sequence
+of generated values when checking that a seed changes a run; a histogram
+alone can hide the difference.
+
+For a class variable constrained only by a `dist` list, xezim can deal
+items from a balanced schedule. Each complete schedule contains items in
+their declared weight proportions. The seed changes their order and the
+starting position, so different seeds can produce identical total counts.
+For example, singleton weights `40,20,12,10,8,5,3,2` give counts
+`800,400,240,200,160,100,60,40` over 2,000 successful calls, even though
+the generated sequences differ. This is intentional xezim solver policy,
+not a requirement that SystemVerilog distributions have exact counts.
+
+Schedules belong to an object and variable and are selected using the
+evaluated weights. They are used only when the reduced schedule fits within
+4,096 entries. Other solver paths, including the same distribution combined
+with a separate range constraint, can use independent weighted draws instead;
+their counts need not match the proportions exactly. Adding a redundant
+constraint can therefore change both the sequence and its histogram.
+Values within a range item are sampled, so balanced item counts do not imply
+exact counts for each value inside the range. Do not rely on a particular
+sequence or solver strategy remaining unchanged across releases.
 
 ## Waveforms
 

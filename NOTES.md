@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Documentation:** Explain balanced `dist` schedules, seed-dependent ordering, and why equal histograms do not imply ignored seeds (#978).
+
 - **Correctness:** Keep package arrays separate from same-named module arrays, preserve class ownership in packed-struct array accesses, and construct the declared class in anonymous struct-array fields (#1147, #1132).
 
 - **Correctness:** Preserve input-port indices around UDP instances, schedule fixed-array and record assignment-pattern leaves in the NBA region, and combine root and descendant waveform scopes with independent depth limits (#1201, #1199, #1195).
