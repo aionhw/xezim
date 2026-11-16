@@ -276,3 +276,16 @@ fn c7_aggregates_more() {
         ],
     );
 }
+
+// §7.4.6 / §7.5.1: out-of-range row `new[n]` still evaluates `n`
+#[test]
+fn c7_5_1_dyn_row_oob_new_size_eval() {
+    check(
+        "7.5.1_dyn_row_oob_new_size_eval",
+        include_str!("sv/7.5.1_dyn_row_oob_new_size_eval.sv"),
+        "rdob",
+        Order::Exact,
+        &["T|7.5.1row_oob|1 1"],
+        &[],
+    );
+}
