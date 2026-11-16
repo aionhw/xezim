@@ -1270,3 +1270,6 @@ mod null_receiver_builtin_names_1139;
 mod static_call_in_param_initializer_1130;
 #[path = "classes/back_reference_completion.rs"]
 mod back_reference_completion;
+
+#[path = "classes/part_select_index_once.rs"]
+mod part_select_index_once;
