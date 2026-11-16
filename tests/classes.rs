@@ -1268,3 +1268,5 @@ mod builtin_class_struct_members_1161;
 mod null_receiver_builtin_names_1139;
 #[path = "classes/static_call_in_param_initializer_1130.rs"]
 mod static_call_in_param_initializer_1130;
+#[path = "classes/back_reference_completion.rs"]
+mod back_reference_completion;
