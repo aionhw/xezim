@@ -1475,6 +1475,40 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) {
+        // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
+        // is evaluated exactly ONCE. The assign_value machinery
+        // re-evaluates the index in several candidate branches, so
+        // fold side-effecting indices before any aggregate probe. A
+        // compound assign (`x[i++] += 2`) was desugared by the parser
+        // into `x[i++] = x[i++] + 2` with a CLONED lvalue (same span)
+        // on the RHS — point that clone at the same folded index so
+        // the increment still happens once.
+        if Self::lvalue_has_incdec_index(lvalue) {
+            if let Some(new_lhs) = self.rewrite_lvalue_index_side_effects(lvalue) {
+                let new_rhs: Expression = match &rvalue.kind {
+                    ExprKind::Binary { op, left, right }
+                        if left.span == lvalue.span
+                            && std::mem::discriminant(&left.kind)
+                                == std::mem::discriminant(&lvalue.kind) =>
+                    {
+                        Expression::new(
+                            ExprKind::Binary {
+                                op: *op,
+                                left: Box::new(new_lhs.clone()),
+                                right: right.clone(),
+                            },
+                            rvalue.span,
+                        )
+                    }
+                    _ => (*rvalue).clone(),
+                };
+                // The frozen target can still be an unpacked aggregate.
+                // Keep its member-wise assignment paths instead of forcing
+                // the value-only scalar store.
+                self.exec_stmt_blocking_assign_body(stmt, &new_lhs, &new_rhs);
+                return;
+            }
+        }
         // #1108: a whole array member of an instance-array element on either
         // side (`w = lane[0].payload`, `lane[1].payload = '{...}`).
         // An element select is folded where it is read or written.
@@ -1579,40 +1613,6 @@ impl Simulator {
         // the HANDLE, it does not copy a value.
         if self.try_event_handle_assign(lvalue, rvalue) {
             return;
-        }
-        // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
-        // is evaluated exactly ONCE. The assign_value machinery
-        // re-evaluates the index in several candidate branches, so
-        // fold side-effecting indices to literals up front. A
-        // compound assign (`x[i++] += 2`) was desugared by the parser
-        // into `x[i++] = x[i++] + 2` with a CLONED lvalue (same span)
-        // on the RHS — point that clone at the same folded index so
-        // the increment still happens once.
-        if Self::lvalue_has_incdec_index(lvalue) {
-            if let Some(new_lhs) = self.rewrite_lvalue_index_side_effects(lvalue) {
-                let new_rhs: Expression = match &rvalue.kind {
-                    ExprKind::Binary { op, left, right }
-                        if left.span == lvalue.span
-                            && std::mem::discriminant(&left.kind)
-                                == std::mem::discriminant(&lvalue.kind) =>
-                    {
-                        Expression::new(
-                            ExprKind::Binary {
-                                op: *op,
-                                left: Box::new(new_lhs.clone()),
-                                right: right.clone(),
-                            },
-                            rvalue.span,
-                        )
-                    }
-                    _ => (*rvalue).clone(),
-                };
-                // The frozen target can still be an unpacked aggregate.
-                // Keep its member-wise assignment paths instead of forcing
-                // the value-only scalar store.
-                self.exec_stmt_blocking_assign_body(stmt, &new_lhs, &new_rhs);
-                return;
-            }
         }
         // LRM §25.8 virtual-interface binding. When the LHS is a
         // class-property write whose property is declared
