@@ -2217,6 +2217,23 @@ impl Simulator {
         // may report as 0 for a class with only methods/statics).
         // A 0 width is never valid for a variable.
         let w = if w0 == 0 { 32 } else { w0 };
+        // §6.20.2: an UNTYPED block-scope `localparam`/`parameter` is
+        // self-determined from its initializer (the parser marks it
+        // `Static`+`Implicit`, no dims). Its width is the initializer's
+        // self-determined width (`4'd0-4'd1` = 4-bit 15), NOT the 1-bit
+        // implicit `logic` that `resolve_type_width` reports for an
+        // untyped Implicit — folding it at 1/32 bits was the `localparam
+        // Q = f();` bug (#1143). A `var`/`static var`/typed decl keeps
+        // its declared width.
+        let self_det_lp = matches!(
+            lifetime,
+            Some(crate::ast::types::Lifetime::Static)
+        ) && matches!(
+            data_type,
+            crate::ast::types::DataType::Implicit {
+                dimensions, ..
+            } if dimensions.is_empty()
+        );
         // A built-in scalar or a plain class type: the packed-layout,
         // struct, enum, typedef and type-parameter probes below all come
         // back empty for it (a plain class resolves to itself).
@@ -3441,6 +3458,20 @@ impl Simulator {
                         self.resolve_dt(data_type),
                         crate::ast::types::DataType::Struct(su) if Self::spreads_member_wise(&su)
                     );
+                // §6.20.2: a self-determined UNTYPED localparam/parameter
+                // takes its width from the initializer (`4'd0-4'd1` = 4-bit
+                // 15), not the 1-bit implicit fallback.
+                let eff_w = if self_det_lp {
+                    d.init
+                        .as_ref()
+                        .and_then(|e| {
+                            super::elaborate::untyped_param_width(e, &self.module.parameters)
+                        })
+                        .or_else(|| Some(32u32))
+                        .unwrap_or(w)
+                } else {
+                    w
+                };
                 let v = if let Some(init_expr) = d.init.as_ref().filter(|_| !struct_init_later) {
                     // §8.8: `B h = C::new(...)` builds a `C`, not the
                     // declared class (the `new` forms below).
@@ -3629,10 +3660,10 @@ impl Simulator {
                             } else {
                                 None
                             };
-                            let raw = typed.unwrap_or_else(|| self.eval_expr_ctx(init_expr, w));
+                            let raw = typed.unwrap_or_else(|| self.eval_expr_ctx(init_expr, eff_w));
                             Self::fit_local_decl_init(
                                 raw,
-                                w,
+                                eff_w,
                                 data_type,
                                 two_state,
                                 is_real_type,
@@ -3644,9 +3675,9 @@ impl Simulator {
                     default_v.clone()
                 };
                 match self.widths.get_mut(d.name.name.as_str()) {
-                    Some(slot) => *slot = w,
+                    Some(slot) => *slot = eff_w,
                     None => {
-                        self.widths.insert(d.name.name.clone(), w);
+                        self.widths.insert(d.name.name.clone(), eff_w);
                     }
                 }
                 // A local variable inside a method (which has a pushed

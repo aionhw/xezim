@@ -4387,6 +4387,7 @@ impl<'a> BytecodeCompiler<'a> {
             match &st.kind {
                 StatementKind::VarDecl {
                     data_type,
+                    lifetime,
                     declarators,
                     ..
                 } => {
@@ -4441,8 +4442,30 @@ impl<'a> BytecodeCompiler<'a> {
                             continue;
                         }
                         let is_string = self.decl_is_string(data_type, None);
+                        // §6.20.2: an UNTYPED block-scope `localparam`/`parameter`
+                        // is SELF-DETERMINED from its initializer — the parser
+                        // marks it `Static`+`Implicit`. Size it from the RHS (`4'd0-4'd1`
+                        // = 4-bit 15), not the 1-bit implicit logic `decl_width`
+                        // returns for an untyped Implicit or the old 32-bit `int`.
+                        let self_determined_lp = matches!(
+                            lifetime,
+                            Some(crate::ast::types::Lifetime::Static)
+                        ) && matches!(
+                            data_type,
+                            crate::ast::types::DataType::Implicit {
+                                dimensions, ..
+                            } if dimensions.is_empty()
+                        );
                         let w = if is_string {
                             0
+                        } else if self_determined_lp {
+                            match (self.params, &d.init) {
+                                (Some(p), Some(e)) => {
+                                    crate::compiler::elaborate::untyped_param_width(e, p)
+                                        .unwrap_or(32)
+                                }
+                                _ => 32,
+                            }
                         } else {
                             self.decl_width(data_type)
                         };
@@ -13956,7 +13979,12 @@ impl<'a> BytecodeCompiler<'a> {
                     // 0 so no Resize ever lands on it, and mark it for the
                     // %s / string-assign paths.
                     let is_string = self.decl_is_string(data_type, None);
-                    let width = if is_string {
+                    // §6.20.2: an UNTYPED block-scope localparam is
+                    // SELF-DETERMINED from its initializer (the parser marks
+                    // it `Static`+`Implicit`). Its width is computed per
+                    // declarator from the RHS below; this is the declared
+                    // width used for a typed / var / real / string decl.
+                    let decl_width = if is_string {
                         0
                     } else {
                         self.decl_width(data_type)
@@ -14082,6 +14110,32 @@ impl<'a> BytecodeCompiler<'a> {
                             self.local_kinds.remove(&slot);
                         }
                     }
+                    // §6.20.2: an UNTYPED block-scope `localparam`/`parameter`
+                    // is SELF-DETERMINED from its initializer — size the
+                    // per-declarator width from the RHS (`4'd0-4'd1` = 4-bit 15)
+                    // rather than the 1-bit implicit `decl_width`.
+                    let self_det_lp = matches!(
+                        lifetime,
+                        Some(crate::ast::types::Lifetime::Static)
+                    ) && matches!(
+                        data_type,
+                        crate::ast::types::DataType::Implicit {
+                            dimensions, ..
+                        } if dimensions.is_empty()
+                    );
+                    let width = if is_string {
+                        0
+                    } else if self_det_lp {
+                        match (self.params, decl.init.as_ref()) {
+                            (Some(p), Some(e)) => {
+                                crate::compiler::elaborate::untyped_param_width(e, p)
+                                    .unwrap_or(32)
+                            }
+                            _ => 32,
+                        }
+                    } else {
+                        decl_width
+                    };
                     match &decl.init {
                         Some(expr) => {
                             let Some(value) = self.compile_expr(expr, width) else {

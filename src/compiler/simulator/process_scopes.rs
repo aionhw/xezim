@@ -1134,14 +1134,23 @@ impl Simulator {
                         names.insert(d.name.name.clone());
                         let mut storage = d.clone();
                         storage.init = None;
-                        allocate.push(Statement::new(
-                            StatementKind::VarDecl {
-                                data_type: data_type.clone(),
-                                lifetime: Some(crate::ast::types::Lifetime::Static),
-                                declarators: vec![storage],
-                            },
-                            s.span,
-                        ));
+                        // §6.20.2: an UNTYPED block-scope `localparam` is
+                        // SELF-DETERMINED from its initializer (the parser
+                        // keeps it `Implicit`). Hoisting strips the init into
+                        // a separate assignment, so the allocated cell must
+                        // carry the initializer's width — an `Implicit` cell
+                        // would collapse to 1-bit and truncate `4'd0-4'd1`
+                        // (15) / `24` to 0. Size it to the RHS width so the
+                        // subsequent `f.Q = <rhs>` assignment sizes the value
+                        // self-determinately.
+                        let sd_lp = matches!(
+                            data_type,
+                            crate::ast::types::DataType::Implicit {
+                                dimensions, ..
+                            } if dimensions.is_empty()
+                        );
+                        let mut alloc_dt = data_type.clone();
+                        let mut init_rhs: Option<Expression> = None;
                         if let Some(init) = &d.init {
                             let empty = std::collections::HashSet::new();
                             let rhs = super::elaborate::rewrite_expr(
@@ -1151,6 +1160,56 @@ impl Simulator {
                                 &empty,
                                 &HashMap::default(),
                             );
+                            if sd_lp {
+                                if let Some(sw) = super::elaborate::untyped_param_width(
+                                    &rhs,
+                                    &module.parameters,
+                                ) {
+                                    let hi = Expression::new(
+                                        ExprKind::Number(NumberLiteral::Integer {
+                                            size: Some(32),
+                                            signed: false,
+                                            base: NumberBase::Decimal,
+                                            value: if sw >= 1 { (sw - 1).to_string() } else {
+                                                "0".to_string()
+                                            },
+                                            cached_val: crate::ast::cache::LiteralCache::new(None),
+                                        }),
+                                        s.span,
+                                    );
+                                    let lo = Expression::new(
+                                        ExprKind::Number(NumberLiteral::Integer {
+                                            size: Some(32),
+                                            signed: false,
+                                            base: NumberBase::Decimal,
+                                            value: "0".to_string(),
+                                            cached_val: crate::ast::cache::LiteralCache::new(None),
+                                        }),
+                                        s.span,
+                                    );
+                                    alloc_dt = crate::ast::types::DataType::IntegerVector {
+                                        kind: crate::ast::types::IntegerVectorType::Logic,
+                                        signing: None,
+                                        dimensions: vec![crate::ast::types::PackedDimension::Range {
+                                            left: Box::new(hi),
+                                            right: Box::new(lo),
+                                            span: s.span,
+                                        }],
+                                        span: s.span,
+                                    };
+                                }
+                            }
+                            init_rhs = Some(rhs);
+                        }
+                        allocate.push(Statement::new(
+                            StatementKind::VarDecl {
+                                data_type: alloc_dt,
+                                lifetime: Some(crate::ast::types::Lifetime::Static),
+                                declarators: vec![storage],
+                            },
+                            s.span,
+                        ));
+                        if let Some(rhs) = init_rhs {
                             let lhs = Expression::new(
                                 ExprKind::Ident(HierarchicalIdentifier {
                                     root: None,
