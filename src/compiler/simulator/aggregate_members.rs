@@ -716,16 +716,16 @@ impl Simulator {
             return Some(base);
         }
         let params = match self.this_stack.last().copied().flatten() {
-            Some(h) => self.instance_param_scope(h),
-            None => self.module.parameters.clone(),
+            Some(h) => std::borrow::Cow::Owned(self.instance_param_scope(h)),
+            None => std::borrow::Cow::Borrowed(&self.module.parameters),
         };
         let mut w = u64::from(base);
         for d in dimensions {
             let crate::ast::types::PackedDimension::Range { left, right, .. } = d else {
                 return None;
             };
-            let l = crate::elaborate::const_eval_i64_with_params(left, Some(&params))?;
-            let r = crate::elaborate::const_eval_i64_with_params(right, Some(&params))?;
+            let l = crate::elaborate::const_eval_i64_with_params(left, Some(params.as_ref()))?;
+            let r = crate::elaborate::const_eval_i64_with_params(right, Some(params.as_ref()))?;
             w = w.checked_mul((l - r).unsigned_abs() + 1)?;
         }
         u32::try_from(w).ok()

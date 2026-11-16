@@ -4828,6 +4828,77 @@ impl Simulator {
         true
     }
 
+    /// A fresh local declaration shadows any prior global-scoped collection
+    /// registration left over from another frame's same-named local
+    /// (subroutine locals use bare names). Reset the array/queue/assoc
+    /// bookkeeping so e.g. a scalar `string str` after a previous
+    /// `string str[$]` isn't still treated as a queue.
+    pub(super) fn clear_shadowed_collection_meta(
+        &mut self,
+        name: &str,
+        data_type: &crate::ast::types::DataType,
+    ) {
+        if !self.decl_shadow_log.is_empty() {
+            self.note_decl_shadow(name, data_type);
+        }
+        // If this local shares its bare name with a caller-frame queue,
+        // preserve the caller's queue storage so it is restored when this
+        // subroutine returns (queue locals are global-by-bare-name; see
+        // `queue_frame_saves`).
+        if !self.save_queue_local(name, true) {
+            self.module.dynamic_arrays.remove(name);
+            self.module.arrays.remove(name);
+            self.module.descending_arrays.remove(name);
+            self.module.queue_max_sizes.remove(name);
+        }
+        self.module.associative_arrays.remove(name);
+        self.module.packed_signal_elem_widths.remove(name);
+        let mut size_key = std::mem::take(&mut self.queue_key_scratch);
+        size_key.clear();
+        size_key.push_str(name);
+        size_key.push_str(".size");
+        self.signals.remove(&size_key);
+        self.queue_key_scratch = size_key;
+    }
+
+    /// Route a declaration initializer through a synthetic `BlockingAssign`,
+    /// so the pattern-spread / queue / associative-array population applies
+    /// through the same path as a standalone assignment. This is the
+    /// boilerplate shared by a local array/queue/assoc declaration whose
+    /// initializer would otherwise be dropped.
+    pub(super) fn route_decl_init_via_assign(
+        &mut self,
+        target: &str,
+        init: &crate::ast::expr::Expression,
+        span: crate::ast::Span,
+    ) {
+        let lvalue = crate::ast::expr::Expression::new(
+            crate::ast::expr::ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: target.to_owned(),
+                        span,
+                    },
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            }),
+            span,
+        );
+        let assign = crate::ast::stmt::Statement::new(
+            crate::ast::stmt::StatementKind::BlockingAssign {
+                lvalue,
+                rvalue: init.clone(),
+            },
+            span,
+        );
+        self.exec_statement(&assign);
+    }
+
     /// Pop the top queue-local save frame and restore every snapshotted name:
     /// drop the callee's current `name.size`/`name[...]` entries and re-insert
     /// the caller's saved ones, AND restore the caller's `module.*` collection

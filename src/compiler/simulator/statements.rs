@@ -2370,31 +2370,7 @@ impl Simulator {
             // the array/queue/assoc bookkeeping so e.g. a scalar `string
             // str` after a previous `string str[$]` isn't still treated
             // as a queue.
-            {
-                let nm = d.name.name.as_str();
-                if !self.decl_shadow_log.is_empty() {
-                    self.note_decl_shadow(nm, data_type);
-                }
-                // If this local shares its bare name with a caller-frame
-                // queue, preserve the caller's queue storage so it is
-                // restored when this subroutine returns (queue locals are
-                // global-by-bare-name; see `queue_frame_saves`).
-                let saved = self.save_queue_local(nm, true);
-                if !saved {
-                    self.module.dynamic_arrays.remove(nm);
-                    self.module.arrays.remove(nm);
-                    self.module.descending_arrays.remove(nm);
-                    self.module.queue_max_sizes.remove(nm);
-                }
-                self.module.associative_arrays.remove(nm);
-                self.module.packed_signal_elem_widths.remove(nm);
-                let mut size_key = std::mem::take(&mut self.queue_key_scratch);
-                size_key.clear();
-                size_key.push_str(nm);
-                size_key.push_str(".size");
-                self.signals.remove(&size_key);
-                self.queue_key_scratch = size_key;
-            }
+            self.clear_shadowed_collection_meta(&d.name.name, data_type);
             // Register a *packed*-struct local's field layout so member
             // access (`p.field`) aliases into the whole variable, as
             // module-level packed-struct signals already do. Without
@@ -2856,33 +2832,7 @@ impl Simulator {
                         .var_decl_types
                         .insert(name.clone(), data_type.clone());
                     if let Some(init) = &d.init {
-                        let lvalue = crate::ast::expr::Expression::new(
-                            crate::ast::expr::ExprKind::Ident(
-                                crate::ast::expr::HierarchicalIdentifier {
-                                    root: None,
-                                    path: vec![crate::ast::expr::HierPathSegment {
-                                        name: crate::ast::Identifier {
-                                            name: name.clone(),
-                                            span: d.name.span,
-                                        },
-                                        selects: Vec::new(),
-                                    }],
-                                    span: d.name.span,
-                                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                                    cached_resolved_name: crate::ast::cache::NameCache::new(),
-                                    bound: crate::ast::binding::Bound::UNSET,
-                                },
-                            ),
-                            d.name.span,
-                        );
-                        let assign = crate::ast::stmt::Statement::new(
-                            crate::ast::stmt::StatementKind::BlockingAssign {
-                                lvalue,
-                                rvalue: init.clone(),
-                            },
-                            d.name.span,
-                        );
-                        self.exec_statement(&assign);
+                        self.route_decl_init_via_assign(&name, init, d.name.span);
                     }
                     continue;
                 }
@@ -3031,33 +2981,7 @@ impl Simulator {
                         // init is silently dropped and the queue
                         // stays empty.
                         if let Some(init) = &d.init {
-                            let lvalue = crate::ast::expr::Expression::new(
-                                crate::ast::expr::ExprKind::Ident(
-                                    crate::ast::expr::HierarchicalIdentifier {
-                                        root: None,
-                                        path: vec![crate::ast::expr::HierPathSegment {
-                                            name: crate::ast::Identifier {
-                                                name: bare.clone(),
-                                                span: d.name.span,
-                                            },
-                                            selects: Vec::new(),
-                                        }],
-                                        span: d.name.span,
-                                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                                        cached_resolved_name: crate::ast::cache::NameCache::new(),
-                                        bound: crate::ast::binding::Bound::UNSET,
-                                    },
-                                ),
-                                d.name.span,
-                            );
-                            let assign = crate::ast::stmt::Statement::new(
-                                crate::ast::stmt::StatementKind::BlockingAssign {
-                                    lvalue,
-                                    rvalue: init.clone(),
-                                },
-                                d.name.span,
-                            );
-                            self.exec_statement(&assign);
+                            self.route_decl_init_via_assign(&bare, init, d.name.span);
                         }
                         continue;
                     }
@@ -3221,33 +3145,7 @@ impl Simulator {
                         // aggregate spread applies write the keyed
                         // elements and record the default fallback.
                         if let Some(init) = &d.init {
-                            let lvalue = crate::ast::expr::Expression::new(
-                                crate::ast::expr::ExprKind::Ident(
-                                    crate::ast::expr::HierarchicalIdentifier {
-                                        root: None,
-                                        path: vec![crate::ast::expr::HierPathSegment {
-                                            name: crate::ast::Identifier {
-                                                name: bare,
-                                                span: d.name.span,
-                                            },
-                                            selects: Vec::new(),
-                                        }],
-                                        span: d.name.span,
-                                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                                        cached_resolved_name: crate::ast::cache::NameCache::new(),
-                                        bound: crate::ast::binding::Bound::UNSET,
-                                    },
-                                ),
-                                d.name.span,
-                            );
-                            let assign = crate::ast::stmt::Statement::new(
-                                crate::ast::stmt::StatementKind::BlockingAssign {
-                                    lvalue,
-                                    rvalue: init.clone(),
-                                },
-                                d.name.span,
-                            );
-                            self.exec_statement(&assign);
+                            self.route_decl_init_via_assign(&bare, init, d.name.span);
                         }
                         continue;
                     }
@@ -3379,33 +3277,7 @@ impl Simulator {
                 // as the queue branch above already does — the pattern
                 // spread then applies every §10.9.1 form.
                 if let Some(init) = &d.init {
-                    let lvalue = crate::ast::expr::Expression::new(
-                        crate::ast::expr::ExprKind::Ident(
-                            crate::ast::expr::HierarchicalIdentifier {
-                                root: None,
-                                path: vec![crate::ast::expr::HierPathSegment {
-                                    name: crate::ast::Identifier {
-                                        name: bare.clone(),
-                                        span: d.name.span,
-                                    },
-                                    selects: Vec::new(),
-                                }],
-                                span: d.name.span,
-                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                                cached_resolved_name: crate::ast::cache::NameCache::new(),
-                                bound: crate::ast::binding::Bound::UNSET,
-                            },
-                        ),
-                        d.name.span,
-                    );
-                    let assign = crate::ast::stmt::Statement::new(
-                        crate::ast::stmt::StatementKind::BlockingAssign {
-                            lvalue,
-                            rvalue: init.clone(),
-                        },
-                        d.name.span,
-                    );
-                    self.exec_statement(&assign);
+                    self.route_decl_init_via_assign(&bare, init, d.name.span);
                 }
             } else {
                 if !matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic))
