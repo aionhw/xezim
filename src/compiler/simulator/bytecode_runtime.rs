@@ -1824,15 +1824,20 @@ impl Simulator {
             return None;
         }
         let (p, n) = self.settle_entries_view;
-        let hint = if !p.is_null() && e < n {
+        let entry = if !p.is_null() && e < n {
             // SAFETY: the settle published the taken vector's buffer, which is
             // heap-stable and outlives this call (restored before returning).
-            unsafe { (*p.add(e)).cold.scope_hint.clone() }
+            Some(unsafe { &*p.add(e) })
         } else {
-            self.comb_entries
-                .get(e)
-                .and_then(|en| en.cold.scope_hint.clone())
+            self.comb_entries.get(e)
         };
+        let hint = entry.and_then(|en| en.cold.scope_hint.clone());
+        let is_always = entry.is_some_and(|en| {
+            matches!(
+                en.item,
+                CombItem::CompiledAlwaysBlock { .. } | CombItem::AlwaysBlock { .. }
+            )
+        });
         let prev_hint = self.name_resolve_hint.borrow().clone();
         let prev_ts = self.timescale_scope_override.take();
         self.set_m_block_scope(hint.as_deref());
@@ -1841,7 +1846,11 @@ impl Simulator {
         }
         // `$time`/`%t` in the fallback scale to the entry's module timescale,
         // as the four-state arm arranges.
-        self.timescale_scope_override = hint;
+        self.timescale_scope_override = if is_always {
+            Some(hint.unwrap_or_default())
+        } else {
+            hint
+        };
         Some((prev_hint, prev_ts))
     }
 
