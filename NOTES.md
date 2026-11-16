@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Compatibility:** Add VPI assertion objects, callbacks, coverage queries and controls (#1191).
+
 - **Correctness:** Diagnose undeclared type names and duplicate class definitions (#1186, core #229).
 
 - **Compatibility:** Support cocotb 2.0.x and 2.1.0 runner APIs (#1189).
