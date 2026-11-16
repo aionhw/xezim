@@ -530,6 +530,10 @@ pub(crate) struct Csp {
     opaque: bool,
     /// Rand sub-object scalars are variables too (`csp_add_sub`).
     has_subs: bool,
+    /// Map from each sub-object handle joined via `csp_add_sub` to its solver
+    /// member prefix (`"a"`, `"policy[0].policy[1]"`), so paths reaching a
+    /// sub-object through handles resolve scalars, arrays and sizes uniformly.
+    sub_prefixes: HashMap<usize, String>,
     /// Some scalar is a member of an unpacked struct member (`s.x`).
     dotted: bool,
     /// `std::randomize(…) with {…}` (§18.12): the variables are the
@@ -2089,7 +2093,18 @@ impl Simulator {
         // §18.4: a rand variable wider than 64 bits that no constraint reads
         // (or reads only through `size()`) takes any value of its width; it
         // stays out of the solve instead of keeping the whole class out.
-        let unread = Self::csp_unread(constraints, rand_props, colls);
+        // §18.5.9: include active constraints of joined sub-objects so a wide
+        // variable read only through a back-reference (`item.wide[95:64]`) is
+        // kept in the solve.
+        let unread = if subs.is_empty() {
+            Self::csp_unread(constraints, rand_props, colls)
+        } else {
+            let mut all_cons: Vec<ClassConstraint> = constraints.to_vec();
+            for &(_, sub) in subs {
+                all_cons.extend(self.active_constraints(sub));
+            }
+            Self::csp_unread(&all_cons, rand_props, colls)
+        };
         // Per-class memo cache: for a fixed class / constraint set / config
         // the whole `csp_vars` + `csp_split_slices` + `csp_translate` graph
         // is value-independent, so a cached `Csp` is reused read-only and
@@ -2159,7 +2174,8 @@ impl Simulator {
         // for the final acceptance check.
         let obj_arrays: HashSet<String> = subs
             .iter()
-            .filter_map(|(p, _)| p.split_once('[').map(|(a, _)| a.to_string()))
+            .flat_map(|(p, _)| p.split('.'))
+            .filter_map(|seg| seg.split_once('[').map(|(a, _)| a.to_string()))
             .collect();
         let _obj_guard = (!obj_arrays.is_empty())
             .then(|| obj::csp_obj_enter(obj_arrays.iter().cloned().collect()));
@@ -2352,6 +2368,7 @@ impl Simulator {
             order: Vec::new(),
             opaque: false,
             has_subs: false,
+            sub_prefixes: HashMap::default(),
             dotted: false,
             scope: Some(HashMap::default()),
             segs: HashMap::default(),
@@ -2573,6 +2590,7 @@ impl Simulator {
             order: Vec::new(),
             opaque: false,
             has_subs: false,
+            sub_prefixes: HashMap::default(),
             dotted: false,
             scope: None,
             segs: HashMap::default(),
@@ -4997,6 +5015,7 @@ impl Simulator {
             .cloned()
             .unwrap_or_default();
         csp.has_subs = true;
+        csp.sub_prefixes.insert(sub, prop.to_string());
         let mut members: HashSet<String> = HashSet::default();
         let mut items: Vec<ConstraintItem> = Vec::new();
         let mut seen_con: HashSet<String> = HashSet::default();
@@ -5010,6 +5029,10 @@ impl Simulator {
                 return None;
             }
             members.extend(cd.properties.keys().cloned());
+            members.extend(cd.array_properties.keys().cloned());
+            members.extend(cd.array_nd_properties.keys().cloned());
+            members.extend(cd.queue_properties.keys().cloned());
+            members.extend(cd.assoc_properties.keys().cloned());
             for name in self.randomize_members(&cd, &rand_disabled) {
                 if !seen_var.insert(name.clone()) {
                     continue;
@@ -5042,6 +5065,15 @@ impl Simulator {
                     {
                         return None;
                     }
+                    continue;
+                }
+                // §18.5.9: the elements of a fixed, dynamic or queue array
+                // of handles join as sub-objects of their own
+                // (`rand_csp_nested_subs`).
+                if is_obj
+                    && !cd.array_nd_properties.contains_key(&name)
+                    && !cd.assoc_properties.contains_key(&name)
+                {
                     continue;
                 }
                 if is_obj || sig.is_real || sig.width == 0 || is_coll {
@@ -5101,7 +5133,11 @@ impl Simulator {
             span: crate::ast::Span::dummy(),
         }];
         let colls = self.collect_rand_colls(sub, &rand_disabled, &child_constraints);
-        let dynamic = colls.iter().any(|c| c.kind == CollKind::Dyn);
+        // (An array of handles holds no values to size or draw: its
+        // elements join as sub-objects.)
+        let dynamic = colls
+            .iter()
+            .any(|c| c.kind == CollKind::Dyn && !c.is_object_elem);
         if !colls.is_empty() {
             let colls = self.csp_expand_rows(&colls);
             let enums: HashMap<String, String> = colls
@@ -5206,8 +5242,9 @@ impl Simulator {
             csp.dom0.push(dom);
         }
         let mut out = Vec::with_capacity(items.len());
+        let mut bound = Vec::new();
         for mut it in items {
-            if !Self::csp_prefix_item(&mut it, prop, &members) {
+            if !Self::csp_prefix_item(&mut it, prop, &members, &mut bound) {
                 return None;
             }
             out.push(it);
@@ -5242,17 +5279,22 @@ impl Simulator {
     /// Rewrite a sub-object's constraint item so its member references go
     /// through the enclosing object's member `prop` (`x` becomes `prop.x`).
     /// False when the item holds something that cannot be rewritten so.
-    fn csp_prefix_item(it: &mut ConstraintItem, prop: &str, members: &HashSet<String>) -> bool {
+    fn csp_prefix_item(
+        it: &mut ConstraintItem,
+        prop: &str,
+        members: &HashSet<String>,
+        bound: &mut Vec<String>,
+    ) -> bool {
         use crate::ast::decl::ConstraintRange;
         match it {
-            ConstraintItem::Expr(e) => Self::csp_prefix_expr(e, prop, members),
+            ConstraintItem::Expr(e) => Self::csp_prefix_expr(e, prop, members, bound),
             ConstraintItem::Inside { expr, range, .. } => {
-                Self::csp_prefix_expr(expr, prop, members)
+                Self::csp_prefix_expr(expr, prop, members, bound)
                     && range.iter_mut().all(|r| match r {
-                        ConstraintRange::Value(v) => Self::csp_prefix_expr(v, prop, members),
+                        ConstraintRange::Value(v) => Self::csp_prefix_expr(v, prop, members, bound),
                         ConstraintRange::Range { lo, hi } => {
-                            Self::csp_prefix_expr(lo, prop, members)
-                                && Self::csp_prefix_expr(hi, prop, members)
+                            Self::csp_prefix_expr(lo, prop, members, bound)
+                                && Self::csp_prefix_expr(hi, prop, members, bound)
                         }
                     })
             }
@@ -5261,8 +5303,8 @@ impl Simulator {
                 constraint,
                 ..
             } => {
-                Self::csp_prefix_expr(condition, prop, members)
-                    && Self::csp_prefix_item(constraint, prop, members)
+                Self::csp_prefix_expr(condition, prop, members, bound)
+                    && Self::csp_prefix_item(constraint, prop, members, bound)
             }
             ConstraintItem::IfElse {
                 condition,
@@ -5270,16 +5312,31 @@ impl Simulator {
                 else_item,
                 ..
             } => {
-                Self::csp_prefix_expr(condition, prop, members)
-                    && Self::csp_prefix_item(then_item, prop, members)
+                Self::csp_prefix_expr(condition, prop, members, bound)
+                    && Self::csp_prefix_item(then_item, prop, members, bound)
                     && else_item
                         .as_mut()
-                        .is_none_or(|e| Self::csp_prefix_item(e, prop, members))
+                        .is_none_or(|e| Self::csp_prefix_item(e, prop, members, bound))
             }
-            ConstraintItem::Soft(inner) => Self::csp_prefix_item(inner, prop, members),
+            ConstraintItem::Foreach {
+                array, vars, item, ..
+            } => {
+                if !Self::csp_prefix_expr(array, prop, members, bound) {
+                    return false;
+                }
+                let mark = bound.len();
+                bound.extend(vars.iter().flatten().map(|v| v.name.clone()));
+                let ok = Self::csp_prefix_item(item, prop, members, bound);
+                bound.truncate(mark);
+                ok
+            }
+            ConstraintItem::Unique { exprs, .. } => exprs
+                .iter_mut()
+                .all(|e| Self::csp_prefix_expr(e, prop, members, bound)),
+            ConstraintItem::Soft(inner) => Self::csp_prefix_item(inner, prop, members, bound),
             ConstraintItem::Block(items) => items
                 .iter_mut()
-                .all(|i| Self::csp_prefix_item(i, prop, members)),
+                .all(|i| Self::csp_prefix_item(i, prop, members, bound)),
             // §18.5.10: an ordering among the sub-object's own members.
             ConstraintItem::Solve {
                 before,
@@ -5294,13 +5351,17 @@ impl Simulator {
                 before_paths
                     .iter_mut()
                     .chain(after_paths.iter_mut())
-                    .all(|e| Self::csp_prefix_expr(e, prop, members))
+                    .all(|e| Self::csp_prefix_expr(e, prop, members, bound))
             }
-            _ => false,
         }
     }
 
-    fn csp_prefix_expr(e: &mut Expression, prop: &str, members: &HashSet<String>) -> bool {
+    fn csp_prefix_expr(
+        e: &mut Expression,
+        prop: &str,
+        members: &HashSet<String>,
+        bound: &[String],
+    ) -> bool {
         // An element of an object array (`arr[k]`) is named by a path
         // segment of its own (see `obj`).
         let elem = prop.contains('[');
@@ -5313,10 +5374,14 @@ impl Simulator {
         };
         let through = |name: &str, span: crate::ast::Span| {
             if elem {
+                // `a[k]`, or `a[k].q[j]` for an element of an object array
+                // that element holds: one segment per object.
+                let mut path: Vec<_> = prop.split('.').map(|p| seg(p, span)).collect();
+                path.push(seg(name, span));
                 return Expression::new(
                     ExprKind::Ident(HierarchicalIdentifier {
                         root: None,
-                        path: vec![seg(prop, span), seg(name, span)],
+                        path,
                         span,
                         cached_signal_id: crate::ast::cache::SignalCache::new(None),
                         cached_resolved_name: crate::ast::cache::NameCache::new(),
@@ -5367,7 +5432,7 @@ impl Simulator {
                 }
                 if h.path.len() == 1 && h.path[0].selects.is_empty() {
                     let n = h.path[0].name.name.clone();
-                    if members.contains(&n) {
+                    if !bound.contains(&n) && members.contains(&n) {
                         *e = through(&n, e.span);
                     }
                     return true;
@@ -5379,18 +5444,16 @@ impl Simulator {
                 }
                 for s in &mut h.path {
                     for x in &mut s.selects {
-                        if !Self::csp_prefix_expr(x, prop, members) {
+                        if !Self::csp_prefix_expr(x, prop, members, bound) {
                             return false;
                         }
                     }
                 }
-                if !members.contains(&h.path[0].name.name) {
+                if bound.contains(&h.path[0].name.name) || !members.contains(&h.path[0].name.name) {
                     return false;
                 }
                 let span = h.span;
-                if elem {
-                    h.path.insert(0, seg(prop, span));
-                } else {
+                {
                     for (k, part) in prop.split('.').enumerate() {
                         h.path.insert(k, seg(part, span));
                     }
@@ -5409,11 +5472,11 @@ impl Simulator {
                 if matches!(expr.kind, ExprKind::This) {
                     return false;
                 }
-                Self::csp_prefix_expr(expr, prop, members)
+                Self::csp_prefix_expr(expr, prop, members, bound)
             }
             ExprKind::Number(_) | ExprKind::StringLiteral(_) | ExprKind::TypeLiteral(_) => true,
             ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
-                Self::csp_prefix_expr(operand, prop, members)
+                Self::csp_prefix_expr(operand, prop, members, bound)
             }
             ExprKind::Binary { left, right, .. }
             | ExprKind::Range(left, right)
@@ -5421,55 +5484,66 @@ impl Simulator {
                 expr: left,
                 index: right,
             } => {
-                Self::csp_prefix_expr(left, prop, members)
-                    && Self::csp_prefix_expr(right, prop, members)
+                Self::csp_prefix_expr(left, prop, members, bound)
+                    && Self::csp_prefix_expr(right, prop, members, bound)
             }
             ExprKind::RangeSelect {
                 expr, left, right, ..
             } => {
-                Self::csp_prefix_expr(expr, prop, members)
-                    && Self::csp_prefix_expr(left, prop, members)
-                    && Self::csp_prefix_expr(right, prop, members)
+                Self::csp_prefix_expr(expr, prop, members, bound)
+                    && Self::csp_prefix_expr(left, prop, members, bound)
+                    && Self::csp_prefix_expr(right, prop, members, bound)
             }
             ExprKind::SystemCall { args, .. } => args
                 .iter_mut()
-                .all(|a| Self::csp_prefix_expr(a, prop, members)),
+                .all(|a| Self::csp_prefix_expr(a, prop, members, bound)),
             ExprKind::Call { func, args }
                 if matches!(
                     &func.kind,
                     ExprKind::MemberAccess { member, .. }
-                        if matches!(member.name.as_str(), "size" | "num" | "sum")
+                        if matches!(
+                            member.name.as_str(),
+                            "size" | "num" | "sum" | "and" | "or" | "xor" | "product" | "min" | "max"
+                        )
+                ) || matches!(
+                    &func.kind,
+                    ExprKind::Ident(h)
+                        if h.path.len() >= 2
+                            && h.path.last().is_some_and(|s| matches!(
+                                s.name.name.as_str(),
+                                "size" | "num" | "sum" | "and" | "or" | "xor" | "product" | "min" | "max"
+                            ))
                 ) =>
             {
-                Self::csp_prefix_expr(func, prop, members)
+                Self::csp_prefix_expr(func, prop, members, bound)
                     && args
                         .iter_mut()
-                        .all(|a| Self::csp_prefix_expr(a, prop, members))
+                        .all(|a| Self::csp_prefix_expr(a, prop, members, bound))
             }
             ExprKind::Replication { count, exprs } => {
-                Self::csp_prefix_expr(count, prop, members)
+                Self::csp_prefix_expr(count, prop, members, bound)
                     && exprs
                         .iter_mut()
-                        .all(|p| Self::csp_prefix_expr(p, prop, members))
+                        .all(|p| Self::csp_prefix_expr(p, prop, members, bound))
             }
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
-                Self::csp_prefix_expr(condition, prop, members)
-                    && Self::csp_prefix_expr(then_expr, prop, members)
-                    && Self::csp_prefix_expr(else_expr, prop, members)
+                Self::csp_prefix_expr(condition, prop, members, bound)
+                    && Self::csp_prefix_expr(then_expr, prop, members, bound)
+                    && Self::csp_prefix_expr(else_expr, prop, members, bound)
             }
             ExprKind::Inside { expr, ranges } => {
-                Self::csp_prefix_expr(expr, prop, members)
+                Self::csp_prefix_expr(expr, prop, members, bound)
                     && ranges
                         .iter_mut()
-                        .all(|r| Self::csp_prefix_expr(r, prop, members))
+                        .all(|r| Self::csp_prefix_expr(r, prop, members, bound))
             }
             ExprKind::Concatenation(parts) => parts
                 .iter_mut()
-                .all(|p| Self::csp_prefix_expr(p, prop, members)),
+                .all(|p| Self::csp_prefix_expr(p, prop, members, bound)),
             _ => false,
         }
     }
@@ -5791,7 +5865,11 @@ impl Simulator {
                         }
                     }
                 }
-                let name = Self::foreach_base_name(array);
+                let name = self.csp_member(csp, array).or_else(|| {
+                    Self::foreach_plain_member(array)
+                        .then(|| Self::foreach_base_name(array))
+                        .flatten()
+                });
                 let arr = name.as_ref().and_then(|n| csp.arrays.get(n)).cloned();
                 let idx_var = match vars.as_slice() {
                     [Some(v)] => Some(v.name.clone()),
@@ -6008,10 +6086,30 @@ impl Simulator {
         array: &Expression,
         name: Option<&str>,
     ) -> Option<Vec<i64>> {
-        let name = name?;
-        if csp.scope.is_some() || csp.arrays.contains_key(name) {
+        if let Some(name) = name
+            && (csp.scope.is_some() || csp.arrays.contains_key(name))
+        {
             return None;
         }
+        if csp.scope.is_none()
+            && !Self::foreach_plain_member(array)
+            && let Some((owner, leaf)) = self.csp_resolve_member_owner(csp.handle, array)
+        {
+            if self.prop_class_type(owner, &leaf).is_some()
+                && !self.is_associative_array(&format!("{owner}#{leaf}"))
+                && !self.prop_is_rand(owner, &leaf)
+                && let Some(keys) = self.rand_child_collection_keys(owner, &leaf)
+            {
+                let prefix = format!("{owner}#{leaf}[");
+                return keys
+                    .iter()
+                    .map(|k| k.strip_prefix(&prefix)?.strip_suffix(']')?.parse().ok())
+                    .collect();
+            }
+            let plain = super::vpi_model::ident_expr(&leaf);
+            return self.csp_foreach_indices_of(owner, &plain, &leaf);
+        }
+        let name = name?;
         self.csp_foreach_indices_of(csp.handle, array, name)
     }
 
@@ -7361,6 +7459,33 @@ impl Simulator {
             return self.csp_eval_node(csp, whole, env, neg);
         };
         let (w, s) = Self::csp_ws(&a);
+        // §18.5.9: the items are constants the evaluator reads below, so an
+        // element of an object array (`a[k].ranges.size()`, state of a
+        // sub-object of the solve) is spelled as the evaluator spells it.
+        // Under the solver's name it read as an unknown name, and the set
+        // built from that refuted a problem that has solutions.
+        let real_ranges: Vec<ConstraintRange>;
+        let ranges: &[ConstraintRange] = if ranges.iter().any(|r| match r {
+            ConstraintRange::Value(e) => Self::csp_obj_real(e).is_some(),
+            ConstraintRange::Range { lo, hi } => {
+                Self::csp_obj_real(lo).is_some() || Self::csp_obj_real(hi).is_some()
+            }
+        }) {
+            let real = |e: &Expression| Self::csp_obj_real(e).unwrap_or_else(|| e.clone());
+            real_ranges = ranges
+                .iter()
+                .map(|r| match r {
+                    ConstraintRange::Value(e) => ConstraintRange::Value(real(e)),
+                    ConstraintRange::Range { lo, hi } => ConstraintRange::Range {
+                        lo: real(lo),
+                        hi: real(hi),
+                    },
+                })
+                .collect();
+            &real_ranges
+        } else {
+            ranges
+        };
         // §11.4.13: the operand and the items are compared like `==`, at the
         // width of all of them and unsigned unless all are signed: `a8 +
         // 8'd1 inside {[256:256]}` adds at 32 bits.
@@ -7527,12 +7652,37 @@ impl Simulator {
     }
 
     /// §18.5.9: a member path through handle members (`sub.p.x`, `p` a
-    /// sub-object's handle back to the solved object) names that object's variable.
+    /// sub-object's handle back to the solved object) names that object's
+    /// solver variable or array.
     fn csp_member_through_handles(&self, csp: &Csp, path: &[String]) -> Option<String> {
         let (leaf, hops) = path.split_last()?;
         let h = hops.iter().try_fold(csp.handle, |h, m| {
+            // `a[k]`: an element of an object array of the solve.
+            if let Some((arr, k)) = m.split_once('[') {
+                let k = k.strip_suffix(']')?;
+                return self
+                    .read_coll_elem(&format!("{h}#{arr}[{k}]"))
+                    .and_then(|v| v.to_u64())
+                    .map(|v| v as usize)
+                    .filter(|&h| h != 0);
+            }
             self.member_handle(h, m).filter(|&h| h != 0)
         })?;
+        let has_member = |n: &str| {
+            csp.scalars.contains_key(n)
+                || csp.arrays.contains_key(n)
+                || csp.nd_dims.contains_key(n)
+                || csp.sizes.contains_key(n)
+        };
+        if h == csp.handle && has_member(leaf) {
+            return Some(leaf.clone());
+        }
+        if let Some(prefix) = csp.sub_prefixes.get(&h) {
+            let cand = format!("{prefix}.{leaf}");
+            if has_member(&cand) {
+                return Some(cand);
+            }
+        }
         csp.scalars.iter().find_map(|(n, &v)| {
             let hit = match &csp.vars[v].key {
                 VarKey::Prop(p) => h == csp.handle && p == leaf,
@@ -7702,14 +7852,51 @@ impl Simulator {
                         // A field of a packed-struct variable (`s.lo`) reads
                         // the variable.
                         push_name(&h.path[0].name.name, out);
-                    } else if csp.has_subs {
-                        // A field or select of a sub-object's variable
-                        // (`a.x.f`, `this.a.x[3]`) reads that variable.
+                    } else if csp.has_subs || csp.dotted {
+                        // A field or select of a sub-object's variable or
+                        // back-referenced owner variable (`a.b.x.f`,
+                        // `p[0].item.hdr.lo`, `p[0].item.arr[i].f`) reads
+                        // that variable or array.
                         let p0 = &h.path[0].name.name;
                         let st = usize::from(
                             p0 == "this" || self.rand_receiver.as_deref() == Some(p0.as_str()),
                         );
-                        if h.path.len() >= st + 2 {
+                        let mut found = false;
+                        for split in (st + 1..=h.path.len()).rev() {
+                            if h.path[st..split - 1]
+                                .iter()
+                                .any(|s| !s.selects.is_empty())
+                            {
+                                continue;
+                            }
+                            let prefix: Vec<String> = h.path[st..split]
+                                .iter()
+                                .map(|s| s.name.name.clone())
+                                .collect();
+                            let joined = prefix.join(".");
+                            let matched = if h.path[split - 1].selects.is_empty()
+                                && (csp.scalars.contains_key(&joined)
+                                    || csp.arrays.contains_key(&joined)
+                                    || csp.nd_dims.contains_key(&joined))
+                            {
+                                Some(joined)
+                            } else if !h.path[split - 1].selects.is_empty()
+                                && (csp.arrays.contains_key(&joined)
+                                    || csp.nd_dims.contains_key(&joined))
+                            {
+                                Some(joined)
+                            } else if prefix.len() >= 2 {
+                                self.csp_member_through_handles(csp, &prefix)
+                            } else {
+                                None
+                            };
+                            if let Some(n) = matched {
+                                push_name(&n, out);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found && h.path.len() >= st + 2 {
                             let n =
                                 format!("{}.{}", h.path[st].name.name, h.path[st + 1].name.name);
                             push_name(&n, out);
@@ -7739,6 +7926,24 @@ impl Simulator {
                     && path.len() >= 2
                     && path[0] == "this"
                 {
+                    let rest = &path[1..];
+                    for split in (1..=rest.len()).rev() {
+                        let prefix = &rest[..split];
+                        let joined = prefix.join(".");
+                        if csp.scalars.contains_key(&joined)
+                            || csp.arrays.contains_key(&joined)
+                            || csp.nd_dims.contains_key(&joined)
+                        {
+                            push_name(&joined, out);
+                            return true;
+                        }
+                        if prefix.len() >= 2
+                            && let Some(n) = self.csp_member_through_handles(csp, prefix)
+                        {
+                            push_name(&n, out);
+                            return true;
+                        }
+                    }
                     push_name(&path[1], out);
                     return true;
                 }
@@ -8210,6 +8415,10 @@ impl Simulator {
                     // fixed size too. Do not treat its built-in size query
                     // as an opaque method reading every rand member.
                     if self.csp_free(csp, expr, env) {
+                        // (Of a sub-object that is an array element, too:
+                        // `a[k].ranges.size()`, as the evaluator spells it.)
+                        let real = Self::csp_obj_real(expr);
+                        let expr = real.as_ref().unwrap_or(expr);
                         let frame = self.csp_frame(&env.binds);
                         self.push_local_frame(frame);
                         let is_array = self.array_operand_name(expr).is_some()
@@ -9905,15 +10114,28 @@ impl Simulator {
                 } else {
                     0
                 };
-                // A rand sub-object's member `a.x` is one variable.
-                let (v, start) = match var_of(self, names[start]) {
-                    Some(v) => (v, start + 1),
-                    None if csp.has_subs && names.len() >= start + 2 => (
-                        var_of(self, &format!("{}.{}", names[start], names[start + 1]))?,
-                        start + 2,
-                    ),
-                    None => return None,
-                };
+                // A rand sub-object's member `a.x` or back-referenced member
+                // `p[0].item.s` at any depth is one variable.
+                let mut found = None;
+                for split in (start + 1..=names.len()).rev() {
+                    let prefix = &names[start..split];
+                    let joined = prefix.join(".");
+                    if let Some(v) = var_of(self, &joined) {
+                        found = Some((v, split));
+                        break;
+                    }
+                    if (csp.has_subs || csp.dotted) && prefix.len() >= 2 {
+                        let owned: Vec<String> =
+                            prefix.iter().map(|s| (*s).to_string()).collect();
+                        if let Some(n) = self.csp_member_through_handles(csp, &owned)
+                            && let Some(v) = var_of(self, &n)
+                        {
+                            found = Some((v, split));
+                            break;
+                        }
+                    }
+                }
+                let (v, start) = found?;
                 if names.len() == start {
                     return Some((v, 0, csp.vars[v].width, true));
                 }
@@ -9930,16 +10152,25 @@ impl Simulator {
                     {
                         path.remove(0);
                     }
-                    let start = if csp.scalars.get(&path[0]) == Some(&v) {
-                        1
-                    } else if path.len() >= 2
-                        && csp.scalars.get(&format!("{}.{}", path[0], path[1])) == Some(&v)
-                    {
-                        2
-                    } else {
-                        return None;
-                    };
-                    if path.len() < start + 2 {
+                    let mut start = None;
+                    for split in (1..path.len()).rev() {
+                        let prefix = &path[..split];
+                        if csp.scalars.get(&prefix.join(".")) == Some(&v) {
+                            start = Some(split);
+                            break;
+                        }
+                        if (csp.has_subs || csp.dotted)
+                            && prefix.len() >= 2
+                            && self
+                                .csp_member_through_handles(csp, prefix)
+                                .is_some_and(|n| csp.scalars.get(&n) == Some(&v))
+                        {
+                            start = Some(split);
+                            break;
+                        }
+                    }
+                    let start = start?;
+                    if path.len() <= start {
                         return None;
                     }
                     let (flo, fw) = field(csp, v, &path[start..].join("."))?;
