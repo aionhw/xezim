@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Compatibility:** Support cocotb 2.0.x and 2.1.0 runner APIs (#1189).
+
 - **Maintenance:** Move two-state bytecode lowering and its existing compiler tests into dedicated modules, preserving the compiler's public paths (#961).
 
 - **Documentation:** Explain balanced `dist` schedules, seed-dependent ordering, and why equal histograms do not imply ignored seeds (#978).
