@@ -25,6 +25,25 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   evaluations and 84.7 M instructions (§10.3.2, §13.4, #1126, reported by
   ds54e).
 
+* Compilation-unit variables and nets are copied only into the module,
+  interface and program definitions that name them, directly, through a unit
+  subroutine they call or through a unit class, instead of into every
+  definition and every instance. A synthetic design with 4,000 module
+  definitions, 200 unit declarations and four instances peaks at 107 MiB
+  instead of 1,500 MiB, and 4,096 instances beside 64 unused unit nets at
+  161 MiB instead of 1,734 MiB. A hierarchical name such as `inst.v` no
+  longer finds a unit variable in an instance whose module does not name it,
+  as the LRM and the reference simulator agree (§3.12.1, §6.7, §23.6, #721,
+  reported by amal-khailtash).
+
+* Instances whose parameter values prepare the same module body (a generate
+  loop index passed to a child that only uses it in expressions) share that
+  body instead of each keeping its own copy, and net classification tables
+  reuse the signal name text. 8,192 such instances with 32 net initializers
+  each peak at 290 MiB instead of 1,252 MiB, with 32 continuous assignments
+  at 261 MiB instead of 1,751 MiB; instances with equal parameters drop from
+  322 to 273 MiB (§23.10, §27, §6.7, #721, reported by amal-khailtash).
+
 **Command line**
 
 * `$dumpvars` and `$fsdbDumpvars` accept indexed scope arguments: a
