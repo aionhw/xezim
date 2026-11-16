@@ -7,10 +7,13 @@ Needs cocotb 2, pytest and an xezim build. From the repository root, after
     XEZIM_BIN=$PWD/target/release/xezim python -m pytest contrib/cocotb/tests
 """
 
+import importlib.util
 import json
 import sys
 from pathlib import Path
 
+import cocotb_tools.config
+import cocotb_tools.runner
 import pytest
 
 HERE = Path(__file__).resolve().parent
@@ -191,3 +194,54 @@ def test_positional_parameter_override(tmp_path):
         build_dir=tmp_path / "build", test_dir=tmp_path / "test",
     )
     assert get_results(results) == (1, 0)
+
+
+def test_vpi_lib_resolves_with_and_without_lib_name_path(monkeypatch):
+    """_vpi_lib uses config.lib_name_path (cocotb 2.1+) and falls back to
+    config.libs_dir / config.lib_name (cocotb 2.0.x)."""
+    r = get_runner("xezim")
+    assert r._vpi_lib.is_file()
+
+    monkeypatch.delattr(cocotb_tools.config, "lib_name_path", raising=False)
+    monkeypatch.setattr(
+        cocotb_tools.config,
+        "lib_name",
+        lambda iface, sim: f"stub_{iface}_{sim}.so",
+        raising=False,
+    )
+    expected = (
+        Path(cocotb_tools.config.libs_dir)
+        / f"stub_vpi_{xezim_runner._VPI_LIB_FLAVOUR}.so"
+    )
+    assert r._vpi_lib == expected
+
+
+def test_as_sv_literal_import_fallback(monkeypatch):
+    """xezim_runner resolves cocotb_tools.runner.as_sv_literal (2.1+) and
+    falls back to _as_sv_literal (2.0.x)."""
+    runner_path = Path(xezim_runner.__file__)
+    supported = getattr(cocotb_tools.runner, "SUPPORTED_RUNNERS", None)
+
+    for attr, tag in (("_as_sv_literal", "2.0"), ("as_sv_literal", "2.1")):
+        with monkeypatch.context() as mp:
+            mp.delattr(cocotb_tools.runner, "as_sv_literal", raising=False)
+            mp.delattr(cocotb_tools.runner, "_as_sv_literal", raising=False)
+            mp.setattr(
+                cocotb_tools.runner, attr, lambda v, t=tag: f"{t}:{v}", raising=False
+            )
+            if isinstance(supported, dict):
+                mp.setitem(supported, "xezim", xezim_runner.Xezim)
+            spec = importlib.util.spec_from_file_location(
+                f"_xezim_runner_probe_{tag}", runner_path
+            )
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            assert mod.as_sv_literal("x") == f"{tag}:x"
+
+
+def test_supported_runners_includes_xezim():
+    """cocotb 2.1+ exposes SUPPORTED_RUNNERS; register() adds xezim to it."""
+    supported = getattr(cocotb_tools.runner, "SUPPORTED_RUNNERS", None)
+    if supported is not None:
+        assert supported["xezim"] is xezim_runner.Xezim
