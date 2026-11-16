@@ -516,3 +516,6 @@ mod instance_array_member_reads_1108;
 mod instance_array_member_arrays_1108;
 #[path = "scheduling/struct_array_actual_paths_1110.rs"]
 mod struct_array_actual_paths_1110;
+
+#[path = "scheduling/pattern_nba_1199.rs"]
+mod pattern_nba_1199;

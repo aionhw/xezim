@@ -639,3 +639,22 @@ fn naming_the_top_module_still_dumps_the_whole_design() {
         d.vars
     );
 }
+
+/// IEEE 1800-2023 §21.7.1.2: union of independently depth-limited scopes.
+#[test]
+fn root_and_descendant_scopes_1195() {
+    let root = dump("root1195", "1", "tb_top");
+    let child = dump("child1195", "1", "tb_top.u_chan");
+    let expected: BTreeSet<_> = root.vars.into_iter().chain(child.vars).collect();
+    for (tag, args) in [
+        ("forward1195", "tb_top, tb_top.u_chan"),
+        ("reverse1195", "tb_top.u_chan, tb_top"),
+    ] {
+        let combined = dump(tag, "1", args);
+        assert_eq!(combined.vars.into_iter().collect::<BTreeSet<_>>(), expected);
+    }
+    assert_eq!(
+        fst_names("fst1195", &["1:tb_top", "1:tb_top.u_chan"]),
+        expected
+    );
+}
