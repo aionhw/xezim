@@ -324,7 +324,12 @@ impl Simulator {
                     if *n == 0 {
                         vm_regs[*d as usize] = Value::zero(0);
                     } else if *n == 1 {
-                        vm_regs[*d as usize] = val;
+                        // §11.8.1: "Concatenation results are unsigned, regardless
+                        // of the operands." `{1{x}}` is still a concatenation, so it
+                        // must not hand the operand's sign flag through.
+                        let mut result = val;
+                        result.is_signed = false;
+                        vm_regs[*d as usize] = result;
                     } else {
                         let result = Value::concat_refs(std::iter::repeat_n(&val, *n as usize));
                         vm_regs[*d as usize] = result;
@@ -1132,7 +1137,12 @@ impl Simulator {
                     if *n == 0 {
                         vm_regs[*d as usize] = Value::zero(0);
                     } else if *n == 1 {
-                        vm_regs[*d as usize] = val;
+                        // §11.8.1: "Concatenation results are unsigned, regardless
+                        // of the operands." `{1{x}}` is still a concatenation, so it
+                        // must not hand the operand's sign flag through.
+                        let mut result = val;
+                        result.is_signed = false;
+                        vm_regs[*d as usize] = result;
                     } else {
                         let result = Value::concat_refs(std::iter::repeat_n(&val, *n as usize));
                         vm_regs[*d as usize] = result;
@@ -3567,10 +3577,13 @@ impl Simulator {
                     if n == 0 {
                         vm_store(&mut self.vm_regs[d], 0, 0, 0, false); // Value::zero(0)
                     } else if n == 1 {
-                        if d != s {
-                            let v = self.vm_regs[s].clone();
-                            self.vm_regs[d] = v;
-                        }
+                        // §11.8.1: "Concatenation results are unsigned, regardless
+                        // of the operands." `{1{x}}` is still a concatenation, so it
+                        // must not hand the operand's sign flag through.
+                        let v = self.vm_regs[s].clone();
+                        let mut result = v;
+                        result.is_signed = false;
+                        self.vm_regs[d] = result;
                     } else {
                         // `{n{x}}` used to build a `Vec<Value>` of `n` clones
                         // (a heap allocation each, for `Wide`) and hand it to
