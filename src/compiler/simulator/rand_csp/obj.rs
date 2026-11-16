@@ -1160,6 +1160,12 @@ impl Simulator {
                 item,
                 span,
             } => {
+                if let Some(items) = self.unroll_assoc_constraint_foreach(handle, array, vars, item) {
+                    for body in items {
+                        self.csp_unroll_item(handle, parent, &body, out)?;
+                    }
+                    return Some(());
+                }
                 let names: Vec<String> = vars.iter().flatten().map(|v| v.name.clone()).collect();
                 let unroll = match parent {
                     None => {

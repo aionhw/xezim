@@ -278,6 +278,50 @@ impl Simulator {
         None
     }
 
+    /// §18.5.8.1: associative state arrays iterate their existing keys,
+    /// including string keys, rather than a numeric range of positions.
+    pub(super) fn unroll_assoc_constraint_foreach(
+        &self,
+        handle: usize,
+        array: &Expression,
+        vars: &[Option<crate::ast::Identifier>],
+        body: &ConstraintItem,
+    ) -> Option<Vec<ConstraintItem>> {
+        let [Some(var)] = vars else { return None; };
+        let (owner, name) = if Self::foreach_plain_member(array) {
+            (handle, Self::foreach_base_name(array)?)
+        } else {
+            self.csp_resolve_member_owner(handle, array)?
+        };
+        let mut class = self.heap.get(owner)?.as_ref()?.class_name.as_str();
+        loop {
+            let cd = self.module.classes.get(class)?;
+            if cd.assoc_properties.contains_key(&name) {
+                break;
+            }
+            if cd.properties.contains_key(&name) {
+                return None;
+            }
+            class = cd.extends.as_deref()?;
+        }
+        let scoped = format!("{owner}#{name}");
+        let string_keys = self.is_string_keyed_array(&scoped);
+        let mut items = Vec::new();
+        for key in self.assoc_key_strs(&scoped) {
+            let literal = if string_keys {
+                Expression::new(ExprKind::StringLiteral(decode_name_key(&key).to_string()), var.span)
+            } else if let Ok(value) = key.parse::<i64>() {
+                Self::literal_of(&Self::signed_loop_val(value), var.span)
+            } else {
+                Self::literal_of(&Value::from_u64(key.parse::<u64>().ok()?, 64), var.span)
+            };
+            let mut item = body.clone();
+            Self::subst_ident_item(&mut item, &var.name, &literal);
+            items.push(item);
+        }
+        Some(items)
+    }
+
     fn check_back_reference_item_impl(&mut self, sub: usize, item: &ConstraintItem) -> bool {
         match item {
             ConstraintItem::Block(items) => items
@@ -311,6 +355,9 @@ impl Simulator {
                 item: body,
                 ..
             } => {
+                if let Some(items) = self.unroll_assoc_constraint_foreach(sub, array, vars, body) {
+                    return items.iter().all(|it| self.check_back_reference_item_impl(sub, it));
+                }
                 let resolve_dims = |target_h: usize, arr: &Expression, name: &str| {
                     self.state_foreach_dims(target_h, arr, name, vars.len())
                         .or_else(|| self.fixed_foreach_dims(target_h, name).map(|d| d.0))

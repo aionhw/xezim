@@ -1005,11 +1005,11 @@ impl Simulator {
     /// of `su`, in declaration order. The count is a constant expression
     /// (A.6.7.1), so a parameter or localparam count is evaluated here; an
     /// integer literal needs no evaluation. None for any other pattern, a
-    /// count other than the member count, or a structure with an unpacked
-    /// array member, which keeps the existing binding.
+    /// count other than the member count. Nested member patterns retain
+    /// their own array dimensions during binding.
     pub(super) fn struct_replication_items<'a>(
         &mut self,
-        su: &crate::ast::types::StructUnionType,
+        _su: &crate::ast::types::StructUnionType,
         items: &'a [AssignmentPatternItem],
         members: usize,
     ) -> Option<Vec<&'a Expression>> {
@@ -1025,13 +1025,6 @@ impl Simulator {
             super::elaborate::struct_pattern_replication_with(items, members, &mut |count| {
                 super::elaborate::struct_pattern_count_value(&self.eval_expr(count))
             })?;
-        if super::elaborate::struct_pattern_has_array_member(
-            su,
-            &self.module.typedef_types,
-            &self.module.typedef_unpacked_dims,
-        ) {
-            return None;
-        }
         Some(expanded)
     }
 

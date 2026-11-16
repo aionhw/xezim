@@ -868,7 +868,6 @@ impl Simulator {
         let mut signed_rand_props: HashSet<String> = HashSet::default();
         // The enclosing objects of this call's chain: all but this one.
         let nested_under = self.rand_solve_chain.len().saturating_sub(1);
-        let mut left_to_enclosing = false;
         let mut cur = Some(class_name.clone());
         while let Some(cname) = cur {
             if let Some(class_def) = self.module.classes.get(&cname) {
@@ -1014,11 +1013,9 @@ impl Simulator {
                         // (`sub_object_constraints_ok`) and solves it jointly
                         // (`rand_csp_subs`).
                         if nested_under > 0 {
-                            let n = con.items.len();
                             con.items.retain(|it| {
                                 !self.rand_item_reads_enclosing(handle, it, nested_under)
                             });
-                            left_to_enclosing |= con.items.len() != n;
                         }
                         constraints.push(con);
                         // §18.5/§8.14: a base class's block names what that
@@ -1245,10 +1242,10 @@ impl Simulator {
         self.class_context_stack.push(Some(class_name.clone()));
         let mut has_post = self.class_has_method(&class_name, "post_randomize");
         let deferred_entry_len = self.rand_post_deferred.len();
-        // §18.6.2: with an item left to an enclosing solve, the values
-        // `post_randomize` may read are final only when that solve is done;
-        // the call runs it then (`rand_post_deferred`).
-        if has_post && left_to_enclosing {
+        // §18.6.2: every randomized child waits for the enclosing solve.
+        // A sibling with no back-reference can still be rewritten by the
+        // joint solve; its callback must run once, on the final values.
+        if has_post && nested_under > 0 {
             has_post = false;
             self.rand_post_defer_self = true;
         }
@@ -1355,8 +1352,6 @@ impl Simulator {
                         deferred_entry_len,
                         has_post,
                         has_rand_children,
-                        &[],
-                        false,
                     );
                 }
             }
@@ -1503,8 +1498,6 @@ impl Simulator {
                         deferred_entry_len,
                         has_post,
                         has_rand_children,
-                        &[],
-                        false,
                     );
                 }
                 out => {
@@ -2957,8 +2950,6 @@ impl Simulator {
                     deferred_entry_len,
                     has_post,
                     has_rand_children,
-                    &sub_objs,
-                    false,
                 );
             }
 
@@ -3037,8 +3028,6 @@ impl Simulator {
                             deferred_entry_len,
                             has_post,
                             has_rand_children,
-                            &sub_objs,
-                            true,
                         );
                     }
                     rand_csp::CspOutcome::Unsat if !sized && !pinned => {
@@ -3199,7 +3188,6 @@ impl Simulator {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn finish_randomize_success(
         &mut self,
         handle: usize,
@@ -3207,39 +3195,8 @@ impl Simulator {
         deferred_entry_len: usize,
         has_post: bool,
         has_rand_children: bool,
-        sub_objs: &[(String, usize)],
-        from_joint: bool,
     ) -> Value {
-        if from_joint {
-            // The joint solve rewrote the sub-objects after
-            // their own post_randomize ran: run it on the final
-            // values.
-            for (_, sub) in sub_objs {
-                let cls = self
-                    .heap
-                    .get(*sub)
-                    .and_then(|o| o.as_ref())
-                    .map(|i| i.class_name.clone());
-                // (One that waits for the call to succeed has
-                // not run yet, and runs once then.)
-                if !self.rand_post_deferred.contains(sub)
-                    && cls.is_some_and(|c| self.class_has_method(&c, "post_randomize"))
-                {
-                    self.exec_method_call(*sub, "post_randomize", &[]);
-                }
-            }
-        }
-        if nested_under > 0 {
-            // A mid-level container that owns deferred children must wait
-            // until the enclosing solve completes so post_randomize runs bottom-up.
-            if has_post {
-                if self.rand_post_deferred.len() > deferred_entry_len {
-                    self.rand_post_defer_self = true;
-                } else {
-                    self.exec_method_call(handle, "post_randomize", &[]);
-                }
-            }
-        } else {
+        if nested_under == 0 {
             // Drain deferred child post_randomize hooks before our own.
             let waiting: Vec<usize> = self.rand_post_deferred.drain(deferred_entry_len..).collect();
             let mut done: HashSet<usize> = HashSet::default();
