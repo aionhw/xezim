@@ -464,12 +464,12 @@ Each library's `vlog_startup_routines` entries run before simulation.
   `vpiAssertionDisable`, `vpiAssertionEnable`, `vpiAssertionReset`,
   `vpiAssertionKill`, `vpiAssertionEnableStep`, `vpiAssertionDisableStep`
   (`vpiAssertionClockSteps`), `vpiAssertionSysOn`, `vpiAssertionSysOff`,
-  `vpiAssertionSysEnd` and `vpiAssertionSysReset` act on concurrent assertion
+  `vpiAssertionSysEnd`, `vpiAssertionSysKill` and `vpiAssertionSysReset` act on concurrent assertion
   directives (a property declaration or instance handle is refused; step
-  enable/disable applies to the whole assertion and ignores the attempt-time
-  argument; controls share enable/disable and lock state with `$asserton`,
+  enable/disable selects the attempt by its start time; DisableStep takes
+  no step-mode argument; controls share enable/disable and lock state with `$asserton`,
   `$assertoff`, `$assertkill` and `$assertcontrol`; VPI Kill leaves the
-  assertion enabled).
+  assertion enabled; SysKill disables new attempts and retains callbacks).
 - `vpi_chk_error`, `vpi_printf`, `vpi_flush`, `vpi_compare_objects`,
   `vpi_get64`.
 - Callbacks: `vpi_register_cb` for every reason of IEEE 1800-2017 §38.36

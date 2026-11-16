@@ -101,6 +101,7 @@ extern int xezim_vpi_control_assertion(int operation, void *handle,
 #define XEZIM_vpiAssertionDisableStep   625
 #define XEZIM_vpiAssertionSysOn         627
 #define XEZIM_vpiAssertionSysReset      630
+#define XEZIM_vpiAssertionSysKill       632
 
 int vpi_control(int operation, ...) {
     int arg = 0;
@@ -114,13 +115,14 @@ int vpi_control(int operation, ...) {
         handle = va_arg(ap, void *);
         if (operation >= XEZIM_vpiAssertionKill)
             time_p = va_arg(ap, void *);
-        if (operation >= XEZIM_vpiAssertionEnableStep)
+        if (operation == XEZIM_vpiAssertionEnableStep)
             step = va_arg(ap, int);
         va_end(ap);
         return xezim_vpi_control_assertion(operation, handle, time_p, step);
     }
-    if (operation >= XEZIM_vpiAssertionSysOn &&
-        operation <= XEZIM_vpiAssertionSysReset)
+    if ((operation >= XEZIM_vpiAssertionSysOn &&
+         operation <= XEZIM_vpiAssertionSysReset) ||
+        operation == XEZIM_vpiAssertionSysKill)
         return xezim_vpi_control_assertion(operation, 0, 0, 0);
     if (operation == XEZIM_vpiStop || operation == XEZIM_vpiFinish) {
         va_list ap;

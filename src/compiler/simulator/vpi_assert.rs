@@ -28,7 +28,7 @@
 //! declaration). Control operations apply only to directives, not property
 //! declarations or instances, and `vpi_register_assertion_cb` refuses the
 //! Phase 2 action and lock reasons. `vpiAssertionEnableStep` / `DisableStep`
-//! apply to the whole assertion (ignoring the attempt time),
+//! select the attempt by its start time,
 //! `cbAssertionStepSuccess` fires for each tick an attempt remains in flight
 //! (including its start tick), and `cbAssertionStepFailure` accompanies each
 //! failure. `info` is always non-NULL (`detail` is NULL, and Disable/Enable/
@@ -66,6 +66,7 @@ const OP_SYS_ON: c_int = 627;
 const OP_SYS_OFF: c_int = 628;
 const OP_SYS_END: c_int = 629;
 const OP_SYS_RESET: c_int = 630;
+const OP_SYS_KILL: c_int = 632;
 
 // Assertion coverage properties (Annex M).
 pub(super) const ATTEMPT_COVERED: c_int = 770;
@@ -139,8 +140,6 @@ struct Target {
     /// The site, once its statement has run.
     site: Option<usize>,
     cbs: Vec<AssertCb>,
-    /// vpiAssertionEnableStep: the step reasons are reported.
-    step: bool,
 }
 
 #[derive(Default)]
@@ -152,14 +151,14 @@ pub(super) struct VpiAssertState {
     sites_seen: usize,
     next_id: u64,
     depth: u32,
-    /// Directives with step callbacks enabled via `vpiAssertionEnableStep`,
+    /// Attempts with step callbacks enabled via `vpiAssertionEnableStep`,
     /// independent of whether any callback is registered yet.
-    step_enabled: HashSet<(String, usize, u8)>,
+    step_enabled: HashSet<(String, usize, u8, u64)>,
     step_any: bool,
 }
 
-fn step_key(r: &AssertRef) -> (String, usize, u8) {
-    (r.scope.clone(), r.span_key, r.kind)
+fn step_key(r: &AssertRef, start: u64) -> (String, usize, u8, u64) {
+    (r.scope.clone(), r.span_key, r.kind, start)
 }
 
 fn known_reason(reason: c_int) -> bool {
@@ -286,7 +285,9 @@ impl Simulator {
             AssertRole::PropertyDecl => return,
         }
         // Step callbacks are off until vpiAssertionEnableStep.
-        if matches!(reason, CB_STEP_SUCCESS | CB_STEP_FAILURE) && !t.step {
+        if matches!(reason, CB_STEP_SUCCESS | CB_STEP_FAILURE)
+            && !self.vpi_assert.step_enabled.contains(&step_key(&t.aref, start))
+        {
             return;
         }
         // A snapshot: a routine may register or remove callbacks.
@@ -517,11 +518,14 @@ impl Simulator {
                     }
                 }
                 // Clause 39.5: the step callbacks are removed.
-                for t in &mut self.vpi_assert.targets {
-                    t.step = false;
-                }
                 self.vpi_assert.step_enabled.clear();
                 self.vpi_assert.step_any = false;
+                return Ok(());
+            }
+            // §39.5.1: kill pending attempts and disable new attempts,
+            // retaining callbacks so SysOn can resume their reports.
+            OP_SYS_KILL => {
+                self.assert_ctl_vpi(assert_ctl::CTL_KILL, None, 15, 7);
                 return Ok(());
             }
             OP_SYS_END => {
@@ -535,7 +539,6 @@ impl Simulator {
                 // Clause 39.5: all the callbacks are removed.
                 for t in &mut self.vpi_assert.targets {
                     t.cbs.clear();
-                    t.step = false;
                 }
                 self.vpi_assert.step_enabled.clear();
                 self.vpi_assert.step_any = false;
@@ -600,14 +603,12 @@ impl Simulator {
             }
             OP_ENABLE_STEP | OP_DISABLE_STEP => {
                 let on = op == OP_ENABLE_STEP;
-                let key = step_key(&r);
+                let start = at.ok_or("step control requires an attempt start time")?;
+                let key = step_key(&r, start);
                 if on {
                     self.vpi_assert.step_enabled.insert(key);
                 } else {
                     self.vpi_assert.step_enabled.remove(&key);
-                }
-                for ti in self.vpi_assert_targets_of(&r) {
-                    self.vpi_assert.targets[ti].step = on;
                 }
                 self.vpi_assert.step_any = !self.vpi_assert.step_enabled.is_empty();
             }
@@ -653,14 +654,12 @@ pub extern "C" fn vpi_register_assertion_cb(
         let ti = match st.targets.iter().position(|t| t.obj == obj) {
             Some(ti) => ti,
             None => {
-                let step = st.step_enabled.contains(&step_key(&aref));
                 st.targets.push(Target {
                     obj,
                     aref,
                     handle: Box::new(h.clone()),
                     site: None,
                     cbs: Vec::new(),
-                    step,
                 });
                 // Match it with its site at the next report.
                 st.sites_seen = usize::MAX;
@@ -708,12 +707,12 @@ pub extern "C" fn xezim_vpi_control_assertion(
         vpi_error(vpi::ERROR, format!("vpi_control({op}): {msg}"));
         0
     };
-    if matches!(op, OP_ENABLE_STEP | OP_DISABLE_STEP) && step != CLOCK_STEPS {
+    if op == OP_ENABLE_STEP && step != CLOCK_STEPS {
         return fail(format!(
             "step control {step} not supported (only vpiAssertionClockSteps)"
         ));
     }
-    let time = if op == OP_KILL && !time_p.is_null() {
+    let time = if matches!(op, OP_KILL | OP_ENABLE_STEP | OP_DISABLE_STEP) && !time_p.is_null() {
         let ty = unsafe { std::ptr::read_unaligned(time_p as *const c_int) };
         if ty == vpi::SIM_TIME || ty == vpi::SCALED_REAL_TIME {
             Some(unsafe { std::ptr::read_unaligned(time_p) })
@@ -723,7 +722,7 @@ pub extern "C" fn xezim_vpi_control_assertion(
     } else {
         None
     };
-    let sys = matches!(op, OP_SYS_ON | OP_SYS_OFF | OP_SYS_END | OP_SYS_RESET);
+    let sys = matches!(op, OP_SYS_ON | OP_SYS_OFF | OP_SYS_END | OP_SYS_RESET | OP_SYS_KILL);
     let r = try_active_sim("vpi_control", |sim| {
         let (aref, def_name) = if sys {
             (None, None)
