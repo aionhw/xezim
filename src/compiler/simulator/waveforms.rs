@@ -208,8 +208,7 @@ impl Simulator {
     // dump. The same copy-pasted filter backed the FST and XTrace dumps.
 
     /// Rewrite dump scope arguments into the top-relative form the signal table
-    /// uses. `None` means "no filter" — either no arguments at all, or an
-    /// argument naming the top module itself (everything lives under it).
+    /// uses. `None` means no scope arguments; an empty prefix names the top.
     pub(super) fn dump_filter_prefixes(top: &str, scopes: &[String]) -> Option<Vec<String>> {
         if scopes.is_empty() {
             return None;
@@ -218,13 +217,15 @@ impl Simulator {
         let mut out = Vec::with_capacity(scopes.len());
         for s in scopes {
             if s == top {
-                return None;
+                // §21.7.1.2: depth applies below each specified instance.
+                out.push(String::new());
+                continue;
             }
-            out.push(
-                s.strip_prefix(top_dot.as_str())
-                    .unwrap_or(s.as_str())
-                    .to_string(),
-            );
+            let prefix = s.strip_prefix(top_dot.as_str()).unwrap_or(s.as_str());
+            // An empty CLI entry or suffix does not name the top module.
+            if !prefix.is_empty() {
+                out.push(prefix.to_string());
+            }
         }
         Some(out)
     }
@@ -314,6 +315,9 @@ impl Simulator {
         match filters {
             None => level_ok(name),
             Some(fs) => fs.iter().any(|f| {
+                if f.is_empty() {
+                    return level_ok(name);
+                }
                 if name == f.as_str() {
                     return true;
                 }
