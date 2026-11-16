@@ -210,3 +210,67 @@ endmodule
         false,
     );
 }
+
+
+/// Cousin: a hierarchical-LHS continuous assign inside an inlined sub-module
+/// (`assign lp.v = ~v;`) must root its RHS in the writing scope, not resolve
+/// `v` into `lp`.
+#[test]
+fn submodule_hier_rhs_same_name() {
+    check(
+        r#"module leaf_pkg;
+    wire [1:0] v;
+endmodule
+
+module mid_mod(input logic [1:0] v);
+    leaf_pkg lp();
+    assign lp.v = ~v;
+endmodule
+
+module tb;
+    logic [1:0] v = 2'b01;
+    mid_mod mm(.v(v));
+    initial begin
+        #5;
+        if (mm.lp.v !== 2'b10) begin
+            $display("FAIL got %b, expected 10", mm.lp.v);
+        end else begin
+            $display("PASS");
+        end
+        $finish;
+    end
+endmodule
+"#,
+        &["PASS"],
+        false,
+    );
+}
+
+/// #1095 cousin: a signed input formal bound to an unsigned part-select
+/// (`u[31:0]`) must keep the formal's signedness (§23.3.3.8, §11.8.1).
+#[test]
+fn signed_formal_unsigned_select_port() {
+    check(
+        r#"module m_signed(input int p, output longint o);
+    assign o = p;
+endmodule
+
+module tb;
+    logic [31:0] u = -5;
+    longint o;
+    m_signed dut(.p(u[31:0]), .o(o));
+    initial begin
+        #1;
+        if (o !== -64'sd5) begin
+            $display("FAIL got %0d, expected -5", o);
+        end else begin
+            $display("PASS");
+        end
+        $finish;
+    end
+endmodule
+"#,
+        &["PASS"],
+        false,
+    );
+}
