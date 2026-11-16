@@ -219,9 +219,8 @@ def test_vpi_lib_resolves_with_and_without_lib_name_path(monkeypatch):
     assert r._vpi_lib == expected
 
 
-def test_as_sv_literal_import_fallback(monkeypatch):
-    """xezim_runner resolves cocotb_tools.runner.as_sv_literal (2.1+) and
-    falls back to _as_sv_literal (2.0.x)."""
+def test_define_values_follow_runner_version(monkeypatch):
+    """Use implicit HDL conversion only with the 2.0 runner API."""
     runner_path = Path(xezim_runner.__file__)
     supported = getattr(cocotb_tools.runner, "SUPPORTED_RUNNERS", None)
 
@@ -240,7 +239,10 @@ def test_as_sv_literal_import_fallback(monkeypatch):
             assert spec is not None and spec.loader is not None
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            assert mod.as_sv_literal("x") == f"{tag}:x"
+            expected = "2.0:x" if tag == "2.0" else "x"
+            assert mod.Xezim._get_define_options(None, {"MSG": "x", "FLAG": None}) == [
+                "-D", f"MSG={expected}", "-D", "FLAG"
+            ]
 
 
 def test_supported_runners_includes_xezim():
