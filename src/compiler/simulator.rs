@@ -365,7 +365,8 @@ fn method_boost_enabled() -> bool {
 // §23.3.2, §7.4: an element of a multidimensional array member of an instance-array element.
 // §6.19.5: enumeration methods take the receiver's declared enumeration.
 // §6.20: procedural parameters retain their own type and declaration kind.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_307b;
+// Scope-specific combinational dependency resolution (§23.6).
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_307c;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never

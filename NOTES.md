@@ -81,6 +81,25 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* Generated structure members retain independent storage, associative-array
+  keys, strings, events and packed struct/enum dimensions (§7.2, §7.4.1,
+  §23.6). Generated collection calls keep separate receiver-cache entries.
+  Top-scope combinational work clears an invoking instance's scope.
+
+* Assignment indexes with side effects are captured before aggregate probes;
+  a part-select RHS no longer evaluates `array[index++]` twice (§11.4.1,
+  #1182). Hierarchical reads preserve their target despite a same-named
+  local, including packed-select observers (#1183).
+
+* Constant evaluation preserves parameter overrides across function calls,
+  typed patterns and array sizing. Compiled artifacts and method caches
+  are refreshed for changed elaboration and scope resolution.
+
+* Nested randomization callbacks run once on final values and do not run
+  after a failed enclosing solve. Back-reference constraints iterate
+  associative state keys (§18.5, §18.6.2). Outer structure replication
+  preserves every array member's pattern and element conversion (§10.9.2).
+
 * The cocotb runner (`contrib/cocotb/xezim_runner.py`) loads with cocotb 2.1,
   which renamed `_as_sv_literal` and removed `cocotb_tools.config.lib_name`, and
   passes `defines` the way cocotb 2.1's own runners do, as written; with
