@@ -4629,4 +4629,3 @@ pub fn lower_two_state(
         writes_span: writes_span.into_boxed_slice(),
     })
 }
-
