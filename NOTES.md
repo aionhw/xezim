@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Maintenance:** Move two-state bytecode lowering and its existing compiler tests into dedicated modules, preserving the compiler's public paths (#961).
+
 - **Documentation:** Explain balanced `dist` schedules, seed-dependent ordering, and why equal histograms do not imply ignored seeds (#978).
 
 - **Correctness:** Keep package arrays separate from same-named module arrays, preserve class ownership in packed-struct array accesses, and construct the declared class in anonymous struct-array fields (#1147, #1132).
