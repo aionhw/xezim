@@ -446,7 +446,7 @@ fn run_vpi_common(tag: &str, body_c: &str, sv: &str) -> String {
 /// IEEE 1800-2017 Clause 39.5 / §20.12: `vpiAssertionSysOff` opens a quiet
 /// window across clock edges (no `START` inside, `START` on the first edge
 /// after `vpiAssertionSysOn`), and `vpiAssertionSysEnd` removes callbacks so a
-/// subsequent `$asserton` resumes assertion attempts without firing callbacks.
+/// subsequent `$asserton` cannot resume assertion attempts.
 #[test]
 fn vpi_assertion_sys_end_and_sys_off_windows() {
     let c = r#"
@@ -475,6 +475,8 @@ static PLI_INT32 t_sys(PLI_BYTE8 *ud) {
 }
 static PLI_INT32 t_check(PLI_BYTE8 *ud) {
     (void)ud;
+    CHECK(vpi_control(vpiAssertionSysOn, NULL) == 0, "ended system refuses restart");
+    CHECK(vpi_register_assertion_cb(a_h, cbAssertionStart, on_cb, NULL) == NULL, "ended system refuses registration");
     vpi_printf("COVER_SUCCESS=%d\n", (int)vpi_get(vpiAssertSuccessCovered, c_h));
     vpi_printf("ERRORS=%d\n", errors);
     return 0;
@@ -499,8 +501,8 @@ module top;
     #10 $t_sys(628); // t=10: vpiAssertionSysOff
     #20 $t_sys(627); // t=30: vpiAssertionSysOn (edges 15, 25 inside window)
     #10 $t_sys(629); // t=40: vpiAssertionSysEnd (after edge 35)
-    #2 $asserton(0, top); // t=42: re-enables assertions after SysEnd
-    #20; // t=62: edges 45 and 55 pass with A attempting
+    #2 $asserton(0, top); // t=42: cannot re-enable assertions after SysEnd
+    #20; // t=62: edges 45 and 55 cannot start attempts
     $t_check;
     $display("RESULT: PASSED");
     $finish;
@@ -528,9 +530,9 @@ endmodule
     assert!(!log.contains("A_ACTION t=15"), "{log}");
     assert!(!log.contains("A_ACTION t=25"), "{log}");
     assert_eq!(log.matches("A_ACTION t=35\n").count(), 1, "{log}");
-    assert_eq!(log.matches("A_ACTION t=45\n").count(), 1, "{log}");
-    assert_eq!(log.matches("A_ACTION t=55\n").count(), 1, "{log}");
-    assert_eq!(log.matches("COVER_SUCCESS=4").count(), 1, "{log}");
+    assert!(!log.contains("A_ACTION t=45"), "{log}");
+    assert!(!log.contains("A_ACTION t=55"), "{log}");
+    assert_eq!(log.matches("COVER_SUCCESS=2").count(), 1, "{log}");
 }
 
 /// IEEE 1800-2017 Clause 39.5: `vpiAssertionKill` with a specific attempt start
@@ -1061,7 +1063,7 @@ endmodule
 }
 
 /// IEEE 1800-2017 Clause 39.5 / §20.12: `vpiAssertionSysReset` and
-/// `vpiAssertionSysEnd` respect assertion lock, and `vpiAssertionSysReset`
+/// lock state interact: reset respects locks, end terminates all attempts. Reset
 /// notifies targets whose statement has not yet run.
 #[test]
 fn vpi_assertion_sys_reset_end_lock_and_unbound() {
@@ -1127,8 +1129,8 @@ module top;
     #2 b = 1;        // t=34: attempts start at t=35
     #3 b = 0;        // t=37
     $assertcontrol(1, 1, 7, 0, top.A); // Lock A again
-    #3 $t_sys_end;   // t=40: B killed & disabled; locked A keeps attempt 35
-    #20;             // t=60: A attempt 35 fails at t=55
+    #3 $t_sys_end;   // t=40: both attempts terminated, including locked A
+    #20;             // t=60: neither attempt reaches its failure action
     $t_check;
     $display("RESULT: PASSED");
     $finish;
@@ -1159,13 +1161,15 @@ endmodule
             "CB U RESET t=32 start=32",
             "CB A START t=35 start=35",
             "CB B START t=35 start=35",
+            "CB A KILL t=40 start=35",
             "CB B KILL t=40 start=35",
+            "CB A DISABLE t=40 start=40",
             "CB B DISABLE t=40 start=40",
         ],
         "unexpected CB transcript:\n{log}"
     );
     assert_eq!(log.matches("A_ACTION_FAIL t=25").count(), 1, "{log}");
-    assert_eq!(log.matches("A_ACTION_FAIL t=55").count(), 1, "{log}");
+    assert!(!log.contains("A_ACTION_FAIL t=55"), "{log}");
     assert!(!log.contains("B_ACTION_FAIL"), "{log}");
 }
 
