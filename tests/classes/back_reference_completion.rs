@@ -2,12 +2,17 @@
 //! state keys and invoke each child's callback once, after the joint solve.
 fn check(src: &str) {
     let sim = xezim::simulate(src, 1000).expect("simulate");
-    assert!(sim.output.iter().any(|o| o.message == "T|PASS"), "{:?}", sim.output);
+    assert!(
+        sim.output.iter().any(|o| o.message == "T|PASS"),
+        "{:?}",
+        sim.output
+    );
 }
 
 #[test]
 fn sibling_callbacks_run_once_on_final_values() {
-    check(r#"
+    check(
+        r#"
 typedef class txn;
 class sibling;
   rand bit [7:0] x;
@@ -42,12 +47,14 @@ module top;
   $display("T|PASS");
  end
 endmodule
-"#);
+"#,
+    );
 }
 
 #[test]
 fn associative_state_constraints_check_string_and_numeric_keys() {
-    check(r#"
+    check(
+        r#"
 typedef class txn;
 class policy;
   txn item;
@@ -78,12 +85,14 @@ module top;
   $display("T|PASS");
  end
 endmodule
-"#);
+"#,
+    );
 }
 
 #[test]
 fn failed_enclosing_solve_does_not_run_child_callbacks() {
-    check(r#"
+    check(
+        r#"
 typedef class txn;
 class child;
   rand bit [7:0] x;
@@ -108,5 +117,6 @@ module top;
   $display("T|PASS");
  end
 endmodule
-"#);
+"#,
+    );
 }

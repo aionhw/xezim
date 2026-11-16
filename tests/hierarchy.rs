@@ -496,3 +496,6 @@ mod net_alias_groups_1092;
 mod generate_net_port_actuals_1093;
 #[path = "hierarchy/generate_real_struct_members_1099.rs"]
 mod generate_real_struct_members_1099;
+
+#[path = "hierarchy/rooted_packed_scope.rs"]
+mod rooted_packed_scope;

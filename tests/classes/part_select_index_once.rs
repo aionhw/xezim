@@ -1,7 +1,8 @@
 //! §11.4.1 / §10.4: assignment selectors run once before aggregate probes.
 #[test]
 fn part_select_rhs_preserves_single_index_evaluation() {
-    let sim = xezim::simulate(r#"typedef struct packed { logic [63:0] data; } chunk;
+    let sim = xezim::simulate(
+        r#"typedef struct packed { logic [63:0] data; } chunk;
 class Packet;
   chunk slots[];
   function new(); slots=new[8]; endfunction
@@ -30,6 +31,13 @@ endclass
 module top;
   initial begin Writer w=new; w.run(); $finish; end
 endmodule
-"#, 1000).expect("simulate");
-    assert!(sim.output.iter().any(|line| line.message == "T|PASS"), "{:?}", sim.output);
+"#,
+        1000,
+    )
+    .expect("simulate");
+    assert!(
+        sim.output.iter().any(|line| line.message == "T|PASS"),
+        "{:?}",
+        sim.output
+    );
 }

@@ -56,7 +56,8 @@ fn replicated_array_member_contexts_and_guards() {
 /// member's inner array pattern and element conversion.
 #[test]
 fn outer_structure_replication_binds_every_array_member() {
-    check(r#"
+    check(
+        r#"
 module top;
   typedef struct {int a[2]; int b[2];} pair;
   typedef struct {logic signed [15:0] a[2]; logic signed [15:0] b[2];} signed_pair;
@@ -70,5 +71,7 @@ module top;
     $display("T|%h %h %h %h",q.a[0],q.a[1],q.b[0],q.b[1]);
   end
 endmodule
-"#, &["T|7 7 7 7", "T|ff80 ff80 ff80 ff80"]);
+"#,
+        &["T|7 7 7 7", "T|ff80 ff80 ff80 ff80"],
+    );
 }
