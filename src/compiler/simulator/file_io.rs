@@ -957,21 +957,39 @@ impl Simulator {
                 return Some(name);
             }
         }
-        if self.module.arrays.contains_key(&*resolved) {
-            return Some(resolved.to_string());
+        let ExprKind::Ident(hier) = &expr.kind else {
+            return None;
+        };
+        // Names that belong to the running subroutine or object are not module
+        // memories, so these checks come before any array lookup. A resolved
+        // name that differs from the spelling and is a registered array is a
+        // local array's own storage, which wins over a scalar of that spelling.
+        if self.frame_bound_bare_name(hier).is_some() {
+            return None;
         }
-        if self.module.arrays.contains_key(&raw) {
-            return Some(raw);
+        // `obj.prop` through a class handle is a property, not a memory (array
+        // properties were taken above). Longer chains, such as `obj.vif.mem`,
+        // resolve through the handle's members as usual.
+        if hier.path.len() == 2
+            && self
+                .eval_ident_handle(&hier.path[0].name.name)
+                .is_some_and(|h| self.heap.get(h).is_some_and(|o| o.is_some()))
+        {
+            return None;
         }
-        if let Some(found) = self.module.arrays.keys().find(|k| {
-            *k == &resolved
-                || *k == &raw
-                || k.ends_with(&format!(".{}", resolved))
-                || k.ends_with(&format!(".{}", raw))
-        }) {
-            return Some(found.clone());
+        let bare = hier.path.len() == 1 && hier.path[0].selects.is_empty();
+        if bare
+            && !(resolved.as_ref() != raw && self.module.arrays.contains_key(resolved.as_ref()))
+            && self.scalar_hides_module_coll(hier.path[0].name.name.as_str())
+        {
+            return None;
         }
-        None
+        // `resolved` carries the scope or local storage the name refers to
+        // here, so it is tried before the spelled path.
+        [resolved.as_ref(), raw.as_str()]
+            .into_iter()
+            .find(|n| self.module.arrays.contains_key(*n))
+            .map(str::to_string)
     }
 
     /// The memory a `$readmem*` / `$writemem*` call names, with its
