@@ -2922,6 +2922,34 @@ impl<'a> Builder<'a> {
                             }
                             continue;
                         }
+                        if let StatementKind::ParamDecl {
+                            data_type,
+                            declarators,
+                            ..
+                        } = &s.kind
+                        {
+                            let sub = Ctx {
+                                scope: inner,
+                                flat_prefix: self.m.scopes[inner as usize].flat_prefix.clone(),
+                                flat_suffix: self.m.scopes[inner as usize].flat_suffix.clone(),
+                                automatic: false,
+                                ..ctx.clone()
+                            };
+                            for d in declarators {
+                                let t = self.tdesc(data_type, &d.dimensions, &sub);
+                                self.declare(
+                                    &d.name,
+                                    t,
+                                    0,
+                                    c::NO_DIRECTION,
+                                    false,
+                                    false,
+                                    d.span,
+                                    &sub,
+                                );
+                            }
+                            continue;
+                        }
                     }
                     self.walk_stmt(s, inner, ctx);
                 }
@@ -3801,6 +3829,16 @@ impl<'a> Builder<'a> {
                     for d in declarators {
                         let t = self.tdesc(data_type, &d.dimensions, &sub);
                         self.declare(&d.name, t, 0, c::NO_DIRECTION, false, auto, d.span, &sub);
+                    }
+                }
+                StatementKind::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
+                } => {
+                    for d in declarators {
+                        let t = self.tdesc(data_type, &d.dimensions, &sub);
+                        self.declare(&d.name, t, 0, c::NO_DIRECTION, false, false, d.span, &sub);
                     }
                 }
                 _ => self.walk_stmt(st, s, &sub),

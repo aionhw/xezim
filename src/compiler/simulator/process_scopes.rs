@@ -478,7 +478,8 @@ impl Simulator {
     pub(super) fn for_each_decl_name<'a>(stmt: &'a Statement, f: &mut dyn FnMut(&'a str, bool)) {
         let mut walk = |s: &'a Statement| Self::for_each_decl_name(s, f);
         match &stmt.kind {
-            StatementKind::VarDecl { declarators, .. } => {
+            StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } => {
                 for d in declarators {
                     f(&d.name.name, !d.dimensions.is_empty());
                 }
@@ -1134,76 +1135,19 @@ impl Simulator {
                         names.insert(d.name.name.clone());
                         let mut storage = d.clone();
                         storage.init = None;
-                        // §6.20.2: an UNTYPED block-scope `localparam` is
-                        // SELF-DETERMINED from its initializer (the parser
-                        // keeps it `Implicit`). Hoisting strips the init into
-                        // a separate assignment, so the allocated cell must
-                        // carry the initializer's width — an `Implicit` cell
-                        // would collapse to 1-bit and truncate `4'd0-4'd1`
-                        // (15) / `24` to 0. Size it to the RHS width so the
-                        // subsequent `f.Q = <rhs>` assignment sizes the value
-                        // self-determinately.
-                        let sd_lp = matches!(
-                            data_type,
-                            crate::ast::types::DataType::Implicit {
-                                dimensions, ..
-                            } if dimensions.is_empty()
-                        );
-                        let mut alloc_dt = data_type.clone();
-                        let mut init_rhs: Option<Expression> = None;
-                        if let Some(init) = &d.init {
+                        let init_rhs: Option<Expression> = d.init.as_ref().map(|init| {
                             let empty = std::collections::HashSet::new();
-                            let rhs = super::elaborate::rewrite_expr(
+                            super::elaborate::rewrite_expr(
                                 init,
                                 "",
                                 formals,
                                 &empty,
                                 &HashMap::default(),
-                            );
-                            if sd_lp {
-                                if let Some(sw) = super::elaborate::untyped_param_width(
-                                    &rhs,
-                                    &module.parameters,
-                                ) {
-                                    let hi = Expression::new(
-                                        ExprKind::Number(NumberLiteral::Integer {
-                                            size: Some(32),
-                                            signed: false,
-                                            base: NumberBase::Decimal,
-                                            value: if sw >= 1 { (sw - 1).to_string() } else {
-                                                "0".to_string()
-                                            },
-                                            cached_val: crate::ast::cache::LiteralCache::new(None),
-                                        }),
-                                        s.span,
-                                    );
-                                    let lo = Expression::new(
-                                        ExprKind::Number(NumberLiteral::Integer {
-                                            size: Some(32),
-                                            signed: false,
-                                            base: NumberBase::Decimal,
-                                            value: "0".to_string(),
-                                            cached_val: crate::ast::cache::LiteralCache::new(None),
-                                        }),
-                                        s.span,
-                                    );
-                                    alloc_dt = crate::ast::types::DataType::IntegerVector {
-                                        kind: crate::ast::types::IntegerVectorType::Logic,
-                                        signing: None,
-                                        dimensions: vec![crate::ast::types::PackedDimension::Range {
-                                            left: Box::new(hi),
-                                            right: Box::new(lo),
-                                            span: s.span,
-                                        }],
-                                        span: s.span,
-                                    };
-                                }
-                            }
-                            init_rhs = Some(rhs);
-                        }
+                            )
+                        });
                         allocate.push(Statement::new(
                             StatementKind::VarDecl {
-                                data_type: alloc_dt,
+                                data_type: data_type.clone(),
                                 lifetime: Some(crate::ast::types::Lifetime::Static),
                                 declarators: vec![storage],
                             },
@@ -1757,7 +1701,9 @@ impl Simulator {
                 let mark = enclosing.len();
                 let mut mine: Vec<String> = Vec::new();
                 for c in stmts.iter() {
-                    if let StatementKind::VarDecl { declarators, .. } = &c.kind {
+                    if let StatementKind::VarDecl { declarators, .. }
+                    | StatementKind::ParamDecl { declarators, .. } = &c.kind
+                    {
                         for d in declarators {
                             if (unlabeled || !d.dimensions.is_empty())
                                 && (claims(&d.name.name)
@@ -1849,9 +1795,12 @@ impl Simulator {
 
     /// Does a block declare variables directly (§6.21: it then opens a scope)?
     pub(super) fn stmts_declare_vars(stmts: &[Statement]) -> bool {
-        stmts
-            .iter()
-            .any(|s| matches!(s.kind, StatementKind::VarDecl { .. }))
+        stmts.iter().any(|s| {
+            matches!(
+                s.kind,
+                StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. }
+            )
+        })
     }
 
     /// The statements a blocking loop or branch body splices into the process
@@ -1906,13 +1855,18 @@ impl Simulator {
             && let Some((_, syncs)) = self.static_local_syncs.last_mut()
         {
             for s in stmts {
-                if let StatementKind::VarDecl {
-                    lifetime,
-                    declarators,
-                    ..
-                } = &s.kind
-                    && !matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
-                {
+                let hide_decls = match &s.kind {
+                    StatementKind::VarDecl {
+                        lifetime,
+                        declarators,
+                        ..
+                    } if !matches!(lifetime, Some(crate::ast::types::Lifetime::Static)) => {
+                        Some(declarators)
+                    }
+                    StatementKind::ParamDecl { declarators, .. } => Some(declarators),
+                    _ => None,
+                };
+                if let Some(declarators) = hide_decls {
                     for d in declarators {
                         let nm = &d.name.name;
                         if !self.static_local_names.contains(nm) {
@@ -1930,17 +1884,24 @@ impl Simulator {
             }
         }
         for s in stmts {
-            let StatementKind::VarDecl {
-                data_type,
-                lifetime,
-                declarators,
-            } = &s.kind
-            else {
-                continue;
+            let (data_type, is_static, declarators) = match &s.kind {
+                StatementKind::VarDecl {
+                    data_type,
+                    lifetime,
+                    declarators,
+                } => (
+                    data_type,
+                    matches!(lifetime, Some(crate::ast::types::Lifetime::Static)),
+                    declarators,
+                ),
+                StatementKind::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
+                } => (data_type, false, declarators),
+                _ => continue,
             };
-            if sv.static_mark.is_none()
-                && matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
-            {
+            if sv.static_mark.is_none() && is_static {
                 sv.static_mark = self
                     .static_local_syncs
                     .last()
@@ -2056,13 +2017,18 @@ impl Simulator {
         }
         let forked = self.next_pid != sv.pid_mark;
         for s in stmts {
-            let StatementKind::VarDecl {
-                data_type,
-                declarators,
-                ..
-            } = &s.kind
-            else {
-                continue;
+            let (data_type, declarators) = match &s.kind {
+                StatementKind::VarDecl {
+                    data_type,
+                    declarators,
+                    ..
+                }
+                | StatementKind::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
+                } => (data_type, declarators),
+                _ => continue,
             };
             let plain = Self::type_is_plain_scalar(data_type);
             for d in declarators {
@@ -2158,7 +2124,9 @@ impl Simulator {
             return None;
         }
         for s in stmts {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 for d in declarators {
                     let nm = d.name.name.as_str();
                     if names.iter().any(|n| n == nm)
@@ -2894,6 +2862,7 @@ impl Simulator {
             | Continue
             | ProceduralContinuous(_)
             | VarDecl { .. }
+            | ParamDecl { .. }
             | Typedef(_)
             | Coverpoint { .. }
             | Cross { .. }

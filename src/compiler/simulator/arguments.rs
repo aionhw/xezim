@@ -3376,7 +3376,8 @@ impl Simulator {
     pub(super) fn collect_decl_names(stmts: &[Statement], out: &mut HashSet<String>) {
         for st in stmts {
             match &st.kind {
-                StatementKind::VarDecl { declarators, .. } => {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => {
                     for d in declarators {
                         out.insert(d.name.name.clone());
                     }
@@ -3420,7 +3421,9 @@ impl Simulator {
                 lifetime: Some(crate::ast::types::Lifetime::Static),
                 ..
             } => false,
-            StatementKind::Null | StatementKind::VarDecl { .. } => true,
+            StatementKind::Null
+            | StatementKind::VarDecl { .. }
+            | StatementKind::ParamDecl { .. } => true,
             StatementKind::Break | StatementKind::Continue => true,
             StatementKind::Return(e) => e.as_ref().is_none_or(|e| self.expr_is_pure(e, locals)),
             StatementKind::BlockingAssign { lvalue, rvalue } => {

@@ -454,6 +454,28 @@ impl Ctx<'_> {
                 }
                 out
             }
+            StatementKind::ParamDecl {
+                is_local,
+                data_type,
+                declarators,
+            } => {
+                let mut out_decls = Vec::with_capacity(declarators.len());
+                for d in declarators {
+                    let mut d = d.clone();
+                    if let Some(e) = &mut d.init {
+                        self.expr(e)?;
+                    }
+                    out_decls.push(d);
+                }
+                vec![Statement::new(
+                    StatementKind::ParamDecl {
+                        is_local: *is_local,
+                        data_type: data_type.clone(),
+                        declarators: out_decls,
+                    },
+                    span,
+                )]
+            }
             StatementKind::BlockingAssign { lvalue, rvalue } => {
                 if let Some(n) = bare_name(lvalue)
                     && let Some(ms) = self.members_of(n)

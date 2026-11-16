@@ -817,6 +817,11 @@ impl Simulator {
                     data_type,
                     declarators,
                     ..
+                }
+                | SK::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
                 } => {
                     if let Some(cls) = sim.typeref_class_name(data_type) {
                         for d in declarators {
@@ -872,6 +877,11 @@ impl Simulator {
         use crate::ast::stmt::StatementKind as SK;
         match &st.kind {
             SK::VarDecl {
+                data_type,
+                declarators,
+                ..
+            }
+            | SK::ParamDecl {
                 data_type,
                 declarators,
                 ..
@@ -1691,7 +1701,8 @@ impl Simulator {
         };
         fn walk(s: &crate::ast::stmt::Statement, f: &dyn Fn(&DataType) -> bool) -> bool {
             match &s.kind {
-                StatementKind::VarDecl { data_type, .. } => f(data_type),
+                StatementKind::VarDecl { data_type, .. }
+                | StatementKind::ParamDecl { data_type, .. } => f(data_type),
                 StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                     stmts.iter().any(|s| walk(s, f))
                 }
@@ -3461,6 +3472,11 @@ impl Simulator {
         // compiler declines a `$cast` with such a destination instead.
         for st in body {
             if let crate::ast::stmt::StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            }
+            | crate::ast::stmt::StatementKind::ParamDecl {
                 data_type,
                 declarators,
                 ..

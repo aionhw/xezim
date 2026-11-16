@@ -174,6 +174,11 @@ impl Simulator {
                 data_type,
                 declarators,
                 ..
+            }
+            | StatementKind::ParamDecl {
+                data_type,
+                declarators,
+                ..
             } = &st.kind
                 && let Some(d) = declarators.iter().find(|d| d.name.name == name)
             {
@@ -347,6 +352,7 @@ impl Simulator {
             | StatementKind::Continue
             | StatementKind::ProceduralContinuous(_)
             | StatementKind::VarDecl { .. }
+            | StatementKind::ParamDecl { .. }
             | StatementKind::Typedef(_)
             | StatementKind::Coverpoint { .. }
             | StatementKind::Cross { .. }
