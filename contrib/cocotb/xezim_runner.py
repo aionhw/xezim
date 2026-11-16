@@ -35,11 +35,12 @@ from typing import List, Mapping, Sequence, Union
 import cocotb_tools.config
 from cocotb_tools.runner import VHDL, Runner, Verilog
 
-# cocotb 2.1.0 promoted `_as_sv_literal` to public `as_sv_literal`.
+# cocotb 2.0 converts Python define values to HDL literals. In 2.1 the
+# caller supplies HDL text; using its public as_sv_literal would quote twice.
 try:
-    from cocotb_tools.runner import as_sv_literal
+    from cocotb_tools.runner import _as_sv_literal as _define_value
 except ImportError:
-    from cocotb_tools.runner import _as_sv_literal as as_sv_literal
+    _define_value = str
 
 PathLike = Union[str, os.PathLike]
 _Command = List[str]
@@ -108,7 +109,7 @@ class Xezim(Runner):
             for name, value in defines.items()
             for arg in (
                 "-D",
-                name if value is None else f"{name}={as_sv_literal(value)}",
+                name if value is None else f"{name}={_define_value(value)}",
             )
         ]
 
