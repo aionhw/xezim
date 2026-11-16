@@ -54,6 +54,8 @@ mod multi_driver_contention;
 mod nameless_udp_instance;
 #[path = "gates/net_declaration_delay.rs"]
 mod net_declaration_delay;
+#[path = "gates/zero_rise_gate_net_delay.rs"]
+mod zero_rise_gate_net_delay;
 #[path = "gates/opt_pass_equivalence.rs"]
 mod opt_pass_equivalence;
 #[path = "gates/packed_member_nba_compiles.rs"]
