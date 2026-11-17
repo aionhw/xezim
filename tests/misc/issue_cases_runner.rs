@@ -820,6 +820,28 @@ fn issue_1197_stream_with_range() {
     assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
 }
 
+/// Issue #1239: a chained `always @(n.f or n.v)` nettype relay must
+/// re-evaluate when its input settles during the final cascade settle, not
+/// only on a later check_edges. Two successive relays each `assign` their
+/// net (with a resolver) from a reg that a blocking-write always block
+/// drives; the downstream relay's input changes after the cascade's last
+/// check_edges, so the relay must fire again IN THE SAME timestep (§9.4.2).
+/// Covers a 3-level chain and a second update. Expected values were checked
+/// byte-for-byte against the reference simulators.
+#[test]
+fn issue_1239_nettype_relay_chain() {
+    let msgs = outputs(
+        include_str!("../issue_cases/nettype_relay_chain_1239.sv"),
+        100_000,
+    );
+    assert!(
+        msgs.iter().any(|m| m == "PASS"),
+        "chained nettype relay must re-evaluate same-delta: {:#?}",
+        msgs
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+}
+
 /// Issue #1204: each continuous driver of a user-defined-nettype net keeps
 /// its OWN delay (§10.3.3) in front of the resolution function, and the
 /// net's declaration initializer is itself a driver. A delayed driver's
