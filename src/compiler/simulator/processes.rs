@@ -2629,6 +2629,20 @@ impl Simulator {
         match &e.kind {
             ExprKind::Paren(inner) => self.capture_intra_pattern(inner, slots, shape),
             ExprKind::AssignmentPattern(items) => {
+                if let Some(super::intra_pattern_shape::ItemShape::Struct(su)) = shape {
+                    let members = su.members.iter().map(|m| m.declarators.len()).sum();
+                    if let Some(expanded) = self.struct_replication_items(su, items, members) {
+                        // §10.9.2: each replicated member takes its own type.
+                        // Capturing the repeated expression in only the first
+                        // member's type loses wider bits and four-state values.
+                        let expanded = expanded
+                            .into_iter()
+                            .map(|e| Item::Ordered(e.clone()))
+                            .collect();
+                        let pattern = Expression::new(ExprKind::AssignmentPattern(expanded), e.span);
+                        return self.capture_intra_pattern(&pattern, slots, shape);
+                    }
+                }
                 let shapes = match shape {
                     Some(s) => self.intra_item_shapes(s, items),
                     None => Vec::new(),
