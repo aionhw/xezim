@@ -190,6 +190,8 @@ fn design_cache_key(
     let mut hash = CacheHash::new();
     hash.bytes(XEZIM_BYTECODE_MAGIC);
     hash.text(env!("CARGO_PKG_VERSION"));
+    // Record packing changes generated VHDL storage before SV elaboration.
+    hash.text("xezim-design-cache-vhd1");
     hash.text(&config.semantic_salt);
     hash.text(top_module_name.unwrap_or(""));
     // An elaboration with unobserved-port elision on leaves nets out, so it

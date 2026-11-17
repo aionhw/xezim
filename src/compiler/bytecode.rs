@@ -3728,6 +3728,15 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Only module helpers may bind bare nonlocals to module signals.
+    /// Package callees keep their own lexical scope (§26.3), including
+    /// when inlined into a module helper.
+    fn module_free_function_context(&self) -> bool {
+        self.free_function_mode
+            && self.method_class.as_deref() == Some("__free_fn__")
+            && self.inlining_stack.iter().all(|callee| !callee.contains("::"))
+    }
+
     /// §26.3: the function-table key a BARE call names from the body being
     /// compiled. Inside a package function (free-function mode under
     /// `__free_fn__<pkg>`) a name declared in several scopes resolves in the
@@ -15920,7 +15929,8 @@ impl<'a> BytecodeCompiler<'a> {
                         if self.free_function_mode
                             && !self.method_handle_names.contains(bare)
                             && !self.string_formal_names.contains(bare)
-                            && self.lookup_signal_id(hier).is_none()
+                            && !(self.module_free_function_context()
+                                && self.lookup_signal_id(hier).is_some())
                         {
                             self.bail("free_fn_pkg_variable");
                             return None;
@@ -18342,7 +18352,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // so `method_handle_chain_ok(base)` is false for them and
                 // that branch would bail. Not admitted (method/arity/receiver
                 // gate) => falls through to the pre-existing paths unchanged.
-                if (self.method_mode || self.free_function_mode)
+                if (self.method_mode || self.module_free_function_context())
                     && let ExprKind::MemberAccess { expr: base, member } = &func.kind
                     && let Some(r) = self.compile_coll_method_call(base, member.name.as_str(), args)
                 {

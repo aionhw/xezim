@@ -358,7 +358,8 @@ fn method_boost_enabled() -> bool {
 // §25.5: a modport-qualified name resolves to the interface instance's own variable.
 // §8.14: a base static that a derived class redeclares counts as a redeclared member.
 // §7.4.1: a member of an element of an ascending packed array of structs slices from slot 0.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3077;
+// Module helper reads and queue operations retain their lexical ownership.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3083;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
