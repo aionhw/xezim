@@ -3668,21 +3668,9 @@ impl Simulator {
                 } else {
                     push_raw_spec(&mut result, None);
                 }
-            } else if c == '\\' {
-                if let Some(&e) = chars.peek() {
-                    chars.next();
-                    match e {
-                        'n' => result.push('\n'),
-                        't' => result.push('\t'),
-                        '\\' => result.push('\\'),
-                        '"' => result.push('"'),
-                        _ => {
-                            result.push('\\');
-                            result.push(e);
-                        }
-                    }
-                }
             } else {
+                // Backslashes in string literals were already decoded by the lexer
+                // (§5.9.1 / §21.2.1.1), so treat `\` as an ordinary literal character.
                 result.push(c);
             }
         }
