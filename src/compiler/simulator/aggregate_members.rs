@@ -1530,21 +1530,16 @@ impl Simulator {
         // came back as the raw f64 BIT PATTERN (1.5 read as
         // 4609434218613702656). This is the read path a §6.6.7 resolution
         // function's struct return goes through — `Tsum('{...}).field1`.
+        let leaf_dt = self.struct_path_member_type(&su, &suffix);
         if leaf_is_real {
             out.is_real = true;
-        } else if let Some(dt) = self.struct_path_member_type(&su, &suffix) {
+        } else if let Some(dt) = &leaf_dt {
             // §7.2.1/§11.8.1: the slice is a raw bit pattern; the member keeps
             // its declared signedness (an `int` member read back as unsigned).
             out.is_signed = self.type_is_signed_concrete(&dt);
         }
         // §6.16: a string member travels in a fixed-width slot; the member
         // itself is the string it holds, not the slot.
-        let mut leaf_dt = Some(ret);
-        for part in &suffix {
-            if let Some(m) = part.strip_prefix('.') {
-                leaf_dt = leaf_dt.and_then(|d| self.member_decl_type(&d, m).map(|(t, _)| t));
-            }
-        }
         if leaf_dt.is_some_and(|d| Self::is_string_data_type(self.resolve_dt_ref(&d))) {
             out = Value::from_string(&out.to_sv_string());
         }
