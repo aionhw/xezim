@@ -6672,7 +6672,7 @@ impl Simulator {
                             if let Some(keys) = self.inside_operand_keys(r) {
                                 for key in keys {
                                     if let Some(ev) = self.get_signal_value_by_name(&key) {
-                                        if val.wildcard_eq(&ev).is_true() {
+                                        if Self::inside_values_equal(&val, &ev).is_true() {
                                             return Value::from_u64(1, 1);
                                         }
                                     }
@@ -6690,19 +6690,17 @@ impl Simulator {
                             if let Some(c) = self.resolve_class_scope_array_const(r) {
                                 for i in c.lo..=c.hi {
                                     if let Some(ev) = self.class_scope_array_const_elem(&c, i) {
-                                        if val.wildcard_eq(&ev).is_true() {
+                                        if Self::inside_values_equal(&val, &ev).is_true() {
                                             return Value::from_u64(1, 1);
                                         }
                                     }
                                 }
                                 continue;
                             }
-                            // §11.4.13: a set element is compared with the
-                            // tested expression using WILDCARD equality, so x/z
-                            // bits in the element are don't-cares — exactly what
-                            // `==?` does. Plain `==` missed `v inside {4'b10xx}`.
+                            // §11.4.13: real pairs use `==`; integral pairs
+                            // use `==?`, with x/z in the item as don't-cares.
                             let ev = item(self, r);
-                            if val.wildcard_eq(&ev).is_true() {
+                            if Self::inside_values_equal(&val, &ev).is_true() {
                                 return Value::from_u64(1, 1);
                             }
                         }

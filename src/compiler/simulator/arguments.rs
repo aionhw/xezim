@@ -153,9 +153,22 @@ impl Simulator {
         )
     }
 
+    /// §11.4.13 / §11.4.5: real operands use numeric equality, including
+    /// conversion of an integral operand to real; a NaN must not match itself.
+    /// Integral pairs retain wildcard equality.
+    #[inline]
+    pub(super) fn inside_values_equal(val: &Value, item: &Value) -> Value {
+        if val.is_real || item.is_real {
+            val.is_equal(item)
+        } else {
+            val.wildcard_eq(item)
+        }
+    }
+
     /// IEEE 1800-2017 §12.5.4 `case (e) inside`: an item is a range, a value or
     /// an array, matched with the same rules as the `inside` OPERATOR — ranges
-    /// are inclusive and x/z in an item are wildcards. `CaseInside` fell through
+    /// are inclusive and x/z in an item are wildcards for integral operands.
+    /// `CaseInside` fell through
     /// to exact `case_eq`, so a range item compared against a garbage value and
     /// a wildcard item never matched: both silently took `default`.
     pub(super) fn case_inside_match(&mut self, val: &Value, pat: &Expression) -> bool {
@@ -175,7 +188,7 @@ impl Simulator {
         if let Some(keys) = self.inside_operand_keys(pat) {
             for key in keys {
                 if let Some(ev) = self.get_signal_value_by_name(&key) {
-                    if val.wildcard_eq(&ev).is_true() {
+                    if Self::inside_values_equal(val, &ev).is_true() {
                         return true;
                     }
                 }
@@ -183,7 +196,7 @@ impl Simulator {
             return false;
         }
         let pv = self.eval_expr(pat);
-        val.wildcard_eq(&pv).is_true()
+        Self::inside_values_equal(val, &pv).is_true()
     }
 
     /// IEEE 1800-2017 §6.12.2: converting a real to an integral type ROUNDS to
