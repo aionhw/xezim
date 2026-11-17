@@ -4055,6 +4055,7 @@ impl Simulator {
         }
         self.enqueue_context_nba(
             NbaEntry {
+                elements: None,
                 root_frame: None,
                 lhs: key.is_none().then(|| root.into_owned()),
                 value,
@@ -4549,7 +4550,15 @@ impl Simulator {
                 } else {
                     entry.value
                 };
-                self.assign_value(&lhs, &value);
+                if let Some(elements) = entry.elements {
+                    let rhs = self.saved_array_pattern(elements, lhs.span);
+                    let stmt = Statement::new(StatementKind::BlockingAssign {
+                        lvalue: lhs.clone(), rvalue: rhs.clone(),
+                    }, lhs.span);
+                    self.exec_stmt_blocking_assign(&stmt, &lhs, &rhs);
+                } else {
+                    self.assign_value(&lhs, &value);
+                }
                 if pushed_root {
                     self.pop_local_frame();
                 }

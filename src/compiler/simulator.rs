@@ -370,7 +370,8 @@ fn method_boost_enabled() -> bool {
 // Class aggregate ownership and struct-field constructor typing (§8.8/§8.11).
 // Scoped memory destinations, dynamic rows and combinational time scope.
 // Explicit event expressions retain function-call operands and result guards.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3080;
+// Net typedef metadata and virtual-interface specialization identities.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3081;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1795,6 +1796,8 @@ pub struct SimOutput {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct NbaEntry {
+    /// §10.10: captured elements of a whole unpacked-array assignment.
+    elements: Option<Vec<Value>>,
     lhs: Option<Expression>,
     value: Value,
     resolved_id: Option<usize>,

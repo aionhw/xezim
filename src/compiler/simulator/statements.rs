@@ -4335,6 +4335,25 @@ impl Simulator {
                         return;
                     }
                 }
+                // §10.10 / §10.4.2: capture all array operands now; replace
+                // the collection only when this entry reaches the NBA region.
+                if let Some(elements) = self.capture_array_rhs(lvalue, rvalue) {
+                    let d = intra_d.unwrap_or_else(|| delay.as_ref()
+                        .map(|e| self.eval_delay_ticks(e)).unwrap_or(0));
+                    let frozen = self.freeze_lvalue_indices(lvalue);
+                    let root_frame = self.nba_root_frame(lvalue);
+                    self.enqueue_context_nba(NbaEntry {
+                        elements: Some(elements),
+                        lhs: Some(frozen),
+                        value: Value::zero(1),
+                        resolved_id: None,
+                        static_key: None,
+                        static_slice: None,
+                        this_handle: self.this_stack.last().copied().flatten(),
+                        root_frame,
+                    }, d);
+                    return;
+                }
                 // §10.8, §10.9: a pattern driven onto a packed target takes
                 // the target's declared type.
                 let packed_pattern = self.eval_pattern_for_lvalue(packed_lvalue, rvalue);
@@ -4663,6 +4682,7 @@ impl Simulator {
                 if let Some(key) = self.nba_static_key_for_lvalue(lvalue) {
                     self.enqueue_context_nba(
                         NbaEntry {
+                            elements: None,
                             lhs: None,
                             value: val.resize_for_assign(w),
                             resolved_id: None,
@@ -4686,6 +4706,7 @@ impl Simulator {
                         // §4.6 b): a partial update to this signal is already
                         // queued; `nba_fast` would commit this one first.
                         self.nba_queue.push(NbaEntry {
+                            elements: None,
                             lhs: None,
                             value: val.resize_for_assign(w),
                             resolved_id: Some(id),
@@ -4727,6 +4748,7 @@ impl Simulator {
                         let static_key = self.nba_static_key_for_lvalue(lvalue);
                         let this_handle = self.this_stack.last().copied().flatten();
                         self.nba_queue.push(NbaEntry {
+                            elements: None,
                             lhs: Some(frozen),
                             value: qval,
                             resolved_id: None,
@@ -4771,6 +4793,7 @@ impl Simulator {
                     let this_handle = self.this_stack.last().copied().flatten();
                     self.enqueue_context_nba(
                         NbaEntry {
+                            elements: None,
                             lhs: Some(frozen),
                             value: qval,
                             resolved_id: None,
