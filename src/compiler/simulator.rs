@@ -14029,6 +14029,8 @@ impl RandColl {
 enum SizeCon {
     /// `a.size() == E` — E already evaluated.
     Eq(u64),
+    /// `a.size() == E` with a negative signed target or one above the trial cap.
+    Impossible,
     /// `a.size() inside {…}` — the ranges already evaluated.
     In(Vec<(u64, u64)>),
     /// `a.size() < E`, `>= E`, … — E already evaluated.
