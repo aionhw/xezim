@@ -271,6 +271,8 @@ mod range_select_param_arith;
 mod real_conversion_of_integral_operands;
 #[path = "types/real_literal_comb_eval.rs"]
 mod real_literal_comb_eval;
+#[path = "types/real_fill_literals.rs"]
+mod real_fill_literals;
 #[path = "types/real_valued_delay.rs"]
 mod real_valued_delay;
 #[path = "types/scoped_type_cast.rs"]
