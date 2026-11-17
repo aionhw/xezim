@@ -42,11 +42,34 @@ impl Simulator {
                     .any(|m| m.contains_key(&*name))
             });
         if in_any_frame {
+            if let Some(flag) = self.task_frame_string_flag(name.as_ref()) {
+                return flag;
+            }
             if let Some(t) = self.var_class_types.get(&*name) {
                 return t == "string";
             }
             if let Some(t) = self.var_typedef_types.get(&*name) {
                 return t == "string";
+            }
+            if !self.method_local_base.is_empty() {
+                return self.string_signals.contains(name.as_ref());
+            }
+        } else {
+            let active_cls = self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+                .map(|i| i.class_name.as_str())
+                .or_else(|| self.class_context_stack.last().and_then(|c| c.as_deref()));
+            if let Some(cls) = active_cls {
+                if self.class_declares_property(cls, name.as_ref()) {
+                    return self
+                        .class_string_props_of(cls)
+                        .iter()
+                        .any(|p| p == name.as_ref());
+                }
             }
         }
         if let Some(t) = self

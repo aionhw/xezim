@@ -3771,12 +3771,20 @@ impl Simulator {
     /// would otherwise read an empty string and silently produce wrong
     /// output (e.g. table printers emitting columns with no padding).
     pub(super) fn get_local_signal_or_static(&mut self, name: &str) -> Option<Value> {
-        if let Some(v) = self.get_local_or_signal(name) {
-            return Some(v);
-        }
-        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
-            if let Some(v) = self.class_static_get(&ctx, name) {
-                return Some(v);
+        // §23.9 / §8.11: lexical scope precedence inside an active routine:
+        // local/formal frame -> `this` instance property -> class static ->
+        // enclosing module signal. Checking module signals first caused a
+        // same-named outer variable (e.g. `int value` or `S value`) to hide
+        // a class property `string value`.
+        if let Some(&base) = self.method_local_base.last() {
+            for m in self.local_stack.get(base..).unwrap_or(&[]).iter().rev() {
+                if let Some(v) = m.get(name) {
+                    return Some(v.clone());
+                }
+            }
+        } else if let Some(m) = self.local_stack.last() {
+            if let Some(v) = m.get(name) {
+                return Some(v.clone());
             }
         }
         // §8.10/§6.16: an INSTANCE property as a built-in method receiver —
@@ -3798,7 +3806,12 @@ impl Simulator {
                 return Some(v.clone());
             }
         }
-        None
+        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            if let Some(v) = self.class_static_get(&ctx, name) {
+                return Some(v);
+            }
+        }
+        self.get_signal_value_by_name(name)
     }
 
     /// Set a loop index/iteration variable. Writes to the current call frame's

@@ -1436,6 +1436,25 @@ impl Simulator {
         false
     }
 
+    pub(super) fn class_declares_nonstatic_collection(&self, class_name: &str, prop: &str) -> bool {
+        let mut cur: Option<&str> = Some(class_name);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            if !cd.static_properties.contains(prop)
+                && (cd.queue_properties.contains_key(prop)
+                    || cd.assoc_properties.contains_key(prop)
+                    || cd.array_properties.contains_key(prop)
+                    || cd.array_nd_properties.contains_key(prop))
+            {
+                return true;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
     /// §6.20.3/§8.25: the design typedef that a formal of a method of
     /// `cname` declared through one of its class type parameters (`T item`)
     /// names in the object `handle`, before the call's frame is entered.

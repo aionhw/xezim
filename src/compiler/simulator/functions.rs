@@ -719,6 +719,8 @@ impl Simulator {
         // above, in the caller's context.
         self.this_stack.push(None);
         self.class_context_stack.push(None);
+        self.method_local_base
+            .push(self.local_stack.len().saturating_sub(1));
         // Track the running subroutine name so `%m` inside a package function
         // resolves to `<pkg>.<name>` (see the `%m` formatter). Popped after the
         // body; recursion keeps the stack ordered.
@@ -870,6 +872,7 @@ impl Simulator {
         self.m_scope_stack = saved_m_scope_fn;
         self.this_stack.pop();
         self.class_context_stack.pop();
+        self.method_local_base.pop();
         let mut result = if let Some(rv) = self.return_value.take() {
             rv
         } else if let Some(su) = self.unpacked_struct_of(&fd.return_type) {

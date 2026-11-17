@@ -1283,3 +1283,5 @@ mod duplicate_class_definition;
 
 #[path = "classes/virtual_type_specialization_231.rs"]
 mod virtual_type_specialization_231;
+#[path = "classes/property_shadowed_by_outer_name.rs"]
+mod property_shadowed_by_outer_name;

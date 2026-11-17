@@ -9,6 +9,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 ### Unreleased
 
 - **Correctness:** Preserve virtual-interface specialization identity, typedef net signing and packed members, and captured array values in deferred assignments (core #231, #1212, #1217).
+- **Correctness:** Resolve unqualified names inside class methods in active routine frames, `this` properties, and class statics before caller frames and module signals (§23.9, §8.11).
 
 - **Correctness:** Track function-call operands in explicit event controls, preserve neighboring bits when delayed slice drivers mature, and omit imported parameter aliases from waveform scopes (#1205, #1213, #1215).
 

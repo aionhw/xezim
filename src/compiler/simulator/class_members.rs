@@ -448,10 +448,13 @@ impl Simulator {
         if self.task_string_formals.is_empty() {
             return None;
         }
-        let i = self
+        let base = self.method_local_base.last().copied().unwrap_or(0);
+        let rel = self
             .local_stack
+            .get(base..)?
             .iter()
             .rposition(|f| f.contains_key(name))?;
+        let i = base + rel;
         let fgen = *self.local_gen_stack.get(i)?;
         let entry = self
             .task_string_formals
