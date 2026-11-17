@@ -767,3 +767,6 @@ mod owned_aggregate_storage_1132_1147;
 
 #[path = "types/net_typedef_metadata_1212.rs"]
 mod net_typedef_metadata_1212;
+
+#[path = "types/real_relational_unknown_bits.rs"]
+mod real_relational_unknown_bits;
