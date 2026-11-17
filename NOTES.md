@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Capture each item of an assignment pattern with an intra-assignment delay or event control in the type of the element or member it is matched to, as without the timing control, instead of at its own width (#1247).
+
 - **Correctness:** Preserve virtual-interface specialization identity, typedef net signing and packed members, and captured array values in deferred assignments (core #231, #1212, #1217).
 
 - **Correctness:** Track function-call operands in explicit event controls, preserve neighboring bits when delayed slice drivers mature, and omit imported parameter aliases from waveform scopes (#1205, #1213, #1215).
