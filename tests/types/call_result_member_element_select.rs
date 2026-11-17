@@ -7,6 +7,32 @@
 
 use xezim::simulate;
 
+/// §7.2.1, §6.16, §7.10.2.5: a projected member retains its declared
+/// string, signed integer or real type, including a queue pop result.
+#[test]
+fn unpacked_call_and_queue_members_keep_their_types() {
+    let src = r#"
+module top;
+  typedef struct { string label; int count; real weight; } row_t;
+  row_t q[$];
+  function automatic row_t make();
+    return '{ "item", -7, 1.5 };
+  endfunction
+  initial begin
+    $display("fn|%0d|%0d|%0.1f", make().label.len(), make().count < 0,
+             make().weight + 0.5);
+    q.push_back(make());
+    $display("q|%0d|%0d", q.pop_front().label.len(), q.size());
+    q.push_back(make());
+    $display("n|%0d|%0d", q.pop_back().count < 0, q.size());
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    let out: Vec<_> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert_eq!(out, ["fn|4|1|2.0", "q|4|0", "n|1|0"]);
+}
+
 #[test]
 fn call_result_member_selects_elements() {
     let src = r#"
