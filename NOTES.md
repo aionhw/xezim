@@ -12,6 +12,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 - **Correctness:** Resolve unqualified names inside class methods in active routine frames, `this` properties, and class statics before caller frames and module signals (§23.9, §8.11).
 - **Correctness:** Resolve class-member fixed, dynamic, queue, 2-D, and descending arrays in DPI open-array actuals and write-backs without cross-talk or bogus dynamic sizing (§35.5.6.1, Annex H.12).
 - **Correctness:** Treat backslashes literally in `$display`/`$sformatf`-family format strings so lexer-decoded escapes are not un-escaped twice (§5.9.1, §21.2.1.1, §21.3.3).
+- **Correctness:** Treat a `0` field width in `$fscanf` and `$sscanf` as unbounded and honor `%*` assignment suppression (§21.3.4.3).
 
 - **Correctness:** Track function-call operands in explicit event controls, preserve neighboring bits when delayed slice drivers mature, and omit imported parameter aliases from waveform scopes (#1205, #1213, #1215).
 

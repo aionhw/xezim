@@ -166,3 +166,5 @@ mod p_format_aggregates_566;
 
 #[path = "strings/format_backslash_literal.rs"]
 mod format_backslash_literal;
+#[path = "strings/scan_zero_width.rs"]
+mod scan_zero_width;
