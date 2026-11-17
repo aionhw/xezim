@@ -764,3 +764,6 @@ mod signed_named_packed_props_ports_1107;
 
 #[path = "types/owned_aggregate_storage_1132_1147.rs"]
 mod owned_aggregate_storage_1132_1147;
+
+#[path = "types/net_typedef_metadata_1212.rs"]
+mod net_typedef_metadata_1212;

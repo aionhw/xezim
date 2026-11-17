@@ -1278,3 +1278,6 @@ mod part_select_index_once;
 mod undeclared_type_name;
 #[path = "classes/duplicate_class_definition.rs"]
 mod duplicate_class_definition;
+
+#[path = "classes/virtual_type_specialization_231.rs"]
+mod virtual_type_specialization_231;
