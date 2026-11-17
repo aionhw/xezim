@@ -462,6 +462,8 @@ mod child_constant_checks_893;
 mod child_constant_package_scope_721;
 #[path = "hierarchy/const_function_instance_scope_721.rs"]
 mod const_function_instance_scope_721;
+#[path = "hierarchy/declared_type_sharing_721.rs"]
+mod declared_type_sharing_721;
 
 #[path = "hierarchy/generate_rename_scope.rs"]
 mod generate_rename_scope;
