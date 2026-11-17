@@ -906,6 +906,8 @@ mod dynamic_array_property_new_init;
 mod dynamic_array_new_in_method;
 #[path = "classes/spec_args_module_params.rs"]
 mod spec_args_module_params;
+#[path = "classes/spec_type_name_module_instance.rs"]
+mod spec_type_name_module_instance;
 #[path = "classes/null_receiver_nonvirtual_call.rs"]
 mod null_receiver_nonvirtual_call;
 #[path = "classes/builtin_class_typedef_handles.rs"]
