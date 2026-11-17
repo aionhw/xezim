@@ -526,3 +526,5 @@ mod event_call_operands_1205;
 mod array_capture_1217;
 #[path = "scheduling/intra_delay_pattern_item_width.rs"]
 mod intra_delay_pattern_item_width;
+#[path = "scheduling/replication_pattern_capture.rs"]
+mod replication_pattern_capture;
