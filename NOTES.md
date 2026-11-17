@@ -12,6 +12,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 - **Correctness:** Reject differing duplicate typedef definitions and warn on identical cross-file typedefs (§3.13, §6.18).
 - **Correctness:** Warn on redefined interfaces, programs and primitives (§3.13, §25.3).
 - **Correctness:** Store an assignment pattern item that is an unpacked array (a variable, a row or a function result) element by element into the sub-array it matches, positionally, by key or through `default:`, instead of zeros (#1233).
+- **Correctness:** Capture each item of an assignment pattern with an intra-assignment delay or event control in the type of the element or member it is matched to, as without the timing control, instead of at its own width (#1247).
 
 - **Correctness:** Preserve virtual-interface specialization identity, typedef net signing and packed members, and captured array values in deferred assignments (core #231, #1212, #1217).
 - **Correctness:** Resolve unqualified names inside class methods in active routine frames, `this` properties, and class statics before caller frames and module signals (§23.9, §8.11).
