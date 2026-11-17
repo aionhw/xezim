@@ -109,3 +109,79 @@ endmodule
 "##);
     assert_eq!(msgs, ["v8=16,1 p4=0,9"]);
 }
+
+/// §10.9.2: a replicated structure pattern evaluates each member in that
+/// member's assignment context, including when §9.4.5 captures it for later.
+#[test]
+fn replicated_struct_capture_keeps_each_member_width() {
+    let msgs = run(r##"
+module top;
+  typedef struct { logic [3:0] lo; logic [7:0] hi; } s_t;
+  logic [7:0] source = 8'hab;
+  logic [3:0] a4 = 4'd15, b4 = 4'd1;
+  s_t plain, delayed, nba, evented, event_nba, carry;
+  event e;
+  initial begin
+    plain = '{2{source}};
+    delayed = #1 '{2{source}};
+    carry = #1 '{2{a4 + b4}};
+    #1;
+    $display("plain=%h,%h delayed=%h,%h nba=%h,%h",
+             plain.lo, plain.hi, delayed.lo, delayed.hi, nba.lo, nba.hi);
+    $display("event=%h,%h event_nba=%h,%h carry=%h,%h",
+             evented.lo, evented.hi, event_nba.lo, event_nba.hi, carry.lo, carry.hi);
+  end
+  initial nba <= #1 '{2{source}};
+  initial evented = @(e) '{2{source}};
+  initial event_nba <= @(e) '{2{source}};
+  initial begin
+    #0 source = 8'h12;
+    #1 -> e;
+  end
+endmodule
+"##);
+    assert_eq!(
+        msgs,
+        [
+            "plain=b,ab delayed=b,ab nba=b,ab",
+            "event=b,ab event_nba=b,ab carry=0,10",
+        ]
+    );
+}
+
+/// §10.9.2: converting a replicated item for a two-state member must not
+/// discard the X/Z bits assigned to a subsequent four-state member.
+#[test]
+fn replicated_struct_capture_keeps_each_member_state_type() {
+    let msgs = run(r##"
+module top;
+  typedef struct { bit [7:0] a; logic [7:0] b; } s_t;
+  logic [7:0] source = 8'b1x0z11xz;
+  s_t plain, delayed, nba, evented, event_nba;
+  event e;
+  initial begin
+    plain = '{2{source}};
+    delayed = #1 '{2{source}};
+    #1;
+    $display("plain=%b,%b delayed=%b,%b nba=%b,%b",
+             plain.a, plain.b, delayed.a, delayed.b, nba.a, nba.b);
+    $display("event=%b,%b event_nba=%b,%b",
+             evented.a, evented.b, event_nba.a, event_nba.b);
+  end
+  initial nba <= #1 '{2{source}};
+  initial evented = @(e) '{2{source}};
+  initial event_nba <= @(e) '{2{source}};
+  initial begin
+    #0 source = 8'hff;
+    #1 -> e;
+  end
+endmodule
+"##);
+    assert_eq!(
+        msgs,
+        [
+            "plain=10001100,1x0z11xz delayed=10001100,1x0z11xz nba=10001100,1x0z11xz",
+            "event=10001100,1x0z11xz event_nba=10001100,1x0z11xz",
+        ]
+    );
+}
