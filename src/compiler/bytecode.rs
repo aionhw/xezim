@@ -1797,6 +1797,8 @@ pub struct BytecodeCompiler<'a> {
     /// with a bare local name (`mem_valid`) is first tried verbatim, then
     /// with this prefix applied (`testbench.mem_valid`).
     pub scope_hint: Option<String>,
+    /// Label for diagnostics only; it must not affect lexical resolution.
+    pub diagnostic_scope: Option<String>,
     /// §26.3: `pkg::member` -> (value, width) of every package enum member,
     /// shared by the module-code compilers (`pkg_enum_consts` is the
     /// method-mode snapshot). A member two packages both declare reaches
@@ -2382,6 +2384,7 @@ impl<'a> BytecodeCompiler<'a> {
             allow_ast_fallback: false,
             m_labels: Vec::new(),
             scope_hint: None,
+            diagnostic_scope: None,
             pkg_enum_consts_ref: None,
             method_enum_constants: HashMap::default(),
             class_scoped_enums: None,
@@ -5293,7 +5296,11 @@ impl<'a> BytecodeCompiler<'a> {
             );
             // A body declared in another scope prints that scope's `%m` and
             // runs on its timescale; no fallback may be emitted inside it.
-            let foreign = qpfx.as_deref() != self.scope_hint.as_deref();
+            // §13.4: a module helper's callee has its own interpreter frame.
+            // Keep a partially interpreted callee as a call, so its local
+            // arrays and aggregate temporaries are bound in that frame.
+            let foreign = self.module_free_function_context()
+                || qpfx.as_deref() != self.scope_hint.as_deref();
             self.inline_foreign += foreign as u32;
             // Formals shadow for the body only. The qualified spellings cover
             // elaboration's instance-rewritten bodies, same as pure calls.
@@ -6345,7 +6352,10 @@ impl<'a> BytecodeCompiler<'a> {
             reason,
             span.start,
             span.end,
-            self.scope_hint.as_deref().unwrap_or("-"),
+            self.diagnostic_scope
+                .as_deref()
+                .or(self.scope_hint.as_deref())
+                .unwrap_or("-"),
             carries
         );
     }
@@ -23492,7 +23502,10 @@ impl<'a> BytecodeCompiler<'a> {
                 eprintln!(
                     "[FALLBACK] compile-fail reason={} scope={}",
                     self.bail_reason.unwrap_or("?"),
-                    self.scope_hint.as_deref().unwrap_or("-")
+                    self.diagnostic_scope
+                        .as_deref()
+                        .or(self.scope_hint.as_deref())
+                        .unwrap_or("-")
                 );
             }
             // Roll back everything; leave the compiler in non-method mode.

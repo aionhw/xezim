@@ -374,7 +374,8 @@ fn method_boost_enabled() -> bool {
 // Class-local shadowing keeps numeric comparisons out of string-member admission.
 // Module helper reads and queue operations retain their lexical ownership.
 // Refresh compiled methods after combining VHDL and main compiler changes.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3084;
+// Module helper fallbacks retain callee frames independently of tracing.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3085;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never

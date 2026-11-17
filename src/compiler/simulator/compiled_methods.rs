@@ -3304,7 +3304,7 @@ impl Simulator {
                     }
                     compiler.set_dpi_import_fds(dpi_fds);
                     if method_trace_enabled() {
-                        compiler.scope_hint = Some(format!("{}.{}", cname, method_name));
+                        compiler.diagnostic_scope = Some(format!("{}.{}", cname, method_name));
                     }
                     let body_refs: Vec<&crate::ast::stmt::Statement> = body.iter().collect();
                     let compiler_outcome = compiler.compile_class_method(

@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Keep interpreter fallbacks in module helpers bound to the callee's frame, and make tracing independent of lexical resolution.
+
 - **Correctness:** Preserve declared member types when selecting from unpacked function and queue results.
 
 - **Correctness:** Keep package variables in their lexical scope in compiled module helpers, and retain per-element storage for unsafe record-array uses.
