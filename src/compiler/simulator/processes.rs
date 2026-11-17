@@ -2496,6 +2496,10 @@ impl Simulator {
         while let ExprKind::Paren(inner) = &rhs.kind {
             rhs = inner;
         }
+        // Existing slice capture retains indexed direction and declared bounds.
+        if matches!(rhs.kind, ExprKind::RangeSelect { .. }) {
+            return None;
+        }
         let mut items = Vec::new();
         fn flatten<'a>(e: &'a Expression, out: &mut Vec<&'a Expression>) {
             match &e.kind {
@@ -2521,7 +2525,7 @@ impl Simulator {
         }
         if !matches!(
             rhs.kind,
-            ExprKind::Concatenation(_) | ExprKind::RangeSelect { .. } | ExprKind::Call { .. }
+            ExprKind::Concatenation(_) | ExprKind::Call { .. }
         ) && self.array_operand_name(rhs).is_none()
         {
             return None;
