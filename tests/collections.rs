@@ -385,3 +385,5 @@ mod pattern_array_items;
 mod struct_concat_forms;
 #[path = "collections/queue_front_shift.rs"]
 mod queue_front_shift;
+#[path = "collections/stream_with_range_1197.rs"]
+mod stream_with_range_1197;
