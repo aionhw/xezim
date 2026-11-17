@@ -1510,7 +1510,7 @@ impl Simulator {
     ) -> Option<Value> {
         let cd = self.get_class_def(cname)?;
         let tn = cd.properties.get(prop)?.type_name.clone()?;
-        if let Some(kind) = Self::container_base(&tn) {
+        if let Some(kind) = self.builtin_container_kind(&tn) {
             let h = self.alloc_builtin_container(kind, args);
             return Some(Value::from_u64(h as u64, 32));
         }
@@ -1887,6 +1887,18 @@ impl Simulator {
 
     pub(super) fn canonicalize_spec_frag(&self, frag: &str) -> String {
         let frag_norm = frag.trim();
+        // §8.25, §23.10: a type argument naming the instance's parameters
+        // (`logic [u6.TW-1:0]`, see `subst_instance_params`).
+        if frag_norm.contains('.')
+            && let Some(sub) = self.subst_instance_params(frag_norm)
+        {
+            return self.canonicalize_spec_frag(&sub);
+        }
+        // §8.25, §6.20: a vector type argument's range is a constant
+        // expression (`logic [6-1:0]` is `logic [5:0]`).
+        if let Some(folded) = self.fold_vector_frag_ranges(frag_norm) {
+            return self.canonicalize_spec_frag(&folded);
+        }
         // §6.22.1: `pkg::T` and the imported `T` are one type, so they
         // key one specialization.
         if let Some(leaf) = self.package_type_leaf(frag_norm) {
@@ -2221,6 +2233,14 @@ impl Simulator {
     /// as part of its type, so `Q#(4'd4)` is not `Q#(4)`. Memoized: keys are
     /// canonicalized at run time.
     pub(super) fn fold_const_spec_frag(&self, frag: &str, typed: bool) -> Option<String> {
+        // §8.25, §23.10: elaboration qualifies a module instance's own
+        // parameters in the arguments it writes (`g#(u6.PW * 2)`); each
+        // stands for that instance's value.
+        if frag.contains('.')
+            && let Some(sub) = self.subst_instance_params(frag)
+        {
+            return self.fold_const_spec_frag(&sub, typed).or(Some(sub));
+        }
         let b = frag.as_bytes();
         let first = *b.first()?;
         let ident_start = first.is_ascii_alphabetic() || first == b'_';
@@ -2317,6 +2337,80 @@ impl Simulator {
             .borrow_mut()
             .insert(key, folded.clone());
         folded
+    }
+
+    /// A `bit`/`logic`/`reg` vector fragment whose packed range bounds are
+    /// constant expressions, with each bound folded to a decimal; None when
+    /// every bound is already a number or one does not fold.
+    fn fold_vector_frag_ranges(&self, frag: &str) -> Option<String> {
+        let kw = ["bit", "logic", "reg"]
+            .into_iter()
+            .find(|k| frag.starts_with(k))?;
+        let open = frag.find('[')?;
+        let head = &frag[..open];
+        if head[kw.len()..]
+            .trim()
+            .split_whitespace()
+            .any(|w| !matches!(w, "signed" | "unsigned"))
+        {
+            return None;
+        }
+        let mut out = head.to_string();
+        let mut rest = &frag[open..];
+        let mut changed = false;
+        while let Some(body) = rest.strip_prefix('[') {
+            let close = body.find(']')?;
+            let (l, r) = body[..close].split_once(':')?;
+            let mut bound = |t: &str| -> Option<String> {
+                let t = t.trim();
+                if t.parse::<i64>().is_ok() {
+                    return Some(t.to_string());
+                }
+                changed = true;
+                self.fold_const_spec_text(t)
+            };
+            let (l, r) = (bound(l)?, bound(r)?);
+            out.push_str(&format!("[{l}:{r}]"));
+            rest = body[close + 1..].trim_start();
+        }
+        (rest.is_empty() && changed).then_some(out)
+    }
+
+    /// `frag` with every instance-qualified parameter name (`u6.PW`, the
+    /// spelling elaboration gives a module instance's own parameter inside a
+    /// specialization's arguments) replaced by its decimal value; None when
+    /// it names none.
+    fn subst_instance_params(&self, frag: &str) -> Option<String> {
+        let b = frag.as_bytes();
+        let name_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+        let mut out = String::with_capacity(frag.len());
+        let mut hit = false;
+        let mut i = 0;
+        while i < b.len() {
+            let start = i;
+            if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+                while i < b.len() && (name_char(b[i]) || (b[i] == b'.' && i + 1 < b.len())) {
+                    i += 1;
+                }
+                let name = &frag[start..i];
+                if name.contains('.')
+                    && let Some(v) = self.module.parameters.get(name).and_then(|v| v.to_i64())
+                {
+                    out.push_str(&v.to_string());
+                    hit = true;
+                    continue;
+                }
+            } else if b[i].is_ascii_digit() || b[i] == b'\'' {
+                i += 1;
+                while i < b.len() && (name_char(b[i]) || b[i] == b'\'') {
+                    i += 1;
+                }
+            } else {
+                i += frag[i..].chars().next().map_or(1, char::len_utf8);
+            }
+            out.push_str(&frag[start..i]);
+        }
+        hit.then_some(out)
     }
 
     /// The parameter value in the executing lexical scope: a class parameter

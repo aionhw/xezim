@@ -501,6 +501,7 @@ impl Instr<'_> {
             // bodies the executor and other constructs own.
             kind @ (StatementKind::Null
             | StatementKind::VarDecl { .. }
+            | StatementKind::ParamDecl { .. }
             | StatementKind::Typedef(_)
             | StatementKind::Coverpoint { .. }
             | StatementKind::Cross { .. }

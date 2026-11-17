@@ -103,6 +103,11 @@ impl Simulator {
         member: &crate::ast::Identifier,
         ctx_width: u32,
     ) -> Value {
+        // #1108: a whole array member of an instance-array element
+        // (`lane[0].payload`).
+        if let Some(folded) = self.inst_array_member_canon_parts(expr, member) {
+            return self.eval_expr_ctx(&folded, ctx_width);
+        }
         // §18.7 — inside `obj.randomize() with { obj.member … }` the
         // receiver `obj` is a caller-scope handle that no longer evals
         // in the randomized frame, so `obj.member` would read 0 and
@@ -1431,6 +1436,7 @@ impl Simulator {
         let n = h.path[0].name.name.as_str();
         let m = member.name.as_str();
         if matches!(m, "size" | "num" | "triggered" | "status")
+            || Self::is_parenless_zero_arg_builtin(m)
             || matches!(n, "super" | "this" | "process")
             || self.name_stats_on
             || self.rand_receiver.is_some()
@@ -2056,6 +2062,79 @@ impl Simulator {
         value
     }
 
+    /// §7.4.1: whether `expr` (an index chain on a plain packed variable,
+    /// not a local or an unpacked array) selects an element of the named
+    /// signed type the variable is a packed array of.
+    #[inline(never)]
+    pub(super) fn packed_named_select_signed(&mut self, expr: &Expression) -> bool {
+        let mut root = expr;
+        let mut selects = 0usize;
+        while let ExprKind::Index { expr: base, .. } = &root.kind {
+            selects += 1;
+            root = base;
+        }
+        // A class property (`h.m_amb[1]`, or `m_amb[1]` in a method): its
+        // declared type is its class's.
+        if !self.packed_named_signed_props.is_empty() {
+            let prop = match &root.kind {
+                ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                ExprKind::Ident(h) if h.root.is_none() => h
+                    .path
+                    .last()
+                    .filter(|s| s.selects.is_empty())
+                    .map(|s| s.name.name.as_str()),
+                _ => None,
+            };
+            if prop.is_some_and(|p| self.packed_named_signed_props.get(p) == Some(&selects))
+                && self.class_prop_named_signed_depth(root) == Some(selects)
+            {
+                return true;
+            }
+        }
+        let ExprKind::Ident(h) = &root.kind else {
+            return false;
+        };
+        if h.root.is_some()
+            || h.path.iter().any(|s| !s.selects.is_empty())
+            || self.frame_bound_bare_name(h).is_some()
+        {
+            return false;
+        }
+        let name = self.resolve_hier_name(h);
+        let name = name.as_ref();
+        self.packed_named_signed.get(name) == Some(&selects)
+            && !self.module.arrays.contains_key(name)
+            && !self.module.arrays_2d.contains_key(name)
+            && !self.module.arrays_nd.contains_key(name)
+    }
+
+    /// §7.4.1: the select depth at which the class property `e` names
+    /// reaches a named signed element type, from the property's declaration
+    /// in its class.
+    fn class_prop_named_signed_depth(&self, e: &Expression) -> Option<usize> {
+        let dt = match &e.kind {
+            // A bare property of the running method's object.
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                let name = h.path[0].name.name.as_str();
+                if self
+                    .local_stack
+                    .last()
+                    .is_some_and(|f| f.contains_key(name))
+                {
+                    return None;
+                }
+                let th = self.this_stack.last().copied().flatten()?;
+                let class = &self.heap.get(th)?.as_ref()?.class_name;
+                let base = class.split('#').next().unwrap_or(class).trim();
+                let owners = self.prop_owners(base);
+                let (_, cd) = owners.get(name)?;
+                cd.property_types.get(name)?.clone()
+            }
+            _ => self.lvalue_static_type(e)?,
+        };
+        super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
+    }
+
     /// Declared expression signedness without executing conditional arms or
     /// calls. Context-determined operands need this type before evaluation.
     #[inline(never)]
@@ -2134,6 +2213,10 @@ impl Simulator {
                             || self.is_associative_array(name.as_ref()),
                     )
                 };
+                if unpacked == 0 && self.packed_named_signed.get(name.as_ref()) == Some(&indices) {
+                    // §7.4.1: an element of a named signed type.
+                    return Some(true);
+                }
                 if indices > unpacked {
                     // More indices can enter a nested queue or associative
                     // row. Only a known scalar signal proves a packed select;
@@ -2328,6 +2411,25 @@ impl Simulator {
             if let Some(stripped) = self.strip_rand_receiver_expr(expr) {
                 return self.eval_expr_ctx(&stripped, ctx_width);
             }
+        }
+        // §7.4.1: an element of a packed array of a named signed type is
+        // signed; the slice that reads it is not. One length test when no
+        // variable is declared that way.
+        if (!self.packed_named_signed.is_empty() || !self.packed_named_signed_props.is_empty())
+            && matches!(expr.kind, ExprKind::Index { .. })
+            && self.packed_named_sign_guard != expr as *const Expression as usize
+            && self.packed_named_select_signed(expr)
+        {
+            let saved = std::mem::replace(
+                &mut self.packed_named_sign_guard,
+                expr as *const Expression as usize,
+            );
+            let mut v = self.eval_expr_ctx_inner(expr, ctx_width, unsigned_context);
+            self.packed_named_sign_guard = saved;
+            if !v.is_real {
+                v.is_signed = true;
+            }
+            return v;
         }
         match &expr.kind {
             ExprKind::Ident(h) => {
@@ -3197,7 +3299,7 @@ impl Simulator {
                         .and_then(|m| m.get(name.as_str()))
                         .cloned()
                     {
-                        if let Some(v) = self.get_signal_value_by_name(&storage) {
+                        if let Some(v) = self.ref_alias_read(&storage) {
                             return v;
                         }
                     }
@@ -5004,6 +5106,18 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // #1108: an element of an array member of an instance-array
+                // element (`lane[0].nest[1][j]`).
+                if let Some(base) = self.inst_array_member_canon(expr) {
+                    let folded = Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(base),
+                            index: index.clone(),
+                        },
+                        expr.span,
+                    );
+                    return self.eval_expr_ctx(&folded, ctx_width);
+                }
                 if let Some(selected) = self.selected_aggregate_rhs(None, expr) {
                     let selected = Expression::new(
                         ExprKind::Index {
@@ -5897,9 +6011,24 @@ impl Simulator {
                 // the empty leading bytes and always returned 0.
                 if let ExprKind::Ident(_hier) = &expr.kind {
                     let nm = base_nm.as_deref().unwrap_or("");
-                    // The running task frame decides for its own formals: a
-                    // string flag another frame left on the name is not it.
-                    if self.frame_name_is_string(nm) {
+                    let active_cls = self
+                        .this_stack
+                        .last()
+                        .copied()
+                        .flatten()
+                        .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+                        .map(|i| i.class_name.as_str())
+                        .or_else(|| self.class_context_stack.last().and_then(|c| c.as_deref()));
+                    let is_str = _hier.path.len() == 1
+                        && !self.method_local_shadows(nm)
+                        && active_cls.is_some_and(|c| self.class_declares_property(c, nm));
+                    if if is_str {
+                        self.class_member_is_string(expr)
+                    } else {
+                        // The running task frame decides for its own formals: a
+                        // string flag another frame left on the name is not it.
+                        self.frame_name_is_string(nm)
+                    } {
                         let content = self.eval_expr(expr).sv_string_bytes();
                         let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
                         let byte = content.get(i).copied().unwrap_or(0);

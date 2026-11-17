@@ -233,6 +233,17 @@ impl Simulator {
                 } else {
                     skip
                 };
+                if skip == 1
+                    && h.path.len() >= 2
+                    && let Some(mut key) =
+                        self.pkg_qual_collection_key(&h.path[0].name.name, &h.path[1].name.name)
+                {
+                    for seg in &h.path[2..] {
+                        key.push('.');
+                        key.push_str(&seg.name.name);
+                    }
+                    return Some(key);
+                }
                 let segs = &h.path[skip..];
                 // The overwhelmingly common shape is a single segment; the
                 // Vec + join below allocates twice for it. This is the
@@ -1627,8 +1638,32 @@ impl Simulator {
             // identifier to itself, and the evaluator re-entered this
             // redirect on the rewritten node until the stack overflowed.
             // Plain resolution of the name already reaches that storage.
-            if storage == name || member_wise_struct(self) {
+            if storage == name
+                || member_wise_struct(self)
+                || (hier.path.len() >= 2 && self.ref_elem_handle_formal(name))
+            {
                 return None;
+            }
+            // A pinned property (`<pin>.<prop>`): the formal's selects go on
+            // the property segment.
+            if let Some(mut pinned) = Self::ref_pin_hier(storage, hier.span) {
+                // A member of a packed struct formal is sliced out of the
+                // property's value by the packed-leaf paths (see
+                // `ref_alias_base_value`); the pin has no declared type to
+                // resolve the member through.
+                if hier.path.len() >= 2
+                    && hier.path[0].selects.is_empty()
+                    && self
+                        .packed_leaf_of_hier(&format!("{}.{}", name, hier.path[1].name.name))
+                        .is_some()
+                {
+                    return None;
+                }
+                let mut rest = hier.path.clone();
+                let first = rest.remove(0);
+                pinned.path[1].selects = first.selects;
+                pinned.path.extend(rest);
+                return Some(pinned);
             }
             let mut path = hier.path.clone();
             path[0].name.name = storage.clone();
@@ -1817,6 +1852,11 @@ impl Simulator {
                             return None;
                         }
                     }
+                }
+                // A handle formal aliased to an element is read from its
+                // refreshed frame slot (see `ref_elem_handle_formal`).
+                if Self::expr_root_first_seg(expr).is_some_and(|r| self.ref_elem_handle_formal(r)) {
+                    return None;
                 }
                 self.ref_formal_redirect_inner(expr, true).map(|ne| {
                     Expression::new(
@@ -2361,6 +2401,100 @@ impl Simulator {
                 return changed;
             }
         }
+
+        // §7.4.2: `m[i][j] = v` on a class-property dynamic array of dynamic
+        // arrays writes element `j` of row `<h>#m[i]`, the key reads use. The
+        // arms below took `[j]` for a bit-select of the row's own cell.
+        if matches!(expr.kind, ExprKind::Index { .. })
+            && !self.no_class_objects()
+            && let Some(row) = self.coll_elem_expr_key(expr)
+            && row.contains('#')
+            && self.module.dynamic_arrays.contains(&row)
+            && self.coll_shape_at(&row).is_some_and(|(shape, depth)| {
+                matches!(shape.dims.get(depth), Some(Dim::Dyn))
+            })
+        {
+            let Some(j) = self.eval_expr(index).to_i64() else {
+                return false;
+            };
+            if j < 0 || j as u64 >= self.get_queue_size(&row) {
+                return false;
+            }
+            let key = format!("{}[{}]", row, j);
+            let elem_is_string = self.is_string_collection(&row)
+                || self.is_string_collection(&key)
+                || self
+                    .p_elem_type_ref(&row)
+                    .is_some_and(|dt| Self::is_string_data_type(&dt));
+            let prev = self.signals.get(&key);
+            let elem_dt = || {
+                self.p_elem_type_ref(&row)
+                    .or_else(|| self.class_member_coll_type(&row).map(std::borrow::Cow::Borrowed))
+            };
+            let declared_slot = || -> Option<Value> {
+                let w = self
+                    .module
+                    .arrays
+                    .get(&row)
+                    .map(|&(_, _, w)| w)
+                    .or_else(|| self.assoc_store_ctx_width(&row))?;
+                let signed = self
+                    .p_elem_type_ref(&row)
+                    .or_else(|| self.class_member_coll_type(&row).map(std::borrow::Cow::Borrowed))
+                    .is_some_and(|dt| {
+                        super::elaborate::is_type_signed_resolved(&dt, &self.module.typedef_types)
+                    });
+                let mut p = Value::zero(w.max(1));
+                p.is_signed = signed;
+                Some(p)
+            };
+            let mut v = if elem_is_string {
+                val.clone()
+            } else if val.is_real {
+                if let Some(p) = prev {
+                    if p.is_real {
+                        Value::from_f64(val.to_f64())
+                    } else {
+                        Self::real_into_slot(p, val.to_f64())
+                    }
+                } else if elem_dt().is_some_and(|dt| super::elaborate::is_type_real(&dt)) {
+                    Value::from_f64(val.to_f64())
+                } else if let Some(p) = declared_slot() {
+                    Self::real_into_slot(&p, val.to_f64())
+                } else {
+                    val.clone()
+                }
+            } else if let Some(p) = prev {
+                if !p.is_real && p.width > 0 {
+                    val.resize(p.width)
+                } else if p.is_real {
+                    Value::from_f64(val.to_f64())
+                } else {
+                    val.clone()
+                }
+            } else if let Some(w) = self
+                .module
+                .arrays
+                .get(&row)
+                .map(|&(_, _, w)| w)
+                .or_else(|| self.assoc_store_ctx_width(&row))
+            {
+                val.resize(w.max(1))
+            } else {
+                val.clone()
+            };
+            if let Some(dt) = elem_dt() {
+                if super::elaborate::is_type_two_state_resolved(&dt, &self.module.typedef_types) {
+                    v = v.to_two_state();
+                }
+            }
+            let changed = self.signals.get(&key) != Some(&v);
+            if changed {
+                self.write_coll_elem(&key, v);
+                self.touch_queue(&row);
+            }
+            return changed;
+        }
         // Element write into an ARRAY-OF-COLLECTIONS class property
         // (`expected[1][0][k] = v`, `dq[1][2] = v`, `aa[0][key] = v`):
         // the base names one element collection (see
@@ -2708,7 +2842,10 @@ impl Simulator {
             // (`for i in 0..sz VAR[i] = …`); without this growth the
             // unpacked `.size()` stayed 0 and every later field read
             // desynced (PCKSZ errors / X compare).
-            if !self.is_associative_array(&an) {
+            let is_fixed_array = self.module.arrays.contains_key(&an)
+                && !self.module.dynamic_arrays.contains(&an)
+                && !self.module.queue_vars.contains(&an);
+            if !self.is_associative_array(&an) && !is_fixed_array {
                 let kval = idx_val.to_i64().unwrap_or(0);
                 if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
                     self.set_queue_size(&an, kval as u64 + 1);
@@ -3891,6 +4028,15 @@ impl Simulator {
     }
 
     pub(super) fn assign_value_inner(&mut self, lhs: &Expression, val: &Value) -> bool {
+        // #1108: an array member of an instance-array element, or a select
+        // of it (`lane[0].nest[1][j] = v`).
+        if matches!(
+            lhs.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
+        ) && let Some(folded) = self.inst_array_member_canon(lhs)
+        {
+            return self.assign_value_inner(&folded, val);
+        }
         // §19.7 `cg.option.<name> = v` on a covergroup instance.
         if let ExprKind::Ident(h) = &lhs.kind {
             if h.path.len() == 3 && h.path[1].name.name == "option" {
@@ -3949,6 +4095,14 @@ impl Simulator {
         // §13.5.2: a selected write through a `ref` formal lands on the
         // caller's actual; an aliased formal's local copy is refreshed so
         // any unredirected read path stays coherent.
+        if self.ref_redirect_possible()
+            && matches!(lhs.kind, ExprKind::MemberAccess { .. } | ExprKind::Ident(_))
+            && let Some(root) = Self::expr_root_first_seg(lhs)
+            && self.ref_elem_handle_formal(root)
+        {
+            let root = root.to_string();
+            self.ref_alias_refresh_slot(&root);
+        }
         if let Some(rewritten) = self.ref_formal_redirect_expr(lhs) {
             let changed = self.assign_value(&rewritten, val);
             let mut root = lhs;
@@ -3968,7 +4122,7 @@ impl Simulator {
                     .and_then(|m| m.get(&fname))
                     .cloned()
                 {
-                    if let Some(full) = self.get_signal_value_by_name(&storage) {
+                    if let Some(full) = self.ref_alias_read(&storage) {
                         if let Some(frame) = self.local_stack.last_mut() {
                             if let Some(slot) = frame.get_mut(&fname) {
                                 *slot = full;
@@ -4358,9 +4512,7 @@ impl Simulator {
                                 self.viface_var_aliases.remove(&storage);
                             }
                         }
-                        let prev = self.get_signal_value_by_name(&storage);
-                        self.set_signal_value_by_name(&storage, val.clone());
-                        return prev.as_ref() != self.get_signal_value_by_name(&storage).as_ref();
+                        return self.ref_alias_write(&storage, val);
                     }
                 }
             }
@@ -4385,8 +4537,22 @@ impl Simulator {
                     _ => val.clone(),
                 };
                 let changed = prev.as_ref() != Some(&fitted);
+                // §13.5.2: a leaf of a `ref` struct formal aliased to the
+                // actual's member is written through at once.
+                let through = if self.ref_redirect_possible() {
+                    self.ref_alias_stack
+                        .last()
+                        .and_then(|m| m.get(key.as_str()))
+                        .cloned()
+                        .map(|storage| (storage, fitted.clone()))
+                } else {
+                    None
+                };
                 if let Some(frame) = self.local_stack.last_mut() {
                     frame.insert(key, fitted);
+                }
+                if let Some((storage, v)) = through {
+                    self.ref_alias_write(&storage, &v);
                 }
                 return changed;
             }

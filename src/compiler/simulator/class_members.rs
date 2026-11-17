@@ -448,10 +448,13 @@ impl Simulator {
         if self.task_string_formals.is_empty() {
             return None;
         }
-        let i = self
+        let base = self.method_local_base.last().copied().unwrap_or(0);
+        let rel = self
             .local_stack
+            .get(base..)?
             .iter()
             .rposition(|f| f.contains_key(name))?;
+        let i = base + rel;
         let fgen = *self.local_gen_stack.get(i)?;
         let entry = self
             .task_string_formals
@@ -5069,6 +5072,22 @@ impl Simulator {
                     }
                     cur = parent.map(|p| p.split('#').next().unwrap_or(&p).to_string());
                 }
+            }
+            // §8.4: a bare call in a method that runs with a null `this`
+            // (a non-virtual method called through a null handle) is a call
+            // through that null handle.
+            if this_h == 0
+                && self.this_stack.last().is_some_and(|t| *t == Some(0))
+                && let Some(Some(ctx)) = self.class_context_stack.last().cloned()
+                && self.class_is_a(&ctx, class_name)
+            {
+                return Some(
+                    self.call_on_null_receiver(&ctx, method_name, args)
+                        .unwrap_or_else(|| {
+                            self.report_null_handle_call(method_name);
+                            Value::zero(32)
+                        }),
+                );
             }
             // §8.10: anywhere else a class-scope `::` access names a STATIC
             // member; a non-static method reached this way has no instance.

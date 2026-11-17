@@ -134,6 +134,32 @@ impl Simulator {
         )
     }
 
+    /// The class of the elements of the collection of handles `name`.
+    pub(super) fn coll_elem_class(&self, name: &str) -> Option<String> {
+        let leaf = name.rsplit('.').next().unwrap_or(name);
+        let root = name.split('[').next().unwrap_or(name);
+        if let Some(c) = [name, leaf, root]
+            .iter()
+            .find_map(|n| self.module.array_elem_class.get(*n))
+        {
+            return Some(c.clone());
+        }
+        let dt = self
+            .module
+            .var_decl_types
+            .get(name)
+            .or_else(|| self.module.var_decl_types.get(leaf))
+            .or_else(|| self.module.var_decl_types.get(root))?;
+        match self.resolve_dt_ref(dt) {
+            DataType::TypeReference { name: tn, .. }
+                if self.module.classes.contains_key(&tn.name.name) =>
+            {
+                Some(tn.name.name.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// The live size of row `name` when the dimension its next select
     /// indexes is a queue or dynamic one, from the declared shape. None for a
     /// fixed row (`raw[0]` of `T raw[][2]`), which is registered as dynamic
@@ -161,11 +187,16 @@ impl Simulator {
 
     /// §7.8.6: the value a read of a NONEXISTENT associative-array element
     /// yields — the element type's default, x for a 4-state integral type and
-    /// 0 for a 2-state one, at the element's width and signedness. `None`
-    /// when the element type is unknown or not integral; the caller keeps its
-    /// own fallback.
+    /// 0 for a 2-state one, at the element's width and signedness, and real
+    /// 0.0 for a real one. `None` when the element type is unknown or neither
+    /// integral nor real; the caller keeps its own fallback.
     pub(super) fn assoc_missing_elem_value(&self, name: &str) -> Option<Value> {
         use crate::ast::types::{IntegerAtomType as IAT, IntegerVectorType as IVT};
+        // §6.8, Table 6-7: a real/shortreal element's default is real 0.0
+        // (`assoc_elem_decl_type` gives integral element types only).
+        if self.coll_elem_is_real(name) {
+            return Some(Value::from_f64(0.0));
+        }
         let dt = self.assoc_elem_decl_type(name)?;
         let four_state = match self.resolve_dt_ref(dt) {
             DataType::IntegerVector { kind, .. } => !matches!(kind, IVT::Bit),
@@ -1419,6 +1450,11 @@ impl Simulator {
         ) {
             match &stmt.kind {
                 SK::VarDecl {
+                    data_type,
+                    declarators,
+                    ..
+                }
+                | SK::ParamDecl {
                     data_type,
                     declarators,
                     ..
@@ -3046,7 +3082,23 @@ impl Simulator {
                     && name.as_bytes()[top.len()] == b'.'
                     && name.starts_with(top)
                 {
-                    if let Some(v) = self.get_signal_value_by_name(&name[top.len() + 1..]) {
+                    let bare = &name[top.len() + 1..];
+                    // `<top>.<sig>` is an ABSOLUTE reference to the top
+                    // module's own variable — never re-scope it under the
+                    // resolve hint (that would bind top's `sig` to a
+                    // same-named net inside the hinted instance: `$root.top.n`
+                    // read a leaf's `l.n` when a hint named `l` was active,
+                    // forwarding x for a 0). Read the stripped key directly;
+                    // array elements and packed leaves fall back to the
+                    // recursion below.
+                    if let Some(&id) = self.signal_name_to_id.get(bare) {
+                        let mut v = self.signal_table[id].clone();
+                        if self.signal_signed[id] {
+                            v.is_signed = true;
+                        }
+                        return Some(v);
+                    }
+                    if let Some(v) = self.get_signal_value_by_name(bare) {
                         return Some(v);
                     }
                 }
@@ -3108,7 +3160,9 @@ impl Simulator {
             // module-scope object existed, silently returned THAT object's
             // field. The whole-struct read was correct throughout, which is
             // what disguised this as an argument-passing bug.
-            if let Some(cur) = self.get_local_or_signal(&base) {
+            // §13.5.2: an aliased `ref` formal's member is the actual's.
+            let aliased = self.ref_alias_base_value(&base);
+            if let Some(cur) = aliased.or_else(|| self.get_local_or_signal(&base)) {
                 let mut v = cur.range_select((off + w - 1) as usize, off as usize);
                 // §7.2.1: the slice is a raw bit pattern — re-stamp the
                 // member's DECLARED signedness (`int s` in a packed struct
@@ -3193,8 +3247,21 @@ impl Simulator {
                     Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                     _ => val,
                 };
+                let through = if self.ref_redirect_possible() {
+                    self.ref_alias_stack
+                        .last()
+                        .and_then(|m| m.get(name))
+                        .cloned()
+                        .map(|storage| (storage, fitted.clone()))
+                } else {
+                    None
+                };
                 if let Some(frame) = self.local_stack.last_mut() {
                     frame.insert(name.to_string(), fitted);
+                }
+                // §13.5.2: an aliased leaf of a `ref` struct formal.
+                if let Some((storage, v)) = through {
+                    self.ref_alias_write(&storage, &v);
                 }
                 return;
             }
@@ -3276,7 +3343,9 @@ impl Simulator {
         // independent leaf that would silently stop aliasing its siblings.
         if let Some((base, off, w)) = self.packed_leaf_of_hier(name) {
             // Frame first, mirroring the read path above.
-            if let Some(cur) = self.get_local_or_signal(&base) {
+            let aliased = self.ref_alias_base_value(&base);
+            let through_alias = aliased.is_some();
+            if let Some(cur) = aliased.or_else(|| self.get_local_or_signal(&base)) {
                 let mut next = cur.clone();
                 let mut piece = val.resize(w);
                 if !self.mixed_packed_vars.is_empty() {
@@ -3285,7 +3354,10 @@ impl Simulator {
                 for i in 0..w {
                     next.set_bit((off + i) as usize, piece.get_bit(i as usize));
                 }
-                if next != cur {
+                if through_alias {
+                    // §13.5.2: write the actual now, and keep the frame copy.
+                    self.ref_alias_store_base(&base, &next);
+                } else if next != cur {
                     self.set_local_or_signal(&base, next);
                 }
                 return;
@@ -3699,12 +3771,20 @@ impl Simulator {
     /// would otherwise read an empty string and silently produce wrong
     /// output (e.g. table printers emitting columns with no padding).
     pub(super) fn get_local_signal_or_static(&mut self, name: &str) -> Option<Value> {
-        if let Some(v) = self.get_local_or_signal(name) {
-            return Some(v);
-        }
-        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
-            if let Some(v) = self.class_static_get(&ctx, name) {
-                return Some(v);
+        // §23.9 / §8.11: lexical scope precedence inside an active routine:
+        // local/formal frame -> `this` instance property -> class static ->
+        // enclosing module signal. Checking module signals first caused a
+        // same-named outer variable (e.g. `int value` or `S value`) to hide
+        // a class property `string value`.
+        if let Some(&base) = self.method_local_base.last() {
+            for m in self.local_stack.get(base..).unwrap_or(&[]).iter().rev() {
+                if let Some(v) = m.get(name) {
+                    return Some(v.clone());
+                }
+            }
+        } else if let Some(m) = self.local_stack.last() {
+            if let Some(v) = m.get(name) {
+                return Some(v.clone());
             }
         }
         // §8.10/§6.16: an INSTANCE property as a built-in method receiver —
@@ -3726,7 +3806,12 @@ impl Simulator {
                 return Some(v.clone());
             }
         }
-        None
+        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            if let Some(v) = self.class_static_get(&ctx, name) {
+                return Some(v);
+            }
+        }
+        self.get_signal_value_by_name(name)
     }
 
     /// Set a loop index/iteration variable. Writes to the current call frame's
@@ -4761,6 +4846,77 @@ impl Simulator {
         true
     }
 
+    /// A fresh local declaration shadows any prior global-scoped collection
+    /// registration left over from another frame's same-named local
+    /// (subroutine locals use bare names). Reset the array/queue/assoc
+    /// bookkeeping so e.g. a scalar `string str` after a previous
+    /// `string str[$]` isn't still treated as a queue.
+    pub(super) fn clear_shadowed_collection_meta(
+        &mut self,
+        name: &str,
+        data_type: &crate::ast::types::DataType,
+    ) {
+        if !self.decl_shadow_log.is_empty() {
+            self.note_decl_shadow(name, data_type);
+        }
+        // If this local shares its bare name with a caller-frame queue,
+        // preserve the caller's queue storage so it is restored when this
+        // subroutine returns (queue locals are global-by-bare-name; see
+        // `queue_frame_saves`).
+        if !self.save_queue_local(name, true) {
+            self.module.dynamic_arrays.remove(name);
+            self.module.arrays.remove(name);
+            self.module.descending_arrays.remove(name);
+            self.module.queue_max_sizes.remove(name);
+        }
+        self.module.associative_arrays.remove(name);
+        self.module.packed_signal_elem_widths.remove(name);
+        let mut size_key = std::mem::take(&mut self.queue_key_scratch);
+        size_key.clear();
+        size_key.push_str(name);
+        size_key.push_str(".size");
+        self.signals.remove(&size_key);
+        self.queue_key_scratch = size_key;
+    }
+
+    /// Route a declaration initializer through a synthetic `BlockingAssign`,
+    /// so the pattern-spread / queue / associative-array population applies
+    /// through the same path as a standalone assignment. This is the
+    /// boilerplate shared by a local array/queue/assoc declaration whose
+    /// initializer would otherwise be dropped.
+    pub(super) fn route_decl_init_via_assign(
+        &mut self,
+        target: &str,
+        init: &crate::ast::expr::Expression,
+        span: crate::ast::Span,
+    ) {
+        let lvalue = crate::ast::expr::Expression::new(
+            crate::ast::expr::ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: target.to_owned(),
+                        span,
+                    },
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            }),
+            span,
+        );
+        let assign = crate::ast::stmt::Statement::new(
+            crate::ast::stmt::StatementKind::BlockingAssign {
+                lvalue,
+                rvalue: init.clone(),
+            },
+            span,
+        );
+        self.exec_statement(&assign);
+    }
+
     /// Pop the top queue-local save frame and restore every snapshotted name:
     /// drop the callee's current `name.size`/`name[...]` entries and re-insert
     /// the caller's saved ones, AND restore the caller's `module.*` collection
@@ -4905,6 +5061,45 @@ impl Simulator {
                 | "exists"
                 | "num"
         )
+    }
+
+    /// Whether `m` names a built-in method of a collection, a string or an
+    /// enumeration, which the call dispatch recognizes by name.
+    pub(super) fn builtin_method_name(m: &str) -> bool {
+        Self::is_array_builtin_method(m)
+            || Self::is_parenless_zero_arg_builtin(m)
+            || matches!(
+                m,
+                "delete"
+                    | "insert"
+                    | "push_back"
+                    | "push_front"
+                    | "find"
+                    | "find_index"
+                    | "find_first"
+                    | "find_first_index"
+                    | "find_last"
+                    | "find_last_index"
+                    | "unique"
+                    | "unique_index"
+                    | "getc"
+                    | "putc"
+                    | "substr"
+                    | "compare"
+                    | "icompare"
+                    | "toupper"
+                    | "tolower"
+                    | "atoi"
+                    | "atohex"
+                    | "atooct"
+                    | "atobin"
+                    | "atoreal"
+                    | "itoa"
+                    | "hextoa"
+                    | "octtoa"
+                    | "bintoa"
+                    | "realtoa"
+            )
     }
 
     pub(super) fn is_parenless_zero_arg_builtin(m: &str) -> bool {

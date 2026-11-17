@@ -103,6 +103,10 @@ mod copy_ctor_type_mismatch;
 mod declared_signedness_wins;
 #[path = "types/default_assignment_pattern_packed.rs"]
 mod default_assignment_pattern_packed;
+#[path = "types/default_real_array_cells.rs"]
+mod default_real_array_cells;
+#[path = "types/default_real_collection_cells.rs"]
+mod default_real_collection_cells;
 #[path = "types/defparam_override.rs"]
 mod defparam_override;
 #[path = "types/diag_kind_limit_env.rs"]
@@ -113,6 +117,8 @@ mod divide_operand_width;
 mod division_operand_width;
 #[path = "types/dollar_lvalue_and_assoc_width.rs"]
 mod dollar_lvalue_and_assoc_width;
+#[path = "types/duplicate_typedef.rs"]
+mod duplicate_typedef;
 #[path = "types/enum_base_and_packed_members.rs"]
 mod enum_base_and_packed_members;
 #[path = "types/enum_cross_cast_assignment.rs"]
@@ -355,6 +361,8 @@ mod unpacked_struct_array_members;
 mod unpacked_struct_func_arg;
 #[path = "types/unpacked_struct_multidim_members.rs"]
 mod unpacked_struct_multidim_members;
+#[path = "types/unpacked_struct_pattern_return.rs"]
+mod unpacked_struct_pattern_return;
 #[path = "types/untyped_param_width.rs"]
 mod untyped_param_width;
 #[path = "types/valparam_spec_cycle.rs"]
@@ -723,6 +731,12 @@ mod struct_array_member_elem_select;
 
 #[path = "types/packed_select_geometry_1002.rs"]
 mod packed_select_geometry_1002;
+#[path = "types/array_member_pattern_replication.rs"]
+mod array_member_pattern_replication;
+#[path = "types/struct_pattern_replication.rs"]
+mod struct_pattern_replication;
+#[path = "types/struct_pattern_replication_constant_counts.rs"]
+mod struct_pattern_replication_constant_counts;
 #[path = "types/unpacked_slice_patterns_1045.rs"]
 mod unpacked_slice_patterns_1045;
 
@@ -736,3 +750,42 @@ mod ansi_port_inheritance_1078;
 mod packed_struct_array_local_fill_1082;
 #[path = "types/packed_struct_array_member_reads_1088.rs"]
 mod packed_struct_array_member_reads_1088;
+
+#[path = "types/struct_negative_array_pattern.rs"]
+mod struct_negative_array_pattern;
+#[path = "types/negative_index_compiled_blocks.rs"]
+mod negative_index_compiled_blocks;
+#[path = "types/signed_literal_pattern_index.rs"]
+mod signed_literal_pattern_index;
+#[path = "types/literal_pattern_key_sites.rs"]
+mod literal_pattern_key_sites;
+#[path = "types/literal_pattern_key_params_1164.rs"]
+mod literal_pattern_key_params_1164;
+#[path = "types/constant_expression_types_1143.rs"]
+mod constant_expression_types_1143;
+#[path = "types/unsigned_operand_kinds_1158.rs"]
+mod unsigned_operand_kinds_1158;
+#[path = "types/signed_packed_member_reads_1159.rs"]
+mod signed_packed_member_reads_1159;
+#[path = "types/signed_named_packed_elements_1107.rs"]
+mod signed_named_packed_elements_1107;
+#[path = "types/package_typedef_negative_bound_1148.rs"]
+mod package_typedef_negative_bound_1148;
+#[path = "types/review_struct_pattern_return.rs"]
+mod review_struct_pattern_return;
+#[path = "types/enum_receiver_types_1132.rs"]
+mod enum_receiver_types_1132;
+#[path = "types/signed_named_packed_props_ports_1107.rs"]
+mod signed_named_packed_props_ports_1107;
+
+#[path = "types/owned_aggregate_storage_1132_1147.rs"]
+mod owned_aggregate_storage_1132_1147;
+
+#[path = "types/net_typedef_metadata_1212.rs"]
+mod net_typedef_metadata_1212;
+
+#[path = "types/real_relational_unknown_bits.rs"]
+mod real_relational_unknown_bits;
+
+#[path = "types/struct_param_localparam_type.rs"]
+mod struct_param_localparam_type;

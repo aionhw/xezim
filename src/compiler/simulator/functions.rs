@@ -548,9 +548,14 @@ impl Simulator {
         // `signed_signals`, so an unregistered signed return type (`function
         // integer f`) silently went unsigned and `f >>>= 3` shifted
         // logically (ivtest cfunc_assign_op_vec asr3).
+        // A typedef'd return type (`function lane_t f`) is signed through
+        // its definition (§6.18).
         let ret_signed = match &ret_tp {
             Some((_, c)) => self.concrete_type_signed(c).unwrap_or(false),
-            None => super::elaborate::is_type_signed(&fd.return_type),
+            None => super::elaborate::is_type_signed_resolved(
+                &fd.return_type,
+                &self.module.typedef_types,
+            ),
         };
         if ret_signed {
             self.signed_signals.insert(ret_name.clone());
@@ -717,6 +722,8 @@ impl Simulator {
         // above, in the caller's context.
         self.this_stack.push(None);
         self.class_context_stack.push(None);
+        self.method_local_base
+            .push(self.local_stack.len().saturating_sub(1));
         // Track the running subroutine name so `%m` inside a package function
         // resolves to `<pkg>.<name>` (see the `%m` formatter). Popped after the
         // body; recursion keeps the stack ordered.
@@ -868,6 +875,7 @@ impl Simulator {
         self.m_scope_stack = saved_m_scope_fn;
         self.this_stack.pop();
         self.class_context_stack.pop();
+        self.method_local_base.pop();
         let mut result = if let Some(rv) = self.return_value.take() {
             rv
         } else if let Some(su) = self.unpacked_struct_of(&fd.return_type) {
@@ -927,7 +935,9 @@ impl Simulator {
             if w > 0 && w != result.width {
                 result = result.resize(w);
             }
-            result.is_signed = super::elaborate::is_type_signed(&fd.return_type);
+            // §13.4.1, §6.18: the result has the return type's sign, through
+            // a typedef too.
+            result.is_signed = ret_signed;
             result = Self::ret_two_state(result, ret_conv);
         }
         // Assoc / fixed-array formals copy element-wise, but the copy is
@@ -1118,6 +1128,8 @@ impl Simulator {
     /// the work that `exec_task_call` runs after the body. Mirrors the original
     /// inline cleanup exactly.
     pub(super) fn unwind_task_frame(&mut self, mut c: TaskCleanup) {
+        // §13.5.2: the aliased leaves of a `ref` struct formal.
+        self.ref_frame_flush();
         // §13.5.3: a default may name an earlier formal; update it before
         // capturing supplied outputs or popping the declaration's scope.
         self.apply_default_formal_outputs(&c.default_output_bindings);
@@ -1169,7 +1181,9 @@ impl Simulator {
             })
             .collect();
         self.ref_binding_stack.pop();
-        self.ref_alias_stack.pop();
+        if let Some(frame) = self.ref_alias_stack.pop() {
+            self.ref_pins_release(&frame);
+        }
         self.ref_identity_stack.pop();
         self.refresh_ref_redirect_hot();
         self.local_iface_aliases.pop();
@@ -1271,6 +1285,9 @@ impl Simulator {
         for saved in c.formal_metadata.into_iter().rev() {
             self.restore_formal_metadata(saved);
         }
+        // The caller's own aliased copies: another process may have written
+        // their actuals while the callee was parked.
+        self.ref_frame_refresh();
     }
 
     /// Register the structural metadata a task/function FORMAL needs so that
@@ -1508,6 +1525,55 @@ impl Simulator {
                 }
             }
         }
+    }
+
+    /// Whether the metadata registered under `name` makes member or element
+    /// selects of it resolve: a packed struct's field layout, or the
+    /// dimensions of a multidimensional packed array.
+    pub(super) fn formal_meta_has_selects(&self, name: &str) -> bool {
+        self.module.packed_struct_fields.contains_key(name)
+            || self.module.packed_signal_elem_widths.contains_key(name)
+            || self
+                .module
+                .packed_full_dims
+                .get(name)
+                .is_some_and(|d| d.len() > 1)
+    }
+
+    /// The running process is back in its task frames. The select metadata
+    /// of a formal is keyed by the formal's NAME in tables every process
+    /// shares, and a call restores the caller's entry when it returns: an
+    /// activation that parks finds, on resuming, whatever another process's
+    /// call (the same task's other activation, or a task with a formal of
+    /// that name) registered or restored meanwhile, so `s.a` of a packed
+    /// struct formal read nothing. Install this process's own again,
+    /// outermost frame first.
+    pub(super) fn reinstall_struct_formal_meta(&mut self) {
+        if self.ref_park_flags & super::ref_aliases::REF_PARK_META == 0
+            || !self
+                .task_cleanup
+                .iter()
+                .any(|c| !c.struct_formal_meta.is_empty())
+        {
+            return;
+        }
+        let frames = std::mem::take(&mut self.task_cleanup);
+        for c in &frames {
+            for (name, own) in &c.struct_formal_meta {
+                let same = self.module.packed_struct_fields.get(name) == own.packed_fields.as_ref()
+                    && self.module.packed_full_dims.get(name) == own.packed_dimensions.as_ref()
+                    && self.module.packed_signal_elem_widths.get(name).copied()
+                        == own
+                            .packed_element_widths
+                            .iter()
+                            .find(|(k, _)| k == name)
+                            .map(|(_, w)| *w);
+                if !same {
+                    self.restore_formal_parts(name, own.clone());
+                }
+            }
+        }
+        self.task_cleanup = frames;
     }
 
     pub(super) fn snapshot_formal_metadata(&self, name: &str) -> FormalMetadataSnapshot {
@@ -2161,6 +2227,7 @@ impl Simulator {
                 &m.typedefs,
                 &m.typedef_types,
             )
+            .or_else(|| Self::untagged_union_layout(m, dt))
         };
         let key = match dt {
             DataType::TypeReference {
@@ -2185,6 +2252,45 @@ impl Simulator {
         self.formal_struct_layouts
             .insert(key, (self.type_tables_gen, fields.clone()));
         fields
+    }
+
+    /// §7.3: the member layout of an unpacked untagged union, which is one
+    /// piece of storage every member starts at bit 0 of (a variable of the
+    /// type is registered the same way at elaboration). None for any other
+    /// type.
+    fn untagged_union_layout(
+        m: &ElaboratedModule,
+        dt: &DataType,
+    ) -> Option<Vec<(String, u32, u32)>> {
+        let DataType::Struct(su) = super::elaborate::resolve_typedef_chain(dt, &m.typedef_types)
+        else {
+            return None;
+        };
+        if su.packed || su.tagged || !matches!(su.kind, crate::ast::types::StructUnionKind::Union) {
+            return None;
+        }
+        let mut out = Vec::new();
+        for member in &su.members {
+            let w = super::elaborate::resolve_type_width(
+                &member.data_type,
+                Some(&m.parameters),
+                Some(&m.typedefs),
+            );
+            let subs = super::elaborate::packed_struct_field_layout(
+                &member.data_type,
+                &m.parameters,
+                &m.typedefs,
+                &m.typedef_types,
+            )
+            .unwrap_or_default();
+            for d in &member.declarators {
+                out.push((d.name.name.clone(), 0, w));
+                for (sn, so, sw) in &subs {
+                    out.push((format!("{}.{}", d.name.name, sn), *so, *sw));
+                }
+            }
+        }
+        Some(out)
     }
 
     fn apply_default_formal_outputs(&mut self, bindings: &[(String, Expression)]) {
@@ -2265,6 +2371,26 @@ impl Simulator {
                 && supplied
                     .as_ref()
                     .is_none_or(|mask| mask.get(i).copied().unwrap_or(false))
+        };
+        // §13.5.2: a `ref` actual that is a property of an object, or a
+        // hierarchical or member name, aliases storage only the CALLER's
+        // scope can resolve; freeze it before the callee's frame exists.
+        let scope_aliases: Vec<Option<String>> = if td
+            .ports
+            .iter()
+            .any(|p| matches!(p.direction, PortDirection::Ref))
+        {
+            td.ports
+                .iter()
+                .enumerate()
+                .map(|(i, port)| {
+                    (matches!(port.direction, PortDirection::Ref) && arg_supplied(i))
+                        .then(|| self.ref_scope_alias_target(port, &args[i]))
+                        .flatten()
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
         // §8.25: a formal typed by one of the class's type parameters has
         // the type bound in the CALLEE's specialization. Resolve each under
@@ -2424,6 +2550,7 @@ impl Simulator {
         let struct_coll_in_base = self.pending_struct_coll_in.len();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
+        let mut leaf_aliases: Vec<(String, String)> = Vec::new();
         for (i, port) in td.ports.iter().enumerate() {
             // A type-parameter formal's bound type: a typedef (an unpacked
             // struct binds member-wise below) or a class.
@@ -2569,6 +2696,16 @@ impl Simulator {
                     actual,
                     &mut locals,
                 ) {
+                    // §13.5.2: each leaf of a `ref` struct formal is aliased
+                    // to the member of the actual it copies, where that
+                    // member is storage the callee can name.
+                    if matches!(port.direction, PortDirection::Ref) && arg_supplied(i) {
+                        for (key, caller_leaf) in &backs {
+                            if let Some(storage) = self.ref_leaf_alias_target(caller_leaf) {
+                                leaf_aliases.push((key.clone(), storage));
+                            }
+                        }
+                    }
                     output_bindings.extend(backs);
                     queue_writebacks.append(&mut self.pending_struct_coll_wb);
                     continue;
@@ -2733,6 +2870,22 @@ impl Simulator {
             }
         }
         self.install_struct_formal_colls(struct_coll_in_base);
+        // The select metadata of this activation's formals (see
+        // `TaskCleanup::struct_formal_meta`).
+        let mut struct_formal_meta: Vec<(String, FormalMetaParts)> = Vec::new();
+        for port in td.ports.iter().filter(|p| p.dimensions.is_empty()) {
+            // A built-in scalar registers no layout.
+            if Self::type_is_plain_scalar(&port.data_type) {
+                continue;
+            }
+            let name = port.name.name.as_str();
+            if self.formal_meta_has_selects(name)
+                && !struct_formal_meta.iter().any(|(n, _)| n == name)
+            {
+                struct_formal_meta.push((name.to_string(), self.snapshot_formal_parts(name)));
+                self.ref_park_flags |= super::ref_aliases::REF_PARK_META;
+            }
+        }
         self.commit_formal_dyn(formal_dyn);
         self.push_local_frame_typed(locals, frame_types);
         // §6.21: open a static-local sync frame keyed by this task name.
@@ -2774,7 +2927,12 @@ impl Simulator {
         let mut alias_map: HashMap<String, String> = HashMap::default();
         for (i, port) in td.ports.iter().enumerate() {
             if matches!(port.direction, crate::ast::types::PortDirection::Ref) && arg_supplied(i) {
-                if let Some(frozen) = self.ref_alias_target(&args[i]) {
+                if let Some(frozen) = scope_aliases
+                    .get(i)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| self.ref_alias_target(&args[i]))
+                {
                     alias_map.insert(port.name.name.clone(), frozen);
                 }
                 // Chained identity binding: an actual that is itself the
@@ -2805,6 +2963,16 @@ impl Simulator {
                 ref_map.insert(port.name.name.clone(), actual);
             }
         }
+        if !leaf_aliases.is_empty()
+            && let Some(marker) = self.ref_leaf_frame_marker()
+        {
+            alias_map.extend(leaf_aliases);
+            alias_map.extend([marker]);
+            self.ref_park_flags |= super::ref_aliases::REF_PARK_LEAVES;
+        }
+        if alias_map.values().any(|s| s.ends_with(']')) {
+            self.ref_park_flags |= super::ref_aliases::REF_PARK_ELEMS;
+        }
         // An aliased ref writes through during the call — a return copy-out
         // would CLOBBER writes other processes made to the actual while this
         // call was suspended (observed: an observer's write overwritten by
@@ -2823,6 +2991,7 @@ impl Simulator {
                 }
             }
         }
+        self.ref_pins_acquire(&alias_map);
         self.ref_alias_stack.push(alias_map);
         self.ref_identity_stack.push(identity_formals);
         self.refresh_ref_redirect_hot();
@@ -2895,6 +3064,7 @@ impl Simulator {
             pushed_method_this: false,
             saved_spec: None,
             formal_metadata,
+            struct_formal_meta,
             modclass: None,
         }
     }

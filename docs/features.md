@@ -127,13 +127,16 @@ See the [coverage guide](coverage-guide.md).
   `svdpi.h`, `vpi_user.h` and `sv_vpi_user.h`, so DPI code compiles without
   any vendor installation.
 * **VPI** via `--vpi-lib <path>` (`-m`) — the IEEE 1800 VPI routines and value
-  formats, simulation and value-change callbacks, and the design object model
-  a VPI tool can walk. See the [DPI and VPI guide](dpi-guide.md).
+  formats, simulation, value-change and concurrent-assertion callbacks
+  (`vpi_register_assertion_cb`, assertion `vpi_control` and coverage
+  properties), and the design object model a VPI tool can walk. See the
+  [DPI and VPI guide](dpi-guide.md).
 * **cocotb** — Python testbenches run against xezim through a runner backend
-  (`contrib/cocotb/xezim_runner.py`) on top of the VPI layer, including timed
-  and synchronous callbacks. `get_runner("xezim")` takes the options of
-  cocotb's other runners: `parameters` become `-g` overrides, and since xezim
-  has no compile step, `build_args` apply when `test()` runs.
+  (`contrib/cocotb/xezim_runner.py`, cocotb 2.0 and 2.1) on top of the VPI
+  layer, including timed and synchronous callbacks. `get_runner("xezim")`
+  takes the options of cocotb's other runners: `parameters` become `-g`
+  overrides, and since xezim has no compile step, `build_args` apply when
+  `test()` runs.
 
 ## Performance features
 

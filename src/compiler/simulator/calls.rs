@@ -151,6 +151,30 @@ impl Simulator {
                 return value;
             }
         }
+        // §6.19.5: an enumeration method takes the enumeration from the
+        // receiver's declared type, whatever expression the receiver is.
+        match &func.kind {
+            ExprKind::MemberAccess { expr: recv, member }
+                if Self::is_enum_method(&member.name, args.len()) =>
+            {
+                if let Some(v) = self.enum_method_on_receiver(recv, &member.name, args) {
+                    return v;
+                }
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 2
+                    && h.path.last().is_some_and(|s| {
+                        s.selects.is_empty() && Self::is_enum_method(&s.name.name, args.len())
+                    }) =>
+            {
+                let recv = self.method_receiver_expr(h, h.path.len() - 1);
+                let m = h.path[h.path.len() - 1].name.name.as_str();
+                if let Some(v) = self.enum_method_on_receiver(&recv, m, args) {
+                    return v;
+                }
+            }
+            _ => {}
+        }
         // §7.5.2, §7.9.1, §7.10.2: a collection method on a function's
         // returned queue, dynamic or associative array (`f().size()`).
         if let ExprKind::MemberAccess { expr: recv, member } = &func.kind
@@ -223,6 +247,12 @@ impl Simulator {
             {
                 let mut stripped = hier.clone();
                 stripped.path.remove(0);
+                if let Some(key) =
+                    self.pkg_qual_collection_key(&hier.path[0].name.name, &hier.path[1].name.name)
+                {
+                    stripped.path[0].name.name = key;
+                }
+                stripped.cached_resolved_name = crate::ast::cache::NameCache::new();
                 stripped.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                 let f = Expression::new(ExprKind::Ident(stripped), func.span);
                 return self.eval_call_inner(&f, args);
@@ -2059,11 +2089,71 @@ impl Simulator {
                 }
                 return self.exec_method_call(handle, &member.name, args);
             }
+            // §8.4: a non-virtual method through a null receiver runs on the
+            // declared class (see `call_on_null_receiver`); it returned a
+            // silent zero here and ran nothing.
+            let recv_var = match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    Some(h.path[0].name.name.clone())
+                }
+                _ => None,
+            };
+            // Only a receiver that is null: one whose value read as 0 here but
+            // that names a live object is left to the paths below.
+            if self.eval_handle_expr(expr).unwrap_or(0) == 0
+                && let Some(decl) = self.null_receiver_class(expr)
+                && let Some(v) = self.call_on_null_receiver_of(
+                    recv_var.as_deref(),
+                    &decl,
+                    &member.name,
+                    args,
+                )
+            {
+                return v;
+            }
         }
         // Handle hierarchical ident call: obj.f()
         if let ExprKind::Ident(hier) = &func.kind {
             let path = &hier.path;
             let len = path.len();
+
+            // §8.4: a class method named like a built-in array, string or
+            // enumeration method (`size`, `num`, `delete`), called through a
+            // null handle. The built-in dispatch below goes by the method's
+            // name and took the call for a method of a collection.
+            if len >= 2
+                && path[len - 1].selects.is_empty()
+                && Self::builtin_method_name(&path[len - 1].name.name)
+                && self
+                    .class_member_names()
+                    .methods
+                    .contains(path[len - 1].name.name.as_str())
+                // A plain variable receiver is a handle only when it is
+                // declared with a class type.
+                && (len > 2 || {
+                    let root = path[0].name.name.as_str();
+                    !self.module.queue_vars.contains(root)
+                        && !self.module.dynamic_arrays.contains(root)
+                        && !self.module.associative_arrays.contains_key(root)
+                        && self.class_of_var(root).is_some()
+                })
+            {
+                let recv = self.method_receiver_expr(hier, len - 1);
+                // Null for certain: the receiver's value itself (a chain
+                // through a static property has no handle to walk).
+                if self.eval_handle_expr(&recv).unwrap_or(0) == 0
+                    && self.eval_expr(&recv).to_u64() == Some(0)
+                    && let Some(decl) = self.null_receiver_class(&recv)
+                    && let Some(v) = self.call_on_null_receiver_of(
+                        (len == 2).then(|| path[0].name.name.as_str()),
+                        &decl,
+                        &path[len - 1].name.name,
+                        args,
+                    )
+                {
+                    return v;
+                }
+            }
 
             // §6.18/§8.23: resolve a plain typedef receiver before dispatching
             // Alias::member_type::method (or pkg::Alias::member_type::method).
@@ -3169,6 +3259,12 @@ impl Simulator {
                                     return res;
                                 }
                             }
+                            // §8.4: a non-virtual method of the declared class.
+                            if let Some(v) =
+                                self.call_on_null_receiver(&decl_full, method_name, args)
+                            {
+                                return v;
+                            }
                         }
                     }
                     // The walked-to property may be a covergroup instance
@@ -3486,12 +3582,21 @@ impl Simulator {
                     // ran nothing; the reference simulator reports the null
                     // dereference. A static method never needs the object.
                     if h == 0
-                        && hier.path.len() == 2
-                        && let Some(decl) = self.class_of_var(&hier.path[0].name.name)
+                        && let Some(decl) = self.null_receiver_class(&recv_expr)
                     {
+                        let mname = hier.path.last().unwrap().name.name.clone();
+                        if let Some(v) = self.call_on_null_receiver_of(
+                            (hier.path.len() == 2).then(|| hier.path[0].name.name.as_str()),
+                            &decl,
+                            &mname,
+                            args,
+                        ) {
+                            return v;
+                        }
+                        // A virtual method: an illegal access (§8.4).
                         let base = decl.split('#').next().unwrap_or(&decl).to_string();
-                        let mname = hier.path[1].name.name.clone();
-                        if self.class_has_method(&base, &mname)
+                        if hier.path.len() == 2
+                            && self.class_has_method(&base, &mname)
                             && !self.is_static_method(&base, &mname)
                         {
                             self.report_null_handle_call(&mname);
@@ -3689,6 +3794,30 @@ impl Simulator {
             if hier.path.len() == 1 {
                 if let Some(full) = self.class_module_subroutine_key(name) {
                     return self.call_scoped_subroutine(&full, args);
+                }
+            }
+            // §26.3: a bare call in a method of a class DECLARED inside a
+            // package binds to that package's own function/task — the class
+            // body scopes through its declaring package before the module
+            // instance scope (mirrors the ident fix in
+            // `resolve_hier_name_uncached`).
+            if hier.path.len() == 1
+                && let Some(pkg) = self
+                    .class_context_stack
+                    .last()
+                    .and_then(|c| c.as_ref())
+                    .and_then(|ctx| self.module.class_decl_pkg.get(ctx.as_str()))
+                    .map(ToOwned::to_owned)
+            {
+                let qual = format!("{}::{}", pkg, name);
+                if let Some(fd) = self.fn_decl_rc(&qual) {
+                    self.pending_pkg_scope = Some(pkg.clone());
+                    return self.exec_function_call(&fd, args);
+                }
+                if let Some(td) = self.task_decl_rc(&qual) {
+                    self.pending_pkg_scope = Some(pkg.clone());
+                    self.exec_task_call(&td, args);
+                    return Value::zero(32);
                 }
             }
             // Module-level function call

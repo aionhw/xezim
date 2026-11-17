@@ -39,7 +39,8 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   in generate scopes and compiled stores to multidimensional unpacked array
   elements, with regressions for packed widths and branch-dependent indices;
   bare scope randomization, constant net drivers after release and root UPF
-  power-domain paths.
+  power-domain paths; nonblocking aggregate assignment-pattern reports and
+  regression cases (PR #1200).
 - **Vrajesh Prakhya** — real-number modelling: Verilog-AMS `wreal` nets
   resolved by summing, user-defined nettypes across the hierarchy and in
   packages (§6.6.7, §6.6.8), real-ness of members projected from call results,
@@ -93,7 +94,9 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   associative-array keys sized per specialization, and specialization
   arguments written as expressions of package parameters keyed by their
   value (§8.25); per-element clocking input history for unpacked arrays with
-  an explicit positive skew (§14.4, PR #1138).
+  an explicit positive skew (§14.4, PR #1138); scope-aware destinations for
+  `$fread` and `$readmem*`, and sizing and element writes for dynamic arrays
+  of dynamic arrays, with regression tests (PRs #1208, #1209).
 - **Taichi Ishitani** — constrained-random fixes (members of rand object array
   elements, `pre_randomize` before the rand and constraint modes are read,
   `this.` member paths in the joint solver, and `XEZIM_RAND_DIAG` reports of
@@ -141,7 +144,10 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   address-space limits, femtosecond runtime caps, finished-fork metadata
   reclamation and shared task continuations, with memory and checkpoint
   regression tests; reports on constant-expression widths, real function
-  locals and compilation-unit parameter shadowing.
+  locals and compilation-unit parameter shadowing; top-level combinational
+  blocks evaluated in their own time unit (PR #1203), waveform scope-list
+  regressions (PR #1196), and detailed alias, interconnect and generated
+  real-structure reports and regression cases.
 - **[git-hevangel](https://github.com/git-hevangel)** — shared statement-list
   numbering when restoring checkpoints of processes that have forked,
   including suspended class tasks and condition or event waiters.
@@ -164,7 +170,10 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
 - **[Shabbar Vejlani](https://github.com/shabbarvejlani)** — class-member
   element selects sized at their declared width in compiled methods
   (§11.6.1), and `foreach` modulo equalities solved by drawing each element
-  from its congruence class (§18.5.8.1).
+  from its congruence class (§18.5.8.1); cocotb 2.1 runner compatibility
+  (PR #1189), undeclared-type diagnostics and duplicate-class detection
+  (PR #1187, core PR #230), and the VPI assertion object model, callbacks,
+  controls, coverage queries and regression tests (PR #1191).
 
 ## Bug reports
 

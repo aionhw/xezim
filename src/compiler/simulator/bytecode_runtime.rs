@@ -324,7 +324,12 @@ impl Simulator {
                     if *n == 0 {
                         vm_regs[*d as usize] = Value::zero(0);
                     } else if *n == 1 {
-                        vm_regs[*d as usize] = val;
+                        // §11.8.1: "Concatenation results are unsigned, regardless
+                        // of the operands." `{1{x}}` is still a concatenation, so it
+                        // must not hand the operand's sign flag through.
+                        let mut result = val;
+                        result.is_signed = false;
+                        vm_regs[*d as usize] = result;
                     } else {
                         let result = Value::concat_refs(std::iter::repeat_n(&val, *n as usize));
                         vm_regs[*d as usize] = result;
@@ -1132,7 +1137,12 @@ impl Simulator {
                     if *n == 0 {
                         vm_regs[*d as usize] = Value::zero(0);
                     } else if *n == 1 {
-                        vm_regs[*d as usize] = val;
+                        // §11.8.1: "Concatenation results are unsigned, regardless
+                        // of the operands." `{1{x}}` is still a concatenation, so it
+                        // must not hand the operand's sign flag through.
+                        let mut result = val;
+                        result.is_signed = false;
+                        vm_regs[*d as usize] = result;
                     } else {
                         let result = Value::concat_refs(std::iter::repeat_n(&val, *n as usize));
                         vm_regs[*d as usize] = result;
@@ -1814,25 +1824,20 @@ impl Simulator {
             return None;
         }
         let (p, n) = self.settle_entries_view;
-        let (hint, ts) = if !p.is_null() && e < n {
+        let entry = if !p.is_null() && e < n {
             // SAFETY: the settle published the taken vector's buffer, which is
             // heap-stable and outlives this call (restored before returning).
-            let cold = unsafe { &(*p.add(e)).cold };
-            (cold.scope_hint.clone(), cold.ts_scope())
+            Some(unsafe { &*p.add(e) })
         } else {
-            match self.comb_entries.get(e) {
-                Some(en) => (en.cold.scope_hint.clone(), en.cold.ts_scope()),
-                None => (None, Self::ts_scope_of(None)),
-            }
+            self.comb_entries.get(e)
         };
+        let hint = entry.and_then(|en| en.cold.scope_hint.clone());
+        let ts = entry.map_or_else(|| Self::ts_scope_of(None), |en| en.cold.ts_scope());
         let prev_hint = self.name_resolve_hint.borrow().clone();
         let prev_ts = self.timescale_scope_override.take();
         self.set_m_block_scope(hint.as_deref());
-        if hint.is_some() {
-            *self.name_resolve_hint.borrow_mut() = hint;
-        }
-        // `$time`/`%t` in the fallback scale to the entry's module timescale,
-        // as the four-state arm arranges.
+        *self.name_resolve_hint.borrow_mut() = hint;
+        // §20.3: the entry's source time scope is independent of its name hint.
         self.timescale_scope_override = ts;
         Some((prev_hint, prev_ts))
     }
@@ -2156,10 +2161,14 @@ impl Simulator {
                     // §8.23: a null receiver still has a legally callable
                     // STATIC target — a static method neither needs nor
                     // references `this` (§8.7), so it resolves on the
-                    // declared class. Anything else through a null handle
-                    // stays a silent zero.
-                    self.exec_static_method_via_object(start_class, method, &args, 0)
-                        .unwrap_or_else(|| Value::zero(32))
+                    // declared class. §8.4: so does a non-virtual instance
+                    // method (see `call_on_null_receiver`).
+                    match self.call_on_null_receiver(start_class, method, &args) {
+                        Some(v) => v,
+                        None => self
+                            .exec_static_method_via_object(start_class, method, &args, 0)
+                            .unwrap_or_else(|| Value::zero(32)),
+                    }
                 } else {
                     self.exec_method_in_class_hierarchy(handle, start_class, method, &args)
                 };
@@ -2627,7 +2636,8 @@ impl Simulator {
                     let elem_name = Self::name_with_key(&an, &key);
                     // Keep the established queue-unpack growth behavior in
                     // sync with the AST path.
-                    if !self.is_associative_array(&an) {
+                    let is_assoc = self.is_associative_array(&an);
+                    if !is_assoc {
                         let kval = idx_val.to_i64().unwrap_or(0);
                         if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
                             self.set_queue_size(&an, kval as u64 + 1);
@@ -2635,10 +2645,31 @@ impl Simulator {
                     }
                     // §10.7: fit to the DECLARED element width when one
                     // was recorded; otherwise store as-is.
-                    let fitted = match self.assoc_elem_width(&an) {
+                    let mut fitted = match self.assoc_elem_width(&an) {
                         Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
                         _ => val.clone(),
                     };
+                    // The element takes its declared signedness, not the RHS's
+                    // (`byte m[int]; m[k] = 8'hF0` is -16) — mirror the AST
+                    // store (`assignments.rs::assign_queue_elem_value`). The
+                    // compiled path dropped this, so a byte array element
+                    // written as a negative RHS stored unsigned 8'hFF and
+                    // later sign-RE-ad to 255.
+                    if is_assoc {
+                        if !fitted.is_real
+                            && let Some(sg) = self.assoc_elem_signed(&an)
+                        {
+                            fitted.is_signed = sg;
+                        }
+                    } else {
+                        // §7.10/§10.7: a queue or dynamic-array element takes
+                        // the element type (an `int unsigned` element of -1
+                        // is 2**32-1).
+                        fitted = self.fit_coll_store_elem(&an, fitted);
+                        if !fitted.is_real && !fitted.is_signed && self.signed_class_coll(&an) {
+                            fitted = self.fit_signed_class_coll_elem(&an, fitted);
+                        }
+                    }
                     let changed = self.signals.get(&elem_name) != Some(&fitted);
                     self.signals.insert(elem_name, fitted);
                     if changed {
@@ -3558,10 +3589,13 @@ impl Simulator {
                     if n == 0 {
                         vm_store(&mut self.vm_regs[d], 0, 0, 0, false); // Value::zero(0)
                     } else if n == 1 {
-                        if d != s {
-                            let v = self.vm_regs[s].clone();
-                            self.vm_regs[d] = v;
-                        }
+                        // §11.8.1: "Concatenation results are unsigned, regardless
+                        // of the operands." `{1{x}}` is still a concatenation, so it
+                        // must not hand the operand's sign flag through.
+                        let v = self.vm_regs[s].clone();
+                        let mut result = v;
+                        result.is_signed = false;
+                        self.vm_regs[d] = result;
                     } else {
                         // `{n{x}}` used to build a `Vec<Value>` of `n` clones
                         // (a heap allocation each, for `Wide`) and hand it to

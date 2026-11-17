@@ -251,6 +251,51 @@ endmodule
     );
 }
 
+/// §26.3: a method of a class DECLARED inside a package reads a bare
+/// package parameter/variable of that package even when the running module
+/// neither imports it nor declares it — and that package scope beats a
+/// same-named module parameter (class bodies scope through their declaring
+/// package before the module instance scope), as does a package function
+/// body that shadows the module scope. A class property of the same
+/// name still beats both.
+#[test]
+fn package_class_method_reads_own_package_bare() {
+    let o = lines(
+        r#"
+package p2;
+  parameter int Q = 5;
+  function int bump(int x); return x + Q; endfunction
+  class pc;
+    function void show(string tag);
+      $display("T|%s %0d", tag, Q);
+    endfunction
+    function void callpkg(string tag); $display("T|%s %0d", tag, bump(10)); endfunction
+  endclass
+  class pc2;
+    int Q = 7;
+    function void show(string tag); $display("T|%s %0d", tag, Q); endfunction
+  endclass
+endpackage
+module tb;
+  parameter int Q = 99;
+  initial begin
+    p2::pc a = new;
+    p2::pc2 b = new;
+    a.show("bare");
+    b.show("prop");
+    a.callpkg("bump");
+    $display("T|mod %0d", Q);
+    $display("T|pfn %0d", p2::bump(99));
+    $finish;
+  end
+endmodule
+"#,
+    );
+    expect_all(
+        &o,
+        &["T|bare 5", "T|prop 7", "T|bump 15", "T|mod 99", "T|pfn 104"],
+    );
+}
 /// Module-scope class variables — in the top module and in an instantiated
 /// module, whose `#(int, P)` folds that instance's `P` — take their
 /// specialization, named or positional, and `$typename` (§20.6.1) lists

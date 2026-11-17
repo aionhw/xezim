@@ -845,6 +845,15 @@ impl Simulator {
             indices.extend(self.member_dim_indices(&dims[1..]).unwrap_or_default());
             return self.snapshot_aggregate_shape(expr, dt, &indices, true);
         }
+        // §10.9.1: a pattern for a queue or dynamic array member has one
+        // element per item.
+        if matches!(dims.first(), Some(UD::Queue { .. } | UD::Unsized(_)))
+            && let ExprKind::AssignmentPattern(items) = &Self::unparen(expr).kind
+        {
+            let mut indices = vec![(0..self.pattern_ordered(items).len() as i64).collect()];
+            indices.extend(self.member_dim_indices(&dims[1..]).unwrap_or_default());
+            return self.snapshot_aggregate_shape(Self::unparen(expr), dt, &indices, true);
+        }
         let indices = self.member_dim_indices(dims).unwrap_or_default();
         self.snapshot_aggregate_shape(expr, dt, &indices, false)
     }
@@ -915,11 +924,26 @@ impl Simulator {
         let ExprKind::TypedPattern { ty, pattern } = &e.kind else {
             return None;
         };
+        self.with_pattern_storage(pattern, ty, e.span, f)
+    }
+
+    /// §10.9: run `f` on storage holding the value of `pattern` taken in
+    /// the unpacked type `ty` — a variable of type `ty` initialized with
+    /// the pattern — then release it. None when `ty` is not an unpacked
+    /// aggregate type or the pattern cannot be snapshotted against it.
+    /// The snapshot goes through `snapshot_aggregate_operand`, so a
+    /// conditional pattern is selected arm by arm, as an assignment's
+    /// conditional aggregate is.
+    fn with_pattern_storage<R>(
+        &mut self,
+        pattern: &Expression,
+        ty: &DataType,
+        span: crate::ast::Span,
+        f: impl FnOnce(&mut Self, &Expression) -> R,
+    ) -> Option<R> {
         let (dt, dims) = self.unpacked_type_shape(ty)?;
-        let value = self.snapshot_aggregate_operand_body(
-            pattern,
-            Some(AggregateContext::Declared(&dt, &dims)),
-        )?;
+        let value =
+            self.snapshot_aggregate_operand(pattern, Some(AggregateContext::Declared(&dt, &dims)))?;
         self.typed_pattern_seq += 1;
         let name = format!("__xz_typed_pattern_{}__", self.typed_pattern_seq);
         self.store_conditional_aggregate(&name, &value);
@@ -927,11 +951,11 @@ impl Simulator {
             vec![crate::ast::expr::HierPathSegment {
                 name: crate::ast::Identifier {
                     name: name.clone(),
-                    span: e.span,
+                    span,
                 },
                 selects: Vec::new(),
             }],
-            e.span,
+            span,
         );
         let out = f(self, &held);
         self.release_conditional_aggregate(&name, &value);
@@ -952,6 +976,71 @@ impl Simulator {
             };
             sim.pack_unpacked_struct(&h.path[0].name.name, &su)
         })?
+    }
+
+    /// The packed transport value of the pattern `pattern` taken in the
+    /// unpacked struct type `dt` (§10.9, §13.4.1): a pattern returned from
+    /// a function or method of that type, carried as an unpacked struct
+    /// return carries a struct variable. None when `dt` is not an unpacked
+    /// struct, or carries unpacked dimensions of its own (an array of
+    /// structs is a collection return, not a struct return).
+    pub(super) fn unpacked_struct_pattern_value(
+        &mut self,
+        pattern: &Expression,
+        dt: &DataType,
+    ) -> Option<Value> {
+        let su = self.unpacked_struct_of(dt)?;
+        let (_, dims) = self.unpacked_type_shape(dt)?;
+        if !dims.is_empty() {
+            return None;
+        }
+        self.with_pattern_storage(pattern, dt, pattern.span, |sim, held| {
+            let ExprKind::Ident(h) = &held.kind else {
+                return None;
+            };
+            let v = sim.pack_unpacked_struct(&h.path[0].name.name, &su);
+            // §7.10, §7.5: queue, dynamic and associative members do not
+            // fit the packed transport; they are staged beside it.
+            if v.is_some() && sim.struct_colls_possible() {
+                sim.stage_ret_struct_colls(held);
+            }
+            v
+        })?
+    }
+
+    /// §10.9, §13.4.1: execute `return e` for a pattern `e` returned as an
+    /// unpacked array or queue of unpacked structs. The pattern is built in
+    /// storage of the return type and that storage is returned, as a
+    /// variable of the type is. False for any other return.
+    pub(super) fn return_pattern_in_storage(
+        &mut self,
+        e: &Expression,
+        span: crate::ast::Span,
+    ) -> bool {
+        let e = self.unpacked_pattern(Self::unparen(e));
+        if !matches!(
+            e.kind,
+            ExprKind::AssignmentPattern(_) | ExprKind::Conditional { .. }
+        ) || !crate::compiler::packed_assignment_pattern_plan::has_pattern(e)
+        {
+            return false;
+        }
+        let Some(dt) = self.return_frame_type() else {
+            return false;
+        };
+        let Some((elem, dims)) = self.unpacked_type_shape(&dt) else {
+            return false;
+        };
+        if dims.is_empty() || self.unpacked_struct_of(&elem).is_none() {
+            return false;
+        }
+        self.with_pattern_storage(e, &dt, e.span, |sim, held| {
+            sim.exec_statement(&Statement::new(
+                StatementKind::Return(Some(held.clone())),
+                span,
+            ));
+        })
+        .is_some()
     }
 
     /// Remove what `store_conditional_aggregate` stored for `value`.
@@ -1006,7 +1095,16 @@ impl Simulator {
         self.module.descending_arrays.remove(name);
         match &value.kind {
             AggregateKind::Scalar { value, .. } => {
-                self.signals.insert(name.into(), value.clone());
+                // §10.10: storing an element must update its live member cells,
+                // including change notification. Temporaries and queue leaves
+                // without registered cells retain their map-backed storage.
+                if self.signal_name_to_id.contains_key(name)
+                    || resolve_array_elem_id(name, &self.array_first_id).is_some()
+                {
+                    self.set_signal_value_by_name(name, value.clone());
+                } else {
+                    self.signals.insert(name.into(), value.clone());
+                }
             }
             AggregateKind::Struct(fields) => {
                 for (field, value) in fields {

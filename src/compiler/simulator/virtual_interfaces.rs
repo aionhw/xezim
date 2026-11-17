@@ -3923,7 +3923,7 @@ impl Simulator {
                 && let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(name))
             {
                 return self
-                    .get_signal_value_by_name(storage)
+                    .ref_alias_peek(storage)
                     .and_then(|v| v.to_u64())
                     .and_then(|t| self.iface_by_token(t))
                     .map(str::to_string);
@@ -4306,8 +4306,15 @@ impl Simulator {
     pub(super) fn dt_is_class_handle(dt: &DataType, module: &ElaboratedModule) -> bool {
         match super::elaborate::resolve_typedef_chain(dt, &module.typedef_types) {
             DataType::TypeReference { name, .. } => {
-                module.classes.contains_key(&name.name.name)
-                    && !module.interfaces.contains(&name.name.name)
+                (module.classes.contains_key(&name.name.name)
+                    && !module.interfaces.contains(&name.name.name))
+                    // §15.3, §15.4, §9.7: the built-in classes of package
+                    // `std`; a handle of one starts null like any other.
+                    || (matches!(
+                        name.name.name.as_str(),
+                        "mailbox" | "semaphore" | "process"
+                    ) && name.scopes.iter().all(|s| s.name.name == "std")
+                        && !module.typedef_types.contains_key(&name.name.name))
             }
             _ => false,
         }

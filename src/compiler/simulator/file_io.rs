@@ -289,11 +289,20 @@ impl Simulator {
         }
         while let Some(fc) = fi.next() {
             if fc == '%' {
+                let suppress = if fi.peek() == Some(&'*') {
+                    fi.next();
+                    true
+                } else {
+                    false
+                };
                 let mut width = String::new();
                 while fi.peek().is_some_and(|c| c.is_ascii_digit()) {
                     width.push(fi.next().unwrap());
                 }
-                let w: usize = width.parse().unwrap_or(usize::MAX);
+                // §21.3.4.3 leaves a maximum field width of 0 undefined; treat 0
+                // as "no maximum", matching the reference simulator and the
+                // display-side meaning of `%0d` (§21.2.1.3).
+                let w: usize = width.parse().ok().filter(|&n| n != 0).unwrap_or(usize::MAX);
                 let Some(spec) = fi.next() else { break };
                 if spec == '%' {
                     si = skip_ws(&s, si);
@@ -309,7 +318,7 @@ impl Simulator {
                     }
                     let v = Value::from_u64(s[si] as u64, 8);
                     si += 1;
-                    if oi < outs.len() {
+                    if !suppress && oi < outs.len() {
                         self.assign_value(&outs[oi], &v);
                         oi += 1;
                         assigned += 1;
@@ -326,8 +335,8 @@ impl Simulator {
                         if si == start {
                             break;
                         }
-                        let text: String = s[start..si].iter().collect();
-                        if oi < outs.len() {
+                        if !suppress && oi < outs.len() {
+                            let text: String = s[start..si].iter().collect();
                             self.assign_value(&outs[oi], &Value::from_string(&text));
                             oi += 1;
                             assigned += 1;
@@ -343,7 +352,7 @@ impl Simulator {
                         let text: String = s[start..si].iter().collect();
                         match text.parse::<f64>() {
                             Ok(f) => {
-                                if oi < outs.len() {
+                                if !suppress && oi < outs.len() {
                                     self.assign_value(&outs[oi], &Value::from_f64(f));
                                     oi += 1;
                                     assigned += 1;
@@ -388,21 +397,17 @@ impl Simulator {
                         {
                             break;
                         }
-                        // Parse at the destination's width, not a fixed 32: a
-                        // 160-bit field has to keep all 160 bits of the token.
-                        let dest_width = if oi < outs.len() {
-                            self.infer_lhs_width(&outs[oi]).max(1)
-                        } else {
-                            32
-                        };
-                        let mut v = Value::from_str_radix(&text, radix, dest_width);
-                        if neg {
-                            v = Self::negate_twos_complement(v);
-                        } else {
-                            v.is_signed = signed;
-                        }
                         si = si2;
-                        if oi < outs.len() {
+                        if !suppress && oi < outs.len() {
+                            // Parse at the destination's width, not a fixed 32: a
+                            // 160-bit field has to keep all 160 bits of the token.
+                            let dest_width = self.infer_lhs_width(&outs[oi]).max(1);
+                            let mut v = Value::from_str_radix(&text, radix, dest_width);
+                            if neg {
+                                v = Self::negate_twos_complement(v);
+                            } else {
+                                v.is_signed = signed;
+                            }
                             self.assign_value(&outs[oi], &v);
                             oi += 1;
                             assigned += 1;
@@ -957,21 +962,39 @@ impl Simulator {
                 return Some(name);
             }
         }
-        if self.module.arrays.contains_key(&*resolved) {
-            return Some(resolved.to_string());
+        let ExprKind::Ident(hier) = &expr.kind else {
+            return None;
+        };
+        // Names that belong to the running subroutine or object are not module
+        // memories, so these checks come before any array lookup. A resolved
+        // name that differs from the spelling and is a registered array is a
+        // local array's own storage, which wins over a scalar of that spelling.
+        if self.frame_bound_bare_name(hier).is_some() {
+            return None;
         }
-        if self.module.arrays.contains_key(&raw) {
-            return Some(raw);
+        // `obj.prop` through a class handle is a property, not a memory (array
+        // properties were taken above). Longer chains, such as `obj.vif.mem`,
+        // resolve through the handle's members as usual.
+        if hier.path.len() == 2
+            && self
+                .eval_ident_handle(&hier.path[0].name.name)
+                .is_some_and(|h| self.heap.get(h).is_some_and(|o| o.is_some()))
+        {
+            return None;
         }
-        if let Some(found) = self.module.arrays.keys().find(|k| {
-            *k == &resolved
-                || *k == &raw
-                || k.ends_with(&format!(".{}", resolved))
-                || k.ends_with(&format!(".{}", raw))
-        }) {
-            return Some(found.clone());
+        let bare = hier.path.len() == 1 && hier.path[0].selects.is_empty();
+        if bare
+            && !(resolved.as_ref() != raw && self.module.arrays.contains_key(resolved.as_ref()))
+            && self.scalar_hides_module_coll(hier.path[0].name.name.as_str())
+        {
+            return None;
         }
-        None
+        // `resolved` carries the scope or local storage the name refers to
+        // here, so it is tried before the spelled path.
+        [resolved.as_ref(), raw.as_str()]
+            .into_iter()
+            .find(|n| self.module.arrays.contains_key(*n))
+            .map(str::to_string)
     }
 
     /// The memory a `$readmem*` / `$writemem*` call names, with its

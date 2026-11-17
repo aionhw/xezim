@@ -140,7 +140,7 @@ impl Simulator {
         // container. Clear any stale same-named entry from another
         // frame (var_container_types is a flat map like
         // var_class_types) when this decl isn't a container.
-        match class_name.and_then(Self::container_base) {
+        match class_name.and_then(|t| self.builtin_container_kind(t)) {
             Some(k) => {
                 self.var_container_types
                     .insert(name.to_string(), k.to_string());
@@ -833,6 +833,24 @@ impl Simulator {
         name: &str,
         e: &Expression,
     ) -> Value {
+        // §6.19.5: the variable has its type before its initializer runs
+        // (`for (e_t s = s.first(); ...)`), in this frame only.
+        if let DataType::TypeReference { name: tref, .. } = data_type {
+            let tn = if tref.has_scope() {
+                tref.qualified()
+            } else {
+                tref.name.name.clone()
+            };
+            if self.module.enum_members.contains_key(&tn)
+                || self.module.typedef_types.contains_key(&tn)
+            {
+                self.record_local_typedef_type(name, &tn);
+            } else if self.module.enum_members.contains_key(&tref.name.name)
+                || self.module.typedef_types.contains_key(&tref.name.name)
+            {
+                self.record_local_typedef_type(name, &tref.name.name);
+            }
+        }
         let v = self.eval_expr(e);
         let w = super::elaborate::resolve_type_width(
             data_type,
@@ -1060,6 +1078,18 @@ impl Simulator {
                 }
             }
         }
+        // §23.9 / §6.21: a non-class formal or local of the active routine
+        // (unless typed via an unresolved class type parameter resolved below)
+        // shadows any `this` property or outer class variable of the same name.
+        if !self.method_local_base.is_empty()
+            && self.method_local_shadows(vname)
+            && !self
+                .var_class_types
+                .get(vname)
+                .is_some_and(|c| self.resolve_type_param_binding(c).is_some())
+        {
+            return None;
+        }
         // Member of `this` (the current object) — IEEE 1800-2023 §8.14:
         // inside a class method, properties of `this` take precedence over
         // outer / unrelated procedural locals in `var_class_types`.
@@ -1078,6 +1108,32 @@ impl Simulator {
                     if let Some(c) = self.bound_prop_class(inst, vname, &tn) {
                         return Some(c);
                     }
+                    return None;
+                }
+                // Non-class property of `this` (`string`, `int`, queue, etc.):
+                // `class_prop_type_named` returns None for builtins, so stop
+                // here rather than falling through to an outer/module var.
+                if let Some((_, cd)) = self.prop_owners(&inst.class_name).get(vname) {
+                    if !cd.static_properties.contains(vname)
+                        || cd.string_properties.contains(vname)
+                    {
+                        return None;
+                    }
+                } else if self.class_declares_nonstatic_collection(&inst.class_name, vname) {
+                    return None;
+                }
+            }
+        }
+        if let Some(Some(cls)) = self.class_context_stack.last() {
+            if let Some(tn) = self.class_prop_type_named(cls, vname) {
+                if self.module.classes.contains_key(&tn) || tn.contains('#') {
+                    return Some(tn);
+                }
+                return None;
+            }
+            if let Some((_, cd)) = self.prop_owners(cls).get(vname) {
+                if cd.static_properties.contains(vname) && cd.string_properties.contains(vname) {
+                    return None;
                 }
             }
         }
@@ -2298,7 +2354,7 @@ impl Simulator {
 
     /// The first path segment of the identifier at the root of a
     /// member/index chain (`s` in `s.mm[1][0]`, `arr` in `arr[2].x`).
-    pub(super) fn expr_root_first_seg(e: &Expression) -> Option<&str> {
+    pub(crate) fn expr_root_first_seg(e: &Expression) -> Option<&str> {
         match &e.kind {
             ExprKind::Ident(h) => h.path.first().map(|s| s.name.name.as_str()),
             ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {

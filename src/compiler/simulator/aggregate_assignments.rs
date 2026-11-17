@@ -512,10 +512,12 @@ impl Simulator {
     /// `e` is itself an assignment pattern and `dt` an unpacked struct, recurse
     /// member-wise; otherwise evaluate and write the leaf.
     pub(super) fn assign_pattern_or_leaf(&mut self, target: &str, dt: &DataType, e: &Expression) {
+        let capture = self.pattern_nba_leaves.take();
         if let ExprKind::AssignmentPattern(sub) = &self.unpacked_pattern(e).kind {
             if !sub.is_empty() {
                 if let DataType::Struct(su) = self.resolve_dt(dt) {
                     if Self::spreads_member_wise(&su) {
+                        self.pattern_nba_leaves = capture;
                         self.assign_pattern_into_struct(target, &su, sub);
                         return;
                     }
@@ -523,7 +525,8 @@ impl Simulator {
                 // §10.9.2: a pattern for a packed element takes the
                 // element's type.
                 if let Some(v) = self.eval_in_packed_type(e, dt) {
-                    self.write_leaf_by_name(target, v);
+                    self.pattern_nba_leaves = capture;
+                    self.write_pattern_leaf(target, v);
                     return;
                 }
             }
@@ -542,13 +545,27 @@ impl Simulator {
                     return;
                 }
                 let synthetic = [AssignmentPatternItem::Default(e.clone())];
+                self.pattern_nba_leaves = capture;
                 self.assign_pattern_into_struct(target, &su, &synthetic);
                 return;
             }
         }
         let value = self.eval_pattern_leaf_value(dt, e, None);
-        if value.is_real || Self::is_string_data_type(self.resolve_dt_ref(dt)) {
+        self.pattern_nba_leaves = capture;
+        if self.pattern_nba_leaves.is_none()
+            && (value.is_real || Self::is_string_data_type(self.resolve_dt_ref(dt)))
+        {
             self.set_signal_value_by_name(target, value);
+        } else {
+            self.write_pattern_leaf(target, value);
+        }
+    }
+
+    /// §10.4.2: collect target writes only; RHS function side effects remain
+    /// immediate because item evaluation runs outside the capture context.
+    pub(super) fn write_pattern_leaf(&mut self, target: &str, value: Value) {
+        if let Some(leaves) = &mut self.pattern_nba_leaves {
+            leaves.push((target.to_string(), value));
         } else {
             self.write_leaf_by_name(target, value);
         }
@@ -615,12 +632,22 @@ impl Simulator {
         // A `real` leaf keeps its real value even when the element signal was
         // never flagged real (array elements are synthesized without the flag);
         // otherwise `real m[3] = '{1.5, ...}` truncates to integers.
+        // §6.12/§20.5: a SHORTREAL member holds a binary32 value — writing
+        // 16777216.25 rounds to IEEE float 16777216.0, not the f64 double.
         if matches!(self.resolve_dt(dt), DataType::Real { .. }) {
-            return if v.is_real {
-                v
+            let f = v.to_f64();
+            let rlim = if matches!(
+                self.resolve_dt(dt),
+                DataType::Real {
+                    kind: crate::ast::types::RealType::ShortReal,
+                    ..
+                }
+            ) {
+                f as f32 as f64
             } else {
-                Value::from_f64(v.to_f64())
+                f
             };
+            return Value::from_f64(rlim);
         }
         v
     }
@@ -711,6 +738,12 @@ impl Simulator {
                 }
                 true
             }
+            // §7.5.1, §8.7: `new[n]` / `new[n](src)` parse as calls of
+            // `new` (see `sized_new_parts`). A collection target makes them
+            // the dynamic-array constructor, which the caller's sized-new
+            // store runs; evaluating them here would call the enclosing
+            // class's constructor on `this` (and the size expression twice).
+            ExprKind::Call { .. } if Self::sized_new_parts(e).is_some() => false,
             ExprKind::Call { .. } => {
                 self.pending_ret_collection = None;
                 let _ = self.eval_expr(e);
@@ -1158,6 +1191,10 @@ impl Simulator {
             }
         }
 
+        if let Some(expanded) = self.struct_replication_items(su, items, members.len()) {
+            ordered = expanded;
+        }
+
         members
             .into_iter()
             .enumerate()
@@ -1167,6 +1204,34 @@ impl Simulator {
                 (mname, mdt, dims, e, explicit.is_some())
             })
             .collect()
+    }
+
+    /// IEEE 1800-2023 §10.9.2: the member expressions of a replicated
+    /// structure pattern `'{n{a, b}}` that sets exactly the `members` members
+    /// of `su`, in declaration order. The count is a constant expression
+    /// (A.6.7.1), so a parameter or localparam count is evaluated here; an
+    /// integer literal needs no evaluation. None for any other pattern, a
+    /// count other than the member count. Nested member patterns retain
+    /// their own array dimensions during binding.
+    pub(super) fn struct_replication_items<'a>(
+        &mut self,
+        _su: &crate::ast::types::StructUnionType,
+        items: &'a [AssignmentPatternItem],
+        members: usize,
+    ) -> Option<Vec<&'a Expression>> {
+        // Decide "not a replication" first: every structure pattern
+        // assignment comes through here, and the member scan below allocates.
+        let [AssignmentPatternItem::Ordered(e)] = items else {
+            return None;
+        };
+        if !matches!(e.kind, ExprKind::Replication { .. }) {
+            return None;
+        }
+        let expanded =
+            super::elaborate::struct_pattern_replication_with(items, members, &mut |count| {
+                super::elaborate::struct_pattern_count_value(&self.eval_expr(count))
+            })?;
+        Some(expanded)
     }
 
     /// Spread an assignment pattern across the members of the UNPACKED struct
@@ -1186,9 +1251,14 @@ impl Simulator {
             if dims.is_empty() {
                 // §10.9.2: the type and default keys reach a packed member
                 // no other key sets.
-                if !explicit && let Some(v) = self.eval_default_in_packed_type(items, &mdt) {
-                    self.write_leaf_by_name(&target, v);
-                    continue;
+                if !explicit {
+                    let capture = self.pattern_nba_leaves.take();
+                    let value = self.eval_default_in_packed_type(items, &mdt);
+                    self.pattern_nba_leaves = capture;
+                    if let Some(v) = value {
+                        self.write_pattern_leaf(&target, v);
+                        continue;
+                    }
                 }
                 self.assign_pattern_or_leaf(&target, &mdt, e);
                 continue;
@@ -1235,6 +1305,8 @@ impl Simulator {
             ExprKind::AssignmentPattern(sub) => {
                 self.assign_pattern_items_over_dims(target, dt, lists, sub);
             }
+            // §10.9.1, §10.10: an unpacked array value supplies the elements.
+            _ if self.assign_array_item(target, lists, dt, e) => {}
             _ => {
                 for idx in first {
                     self.assign_pattern_over_dims(&format!("{}[{}]", target, idx), dt, rest, e);
@@ -1255,6 +1327,20 @@ impl Simulator {
         let Some((first, rest)) = lists.split_first() else {
             return;
         };
+        // IEEE 1800-2023 §10.9.1/§10.10.1: replication supplies a whole
+        // dimension, with each expression converted to its element's type.
+        // This helper checks the replication shape before evaluating counts
+        // or allocating, and leaves mismatched counts on the existing path.
+        if let Some(expanded) =
+            super::elaborate::struct_pattern_replication_with(sub, first.len(), &mut |count| {
+                super::elaborate::struct_pattern_count_value(&self.eval_expr(count))
+            })
+        {
+            for (idx, v) in first.iter().zip(expanded) {
+                self.assign_pattern_over_dims(&format!("{}[{}]", target, idx), dt, rest, v);
+            }
+            return;
+        }
         let mut per_elem: Vec<Option<&Expression>> = vec![None; first.len()];
         let mut dflt: Option<&Expression> = None;
         let mut pos = 0usize;
@@ -1539,6 +1625,12 @@ impl Simulator {
                     DT::Struct(inner) => {
                         self.collect_two_state_leaves(inner, &leaf, out);
                     }
+                    // §8.4: a class handle starts null; it has no x state.
+                    DT::TypeReference { .. }
+                        if Self::dt_is_class_handle(&resolved, &self.module) =>
+                    {
+                        out.insert(leaf);
+                    }
                     DT::IntegerVector { kind: IVT::Bit, .. }
                     | DT::IntegerAtom {
                         kind: IAT::Byte | IAT::ShortInt | IAT::Int | IAT::LongInt,
@@ -1749,7 +1841,7 @@ impl Simulator {
     /// For an array operand that is a whole array or a row of a multi-
     /// dimensional unpacked array (`q`, `q[1]`), the dimensions left below the
     /// selected indices and the leaf-path suffixes in declared order.
-    fn unpacked_row_suffixes(&mut self, expr: &Expression) -> Option<Vec<String>> {
+    pub(super) fn unpacked_row_suffixes(&mut self, expr: &Expression) -> Option<Vec<String>> {
         let mut idx_exprs: Vec<&Expression> = Vec::new();
         let mut cur = expr;
         while let ExprKind::Index { expr: inner, index } = &cur.kind {
@@ -3688,7 +3780,51 @@ impl Simulator {
     /// interface) keeps the value as evaluated.
     #[inline(never)]
     pub(super) fn fit_queue_push_elem(&self, coll: &str, val: Value) -> Value {
-        let Some((w, signed, two_state)) = self.integral_queue_elem(coll) else {
+        Self::fit_queue_elem_to(self.integral_queue_elem(coll), val)
+    }
+
+    /// `fit_queue_push_elem` for a compiled element store (`StoreCollElem`).
+    /// The element type comes from a small cache of the last collections
+    /// stored to, so a store loop resolves it once per collection instead of
+    /// on every store (the lookup walks the object's class chain several
+    /// times). A class member's entry also keys on the object's class, and an
+    /// object with type-parameter bindings or a specialization is never
+    /// cached, so a reused handle cannot see another object's element type.
+    pub(super) fn fit_coll_store_elem(&mut self, coll: &str, val: Value) -> Value {
+        let inst = coll
+            .split_once('#')
+            .and_then(|(h, _)| h.parse::<usize>().ok())
+            .and_then(|h| self.heap.get(h)?.as_deref());
+        let cacheable = inst.is_none_or(|i| i.type_bindings.is_empty() && i.spec.is_none());
+        let class = inst.map(|i| i.class_name.as_str());
+        let hit = cacheable
+            .then(|| {
+                self.coll_store_fit_cache
+                    .iter()
+                    .flatten()
+                    .find(|(name, cls, _)| name == coll && cls.as_deref() == class)
+                    .map(|&(_, _, info)| info)
+            })
+            .flatten();
+        let info = match hit {
+            Some(info) => info,
+            None => {
+                let info = self.integral_queue_elem(coll);
+                if cacheable {
+                    let slot = self.coll_store_fit_next % self.coll_store_fit_cache.len();
+                    self.coll_store_fit_next = slot + 1;
+                    self.coll_store_fit_cache[slot] =
+                        Some((coll.to_string(), class.map(str::to_string), info));
+                }
+                info
+            }
+        };
+        Self::fit_queue_elem_to(info, val)
+    }
+
+    /// Fit `val` to the integral element type `info` (`integral_queue_elem`).
+    fn fit_queue_elem_to(info: Option<(u32, bool, bool)>, val: Value) -> Value {
+        let Some((w, signed, two_state)) = info else {
             return val;
         };
         // §6.12.2: a real argument rounds to the integral element type.
@@ -3958,22 +4094,29 @@ impl Simulator {
     }
 
     /// Assign `e` to every leaf of the sub-array `base` spanning `dims`
-    /// (`m = '{default:0}` on a multi-dimensional array).
+    /// (`m = '{default:0}` on a multi-dimensional array). An unpacked array
+    /// value supplies the elements of the first sub-array it matches
+    /// (§10.9.1, §10.10); `descending` orders its elements.
     pub(super) fn fill_dims(
         &mut self,
         base: &str,
         dims: &[(i64, i64)],
         dt: &DataType,
         e: &Expression,
+        descending: &[bool],
     ) {
         if dims.is_empty() {
             self.assign_pattern_or_leaf(base, dt, e);
             return;
         }
+        if self.assign_array_item_dims(base, dims, descending, dt, e) {
+            return;
+        }
         let (lo, hi) = dims[0];
+        let inner_desc = descending.get(1..).unwrap_or(&[]);
         for i in lo..=hi {
             let target = format!("{}[{}]", base, i);
-            self.fill_dims(&target, &dims[1..], dt, e);
+            self.fill_dims(&target, &dims[1..], dt, e, inner_desc);
         }
     }
 
@@ -4006,7 +4149,7 @@ impl Simulator {
                     ExprKind::AssignmentPattern(sub) if !sub.is_empty() => {
                         self.assign_pattern_array(&target, &dims[1..], dt, sub, inner_desc);
                     }
-                    _ => self.fill_dims(&target, &dims[1..], dt, e),
+                    _ => self.fill_dims(&target, &dims[1..], dt, e, inner_desc),
                 }
             } else {
                 self.assign_pattern_or_leaf(&target, dt, e);
@@ -4356,7 +4499,9 @@ impl Simulator {
         if !Self::spreads_member_wise(&su) {
             return false;
         }
+        let capture = self.pattern_nba_leaves.take();
         let iv = self.eval_expr(index);
+        self.pattern_nba_leaves = capture;
         let key = if self.module.associative_arrays.contains_key(&*bname) {
             self.assoc_key_str(&bname, &iv)
         } else {

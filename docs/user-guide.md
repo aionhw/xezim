@@ -8,6 +8,9 @@ of options and environment variables is in the
 [debugging](DEBUGGING.md).
 
 * [Running a simulation](#running-a-simulation)
+* [Cocotb Python testbenches](#cocotb-python-testbenches)
+* [VPI assertion integration](#vpi-assertion-integration)
+* [Random seeds and weighted distributions](#random-seeds-and-weighted-distributions)
 * [Waveforms](#waveforms)
 * [Checkpoints](#checkpoints)
 * [Warm design cache](#warm-design-cache)
@@ -77,6 +80,98 @@ Output, report and assertion messages and the exit status follow GHDL. The
 [VHDL guide](vhdl-guide.md) lists what is supported, the VHDL-2019
 additions, mixed-language designs and how the results are verified.
 
+Current `main` also diagnoses undeclared type names and duplicate class
+definitions. Declare or import the intended type before using it, and keep
+one class definition per name in a scope. A forward class typedef is not a
+second class definition.
+
+## Cocotb Python testbenches
+
+The runner in `contrib/cocotb/xezim_runner.py` supports cocotb 2.0.x and 2.1.0;
+its integration tests cover 2.0.1 and 2.1.0. The 2.1 compatibility changes are
+available on `main` after 0.11.6.
+
+From the repository root, make the runner importable and select your binary:
+
+```bash
+export PYTHONPATH="$PWD/contrib/cocotb${PYTHONPATH:+:$PYTHONPATH}"
+export XEZIM_BIN="$PWD/target/release/xezim"
+python run_test.py
+```
+
+A minimal `run_test.py`, with your `dut.sv` and cocotb `test_dut.py` beside it:
+
+```python
+import xezim_runner  # registers the xezim backend
+from cocotb_tools.runner import get_runner
+
+runner = get_runner("xezim")
+runner.build(sources=["dut.sv"], hdl_toplevel="dut", build_dir="sim_build")
+runner.test(hdl_toplevel="dut", test_module="test_dut")
+```
+
+`build()` records the source files and options; `test()` invokes xezim to
+elaborate and simulate them. Use `parameters={"WIDTH": 8}` for parameter
+overrides and `waves=True` for an FST waveform in the build directory.
+
+Macro values follow the installed cocotb version. For a macro that expands
+to the SystemVerilog string literal `"hi"`, use `defines={"MSG": "hi"}` with
+2.0, or `defines={"MSG": '"hi"'}` with 2.1. Version 2.1 takes HDL text as
+written; it does not add quotes. In either version, `None` defines a macro
+without a value. See the [runner documentation](../contrib/cocotb/xezim_runner.py)
+for option and parameter-rebuild behavior.
+
+## VPI assertion integration
+
+On `main` after 0.11.6, VPI clients can discover concurrent assertion objects,
+register callbacks with `vpi_register_assertion_cb`, query assertion coverage,
+and control assertions through `vpi_control`. Build the client against
+`include/vpi_user.h` and `include/sv_vpi_user.h`, then load its shared library:
+
+```bash
+xezim --vpi-lib ./assertion_monitor.so top.sv
+```
+
+Step controls select an attempt by its start time. `vpiAssertionEnableStep`
+takes the assertion handle, a time pointer and `vpiAssertionClockSteps`;
+`vpiAssertionDisableStep` takes only the handle and time pointer after its
+operation code. `vpiAssertionSysKill` discards pending attempts and disables
+new ones while retaining callbacks. `vpiAssertionSysOn` allows new attempts
+to start again; it does not revive discarded attempts.
+`vpiAssertionSysEnd` removes callbacks and ends the assertion system; later
+controls or callback registrations cannot restart it.
+
+This is the Phase 1 interface. Phase 2 action and lock callbacks are not
+supported. Step callbacks report clock-level progress, callback `detail` is
+NULL, and some coverage counts are approximations. See the
+[DPI and VPI guide](dpi-guide.md#classic-vpi-modules---vpi-lib) for the supported
+objects, callback semantics, coverage limits and checkpoint behavior.
+
+## Random seeds and weighted distributions
+
+Use `+seed=<integer>` to reproduce a randomized run. Compare the sequence
+of generated values when checking that a seed changes a run; a histogram
+alone can hide the difference.
+
+For a class variable constrained only by a `dist` list, xezim can deal
+items from a balanced schedule. Each complete schedule contains items in
+their declared weight proportions. The seed changes their order and the
+starting position, so different seeds can produce identical total counts.
+For example, singleton weights `40,20,12,10,8,5,3,2` give counts
+`800,400,240,200,160,100,60,40` over 2,000 successful calls, even though
+the generated sequences differ. This is intentional xezim solver policy,
+not a requirement that SystemVerilog distributions have exact counts.
+
+Schedules belong to an object and variable and are selected using the
+evaluated weights. They are used only when the reduced schedule fits within
+4,096 entries. Other solver paths, including the same distribution combined
+with a separate range constraint, can use independent weighted draws instead;
+their counts need not match the proportions exactly. Adding a redundant
+constraint can therefore change both the sequence and its histogram.
+Values within a range item are sampled, so balanced item counts do not imply
+exact counts for each value inside the range. Do not rely on a particular
+sequence or solver strategy remaining unchanged across releases.
+
 ## Waveforms
 
 Waveform support is compiled into the model only on request, because it is
@@ -96,6 +191,28 @@ per-signal trace table. Pass `--wave` to enable `$dumpfile`/`$dumpvars`
 
 `--fst` and `--xtrace` imply `--wave`. The three formats are cross-checked
 against each other by decoding them.
+
+The scope options above select what to dump; `--wave-suppress <entry>`
+excludes, and one list applies to all three formats. A bare name is a module
+definition: `--wave-suppress mem_bank` drops every instance of `mem_bank` at
+any depth. A dotted name is one hierarchical path, with or without the
+top-module name: `--wave-suppress tb_top.u_blk.u_bank0` drops that instance
+and everything below it. A path can also name an instance array or a generate
+loop (all of its elements, or one as `g_lane[1]`) or a variable (an unpacked
+array with all of its elements, or one element). A bare name that is not a
+module is read as a path below the top module, so `--wave-suppress u_blk`
+works like `--fst-scope u_blk`; `--wave-suppress-module <name>` forces the
+module reading when an instance has the same name as a module.
+`--wave-suppress-file <file>` reads entries from a file.
+
+Excluded signals are dropped while the dump collects its signals, so they
+cost nothing in the header, the identifier tables or the per-step change
+detection. Each entry reports how many signals it removed, and an entry that
+removed nothing is reported with a warning when the whole design was
+selected. An `--fst-scope`, `--xtrace-scope` or `$dumpvars` argument that
+names an excluded scope, or something inside it, dumps what it names; other
+entries still apply inside it. A compiled artifact takes the options when it
+is run.
 
 Ctrl-C (SIGINT) or SIGTERM stops the run at the current time and closes the
 dumps normally; this includes a long loop inside one time slot. If the run

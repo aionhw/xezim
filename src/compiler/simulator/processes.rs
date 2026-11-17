@@ -100,6 +100,9 @@ impl Simulator {
     }
 
     pub(super) fn take_process_context(&mut self) -> ProcessContext {
+        // §13.5.2: the aliased leaves of a `ref` struct formal reach their
+        // actuals before another process runs.
+        self.ref_frame_flush();
         // The ref stacks leave with the context; nothing can redirect until
         // a context is restored or a new ref frame is pushed.
         self.ref_redirect_hot = false;
@@ -166,6 +169,10 @@ impl Simulator {
         if !self.local_meta_cache.is_empty() && !self.local_meta_claims.is_empty() {
             self.reapply_local_meta();
         }
+        if !self.task_cleanup.is_empty() {
+            self.reinstall_struct_formal_meta();
+        }
+        self.ref_frame_refresh();
     }
 
     /// Capture the current process context, including the current
@@ -937,9 +944,7 @@ impl Simulator {
                     self.timescale_scope_override = entry.cold.ts_scope();
                     let saved_hint = if compiled.has_fallback {
                         let prev = self.name_resolve_hint.borrow().clone();
-                        if let Some(sc) = entry.cold.scope_hint.as_ref() {
-                            *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
-                        }
+                        *self.name_resolve_hint.borrow_mut() = entry.cold.scope_hint.clone();
                         Some(prev)
                     } else {
                         None
@@ -2471,6 +2476,239 @@ impl Simulator {
             }
             _ => None,
         }
+    }
+
+    /// §10.10: capture a one-dimensional unpacked array in element order.
+    pub(super) fn capture_array_rhs(
+        &mut self,
+        lhs: &Expression,
+        rhs: &Expression,
+    ) -> Option<Vec<Value>> {
+        let dst = self.array_operand_name(lhs)?;
+        if self.is_associative_array(&dst)
+            || self.module.arrays_2d.contains_key(&dst)
+            || self.module.arrays_nd.contains_key(&dst)
+            || self.queue_elem_struct(&dst).is_some()
+        {
+            return None;
+        }
+        let mut rhs = rhs;
+        while let ExprKind::Paren(inner) = &rhs.kind {
+            rhs = inner;
+        }
+        // Existing slice capture retains indexed direction and declared bounds.
+        if matches!(rhs.kind, ExprKind::RangeSelect { .. }) {
+            return None;
+        }
+        let mut items = Vec::new();
+        fn flatten<'a>(e: &'a Expression, out: &mut Vec<&'a Expression>) {
+            match &e.kind {
+                ExprKind::Concatenation(xs) => {
+                    for x in xs {
+                        flatten(x, out);
+                    }
+                }
+                ExprKind::Paren(x) => flatten(x, out),
+                _ => out.push(e),
+            }
+        }
+        if let ExprKind::AssignmentPattern(xs) = &rhs.kind {
+            // Positional patterns include already captured intra-assignment
+            // operands. Keyed/default patterns retain their existing path.
+            if !xs
+                .iter()
+                .all(|x| matches!(x, AssignmentPatternItem::Ordered(_)))
+            {
+                return None;
+            }
+            // §11.6.1: each item in the element type, as without the delay.
+            let shape = self.intra_element_shape(&dst);
+            return Some(
+                xs.iter()
+                    .map(|x| self.intra_item_value(shape.as_ref(), x.expr()))
+                    .collect(),
+            );
+        }
+        if !matches!(
+            rhs.kind,
+            ExprKind::Concatenation(_) | ExprKind::Call { .. }
+        ) && self.array_operand_name(rhs).is_none()
+        {
+            return None;
+        }
+        flatten(rhs, &mut items);
+        Some(self.unpacked_concat_operand_values(items))
+    }
+
+    pub(super) fn saved_array_pattern(
+        &mut self,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Expression {
+        let items = values
+            .into_iter()
+            .map(|v| AssignmentPatternItem::Ordered(self.make_intra_saved_expr(v, span)))
+            .collect();
+        Expression::new(ExprKind::AssignmentPattern(items), span)
+    }
+
+    /// §9.4.5: capture the right-hand side of an intra-assignment timing
+    /// control when the statement runs, against its target as an
+    /// assignment without the timing control would evaluate it: at the
+    /// target's width (§11.6.1), and a pattern shaped by a packed target
+    /// (§10.9). A pattern for any other target takes its shape from the
+    /// target only when it is stored, so each item's value is captured
+    /// instead, keys and nesting kept, and the delayed store runs the
+    /// pattern of captured values. Returns that right-hand side and the
+    /// statement that frees the captured items after the store, if any.
+    pub(super) fn capture_intra_rhs(
+        &mut self,
+        lvalue: &Expression,
+        rhs: &Expression,
+        span: crate::ast::Span,
+    ) -> (Expression, Option<Statement>) {
+        let mut inner = rhs;
+        while let ExprKind::Paren(e) = &inner.kind {
+            inner = e;
+        }
+        // §11.4.11: a conditional of unpacked aggregates (`c ? '{1, 2} :
+        // '{3, 4}`) selects its operand now, and that operand is captured.
+        // An operand read through a call, or both operands merged under an
+        // unknown condition, are already a snapshot taken now.
+        if matches!(inner.kind, ExprKind::Conditional { .. })
+            && let Some(selected) = self.selected_aggregate_rhs(Some(lvalue), inner)
+        {
+            if matches!(&selected.kind, ExprKind::Ident(h)
+                if h.path.len() == 1 && h.path[0].name.name.starts_with("__xz_cond_aggregate_"))
+            {
+                return (selected, None);
+            }
+            return self.capture_intra_rhs(lvalue, &selected, span);
+        }
+        if let Some(values) = self.capture_array_rhs(lvalue, inner) {
+            return (self.saved_array_pattern(values, span), None);
+        }
+        if matches!(inner.kind, ExprKind::AssignmentPattern(_)) {
+            // A packed target shapes the pattern now; its value is the one
+            // evaluation of the items (a second would repeat their calls).
+            if let Some(v) = self.eval_pattern_for_lvalue(lvalue, inner) {
+                return (self.make_intra_saved_expr(v, span), None);
+            }
+            let mut slots = Vec::new();
+            let shape = self.intra_target_shape(lvalue);
+            let captured = self.capture_intra_pattern(inner, &mut slots, shape.as_ref());
+            let args = slots
+                .iter()
+                .map(|&idx| Self::intra_slot_literal(idx, span))
+                .collect();
+            let release = Statement::new(
+                StatementKind::Expr(Expression::new(
+                    ExprKind::SystemCall {
+                        name: INTRA_RELEASE_MARKER.to_string(),
+                        args,
+                    },
+                    span,
+                )),
+                span,
+            );
+            return (captured, Some(release));
+        }
+        let val = self.eval_target_rhs(lvalue, rhs);
+        (self.make_intra_saved_expr(val, span), None)
+    }
+
+    /// The pattern `e` with each item's value captured (`capture_intra_rhs`),
+    /// each in the type of the element `shape` matches it to, if known.
+    fn capture_intra_pattern(
+        &mut self,
+        e: &Expression,
+        slots: &mut Vec<u64>,
+        shape: Option<&super::intra_pattern_shape::ItemShape>,
+    ) -> Expression {
+        use crate::ast::expr::AssignmentPatternItem as Item;
+        match &e.kind {
+            ExprKind::Paren(inner) => self.capture_intra_pattern(inner, slots, shape),
+            ExprKind::AssignmentPattern(items) => {
+                if let Some(super::intra_pattern_shape::ItemShape::Struct(su)) = shape {
+                    let members = su.members.iter().map(|m| m.declarators.len()).sum();
+                    if let Some(expanded) = self.struct_replication_items(su, items, members) {
+                        // §10.9.2: each replicated member takes its own type.
+                        // Capturing the repeated expression in only the first
+                        // member's type loses wider bits and four-state values.
+                        let expanded = expanded
+                            .into_iter()
+                            .map(|e| Item::Ordered(e.clone()))
+                            .collect();
+                        let pattern = Expression::new(ExprKind::AssignmentPattern(expanded), e.span);
+                        return self.capture_intra_pattern(&pattern, slots, shape);
+                    }
+                }
+                let shapes = match shape {
+                    Some(s) => self.intra_item_shapes(s, items),
+                    None => Vec::new(),
+                };
+                let mut out = Vec::with_capacity(items.len());
+                for (k, item) in items.iter().enumerate() {
+                    let sh = shapes.get(k).and_then(Option::as_ref);
+                    out.push(match item {
+                        Item::Ordered(x) => Item::Ordered(self.capture_intra_pattern(x, slots, sh)),
+                        Item::Named(n, x) => {
+                            Item::Named(n.clone(), self.capture_intra_pattern(x, slots, sh))
+                        }
+                        Item::Typed(t, x) => {
+                            Item::Typed(t.clone(), self.capture_intra_pattern(x, slots, sh))
+                        }
+                        Item::Default(x) => Item::Default(self.capture_intra_pattern(x, slots, sh)),
+                        Item::Keyed(k, x) => {
+                            Item::Keyed(k.clone(), self.capture_intra_pattern(x, slots, sh))
+                        }
+                    });
+                }
+                Expression::new(ExprKind::AssignmentPattern(out), e.span)
+            }
+            // `'{n{a, b}}`: the count stays, the items are captured, each
+            // matched to an element as the replication is.
+            ExprKind::Replication { count, exprs } => {
+                let mut out = Vec::with_capacity(exprs.len());
+                for x in exprs {
+                    out.push(self.capture_intra_pattern(x, slots, shape));
+                }
+                Expression::new(
+                    ExprKind::Replication {
+                        count: count.clone(),
+                        exprs: out,
+                    },
+                    e.span,
+                )
+            }
+            _ => {
+                let val = self.intra_item_value(shape, e);
+                let idx = self.intra_saved_next;
+                self.intra_saved_next += 1;
+                self.intra_saved.insert(idx, val);
+                slots.push(idx);
+                Expression::new(
+                    ExprKind::SystemCall {
+                        name: INTRA_KEPT_MARKER.to_string(),
+                        args: vec![Self::intra_slot_literal(idx, e.span)],
+                    },
+                    e.span,
+                )
+            }
+        }
+    }
+
+    fn intra_slot_literal(idx: u64, span: crate::ast::Span) -> Expression {
+        Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: false,
+                base: NumberBase::Decimal,
+                value: idx.to_string(),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
+            }),
+            span,
+        )
     }
 
     /// Stash a §9.4.5 RHS value evaluated at statement-execution time and
@@ -4178,8 +4416,8 @@ impl Simulator {
                     if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4 {
                         let n_val = self.eval_expr(&args[0]).to_u64().unwrap_or(0) as i64;
                         let edge_code = self.eval_expr(&args[1]).to_u64().unwrap_or(0);
-                        let val = self.eval_target_rhs(lvalue, &args[3]);
-                        let saved = self.make_intra_saved_expr(val, rvalue.span);
+                        let (saved, release) =
+                            self.capture_intra_rhs(lvalue, &args[3], rvalue.span);
                         let assign = Statement::new(
                             StatementKind::BlockingAssign {
                                 lvalue: lvalue.clone(),
@@ -4212,6 +4450,7 @@ impl Simulator {
                             ));
                         }
                         cont.push(assign);
+                        cont.extend(release);
                         // Chain the caller's tail instead of copying it onto the end of
                         // the spliced body (ProcCont::pushed).
                         self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
@@ -4226,16 +4465,16 @@ impl Simulator {
             // `#d;` followed by `lhs = <saved value>;`.
             if let StatementKind::BlockingAssign { lvalue, rvalue } = &stmt.kind {
                 if let Some((d_expr, rhs)) = Self::intra_delay_marker(rvalue) {
-                    let val = self.eval_expr(rhs);
+                    let (saved, release) = self.capture_intra_rhs(lvalue, rhs, rvalue.span);
                     let delay = self.eval_delay_ticks(d_expr);
-                    let saved = self.make_intra_saved_expr(val, rvalue.span);
-                    let cont = vec![Statement::new(
+                    let mut cont = vec![Statement::new(
                         StatementKind::BlockingAssign {
                             lvalue: lvalue.clone(),
                             rvalue: saved,
                         },
                         stmt.span,
                     )];
+                    cont.extend(release);
                     // Chain the caller's tail rather than copying it (ProcCont::pushed).
                     let cont = pc.pushed(cont, pc.start + i + 1);
                     self.event_queue.schedule(self.time + delay, pid, cont);
@@ -5352,9 +5591,8 @@ impl Simulator {
                     // pre-computed assignment directly at t+d.
                     if let StatementKind::BlockingAssign { lvalue, rvalue } = &s.kind {
                         if let Some((d_expr, rhs)) = Self::intra_delay_marker(rvalue) {
-                            let val = self.eval_expr(rhs);
+                            let (saved, release) = self.capture_intra_rhs(lvalue, rhs, rvalue.span);
                             let delay = self.eval_delay_ticks(d_expr);
-                            let saved = self.make_intra_saved_expr(val, rvalue.span);
                             let assign = Statement::new(
                                 StatementKind::BlockingAssign {
                                     lvalue: lvalue.clone(),
@@ -5362,11 +5600,10 @@ impl Simulator {
                                 },
                                 s.span,
                             );
-                            self.event_queue.schedule(
-                                self.time + delay,
-                                pid_child,
-                                vec![assign].into(),
-                            );
+                            let mut cont = vec![assign];
+                            cont.extend(release);
+                            self.event_queue
+                                .schedule(self.time + delay, pid_child, cont.into());
                             child_pids.insert(pid_child);
                             continue;
                         }

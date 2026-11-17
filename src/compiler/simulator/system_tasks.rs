@@ -306,6 +306,14 @@ impl Simulator {
     }
 
     pub(super) fn exec_system_task(&mut self, name: &str, args: &[Expression]) {
+        if name == INTRA_RELEASE_MARKER {
+            for a in args {
+                if let Some(idx) = self.eval_expr(a).to_u64() {
+                    self.intra_saved.remove(&idx);
+                }
+            }
+            return;
+        }
         if name == SYNC_WAKE_MARKER {
             if let Some(id) = args.first().and_then(|a| self.eval_expr(a).to_u64()) {
                 self.sync_wakes.insert(id);
@@ -896,12 +904,46 @@ impl Simulator {
                 );
                 let mut scopes: Vec<String> = Vec::new();
                 for a in args.iter().skip(1) {
-                    if let ExprKind::Ident(hier) = &a.kind {
-                        let s = self.resolve_hier_name(hier);
-                        if !s.is_empty() {
-                            scopes.push(s.to_string());
+                    // A plain identifier keeps the signal resolver, which knows
+                    // the current-scope and package binding of a bare name. An
+                    // INDEXED path is not an `ExprKind::Ident` at all — the
+                    // parser builds `Index`/`MemberAccess` around it — so it
+                    // used to be dropped here without a word and the dump fell
+                    // back to the whole design; `dump_scope_arg` is the
+                    // `$dumpvars` renderer for that spelling.
+                    let name = match &a.kind {
+                        ExprKind::Ident(hier)
+                            if hier.path.iter().all(|seg| seg.selects.is_empty()) =>
+                        {
+                            let s = self.resolve_hier_name(hier);
+                            (!s.is_empty()).then(|| s.to_string())
+                        }
+                        _ => self.dump_scope_arg(a),
+                    };
+                    match name {
+                        Some(s) => scopes.push(s),
+                        None => {
+                            let text = self.expr_snippet_in(a, None);
+                            self.warn_system_task_once(
+                                &format!("$fsdbDumpvars arg {text}"),
+                                &format!(
+                                    "Warning: $fsdbDumpvars argument '{text}' is not a scope or \
+                                     variable name and was ignored"
+                                ),
+                            );
                         }
                     }
+                }
+                // Same fail-closed rule as `$dumpvars`: an empty scope list
+                // means "no filter", not "select nothing".
+                self.fst_dump_none = false;
+                if args.len() > 1 && scopes.is_empty() {
+                    self.warn_system_task_once(
+                        "$fsdbDumpvars no usable argument",
+                        "Warning: no $fsdbDumpvars argument named a scope or variable, so the \
+                         dump selects nothing (an empty scope list would dump the whole design)",
+                    );
+                    self.fst_dump_none = true;
                 }
                 self.fst_scopes = scopes;
                 if self.fst_writer.is_none() {
@@ -922,7 +964,9 @@ impl Simulator {
                         self.vcd_file = Some("vcdplus.vcd".to_string());
                     }
                     self.vcd_filter_scopes = Vec::new();
+                    self.vcd_dump_none = false;
                     self.vcd_dump_depth = 0;
+                    self.vcd_earlier_selections.clear();
                     self.vcd_start_dump();
                 } else {
                     self.vcd_dump_on();
@@ -942,24 +986,59 @@ impl Simulator {
                     .unwrap_or(0) as u32;
                 let mut filter_scopes: Vec<String> = Vec::new();
                 for a in args.iter().skip(1) {
-                    if let ExprKind::Ident(hier) = &a.kind {
-                        // The argument names a SCOPE path. Join it verbatim —
-                        // `resolve_hier_name` is a SIGNAL resolver whose
-                        // scope-stripping heuristics collapsed
+                    match self.dump_scope_arg(a) {
+                        // The argument names a SCOPE or a VARIABLE. Join it
+                        // verbatim — `resolve_hier_name` is a SIGNAL resolver
+                        // whose scope-stripping heuristics collapsed
                         // `tb.u_m.u_i` to the leaf `u_i`, so a hierarchical
                         // `$dumpvars(0, top.a.b)` selected nothing.
                         // `dump_filter_prefixes` strips the top-module prefix.
-                        let s = hier
-                            .path
-                            .iter()
-                            .map(|seg| seg.name.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(".");
-                        if !s.is_empty() {
-                            filter_scopes.push(s);
+                        Some(s) => filter_scopes.push(s),
+                        None => {
+                            let text = self.expr_snippet_in(a, None);
+                            self.warn_system_task_once(
+                                &format!("$dumpvars arg {text}"),
+                                &format!(
+                                    "Warning: $dumpvars argument '{text}' is not a scope or \
+                                     variable name and was ignored"
+                                ),
+                            );
                         }
                     }
                 }
+                // An EMPTY filter list means "no filter" — the whole design. So
+                // when the user DID name arguments and not one of them survived
+                // as a name, the run must not fail open into a full dump: say
+                // so, and select nothing.
+                let dump_none = args.len() > 1 && filter_scopes.is_empty();
+                if dump_none {
+                    self.warn_system_task_once(
+                        "$dumpvars no usable argument",
+                        "Warning: no $dumpvars argument named a scope or variable, so the dump \
+                         selects nothing (an empty $dumpvars filter would dump the whole \
+                         design)",
+                    );
+                }
+                // §21.7.1.2: "$dumpvars can be invoked as often as desired
+                // throughout the model ... but the execution of all the
+                // $dumpvars tasks shall be at the same simulation time", and
+                // dumping starts at the end of that time unit, so a further
+                // call at the start time adds its objects: restart the dump
+                // with every selection. A call at a later time stays a
+                // checkpoint of the running dump (`vcd_start_dump`).
+                if self.vcd_writer.is_some() && self.vcd_start_time == self.time {
+                    if !self.vcd_dump_none {
+                        let earlier = std::mem::take(&mut self.vcd_filter_scopes);
+                        self.vcd_earlier_selections
+                            .push((earlier, self.vcd_dump_depth));
+                    }
+                    // Dropping the writer flushes it and joins its thread
+                    // before the file is created again.
+                    self.vcd_writer = None;
+                } else if self.vcd_writer.is_none() {
+                    self.vcd_earlier_selections.clear();
+                }
+                self.vcd_dump_none = dump_none;
                 self.vcd_filter_scopes = filter_scopes;
                 self.vcd_dump_depth = depth;
                 self.vcd_start_dump();
@@ -2032,7 +2111,10 @@ impl Simulator {
             // here rather than at one call site.
             ExprKind::Ident(hier) if hier.path.len() == 1 => {
                 let name = &hier.path[0].name.name;
-                if self.local_stack.iter().rev().any(|m| m.contains_key(name)) {
+                // Only the active routine's own frames shadow `this.<name>`
+                // (§23.9, §6.21); a caller's frame below `method_local_base`
+                // must not hide a class property of the same name.
+                if self.method_local_shadows(name) {
                     return false;
                 }
                 (self.this_stack.last().copied().flatten(), name.clone())
@@ -2058,17 +2140,22 @@ impl Simulator {
             }
             _ => return false,
         };
-        let handle = match handle_opt {
-            Some(h) => h,
-            None => return false,
-        };
-        let inst = match self.heap.get(handle).and_then(|c| c.as_ref()) {
-            Some(i) => i,
+        let class_name: &str = match handle_opt {
+            Some(h) => match self.heap.get(h).and_then(|c| c.as_ref()) {
+                Some(i) => &i.class_name,
+                None => return false,
+            },
+            None if matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() == 1) => {
+                match self.class_context_stack.last().and_then(|c| c.as_deref()) {
+                    Some(cls) => cls,
+                    None => return false,
+                }
+            }
             None => return false,
         };
         // Does a class on the inheritance chain declare `prop` as a string
         // property?
-        self.class_string_props_of(&inst.class_name)
+        self.class_string_props_of(class_name)
             .iter()
             .any(|p| *p == prop)
     }
@@ -2169,8 +2256,8 @@ impl Simulator {
                 }
                 let name = seg.name.name.as_str();
                 // §8.7: a bare property name inside a method is `this.<name>`
-                // unless a local or formal shadows it (§6.21).
-                if !self.local_stack.iter().any(|m| m.contains_key(name)) {
+                // unless a local or formal of the active routine shadows it (§6.21).
+                if !self.method_local_shadows(name) {
                     let cls: Option<String> = match self.this_stack.last().copied().flatten() {
                         Some(hd) => self
                             .heap
@@ -2374,10 +2461,25 @@ impl Simulator {
     /// state.  Used by `class_member_is_string` (a `&self` method) to resolve
     /// `obj.<prop>` where `obj` is a local whose stored `Value` is the handle.
     pub(super) fn peek_local_handle(&self, name: &str) -> Option<usize> {
-        // Innermost-out search of the call frames.
-        for m in self.local_stack.iter().rev() {
+        // Innermost-out search of the active routine's frames.
+        let base = self.method_local_base.last().copied().unwrap_or(0);
+        for m in self.local_stack.get(base..).unwrap_or(&[]).iter().rev() {
             if let Some(v) = m.get(name) {
                 return v.to_u64().map(|h| h as usize);
+            }
+        }
+        // Class property of `this` shadows an outer/module variable (§23.9, §8.11).
+        if let Some(Some(handle)) = self.this_stack.last() {
+            if let Some(inst) = self.heap.get(*handle).and_then(|o| o.as_ref()) {
+                let key = self
+                    .shadowed_prop_key(name, false)
+                    .unwrap_or_else(|| name.to_string());
+                if let Some(v) = inst.properties.get(&key) {
+                    return v.to_u64().map(|h| h as usize);
+                }
+                if self.class_declares_property(&inst.class_name, name) {
+                    return None;
+                }
             }
         }
         // A module-scope class-handle declaration (`holder h;` in a `module`,
@@ -3573,21 +3675,9 @@ impl Simulator {
                 } else {
                     push_raw_spec(&mut result, None);
                 }
-            } else if c == '\\' {
-                if let Some(&e) = chars.peek() {
-                    chars.next();
-                    match e {
-                        'n' => result.push('\n'),
-                        't' => result.push('\t'),
-                        '\\' => result.push('\\'),
-                        '"' => result.push('"'),
-                        _ => {
-                            result.push('\\');
-                            result.push(e);
-                        }
-                    }
-                }
             } else {
+                // Backslashes in string literals were already decoded by the lexer
+                // (§5.9.1 / §21.2.1.1), so treat `\` as an ordinary literal character.
                 result.push(c);
             }
         }

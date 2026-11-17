@@ -173,6 +173,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
         }
     }
     check_class_and_package_undeclared(defs, elab, &pkg_names, &mut errs);
+    check_undeclared_type_names(defs, elab, &pkg_names, &mut errs);
     check_nettype_partial_drivers(defs, elab, &mut errs);
     check_named_block_refs(defs, &mut errs);
     if xezim_core::sv_parser::strict_checks() {
@@ -1164,6 +1165,11 @@ fn check_stmt_stream(
         data_type,
         declarators,
         ..
+    }
+    | StatementKind::ParamDecl {
+        data_type,
+        declarators,
+        ..
     } = &s.kind
     {
         for decl in declarators {
@@ -1687,6 +1693,7 @@ fn is_leading_nonexec(s: &Statement) -> bool {
     matches!(
         s.kind,
         StatementKind::VarDecl { .. }
+            | StatementKind::ParamDecl { .. }
             | StatementKind::Typedef(_)
             | StatementKind::Null
             | StatementKind::ScopePop
@@ -1944,7 +1951,11 @@ fn is_builtin_type(n: &str) -> bool {
             | "enum"
             | "struct"
             | "union"
+            // §15.3, §15.4, §9.7: the built-in classes of package `std`,
+            // visible in every scope.
             | "process"
+            | "mailbox"
+            | "semaphore"
             | "supply0"
             | "supply1"
     )
@@ -2106,7 +2117,8 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
     fn block_members(stmts: &[Statement], out: &mut HashSet<String>) {
         for st in stmts {
             for_each_stmt(st, &mut |s| match &s.kind {
-                StatementKind::VarDecl { declarators, .. } => {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => {
                     out.extend(declarators.iter().map(|d| d.name.name.clone()));
                 }
                 StatementKind::SeqBlock { name: Some(n), .. }
@@ -2224,7 +2236,9 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
     for st in &stmts {
         note_stmt(st, &mut blocks);
         for_each_stmt(st, &mut |s| {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 data.extend(declarators.iter().map(|d| d.name.name.clone()));
             }
         });
@@ -2924,7 +2938,9 @@ fn check_subroutine_range_idents(
     let check = |sub: &str, dts: Vec<&DataType>, body: &[Statement], errs: &mut Vec<String>| {
         let mut locals = HashSet::new();
         for st in body {
-            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &st.kind
+            {
                 locals.extend(declarators.iter().map(|d| d.name.name.as_str()));
             }
         }
@@ -3139,7 +3155,8 @@ fn check_foreach_dims(items: &[ModuleItem], errs: &mut Vec<String>) {
     let mut loops: Vec<(String, usize)> = Vec::new();
     for st in &stmts {
         for_each_stmt(st, &mut |s| match &s.kind {
-            StatementKind::VarDecl { declarators, .. } => {
+            StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } => {
                 locals.extend(declarators.iter().map(|d| d.name.name.clone()))
             }
             StatementKind::Foreach { array, vars, .. } => {
@@ -3251,7 +3268,9 @@ fn check_select_depth(items: &[ModuleItem], errs: &mut Vec<String>) {
     }
     for st in &stmts {
         for_each_stmt(st, &mut |s| {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 for d in declarators {
                     dims.remove(d.name.name.as_str());
                 }
@@ -3929,7 +3948,9 @@ fn note_function_names(f: &xezim_core::ast::decl::FunctionDeclaration, out: &mut
     }
     note_data_type_names(&f.return_type, out);
     for st in f.items.iter() {
-        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+        if let StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } = &st.kind
+        {
             note_declarator_names(declarators, out);
         }
     }
@@ -3942,7 +3963,9 @@ fn note_task_names(t: &xezim_core::ast::decl::TaskDeclaration, out: &mut HashSet
         note_data_type_names(&p.data_type, out);
     }
     for st in t.items.iter() {
-        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+        if let StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } = &st.kind
+        {
             note_declarator_names(declarators, out);
         }
     }
@@ -4663,7 +4686,9 @@ fn check_wildcard_import_conflicts(
             _ => continue,
         };
         for_each_stmt(st, &mut |s| {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 locals.extend(declarators.iter().map(|d| d.name.name.clone()));
             }
         });
@@ -4881,7 +4906,9 @@ fn check_inherited_local_access(
             let mut locals: HashSet<String> = ports.iter().map(|p| p.name.name.clone()).collect();
             for st in body {
                 for_each_stmt(st, &mut |s| {
-                    if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                    if let StatementKind::VarDecl { declarators, .. }
+                    | StatementKind::ParamDecl { declarators, .. } = &s.kind
+                    {
                         locals.extend(declarators.iter().map(|d| d.name.name.clone()));
                     }
                 });
@@ -5046,7 +5073,8 @@ fn check_member_access_roots(items: &[ModuleItem], errs: &mut Vec<String>) {
         let mut names: HashSet<String> = ports.iter().map(|p| p.name.name.clone()).collect();
         for st in body {
             for_each_stmt(st, &mut |s| match &s.kind {
-                StatementKind::VarDecl { declarators, .. } => {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => {
                     names.extend(declarators.iter().map(|d| d.name.name.clone()))
                 }
                 StatementKind::SeqBlock { name: Some(n), .. }
@@ -5071,7 +5099,9 @@ fn check_member_access_roots(items: &[ModuleItem], errs: &mut Vec<String>) {
         };
         for st in stmts {
             for_each_stmt(st, &mut |s| {
-                if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                if let StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } = &s.kind
+                {
                     locals.extend(declarators.iter().map(|d| d.name.name.clone()));
                 }
             });
@@ -5435,6 +5465,13 @@ fn monitor_stmt(
                 }
             }
         }
+        StatementKind::ParamDecl { declarators, .. } => {
+            if let Some(top) = scopes.last_mut() {
+                for d in declarators {
+                    top.push((d.name.name.clone(), false));
+                }
+            }
+        }
         StatementKind::Expr(e) => {
             if let ExprKind::SystemCall { name, args } = &e.kind
                 && matches!(
@@ -5562,7 +5599,9 @@ fn check_unpacked_pattern_counts(items: &[ModuleItem], errs: &mut Vec<String>) {
         .collect();
     for s in &procs {
         for_each_stmt(s, &mut |st| {
-            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &st.kind
+            {
                 for d in declarators {
                     shadowed.insert(d.name.name.clone());
                 }
@@ -5697,4 +5736,327 @@ fn monitor_idents(e: &Expression, out: &mut Vec<String>) {
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// §6.18, §8.3, §8.13 — a declaration or `extends` clause naming a type that
+// is declared nowhere.
+// ---------------------------------------------------------------------------
+//
+// `addr_constrained_txn txn = new();` with no such class in the compilation
+// elaborated as an untyped handle: `randomize()` did nothing, every member
+// read `x`, and the run exited 0. An undefined base class was dropped the same
+// way. A type identifier shall be declared before it is used (§6.18), and a
+// class handle or base class shall name a class (§8.3, §8.13).
+//
+// As with the #888 finder above, the pass does not resolve scopes: a name is
+// reported only when NOTHING in the design declares it (no class, typedef,
+// type parameter, covergroup, nettype, interface, package member, ...). A
+// type that exists but is not visible from the use is left to elaboration.
+// Scoped names (`pkg::T`, `C::T`) are left alone too.
+
+/// Walks every definition twice: once harvesting the type-like names the #888
+/// harvest does not reach (`collecting`), once checking the type positions.
+struct UndeclaredTypeFinder<'a> {
+    elab: &'a ElaboratedModule,
+    pkg_names: &'a HashSet<String>,
+    declared: HashSet<String>,
+    collecting: bool,
+    /// The definition being walked, to locate a span in the right file.
+    owner: String,
+    seen: HashSet<String>,
+    errs: Vec<String>,
+}
+
+impl<'a> UndeclaredTypeFinder<'a> {
+    fn known(&self, n: &str) -> bool {
+        !is_plain_ident(n)
+            || is_builtin_type(n)
+            || reserved_type_arg_name(n)
+            || self.pkg_names.contains(n)
+            || self.declared.contains(n)
+            || top_declares(n, self.elab)
+            || self.elab.covergroups.contains_key(n)
+            || self.elab.checker_decls.contains_key(n)
+            || self.elab.nettype_resolvers.contains_key(n)
+            || self.elab.forward_typedef_names.contains(n)
+    }
+
+    fn report(&mut self, n: &str, span: xezim_core::ast::Span, message: String) {
+        if self.collecting || self.known(n) || !self.seen.insert(message.clone()) {
+            return;
+        }
+        self.errs.push(xezim_core::elaborate::span_error_of(
+            self.elab,
+            span,
+            &self.owner,
+            &message,
+        ));
+    }
+
+    /// The type of the declaration of `declared_name`.
+    fn data_type(&mut self, dt: &DataType, declared_name: &str) {
+        match dt {
+            DataType::TypeReference { name, .. } if !name.has_scope() => {
+                let n = name.name.name.clone();
+                let message = format!(
+                    "'{n}' is not a declared type or class: it is used as the type of \
+                     '{declared_name}' but nothing in the design declares it \
+                     (IEEE 1800-2017 §6.18, §8.3)"
+                );
+                self.report(&n, name.span, message);
+            }
+            DataType::Struct(su) => {
+                for m in &su.members {
+                    let member = m
+                        .declarators
+                        .first()
+                        .map(|d| d.name.name.clone())
+                        .unwrap_or_default();
+                    self.data_type(&m.data_type, &member);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn declarators(&mut self, dt: &DataType, ds: &[VarDeclarator]) {
+        let first = ds.first().map(|d| d.name.name.clone()).unwrap_or_default();
+        self.data_type(dt, &first);
+    }
+
+    fn typedef_name(&mut self, td: &TypedefDeclaration) {
+        if self.collecting {
+            self.declared.insert(td.name.name.clone());
+        }
+    }
+
+    fn stmt(&mut self, s: &Statement) {
+        use xezim_core::ast::stmt::ForInit;
+        match &s.kind {
+            StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } => self.declarators(data_type, declarators),
+            StatementKind::Typedef(td) => self.typedef_name(td),
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.stmt(then_stmt);
+                if let Some(e) = else_stmt {
+                    self.stmt(e);
+                }
+            }
+            StatementKind::Case { items, .. } => {
+                for it in items {
+                    self.stmt(&it.stmt);
+                }
+            }
+            StatementKind::For { init, body, .. } => {
+                for i in init {
+                    if let ForInit::VarDecl {
+                        data_type, name, ..
+                    } = i
+                    {
+                        self.data_type(data_type, &name.name);
+                    }
+                }
+                self.stmt(body);
+            }
+            StatementKind::Foreach { body, .. }
+            | StatementKind::ForeachTail { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::ForeverTail { body }
+            | StatementKind::RsAction { body }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => self.stmt(body),
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                for st in stmts {
+                    self.stmt(st);
+                }
+            }
+            StatementKind::RandCase { items } => {
+                for (_, st) in items {
+                    self.stmt(st);
+                }
+            }
+            StatementKind::WaitOrder { pass, fail, .. } => {
+                for st in [pass, fail].into_iter().flatten() {
+                    self.stmt(st);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn ports(&mut self, ports: &[xezim_core::ast::decl::FunctionPort]) {
+        for p in ports {
+            self.data_type(&p.data_type, &p.name.name);
+        }
+    }
+
+    fn function(&mut self, f: &xezim_core::ast::decl::FunctionDeclaration) {
+        self.data_type(&f.return_type, &f.name.name.name);
+        self.ports(&f.ports);
+        for st in f.items.iter() {
+            self.stmt(st);
+        }
+    }
+
+    fn task(&mut self, t: &xezim_core::ast::decl::TaskDeclaration) {
+        self.ports(&t.ports);
+        for st in t.items.iter() {
+            self.stmt(st);
+        }
+    }
+
+    fn covergroup(&mut self, cg: &xezim_core::ast::decl::CovergroupDeclaration) {
+        if self.collecting {
+            self.declared.insert(cg.name.name.clone());
+        }
+    }
+
+    fn class(&mut self, c: &ClassDeclaration) {
+        if self.collecting {
+            self.declared.insert(c.name.name.clone());
+        }
+        if let Some(x) = &c.extends {
+            if x.scopes.is_empty() {
+                let n = x.name.name.clone();
+                let message = format!(
+                    "class '{}' extends '{n}', but nothing in the design declares a class \
+                     '{n}' (IEEE 1800-2017 §8.13)",
+                    c.name.name
+                );
+                self.report(&n, x.span, message);
+            }
+        }
+        for it in &c.items {
+            match it {
+                ClassItem::Property(pr) => self.declarators(&pr.data_type, &pr.declarators),
+                ClassItem::Method(m) => match &m.kind {
+                    ClassMethodKind::Function(f)
+                    | ClassMethodKind::PureVirtual(f)
+                    | ClassMethodKind::Extern(f) => self.function(f),
+                    ClassMethodKind::Task(t) => self.task(t),
+                },
+                ClassItem::Typedef(td) => self.typedef_name(td),
+                ClassItem::Class(inner) => self.class(inner),
+                ClassItem::Covergroup(cg) => self.covergroup(cg),
+                _ => {}
+            }
+        }
+    }
+
+    fn items(&mut self, items: &[ModuleItem]) {
+        for it in items {
+            match it {
+                ModuleItem::DataDeclaration(d) => self.declarators(&d.data_type, &d.declarators),
+                ModuleItem::TypedefDeclaration(td) => self.typedef_name(td),
+                ModuleItem::FunctionDeclaration(f) => self.function(f),
+                ModuleItem::TaskDeclaration(t) => self.task(t),
+                ModuleItem::ClassDeclaration(c) => self.class(c),
+                ModuleItem::InitialConstruct(p) => self.stmt(&p.stmt),
+                ModuleItem::AlwaysConstruct(p) => self.stmt(&p.stmt),
+                ModuleItem::FinalConstruct(p) => self.stmt(&p.stmt),
+                ModuleItem::CovergroupDeclaration(cg) => self.covergroup(cg),
+                ModuleItem::NettypeDeclaration(nt) => {
+                    if self.collecting {
+                        self.declared.insert(nt.name.name.clone());
+                    }
+                }
+                ModuleItem::CheckerDeclaration(ck) => {
+                    if self.collecting {
+                        self.declared.insert(ck.name.name.clone());
+                    }
+                    self.items(&ck.items);
+                }
+                ModuleItem::GenerateRegion(g) => self.items(&g.items),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, its) in &g.branches {
+                        self.items(its);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => self.items(&g.items),
+                ModuleItem::GenerateCase(g) => {
+                    for arm in &g.arms {
+                        if self.collecting {
+                            note_items_names(&arm.items, &mut self.declared);
+                        }
+                        self.items(&arm.items);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn definitions(&mut self, defs: &[&SourceDefinition]) {
+        use xezim_core::ast::decl::PackageItem;
+        for d in defs {
+            self.owner = d.name();
+            if self.collecting {
+                self.declared.insert(d.name());
+            }
+            match d {
+                SourceDefinition::Module(m) => self.items(&m.items),
+                SourceDefinition::Interface(m) => self.items(&m.items),
+                SourceDefinition::Program(m) => self.items(&m.items),
+                SourceDefinition::Package(p) => {
+                    for it in &p.items {
+                        match it {
+                            PackageItem::Data(dd) => {
+                                self.declarators(&dd.data_type, &dd.declarators)
+                            }
+                            PackageItem::Typedef(td) => self.typedef_name(td),
+                            PackageItem::Function(f) => self.function(f),
+                            PackageItem::Task(t) => self.task(t),
+                            PackageItem::Class(c) => self.class(c),
+                            PackageItem::Nettype(nt) if self.collecting => {
+                                self.declared.insert(nt.name.name.clone());
+                            }
+                            PackageItem::Checker(ck) if self.collecting => {
+                                self.declared.insert(ck.name.name.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                SourceDefinition::Class(c) => self.class(c),
+                SourceDefinition::Typedef(_) | SourceDefinition::Udp(_) => {}
+            }
+        }
+    }
+}
+
+/// §6.18, §8.3, §8.13: report every unscoped type name, in a variable,
+/// property, subroutine-port or return-type declaration or in an `extends`
+/// clause, that nothing in the design declares.
+fn check_undeclared_type_names(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+    pkg_names: &HashSet<String>,
+    errs: &mut Vec<String>,
+) {
+    let mut f = UndeclaredTypeFinder {
+        elab,
+        pkg_names,
+        declared: design_declared_names(defs),
+        collecting: true,
+        owner: String::new(),
+        seen: HashSet::new(),
+        errs: Vec::new(),
+    };
+    f.definitions(defs);
+    f.collecting = false;
+    f.definitions(defs);
+    // `defs` iterates a hash map; keep the report order stable.
+    f.errs.sort();
+    errs.extend(f.errs);
 }

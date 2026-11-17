@@ -189,7 +189,7 @@ impl Simulator {
                 .properties
                 .get(&pname)
                 .and_then(|s| s.type_name.as_deref())
-                .and_then(Self::container_base);
+                .and_then(|t| self.builtin_container_kind(t));
             let (is_new, ctor_args): (bool, &[Expression]) = match &init.kind {
                 ExprKind::Call { func, args } if matches!(&func.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new" && h.path[0].selects.is_empty()) => {
                     (true, args.as_slice())

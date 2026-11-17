@@ -74,7 +74,8 @@
 **Debug and integration**
 - VCD, FST and XTrace waveforms
 - DPI-C, the IEEE 1800 VPI (routines, callbacks and the design object
-  model), and [cocotb](contrib/cocotb) Python testbenches
+  model), [assertion callbacks and controls](docs/user-guide.md#vpi-assertion-integration),
+  and [cocotb 2.0/2.1](docs/user-guide.md#cocotb-python-testbenches) Python testbenches
 - Diagnostics that name the file, line and macro a problem came from
 - Opt-in [memory tracing](docs/user-guide.md#diagnosing-memory-growth) during
   parsing, elaboration and simulation setup
@@ -96,7 +97,7 @@
 
 **Open**
 - Apache 2.0 licensed, developed in the open
-- More than 7,000 regression tests, many checked against a commercial
+- More than 7,300 regression tests, including comparisons against a
   reference simulator
 - Built with AI assistance as part of the engineering workflow
 
@@ -105,6 +106,19 @@
 </table>
 
 The [feature list](docs/features.md) has the details.
+
+## Recent updates on main
+
+These changes are available on `main` after 0.11.6:
+
+- VPI assertion objects, callbacks and controls, with
+  [documented limits](docs/user-guide.md#vpi-assertion-integration).
+- Cocotb 2.1.0 support alongside 2.0.1, including version-specific macro values.
+- Correct dynamic-array row sizing and writes, memory-task destination lookup,
+  and time functions in top-level combinational blocks.
+- Diagnostics for undeclared type names and duplicate class definitions.
+
+See the [unreleased notes](NOTES.md#unreleased) for the complete changes.
 
 ## What Xezim does
 

@@ -17,6 +17,8 @@ mod assoc_in_always_ff_and_string_element_methods;
 mod call_time_defaults_and_string_queries;
 #[path = "strings/class_member_string_queue_element_via_path.rs"]
 mod class_member_string_queue_element_via_path;
+#[path = "strings/class_member_string_queue_element_bytecode_compare.rs"]
+mod class_member_string_queue_element_bytecode_compare;
 #[path = "strings/compiled_sformatf_native.rs"]
 mod compiled_sformatf_native;
 #[path = "strings/display_only_always.rs"]
@@ -121,6 +123,8 @@ mod uvm_dpi_driver_linkage;
 mod uvm_dpi_user_library_wins;
 #[path = "strings/vpi_array_ports.rs"]
 mod vpi_array_ports;
+#[path = "strings/vpi_assertion_controls.rs"]
+mod vpi_assertion_controls;
 #[path = "strings/vpi_callbacks.rs"]
 mod vpi_callbacks;
 #[path = "strings/vpi_mcd_and_time_queries.rs"]
@@ -159,3 +163,8 @@ mod format_unknown_spec_no_eval;
 
 #[path = "strings/p_format_aggregates_566.rs"]
 mod p_format_aggregates_566;
+
+#[path = "strings/format_backslash_literal.rs"]
+mod format_backslash_literal;
+#[path = "strings/scan_zero_width.rs"]
+mod scan_zero_width;

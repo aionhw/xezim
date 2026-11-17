@@ -1095,7 +1095,9 @@ impl Simulator {
             } else if super::elaborate::is_type_two_state_resolved(
                 &m.data_type,
                 &self.module.typedef_types,
-            ) {
+            ) || Self::dt_is_class_handle(&m.data_type, &self.module)
+            {
+                // §8.4: a class handle member starts null.
                 Value::zero(mw)
             } else {
                 Value::new(mw)
@@ -1477,7 +1479,7 @@ impl Simulator {
         let pattern_vals = if pattern_tmp.is_some() {
             None
         } else {
-            self.eval_flat_struct_pattern(arg, leaf_count, &widths)
+            self.eval_flat_struct_pattern(&su, arg, leaf_count, &widths)
                 .or_else(|| {
                     let keys: Vec<_> = leaves.iter().map(|l| (l.0.clone(), l.2, l.3)).collect();
                     self.struct_pattern_leaf_values(port_name, &su, arg, &keys)
@@ -1797,6 +1799,7 @@ impl Simulator {
     /// a simple ordered pattern (caller falls back to member-access eval).
     pub(super) fn eval_flat_struct_pattern(
         &mut self,
+        su: &crate::ast::types::StructUnionType,
         arg: &Expression,
         n: usize,
         widths: &[u32],
@@ -1804,7 +1807,9 @@ impl Simulator {
         let ExprKind::AssignmentPattern(parts) = &self.unpacked_pattern(arg).kind else {
             return None;
         };
-        if parts.len() != n {
+        // §10.9.2: even a one-member replication needs member type
+        // context. Let the shared structure binder remove its inner braces.
+        if parts.len() != n || self.struct_replication_items(su, parts, n).is_some() {
             return None;
         }
         let mut out = Vec::with_capacity(n);
@@ -1957,7 +1962,7 @@ impl Simulator {
             locals.insert(format!("{}.", port_name), Value::zero(1));
             let widths: Vec<_> = leaves.iter().map(|l| l.2).collect();
             let pattern_vals = self
-                .eval_flat_struct_pattern(arg, leaves.len(), &widths)
+                .eval_flat_struct_pattern(&su, arg, leaves.len(), &widths)
                 .or_else(|| {
                     let keys: Vec<_> = leaves.iter().map(|l| (l.0.clone(), l.2, l.3)).collect();
                     self.struct_pattern_leaf_values(port_name, &su, arg, &keys)
@@ -2001,7 +2006,7 @@ impl Simulator {
             })
             .collect();
         let pattern_vals = self
-            .eval_flat_struct_pattern(arg, flat_names.len(), &widths)
+            .eval_flat_struct_pattern(&su, arg, flat_names.len(), &widths)
             .or_else(|| {
                 let mut keys = Vec::new();
                 for m in &su.members {
@@ -2275,6 +2280,8 @@ impl Simulator {
             return Some((caller.clone(), caller, prior));
         }
         let key = self.formal_dyn_key(&param, &port.data_type);
+        // §13.5.1: copied associative elements retain their packed fields.
+        self.register_packed_leaf_layout(&key, &port.data_type);
         self.register_formal_shape(&key, &port.dimensions);
         if !matches!(port.direction, PortDirection::Output) {
             // §13.5.1: copy every element in, including unpacked-struct
@@ -2487,6 +2494,9 @@ impl Simulator {
             return self.bind_array_arg(port, &selected);
         }
         let arg = self.unpacked_pattern(arg);
+        // #1108: an array member of an instance-array element.
+        let folded = self.inst_array_member_canon(arg);
+        let arg = folded.as_ref().unwrap_or(arg);
         let params = Some(&self.module.parameters);
         let (lo, hi) = match dims.first()? {
             UD::Range { left, right, .. } => {
@@ -3519,7 +3529,8 @@ impl Simulator {
     pub(super) fn collect_decl_names(stmts: &[Statement], out: &mut HashSet<String>) {
         for st in stmts {
             match &st.kind {
-                StatementKind::VarDecl { declarators, .. } => {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => {
                     for d in declarators {
                         out.insert(d.name.name.clone());
                     }
@@ -3563,7 +3574,9 @@ impl Simulator {
                 lifetime: Some(crate::ast::types::Lifetime::Static),
                 ..
             } => false,
-            StatementKind::Null | StatementKind::VarDecl { .. } => true,
+            StatementKind::Null
+            | StatementKind::VarDecl { .. }
+            | StatementKind::ParamDecl { .. } => true,
             StatementKind::Break | StatementKind::Continue => true,
             StatementKind::Return(e) => e.as_ref().is_none_or(|e| self.expr_is_pure(e, locals)),
             StatementKind::BlockingAssign { lvalue, rvalue } => {

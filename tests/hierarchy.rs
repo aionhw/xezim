@@ -57,6 +57,10 @@ mod dump_merged_sv_adopted_primary;
 mod dump_merged_sv_library_dedup;
 #[path = "hierarchy/dump_merged_sv_top_pruning.rs"]
 mod dump_merged_sv_top_pruning;
+#[path = "hierarchy/duplicate_package_definition.rs"]
+mod duplicate_package_definition;
+#[path = "hierarchy/duplicate_definition_warning.rs"]
+mod duplicate_definition_warning;
 #[path = "hierarchy/expression_port_actuals.rs"]
 mod expression_port_actuals;
 #[path = "hierarchy/final_blocks_hierarchy.rs"]
@@ -285,6 +289,11 @@ mod instance_loop_local_shadows_module_var;
 mod instance_task_in_forever_loop;
 #[path = "hierarchy/interface_port_inside.rs"]
 mod interface_port_inside;
+#[path = "hierarchy/interface_same_name_drive_1123.rs"]
+mod interface_same_name_drive_1123;
+
+#[path = "hierarchy/explicit_dollar_root_read_1124.rs"]
+mod explicit_dollar_root_read_1124;
 #[path = "hierarchy/interface_task_lexical_scope.rs"]
 mod interface_task_lexical_scope;
 #[path = "hierarchy/library_dir_on_demand.rs"]
@@ -487,3 +496,16 @@ mod bind_instance_names_core_201;
 mod instance_struct_members_root_1046;
 #[path = "hierarchy/shared_net_initializer_targets.rs"]
 mod shared_net_initializer_targets;
+#[path = "hierarchy/negative_genvar_cached.rs"]
+mod negative_genvar_cached;
+#[path = "hierarchy/unit_storage_shared_bodies_721.rs"]
+mod unit_storage_shared_bodies_721;
+#[path = "hierarchy/net_alias_groups_1092.rs"]
+mod net_alias_groups_1092;
+#[path = "hierarchy/generate_net_port_actuals_1093.rs"]
+mod generate_net_port_actuals_1093;
+#[path = "hierarchy/generate_real_struct_members_1099.rs"]
+mod generate_real_struct_members_1099;
+
+#[path = "hierarchy/rooted_packed_scope.rs"]
+mod rooted_packed_scope;

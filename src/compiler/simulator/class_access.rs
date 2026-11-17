@@ -200,7 +200,18 @@ impl Simulator {
         // per instance (`u0.q` / `u1.q`), so interning it too keeps the
         // entry per instance — `q.size()` inside a `for` in ten siblings
         // otherwise read the first sibling's queue.
-        let head = hier.path[0].name.name.as_str();
+        // §7.9 / §23.6: generated calls may share a dummy span and head
+        // (`g.s.q.push_back`, `g.s.aa.num`). Keep the entire receiver in
+        // the key; its first segment alone aliases distinct members.
+        let receiver;
+        let head = if keep == 1 && hier.root.is_none() {
+            hier.path[0].name.name.as_str()
+        } else {
+            receiver = format!("{}{}", if hier.root.is_some() { "$root." } else { "" },
+                hier.path[..keep].iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join("."));
+            receiver.as_str()
+        };
+        let cacheable = hier.path[..keep].iter().all(|s| s.selects.is_empty());
         let head_id = match self.method_receiver_hint_ids.get(head) {
             Some(&id) => id,
             None => {
@@ -216,7 +227,7 @@ impl Simulator {
             hint_id,
             head_id,
         );
-        if let Some(e) = self.method_receiver_cache.get(&key) {
+        if cacheable && let Some(e) = self.method_receiver_cache.get(&key) {
             return e.clone();
         }
         let base = HierarchicalIdentifier {
@@ -228,7 +239,9 @@ impl Simulator {
             bound: crate::ast::binding::Bound::UNSET,
         };
         let e = std::rc::Rc::new(Expression::new(ExprKind::Ident(base), hier.span));
-        self.method_receiver_cache.insert(key, e.clone());
+        if cacheable {
+            self.method_receiver_cache.insert(key, e.clone());
+        }
         e
     }
 
@@ -397,6 +410,10 @@ impl Simulator {
                     }
                 } else if !self.contested_pkg_vars.is_empty()
                     && self.contested_pkg_vars.contains(leaf)
+                    // A module-local declaration that SHADOWS the wildcard
+                    // import (§26.3) wins: the runtime must not redirect the
+                    // shadowing bare name to the package var.
+                    && !self.module.wildcard_shadowed.contains(leaf)
                 {
                     if let Some(qual) = self.contested_pkg_var_in_scope(leaf) {
                         return std::borrow::Cow::Owned(qual);
@@ -540,6 +557,10 @@ impl Simulator {
                     }
                 } else if !self.contested_pkg_vars.is_empty()
                     && self.contested_pkg_vars.contains(leaf)
+                    // A module-local declaration that SHADOWS the wildcard
+                    // import (§26.3) wins: the runtime must not redirect the
+                    // shadowing bare name to the package var.
+                    && !self.module.wildcard_shadowed.contains(leaf)
                 {
                     if let Some(qual) = self.contested_pkg_var_in_scope(leaf) {
                         return qual;
@@ -912,6 +933,14 @@ impl Simulator {
         } else {
             self.strip_modport_segments(&raw).unwrap_or(raw)
         };
+        // §23.6: a declared aggregate head is already bound. Its missing
+        // leaf may use the aggregate fallback, but must not be searched for
+        // beneath an unrelated hinted or generated scope.
+        let declared_aggregate_head = hier.path.len() >= 2
+            && self.module.var_decl_types.get(&hier.path[0].name.name).is_some_and(|dt| {
+                matches!(super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types),
+                    DataType::Struct(_))
+            });
         // §8/§23.9: in a method of a class declared inside a module, a
         // dotted name headed by an item of the object's instance (an
         // unpacked struct, an interface or module instance) is that
@@ -1048,14 +1077,82 @@ impl Simulator {
         // declaration resolves a simple name DOWNWARD into the instance
         // — illegal per §23.6 — which the per-hier cache then
         // froze, silently retargeting the parent's NBAs into the child.
-        // Mirrors the bytecode compiler's lookup_signal_id scope-first
-        // order, gated on `activation_scope`: the own-scope lookup uses
-        // the ACTIVATION's scope (never the ratcheted hint, never a stale
-        // current_pid), and compile-time evals — which leave
-        // activation_scope None and deliberately install the correct
-        // scope through the resolve hint — keep their hint-first
-        // order.
+        // §26.3: a bare name inside a method of a class declared in a
+        // package resolves to that package's own parameter or package
+        // variable, even without the running module importing it. The
+        // class's declaring package scope is searched before the module or
+        // instance activation scope, so it fires here — before the
+        // `activation_scope` own-module lookup below — but after the
+        // class-member check (a class property beats the package name;
+        // class properties resolve on their own path before this resolver).
+        // (The contested-variable case is handled earlier via
+        // `contested_pkg_var_in_scope`.)
+        if hier.path.len() == 1 && !raw.contains('.') {
+            let pkg: Option<String> = self
+                .class_context_stack
+                .last()
+                .and_then(|c| c.as_ref())
+                .and_then(|ctx| self.module.class_decl_pkg.get(ctx.as_str()))
+                .map(|s| s.as_str())
+                // §26.3: a bare name inside a package FUNCTION/task body
+                // (no class) names that package's own parameter or variable
+                // too — `p2::helper` returning `Q` reads `p2::Q`.
+                .or_else(|| {
+                    self.pkg_scope_stack.last().and_then(|p| p.as_ref()).map(|p| p.as_str())
+                })
+                .map(ToOwned::to_owned);
+            if let Some(pkg) = pkg {
+                let qual = format!("{}::{}", pkg, raw);
+                if self.module.parameters.get(&qual).is_some()
+                    || self.signal_name_to_id.contains_key(qual.as_str())
+                {
+                    return qual;
+                }
+                // §26.3: `raw` may be IMPORTED into the class's declaring
+                // package (`import gp::*;` inside `p`, class method reading
+                // bare `raw`). The package declares no `p::raw`; resolve
+                // through `p`'s imports to the exporting package's own name.
+                if let Some(imports) = self.module.def_pkg_imports.get(&pkg) {
+                    let mut wildcard: Option<String> = None;
+                    for (src, item) in imports {
+                        match item.as_deref() {
+                            Some(leaf) if leaf == raw => {
+                                let q = format!("{}::{}", src, raw);
+                                if self.module.parameters.get(&q).is_some()
+                                    || self.signal_name_to_id.contains_key(q.as_str())
+                                {
+                                    return q;
+                                }
+                            }
+                            None if self.module.parameters.get(&format!("{}::{}", src, raw)).is_some()
+                                || self.signal_name_to_id.contains_key(&format!("{}::{}", src, raw))
+                            => {
+                                // §26.3: refuse to guess when two wildcard
+                                // imports could both supply it; fall through to
+                                // ordinary resolution instead.
+                                if wildcard.is_some() {
+                                    wildcard = None;
+                                    break;
+                                }
+                                wildcard = Some(src.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(src) = wildcard {
+                        return format!("{}::{}", src, raw);
+                    }
+                }
+            }
+        }
         if !raw.contains('.') {
+            // Mirrors the bytecode compiler's lookup_signal_id scope-first
+            // order, gated on `activation_scope`: the own-scope lookup uses
+            // the ACTIVATION's scope (never the ratcheted hint, never a stale
+            // current_pid), and compile-time evals — which leave
+            // activation_scope None and deliberately install the correct
+            // scope through the resolve hint — keep their hint-first
+            // order.
             let activation = self.activation_scope.borrow();
             match activation.as_deref() {
                 // Top-scope activation: its own module's names are the
@@ -1100,7 +1197,7 @@ impl Simulator {
                     return scoped;
                 }
             }
-        } else if !self.signal_name_to_id.contains_key(raw.as_str()) {
+        } else if !declared_aggregate_head && !self.signal_name_to_id.contains_key(raw.as_str()) {
             // A DOTTED reference from a hinted scope (`core.seq` inside a
             // class method of an object built in `u_w`, or inside a
             // nested block of `u_w`) names a sibling instance's member:
@@ -1339,7 +1436,7 @@ impl Simulator {
         // last `.`-segment matches the leaf — turns the O(N) scan over
         // 35M signals into O(M) where M is the number of signals sharing
         // that leaf name (usually small).
-        if hier.path.len() > 1 {
+        if hier.path.len() > 1 && !declared_aggregate_head {
             let suffix = format!(".{}", raw);
             let candidates: Vec<&str> = if let Some(ids) = self.leaf_name_to_ids.get(leaf.as_str())
             {

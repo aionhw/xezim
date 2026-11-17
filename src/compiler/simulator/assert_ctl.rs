@@ -83,7 +83,7 @@ impl CtlState {
     pub(super) fn fail_action(self) -> bool {
         self.0 & Self::FAIL_OFF == 0
     }
-    fn locked(self) -> bool {
+    pub(super) fn locked(self) -> bool {
         self.0 & Self::LOCKED != 0
     }
     fn set(&mut self, bit: u8, on: bool) {
@@ -412,6 +412,15 @@ impl Simulator {
             levels,
             targets: (!targets.is_empty()).then_some(targets),
         };
+        self.assert_ctl_push(entry);
+    }
+
+    /// Append one control to the log, with its immediate effects.
+    fn assert_ctl_push(&mut self, entry: CtlEntry) {
+        // §39.5.1: system termination also prevents task-based re-enabling.
+        if self.vpi_assert.ended {
+            return;
+        }
         if self.assert_ctl.is_none() {
             let mut c = AssertCtl {
                 multi_top: self.root_is_multi_top(),
@@ -425,9 +434,29 @@ impl Simulator {
         if entry.ctl == CTL_KILL {
             self.assert_ctl_kill(&entry);
         }
+        // IEEE 1800-2017 Clause 39: snapshot after `assert_ctl_kill`, whose
+        // callbacks may themselves push controls before `entry` enters the log.
+        let watched = self.vpi_assert_on.then(|| self.vpi_assert_ctl_snapshot());
         let c = self.assert_ctl.as_mut().unwrap();
         c.push(entry);
         self.assert_ctl_on = !c.log.is_empty();
+        if let Some(before) = watched {
+            self.vpi_assert_ctl_changed(before);
+        }
+    }
+
+    /// A control written through the VPI (IEEE 1800-2017 Clause 39.5): the
+    /// same log entry the system task makes, so both see one state.
+    /// `target` is the instance-relative path of one assertion, `None` the
+    /// design.
+    pub(super) fn assert_ctl_vpi(&mut self, ctl: u8, target: Option<String>, atype: u8, dtype: u8) {
+        self.assert_ctl_push(CtlEntry {
+            ctl,
+            atype,
+            dtype,
+            levels: 0,
+            targets: target.map(|t| vec![t]),
+        });
     }
 
     /// The instance-relative path a list argument names: a scope (instance,
@@ -518,9 +547,8 @@ impl Simulator {
         }
         self.deferred_asserts = kept;
         for i in killed {
-            self.sva_sites[i].attempts.clear();
-            self.sva_sites[i].matured.clear();
-            self.sva_proc_pending.retain(|p| p.0 != i);
+            // Each attempt discarded is a cbAssertionKill (Clause 39.4.2).
+            self.vpi_assert_kill_site(i, None);
         }
     }
 

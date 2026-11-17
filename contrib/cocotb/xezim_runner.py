@@ -33,7 +33,14 @@ from pathlib import Path
 from typing import List, Mapping, Sequence, Union
 
 import cocotb_tools.config
-from cocotb_tools.runner import VHDL, Runner, Verilog, _as_sv_literal
+from cocotb_tools.runner import VHDL, Runner, Verilog
+
+# cocotb 2.0 converts Python define values to HDL literals. In 2.1 the
+# caller supplies HDL text; using its public as_sv_literal would quote twice.
+try:
+    from cocotb_tools.runner import _as_sv_literal as _define_value
+except ImportError:
+    _define_value = str
 
 PathLike = Union[str, os.PathLike]
 _Command = List[str]
@@ -95,14 +102,14 @@ class Xezim(Runner):
         return [arg for inc in includes for arg in ("-I", str(inc))]
 
     def _get_define_options(self, defines: Mapping[str, object]) -> _Command:
-        # Values as cocotb's other runners give them, through the same helper:
-        # a number as written, a string as a string literal.
+        # Values as cocotb's other runners give them: cocotb 2.0 writes a
+        # string as a string literal, cocotb 2.1 takes it as written.
         return [
             arg
             for name, value in defines.items()
             for arg in (
                 "-D",
-                name if value is None else f"{name}={_as_sv_literal(value)}",
+                name if value is None else f"{name}={_define_value(value)}",
             )
         ]
 
@@ -127,6 +134,11 @@ class Xezim(Runner):
 
     @property
     def _vpi_lib(self) -> Path:
+        # cocotb 2.1.0 removed `config.lib_name` in favor of `config.lib_name_path`
+        # (also available in 2.0.1); fall back for earlier 2.0.x releases.
+        lib_name_path = getattr(cocotb_tools.config, "lib_name_path", None)
+        if lib_name_path is not None:
+            return Path(lib_name_path("vpi", _VPI_LIB_FLAVOUR))
         return Path(cocotb_tools.config.libs_dir) / cocotb_tools.config.lib_name(
             "vpi", _VPI_LIB_FLAVOUR
         )
@@ -205,7 +217,7 @@ class Xezim(Runner):
                 f"{self.build_file} is missing — call build() before test()."
             )
 
-        # libcocotbvpi_*.so links against libcocotb.so beside it.
+        # libcocotbvpi_*.so links against the cocotb libraries beside it.
         libs_dir = str(cocotb_tools.config.libs_dir)
         ld = self.env.get("LD_LIBRARY_PATH", os.environ.get("LD_LIBRARY_PATH", ""))
         self.env["LD_LIBRARY_PATH"] = f"{libs_dir}:{ld}" if ld else libs_dir
@@ -229,11 +241,14 @@ class Xezim(Runner):
 def register() -> None:
     """Teach ``cocotb_tools.runner.get_runner`` about ``"xezim"``.
 
-    Wraps the stock ``get_runner`` rather than editing its table, so it keeps
-    working for every simulator cocotb already supports and stays correct if
-    that table changes.
+    Registers in ``SUPPORTED_RUNNERS`` when cocotb exposes it (2.1+) and wraps
+    ``get_runner`` so earlier cocotb 2.0.x releases work too.
     """
     import cocotb_tools.runner as _runner
+
+    supported = getattr(_runner, "SUPPORTED_RUNNERS", None)
+    if isinstance(supported, dict):
+        supported["xezim"] = Xezim
 
     if getattr(_runner.get_runner, "_xezim_wrapped", False):
         return

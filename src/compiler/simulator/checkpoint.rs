@@ -30,7 +30,12 @@ use serde::ser::{SerializeSeq, Serializer};
 // §10.3.3 / §28.16: CombItem::ContAssign retains its original delay target.
 // §10.3.3 / §28.16: and the fall and turn-off delays of a select target.
 // Annex D.9 / §8.3: rebuild property-owner indexes from restored classes.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x09";
+// §16.12.14: abort properties in SvaNode/SvaState, settled attempts per site.
+// §16.12.8: SvaNode::Implies.
+// §13.5.2: TaskCleanup::struct_formal_meta, Simulator::ref_park_flags.
+// §10.3.3: delayed updates retain the mask of bits owned by their driver.
+// Whole-array NBA entries carry captured element values.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x0d";
 
 #[derive(Default)]
 struct Session {
@@ -971,6 +976,8 @@ impl Simulator {
         // block of the saving run had started; the bodies this build queued
         // for its own time 0 belong to no restored process.
         self.lazy_initial.clear();
+        // #1149: the listed-once bits of the restored deferred reads.
+        self.rebuild_deferred_proc_seen();
         self.method_plans.borrow_mut().clear();
         self.fsm_clobber_cache.clear();
         // Annex D.9 / §8.3: this derived index borrows the class table.
@@ -1259,6 +1266,7 @@ checkpoint_state!(
     deferred_comb_pool,
     deferred_proc_entries,
     delayed_nba,
+    delayed_nba_queue,
     delayed_slice_chains,
     delayed_updates,
     dirty_any,
@@ -1427,6 +1435,7 @@ checkpoint_state!(
     name_resolve_hint,
     nba_fast,
     nba_fast_index,
+    nba_queue,
     nba_touched_edge_non_clock,
     nested_run_epoch,
     next_dpi_task,
@@ -1532,6 +1541,7 @@ checkpoint_state!(
     ref_alias_stack,
     ref_binding_stack,
     ref_identity_stack,
+    ref_park_flags,
     ref_redirect_hot,
     return_flag,
     return_value,

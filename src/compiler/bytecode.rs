@@ -2,6 +2,13 @@
 //! Compiles AST expressions and statements into a flat instruction array
 //! that can be executed without pointer-chasing through Box<Expression> trees.
 
+mod two_state;
+pub use two_state::*;
+#[cfg(test)]
+use two_state::fuse_ts_pairs;
+#[cfg(test)]
+mod tests;
+
 use super::simulator::NameMap;
 use super::value::Value;
 use crate::ast::decl::{FunctionDeclaration, TaskDeclaration};
@@ -51,6 +58,12 @@ pub(crate) struct MethodAdmission {
     /// The `instance_fields` that are strings (§6.16), so a dotted read
     /// through a handle of that class is a string operand.
     pub instance_string_fields: HashMap<String, HashSet<String>>,
+    /// The `instance_fields` that are STRING QUEUE / dynamic / associative
+    /// arrays (§6.16 + §7.10/§7.11), keyed by declared class: a dotted
+    /// element read `obj.m_q[i]` through a handle of that class is a
+    /// string operand (`string_cmp`/`StrOp` typing, not the integral
+    /// fallback).
+    pub instance_string_colls: HashMap<String, HashSet<String>>,
     /// §8.20: declared class -> method -> the class whose body a call
     /// through a handle of that declared type binds to, for every
     /// NON-virtual method that some subclass redeclares (the only case where
@@ -66,6 +79,9 @@ pub(crate) struct MethodAdmission {
     /// elements load as one plain value join: string and multi-dimensional
     /// packed elements need facts the compiler keeps for `this` alone.
     pub instance_colls: HashMap<String, ClassColls>,
+    /// Fixed scalar integral return (width, signed) of class methods, keyed by
+    /// `(class, method_name)` including inherited methods.
+    pub method_return_types: HashMap<(String, String), (u32, bool)>,
     /// Free-function facts the method compiles keep asking for; the function
     /// table they come from is the same for every method compile.
     pub fn_facts: FnFacts,
@@ -1946,6 +1962,11 @@ pub struct BytecodeCompiler<'a> {
     /// receivers. See `method_handle_chain_class`.
     handle_member_types: Option<&'a HashMap<String, HashMap<String, String>>>,
     pub(crate) method_admission: Option<std::rc::Rc<MethodAdmission>>,
+    /// Per-specialization instance field widths and signedness for `this` when
+    /// the class chain has value parameters (where `MethodAdmission` cannot
+    /// hold one global fixed width).
+    pub(crate) this_field_widths: HashMap<String, u32>,
+    pub(crate) this_field_signed: HashSet<String>,
     /// Formal declarations supply the same local select metadata as body locals.
     method_formal_types: Option<&'a [crate::ast::decl::FunctionPort]>,
     /// The implicit result is a local of the declared return type too.
@@ -2188,6 +2209,14 @@ pub struct BytecodeCompiler<'a> {
     /// Named-cast targets known at compile time: name -> (width, signed).
     /// See the simulator's `cast_widths`.
     cast_widths: Option<&'a HashMap<String, (u32, bool)>>,
+    /// `expr_signedness` of a dotted identifier (a hierarchical, interface,
+    /// package or member name), by name: an operator re-types its operand
+    /// subtrees, so a long expression asks for the same leaf many times.
+    /// Cleared with the scope hint, which name resolution depends on.
+    dotted_ident_sign: HashMap<String, Option<bool>>,
+    /// `packed_named_select_signed`'s declaration lookup, by variable name:
+    /// the select depth that reaches a named signed element, if any.
+    named_elem_depth: HashMap<String, Option<usize>>,
     /// Top-module name (e.g. "tb"). When a hierarchical identifier reads a
     /// signal whose absolute path is `<top>.<rest>` (e.g. xezim's
     /// port-rewriting baked the top name into a cross-hierarchical
@@ -2389,6 +2418,8 @@ impl<'a> BytecodeCompiler<'a> {
             method_class: None,
             handle_member_types: None,
             method_admission: None,
+            this_field_widths: HashMap::default(),
+            this_field_signed: HashSet::default(),
             method_formal_types: None,
             method_return_type: None,
             method_result_reg: None,
@@ -2435,6 +2466,8 @@ impl<'a> BytecodeCompiler<'a> {
             local_var_struct: HashMap::default(),
             local_packed_types: HashMap::default(),
             cast_widths: None,
+            dotted_ident_sign: HashMap::default(),
+            named_elem_depth: HashMap::default(),
             pattern_ctx: None,
             inline_ret_ty: None,
             local_const_vars: HashMap::default(),
@@ -3195,6 +3228,32 @@ impl<'a> BytecodeCompiler<'a> {
         Some(Box::new(ArrayOperand::Named(name)))
     }
 
+    /// `array_operand` with the index register the element instruction
+    /// reads. §7.4.2: an index into an array whose range has a negative
+    /// bound addresses elements by its signed value, but the element
+    /// instructions read the register's bits as an unsigned number, so
+    /// `arr[-1]` of `int arr[-1:1]`, or `arr[k]` with `int k = -1`, missed its
+    /// element in every compiled block (a read gave x, a write was lost).
+    /// Widen the index to 64 bits first: `MoveResize` sign-extends a signed
+    /// index and zero-extends an unsigned one, which stays out of range.
+    fn array_operand_index(
+        &mut self,
+        name: String,
+        idx_reg: RegId,
+    ) -> Option<(Box<ArrayOperand>, RegId)> {
+        let array = self.array_operand(name)?;
+        let lowest = match array.as_ref() {
+            ArrayOperand::Dense { lo, hi, .. } => (*lo).min(*hi),
+            ArrayOperand::Named(name) => self.arrays.get(name).map_or(0, |&(lo, hi, _)| lo.min(hi)),
+        };
+        if lowest >= 0 {
+            return Some((array, idx_reg));
+        }
+        let wide = self.alloc_reg();
+        self.emit(Insn::MoveResize(wide, idx_reg, 64));
+        Some((array, wide))
+    }
+
     pub fn set_params(&mut self, params: &'a HashMap<String, Value>) {
         self.params = Some(params);
     }
@@ -3433,8 +3492,15 @@ impl<'a> BytecodeCompiler<'a> {
             return self.local_var_dims.get(&reg);
         }
         let m = self.packed_full_dims?;
-        m.get(raw.as_ref())
+        // §23.6 / §7.4.1: absolute names use the same top-prefix
+        // normalization as signal lookup, including their packed geometry.
+        let top_rest = self.top_module_name.as_ref()
+            .and_then(|top| raw.strip_prefix(top.as_str()).and_then(|s| s.strip_prefix('.')));
+        let rooted = hier.root.is_some() || top_rest.is_some();
+        let raw = top_rest.unwrap_or(raw.as_ref());
+        m.get(raw)
             .or_else(|| {
+                if rooted { return None; }
                 self.scope_hint
                     .as_ref()
                     .and_then(|sc| with_dotted(sc, &raw, |k| m.get(k)))
@@ -3552,6 +3618,8 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     pub fn set_scope_hint(&mut self, scope: Option<String>) {
+        self.dotted_ident_sign.clear();
+        self.named_elem_depth.clear();
         self.scope_hint = scope;
     }
 
@@ -3676,7 +3744,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// Does `stmt` declare a variable anywhere (a block-local `VarDecl`)?
     fn stmt_declares(stmt: &Statement) -> bool {
         match &stmt.kind {
-            StatementKind::VarDecl { .. } => true,
+            StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. } => true,
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                 stmts.iter().any(Self::stmt_declares)
             }
@@ -3816,7 +3884,26 @@ impl<'a> BytecodeCompiler<'a> {
             }
             (!out.is_empty()).then_some(out)
         };
-        let (sfd, sargs) = super::struct_sra::scalarize_member_call(fd, args, member, &members)?;
+        // §7.4.2/§10.9.2: typedef array members keep the existing scalarizer
+        // handling; only the new replication expansion is disabled for them.
+        let replication_allowed = |ms: &super::struct_sra::Members| {
+            !ms.iter().any(|(_, dt)| {
+                let DataType::TypeReference { name, .. } = dt else {
+                    return false;
+                };
+                self.typedef_unpacked_dims.is_some_and(|dims| {
+                    self.typedef_entry(dims, name, scope)
+                        .is_some_and(|(_, d)| !d.is_empty())
+                })
+            })
+        };
+        let (sfd, sargs) = super::struct_sra::scalarize_member_call(
+            fd,
+            args,
+            member,
+            &members,
+            &replication_allowed,
+        )?;
         let start = self.insns.len();
         let next = self.next_reg;
         let saved_reason = self.bail_reason;
@@ -4521,6 +4608,445 @@ impl<'a> BytecodeCompiler<'a> {
     /// become register-backed locals; a `return <expr>` assigns the return
     /// register (only valid as the final statement, which is the shape any
     /// combinational helper uses).
+    fn untyped_param_effective_dt(
+        &self,
+        signing: &Option<crate::ast::types::Signing>,
+        init: Option<&Expression>,
+        span: crate::ast::Span,
+    ) -> crate::ast::types::DataType {
+        use crate::ast::types::{
+            DataType, IntegerVectorType, PackedDimension, RealType, Signing, SimpleType,
+        };
+        if let Some(e) = init {
+            if self.expr_is_real_static(e) {
+                return DataType::Real {
+                    kind: RealType::Real,
+                    span,
+                };
+            }
+            if self.expr_is_string_static(e) {
+                return DataType::Simple {
+                    kind: SimpleType::String,
+                    span,
+                };
+            }
+        }
+        let w = self
+            .params
+            .and_then(|p| init.and_then(|e| crate::compiler::elaborate::untyped_param_width(e, p)))
+            .unwrap_or(32)
+            .max(1);
+        let eff_signing = match signing {
+            Some(s) => Some(*s),
+            None => match (self.params, init) {
+                (Some(p), Some(e)) => Some(
+                    if crate::compiler::elaborate::untyped_param_is_signed(e, p) {
+                        Signing::Signed
+                    } else {
+                        Signing::Unsigned
+                    },
+                ),
+                _ => Some(Signing::Signed),
+            },
+        };
+        let int_lit = |val: String| {
+            Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                    size: Some(32),
+                    signed: false,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: val,
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                }),
+                span,
+            )
+        };
+        DataType::IntegerVector {
+            kind: IntegerVectorType::Logic,
+            signing: eff_signing,
+            dimensions: vec![PackedDimension::Range {
+                left: Box::new(int_lit((w - 1).to_string())),
+                right: Box::new(int_lit("0".to_string())),
+                span,
+            }],
+            span,
+        }
+    }
+
+    fn compile_stmt_decl_item(
+        &mut self,
+        stmt_span: crate::ast::Span,
+        data_type: &crate::ast::types::DataType,
+        lifetime: &Option<crate::ast::types::Lifetime>,
+        decl: &crate::ast::stmt::VarDeclarator,
+    ) -> bool {
+        // §6.18: a local declared through a typedef that carries
+        // unpacked dims is a collection too. A queue / unsized
+        // array without an initializer takes the local-collection
+        // path below; any other shape stays on the AST path.
+        if decl.dimensions.is_empty()
+            && let crate::ast::types::DataType::TypeReference { name: tn, .. } = data_type
+            && let Some(dims) = self.typedef_coll_dims.get(&type_name_key(tn))
+        {
+            use crate::ast::types::UnpackedDimension as UD;
+            if self.method_mode
+                && decl.init.is_none()
+                && dims.len() == 1
+                && matches!(dims[0], UD::Queue { .. } | UD::Unsized(_))
+            {
+                let synth = Statement::new(
+                    StatementKind::VarDecl {
+                        data_type: data_type.clone(),
+                        lifetime: lifetime.clone(),
+                        declarators: vec![decl.clone()],
+                    },
+                    stmt_span,
+                );
+                self.emit(Insn::InitLocalColl(Box::new((
+                    Arc::new(synth),
+                    Arc::from("VarDecl_local_coll"),
+                ))));
+                self.local_coll_names.insert(decl.name.name.clone());
+                // §6.16: `typedef string q_t[$]` elements are
+                // strings, as a `string q[$]` local's are.
+                if self.typedef_coll_strings.contains(&type_name_key(tn)) {
+                    self.local_coll_strings.insert(decl.name.name.clone());
+                } else {
+                    self.local_coll_strings.remove(&decl.name.name);
+                }
+                return true;
+            }
+            self.bail("VarDecl_typedef_array");
+            return false;
+        }
+        if !decl.dimensions.is_empty() {
+            use crate::ast::types::UnpackedDimension as UD;
+            if self.method_mode
+                && decl.init.is_none()
+                && decl.dimensions.len() == 1
+                && matches!(decl.dimensions[0], UD::Queue { .. } | UD::Unsized(_))
+            {
+                let synth = Statement::new(
+                    StatementKind::VarDecl {
+                        data_type: data_type.clone(),
+                        lifetime: lifetime.clone(),
+                        declarators: vec![decl.clone()],
+                    },
+                    stmt_span,
+                );
+                self.emit(Insn::InitLocalColl(Box::new((
+                    Arc::new(synth),
+                    Arc::from("VarDecl_local_coll"),
+                ))));
+                self.local_coll_names.insert(decl.name.name.clone());
+                if Self::dt_is_string(data_type) {
+                    self.local_coll_strings.insert(decl.name.name.clone());
+                } else {
+                    self.local_coll_strings.remove(&decl.name.name);
+                }
+                return true;
+            }
+            // One constant-bounded unpacked dimension, small: a
+            // register bank. (`logic [7:0] tmp [0:15]` in an
+            // inlined AES shift_rows / rcon table.) Every access
+            // must fold to a constant index or the enclosing
+            // compile fails and rolls back.
+            let bounds = if decl.dimensions.len() == 1 {
+                match &decl.dimensions[0] {
+                    UD::Range { left, right, .. } => {
+                        let l = self.fold_const(left).and_then(|v| v.to_u64());
+                        let r = self.fold_const(right).and_then(|v| v.to_u64());
+                        match (l, r) {
+                            (Some(l), Some(r)) => {
+                                let (lo, hi) = (l.min(r) as i64, l.max(r) as i64);
+                                Some((lo, (hi - lo + 1) as usize))
+                            }
+                            _ => None,
+                        }
+                    }
+                    UD::Expression { expr, .. } => self
+                        .fold_const(expr)
+                        .and_then(|v| v.to_u64())
+                        .filter(|&n| n > 0)
+                        .map(|n| (0i64, n as usize)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let Some((lo, len)) = bounds.filter(|&(_, n)| n <= 64) else {
+                self.bail("VarDecl_array");
+                return false;
+            };
+            if decl.init.is_some() {
+                self.bail("VarDecl_array_init");
+                return false;
+            }
+            let ew = self.decl_width(data_type);
+            let base = self.next_reg;
+            for _ in 0..len {
+                let slot = self.alloc_reg();
+                let init = self.type_default_value(data_type, ew);
+                self.emit(Insn::LoadConst(slot, Box::new(init)));
+            }
+            let Ok(base) = RegId::try_from(base) else {
+                self.bail("VarDecl_array");
+                return false;
+            };
+            self.local_array_regs
+                .insert(decl.name.name.clone(), (base, ew, len, lo));
+            return true;
+        }
+        // §6.16 string local: no declared width — bind at width
+        // 0 so no Resize ever lands on it, and mark it for the
+        // %s / string-assign paths.
+        let is_string = self.decl_is_string(data_type, None);
+        let decl_width = if is_string {
+            0
+        } else {
+            self.decl_width(data_type)
+        };
+        // §6.21: a STATIC local persists across calls — its
+        // declaration runs ONCE. A declarator WITH an initializer
+        // has run-once semantics the block cannot express — bail
+        // the whole method to the AST path.
+        if self.method_mode
+            && matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+        {
+            if decl.init.is_some() {
+                self.bail("static_local_init");
+                return false;
+            }
+            let slot = self.alloc_reg();
+            let is_real = self.decl_is_real(data_type, None);
+            let is_string = self.decl_is_string(data_type, None);
+            let is_class_handle = self.class_local_names.contains(&decl.name.name);
+            let (w, default) = if is_class_handle {
+                (0, Value::zero(32))
+            } else if is_real {
+                (0, Value::from_f64(0.0))
+            } else {
+                let w = if is_string {
+                    0
+                } else {
+                    self.decl_width(data_type)
+                };
+                (w, self.type_default_value(data_type, w))
+            };
+            if is_class_handle {
+                self.method_handle_names.insert(decl.name.name.clone());
+            } else {
+                if is_real {
+                    self.local_var_is_real.insert(decl.name.name.clone());
+                }
+                if is_string {
+                    self.local_var_is_string.insert(decl.name.name.clone());
+                }
+                if let Some(k) = self.local_kind_of(data_type, None) {
+                    self.local_kinds.insert(slot, k);
+                }
+                self.note_local_dims(slot, data_type);
+            }
+            self.local_var_regs
+                .insert(decl.name.name.clone(), (slot, w));
+            self.decl_local_regs.insert(decl.name.name.clone());
+            self.method_static_locals
+                .push((decl.name.name.clone(), slot, default));
+            return true;
+        }
+        // Step 6: a CLASS-typed local holds a heap HANDLE in a register.
+        if self.method_mode && self.class_local_names.contains(&decl.name.name) {
+            let slot = self.alloc_reg();
+            let new_cls = decl
+                .init
+                .as_ref()
+                .filter(|e| Self::is_new_shape(e))
+                .and_then(|_| self.new_type_map.get(&decl.name.name))
+                .filter(|cls| {
+                    matches!(data_type, crate::ast::types::DataType::TypeReference { name, .. }
+                        if name.name.name.rsplit("::").next() == Some(cls.as_str()))
+                })
+                .cloned();
+            match &decl.init {
+                Some(expr) if new_cls.is_some() => {
+                    let cls = new_cls.expect("checked");
+                    let Some(value) = self.compile_new_construct(expr, &cls) else {
+                        self.bail("VarDecl_init");
+                        return false;
+                    };
+                    self.emit(Insn::Move(slot, value));
+                }
+                Some(expr) => {
+                    let Some(value) = self.compile_expr(expr, 0) else {
+                        self.bail("VarDecl_init");
+                        return false;
+                    };
+                    self.emit(Insn::Move(slot, value));
+                }
+                None => {
+                    self.emit(Insn::LoadConst(slot, Box::new(Value::zero(32))));
+                }
+            }
+            if self.method_bound_names.contains(&decl.name.name)
+                && self.local_var_regs.contains_key(&decl.name.name)
+            {
+                self.method_shadowing_regs.insert(slot);
+            }
+            self.local_var_regs
+                .insert(decl.name.name.clone(), (slot, 0));
+            self.method_handle_names.insert(decl.name.name.clone());
+            self.decl_local_regs.insert(decl.name.name.clone());
+            return true;
+        }
+        // §6.12: a `real` local holds a real, whatever its
+        // initializer (or its default, 0.0) is.
+        let is_real = self.decl_is_real(data_type, None);
+        let kind = if is_string {
+            Some(LocalKind::Str)
+        } else {
+            self.local_kind_of(data_type, None)
+        };
+        let slot = self.alloc_reg();
+        match kind {
+            Some(k) => {
+                self.local_kinds.insert(slot, k);
+            }
+            None => {
+                self.local_kinds.remove(&slot);
+            }
+        }
+        let width = decl_width;
+        self.note_local_dims(slot, data_type);
+        match &decl.init {
+            Some(expr) => {
+                let Some(value) = self.compile_expr(expr, width) else {
+                    self.bail("VarDecl_init");
+                    return false;
+                };
+                self.emit(Insn::Move(slot, value));
+            }
+            None => {
+                let value = if is_real {
+                    Value::from_f64(0.0)
+                } else {
+                    self.type_default_value(data_type, width)
+                };
+                self.emit(Insn::LoadConst(slot, Box::new(value)));
+            }
+        }
+        let name = &decl.name.name;
+        if is_real {
+            self.emit_to_real(slot);
+            self.local_var_is_real.insert(name.clone());
+        } else {
+            self.local_var_is_real.remove(name);
+            if width > 0 {
+                self.emit(Insn::Resize(slot, width));
+                self.emit_local_fit(slot);
+            }
+        }
+        if is_string {
+            self.local_var_is_string.insert(name.clone());
+        } else {
+            self.local_var_is_string.remove(name);
+        }
+        self.local_var_regs.insert(name.clone(), (slot, width));
+        self.record_local_packed_type(slot, data_type);
+        self.decl_local_regs.insert(name.clone());
+        true
+    }
+
+    fn compile_pure_decl(
+        &mut self,
+        data_type: &crate::ast::types::DataType,
+        d: &crate::ast::stmt::VarDeclarator,
+    ) -> bool {
+        // Step 6: a CLASS-typed local holds a heap HANDLE in a
+        // register — default null (0), no resize (handles
+        // round-trip untouched), and the name joins
+        // `method_handle_names` so `.member` is a heap access.
+        if self.class_local_names.contains(&d.name.name) && d.dimensions.is_empty() {
+            let slot = self.alloc_reg();
+            match &d.init {
+                Some(e) => {
+                    let Some(v) = self.compile_expr(e, 0) else {
+                        return false;
+                    };
+                    self.emit(Insn::Move(slot, v));
+                }
+                None => {
+                    self.emit(Insn::LoadConst(slot, Box::new(Value::zero(32))));
+                }
+            }
+            self.local_var_regs.insert(d.name.name.clone(), (slot, 0));
+            self.method_handle_names.insert(d.name.name.clone());
+            return true;
+        }
+        let is_real = self.decl_is_real(data_type, None);
+        if !d.dimensions.is_empty() {
+            // A SMALL fixed-shape local array (`real row
+            // [0:3]`) — the working-buffer shape every
+            // interpolation helper uses — becomes one
+            // register per element; a dynamic index selects
+            // by compare/branch chain (see
+            // `compile_local_array_read`). Anything else
+            // (queues, big or non-constant shapes) keeps the
+            // AST path.
+            if d.init.is_some()
+                || !self.bind_local_array(&d.name.name, &d.dimensions, data_type, is_real)
+            {
+                self.bail("Expr_Call_local_array");
+                return false;
+            }
+            return true;
+        }
+        let is_string = self.decl_is_string(data_type, None);
+        let w = if is_string {
+            0
+        } else {
+            self.decl_width(data_type)
+        };
+        let slot = self.alloc_reg();
+        match &d.init {
+            Some(e) => {
+                let Some(v) = self.compile_expr(e, w) else {
+                    return false;
+                };
+                self.emit(Insn::Move(slot, v));
+            }
+            None => {
+                let init = self.type_default_value(data_type, w);
+                self.emit(Insn::LoadConst(slot, Box::new(init)));
+            }
+        }
+        if is_real {
+            self.local_var_is_real.insert(d.name.name.clone());
+            self.emit_to_real(slot);
+        } else if w > 0 {
+            self.emit(Insn::Resize(slot, w));
+        }
+        if is_string {
+            self.local_var_is_string.insert(d.name.name.clone());
+        }
+        if let Some(ew) = self.decl_elem_width(data_type) {
+            if ew > 0 && w > ew && w % ew == 0 {
+                if self.decl_outer_dim_unnormalized(data_type) {
+                    self.bail("Expr_Call_packed_outer_dim");
+                    return false;
+                }
+                self.local_var_elem.insert(d.name.name.clone(), ew);
+            }
+        }
+        if let Some(k) = self.local_kind_of(data_type, None) {
+            self.local_kinds.insert(slot, k);
+            self.emit_local_fit(slot);
+        }
+        self.note_local_dims(slot, data_type);
+        self.local_var_regs.insert(d.name.name.clone(), (slot, w));
+        self.record_local_packed_type(slot, data_type);
+        true
+    }
+
     fn compile_pure_body(&mut self, items: &[Statement]) -> bool {
         for st in items {
             match &st.kind {
@@ -4534,95 +5060,37 @@ impl<'a> BytecodeCompiler<'a> {
                         return false;
                     }
                     for d in declarators {
-                        // Step 6: a CLASS-typed local holds a heap HANDLE in a
-                        // register — default null (0), no resize (handles
-                        // round-trip untouched), and the name joins
-                        // `method_handle_names` so `.member` is a heap access.
-                        if self.class_local_names.contains(&d.name.name) && d.dimensions.is_empty()
+                        if !self.compile_pure_decl(data_type, d) {
+                            return false;
+                        }
+                    }
+                }
+                StatementKind::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
+                } => {
+                    if self.method_mode && self.class_alias_dynamic_width(data_type) {
+                        self.bail("class_alias_runtime_width");
+                        return false;
+                    }
+                    let untyped = matches!(
+                        data_type,
+                        crate::ast::types::DataType::Implicit { dimensions, .. }
+                            if dimensions.is_empty()
+                    );
+                    for d in declarators {
+                        let eff_dt = if untyped
+                            && let crate::ast::types::DataType::Implicit { signing, .. } = data_type
                         {
-                            let slot = self.alloc_reg();
-                            match &d.init {
-                                Some(e) => {
-                                    let Some(v) = self.compile_expr(e, 0) else {
-                                        return false;
-                                    };
-                                    self.emit(Insn::Move(slot, v));
-                                }
-                                None => {
-                                    self.emit(Insn::LoadConst(slot, Box::new(Value::zero(32))));
-                                }
-                            }
-                            self.local_var_regs.insert(d.name.name.clone(), (slot, 0));
-                            self.method_handle_names.insert(d.name.name.clone());
-                            continue;
-                        }
-                        let is_real = self.decl_is_real(data_type, None);
-                        if !d.dimensions.is_empty() {
-                            // A SMALL fixed-shape local array (`real row
-                            // [0:3]`) — the working-buffer shape every
-                            // interpolation helper uses — becomes one
-                            // register per element; a dynamic index selects
-                            // by compare/branch chain (see
-                            // `compile_local_array_read`). Anything else
-                            // (queues, big or non-constant shapes) keeps the
-                            // AST path.
-                            if d.init.is_some()
-                                || !self.bind_local_array(
-                                    &d.name.name,
-                                    &d.dimensions,
-                                    data_type,
-                                    is_real,
-                                )
-                            {
-                                self.bail("Expr_Call_local_array");
-                                return false;
-                            }
-                            continue;
-                        }
-                        let is_string = self.decl_is_string(data_type, None);
-                        let w = if is_string {
-                            0
+                            Some(self.untyped_param_effective_dt(signing, d.init.as_ref(), st.span))
                         } else {
-                            self.decl_width(data_type)
+                            None
                         };
-                        let slot = self.alloc_reg();
-                        match &d.init {
-                            Some(e) => {
-                                let Some(v) = self.compile_expr(e, w) else {
-                                    return false;
-                                };
-                                self.emit(Insn::Move(slot, v));
-                            }
-                            None => {
-                                let init = self.type_default_value(data_type, w);
-                                self.emit(Insn::LoadConst(slot, Box::new(init)));
-                            }
+                        let dt = eff_dt.as_ref().unwrap_or(data_type);
+                        if !self.compile_pure_decl(dt, d) {
+                            return false;
                         }
-                        if is_real {
-                            self.local_var_is_real.insert(d.name.name.clone());
-                            self.emit_to_real(slot);
-                        } else if w > 0 {
-                            self.emit(Insn::Resize(slot, w));
-                        }
-                        if is_string {
-                            self.local_var_is_string.insert(d.name.name.clone());
-                        }
-                        if let Some(ew) = self.decl_elem_width(data_type) {
-                            if ew > 0 && w > ew && w % ew == 0 {
-                                if self.decl_outer_dim_unnormalized(data_type) {
-                                    self.bail("Expr_Call_packed_outer_dim");
-                                    return false;
-                                }
-                                self.local_var_elem.insert(d.name.name.clone(), ew);
-                            }
-                        }
-                        if let Some(k) = self.local_kind_of(data_type, None) {
-                            self.local_kinds.insert(slot, k);
-                            self.emit_local_fit(slot);
-                        }
-                        self.note_local_dims(slot, data_type);
-                        self.local_var_regs.insert(d.name.name.clone(), (slot, w));
-                        self.record_local_packed_type(slot, data_type);
                     }
                 }
                 // `return` — early or final — compiles via compile_stmt's
@@ -5180,7 +5648,8 @@ impl<'a> BytecodeCompiler<'a> {
         }
         match &stmt.kind {
             StatementKind::Null => true,
-            StatementKind::VarDecl { declarators, .. } => declarators
+            StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } => declarators
                 .iter()
                 .all(|decl| decl.init.as_ref().map(&expr_simple).unwrap_or(true)),
             StatementKind::NonblockingAssign { lvalue, rvalue, .. }
@@ -5727,7 +6196,10 @@ impl<'a> BytecodeCompiler<'a> {
         // A declaration run by the interpreter would live in the carried
         // frame and vanish with it, while the statements after it still
         // need the variable.
-        if matches!(stmt.kind, StatementKind::VarDecl { .. }) {
+        if matches!(
+            stmt.kind,
+            StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. }
+        ) {
             return Err("fb_decl_escapes");
         }
         let scan = self.fb_scan_with(|s| s.stmt(stmt));
@@ -6212,7 +6684,7 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::TimingControl { .. } => "Stmt_Timing",
             StatementKind::Wait { .. } => "Stmt_Wait",
             StatementKind::Assertion(_) => "Stmt_Assertion",
-            StatementKind::VarDecl { .. } => "Stmt_VarDecl",
+            StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. } => "Stmt_VarDecl",
             _ => "Stmt_other",
         }
     }
@@ -7024,15 +7496,13 @@ impl<'a> BytecodeCompiler<'a> {
             crate::ast::expr::ExprKind::MemberAccess { expr: base, member } => {
                 let m = member.name.as_str();
                 // A receiver of another declared class (`p.contents` with
-                // `pattern p`) is admitted by THAT class's collections.
-                let admitted = match self.foreign_colls(base) {
-                    Some(colls) => colls.members.contains(m),
-                    None => {
-                        self.method_handle_chain_class(base).is_some()
-                            && self.coll_member_names.contains(m)
-                    }
-                };
-                admitted.then(|| (member.name.clone(), false, Some((**base).clone())))
+                // `pattern p`) is admitted by THAT class's collections. A
+                // STRING collection (`obj.m_q[i]`) is admitted by the
+                // class's string-collection set (kept separate — see
+                // `instance_string_colls`); its element loads as a real
+                // string Value, so `StrOp` typing works.
+                self.foreign_coll_admitted(base, m)
+                    .then(|| (member.name.clone(), false, Some((**base).clone())))
             }
             // The parser's spelling of a dotted foreach array: `p.contents`.
             crate::ast::expr::ExprKind::Ident(h)
@@ -7042,12 +7512,33 @@ impl<'a> BytecodeCompiler<'a> {
             {
                 let base = Self::dotted_head_expr(h);
                 let m = h.path[1].name.name.as_str();
-                self.foreign_colls(&base)?
-                    .members
-                    .contains(m)
+                self.foreign_coll_admitted(&base, m)
                     .then(|| (m.to_string(), false, Some(base)))
             }
             _ => None,
+        }
+    }
+
+    /// `obj.m_q` — is `m_q` a collection member (integral OR string) of
+    /// `obj`'s DECLARED class, resolvable through a handle chain?
+    /// Returns true for the plan's integral `instance_colls` members and
+    /// for string collections (`instance_string_colls`).
+    fn foreign_coll_admitted(&self, base: &Expression, m: &str) -> bool {
+        match self.foreign_colls(base) {
+            Some(colls) => {
+                colls.members.contains(m)
+                    || self
+                        .method_admission
+                        .as_ref()
+                        .and_then(|a| {
+                            self.method_handle_chain_class(base)
+                                .and_then(|c| a.instance_string_colls.get(&c))
+                        })
+                        .is_some_and(|sc| sc.contains(m))
+            }
+            None => {
+                self.method_handle_chain_class(base).is_some() && self.coll_member_names.contains(m)
+            }
         }
     }
 
@@ -7992,7 +8483,8 @@ impl<'a> BytecodeCompiler<'a> {
                     lifetime: Some(crate::ast::types::Lifetime::Static),
                     ..
                 } => false,
-                StatementKind::VarDecl { declarators, .. } => {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => {
                     for d in declarators {
                         if let Some(e) = &d.init {
                             if !expr_ok(e, bound, me, ext) {
@@ -8587,7 +9079,13 @@ impl<'a> BytecodeCompiler<'a> {
             // (`q[0]` on `string q[$]`), local or instance member, is a
             // string.
             ExprKind::Index { expr: base, .. } => {
-                self.local_string_coll(base) || self.member_string_coll(base)
+                if self.local_string_coll(base) || self.member_string_coll(base) {
+                    return true;
+                }
+                // `obj.m_q[i]`: a referenced object's string-collection
+                // element is a string too (§6.16/§7.10) — the member
+                // collection may be on a class other than the method's own.
+                self.foreign_string_coll_member(base).is_some()
             }
             ExprKind::Paren(inner) => self.expr_is_string_static(inner),
             ExprKind::SystemCall { name, args } => match name.as_str() {
@@ -8619,6 +9117,7 @@ impl<'a> BytecodeCompiler<'a> {
                     && h.root.is_none()
                     && h.path.len() == 1
                     && h.path[0].selects.is_empty()
+                    && !self.local_var_regs.contains_key(raw.as_str())
                     && self.string_member_names.contains(raw.as_str())
                 {
                     return true;
@@ -8708,6 +9207,55 @@ impl<'a> BytecodeCompiler<'a> {
                     .is_some_and(|fields| fields.contains(member))
             })
         })
+    }
+
+    /// Method mode: is `base.member` a STRING-COLLECTION member (queue /
+    /// dynamic / associative array of `string`) of `base`'s DECLARED class,
+    /// read through an admitted handle chain? Mirrors `dotted_string_member`
+    /// for collection members, so `obj.m_q[i]` (a referenced object's string
+    /// collection element) is typed as a string by `string_cmp` instead of
+    /// falling to the integral X-padded compare (§6.16/§7.10).
+    fn dotted_string_coll(&self, base: &Expression, member: &str) -> bool {
+        if !self.method_handle_chain_ok(base) || !self.method_instance_field_ok(base, member) {
+            return false;
+        }
+        let class = self.method_handle_chain_class(base);
+        if class.as_deref() == Some(self.method_class.as_deref().unwrap_or("")) {
+            return false;
+        }
+        class.is_some_and(|class| {
+            self.method_admission.as_ref().is_some_and(|admission| {
+                admission
+                    .instance_string_colls
+                    .get(&class)
+                    .is_some_and(|colls| colls.contains(member))
+            })
+        })
+    }
+
+    /// If `expr` is an admitted, select-free reference to a foreign
+    /// object's string-collection member (`a1.q`, `this.holder.q`), return
+    /// the member name; else None. Consumes the two AST spellings a dotted
+    /// collection element (`a1.q[i]`) reaches: `MemberAccess { expr: a1,
+    /// member: q }` and the dotted two-segment Ident `a1.q`.
+    fn foreign_string_coll_member(&self, expr: &Expression) -> Option<String> {
+        match &expr.kind {
+            ExprKind::MemberAccess { expr: base, member } => self
+                .dotted_string_coll(base, member.name.as_str())
+                .then(|| member.name.clone()),
+            ExprKind::Ident(h)
+                if self.method_mode
+                    && h.root.is_none()
+                    && h.path.len() == 2
+                    && h.path.iter().all(|seg| seg.selects.is_empty()) =>
+            {
+                let base = Self::dotted_head_expr(h);
+                let member = h.path[1].name.name.as_str();
+                self.dotted_string_coll(&base, member)
+                    .then(|| h.path[1].name.name.to_string())
+            }
+            _ => None,
+        }
     }
 
     /// `recv.method(args)` where the receiver is a statically-known STRING
@@ -9446,7 +9994,192 @@ impl<'a> BytecodeCompiler<'a> {
         self.emit(Insn::LoadSignal(root, as_sig_id(base_id)));
         let dest = self.alloc_reg();
         self.emit(Insn::RangeSelectConst(dest, root, off + w - 1, off));
+        // §7.2.1: the member keeps its declared type's sign.
+        if self.packed_member_signed(&key, member) == Some(true) {
+            self.emit(Insn::SetSigned(dest));
+        }
         Some(dest)
+    }
+
+    /// §7.4.3: the width of one element of the outer packed dimension of the
+    /// plain packed variable `base`, from its declared type and its signal
+    /// width — 1 for a vector, 11 for `lane_t [-9:9] x`. None for any other
+    /// shape (an unpacked array, a member, a local), which keeps its
+    /// interpreted path.
+    fn packed_part_select_elem_width(&self, base: &Expression) -> Option<u32> {
+        use crate::ast::types::{DataType as D, PackedDimension as P};
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.root.is_some()
+            || h.path.len() != 1
+            || !h.path[0].selects.is_empty()
+            || self.local_var_reg_of(h).is_some()
+            || self.lookup_array_name(h).is_some()
+            || self.is_multi_dim_array(h)
+        {
+            return None;
+        }
+        let total = *self.signal_widths.get(self.lookup_signal_id(h)?)?;
+        let raw = Self::hier_raw_name(h);
+        let scoped = self
+            .scope_hint
+            .as_ref()
+            .map(|scope| format!("{}.{}", scope, raw));
+        fn lookup<'m, V>(
+            m: &'m HashMap<String, V>,
+            scoped: Option<&str>,
+            raw: &str,
+        ) -> Option<&'m V> {
+            scoped.and_then(|q| m.get(q)).or_else(|| m.get(raw))
+        }
+        let (scoped, raw) = (scoped.as_deref(), raw.as_str());
+        let declared = self.var_decl_types.and_then(|m| lookup(m, scoped, raw));
+        let (Some(mut dt), Some(types)) = (declared, self.typedef_types) else {
+            // No declaration on record (a net, say): the packed shape tables
+            // decide, and a name in neither is a plain vector.
+            if let Some(&ew) = self.packed_elem_widths.and_then(|m| lookup(m, scoped, raw)) {
+                return (ew > 0).then_some(ew);
+            }
+            if self
+                .packed_full_dims
+                .and_then(|m| lookup(m, scoped, raw))
+                .is_some_and(|dims| dims.len() > 1)
+            {
+                return None;
+            }
+            return Some(1);
+        };
+        // The outer dimension: the declaration's first packed range, through
+        // plain typedef aliases; a declaration with none selects bits.
+        let mut outer: Option<&P> = None;
+        for _ in 0..64 {
+            match dt {
+                D::TypeReference {
+                    name, dimensions, ..
+                } => {
+                    if let Some(first) = dimensions.first() {
+                        outer = Some(first);
+                        break;
+                    }
+                    dt = crate::compiler::elaborate::lookup_scoped_type(name, types)?;
+                }
+                D::IntegerVector { dimensions, .. } | D::Implicit { dimensions, .. } => {
+                    outer = dimensions.first();
+                    break;
+                }
+                D::IntegerAtom { .. } | D::Struct(_) | D::Enum(_) => break,
+                _ => return None,
+            }
+        }
+        let count = match outer {
+            None => total,
+            Some(P::Range { left, right, .. }) => {
+                let (l, r) = (self.eval_const_bound(left)?, self.eval_const_bound(right)?);
+                (l - r).unsigned_abs() as u32 + 1
+            }
+            Some(_) => return None,
+        };
+        (count > 0 && total % count == 0).then(|| total / count)
+    }
+
+    /// §7.4.1: whether `expr` (an index chain on a plain packed variable)
+    /// selects an element whose type is a named signed type — see
+    /// `signed_named_packed_elem_depth`.
+    fn packed_named_select_signed(&mut self, expr: &Expression) -> bool {
+        let (Some(decls), Some(types)) = (self.var_decl_types, self.typedef_types) else {
+            return false;
+        };
+        let mut root = expr;
+        let mut selects = 0usize;
+        while let ExprKind::Index { expr: base, .. } = &root.kind {
+            selects += 1;
+            root = base;
+        }
+        let ExprKind::Ident(h) = &root.kind else {
+            return false;
+        };
+        if h.root.is_some()
+            || h.path.iter().any(|s| !s.selects.is_empty())
+            || self.local_var_reg_of(h).is_some()
+            || self.lookup_array_name(h).is_some()
+            || self.is_multi_dim_array(h)
+        {
+            return false;
+        }
+        let raw = Self::hier_raw_name(h);
+        if let Some(&depth) = self.named_elem_depth.get(&raw) {
+            return depth == Some(selects);
+        }
+        let scoped = self
+            .scope_hint
+            .as_ref()
+            .map(|scope| format!("{}.{}", scope, raw));
+        let depth = scoped
+            .as_deref()
+            .and_then(|q| declared_type_of(q, decls, types))
+            .or_else(|| declared_type_of(&raw, decls, types))
+            .and_then(|dt| signed_named_packed_elem_depth(dt, types));
+        self.named_elem_depth.insert(raw, depth);
+        depth == Some(selects)
+    }
+
+    /// §7.2.1, §6.11.3: the signedness of `member` (a dotted path) of the
+    /// packed structure or union variable `var` holds, from its declared
+    /// type. None when the declaration or the member cannot be resolved.
+    fn packed_member_signed(&self, var: &str, member: &str) -> Option<bool> {
+        use crate::ast::types::DataType as D;
+        let decls = self.var_decl_types?;
+        let types = self.typedef_types?;
+        let leaf_var = var.rsplit_once('.').map_or(var, |(_, leaf)| leaf);
+        let mut dt = decls.get(var).or_else(|| decls.get(leaf_var))?;
+        for segment in member.split('.') {
+            let D::Struct(su) = crate::compiler::elaborate::resolve_typedef_chain(dt, types) else {
+                return None;
+            };
+            if !su.packed {
+                return None;
+            }
+            dt = &su
+                .members
+                .iter()
+                .find(|m| m.declarators.iter().any(|d| d.name.name == segment))?
+                .data_type;
+        }
+        let resolved = crate::compiler::elaborate::resolve_typedef_chain(dt, types);
+        match resolved {
+            D::IntegerAtom { .. } | D::IntegerVector { .. } | D::Enum(_) | D::Struct(_) => Some(
+                crate::compiler::elaborate::is_type_signed_resolved(resolved, types),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The packed-structure variable and member path a dotted identifier
+    /// names (`s.f`, `s.inner.f`), as `compile_packed_member_read` reads it.
+    fn packed_member_of_hier(&self, hier: &HierarchicalIdentifier) -> Option<(String, String)> {
+        let fields_tbl = self.packed_struct_fields?;
+        if hier.root.is_some() || hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let raw = Self::hier_raw_name(hier);
+        let (base, member) = raw.rsplit_once('.')?;
+        let key = self
+            .scope_hint
+            .as_ref()
+            .map(|scope| format!("{}.{}", scope, base))
+            .filter(|q| self.signal_name_to_id.get(q.as_str()).is_some())
+            .or_else(|| {
+                self.signal_name_to_id
+                    .get(base)
+                    .is_some()
+                    .then(|| base.to_string())
+            })?;
+        let layout = fields_tbl.get(&key).or_else(|| fields_tbl.get(base))?;
+        layout
+            .iter()
+            .any(|(m, _, w)| m == member && *w > 0)
+            .then(|| (key, member.to_string()))
     }
 
     /// Does this statement read or write a register-bank local array? Such a
@@ -12279,13 +13012,18 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn packed_elem_width_of(&self, hier: &HierarchicalIdentifier) -> Option<u32> {
         let raw = Self::hier_raw_cow(hier);
+        let top_rest = self.top_module_name.as_ref()
+            .and_then(|top| raw.strip_prefix(top.as_str()).and_then(|s| s.strip_prefix('.')));
+        let rooted = hier.root.is_some() || top_rest.is_some();
+        let raw = top_rest.unwrap_or(raw.as_ref());
         self.packed_elem_widths
             .and_then(|m| {
-                m.get(raw.as_ref())
+                m.get(raw)
                     .copied()
                     // Inside an inlined instance the name is spelled bare
                     // while the table holds it under the instance path.
                     .or_else(|| {
+                        if rooted { return None; }
                         self.scope_hint
                             .as_ref()
                             .and_then(|sc| with_dotted(sc, &raw, |k| m.get(k).copied()))
@@ -13170,7 +13908,7 @@ impl<'a> BytecodeCompiler<'a> {
                     // A block redeclaring the name is another variable:
                     // judge conservatively.
                     let redeclares = stmts.iter().any(|c| {
-                        matches!(&c.kind, StatementKind::VarDecl { declarators, .. }
+                        matches!(&c.kind, StatementKind::VarDecl { declarators, .. } | StatementKind::ParamDecl { declarators, .. }
                             if declarators.iter().any(|d| d.name.name == name))
                     });
                     if redeclares {
@@ -13265,7 +14003,9 @@ impl<'a> BytecodeCompiler<'a> {
         // module variable). Failing WITHOUT fallback here makes the enclosing
         // SeqBlock's own wrapper roll back and emit a single whole-block
         // StmtFallback instead.
-        if let StatementKind::VarDecl { declarators, .. } = &stmt.kind {
+        if let StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } = &stmt.kind
+        {
             if declarators.iter().any(|d| {
                 self.signal_name_to_id.contains_key(d.name.name.as_str())
                     || self.process_local_names.contains(d.name.name.as_str())
@@ -13734,322 +14474,38 @@ impl<'a> BytecodeCompiler<'a> {
                     return false;
                 }
                 for decl in declarators {
-                    // §6.18: a local declared through a typedef that carries
-                    // unpacked dims is a collection too. A queue / unsized
-                    // array without an initializer takes the local-collection
-                    // path below; any other shape stays on the AST path.
-                    if decl.dimensions.is_empty()
-                        && let crate::ast::types::DataType::TypeReference { name: tn, .. } =
-                            data_type
-                        && let Some(dims) = self.typedef_coll_dims.get(&type_name_key(tn))
-                    {
-                        use crate::ast::types::UnpackedDimension as UD;
-                        if self.method_mode
-                            && decl.init.is_none()
-                            && dims.len() == 1
-                            && matches!(dims[0], UD::Queue { .. } | UD::Unsized(_))
-                        {
-                            let synth = Statement::new(
-                                StatementKind::VarDecl {
-                                    data_type: data_type.clone(),
-                                    lifetime: lifetime.clone(),
-                                    declarators: vec![decl.clone()],
-                                },
-                                stmt.span,
-                            );
-                            self.emit(Insn::InitLocalColl(Box::new((
-                                Arc::new(synth),
-                                Arc::from("VarDecl_local_coll"),
-                            ))));
-                            self.local_coll_names.insert(decl.name.name.clone());
-                            // §6.16: `typedef string q_t[$]` elements are
-                            // strings, as a `string q[$]` local's are.
-                            if self.typedef_coll_strings.contains(&type_name_key(tn)) {
-                                self.local_coll_strings.insert(decl.name.name.clone());
-                            } else {
-                                self.local_coll_strings.remove(&decl.name.name);
-                            }
-                            continue;
-                        }
-                        self.bail("VarDecl_typedef_array");
+                    if !self.compile_stmt_decl_item(stmt.span, data_type, lifetime, decl) {
                         return false;
                     }
-                    if !decl.dimensions.is_empty() {
-                        // class-perf row 3: a LOCAL queue / dynamic array
-                        // (single queue / unsized unpacked dimension, no
-                        // initializer). Storage and every bit of queue
-                        // bookkeeping (the per-call `@name#id` key, the
-                        // arrays / dynamic_arrays / queue_vars / widths /
-                        // size-shadow / element-type registrations) live in
-                        // the interpreter; re-running the DECLARATION there
-                        // (a StmtFallback of the single-declarator statement
-                        // — `exec_stmt_var_decl` verbatim) keeps all those
-                        // table writes in one place, and the method's own
-                        // queue frame (pushed by the dispatch before the
-                        // block runs) scopes and cleans up the per-call key
-                        // on return. Every later use in this body resolves
-                        // the bare name through the interpreter's own
-                        // precedence (`dyn_name_lookup` → @key, marked via
-                        // `local_coll_names`), so ops are byte-identical to
-                        // the AST path. Decls WITH initializers keep the
-                        // VarDecl_array_init bail: the init lowering
-                        // (pattern spreads, element seeding) is deep and
-                        // stays interpreter-owned in this row.
-                        use crate::ast::types::UnpackedDimension as UD;
-                        if self.method_mode
-                            && decl.init.is_none()
-                            && decl.dimensions.len() == 1
-                            && matches!(decl.dimensions[0], UD::Queue { .. } | UD::Unsized(_))
-                        {
-                            let synth = Statement::new(
-                                StatementKind::VarDecl {
-                                    data_type: data_type.clone(),
-                                    lifetime: lifetime.clone(),
-                                    declarators: vec![decl.clone()],
-                                },
-                                stmt.span,
-                            );
-                            // Direct emission — NOT emit_fallback: the decl
-                            // reads no registers (init is None), so neither
-                            // the decl_local_regs nor the loop-var hazard
-                            // applies; it must survive even where plain
-                            // fallbacks are barred. class-perf: emitted as the
-                            // dedicated `InitLocalColl` opcode (not a
-                            // `StmtFallback`) so the enclosing block stays
-                            // eligible for the fast-call admission gate — a
-                            // `VarDecl_local_coll` StmtFallback pessimized
-                            // otherwise-blink functions like `uvm_re_match`.
-                            self.emit(Insn::InitLocalColl(Box::new((
-                                Arc::new(synth),
-                                Arc::from("VarDecl_local_coll"),
-                            ))));
-                            self.local_coll_names.insert(decl.name.name.clone());
-                            if Self::dt_is_string(data_type) {
-                                self.local_coll_strings.insert(decl.name.name.clone());
-                            } else {
-                                self.local_coll_strings.remove(&decl.name.name);
-                            }
-                            continue;
-                        }
-                        // One constant-bounded unpacked dimension, small: a
-                        // register bank. (`logic [7:0] tmp [0:15]` in an
-                        // inlined AES shift_rows / rcon table.) Every access
-                        // must fold to a constant index or the enclosing
-                        // compile fails and rolls back.
-                        let bounds = if decl.dimensions.len() == 1 {
-                            match &decl.dimensions[0] {
-                                UD::Range { left, right, .. } => {
-                                    let l = self.fold_const(left).and_then(|v| v.to_u64());
-                                    let r = self.fold_const(right).and_then(|v| v.to_u64());
-                                    match (l, r) {
-                                        (Some(l), Some(r)) => {
-                                            let (lo, hi) = (l.min(r) as i64, l.max(r) as i64);
-                                            Some((lo, (hi - lo + 1) as usize))
-                                        }
-                                        _ => None,
-                                    }
-                                }
-                                UD::Expression { expr, .. } => self
-                                    .fold_const(expr)
-                                    .and_then(|v| v.to_u64())
-                                    .filter(|&n| n > 0)
-                                    .map(|n| (0i64, n as usize)),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-                        let Some((lo, len)) = bounds.filter(|&(_, n)| n <= 64) else {
-                            self.bail("VarDecl_array");
-                            return false;
-                        };
-                        if decl.init.is_some() {
-                            self.bail("VarDecl_array_init");
-                            return false;
-                        }
-                        let ew = self.decl_width(data_type);
-                        let base = self.next_reg;
-                        for _ in 0..len {
-                            let slot = self.alloc_reg();
-                            let init = self.type_default_value(data_type, ew);
-                            self.emit(Insn::LoadConst(slot, Box::new(init)));
-                        }
-                        let Ok(base) = RegId::try_from(base) else {
-                            self.bail("VarDecl_array");
-                            return false;
-                        };
-                        self.local_array_regs
-                            .insert(decl.name.name.clone(), (base, ew, len, lo));
-                        continue;
-                    }
-                    // §6.16 string local: no declared width — bind at width
-                    // 0 so no Resize ever lands on it, and mark it for the
-                    // %s / string-assign paths.
-                    let is_string = self.decl_is_string(data_type, None);
-                    let width = if is_string {
-                        0
-                    } else {
-                        self.decl_width(data_type)
-                    };
-                    // §6.21: a STATIC local persists across calls — its
-                    // declaration runs ONCE. The compiled path must NOT
-                    // seed the register (a compile-time default folds
-                    // `m_inst == null` to true and a fresh singleton is
-                    // constructed on every call); the dispatch shell seeds
-                    // it from the persistent store instead and copies the
-                    // final register back at exit. A declarator WITH an
-                    // initializer has run-once semantics the block cannot
-                    // express — bail the whole method to the AST path.
-                    if self.method_mode
-                        && matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+                }
+                true
+            }
+            StatementKind::ParamDecl {
+                data_type,
+                declarators,
+                ..
+            } => {
+                if self.method_mode && self.class_alias_dynamic_width(data_type) {
+                    self.bail("class_alias_runtime_width");
+                    return false;
+                }
+                let untyped = matches!(
+                    data_type,
+                    crate::ast::types::DataType::Implicit { dimensions, .. }
+                        if dimensions.is_empty()
+                );
+                for decl in declarators {
+                    let eff_dt = if untyped
+                        && let crate::ast::types::DataType::Implicit { signing, .. } = data_type
                     {
-                        if decl.init.is_some() {
-                            self.bail("static_local_init");
-                            return false;
-                        }
-                        let slot = self.alloc_reg();
-                        let is_real = self.decl_is_real(data_type, None);
-                        let is_string = self.decl_is_string(data_type, None);
-                        let is_class_handle = self.class_local_names.contains(&decl.name.name);
-                        let (w, default) = if is_class_handle {
-                            (0, Value::zero(32))
-                        } else if is_real {
-                            (0, Value::from_f64(0.0))
-                        } else {
-                            let w = if is_string {
-                                0
-                            } else {
-                                self.decl_width(data_type)
-                            };
-                            (w, self.type_default_value(data_type, w))
-                        };
-                        if is_class_handle {
-                            self.method_handle_names.insert(decl.name.name.clone());
-                        } else {
-                            if is_real {
-                                self.local_var_is_real.insert(decl.name.name.clone());
-                            }
-                            if is_string {
-                                self.local_var_is_string.insert(decl.name.name.clone());
-                            }
-                            if let Some(k) = self.local_kind_of(data_type, None) {
-                                self.local_kinds.insert(slot, k);
-                            }
-                            self.note_local_dims(slot, data_type);
-                        }
-                        self.local_var_regs
-                            .insert(decl.name.name.clone(), (slot, w));
-                        self.decl_local_regs.insert(decl.name.name.clone());
-                        self.method_static_locals
-                            .push((decl.name.name.clone(), slot, default));
-                        continue;
-                    }
-                    // Step 6: a CLASS-typed local holds a heap HANDLE in a
-                    // register — default null (0), no resize (handles
-                    // round-trip untouched), and the name joins
-                    // `method_handle_names` so `.member` is a heap access.
-                    if self.method_mode && self.class_local_names.contains(&decl.name.name) {
-                        let slot = self.alloc_reg();
-                        // §8.8: `C h = new(...)` constructs the local's
-                        // declared class, as `h = new(...)` does.
-                        // The map is keyed by name, so a declaration that
-                        // shadows another of a different class (a member, a
-                        // sibling block's local) keeps the general lowering.
-                        let new_cls = decl
-                            .init
-                            .as_ref()
-                            .filter(|e| Self::is_new_shape(e))
-                            .and_then(|_| self.new_type_map.get(&decl.name.name))
-                            .filter(|cls| {
-                                matches!(data_type, crate::ast::types::DataType::TypeReference { name, .. }
-                                    if name.name.name.rsplit("::").next() == Some(cls.as_str()))
-                            })
-                            .cloned();
-                        match &decl.init {
-                            Some(expr) if new_cls.is_some() => {
-                                let cls = new_cls.expect("checked");
-                                let Some(value) = self.compile_new_construct(expr, &cls) else {
-                                    self.bail("VarDecl_init");
-                                    return false;
-                                };
-                                self.emit(Insn::Move(slot, value));
-                            }
-                            Some(expr) => {
-                                let Some(value) = self.compile_expr(expr, 0) else {
-                                    self.bail("VarDecl_init");
-                                    return false;
-                                };
-                                self.emit(Insn::Move(slot, value));
-                            }
-                            None => {
-                                self.emit(Insn::LoadConst(slot, Box::new(Value::zero(32))));
-                            }
-                        }
-                        if self.method_bound_names.contains(&decl.name.name)
-                            && self.local_var_regs.contains_key(&decl.name.name)
-                        {
-                            self.method_shadowing_regs.insert(slot);
-                        }
-                        self.local_var_regs
-                            .insert(decl.name.name.clone(), (slot, 0));
-                        self.method_handle_names.insert(decl.name.name.clone());
-                        self.decl_local_regs.insert(decl.name.name.clone());
-                        continue;
-                    }
-                    // §6.12: a `real` local holds a real, whatever its
-                    // initializer (or its default, 0.0) is.
-                    let is_real = self.decl_is_real(data_type, None);
-                    let kind = if is_string {
-                        Some(LocalKind::Str)
+                        Some(self.untyped_param_effective_dt(signing, decl.init.as_ref(), stmt.span))
                     } else {
-                        self.local_kind_of(data_type, None)
+                        None
                     };
-                    let slot = self.alloc_reg();
-                    match kind {
-                        Some(k) => {
-                            self.local_kinds.insert(slot, k);
-                        }
-                        None => {
-                            self.local_kinds.remove(&slot);
-                        }
+                    let dt = eff_dt.as_ref().unwrap_or(data_type);
+                    if !self.compile_stmt_decl_item(stmt.span, dt, &None, decl) {
+                        return false;
                     }
-                    self.note_local_dims(slot, data_type);
-                    match &decl.init {
-                        Some(expr) => {
-                            let Some(value) = self.compile_expr(expr, width) else {
-                                self.bail("VarDecl_init");
-                                return false;
-                            };
-                            self.emit(Insn::Move(slot, value));
-                        }
-                        None => {
-                            let value = if is_real {
-                                Value::from_f64(0.0)
-                            } else {
-                                self.type_default_value(data_type, width)
-                            };
-                            self.emit(Insn::LoadConst(slot, Box::new(value)));
-                        }
-                    }
-                    let name = &decl.name.name;
-                    if is_real {
-                        self.emit_to_real(slot);
-                        self.local_var_is_real.insert(name.clone());
-                    } else {
-                        self.local_var_is_real.remove(name);
-                        if width > 0 {
-                            self.emit(Insn::Resize(slot, width));
-                            self.emit_local_fit(slot);
-                        }
-                    }
-                    if is_string {
-                        self.local_var_is_string.insert(name.clone());
-                    } else {
-                        self.local_var_is_string.remove(name);
-                    }
-                    self.local_var_regs.insert(name.clone(), (slot, width));
-                    self.record_local_packed_type(slot, data_type);
-                    self.decl_local_regs.insert(name.clone());
                 }
                 true
             }
@@ -15502,6 +15958,7 @@ impl<'a> BytecodeCompiler<'a> {
                     StatementKind::Assertion(_) => "Assertion",
                     StatementKind::ProceduralContinuous(_) => "ProceduralContinuous",
                     StatementKind::VarDecl { .. } => "VarDecl",
+                    StatementKind::ParamDecl { .. } => "ParamDecl",
                     StatementKind::Coverpoint { .. } => "Coverpoint",
                     StatementKind::Cross { .. } => "Cross",
                     _ => "Other",
@@ -15669,6 +16126,11 @@ impl<'a> BytecodeCompiler<'a> {
             return self.compile_pattern(expr, ctx_width, pattern_ctx);
         }
         let result = self.compile_expr_inner(expr, ctx_width, unsigned_context)?;
+        // §7.4.1: an element of a packed array of a named signed type
+        // (`lane_t [0:8] x; x[1]`) is signed; the slice that read it is not.
+        if matches!(expr.kind, ExprKind::Index { .. }) && self.packed_named_select_signed(expr) {
+            self.emit(Insn::SetSigned(result));
+        }
         let propagates = matches!(
             expr.kind,
             ExprKind::Binary { .. }
@@ -15694,6 +16156,16 @@ impl<'a> BytecodeCompiler<'a> {
         // §7.10: `$` is the last index of the queue its select indexes. The
         // interpreter evaluates a select chain holding one whole, binding each
         // `$` to its own base.
+        if matches!(
+            expr.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
+        ) && self.inst_array_multidim_elem(expr)
+        {
+            // #1108: an element of a multidimensional array member of an
+            // instance-array element (`lane[0].nest[1][2]`) is resolved by
+            // the interpreter, from the array's stored name.
+            return self.emit_expr_fallback(expr, ctx_width, "inst_array_member");
+        }
         if matches!(
             expr.kind,
             ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
@@ -16162,6 +16634,40 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(r) = self.compile_real_operator(*op, left, right) {
                     return r;
                 }
+                // §11.6.1: in a self-determined position (a concatenation
+                // operand, no context width) an arithmetic or bitwise
+                // operator is its own context: the wider operand's width,
+                // propagated down to both operands, so the narrower one is
+                // extended by its own sign before the operator. Without it
+                // the operands met at unequal widths and the two execution
+                // tiers extended them differently.
+                let ctx_width = if ctx_width == 0
+                    && matches!(
+                        op,
+                        BinaryOp::Add
+                            | BinaryOp::Sub
+                            | BinaryOp::Mul
+                            | BinaryOp::BitAnd
+                            | BinaryOp::BitOr
+                            | BinaryOp::BitXor
+                            | BinaryOp::BitXnor
+                    ) {
+                    // Only with both operands' widths (the two width oracles
+                    // agreeing) and signs known: anything else keeps the
+                    // run-time operator's own extension.
+                    // Equal widths need no extension.
+                    let (lw, rw) = (self.lrm_self_width(left), self.lrm_self_width(right));
+                    let known = lw > 0
+                        && rw > 0
+                        && lw != rw
+                        && lw == self.expr_max_width(left)
+                        && rw == self.expr_max_width(right)
+                        && self.expr_signedness(left).is_some()
+                        && self.expr_signedness(right).is_some();
+                    if known { lw.max(rw) } else { 0 }
+                } else {
+                    ctx_width
+                };
                 // Verilog operand-width rules: comparison and logical ops
                 // (==, !=, <, <=, >, >=, &&, ||, ===, !==, case-eq) are
                 // self-determined — their operands' widths are max(L,R) of
@@ -16292,7 +16798,29 @@ impl<'a> BytecodeCompiler<'a> {
                 // before evaluation, including nested arithmetic, not only shifts.
                 let left_unsigned = joint_unsigned;
                 let right_unsigned = joint_unsigned;
-                let l = self.compile_expr_typed(left, sub_ctx, left_unsigned)?;
+                let l_sub_ctx = if matches!(
+                    op,
+                    BinaryOp::Div
+                        | BinaryOp::Mod
+                        | BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
+                        | BinaryOp::ArithShiftLeft
+                        | BinaryOp::ArithShiftRight
+                        | BinaryOp::Power
+                ) && self.lrm_self_width(left) == 0
+                {
+                    0
+                } else {
+                    sub_ctx
+                };
+                let r_sub_ctx = if matches!(op, BinaryOp::Div | BinaryOp::Mod)
+                    && self.lrm_self_width(right) == 0
+                {
+                    0
+                } else {
+                    sub_ctx
+                };
+                let l = self.compile_expr_typed(left, l_sub_ctx, left_unsigned)?;
                 // §11.4.10: a shift's RIGHT operand is SELF-DETERMINED — its
                 // width never affects the result, so it keeps its own.
                 let is_shift = matches!(
@@ -16305,7 +16833,7 @@ impl<'a> BytecodeCompiler<'a> {
                 let r = if is_shift || matches!(op, BinaryOp::Power) {
                     self.compile_expr(right, self.expr_max_width(right))?
                 } else {
-                    self.compile_expr_typed(right, sub_ctx, right_unsigned)?
+                    self.compile_expr_typed(right, r_sub_ctx, right_unsigned)?
                 };
                 // Context width resizing for arithmetic / bitwise ops only.
                 // For self-determined comparisons we must NOT resize to
@@ -16354,9 +16882,15 @@ impl<'a> BytecodeCompiler<'a> {
                         // widths, so `smin / sm1` divided at 8 bits (wrapping
                         // -128/-1) and a divide-by-zero produced x at 8 bits.
                         // §11.8.1 signedness applies exactly as for +/-.
-                        let opw = ctx_width
-                            .max(self.lrm_self_width(left))
-                            .max(self.lrm_self_width(right));
+                        // When either operand's static width is unknown (0),
+                        // do not resize before the runtime Div/Mod — `opw`
+                        // could be narrower than the operand's runtime width
+                        // and truncate high bits before the division/modulo,
+                        // whereas `Value::div`/`Value::modulo` already widens
+                        // both operands to `max(l.width, r.width)` at runtime.
+                        let lw = self.lrm_self_width(left);
+                        let rw = self.lrm_self_width(right);
+                        let opw = ctx_width.max(lw).max(rw);
                         let ls = self.expr_signedness(left);
                         let rs = self.expr_signedness(right);
                         if ls == Some(false) || rs == Some(false) {
@@ -16367,7 +16901,7 @@ impl<'a> BytecodeCompiler<'a> {
                                 self.emit(Insn::ClearSigned(r));
                             }
                         }
-                        if opw > 0 {
+                        if lw > 0 && rw > 0 && opw > 0 {
                             self.emit(Insn::Resize(l, opw));
                             self.emit(Insn::Resize(r, opw));
                         }
@@ -16457,10 +16991,12 @@ impl<'a> BytecodeCompiler<'a> {
                         // operation width — ctx joined with the operand's own
                         // LRM width (never the carry-aware estimate, which
                         // shifted dropped carries back into range).
-                        // An operand of unknown width (0) in a self-determined
-                        // context keeps the width its load produced.
-                        let opw = ctx_width.max(self.lrm_self_width(left));
-                        if opw > 0 {
+                        // An operand of unknown width (0) keeps the width its
+                        // load produced so a narrower target context cannot
+                        // truncate bits before the shift.
+                        let lw = self.lrm_self_width(left);
+                        let opw = ctx_width.max(lw);
+                        if lw > 0 && opw > 0 {
                             self.emit(Insn::Resize(l, opw));
                         }
                         self.emit(Insn::Shl(dest, l, r));
@@ -16471,9 +17007,12 @@ impl<'a> BytecodeCompiler<'a> {
                         // produced: a signed 8-bit value in a 32-bit context
                         // shifted at 8 bits then zero-extended (00000013 for
                         // 1ffffff3), and `(a+a) >> 1` shifted the carry back
-                        // in (0xa3 for 0x23).
-                        let opw = ctx_width.max(self.lrm_self_width(left));
-                        if opw > 0 {
+                        // in (0xa3 for 0x23). When `lw == 0`, keep the loaded
+                        // width so a narrower target cannot truncate high bits
+                        // before shifting them into range.
+                        let lw = self.lrm_self_width(left);
+                        let opw = ctx_width.max(lw);
+                        if lw > 0 && opw > 0 {
                             self.emit(Insn::Resize(l, opw));
                         }
                         if matches!(op, BinaryOp::ShiftRight) {
@@ -16513,8 +17052,9 @@ impl<'a> BytecodeCompiler<'a> {
                             // to the operation width first; `a ** 2` in a
                             // 32-bit context computed at 8 bits (0x90) and
                             // then bailed the whole block to the interpreter.
-                            let opw = sub_ctx.max(self.expr_max_width(left));
-                            if opw > 0 {
+                            let lw = self.expr_max_width(left);
+                            let opw = sub_ctx.max(lw);
+                            if lw > 0 && opw > 0 {
                                 self.emit(Insn::Resize(l, opw));
                             }
                             self.emit(Insn::Pow(dest, l, r));
@@ -16956,7 +17496,7 @@ impl<'a> BytecodeCompiler<'a> {
                             ));
                             return Some(dest);
                         }
-                        let array = self.array_operand(name)?;
+                        let (array, idx_reg) = self.array_operand_index(name, idx_reg)?;
                         self.emit(Insn::LoadArrayElem(dest, array, idx_reg));
                         return Some(dest);
                     }
@@ -17464,15 +18004,23 @@ impl<'a> BytecodeCompiler<'a> {
                             .lookup_signal_id(h)
                             .and_then(|id| self.signal_widths.get(id).copied())
                             .unwrap_or(0),
-                        // `x[hi:lo]` with constant bounds: hi - lo + 1.
+                        // `x[hi:lo]` with constant bounds: hi - lo + 1
+                        // ELEMENTS of `x`'s outer packed dimension, each as
+                        // wide as one element (§7.4.3, §11.4.14): a slice of
+                        // `lane_t [-9:9] x` is eleven bits per element.
                         ExprKind::RangeSelect {
+                            expr: base,
                             left,
                             right,
                             kind: RangeKind::Constant,
-                            ..
-                        } => match (self.eval_const_bound(left), self.eval_const_bound(right)) {
-                            (Some(hi), Some(lo)) if hi >= lo => (hi - lo + 1) as u32,
-                            (Some(hi), Some(lo)) => (lo - hi + 1) as u32,
+                        } => match (
+                            self.eval_const_bound(left),
+                            self.eval_const_bound(right),
+                            self.packed_part_select_elem_width(base),
+                        ) {
+                            (Some(hi), Some(lo), Some(ew)) => {
+                                ((hi - lo).unsigned_abs() as u32 + 1).saturating_mul(ew)
+                            }
                             _ => 0,
                         },
                         _ => 0,
@@ -18066,12 +18614,21 @@ impl<'a> BytecodeCompiler<'a> {
                 // are already flattened in the layout table.
                 let direct_start = self.insns.len();
                 let direct_reg = self.next_reg;
-                if let Some((root, _, _, fields)) = self.compile_packed_struct_value(base)
+                if let Some((root, key, hier, fields)) = self.compile_packed_struct_value(base)
                     && let Some((_, off, width)) =
                         fields.iter().find(|(name, _, _)| name == &member.name)
                 {
                     let dest = self.alloc_reg();
                     self.emit(Insn::RangeSelectConst(dest, root, *off + *width - 1, *off));
+                    // §7.2.1: the member keeps its declared type's sign.
+                    let var = Self::hier_raw_name(&hier);
+                    if self
+                        .packed_member_signed(&key, &member.name)
+                        .or_else(|| self.packed_member_signed(&var, &member.name))
+                        == Some(true)
+                    {
+                        self.emit(Insn::SetSigned(dest));
+                    }
                     return Some(dest);
                 }
                 self.truncate_insns(direct_start);
@@ -18975,7 +19532,8 @@ impl<'a> BytecodeCompiler<'a> {
             lo_reg,
             Box::new(Value::from_u64(off as u64, 32)),
         ));
-        Some((self.array_operand(name)?, idx_reg, hi_reg, lo_reg, resized))
+        let (array, idx_reg) = self.array_operand_index(name, idx_reg)?;
+        Some((array, idx_reg, hi_reg, lo_reg, resized))
     }
 
     /// A packed lvalue PATH that mixes several dynamic steps:
@@ -19359,7 +19917,8 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            let Some(array) = self.array_operand(name) else {
+                            let Some((array, idx_reg)) = self.array_operand_index(name, idx_reg)
+                            else {
                                 return false;
                             };
                             self.emit(Insn::NbaAssignArray(array, idx_reg, val_reg, width));
@@ -19665,7 +20224,9 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                 };
                                 if let Some((hi_reg, lo_reg)) = regs {
-                                    let Some(array) = self.array_operand(name) else {
+                                    let Some((array, idx_reg)) =
+                                        self.array_operand_index(name, idx_reg)
+                                    else {
                                         return false;
                                     };
                                     self.emit(Insn::NbaAssignArrayRange(
@@ -19942,7 +20503,7 @@ impl<'a> BytecodeCompiler<'a> {
                     b_reg,
                     Box::new(Value::from_u64(b as u64, 32)),
                 ));
-                let Some(array) = self.array_operand(name) else {
+                let Some((array, idx_reg)) = self.array_operand_index(name, idx_reg) else {
                     return Some(false);
                 };
                 self.emit(Insn::BlockingAssignArrayRange(
@@ -20189,7 +20750,34 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Whether `e` selects, through two or more indices, an array member
+    /// reached through a select (`lane[0].nest[1][2]`).
+    fn inst_array_multidim_elem(&self, e: &Expression) -> bool {
+        let ExprKind::Index { expr: inner, .. } = &e.kind else {
+            return false;
+        };
+        if !matches!(inner.kind, ExprKind::Index { .. })
+            || !crate::compiler::simulator::Simulator::select_entered_member_shape(inner)
+        {
+            return false;
+        }
+        // An element of a variable (`sa[1].f0[3][7]` of an array of
+        // structures) is not a scope; it compiles as before.
+        let Some(root) = crate::compiler::simulator::Simulator::expr_root_first_seg(inner) else {
+            return false;
+        };
+        !self.arrays.contains_key(root)
+            && !self.scope_hint.as_ref().is_some_and(|scope| {
+                self.arrays
+                    .contains_key(format!("{}.{}", scope, root).as_str())
+            })
+    }
+
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
+        if self.inst_array_multidim_elem(lhs) {
+            self.bail("inst_array_member");
+            return false;
+        }
         // class-perf method-mode: `this.<member> = e` / `<classlocal>.<member> = e`
         // is an OBJECT-field store off the heap.
         if self.method_mode
@@ -20570,7 +21158,8 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            let Some(array) = self.array_operand(name) else {
+                            let Some((array, idx_reg)) = self.array_operand_index(name, idx_reg)
+                            else {
                                 return false;
                             };
                             self.emit(Insn::BlockingAssignArray(array, idx_reg, val_reg, width));
@@ -20996,7 +21585,9 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                 };
                                 if let Some((hi_reg, lo_reg)) = regs {
-                                    let Some(array) = self.array_operand(name) else {
+                                    let Some((array, idx_reg)) =
+                                        self.array_operand_index(name, idx_reg)
+                                    else {
                                         return false;
                                     };
                                     self.emit(Insn::BlockingAssignArrayRange(
@@ -21542,7 +22133,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // §5.7 (issue #31): compiled-path literals warn here — once
                 // per literal string, deduped with the elaboration/AST sites.
                 crate::compiler::elaborate::warn_unsized_decimal_wrap(*size, base, value);
-                let mut v = Value::from_str_radix(value, r, w);
+                let mut v = Value::from_literal_text(value, r, w);
                 // Same inline cache the AST evaluator keeps on this node: a
                 // literal in a declared range is re-evaluated for every
                 // reference to the signal.
@@ -21786,16 +22377,70 @@ impl<'a> BytecodeCompiler<'a> {
                     let class = self.method_class.as_deref()?;
                     return Some(self.class_field_signed(class, &h.path[0].name.name));
                 }
-                let id = self.lookup_signal_id(h)?;
-                Some(self.signal_signed[id])
+                self.named_operand_signedness(h)
+            }
+            // §11.8.1: a package parameter (`pkg::P`), an interface variable
+            // (`i0.u`), a hierarchical reference (`lf.u`) or a flattened
+            // unpacked-structure member (`unp.u`) has its declared type's
+            // signedness, so an unsigned one makes the expression unsigned.
+            ExprKind::Ident(h)
+                if h.path.len() > 1 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let name = Self::hier_raw_name(h);
+                if let Some(&known) = self.dotted_ident_sign.get(&name) {
+                    return known;
+                }
+                let sign = if self.lookup_signal_id(h).is_none()
+                    && let Some((key, member)) = self.packed_member_of_hier(h)
+                {
+                    // §7.2.1: a packed-structure member has its declared type.
+                    self.packed_member_signed(&key, &member)
+                } else {
+                    self.named_operand_signedness(h)
+                };
+                self.dotted_ident_sign.insert(name, sign);
+                sign
+            }
+            // §11.5, §13.4.1: a function call has its return type's sign.
+            ExprKind::Call { func, .. } => {
+                if let Some((_, signed)) = self.class_method_return_type(func) {
+                    return Some(signed);
+                }
+                let ExprKind::Ident(h) = &func.kind else {
+                    return None;
+                };
+                if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    return None;
+                }
+                let name = self.scoped_callee_name(h.path[0].name.name.clone())?;
+                let fd = self.functions.and_then(|f| f.get(&name))?;
+                self.decl_signedness(&fd.return_type, Some(name.as_str()))
             }
             ExprKind::MemberAccess { expr: base, member } if self.method_mode => {
                 self.handle_member_width(base, &member.name)?;
                 let class = self.method_handle_chain_class(base)?;
                 Some(self.class_field_signed(&class, &member.name))
             }
+            // §7.2.1: a member of a packed-structure element (`a[0].f`) has
+            // its declared type's sign, as the direct member read gives it.
+            ExprKind::MemberAccess { expr: base, member } => {
+                let mut root = base.as_ref();
+                while let ExprKind::Index { expr, .. } | ExprKind::Paren(expr) = &root.kind {
+                    root = &**expr;
+                }
+                let ExprKind::Ident(hier) = &root.kind else {
+                    return None;
+                };
+                let (key, fields) = self.packed_struct_layout_for_hier(hier)?;
+                if !fields.iter().any(|(name, _, _)| name == &member.name) {
+                    return None;
+                }
+                self.packed_member_signed(&key, &member.name)
+                    .or_else(|| self.packed_member_signed(&Self::hier_raw_name(hier), &member.name))
+            }
             // Part-selects, concatenations and replications are UNSIGNED
             // regardless of their operands (§11.8.1).
+            ExprKind::Index { .. } if self.packed_named_select_signed(e) => Some(true),
             ExprKind::Index { expr, .. } => {
                 // §7.4: an unpacked element retains its declared type; only
                 // a packed bit-select is necessarily unsigned (§11.8.1).
@@ -21841,6 +22486,18 @@ impl<'a> BytecodeCompiler<'a> {
                 "$unsigned" => Some(false),
                 // §6.24.1: a SIZE cast preserves the operand's signedness.
                 "$__xz_size_cast" => args.get(1).and_then(|a| self.expr_signedness(a)),
+                // §6.24.1: a type cast (`u8_t'(x)`) has the type's sign; a
+                // size cast through a parameter (`N'(x)`) keeps the operand's.
+                "$__xz_named_cast" => {
+                    let key = self.named_cast_key(args.first()?)?;
+                    if let Some(&(_, signed)) = self.cast_widths.and_then(|m| m.get(&key)) {
+                        Some(signed)
+                    } else if self.params.is_some_and(|p| p.contains_key(&key)) {
+                        args.get(1).and_then(|a| self.expr_signedness(a))
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             },
             ExprKind::Unary { op, operand } => match op {
@@ -21897,6 +22554,39 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// §11.8.1: the signedness of a named operand with no select: a signal
+    /// (module variable, interface variable, hierarchical reference or a
+    /// flattened unpacked member) has its declared sign, a parameter its
+    /// value's (§6.20.2). Unknown when the name resolves to neither.
+    fn named_operand_signedness(&self, h: &HierarchicalIdentifier) -> Option<bool> {
+        if let Some(id) = self.lookup_signal_id(h) {
+            return self.signal_signed.get(id).copied();
+        }
+        self.lookup_param_value(h)
+            .filter(|v| !v.is_real)
+            .map(|v| v.is_signed)
+    }
+
+    /// §6.11.3: the signedness a declared integral type gives its values;
+    /// None for a real, string or unresolved type.
+    fn decl_signedness(
+        &self,
+        dt: &crate::ast::types::DataType,
+        scope: Option<&str>,
+    ) -> Option<bool> {
+        use crate::ast::types::DataType as D;
+        let resolved = self.resolved_decl_type(dt, scope);
+        match resolved {
+            D::IntegerAtom { .. } | D::IntegerVector { .. } | D::Enum(_) | D::Implicit { .. } => {
+                Some(crate::compiler::elaborate::is_type_signed(resolved))
+            }
+            D::Struct(su) if su.packed => {
+                Some(crate::compiler::elaborate::is_type_signed(resolved))
+            }
+            _ => None,
+        }
+    }
+
     /// Self-determined width of a system function's RESULT (IEEE 1800-2017
     /// §20/§21) — see `system_function_result`; `$signed`/`$unsigned`/
     /// `$past`/`$sampled` carry their argument's width. Real- and
@@ -21938,7 +22628,10 @@ impl<'a> BytecodeCompiler<'a> {
         if self.local_var_regs.contains_key(name) || !self.bare_member_names.contains(name) {
             return None;
         }
-        self.class_field_width(self.method_class.as_deref()?, name)
+        self.this_field_widths
+            .get(name)
+            .copied()
+            .or_else(|| self.class_field_width(self.method_class.as_deref()?, name))
     }
 
     /// Method mode: the declared width of `base.member` through an admitted
@@ -21947,16 +22640,22 @@ impl<'a> BytecodeCompiler<'a> {
         if !self.method_handle_chain_ok(base) || !self.method_instance_field_ok(base, member) {
             return None;
         }
+        if matches!(base.kind, ExprKind::This)
+            && let Some(&w) = self.this_field_widths.get(member)
+        {
+            return Some(w);
+        }
         self.class_field_width(&self.method_handle_chain_class(base)?, member)
     }
 
     fn class_field_signed(&self, class: &str, field: &str) -> bool {
-        self.method_admission.as_ref().is_some_and(|admission| {
-            admission
-                .instance_field_signed
-                .get(class)
-                .is_some_and(|fields| fields.contains(field))
-        })
+        (self.method_class.as_deref() == Some(class) && self.this_field_signed.contains(field))
+            || self.method_admission.as_ref().is_some_and(|admission| {
+                admission
+                    .instance_field_signed
+                    .get(class)
+                    .is_some_and(|fields| fields.contains(field))
+            })
     }
 
     fn class_field_width(&self, class: &str, field: &str) -> Option<u32> {
@@ -21966,6 +22665,55 @@ impl<'a> BytecodeCompiler<'a> {
             .get(class)?
             .get(field)
             .copied()
+    }
+
+    fn class_method_return_type(&self, func: &Expression) -> Option<(u32, bool)> {
+        if !self.method_mode {
+            return None;
+        }
+        let admission = self.method_admission.as_ref()?;
+        match &func.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && self.class_method_names.contains(h.path[0].name.name.as_str()) =>
+            {
+                let class = self.method_class.as_ref()?;
+                let base = class.split('#').next().unwrap_or(class.as_str());
+                admission
+                    .method_return_types
+                    .get(&(class.clone(), h.path[0].name.name.clone()))
+                    .or_else(|| {
+                        admission
+                            .method_return_types
+                            .get(&(base.to_string(), h.path[0].name.name.clone()))
+                    })
+                    .copied()
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                let class = if matches!(&base.kind, ExprKind::Ident(h)
+                    if h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && h.path[0].name.name == "super")
+                {
+                    self.method_class_parent.clone()?
+                } else {
+                    self.method_handle_chain_class(base)?
+                };
+                let base_cls = class.split('#').next().unwrap_or(class.as_str());
+                admission
+                    .method_return_types
+                    .get(&(class.clone(), member.name.clone()))
+                    .or_else(|| {
+                        admission
+                            .method_return_types
+                            .get(&(base_cls.to_string(), member.name.clone()))
+                    })
+                    .copied()
+            }
+            _ => None,
+        }
     }
 
     /// §6.24.1 / §11.6.1: a cast is self-determined at its target width.
@@ -22136,6 +22884,11 @@ impl<'a> BytecodeCompiler<'a> {
                 // §11.6.1: a function call is as wide as its return type; its
                 // arguments are sized by the formals, not by the call's
                 // context (`f(16'(a))` with an 8-bit result is 8 bits).
+                if let Some((w, _)) = self.class_method_return_type(func)
+                    && w > 0
+                {
+                    return w;
+                }
                 if let ExprKind::Ident(h) = &func.kind
                     && h.root.is_none()
                     && h.path.len() == 1
@@ -22483,7 +23236,9 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_bound_names.insert(rname.to_string());
         }
         for st in body {
-            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &st.kind
+            {
                 self.method_bound_names
                     .extend(declarators.iter().map(|d| d.name.name.clone()));
             }
@@ -22515,7 +23270,9 @@ impl<'a> BytecodeCompiler<'a> {
             self.cast_reg_ok_locals.insert(rname.to_string());
         }
         for st in body {
-            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &st.kind
+            {
                 for d in declarators {
                     self.cast_reg_ok_locals.insert(d.name.name.clone());
                 }
@@ -22710,7 +23467,10 @@ impl<'a> BytecodeCompiler<'a> {
         // anything else fails the whole body.
         let mut ok = true;
         for stmt in body {
-            if matches!(stmt.kind, StatementKind::VarDecl { .. }) {
+            if matches!(
+                stmt.kind,
+                StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. }
+            ) {
                 // Body locals bind themselves into `local_var_regs` via the
                 // existing VarDecl arm; only a shadowing/signal collision
                 // fails it.
@@ -25497,5887 +26257,6 @@ impl<'a> BytecodeCompiler<'a> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn concrete_typedef_kinds_keep_scopes_and_runtime_type_parameters() {
-        use crate::ast::types::{DataType as D, IntegerAtomType as A, TypeName};
-        let span = crate::ast::Span::dummy();
-        let alias = |name: &str| D::TypeReference {
-            name: TypeName {
-                scopes: vec![],
-                name: crate::ast::Identifier {
-                    name: name.into(),
-                    span,
-                },
-                span,
-                bound: Default::default(),
-            },
-            dimensions: vec![],
-            type_args: vec![],
-            span,
-        };
-        let atom = |kind| D::IntegerAtom {
-            kind,
-            signing: None,
-            span,
-        };
-        let signals = NameMap::default();
-        let arrays = HashMap::default();
-        let widths = HashMap::default();
-        let types: HashMap<_, _> = [
-            ("word".into(), atom(A::Int)),
-            ("inst.word".into(), atom(A::Byte)),
-            ("inst.chain".into(), alias("word")),
-            ("T".into(), atom(A::Int)),
-        ]
-        .into_iter()
-        .collect();
-        let mut compiler = BytecodeCompiler::new(&signals, &[], &[], &arrays, &widths);
-        compiler.set_typedef_types(&types);
-        assert_eq!(
-            compiler.local_kind_of(&alias("chain"), Some("inst.f")),
-            Some(LocalKind::Int {
-                width: 8,
-                signed: true,
-                two_state: true
-            })
-        );
-        assert!(
-            !compiler
-                .type_default_value_in(&alias("chain"), 8, Some("inst.f"))
-                .has_xz()
-        );
-        assert!(
-            compiler
-                .type_default_value_in(&alias("chain"), 8, Some("inst.f"))
-                .is_signed
-        );
-        compiler.method_class = Some("C".into());
-        compiler.set_local_typedef_types(
-            [
-                ("C::word".into(), atom(A::LongInt)),
-                ("word".into(), atom(A::LongInt)),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        assert_eq!(compiler.decl_width(&alias("word")), 64);
-        assert_eq!(compiler.decl_width_in(&alias("word"), Some("f")), 32);
-        assert_eq!(compiler.decl_width_in(&alias("word"), Some("inst.f")), 8);
-        compiler.set_unresolved_type_names(["T".into()].into_iter().collect());
-        assert_eq!(compiler.local_kind_of(&alias("T"), None), None);
-        assert_eq!(
-            compiler.local_kind_of(&alias("T"), Some("inst.f")),
-            Some(LocalKind::Int {
-                width: 32,
-                signed: true,
-                two_state: true
-            })
-        );
-        assert_eq!(compiler.local_kind_of(&alias("unknown_class"), None), None);
-        compiler.local_typedef_types.insert(
-            "C::dynamic".into(),
-            D::IntegerVector {
-                kind: crate::ast::types::IntegerVectorType::Logic,
-                signing: None,
-                dimensions: vec![crate::ast::types::PackedDimension::Range {
-                    left: Box::new(ident_expr("W")),
-                    right: Box::new(Expression::new(
-                        ExprKind::Number(NumberLiteral::UnbasedUnsized('0')),
-                        span,
-                    )),
-                    span,
-                }],
-                span,
-            },
-        );
-        assert!(compiler.class_alias_dynamic_width(&alias("dynamic")));
-        assert!(!compiler.class_alias_dynamic_width(&alias("word")));
-    }
-
-    #[test]
-    fn unsupported_selected_frame_target_never_resolves_module_homonym() {
-        let mut signals = NameMap::default();
-        signals.insert(Arc::from("k"), 0);
-        let arrays = HashMap::default();
-        let widths = HashMap::default();
-        let mut compiler = BytecodeCompiler::new(&signals, &[false], &[8], &arrays, &widths);
-        let reg = compiler.alloc_reg();
-        let value = compiler.alloc_reg();
-        compiler.local_var_regs.insert("k".into(), (reg, 8));
-        let lhs = indexed_expr("k", '0');
-        // No LocalKind: an unsupported declaration must decline, not store
-        // to module k. The same holds for a deferred write to this local.
-        assert!(!compiler.compile_blocking_target(&lhs, value, 1));
-        assert!(!compiler.compile_nba_target(&lhs, value, 1));
-        assert!(compiler.insns.is_empty());
-        compiler.local_kinds.insert(
-            reg,
-            LocalKind::Int {
-                width: 8,
-                signed: false,
-                two_state: false,
-            },
-        );
-        assert!(compiler.compile_blocking_target(&lhs, value, 1));
-        assert!(!compiler.insns.iter().any(|i| matches!(
-            i,
-            Insn::BlockingAssign(..)
-                | Insn::BlockingAssignBitDyn(..)
-                | Insn::BlockingAssignRange(..)
-                | Insn::BlockingAssignRangeDyn(..)
-        )));
-    }
-
-    #[test]
-    fn constant_branch_fusion_preserves_kinds_and_constants() {
-        for kind in [BinOpConstKind::Eq, BinOpConstKind::CaseEq] {
-            for k in [
-                Value::from_u64(3, 8),
-                Value::all_x(8),
-                Value::all_z(8),
-                Value::from_u128(1 << 80, 96),
-            ] {
-                let mut insns = vec![
-                    Insn::BinOpConst(2, 0, Box::new(k.clone()), kind),
-                    Insn::Nop,
-                    Insn::BranchIfFalse(2, 4),
-                    Insn::Move(5, 0),
-                ];
-                BytecodeCompiler::fuse_cmp_branch_move_resize(&mut insns);
-                let Insn::CmpBranchConst(fused_kind, src, fused_k, tmp, target) = &insns[0] else {
-                    panic!("constant equality was not fused: {:?}", insns[0]);
-                };
-                assert_eq!(*fused_kind, kind);
-                assert_eq!((*src, *tmp, *target), (0, 2, 4));
-                assert_eq!(**fused_k, k);
-                assert!(matches!(insns[2], Insn::Nop));
-            }
-        }
-    }
-
-    #[test]
-    fn constant_branch_fusion_preserves_live_results_and_branch_entries() {
-        let compare =
-            || Insn::BinOpConst(2, 0, Box::new(Value::from_u64(3, 8)), BinOpConstKind::Eq);
-        let streams = [
-            // The true path replaces the result; the false path still reads it.
-            vec![
-                compare(),
-                Insn::BranchIfFalse(2, 4),
-                Insn::LoadConst(2, Box::new(Value::zero(8))),
-                Insn::Jump(5),
-                Insn::Move(5, 2),
-            ],
-            // A backward edge reaches a read before the comparison redefines it.
-            vec![Insn::Move(5, 2), compare(), Insn::BranchIfFalse(2, 0)],
-            // Another branch enters the pair at its second instruction.
-            vec![Insn::Jump(2), compare(), Insn::BranchIfFalse(2, 3)],
-            // Opaque escapes may observe a register-backed local.
-            vec![
-                compare(),
-                Insn::BranchIfFalse(2, 3),
-                carrying_fallback(Some(2)),
-            ],
-        ];
-        for mut insns in streams {
-            BytecodeCompiler::fuse_cmp_branch_move_resize(&mut insns);
-            assert!(!insns.iter().any(|i| matches!(i, Insn::CmpBranchConst(..))));
-        }
-    }
-
-    #[test]
-    fn constant_branch_targets_and_read_operands_survive_rewrites() {
-        let mut branch = Insn::CmpBranchConst(
-            BinOpConstKind::CaseEq,
-            1,
-            Box::new(Value::from_u64(3, 8)),
-            2,
-            4,
-        );
-        assert!(branch.offset_regs_and_targets(5, 7));
-        assert!(matches!(branch, Insn::CmpBranchConst(_, 6, _, 7, 11)));
-        assert!(BytecodeCompiler::insn_reads_reg(&branch, 6));
-        assert!(!BytecodeCompiler::insn_reads_reg(&branch, 7));
-        assert_eq!(BytecodeCompiler::dest_reg(&branch), None);
-        assert!(BytecodeCompiler::replace_read_reg(&mut branch, 6, 9));
-        assert!(matches!(branch, Insn::CmpBranchConst(_, 9, _, 7, 11)));
-
-        let mut insns = vec![
-            Insn::CmpBranchConst(BinOpConstKind::Eq, 0, Box::new(Value::zero(8)), 1, 4),
-            Insn::Nop,
-            Insn::Move(3, 0),
-            Insn::Nop,
-        ];
-        assert!(BytecodeCompiler::branch_target_map(&insns)[4]);
-        BytecodeCompiler::compact_nops(&mut insns);
-        assert!(matches!(insns[0], Insn::CmpBranchConst(_, _, _, _, 2)));
-        let mut live = RegLiveness::new(insns.len());
-        assert!(live.read_before_write(&insns, &[0], 0));
-        let back = [Insn::CmpBranchConst(
-            BinOpConstKind::Eq,
-            0,
-            Box::new(Value::zero(8)),
-            1,
-            0,
-        )];
-        assert!(BytecodeCompiler::has_backward_branch(&back));
-    }
-
-    #[test]
-    fn constant_branch_lowering_preserves_acceleration_and_case_equality_guard() {
-        for kind in [BinOpConstKind::Eq, BinOpConstKind::CaseEq] {
-            let cb = CompiledBlock {
-                instructions: vec![
-                    Insn::LoadSignal(0, 0),
-                    Insn::CmpBranchConst(kind, 0, Box::new(Value::from_u64(3, 8)), 1, 3),
-                    Insn::NbaAssign(1, 0, 8),
-                ],
-                num_regs: 2,
-                has_fallback: false,
-                nba_dup_targets: false,
-                foreach_slots: 0,
-                static_locals: Box::new([]),
-            };
-            let ts = lower_two_state(
-                &cb,
-                &[8, 8],
-                &[false, false],
-                &[false, false],
-                &HashMap::default(),
-            )
-            .expect("constant comparison remains two-state lowerable");
-            assert!(ts.has_ctrl);
-            assert!(matches!(
-                ts.insns[1],
-                TsInsn::EqCBrFalse {
-                    d: 1,
-                    s: 0,
-                    k: 3,
-                    t: 3
-                }
-            ));
-            assert_eq!(ts.insns.len(), 3);
-            assert_eq!(ts.tsx, kind == BinOpConstKind::Eq);
-            // The existing signed widening, X/Z, fill, and wide-constant
-            // admission rules must also govern the fused form.
-            for k in [
-                Value::all_x(8),
-                Value::all_z(8),
-                Value::from_u128(1 << 80, 96),
-            ] {
-                let mut cb = cb.clone();
-                cb.instructions[1] = Insn::CmpBranchConst(kind, 0, Box::new(k), 1, 3);
-                assert!(
-                    lower_two_state(
-                        &cb,
-                        &[8, 8],
-                        &[false, false],
-                        &[false, false],
-                        &HashMap::default()
-                    )
-                    .is_none()
-                );
-            }
-            let mut cb = cb.clone();
-            let mut k = Value::from_u64(3, 16);
-            k.is_signed = true;
-            cb.instructions[1] = Insn::CmpBranchConst(kind, 0, Box::new(k), 1, 3);
-            assert!(
-                lower_two_state(
-                    &cb,
-                    &[8, 8],
-                    &[true, false],
-                    &[false, false],
-                    &HashMap::default()
-                )
-                .is_none()
-            );
-        }
-    }
-
-    #[test]
-    fn constant_two_state_branch_fusion_preserves_registers_and_entries() {
-        for dest in [0, 1] {
-            let mut stream = vec![
-                TsInsn::EqC {
-                    d: dest,
-                    s: 0,
-                    k: u64::MAX,
-                },
-                TsInsn::BrFalse { s: dest, t: 3 },
-                TsInsn::Const { d: 2, v: 19 },
-            ];
-            fuse_ts_pairs(&mut stream);
-            assert!(matches!(stream[0], TsInsn::EqCBrFalse {
-                d, s: 0, k: u64::MAX, t: 2
-            } if d == dest));
-            assert_eq!(stream.len(), 2);
-            assert!(tsx_insn_ok(&stream[0]));
-        }
-        for condition in [0, 1] {
-            let mut stream = vec![
-                TsInsn::Jmp { t: 2 },
-                TsInsn::EqC { d: 1, s: 0, k: 3 },
-                TsInsn::BrFalse { s: condition, t: 3 },
-            ];
-            fuse_ts_pairs(&mut stream);
-            assert_eq!(stream.len(), 3, "never erase an incoming branch entry");
-        }
-        let mut mismatched = vec![
-            TsInsn::EqC { d: 1, s: 0, k: 3 },
-            TsInsn::BrFalse { s: 0, t: 2 },
-        ];
-        fuse_ts_pairs(&mut mismatched);
-        assert_eq!(mismatched.len(), 2, "branch must consume the comparison");
-    }
-
-    #[test]
-    fn constant_two_state_branch_fusion_relocates_tables_backedges_and_exit() {
-        let mut stream = vec![
-            TsInsn::CaseJmp {
-                s: 0,
-                cj: Box::new(CaseJumpData {
-                    table: vec![1, 3, 5],
-                    default: 6,
-                }),
-            },
-            TsInsn::EqC { d: 1, s: 0, k: 3 },
-            TsInsn::BrFalse { s: 1, t: 6 },
-            TsInsn::Const { d: 2, v: 19 },
-            TsInsn::Jmp { t: 1 },
-            TsInsn::Const { d: 2, v: 23 },
-        ];
-        fuse_ts_pairs(&mut stream);
-        assert_eq!(stream.len(), 5);
-        let TsInsn::CaseJmp { cj, .. } = &stream[0] else {
-            panic!("case dispatch")
-        };
-        assert_eq!(cj.table, [1, 2, 4]);
-        assert_eq!(cj.default, 5);
-        assert!(matches!(stream[1], TsInsn::EqCBrFalse { t: 5, .. }));
-        assert!(matches!(stream[3], TsInsn::Jmp { t: 1 }));
-    }
-
-    /// §12.5: relocating a case preserves holes, duplicate targets and block exits.
-    #[test]
-    fn case_jump_relocation_adjusts_selector_and_all_targets() {
-        let original = Insn::CaseJump(
-            2,
-            Box::new(CaseJumpData {
-                table: vec![1, 5, 1],
-                default: 5,
-            }),
-        );
-        let mut relocated = original.clone();
-        assert!(relocated.offset_regs_and_targets(7, 11));
-        let Insn::CaseJump(selector, jump) = relocated else {
-            panic!("case jump")
-        };
-        assert_eq!(selector, 9);
-        assert_eq!(jump.table, vec![12, 16, 12]);
-        assert_eq!(jump.default, 16);
-        let Insn::CaseJump(selector, jump) = original else {
-            panic!("original case jump")
-        };
-        assert_eq!(selector, 2);
-        assert_eq!(jump.table, vec![1, 5, 1]);
-        assert_eq!(jump.default, 5);
-    }
-
-    /// §12.5: each case arm's temporary definition has its own lifetime.
-    #[test]
-    fn comparison_fusion_accepts_recycled_temporaries() {
-        let mut insns = vec![
-            Insn::CaseEq(3, 0, 1),
-            Insn::BranchIfFalse(3, 4),
-            Insn::Move(5, 0),
-            Insn::Jump(7),
-            Insn::CaseEq(3, 0, 2),
-            Insn::BranchIfFalse(3, 7),
-            Insn::Move(5, 1),
-        ];
-        BytecodeCompiler::fuse_cmp_branch_move_resize(&mut insns);
-        assert!(matches!(
-            insns[0],
-            Insn::CmpBranch(CmpKind::CaseEq, 0, 1, 3, 4)
-        ));
-        assert!(matches!(
-            insns[4],
-            Insn::CmpBranch(CmpKind::CaseEq, 0, 2, 3, 7)
-        ));
-        assert!(matches!(insns[1], Insn::Nop));
-        assert!(matches!(insns[5], Insn::Nop));
-    }
-
-    /// §12.4: an untaken arm can bypass a definition and keep the old value live.
-    #[test]
-    fn comparison_fusion_keeps_a_value_read_on_the_other_branch() {
-        let mut insns = vec![
-            Insn::CaseEq(3, 0, 1),
-            Insn::BranchIfFalse(3, 4),
-            Insn::LoadConst(3, Box::new(Value::from_u64(0, 1))),
-            Insn::Jump(5),
-            Insn::Move(5, 3),
-        ];
-        BytecodeCompiler::fuse_cmp_branch_move_resize(&mut insns);
-        assert!(matches!(insns[0], Insn::CaseEq(3, 0, 1)));
-        assert!(matches!(insns[1], Insn::BranchIfFalse(3, 4)));
-    }
-
-    /// §12.5: loads in later case arms replace the earlier constant definition.
-    #[test]
-    fn constant_fusion_accepts_recycled_temporaries() {
-        let mut insns = vec![
-            Insn::LoadConst(2, Box::new(Value::from_u64(1, 8))),
-            Insn::CaseEq(3, 0, 2),
-            Insn::BranchIfFalse(3, 4),
-            Insn::Jump(7),
-            Insn::LoadConst(2, Box::new(Value::from_u64(2, 8))),
-            Insn::CaseEq(3, 0, 2),
-            Insn::Move(5, 3),
-        ];
-        BytecodeCompiler::fuse_binop_const(&mut insns);
-        assert!(matches!(insns[0], Insn::Nop));
-        assert!(matches!(insns[4], Insn::Nop));
-        assert!(matches!(
-            insns[1],
-            Insn::BinOpConst(3, 0, _, BinOpConstKind::CaseEq)
-        ));
-        assert!(matches!(
-            insns[5],
-            Insn::BinOpConst(3, 0, _, BinOpConstKind::CaseEq)
-        ));
-    }
-
-    /// §12.4: a branch can bypass the next textual constant definition.
-    #[test]
-    fn constant_fusion_keeps_a_value_read_on_the_other_branch() {
-        let mut insns = vec![
-            Insn::LoadConst(2, Box::new(Value::from_u64(1, 8))),
-            Insn::CaseEq(3, 0, 2),
-            Insn::BranchIfFalse(3, 5),
-            Insn::LoadConst(2, Box::new(Value::from_u64(2, 8))),
-            Insn::Jump(6),
-            Insn::Move(5, 2),
-        ];
-        BytecodeCompiler::fuse_binop_const(&mut insns);
-        assert!(matches!(insns[0], Insn::LoadConst(2, _)));
-        assert!(matches!(insns[1], Insn::CaseEq(3, 0, 2)));
-    }
-
-    /// §12.7: liveness follows loop back-edges and reads before in-place writes.
-    #[test]
-    fn definition_liveness_handles_loops_in_place_reads_and_fallbacks() {
-        let streams = [
-            vec![Insn::Move(5, 2), Insn::Jump(0)],
-            vec![Insn::Add(2, 2, 1)],
-            vec![carrying_fallback(Some(2))],
-        ];
-        for insns in streams {
-            let mut live = RegLiveness::new(insns.len());
-            assert!(live.read_before_write(&insns, &[insns.len() - 1], 2));
-        }
-        let insns = vec![Insn::Jump(0)];
-        let mut live = RegLiveness::new(insns.len());
-        assert!(!live.read_before_write(&insns, &[0], 2));
-        // Epoch reuse must not carry an earlier query's visited nodes forward.
-        assert!(!live.read_before_write(&insns, &[0], 3));
-        live.epoch = u32::MAX;
-        assert!(!live.read_before_write(&insns, &[0], 2));
-    }
-
-    /// §12.5: every dispatch successor must kill the definition before reading it.
-    #[test]
-    fn definition_liveness_checks_all_dispatch_successors() {
-        let mut insns = vec![
-            Insn::CaseJump(
-                0,
-                Box::new(CaseJumpData {
-                    table: vec![1, 3],
-                    default: 5,
-                }),
-            ),
-            Insn::LoadConst(2, Box::new(Value::from_u64(0, 8))),
-            Insn::Jump(6),
-            Insn::Move(5, 2),
-            Insn::Jump(6),
-            Insn::LoadConst(2, Box::new(Value::from_u64(0, 8))),
-        ];
-        let mut live = RegLiveness::new(insns.len());
-        assert!(live.read_before_write(&insns, &[0], 2));
-        insns[3] = Insn::LoadConst(2, Box::new(Value::from_u64(0, 8)));
-        assert!(!live.read_before_write(&insns, &[0], 2));
-        // Long paths retain the original instruction conservatively rather
-        // than making compilation quadratic or overlooking a distant use.
-        let mut insns = vec![Insn::Nop; 1025];
-        insns.push(Insn::Move(5, 2));
-        let mut live = RegLiveness::new(insns.len());
-        assert!(live.read_before_write(&insns, &[0], 2));
-    }
-
-    #[test]
-    fn constant_fusion_preserves_the_consumers_replacement_definition() {
-        let mut insns = vec![
-            Insn::LoadConst(2, Box::new(Value::from_u64(3, 8))),
-            Insn::Add(2, 0, 2),
-            Insn::Move(5, 2),
-        ];
-        BytecodeCompiler::fuse_binop_const(&mut insns);
-        assert!(matches!(insns[0], Insn::Nop));
-        assert!(matches!(
-            insns[1],
-            Insn::BinOpConst(2, 0, _, BinOpConstKind::Add)
-        ));
-        assert!(matches!(insns[2], Insn::Move(5, 2)));
-    }
-
-    /// §12.5: short dense tables preserve first-match dispatch; sparse cases stay chains.
-    #[test]
-    fn case_jump_admits_short_dense_tables() {
-        let span = crate::ast::Span::dummy();
-        for (count, stride, expected) in [
-            (3, 1, false),
-            (4, 1, true),
-            (7, 1, true),
-            (7, 100, false),
-            (8, 100, true),
-        ] {
-            let mut signals = NameMap::default();
-            signals.insert(Arc::from("selector"), 0);
-            let arrays = HashMap::default();
-            let widths = HashMap::default();
-            let mut compiler = BytecodeCompiler::new(&signals, &[false], &[16], &arrays, &widths);
-            let items: Vec<_> = (0..count)
-                .map(|index| crate::ast::stmt::CaseItem {
-                    patterns: vec![Expression::new(
-                        ExprKind::Number(NumberLiteral::Integer {
-                            size: Some(16),
-                            signed: false,
-                            base: NumberBase::Decimal,
-                            value: (index * stride).to_string(),
-                            cached_val: crate::ast::cache::LiteralCache::new(None),
-                        }),
-                        span,
-                    )],
-                    is_default: false,
-                    stmt: Statement::new(StatementKind::Null, span),
-                    span,
-                    pattern: None,
-                    guard: None,
-                })
-                .collect();
-            assert_eq!(
-                compiler.compile_case_jump(&ident_expr("selector"), &items),
-                expected
-            );
-            assert_eq!(
-                compiler
-                    .insns
-                    .iter()
-                    .any(|insn| matches!(insn, Insn::CaseJump(..))),
-                expected
-            );
-        }
-    }
-
-    /// The read counts the peephole passes use must answer exactly what a
-    /// scan of the block with `insn_reads_reg` answers, before and after
-    /// the edits they track.
-    #[test]
-    fn reg_readers_match_a_full_scan() {
-        let k = || Box::new(Value::from_u64(3, 8));
-        let fallback = || {
-            Insn::EvalExprFallback(
-                Box::new((
-                    Arc::new(ident_expr("x")),
-                    Arc::from(""),
-                    FbLocals::default(),
-                )),
-                9,
-                8,
-            )
-        };
-        let mut insns = vec![
-            Insn::LoadConst(1, k()),
-            Insn::Add(2, 1, 1),
-            Insn::Select(3, 2, 1, 4),
-            Insn::Concat(5, Box::new(vec![1, 3, 3])),
-            Insn::BranchIfFalse(5, 0),
-            Insn::Move(6, 2),
-            Insn::Nop,
-        ];
-        let scan = |insns: &[Insn], r: RegId, skip: &[usize]| {
-            insns
-                .iter()
-                .enumerate()
-                .any(|(j, x)| !skip.contains(&j) && BytecodeCompiler::insn_reads_reg(x, r))
-        };
-        let skips: [&[usize]; 5] = [&[], &[0], &[1], &[1, 2], &[2, 3, 5]];
-        let check = |insns: &[Insn], rr: &RegReaders| {
-            for r in 0..12 {
-                for skip in skips {
-                    assert_eq!(
-                        rr.read_outside(insns, r, skip),
-                        scan(insns, r, skip),
-                        "r={r} skip={skip:?}"
-                    );
-                }
-            }
-        };
-        let mut rr = RegReaders::new(&insns);
-        check(&insns, &rr);
-        // Edit the way the passes do: remove the old form, add the new one.
-        rr.remove(&insns[1]);
-        insns[1] = Insn::BinOpConst(2, 4, k(), BinOpConstKind::Add);
-        rr.add(&insns[1]);
-        check(&insns, &rr);
-        // A fallback reads every register.
-        rr.remove(&insns[6]);
-        insns[6] = fallback();
-        rr.add(&insns[6]);
-        check(&insns, &rr);
-        rr.remove(&insns[6]);
-        insns[6] = Insn::Nop;
-        check(&insns, &rr);
-    }
-
-    fn ident_expr(name: &str) -> Expression {
-        let span = crate::ast::Span::dummy();
-        Expression::new(
-            ExprKind::Ident(HierarchicalIdentifier {
-                root: None,
-                path: vec![HierPathSegment {
-                    name: crate::ast::Identifier {
-                        name: name.to_owned(),
-                        span,
-                    },
-                    selects: Vec::new(),
-                }],
-                span,
-                cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                cached_resolved_name: crate::ast::cache::NameCache::new(),
-                bound: crate::ast::binding::Bound::UNSET,
-            }),
-            span,
-        )
-    }
-
-    fn indexed_expr(name: &str, index: char) -> Expression {
-        let span = crate::ast::Span::dummy();
-        Expression::new(
-            ExprKind::Index {
-                expr: Box::new(ident_expr(name)),
-                index: Box::new(Expression::new(
-                    ExprKind::Number(NumberLiteral::UnbasedUnsized(index)),
-                    span,
-                )),
-            },
-            span,
-        )
-    }
-
-    fn nested_indexed_expr(name: &str, outer: char, inner: char) -> Expression {
-        let span = crate::ast::Span::dummy();
-        Expression::new(
-            ExprKind::Index {
-                expr: Box::new(indexed_expr(name, outer)),
-                index: Box::new(Expression::new(
-                    ExprKind::Number(NumberLiteral::UnbasedUnsized(inner)),
-                    span,
-                )),
-            },
-            span,
-        )
-    }
-
-    #[test]
-    fn generated_nonzero_outer_index_resolves_to_flattened_signal() {
-        let mut signals = NameMap::default();
-        signals.insert(Arc::from("flat"), 0);
-        let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
-        let widths: HashMap<String, u32> = HashMap::default();
-        let compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
-
-        assert_eq!(
-            compiler.flattened_outer_const_signal_id(&indexed_expr("flat", '1')),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn genuine_array_shapes_do_not_resolve_as_flattened_signals() {
-        let mut signals = NameMap::default();
-        signals.insert(Arc::from("flat"), 0);
-        let widths: HashMap<String, u32> = HashMap::default();
-        let expr = indexed_expr("flat", '1');
-
-        let mut arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
-        arrays.insert("flat".to_owned(), (0, 3, 160));
-        let compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
-        assert_eq!(compiler.flattened_outer_const_signal_id(&expr), None);
-
-        let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
-        let mut packed_elem_widths: HashMap<String, u32> = HashMap::default();
-        packed_elem_widths.insert("flat".to_owned(), 32);
-        let mut compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
-        compiler.set_packed_elem_widths(&packed_elem_widths);
-        assert_eq!(compiler.flattened_outer_const_signal_id(&expr), None);
-
-        let mut multi_dim_arrays: HashSet<String> = HashSet::default();
-        multi_dim_arrays.insert("flat".to_owned());
-        let mut compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
-        compiler.set_multi_dim_arrays(&multi_dim_arrays);
-        assert_eq!(compiler.flattened_outer_const_signal_id(&expr), None);
-    }
-
-    #[test]
-    fn constant_multi_dim_array_element_uses_scalar_bytecode() {
-        let mut signals = NameMap::default();
-        signals.insert(Arc::from("m[1][0]"), 0);
-        let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
-        let widths: HashMap<String, u32> = HashMap::default();
-        let mut multi_dim_arrays: HashSet<String> = HashSet::default();
-        multi_dim_arrays.insert("m".to_owned());
-        let lhs = nested_indexed_expr("m", '1', '0');
-
-        let mut compiler = BytecodeCompiler::new(&signals, &[false], &[8], &arrays, &widths);
-        compiler.set_multi_dim_arrays(&multi_dim_arrays);
-        assert_eq!(compiler.const_multi_dim_array_elem_signal_id(&lhs), Some(0));
-        assert!(compiler.compile_nba_target(&lhs, 0, 8));
-        let block = compiler.finish();
-        assert!(matches!(
-            block.instructions.as_slice(),
-            [Insn::NbaAssign(0, 0, 8)]
-        ));
-
-        let mut compiler = BytecodeCompiler::new(&signals, &[false], &[8], &arrays, &widths);
-        compiler.set_multi_dim_arrays(&multi_dim_arrays);
-        assert!(compiler.compile_expr(&lhs, 0).is_some());
-        let block = compiler.finish();
-        assert!(matches!(
-            block.instructions.as_slice(),
-            [Insn::LoadSignal(0, 0)]
-        ));
-    }
-
-    /// §9.4.1 / §22.7: a root expression's result is read after the block
-    /// runs, so the peepholes must not drop it. `1 * 2.0` is the form a
-    /// bare delay takes when the module's time unit is not the global tick
-    /// (`#1` under `timescale 1ns/100ps` becomes `1 * 10.0`); constant
-    /// folding reduced it to a `LoadConst` nothing in the block read, which
-    /// was then deleted — the fast `always #d` path read a stale register
-    /// and looped at zero delay.
-    #[test]
-    fn root_expr_result_survives_constant_folding() {
-        let signals = NameMap::default();
-        let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
-        let widths: HashMap<String, u32> = HashMap::default();
-        let sp = crate::ast::Span::dummy();
-        let one = Expression::new(
-            ExprKind::Number(NumberLiteral::Integer {
-                size: None,
-                signed: true,
-                base: crate::ast::expr::NumberBase::Decimal,
-                value: "1".into(),
-                cached_val: crate::ast::cache::LiteralCache::new(None),
-            }),
-            sp,
-        );
-        let two = Expression::new(ExprKind::Number(NumberLiteral::Real(2.0)), sp);
-        let expr = Expression::new(
-            ExprKind::Binary {
-                op: crate::ast::expr::BinaryOp::Mul,
-                left: Box::new(one),
-                right: Box::new(two),
-            },
-            sp,
-        );
-        let mut compiler = BytecodeCompiler::new(&signals, &[], &[], &arrays, &widths);
-        let result = compiler.compile_root_expr(&expr).expect("compiles");
-        let block = compiler.finish();
-        assert!(
-            block.instructions.iter().any(|i| matches!(
-                i,
-                Insn::LoadConst(r, v) if *r == result && v.is_real && v.to_f64() == 2.0
-            )),
-            "result register {result} not written: {:?}",
-            block.instructions
-        );
-    }
-
-    #[test]
-    fn register_ids_do_not_wrap_at_u16_limit() {
-        let signals = NameMap::default();
-        let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
-        let widths: HashMap<String, u32> = HashMap::default();
-        let mut compiler = BytecodeCompiler::new(&signals, &[], &[], &arrays, &widths);
-
-        let mut last = 0;
-        for _ in 0..=u16::MAX {
-            last = compiler.alloc_reg();
-        }
-        compiler.emit(Insn::LoadConst(last, Box::new(Value::zero(1))));
-
-        let block = compiler.finish();
-        assert_eq!(last, u16::MAX);
-        assert_eq!(block.num_regs, u16::MAX as u32 + 1);
-        assert!(matches!(
-            block.instructions.last(),
-            Some(Insn::LoadConst(reg, _)) if u32::from(*reg) < block.num_regs
-        ));
-
-        // The next temporary is the first ID that cannot be represented by
-        // the compact instruction encoding. It must request fallback instead
-        // of wrapping to register zero as it did in BUG_REPORT.md.
-        let mut compiler = BytecodeCompiler::new(&signals, &[], &[], &arrays, &widths);
-        for _ in 0..=u16::MAX {
-            compiler.alloc_reg();
-        }
-        let expr = Expression::new(
-            ExprKind::Number(NumberLiteral::UnbasedUnsized('0')),
-            crate::ast::Span::dummy(),
-        );
-        assert_eq!(compiler.compile_root_expr(&expr), None);
-        assert!(compiler.register_overflow);
-        assert_eq!(compiler.next_reg, u16::MAX as u32 + 1);
-    }
-
-    #[test]
-    fn redundant_resizes_become_nops_and_narrowing_ones_survive() {
-        // Signal 0 is 8 bits, so the first resize is already satisfied; the
-        // second genuinely narrows; the third is satisfied by the second.
-        let mut insns = vec![
-            Insn::LoadSignal(0, 0),
-            Insn::Resize(0, 8),
-            Insn::Resize(0, 4),
-            Insn::Resize(0, 4),
-        ];
-        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], None, 1);
-        assert!(matches!(
-            insns.as_slice(),
-            [
-                Insn::LoadSignal(0, 0),
-                Insn::Nop,
-                Insn::Resize(0, 4),
-                Insn::Nop
-            ]
-        ));
-    }
-
-    #[test]
-    fn a_resize_that_is_a_branch_target_is_never_removed() {
-        // Control can arrive at index 3 without having run index 2, so the
-        // width of r0 there depends on the path taken.
-        let mut insns = vec![
-            Insn::LoadSignal(0, 0),
-            Insn::BranchIfFalse(0, 3),
-            Insn::Resize(0, 8),
-            Insn::Resize(0, 8),
-        ];
-        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], None, 1);
-        assert!(matches!(insns[2], Insn::Nop));
-        assert!(matches!(insns[3], Insn::Resize(0, 8)));
-    }
-
-    fn carrying_fallback(reg: Option<RegId>) -> Insn {
-        let stmt = Statement::new(
-            StatementKind::Expr(ident_expr("x")),
-            crate::ast::Span::dummy(),
-        );
-        let locals: FbLocals = match reg {
-            Some(reg) => vec![FbLocal {
-                name: Arc::from("x"),
-                reg,
-                kind: LocalKind::Int {
-                    width: 8,
-                    signed: false,
-                    two_state: false,
-                },
-                via_binding: false,
-                class: None,
-            }]
-            .into_boxed_slice(),
-            None => FbLocals::default(),
-        };
-        Insn::StmtFallback(Box::new((Arc::new(stmt), Arc::from(""), locals)))
-    }
-
-    /// A fallback that carries a register-backed local copies it back, so
-    /// nothing known about that register before it may be used after it.
-    #[test]
-    fn constant_folding_stops_at_a_fallback_that_carries_the_register() {
-        let run = |fb: Insn| {
-            let mut insns = vec![
-                Insn::LoadConst(0, Box::new(Value::from_u64(3, 8))),
-                Insn::LoadSignal(2, 0),
-                fb,
-                Insn::BitSelect(1, 2, 0),
-                Insn::BlockingAssign(0, 1, 8),
-            ];
-            BytecodeCompiler::fold_const_regs(&mut insns, &[8]);
-            insns
-        };
-        let carried = run(carrying_fallback(Some(0)));
-        assert!(
-            matches!(carried[3], Insn::BitSelect(1, 2, 0)),
-            "{:?}",
-            carried[3]
-        );
-        // An ordinary fallback cannot see registers: the index still folds.
-        let plain = run(carrying_fallback(None));
-        assert!(
-            matches!(plain[3], Insn::BitSelectConst(1, 2, 3)),
-            "{:?}",
-            plain[3]
-        );
-    }
-
-    /// Carried locals live in the four-state register file; the two-state
-    /// lowering must leave such a block alone.
-    #[test]
-    fn two_state_lowering_refuses_a_fallback_that_carries_locals() {
-        let block = |fb: Insn| CompiledBlock {
-            instructions: vec![
-                Insn::LoadConst(0, Box::new(Value::from_u64(3, 8))),
-                fb,
-                Insn::NbaAssign(0, 0, 8),
-            ],
-            num_regs: 1,
-            has_fallback: true,
-            nba_dup_targets: false,
-            foreach_slots: 0,
-            static_locals: Box::new([]),
-        };
-        let lower =
-            |cb: &CompiledBlock| lower_two_state(cb, &[8], &[false], &[false], &HashMap::default());
-        assert!(lower(&block(carrying_fallback(Some(0)))).is_none());
-        assert!(lower(&block(carrying_fallback(None))).is_some());
-    }
-
-    #[test]
-    fn arithmetic_on_a_possibly_real_operand_keeps_its_resize() {
-        // A signal's declared type may be `real`, and `Value::add` then returns
-        // a 64-bit `from_f64` instead of `max(width)` — so the result width is
-        // not established here even though both operand widths are known.
-        // `bitwise_or` has no such special case, so its resize does go.
-        let mut insns = vec![
-            Insn::LoadSignal(0, 0),
-            Insn::LoadSignal(1, 0),
-            Insn::Add(2, 0, 1),
-            Insn::Resize(2, 8),
-            Insn::BitOr(3, 0, 1),
-            Insn::Resize(3, 8),
-        ];
-        BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], None, 4);
-        assert!(matches!(insns[3], Insn::Resize(2, 8)));
-        assert!(matches!(insns[5], Insn::Nop));
-    }
-
-    // class-perf: an all-or-nothing method-body compile lowers `this.<member>`
-    // reads and writes to LoadClassMember/StoreClassMember, never an AST
-    // fallback, for a body the compiler fully understands.
-    #[test]
-    fn method_body_this_member_lowers() {
-        fn span() -> crate::ast::Span {
-            crate::ast::Span::dummy()
-        }
-        fn this_member(member: &str) -> Expression {
-            Expression::new(
-                ExprKind::MemberAccess {
-                    expr: Box::new(Expression::new(ExprKind::This, span())),
-                    member: crate::ast::Identifier {
-                        name: member.to_string(),
-                        span: span(),
-                    },
-                },
-                span(),
-            )
-        }
-        fn num(n: u64) -> Expression {
-            Expression::new(
-                ExprKind::Number(NumberLiteral::Integer {
-                    size: None,
-                    signed: false,
-                    base: NumberBase::Decimal,
-                    value: n.to_string(),
-                    cached_val: Default::default(),
-                }),
-                span(),
-            )
-        }
-        // function int f(int delta); this.acc = 5; return this.acc; endfunction
-        let formals = vec![("delta".to_string(), 32u32)];
-        let class_formals: HashSet<String> = Default::default();
-        let stmt_store = Statement::new(
-            StatementKind::BlockingAssign {
-                lvalue: this_member("acc"),
-                rvalue: num(5),
-            },
-            span(),
-        );
-        let stmt_ret = Statement::new(StatementKind::Return(Some(this_member("acc"))), span());
-        let body: Vec<&Statement> = vec![&stmt_store, &stmt_ret];
-
-        let sigmap: NameMap = Default::default();
-        let sig_signed: Vec<bool> = Vec::new();
-        let sig_w: Vec<u32> = Vec::new();
-        let arrays: HashMap<String, (i64, i64, u32)> = Default::default();
-        let widths: HashMap<String, u32> = Default::default();
-        let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
-
-        let mut admission = MethodAdmission::default();
-        admission
-            .instance_fields
-            .insert(String::new(), ["acc".to_string()].into_iter().collect());
-        compiler.method_admission = Some(std::rc::Rc::new(admission));
-
-        let empty_fns: HashMap<String, FunctionDeclaration> = HashMap::default();
-        let out = compiler.compile_class_method(
-            &formals,
-            &class_formals,
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &None,
-            &HashMap::default(),
-            &HashMap::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashMap::default(),
-            &HashSet::default(),
-            &HashMap::default(),
-            &HashSet::default(),
-            &empty_fns,
-            &HashMap::default(),
-            "",
-            &HashMap::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &[],
-            Some(("f", 32, false, false)),
-            false,
-            &body,
-        );
-        let (block, this_reg, _result_reg, _ret_reg) =
-            out.expect("simple this.member body should compile all-or-nothing");
-        // `this` occupies the method's first allocated register (slot 0).
-        assert_eq!(this_reg, 0);
-        // Exactly one store and one load of the `acc` member.
-        let stores = block
-            .instructions
-            .iter()
-            .filter(|i| matches!(i, Insn::StoreClassMember(..)))
-            .count();
-        let loads = block
-            .instructions
-            .iter()
-            .filter(|i| matches!(i, Insn::LoadClassMember(..)))
-            .count();
-        assert_eq!(stores, 1, "expected one StoreClassMember, got {stores}");
-        assert_eq!(loads, 1, "expected one LoadClassMember, got {loads}");
-        assert!(!block.has_fallback, "method body must have no AST fallback");
-    }
-
-    // class-perf: a body that CALLS a method (`this.compute(1)`) in an
-    // EXPRESSION position on `this` now LOWERS to a CallMethod instruction
-    // (Step 4): the compiled body re-enters the interpreter's method
-    // dispatcher for the callee, so the caller stays 100% VM. Still
-    // byte-identical by construction (the callee keeps full AST semantics).
-    #[test]
-    fn method_body_with_call_lowers_to_callmethod() {
-        fn span() -> crate::ast::Span {
-            crate::ast::Span::dummy()
-        }
-        fn this_member(member: &str) -> Expression {
-            Expression::new(
-                ExprKind::MemberAccess {
-                    expr: Box::new(Expression::new(ExprKind::This, span())),
-                    member: crate::ast::Identifier {
-                        name: member.to_string(),
-                        span: span(),
-                    },
-                },
-                span(),
-            )
-        }
-        // return this.compute(1);   (a virtual method call)
-        let call = Expression::new(
-            ExprKind::Call {
-                func: Box::new(this_member("compute")),
-                args: vec![Expression::new(
-                    ExprKind::Number(NumberLiteral::UnbasedUnsized('1')),
-                    span(),
-                )],
-            },
-            span(),
-        );
-        let stmt_ret = Statement::new(StatementKind::Return(Some(call)), span());
-        let body: Vec<&Statement> = vec![&stmt_ret];
-
-        let sigmap: NameMap = Default::default();
-        let sig_signed: Vec<bool> = Vec::new();
-        let sig_w: Vec<u32> = Vec::new();
-        let arrays: HashMap<String, (i64, i64, u32)> = Default::default();
-        let widths: HashMap<String, u32> = Default::default();
-        let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
-        compiler.method_admission = Some(std::rc::Rc::new(MethodAdmission::default()));
-
-        let empty_fns: HashMap<String, FunctionDeclaration> = HashMap::default();
-        let out = compiler.compile_class_method(
-            &[],
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &None,
-            &HashMap::default(),
-            &HashMap::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashMap::default(),
-            &HashSet::default(),
-            &HashMap::default(),
-            &HashSet::default(),
-            &empty_fns,
-            &HashMap::default(),
-            "",
-            &HashMap::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &HashSet::default(),
-            &[],
-            Some(("f", 32, false, false)),
-            false,
-            &body,
-        );
-        let compiled =
-            out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
-        let cm = compiled
-            .0
-            .instructions
-            .iter()
-            .filter(|i| {
-                matches!(
-                    i,
-                    Insn::CallMethod(..)
-                        | Insn::CallCollMethod(..)
-                        | Insn::LoadCollElem(..)
-                        | Insn::StoreCollElem(..)
-                )
-            })
-            .count();
-        assert_eq!(cm, 1, "expected one CallMethod, got {cm}");
-        assert!(
-            !compiled.0.has_fallback,
-            "method body must have no AST fallback"
-        );
-    }
-
-    // A class method with an unresolved bare name must decline compilation
-    // so the interpreter can resolve the name against its lexical class scope.
-    #[test]
-    fn method_body_with_unresolved_class_scope_name_bails() {
-        // return os; (no register, member metadata, or module signal binds os)
-        let stmt_ret = Statement::new(
-            StatementKind::Return(Some(ident_expr("os"))),
-            crate::ast::Span::dummy(),
-        );
-        let body: Vec<&Statement> = vec![&stmt_ret];
-
-        let sigmap: NameMap = Default::default();
-        let sig_signed: Vec<bool> = Vec::new();
-        let sig_w: Vec<u32> = Vec::new();
-        let arrays: HashMap<String, (i64, i64, u32)> = Default::default();
-        let widths: HashMap<String, u32> = Default::default();
-
-        let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
-        let empty_fns: HashMap<String, FunctionDeclaration> = HashMap::default();
-        assert!(
-            compiler
-                .compile_class_method(
-                    &[],
-                    &HashSet::default(),
-                    &HashSet::default(),
-                    &HashSet::default(),
-                    &HashSet::default(),
-                    &None,
-                    &HashMap::default(),
-                    &HashMap::default(),
-                    &HashSet::default(),
-                    &HashSet::default(),
-                    &HashMap::default(),
-                    &HashSet::default(),
-                    &HashMap::default(),
-                    &HashSet::default(),
-                    &empty_fns,
-                    &HashMap::default(),
-                    "",
-                    &HashMap::default(),
-                    &HashSet::default(),
-                    &HashSet::default(),
-                    &HashSet::default(),
-                    &HashSet::default(),
-                    &HashSet::default(),
-                    &HashSet::default(),
-                    &HashSet::default(),
-                    &HashSet::default(),
-                    &HashSet::default(),
-                    &[],
-                    Some(("f", 32, false, false)),
-                    false,
-                    &body
-                )
-                .is_none(),
-            "an unresolved class-scope name must leave the method on the interpreter"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Two-state lowering (P5). A comb block whose reads are all X-free at eval
-// time can run on plain u64 words: no 4-state masks, no `Value` clones, no
-// storage dispatch. `lower_two_state` translates a compiled block's insn
-// stream 1:1 into `TsInsn`s with STATICALLY-known widths and masks, bailing
-// (returning None) on anything whose 2-state semantics are not proven here:
-//
-// - signed loads/consts (2-state Resize only zero-extends; every lowered reg
-//   is unsigned by construction, so a Resize that widens is a no-op),
-// - out-of-STATIC-range selects (4-state reads produce X bits there),
-// - fill/real/wide(>64)/X-carrying constants,
-// - width-changing or real/wide writebacks,
-// - any opcode outside the proven set (branches, fallbacks, arrays, …).
-//
-// The eval site must additionally check, per evaluation: every signal in
-// `read_sigs` currently holds an X-free value (width ≤ 64 was proven at
-// lower time, so storage is Inline and `raw_bits` is exact), no forces are
-// active, and `warn_x` is off (the 2-state path skips its bookkeeping).
-// On any miss it falls back to the 4-state stream, which is always correct.
-// ---------------------------------------------------------------------------
-
-/// Payload of the dynamic array-element ops, boxed to keep `TsInsn` at 24
-/// bytes (the `i64` bounds pair alone would push every instruction to 40
-/// bytes and cost measurable dispatch bandwidth on long comb streams).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TsElemStoreFromSig {
-    pub sig: u32,
-    pub dl: u16,
-    pub op: TsElemOp,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TsElemOp {
-    pub first: u32,
-    pub lo: i64,
-    pub hi: i64,
-    pub idx: u16,
-    pub s: u16,
-    pub w: u32,
-    pub mask: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TsNbaFromElem {
-    pub dst: u32,
-    pub first: u32,
-    pub lo: i64,
-    pub hi: i64,
-    pub idx_sig: u32,
-    pub w: u32,
-}
-
-/// One two-state instruction. Register file is `u64`; every value is kept
-/// masked to its static width by construction. Branch targets are indices
-/// into the LOWERED stream (remapped from the 4-state stream's indices).
-/// Variant name of a two-state instruction (census / diagnostics only).
-#[cfg(feature = "opcode-census")]
-pub fn ts_insn_name(i: &TsInsn) -> &'static str {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static NAMES: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
-    let dbg = format!("{:?}", i);
-    let key: String = dbg
-        .split(|c: char| c == ' ' || c == '{' || c == '(')
-        .next()
-        .unwrap_or("?")
-        .to_string();
-    let mut g = NAMES.lock().unwrap();
-    let m = g.get_or_insert_with(HashMap::new);
-    if let Some(s) = m.get(&key) {
-        return s;
-    }
-    let leaked: &'static str = Box::leak(key.clone().into_boxed_str());
-    m.insert(key, leaked);
-    leaked
-}
-
-/// Boxed payload of `RangeStoreX`/`RangeStoreXW` (rare: folded x-constant
-/// range stores), kept off the hot enum size.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TsRangeStoreX {
-    pub sig: u32,
-    pub hi: u32,
-    pub lo: u32,
-    pub v: u64,
-    pub x: u64,
-}
-
-/// Boxed payload of `CaseMaskJmp`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TsCaseMaskJmp {
-    pub mask: u64,
-    pub lo: u32,
-    pub wmask: u64,
-    pub mj: Box<CaseMaskJumpData>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum TsInsn {
-    /// regs[d] = signal_table[sig] (raw value bits; proven X-free by the
-    /// eval-site prefilter).
-    LoadSig {
-        d: u16,
-        sig: u32,
-    },
-    Const {
-        d: u16,
-        v: u64,
-    },
-    /// regs[d] = bit `bit` of a ≤64-bit signal (inline raw_bits path).
-    SigBit {
-        d: u16,
-        sig: u32,
-        bit: u16,
-    },
-    /// regs[d] = (signal >> lo) & mask, ≤64-bit signal.
-    SigRange {
-        d: u16,
-        sig: u32,
-        lo: u16,
-        mask: u64,
-    },
-    /// Wide-signal (>64) variants — read the addressed slice only.
-    SigBitW {
-        d: u16,
-        sig: u32,
-        bit: u16,
-    },
-    SigRangeW {
-        d: u16,
-        sig: u32,
-        lo: u16,
-        w: u16,
-        mask: u64,
-    },
-    /// regs[d] = bit `bit` of regs[s].
-    Bit {
-        d: u16,
-        s: u16,
-        bit: u8,
-    },
-    /// regs[d] = (regs[s] >> lo) & mask.
-    Range {
-        d: u16,
-        s: u16,
-        lo: u8,
-        mask: u64,
-    },
-    Xor {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    And {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    Or {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    /// regs[d] = if regs[c] != 0 { regs[a] } else { regs[b] } — §11.4.11
-    /// conditional. Two-state values are X-free by the eval-site prefilter,
-    /// so the 4-state arm's unknown-condition bit-merge cannot arise and the
-    /// selector reduces to plain SV truthiness (non-zero).
-    /// `m`: the result width mask, used only by the x-plane executor's
-    /// merge of the two arms under an x selector.
-    Sel {
-        d: u16,
-        c: u16,
-        a: u16,
-        b: u16,
-        m: u64,
-    },
-    /// regs[d] = !regs[s] & mask (mask = source width).
-    Not {
-        d: u16,
-        s: u16,
-        mask: u64,
-    },
-    XorC {
-        d: u16,
-        s: u16,
-        k: u64,
-    },
-    /// regs[d] = (regs[s] == k) — 4-state Eq/CaseEq agree on clean values.
-    EqC {
-        d: u16,
-        s: u16,
-        k: u64,
-    },
-    /// Wrapping two's-complement at max operand width (`mask`); operands are
-    /// zero-extended (all lowered registers are unsigned).
-    Add {
-        d: u16,
-        a: u16,
-        b: u16,
-        mask: u64,
-    },
-    Sub {
-        d: u16,
-        a: u16,
-        b: u16,
-        mask: u64,
-    },
-    /// 1-bit comparison results; unsigned compare per §5.5.1 (either operand
-    /// unsigned ⇒ unsigned, and every lowered register is unsigned).
-    Eq {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    /// regs[d] = ((regs[s] & mask) == v) — a `casez`/`casex` compare against
-    /// a constant pattern: `mask` clears the pattern's wildcard bits (z, or
-    /// x too for casex) and the bits above the compare width; `v` is the
-    /// pattern value under that mask. The selector is X-free on this path.
-    MaskEq {
-        d: u16,
-        s: u16,
-        mask: u64,
-        v: u64,
-    },
-    Neq {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    /// Fused adjacent pairs (see `fuse_ts_pairs`). Each one is exactly its
-    /// two component instructions run back to back — same register writes,
-    /// same order — minus one dispatch through the executor's jump table.
-    LoadSigNot {
-        dl: u16,
-        d: u16,
-        sig: u32,
-    },
-    /// `lo`/`w` (width) instead of `lo`/`mask`: keeps the payload ≤ 22 bytes
-    /// so `TsInsn` is 24 bytes (was 32); the executor rebuilds the mask.
-    SigRangeEqC {
-        dr: u16,
-        d: u16,
-        sig: u32,
-        lo: u8,
-        w: u8,
-        k: u64,
-    },
-    LoadSigLogAnd {
-        dl: u16,
-        sig: u32,
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    LogNotAnd {
-        dn: u16,
-        s: u16,
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    LogNotLogAnd {
-        dn: u16,
-        s: u16,
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    LogAndStore {
-        d: u16,
-        a: u16,
-        b: u16,
-        sig: u32,
-        mask: u64,
-    },
-    AndRangeStore {
-        d: u16,
-        a: u16,
-        b: u16,
-        sig: u32,
-        hi: u32,
-        lo: u32,
-    },
-    SigBitNot {
-        db: u16,
-        d: u16,
-        sig: u32,
-        bit: u16,
-    },
-    /// Second fusion batch (same rules).
-    LoadSig2 {
-        d1: u16,
-        sig1: u32,
-        d2: u16,
-        sig2: u32,
-    },
-    SigBit2 {
-        d1: u16,
-        sig1: u32,
-        bit1: u16,
-        d2: u16,
-        sig2: u32,
-        bit2: u16,
-    },
-    LoadSigBrNz {
-        dl: u16,
-        sig: u32,
-        t: u32,
-    },
-    BrFalseLoadSig {
-        s: u16,
-        t: u32,
-        dl: u16,
-        sig: u32,
-    },
-    EqBrFalse {
-        d: u16,
-        a: u16,
-        b: u16,
-        t: u32,
-    },
-    /// Constant equality followed by a false branch. The comparison still
-    /// writes `d`, including when it aliases `s` or the branch is taken.
-    EqCBrFalse {
-        d: u16,
-        s: u16,
-        k: u64,
-        t: u32,
-    },
-    LoadSigLogOr {
-        dl: u16,
-        sig: u32,
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    LoadSigAnd {
-        dl: u16,
-        sig: u32,
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    LoadSigRepl {
-        dl: u16,
-        sig: u32,
-        d: u16,
-        w: u8,
-        count: u8,
-    },
-    LoadSigSigRange {
-        dl: u16,
-        sig: u32,
-        d: u16,
-        sig2: u32,
-        lo: u16,
-        mask: u64,
-    },
-    SigRangeAnd {
-        dr: u16,
-        sig: u32,
-        lo: u16,
-        mask: u64,
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    SigRangeEq {
-        dr: u16,
-        sig: u32,
-        lo: u16,
-        mask: u64,
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    ConstEq {
-        dc: u16,
-        v: u64,
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    LogOrStore {
-        d: u16,
-        a: u16,
-        b: u16,
-        sig: u32,
-        mask: u64,
-    },
-    AndOr {
-        d1: u16,
-        a1: u16,
-        b1: u16,
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    OrRangeStore {
-        d: u16,
-        a: u16,
-        b: u16,
-        sig: u32,
-        hi: u32,
-        lo: u32,
-    },
-    Lt {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    /// Signed relational compare (§11.8.1: both operands signed). `sa`/`sb`
-    /// are the shifts that sign-extend each operand from its static width;
-    /// `kind`: 0 `<`, 1 `<=`, 2 `>`, 3 `>=`.
-    CmpS {
-        d: u16,
-        a: u16,
-        b: u16,
-        kind: u8,
-        sa: u8,
-        sb: u8,
-    },
-    /// `sig[regs[i]] <= regs[s]` (§11.5.1: an out-of-range index writes
-    /// nothing); merges into the pending entry like `RangeStoreNba`.
-    BitStoreNbaDyn {
-        sig: u32,
-        i: u16,
-        s: u16,
-        w: u32,
-    },
-    /// `d = regs[s][regs[i]]` on a narrow register. An out-of-range index
-    /// reads x in four-state (§11.5.1), which the executor cannot produce:
-    /// it ABORTS and the four-state re-run supplies the x.
-    BitDyn {
-        d: u16,
-        s: u16,
-        i: u16,
-        w: u32,
-    },
-    Leq {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    Gt {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    Geq {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    LogNot {
-        d: u16,
-        s: u16,
-    },
-    LogAnd {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    LogOr {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    /// MSB-first parts, mirroring `Value::concat_refs`.
-    Concat {
-        d: u16,
-        parts: Box<[(u16, u8)]>,
-    },
-    /// Two- and three-part `Concat` with the operands in the instruction
-    /// itself: `d = (a << wb) | b` and `d = ((a << wb | b) << wc) | c`.
-    /// The boxed-parts form chases a heap pointer per evaluation; on the
-    /// C910 `Concat` was 8% of executor time and most concats have two or
-    /// three parts.
-    Concat2 {
-        d: u16,
-        a: u16,
-        wa: u8,
-        b: u16,
-        wb: u8,
-    },
-    Concat3 {
-        d: u16,
-        a: u16,
-        wa: u8,
-        b: u16,
-        wb: u8,
-        c: u16,
-        wc: u8,
-    },
-    /// In-place truncation (a `Resize` that narrows; widening is free).
-    Mask {
-        d: u16,
-        mask: u64,
-    },
-    /// Jump to `t` when the signal (or its `bit`, when != u32::MAX) is zero.
-    /// The prefilter proved the signal X-free, so `!is_true` = `== 0`.
-    BrSigFalse {
-        sig: u32,
-        bit: u32,
-        t: u32,
-    },
-    /// Jump to `t` when regs[s] == 0 (4-state `BranchIfFalse` on a clean reg).
-    BrFalse {
-        s: u16,
-        t: u32,
-    },
-    /// Jump to `t` when regs[s] != 0 (4-state `BranchUnlessZero`).
-    BrNz {
-        s: u16,
-        t: u32,
-    },
-    Jmp {
-        t: u32,
-    },
-    /// A backward `Jmp` (a loop back-edge; rewritten once the stream is
-    /// final): Ctrl-C bails the block to the four-state VM, whose back-edge
-    /// poll stops the run. A long loop inside one time slot never reaches the
-    /// event loop's own poll. A separate instruction rather than a test in
-    /// `Jmp`, so forward jumps pay nothing.
-    JmpPoll {
-        t: u32,
-    },
-    /// Ahead of a do-while back-edge (`BrNz`), same purpose as `JmpPoll`.
-    LoopPoll,
-    /// Jump-table dispatch (§12.5 `case`). Two-state registers are X-free by
-    /// the eval-site prefilter, so the 4-state arm's "any x/z bit matches no
-    /// pattern -> default" branch cannot arise and this reduces to a bounds-
-    /// checked table index. Targets are LOWERED indices (remapped in the same
-    /// fixup pass as the other branches).
-    CaseJmp {
-        s: u16,
-        cj: Box<CaseJumpData>,
-    },
-    /// Bucket-window jump table (§12.5 `case` with wildcard-free windows).
-    /// X-free registers make the 4-state `xz_path` (wildcard selector can
-    /// match several buckets) unreachable, leaving a plain window index.
-    CaseMaskJmp {
-        s: u16,
-        mj: Box<TsCaseMaskJmp>,
-    },
-    /// regs[d] = (regs[s] != 0) — §11.4.9 reduction OR on an X-free operand.
-    RedOr {
-        d: u16,
-        s: u16,
-    },
-    /// Wide (65..512-bit) reduction OR: reads the WIDE register file. The
-    /// narrow `RedOr` on a wide source read `regs[s]` — a slot the wide load
-    /// never wrote, i.e. whatever the PREVIOUS block's evaluation left there.
-    WRedOr {
-        d: u16,
-        s: u16,
-    },
-    /// Wide reduction AND: value == all-ones over its width `w`.
-    WRedAnd {
-        d: u16,
-        s: u16,
-        w: u16,
-    },
-    /// regs[d] = (regs[s] == mask) — §11.4.9 reduction AND; `mask` is the
-    /// source width, so "all ones" is an equality against it.
-    RedAnd {
-        d: u16,
-        s: u16,
-        mask: u64,
-    },
-    /// `sig[regs[i]] = regs[s] & 1` (§11.5.1 dynamic bit-select target).
-    /// Out-of-range indices are dropped, matching `Value::set_bit`. Splices
-    /// through the same plane-level merge as `RangeStore`, so X elsewhere in
-    /// the destination survives. `w > 64` (wide destination) sets the bit in
-    /// the wide planes directly.
-    BitStoreDyn {
-        sig: u32,
-        i: u16,
-        s: u16,
-        w: u32,
-    },
-    /// `d = sig[i +: w]` at a run-time offset, on a narrow or a wide
-    /// signal; a slice running past the signal aborts (the four-state read
-    /// yields x there), an x inside it bails like any signal read.
-    SigRangeDyn {
-        d: u16,
-        sig: u32,
-        i: u16,
-        w: u16,
-        sw: u32,
-        mask: u64,
-    },
-    /// `sig[i +: w] = s` at a run-time offset; a slice past the signal
-    /// aborts to the four-state re-run.
-    RangeStoreDyn {
-        sig: u32,
-        i: u16,
-        s: u16,
-        w: u16,
-        sw: u32,
-        mask: u64,
-    },
-    /// `sig[i +: w] <= s` at a run-time offset.
-    RangeStoreNbaDyn {
-        sig: u32,
-        i: u16,
-        s: u16,
-        w: u16,
-        sw: u32,
-        mask: u64,
-    },
-    /// Save a WIDE (65..=512-bit) signal the block reads before writing,
-    /// so a later bail can restore it; the narrow form is `SaveSig`.
-    SaveSigW {
-        sig: u32,
-    },
-    /// Wide mux: `d = c ? a : b` on the wide register file (`c` narrow).
-    WSel {
-        d: u16,
-        c: u16,
-        a: u16,
-        b: u16,
-    },
-    /// `sig[hi:lo] = {N{bit}}` where the bit is x or z: fill both planes
-    /// (`v` is the value bit, x is always set). A reset default of `'x` on
-    /// a wide bus takes this form.
-    RangeFillXW {
-        sig: u32,
-        hi: u32,
-        lo: u32,
-        v: u8,
-    },
-    /// Blocking store of a folded 4-state constant (`y = 'x;`). `v`/`x` are
-    /// the raw value/xz planes, already masked to the assigned width.
-    ConstStoreX {
-        sig: u32,
-        v: u64,
-        x: u64,
-    },
-    /// Partial-range counterpart (`y[hi:lo] = 'x;`).
-    RangeStoreX(Box<TsRangeStoreX>),
-    /// Write back `regs[s] & mask` to `sig` with change-detect + dirty
-    /// marking (the eval site mirrors the 4-state fast-path bookkeeping).
-    Store {
-        sig: u32,
-        s: u16,
-        mask: u64,
-    },
-    /// Nonblocking write: queue `regs[s] & mask` (width `w`) with §10.4.2
-    /// last-write-wins and the eval-time elision, exactly as `NbaAssign`.
-    StoreNba {
-        sig: u32,
-        s: u16,
-        w: u32,
-        mask: u64,
-    },
-    /// NBA of a compile-time CONSTANT (`q <= 8'h3f;`) — the single largest
-    /// two-state bail on c906 (1,189 edge blocks). Non-abortable: the value
-    /// was validated 2-state at lowering.
-    ConstStoreNba {
-        sig: u32,
-        v: u64,
-        w: u32,
-    },
-    /// Partial-bit NBA (`q[hi:lo] <= v`). Mirrors the 4-state executor's
-    /// `compose_inline_range_bits` merge against the pending-or-current
-    /// value — the composition works on raw bit PLANES, so an X base flows
-    /// through instead of aborting; only the SOURCE must be 2-state, and it
-    /// is (it lives in a ts register). Non-abortable.
-    RangeStoreNba {
-        sig: u32,
-        hi: u32,
-        lo: u32,
-        s: u16,
-        mask: u64,
-    },
-    /// Blocking counterpart of `RangeStoreNba`: splice regs[s] into
-    /// signal[hi:lo] immediately (§10.4.1), preserving the bits outside the
-    /// window. The TS bail census measured `BlockingAssignRange` gating
-    /// 133.2M interpreter evaluations on the C906 SoC — 42.9% of them, the
-    /// single largest reason two-state lowering gave up.
-    RangeStore {
-        sig: u32,
-        hi: u32,
-        lo: u32,
-        s: u16,
-        mask: u64,
-    },
-    /// `RangeStore` into a >64-bit destination: the ≤64-bit slice regs[s]
-    /// replaces bits [hi:lo] of the wide planes; everything else (X
-    /// included) is preserved. Routed through the same splice the JIT bridge
-    /// uses for wide destinations.
-    RangeStoreW {
-        sig: u32,
-        hi: u32,
-        lo: u32,
-        s: u16,
-        mask: u64,
-    },
-    /// `RangeStoreNba` for a destination wider than 64 bits: the window is
-    /// spliced into the pending NBA value (seeded from the signal).
-    RangeStoreNbaW {
-        sig: u32,
-        hi: u32,
-        lo: u32,
-        s: u16,
-        mask: u64,
-    },
-    /// `sig[hi:lo] = {N{bit}}` for any width (the `bus = {265{1'b0}}` default
-    /// assignment that opens most c906 decode blocks): a constant fill of
-    /// the window, blocking and non-blocking.
-    RangeFillW {
-        sig: u32,
-        hi: u32,
-        lo: u32,
-        bit: u8,
-    },
-    RangeFillNbaW {
-        sig: u32,
-        hi: u32,
-        lo: u32,
-        bit: u8,
-    },
-    /// `RangeStoreX` into a >64-bit destination (folded 4-state constant).
-    RangeStoreXW(Box<TsRangeStoreX>),
-    /// Dynamic array-element read: eid = first + (regs[idx] - lo). ABORTS
-    /// the two-state run (caller re-runs 4-state) when the index is out of
-    /// range or the element holds X — both produce X in 4-state. Lowering
-    /// only admits this before any side-effecting op, so an abort is clean.
-    ElemLoad(Box<TsElemOp>),
-    /// `ElemLoad` into the wide bank: elements wider than 64 bits (a
-    /// vector unit's register file, a cache line array). Out-of-range
-    /// aborts like `ElemLoad`; an element holding X is an x-read bail, so a
-    /// persistently undefined memory sleeps like any other x source.
-    WElemLoad(Box<TsElemOp>),
-    /// Dynamic array-element NBA (`mem[waddr] <= v`): out-of-range DROPS
-    /// silently (4-state behavior); otherwise mirrors the NbaAssignArray
-    /// arm (elide-if-equal, then index+push).
-    ElemStoreNba(Box<TsElemOp>),
-    /// `LoadSig { d } ; ElemStoreNba { s: d }` fused: the data comes straight
-    /// from the source signal's planes, and x/z bits are QUEUED as a 4-state
-    /// value instead of bailing the block (a RAM written with x data — the
-    /// image-load phase, uninitialised words — fired that bail on every
-    /// clock edge: c906 1.7M x-read bails per 100 iterations from the
-    /// `if (we) mem[a] <= d` blocks). `d` is still written for later readers.
-    ElemStoreNbaFromSig(Box<TsElemStoreFromSig>),
-    /// Dynamic array-element blocking write; out-of-range drops silently.
-    ElemStore(Box<TsElemOp>),
-    /// Fused array-read-to-NBA (`q <= mem[raddr]`, NbaAssignArrayRead):
-    /// index comes from a SIGNAL; aborts on out-of-range or X element
-    /// (4-state queues an X value there).
-    NbaFromElem(Box<TsNbaFromElem>),
-    /// `NbaFromElem` for elements wider than 64 bits: the element Value is
-    /// queued whole (the NBA queue holds Values), so it needs no wide
-    /// register and runs in every executor through the out-of-line arm.
-    WNbaFromElem(Box<TsNbaFromElem>),
-    // ---- WIDE (65..=512-bit) bank: little-endian [u64; N] registers, N
-    // = 2 or 8 words per block (`TwoStateBlock::wide_words`); widths give
-    // the executor the top word and its mask. ----
-    /// wregs[d] = signal words; bails when the signal holds X/Z.
-    WLoadSig {
-        d: u16,
-        sig: u32,
-    },
-    /// Little-endian words of the constant (≤ N of them).
-    WConst {
-        d: u16,
-        v: Box<[u64]>,
-    },
-    WXor {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    WAnd {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    WOr {
-        d: u16,
-        a: u16,
-        b: u16,
-    },
-    /// wregs[d] = !wregs[s] masked to width `w`.
-    WNot {
-        d: u16,
-        s: u16,
-        w: u16,
-    },
-    /// Wide→wide slice: wregs[d] = (wregs[s] >> lo) & mask(w), w in 65..=512.
-    WRange {
-        d: u16,
-        s: u16,
-        lo: u16,
-        w: u16,
-    },
-    /// Narrow (≤64) slice of a wide register.
-    RangeFromW {
-        d: u16,
-        s: u16,
-        lo: u16,
-        mask: u64,
-    },
-    BitFromW {
-        d: u16,
-        s: u16,
-        bit: u16,
-    },
-    /// MSB-first concat into a wide register; parts (reg, width, is_wide)
-    /// may be narrow or wide.
-    WConcat {
-        d: u16,
-        parts: Box<[(u16, u16, bool)]>,
-    },
-    /// Resize truncation within the wide bank to width `w`.
-    WMask {
-        d: u16,
-        w: u16,
-    },
-    /// Bank moves for Resize crossings (same register index).
-    WFromN {
-        r: u16,
-    },
-    NFromW {
-        r: u16,
-        mask: u64,
-    },
-    /// Wide writeback with change-detect + dirty hooks (the register is
-    /// masked to its width by construction; stored via Value::set_words).
-    WStore {
-        sig: u32,
-        s: u16,
-    },
-    WStoreNba {
-        sig: u32,
-        s: u16,
-        w: u32,
-    },
-    /// `sig[lo+w-1:lo] = wregs[s]` / `<=`: a whole wide (65..=512-bit)
-    /// register written into a window of a wider destination (the
-    /// `bus[127:0] = data` arms of the c906 load/store arbiters).
-    WRangeStore {
-        sig: u32,
-        lo: u32,
-        s: u16,
-        w: u32,
-    },
-    WRangeStoreNba {
-        sig: u32,
-        lo: u32,
-        s: u16,
-        w: u32,
-    },
-    /// Wrapping multiply at max operand width (both operands unsigned).
-    Mul {
-        d: u16,
-        a: u16,
-        b: u16,
-        mask: u64,
-    },
-    /// Wide (65..=512-bit) slice of a SIGNAL into the wide bank; bails
-    /// when any bit of the slice holds X/Z.
-    WSigRange {
-        d: u16,
-        sig: u32,
-        lo: u16,
-        w: u16,
-    },
-    /// Logical shifts. `w` is the LEFT operand's width, which is also the
-    /// result width (`Value::shift_left`/`shift_right` keep `self.width`);
-    /// an amount ≥ w yields 0, matching those helpers exactly. The amount
-    /// register is X-free by construction, so the 4-state all-X result for
-    /// an X amount cannot arise here.
-    /// regs[d] = (regs[s] + k) & mask — the fused constant add. Counters
-    /// and address increments make this the most common shape in clocked
-    /// bodies, which the islands cover since the edge hook landed.
-    AddC {
-        d: u16,
-        s: u16,
-        k: u64,
-        mask: u64,
-    },
-    Shl {
-        d: u16,
-        a: u16,
-        b: u16,
-        w: u32,
-        mask: u64,
-    },
-    Shr {
-        d: u16,
-        a: u16,
-        b: u16,
-        w: u32,
-    },
-    /// Narrow replicate: dst = {count{src}} with count*w ≤ 64.
-    Repl {
-        d: u16,
-        s: u16,
-        w: u8,
-        count: u8,
-    },
-    /// Wide replicate (result 65..=512 bits) of a NARROW part.
-    WRepl {
-        d: u16,
-        s: u16,
-        w: u8,
-        count: u16,
-    },
-    /// One statement the bytecode compiler could not compile (a `$display`
-    /// in a check's failing branch, typically), run by the AST interpreter
-    /// in place. Before this, any such statement kept the WHOLE block on the
-    /// four-state VM at ~150 host instructions per bytecode instruction,
-    /// even when the fallback sat on a branch that never executes.
-    Fallback(Arc<Statement>),
-    /// Save the signal's current bits; the executor restores every saved
-    /// signal when the block bails, so the four-state re-run is exact for
-    /// a block that reads a signal it later overwrites.
-    SaveSig {
-        sig: u32,
-    },
-    /// Process-FSM wait points (only in FSM streams, run by the control
-    /// executor from a start index). `resume` is the four-state pc after
-    /// the wait, which the runner keeps as the process's pc; `vm_to_ts`
-    /// maps it back to a stream index on the next resume.
-    WaitEdge {
-        ix: u32,
-        resume: u32,
-    },
-    /// A folded constant delay: `raw` is the f64 bit pattern of the tick
-    /// count before quantization (`fsm_delay_ticks` applies it at run time).
-    WaitDelayRaw {
-        raw: u64,
-        resume: u32,
-    },
-    /// `Insn::CovHit`; undone on a bail like a hazard save.
-    CovHit(u32),
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-
-pub struct TwoStateBlock {
-    pub insns: Vec<TsInsn>,
-    pub num_regs: u32,
-    /// Deduped ≤64-bit signals read WHOLE — checked X-free with one
-    /// raw_bits call each.
-    pub reads_whole: Box<[u32]>,
-    /// Deduped (signal, lo, width) slices of WIDE signals — checked via
-    /// raw_bits_slice, so unrelated X bits don't force a bail.
-    pub reads_slice: Box<[(u32, u16, u16)]>,
-    /// Any branch/jump present. Straight-line blocks (the overwhelmingly
-    /// common comb shape) run a compact loop without the pc bookkeeping.
-    pub has_ctrl: bool,
-    /// Any wide (65..=512-bit) op present — routed to the wide executor so
-    /// the narrow hot loops keep their code size.
-    pub has_wide: bool,
-    /// Words per wide register for this block: 0 (none), 2 (widths up to
-    /// 128) or 8 (up to 512); selects the wide executor's monomorph.
-    pub wide_words: u8,
-    /// Process-FSM streams only: the stream holds wait opcodes; `vm_to_ts`
-    /// maps each four-state pc to its stream index; `wait_regs` lists, per
-    /// resume pc, the registers the stream defines there as (reg, width,
-    /// signed) — the set a VM re-run converts from and to.
-    pub has_wait: bool,
-    /// Every instruction has an x-plane form and the stream needs no
-    /// wide bank: the x-plane executor can run it after an x-read bail.
-    pub tsx: bool,
-    pub vm_to_ts: Box<[u32]>,
-    pub wait_regs: Box<[(u32, Box<[(u16, u32, bool)]>)]>,
-    /// Wide (>64-bit) signals read WHOLE — X-checked via words_if_clean.
-    pub reads_wide: Box<[u32]>,
-    /// Signals this block WRITES (sorted, deduped). §9.3.1 force filtering
-    /// is per DESTINATION — `write_sig!` drops writes to forced signals and
-    /// the two-state stores bypass that check — so an active force only
-    /// makes a block unsafe when the block writes a forced signal. Reads of
-    /// a forced signal are exact (the forced value lives in the table).
-    pub writes: Box<[u32]>,
-    /// Array element-store spans `(first_id, count)`: a dynamic element
-    /// write can land on any id in the span, so a forced id inside one
-    /// disqualifies the block.
-    pub writes_span: Box<[(u32, u32)]>,
-}
-
-/// Can the x-plane executor run this instruction? Everything except the
-/// wide bank, process waits and AST fallbacks.
-pub fn tsx_insn_ok(i: &TsInsn) -> bool {
-    !matches!(
-        i,
-        TsInsn::Fallback(..)
-            | TsInsn::WaitEdge { .. }
-            | TsInsn::WaitDelayRaw { .. }
-            | TsInsn::WRedOr { .. }
-            | TsInsn::WRedAnd { .. }
-            | TsInsn::WSel { .. }
-            | TsInsn::WLoadSig { .. }
-            | TsInsn::WConst { .. }
-            | TsInsn::WXor { .. }
-            | TsInsn::WAnd { .. }
-            | TsInsn::WOr { .. }
-            | TsInsn::WNot { .. }
-            | TsInsn::WRange { .. }
-            | TsInsn::RangeFromW { .. }
-            | TsInsn::BitFromW { .. }
-            | TsInsn::WConcat { .. }
-            | TsInsn::WMask { .. }
-            | TsInsn::WFromN { .. }
-            | TsInsn::NFromW { .. }
-            | TsInsn::WStore { .. }
-            | TsInsn::WStoreNba { .. }
-            | TsInsn::WRangeStore { .. }
-            | TsInsn::WRangeStoreNba { .. }
-            | TsInsn::WSigRange { .. }
-            | TsInsn::WRepl { .. }
-            | TsInsn::WElemLoad(..)
-    )
-}
-
-fn ts_mask(w: u32) -> u64 {
-    if w >= 64 { u64::MAX } else { (1u64 << w) - 1 }
-}
-
-/// Sensitivity mask of bits `lo .. lo + n` of a `width`-bit signal. A
-/// signal of up to 64 bits maps bit for bit; a wider one maps mask bit `k`
-/// to the `2^s`-bit chunk starting at `k << s`, `s` the smallest shift that
-/// fits the signal in 64 chunks, so a span covers every chunk it touches.
-/// (Bits past chunk 63 — only out-of-range spans — all map to chunk 63,
-/// the same way for reads and writes.) An empty span claims the whole
-/// signal.
-#[inline(always)]
-pub fn sig_span_mask(width: u32, lo: u32, n: u32) -> u64 {
-    if n == 0 {
-        return u64::MAX;
-    }
-    let sh = sig_chunk_shift(width);
-    let first = (lo >> sh).min(63);
-    let last = (lo.saturating_add(n - 1) >> sh).min(63);
-    (u64::MAX >> (63 - last)) & (u64::MAX << first)
-}
-
-/// log2 of the chunk size `sig_span_mask` uses for a `width`-bit signal.
-#[inline(always)]
-pub fn sig_chunk_shift(width: u32) -> u32 {
-    if width <= 64 {
-        0
-    } else {
-        // ceil(log2(ceil(width / 64)))
-        let c = width.div_ceil(64);
-        32 - (c - 1).leading_zeros()
-    }
-}
-
-/// Bits read by a two-state stream, per signal, for bit-granular comb
-/// sensitivity: `(signal, mask)` with `sig_span_mask` chunks (`u64::MAX`
-/// for a whole-signal read), plus every signal the stream stores, once per
-/// store instruction. None when the stream holds anything whose reads are
-/// not a fixed set of bits: array elements, AST fallbacks, waits, coverage
-/// hits (an evaluation count is observable). The match is exhaustive on
-/// purpose — a new instruction must be classified before it compiles.
-pub fn ts_read_masks(insns: &[TsInsn], widths: &[u32]) -> Option<(Vec<(u32, u64)>, Vec<u32>)> {
-    let mut reads: Vec<(u32, u64)> = Vec::new();
-    let mut writes: Vec<u32> = Vec::new();
-    let wid = |sig: u32| widths.get(sig as usize).copied().unwrap_or(0);
-    let add = |reads: &mut Vec<(u32, u64)>, sig: u32, m: u64| {
-        if let Some(e) = reads.iter_mut().find(|e| e.0 == sig) {
-            e.1 |= m;
-        } else {
-            reads.push((sig, m));
-        }
-    };
-    // Low contiguous `mask` → its bit count (0 claims the whole signal).
-    let nbits = |mask: u64| 64 - mask.leading_zeros();
-    for i in insns {
-        match i {
-            TsInsn::LoadSig { sig, .. }
-            | TsInsn::LoadSigNot { sig, .. }
-            | TsInsn::LoadSigLogAnd { sig, .. }
-            | TsInsn::LoadSigBrNz { sig, .. }
-            | TsInsn::BrFalseLoadSig { sig, .. }
-            | TsInsn::LoadSigLogOr { sig, .. }
-            | TsInsn::LoadSigAnd { sig, .. }
-            | TsInsn::LoadSigRepl { sig, .. }
-            | TsInsn::WLoadSig { sig, .. }
-            | TsInsn::SigRangeDyn { sig, .. } => add(&mut reads, *sig, u64::MAX),
-            TsInsn::LoadSig2 { sig1, sig2, .. } => {
-                add(&mut reads, *sig1, u64::MAX);
-                add(&mut reads, *sig2, u64::MAX);
-            }
-            TsInsn::SigBit { sig, bit, .. }
-            | TsInsn::SigBitW { sig, bit, .. }
-            | TsInsn::SigBitNot { sig, bit, .. } => {
-                add(&mut reads, *sig, sig_span_mask(wid(*sig), *bit as u32, 1))
-            }
-            TsInsn::SigBit2 {
-                sig1,
-                bit1,
-                sig2,
-                bit2,
-                ..
-            } => {
-                add(
-                    &mut reads,
-                    *sig1,
-                    sig_span_mask(wid(*sig1), *bit1 as u32, 1),
-                );
-                add(
-                    &mut reads,
-                    *sig2,
-                    sig_span_mask(wid(*sig2), *bit2 as u32, 1),
-                );
-            }
-            TsInsn::SigRange { sig, lo, mask, .. }
-            | TsInsn::SigRangeAnd { sig, lo, mask, .. }
-            | TsInsn::SigRangeEq { sig, lo, mask, .. } => add(
-                &mut reads,
-                *sig,
-                sig_span_mask(wid(*sig), *lo as u32, nbits(*mask)),
-            ),
-            TsInsn::SigRangeW { sig, lo, w, .. } | TsInsn::WSigRange { sig, lo, w, .. } => add(
-                &mut reads,
-                *sig,
-                sig_span_mask(wid(*sig), *lo as u32, *w as u32),
-            ),
-            TsInsn::SigRangeEqC { sig, lo, w, .. } => add(
-                &mut reads,
-                *sig,
-                sig_span_mask(wid(*sig), *lo as u32, *w as u32),
-            ),
-            TsInsn::LoadSigSigRange {
-                sig,
-                sig2,
-                lo,
-                mask,
-                ..
-            } => {
-                add(&mut reads, *sig, u64::MAX);
-                add(
-                    &mut reads,
-                    *sig2,
-                    sig_span_mask(wid(*sig2), *lo as u32, nbits(*mask)),
-                );
-            }
-            TsInsn::BrSigFalse { sig, bit, .. } => {
-                let m = if *bit == u32::MAX {
-                    u64::MAX
-                } else {
-                    sig_span_mask(wid(*sig), *bit, 1)
-                };
-                add(&mut reads, *sig, m);
-            }
-            TsInsn::LogAndStore { sig, .. }
-            | TsInsn::AndRangeStore { sig, .. }
-            | TsInsn::LogOrStore { sig, .. }
-            | TsInsn::OrRangeStore { sig, .. }
-            | TsInsn::BitStoreNbaDyn { sig, .. }
-            | TsInsn::BitStoreDyn { sig, .. }
-            | TsInsn::RangeStoreDyn { sig, .. }
-            | TsInsn::RangeStoreNbaDyn { sig, .. }
-            | TsInsn::RangeFillXW { sig, .. }
-            | TsInsn::ConstStoreX { sig, .. }
-            | TsInsn::Store { sig, .. }
-            | TsInsn::StoreNba { sig, .. }
-            | TsInsn::ConstStoreNba { sig, .. }
-            | TsInsn::RangeStoreNba { sig, .. }
-            | TsInsn::RangeStore { sig, .. }
-            | TsInsn::RangeStoreW { sig, .. }
-            | TsInsn::RangeStoreNbaW { sig, .. }
-            | TsInsn::RangeFillW { sig, .. }
-            | TsInsn::RangeFillNbaW { sig, .. }
-            | TsInsn::WStore { sig, .. }
-            | TsInsn::WStoreNba { sig, .. }
-            | TsInsn::WRangeStore { sig, .. }
-            | TsInsn::WRangeStoreNba { sig, .. } => writes.push(*sig),
-            TsInsn::RangeStoreX(p) | TsInsn::RangeStoreXW(p) => writes.push(p.sig),
-            // A save snapshots a signal the stream is about to store, for
-            // the undo after a bail: not an input.
-            TsInsn::SaveSig { .. } | TsInsn::SaveSigW { .. } => {}
-            TsInsn::ElemLoad(..)
-            | TsInsn::WElemLoad(..)
-            | TsInsn::ElemStoreNba(..)
-            | TsInsn::ElemStoreNbaFromSig(..)
-            | TsInsn::ElemStore(..)
-            | TsInsn::NbaFromElem(..)
-            | TsInsn::WNbaFromElem(..)
-            | TsInsn::Fallback(..)
-            | TsInsn::WaitEdge { .. }
-            | TsInsn::WaitDelayRaw { .. }
-            | TsInsn::CovHit(..) => return None,
-            TsInsn::Const { .. }
-            | TsInsn::Bit { .. }
-            | TsInsn::Range { .. }
-            | TsInsn::Xor { .. }
-            | TsInsn::And { .. }
-            | TsInsn::Or { .. }
-            | TsInsn::Sel { .. }
-            | TsInsn::Not { .. }
-            | TsInsn::XorC { .. }
-            | TsInsn::EqC { .. }
-            | TsInsn::Add { .. }
-            | TsInsn::Sub { .. }
-            | TsInsn::Eq { .. }
-            | TsInsn::MaskEq { .. }
-            | TsInsn::Neq { .. }
-            | TsInsn::LogNotAnd { .. }
-            | TsInsn::LogNotLogAnd { .. }
-            | TsInsn::EqBrFalse { .. }
-            | TsInsn::EqCBrFalse { .. }
-            | TsInsn::ConstEq { .. }
-            | TsInsn::AndOr { .. }
-            | TsInsn::Lt { .. }
-            | TsInsn::CmpS { .. }
-            | TsInsn::BitDyn { .. }
-            | TsInsn::Leq { .. }
-            | TsInsn::Gt { .. }
-            | TsInsn::Geq { .. }
-            | TsInsn::LogNot { .. }
-            | TsInsn::LogAnd { .. }
-            | TsInsn::LogOr { .. }
-            | TsInsn::Concat { .. }
-            | TsInsn::Concat2 { .. }
-            | TsInsn::Concat3 { .. }
-            | TsInsn::Mask { .. }
-            | TsInsn::BrFalse { .. }
-            | TsInsn::BrNz { .. }
-            | TsInsn::Jmp { .. }
-            | TsInsn::JmpPoll { .. }
-            | TsInsn::LoopPoll
-            | TsInsn::CaseJmp { .. }
-            | TsInsn::CaseMaskJmp { .. }
-            | TsInsn::RedOr { .. }
-            | TsInsn::WRedOr { .. }
-            | TsInsn::WRedAnd { .. }
-            | TsInsn::RedAnd { .. }
-            | TsInsn::WSel { .. }
-            | TsInsn::WConst { .. }
-            | TsInsn::WXor { .. }
-            | TsInsn::WAnd { .. }
-            | TsInsn::WOr { .. }
-            | TsInsn::WNot { .. }
-            | TsInsn::WRange { .. }
-            | TsInsn::RangeFromW { .. }
-            | TsInsn::BitFromW { .. }
-            | TsInsn::WConcat { .. }
-            | TsInsn::WMask { .. }
-            | TsInsn::WFromN { .. }
-            | TsInsn::NFromW { .. }
-            | TsInsn::Mul { .. }
-            | TsInsn::AddC { .. }
-            | TsInsn::Shl { .. }
-            | TsInsn::Shr { .. }
-            | TsInsn::Repl { .. }
-            | TsInsn::WRepl { .. } => {}
-        }
-    }
-    Some((reads, writes))
-}
-
-thread_local! {
-    /// Opcode the lowering was on when it gave up — the only way to answer
-    /// "why is this block not an island?" on a design you cannot read.
-    /// Reported by the XZ_TS_DBG dump.
-    static TS_BAIL_AT: std::cell::Cell<(usize, &'static str)> =
-        const { std::cell::Cell::new((0, "-")) };
-}
-
-/// (stream index, opcode) where the last `lower_two_state` call stopped.
-pub fn ts_last_bail() -> (usize, &'static str) {
-    TS_BAIL_AT.with(|c| c.get())
-}
-
-thread_local! {
-    /// Fine-grained reason for the last bail, for arms that carry several
-    /// distinct gates. The opcode alone was not enough: the gate census
-    /// showed `BlockingAssignRange` accounting for 58% of all interpreter
-    /// evaluations on the C906 SoC while its DESTINATION passed every
-    /// signal-level check, so the deciding condition had to be named from
-    /// inside the arm.
-    static TS_GATE_WHY: std::cell::Cell<&'static str> =
-        const { std::cell::Cell::new("-") };
-}
-
-/// Fine-grained gate label for the last `lower_two_state` bail ("-" when the
-/// arm does not carry one).
-pub fn ts_last_gate() -> &'static str {
-    TS_GATE_WHY.with(|c| c.get())
-}
-
-/// Does the block read a signal (or array) BEFORE writing it, on some path,
-/// with no write of that signal earlier on that same path?
-///
-/// Every two-state bail — an x-read, an out-of-range element index — hands
-/// the block to the four-state interpreter, which re-runs it from the top
-/// against the signal table as the two-state stores left it. That re-run
-/// reproduces the aborted run exactly iff no load observed a signal the
-/// block itself overwrites later on the same path: `cnt = cnt + 1; ...`
-/// followed by a bail would increment twice. Loop counters (`i = 0; ...
-/// i = i + 1`) are fine — every read of `i` is dominated by a store.
-///
-/// Two small dataflow passes over the block's CFG: MUST-stored (intersection
-/// over predecessors) protects a read; a read of an unprotected signal is
-/// recorded (union), and a later blocking store of a recorded signal is the
-/// hazard. Non-blocking assignments queue and never touch the table.
-/// Returns the signals whose read-after-write makes a re-run inexact
-/// (`Ok(empty)` = none), or `Err` when a hazard sits on an array or the
-/// dataflow did not converge — those blocks cannot be saved and restored.
-fn ts_raw_hazard(
-    insns: &[Insn],
-    array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
-) -> Result<Vec<u32>, ()> {
-    #[derive(PartialEq, Eq, Hash, Clone)]
-    enum Base {
-        Sig(u32),
-        Arr(usize),
-        ArrName(String),
-    }
-    // One access site class: base + bit range. `protects` is false for a
-    // store whose bits are not static (dynamic bit / array element), which
-    // therefore shields no later read.
-    struct Acc {
-        base: Base,
-        lo: u32,
-        hi: u32,
-        protects: bool,
-    }
-    const FULL: (u32, u32) = (0, u32::MAX);
-    let arr_base = |a: &ArrayOperand| -> Base {
-        match a {
-            ArrayOperand::Dense { first_id, .. } => Base::Arr(*first_id),
-            ArrayOperand::Named(name) => match array_first_id.get(name.as_str()) {
-                Some(&(first, _, _)) => Base::Arr(first),
-                None => Base::ArrName(name.clone()),
-            },
-        }
-    };
-    let n = insns.len();
-    let mut loads: Vec<Acc> = Vec::new();
-    let mut stores: Vec<Acc> = Vec::new();
-    let mut reads: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut writes: Vec<Option<usize>> = vec![None; n];
-    type AccKey = (Base, u32, u32, bool);
-    // Linear for the usual handful of access classes; past that through an
-    // index (an unrolled reduction loads one signal per trip), which covers
-    // a prefix of the append-only list.
-    fn intern(v: &mut Vec<Acc>, ix: &mut HashMap<AccKey, usize>, a: Acc) -> usize {
-        let found = if v.len() < 16 {
-            v.iter().position(|x| {
-                x.base == a.base && x.lo == a.lo && x.hi == a.hi && x.protects == a.protects
-            })
-        } else {
-            for (i, x) in v.iter().enumerate().skip(ix.len()) {
-                ix.entry((x.base.clone(), x.lo, x.hi, x.protects))
-                    .or_insert(i);
-            }
-            ix.get(&(a.base.clone(), a.lo, a.hi, a.protects)).copied()
-        };
-        match found {
-            Some(i) => i,
-            None => {
-                v.push(a);
-                v.len() - 1
-            }
-        }
-    }
-    let mut loads_ix: HashMap<AccKey, usize> = HashMap::default();
-    let mut stores_ix: HashMap<AccKey, usize> = HashMap::default();
-    let rng = |a: u32, b: u32| -> (u32, u32) { (a.min(b), a.max(b)) };
-    for (i, insn) in insns.iter().enumerate() {
-        let mut ld = |base: Base, r: (u32, u32)| {
-            reads[i].push(intern(
-                &mut loads,
-                &mut loads_ix,
-                Acc {
-                    base,
-                    lo: r.0,
-                    hi: r.1,
-                    protects: false,
-                },
-            ));
-        };
-        match insn {
-            Insn::LoadSignal(_, sig) | Insn::LoadSignalSigned(_, sig) => ld(Base::Sig(*sig), FULL),
-            Insn::LoadSignalBit(_, sig, b) => ld(Base::Sig(*sig), (*b, *b)),
-            Insn::LoadSignalRange(_, sig, l, r) => ld(Base::Sig(*sig), rng(*l, *r)),
-            Insn::BranchIfSignalFalse(sig, _, b) => ld(
-                Base::Sig(*sig),
-                if *b == u32::MAX { FULL } else { (*b, *b) },
-            ),
-            Insn::LoadArrayElem(_, arr, _) => ld(arr_base(arr), FULL),
-            Insn::NbaAssignArrayRead(_, arr, isig, _) => {
-                ld(arr_base(arr), FULL);
-                ld(Base::Sig(*isig), FULL);
-            }
-            _ => {}
-        }
-        let st = match insn {
-            Insn::BlockingAssign(sig, _, _) | Insn::BlockingAssignString(sig, _) => Some(Acc {
-                base: Base::Sig(*sig),
-                lo: 0,
-                hi: u32::MAX,
-                protects: true,
-            }),
-            Insn::BlockingAssignRange(sig, hi, lo, _) => {
-                let r = rng(*hi, *lo);
-                Some(Acc {
-                    base: Base::Sig(*sig),
-                    lo: r.0,
-                    hi: r.1,
-                    protects: true,
-                })
-            }
-            Insn::BlockingAssignBitDyn(sig, _, _) => Some(Acc {
-                base: Base::Sig(*sig),
-                lo: 0,
-                hi: u32::MAX,
-                protects: false,
-            }),
-            Insn::BlockingAssignArray(arr, _, _, _)
-            | Insn::BlockingAssignArrayRange(arr, _, _, _, _) => Some(Acc {
-                base: arr_base(arr),
-                lo: 0,
-                hi: u32::MAX,
-                protects: false,
-            }),
-            _ => None,
-        };
-        if let Some(a) = st {
-            writes[i] = Some(intern(&mut stores, &mut stores_ix, a));
-        }
-    }
-    if stores.is_empty() || loads.is_empty() {
-        return Ok(Vec::new());
-    }
-    let (nl, ns) = (loads.len(), stores.len());
-    if nl > 4096 || ns > 4096 {
-        return Err(());
-    }
-    // covers[L]: store classes whose static range contains load class L.
-    // overlaps[S]: load classes whose range meets store class S.
-    let covers: Vec<Vec<usize>> = loads
-        .iter()
-        .map(|l| {
-            stores
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.protects && s.base == l.base && s.lo <= l.lo && s.hi >= l.hi)
-                .map(|(j, _)| j)
-                .collect()
-        })
-        .collect();
-    let overlaps: Vec<Vec<usize>> = stores
-        .iter()
-        .map(|s| {
-            loads
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.base == s.base && l.lo <= s.hi && s.lo <= l.hi)
-                .map(|(j, _)| j)
-                .collect()
-        })
-        .collect();
-    let lw = nl.div_ceil(64);
-    let sw = ns.div_ceil(64);
-    let succs = |i: usize| -> Vec<usize> {
-        match &insns[i] {
-            Insn::Jump(t) => vec![*t as usize],
-            Insn::BranchIfFalse(_, t)
-            | Insn::BranchUnlessZero(_, t)
-            | Insn::BranchIfSignalFalse(_, t, _)
-            | Insn::CmpBranch(_, _, _, _, t)
-            | Insn::CmpBranchConst(_, _, _, _, t) => vec![i + 1, *t as usize],
-            Insn::CaseJump(_, cj) => cj
-                .table
-                .iter()
-                .chain(std::iter::once(&cj.default))
-                .map(|&t| t as usize)
-                .collect(),
-            Insn::CaseMaskJump(_, mj) => mj
-                .table
-                .iter()
-                .chain(std::iter::once(&mj.xz_path))
-                .map(|&t| t as usize)
-                .collect(),
-            _ => vec![i + 1],
-        }
-    };
-    let bit = |v: &[u64], k: usize| (v[k >> 6] >> (k & 63)) & 1 != 0;
-    // must_in over store classes (intersection; top = all-ones except the
-    // entry), unprot_in over load classes (union).
-    let mut must_in: Vec<Vec<u64>> = vec![vec![u64::MAX; sw]; n + 1];
-    must_in[0] = vec![0; sw];
-    let mut unprot_in: Vec<Vec<u64>> = vec![vec![0; lw]; n + 1];
-    let mut must_out: Vec<Vec<u64>> = vec![vec![u64::MAX; sw]; n];
-    let mut unprot_out: Vec<Vec<u64>> = vec![vec![0; lw]; n];
-    let mut hazards: Vec<u32> = Vec::new();
-    let mut changed = true;
-    let mut sweeps = 0;
-    while changed {
-        changed = false;
-        sweeps += 1;
-        if sweeps > 64 {
-            return Err(());
-        }
-        for i in 0..n {
-            let mut mo = must_in[i].clone();
-            let mut uo = unprot_in[i].clone();
-            for &l in &reads[i] {
-                let protected = covers[l].iter().any(|&sidx| bit(&must_in[i], sidx));
-                if !protected {
-                    uo[l >> 6] |= 1u64 << (l & 63);
-                }
-            }
-            if let Some(sidx) = writes[i] {
-                if overlaps[sidx].iter().any(|&l| bit(&unprot_in[i], l)) {
-                    match stores[sidx].base {
-                        Base::Sig(sg) => {
-                            if !hazards.contains(&sg) {
-                                hazards.push(sg);
-                            }
-                        }
-                        _ => return Err(()),
-                    }
-                }
-                mo[sidx >> 6] |= 1u64 << (sidx & 63);
-            }
-            if mo != must_out[i] || uo != unprot_out[i] {
-                changed = true;
-                must_out[i] = mo;
-                unprot_out[i] = uo;
-            }
-            for t in succs(i) {
-                if t > n {
-                    continue;
-                }
-                let mut ch = false;
-                for w in 0..sw {
-                    let nm = must_in[t][w] & must_out[i][w];
-                    if nm != must_in[t][w] {
-                        must_in[t][w] = nm;
-                        ch = true;
-                    }
-                }
-                for w in 0..lw {
-                    let nu = unprot_in[t][w] | unprot_out[i][w];
-                    if nu != unprot_in[t][w] {
-                        unprot_in[t][w] = nu;
-                        ch = true;
-                    }
-                }
-                if ch {
-                    changed = true;
-                }
-            }
-        }
-    }
-    Ok(hazards)
-}
-
-/// Peephole over a lowered stream: the eight adjacent opcode pairs that a
-/// c906 census put at 17% of all two-state instructions collapse into one
-/// fused instruction each. A pair is only fused when its second half is not
-/// a branch target; every branch target is then remapped.
-fn fuse_ts_pairs(out: &mut Vec<TsInsn>) {
-    let n = out.len();
-    if n < 2 {
-        return;
-    }
-    let mut is_tgt = vec![false; n + 1];
-    for i in out.iter() {
-        match i {
-            TsInsn::BrSigFalse { t, .. }
-            | TsInsn::BrFalse { t, .. }
-            | TsInsn::BrNz { t, .. }
-            | TsInsn::EqCBrFalse { t, .. }
-            | TsInsn::Jmp { t } => {
-                if (*t as usize) <= n {
-                    is_tgt[*t as usize] = true;
-                }
-            }
-            TsInsn::CaseMaskJmp { mj, .. } => {
-                let mj = &mj.mj;
-                for t in mj.table.iter().chain(std::iter::once(&mj.xz_path)) {
-                    if (*t as usize) <= n {
-                        is_tgt[*t as usize] = true;
-                    }
-                }
-            }
-            TsInsn::CaseJmp { cj, .. } => {
-                for t in cj.table.iter().chain(std::iter::once(&cj.default)) {
-                    if (*t as usize) <= n {
-                        is_tgt[*t as usize] = true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut fused: Vec<TsInsn> = Vec::with_capacity(n);
-    let mut new_of: Vec<u32> = vec![0; n + 1];
-    let mut i = 0;
-    let mut any = false;
-    while i < n {
-        new_of[i] = fused.len() as u32;
-        // Three-instruction form: `LoadSig(data) ; LoadSig(index) ;
-        // ElemStoreNba { s: data, idx: index }` (the lowering emits the data
-        // load first). The data load folds into the x-tolerant
-        // `ElemStoreNbaFromSig`; the index load stays. Checked before the
-        // pair rules so the two-load merge does not pre-empt it.
-        if i + 2 < n && !is_tgt[i + 1] && !is_tgt[i + 2] {
-            if let (
-                TsInsn::LoadSig { d: d1, sig: sig1 },
-                TsInsn::LoadSig { d: d2, sig: sig2 },
-                TsInsn::ElemStoreNba(op),
-            ) = (&out[i], &out[i + 1], &out[i + 2])
-            {
-                if op.s == *d1 && op.idx == *d2 {
-                    new_of[i + 1] = fused.len() as u32;
-                    fused.push(TsInsn::LoadSig { d: *d2, sig: *sig2 });
-                    new_of[i + 2] = fused.len() as u32;
-                    fused.push(TsInsn::ElemStoreNbaFromSig(Box::new(TsElemStoreFromSig {
-                        sig: *sig1,
-                        dl: *d1,
-                        op: (**op).clone(),
-                    })));
-                    any = true;
-                    i += 3;
-                    continue;
-                }
-            }
-        }
-        let f = if i + 1 < n && !is_tgt[i + 1] {
-            match (&out[i], &out[i + 1]) {
-                (TsInsn::LoadSig { d: dl, sig }, TsInsn::ElemStoreNba(op)) if op.s == *dl => {
-                    Some(TsInsn::ElemStoreNbaFromSig(Box::new(TsElemStoreFromSig {
-                        sig: *sig,
-                        dl: *dl,
-                        op: (**op).clone(),
-                    })))
-                }
-                (TsInsn::LoadSig { d: dl, sig }, TsInsn::LogNot { d, s }) if s == dl => {
-                    Some(TsInsn::LoadSigNot {
-                        dl: *dl,
-                        d: *d,
-                        sig: *sig,
-                    })
-                }
-                (
-                    TsInsn::SigRange {
-                        d: dr,
-                        sig,
-                        lo,
-                        mask,
-                    },
-                    TsInsn::EqC { d, s, k },
-                ) if s == dr
-                    && *lo < 64
-                    && mask.count_ones() as u64 == 64 - mask.leading_zeros() as u64 =>
-                {
-                    Some(TsInsn::SigRangeEqC {
-                        dr: *dr,
-                        d: *d,
-                        sig: *sig,
-                        lo: *lo as u8,
-                        w: (64 - mask.leading_zeros()) as u8,
-                        k: *k,
-                    })
-                }
-                (TsInsn::LoadSig { d: dl, sig }, TsInsn::LogAnd { d, a, b })
-                    if a == dl || b == dl =>
-                {
-                    Some(TsInsn::LoadSigLogAnd {
-                        dl: *dl,
-                        sig: *sig,
-                        d: *d,
-                        a: *a,
-                        b: *b,
-                    })
-                }
-                (TsInsn::LogNot { d: dn, s }, TsInsn::And { d, a, b }) if a == dn || b == dn => {
-                    Some(TsInsn::LogNotAnd {
-                        dn: *dn,
-                        s: *s,
-                        d: *d,
-                        a: *a,
-                        b: *b,
-                    })
-                }
-                (TsInsn::LogNot { d: dn, s }, TsInsn::LogAnd { d, a, b }) if a == dn || b == dn => {
-                    Some(TsInsn::LogNotLogAnd {
-                        dn: *dn,
-                        s: *s,
-                        d: *d,
-                        a: *a,
-                        b: *b,
-                    })
-                }
-                (TsInsn::LogAnd { d, a, b }, TsInsn::Store { sig, s, mask }) if s == d => {
-                    Some(TsInsn::LogAndStore {
-                        d: *d,
-                        a: *a,
-                        b: *b,
-                        sig: *sig,
-                        mask: *mask,
-                    })
-                }
-                (
-                    TsInsn::And { d, a, b },
-                    TsInsn::RangeStore {
-                        sig,
-                        hi,
-                        lo,
-                        s,
-                        mask,
-                    },
-                ) if s == d && *mask == ts_mask(*hi - *lo + 1) => Some(TsInsn::AndRangeStore {
-                    d: *d,
-                    a: *a,
-                    b: *b,
-                    sig: *sig,
-                    hi: *hi,
-                    lo: *lo,
-                }),
-                (TsInsn::SigBit { d: db, sig, bit }, TsInsn::LogNot { d, s }) if s == db => {
-                    Some(TsInsn::SigBitNot {
-                        db: *db,
-                        d: *d,
-                        sig: *sig,
-                        bit: *bit,
-                    })
-                }
-                (TsInsn::LoadSig { d: d1, sig: sig1 }, TsInsn::LoadSig { d: d2, sig: sig2 }) => {
-                    Some(TsInsn::LoadSig2 {
-                        d1: *d1,
-                        sig1: *sig1,
-                        d2: *d2,
-                        sig2: *sig2,
-                    })
-                }
-                (
-                    TsInsn::SigBit {
-                        d: d1,
-                        sig: sig1,
-                        bit: bit1,
-                    },
-                    TsInsn::SigBit {
-                        d: d2,
-                        sig: sig2,
-                        bit: bit2,
-                    },
-                ) => Some(TsInsn::SigBit2 {
-                    d1: *d1,
-                    sig1: *sig1,
-                    bit1: *bit1,
-                    d2: *d2,
-                    sig2: *sig2,
-                    bit2: *bit2,
-                }),
-                (TsInsn::LoadSig { d: dl, sig }, TsInsn::BrNz { s, t }) if s == dl => {
-                    Some(TsInsn::LoadSigBrNz {
-                        dl: *dl,
-                        sig: *sig,
-                        t: *t,
-                    })
-                }
-                (TsInsn::BrFalse { s, t }, TsInsn::LoadSig { d: dl, sig }) => {
-                    Some(TsInsn::BrFalseLoadSig {
-                        s: *s,
-                        t: *t,
-                        dl: *dl,
-                        sig: *sig,
-                    })
-                }
-                (TsInsn::Eq { d, a, b }, TsInsn::BrFalse { s, t }) if s == d => {
-                    Some(TsInsn::EqBrFalse {
-                        d: *d,
-                        a: *a,
-                        b: *b,
-                        t: *t,
-                    })
-                }
-                (TsInsn::EqC { d, s, k }, TsInsn::BrFalse { s: condition, t })
-                    if condition == d =>
-                {
-                    Some(TsInsn::EqCBrFalse {
-                        d: *d,
-                        s: *s,
-                        k: *k,
-                        t: *t,
-                    })
-                }
-                (TsInsn::LoadSig { d: dl, sig }, TsInsn::LogOr { d, a, b })
-                    if a == dl || b == dl =>
-                {
-                    Some(TsInsn::LoadSigLogOr {
-                        dl: *dl,
-                        sig: *sig,
-                        d: *d,
-                        a: *a,
-                        b: *b,
-                    })
-                }
-                (TsInsn::LoadSig { d: dl, sig }, TsInsn::And { d, a, b }) if a == dl || b == dl => {
-                    Some(TsInsn::LoadSigAnd {
-                        dl: *dl,
-                        sig: *sig,
-                        d: *d,
-                        a: *a,
-                        b: *b,
-                    })
-                }
-                (TsInsn::LoadSig { d: dl, sig }, TsInsn::Repl { d, s, w, count }) if s == dl => {
-                    Some(TsInsn::LoadSigRepl {
-                        dl: *dl,
-                        sig: *sig,
-                        d: *d,
-                        w: *w,
-                        count: *count,
-                    })
-                }
-                (
-                    TsInsn::LoadSig { d: dl, sig },
-                    TsInsn::SigRange {
-                        d,
-                        sig: sig2,
-                        lo,
-                        mask,
-                    },
-                ) => Some(TsInsn::LoadSigSigRange {
-                    dl: *dl,
-                    sig: *sig,
-                    d: *d,
-                    sig2: *sig2,
-                    lo: *lo,
-                    mask: *mask,
-                }),
-                (
-                    TsInsn::SigRange {
-                        d: dr,
-                        sig,
-                        lo,
-                        mask,
-                    },
-                    TsInsn::And { d, a, b },
-                ) if a == dr || b == dr => Some(TsInsn::SigRangeAnd {
-                    dr: *dr,
-                    sig: *sig,
-                    lo: *lo,
-                    mask: *mask,
-                    d: *d,
-                    a: *a,
-                    b: *b,
-                }),
-                (
-                    TsInsn::SigRange {
-                        d: dr,
-                        sig,
-                        lo,
-                        mask,
-                    },
-                    TsInsn::Eq { d, a, b },
-                ) if a == dr || b == dr => Some(TsInsn::SigRangeEq {
-                    dr: *dr,
-                    sig: *sig,
-                    lo: *lo,
-                    mask: *mask,
-                    d: *d,
-                    a: *a,
-                    b: *b,
-                }),
-                (TsInsn::Const { d: dc, v }, TsInsn::Eq { d, a, b }) if a == dc || b == dc => {
-                    Some(TsInsn::ConstEq {
-                        dc: *dc,
-                        v: *v,
-                        d: *d,
-                        a: *a,
-                        b: *b,
-                    })
-                }
-                (TsInsn::LogOr { d, a, b }, TsInsn::Store { sig, s, mask }) if s == d => {
-                    Some(TsInsn::LogOrStore {
-                        d: *d,
-                        a: *a,
-                        b: *b,
-                        sig: *sig,
-                        mask: *mask,
-                    })
-                }
-                (
-                    TsInsn::And {
-                        d: d1,
-                        a: a1,
-                        b: b1,
-                    },
-                    TsInsn::Or { d, a, b },
-                ) if a == d1 || b == d1 => Some(TsInsn::AndOr {
-                    d1: *d1,
-                    a1: *a1,
-                    b1: *b1,
-                    d: *d,
-                    a: *a,
-                    b: *b,
-                }),
-                (
-                    TsInsn::Or { d, a, b },
-                    TsInsn::RangeStore {
-                        sig,
-                        hi,
-                        lo,
-                        s,
-                        mask,
-                    },
-                ) if s == d && *mask == ts_mask(*hi - *lo + 1) => Some(TsInsn::OrRangeStore {
-                    d: *d,
-                    a: *a,
-                    b: *b,
-                    sig: *sig,
-                    hi: *hi,
-                    lo: *lo,
-                }),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if let Some(f) = f {
-            new_of[i + 1] = fused.len() as u32;
-            fused.push(f);
-            any = true;
-            i += 2;
-        } else {
-            fused.push(out[i].clone());
-            i += 1;
-        }
-    }
-    if !any {
-        return;
-    }
-    new_of[n] = fused.len() as u32;
-    for insn in fused.iter_mut() {
-        match insn {
-            TsInsn::BrSigFalse { t, .. }
-            | TsInsn::BrFalse { t, .. }
-            | TsInsn::BrNz { t, .. }
-            | TsInsn::LoadSigBrNz { t, .. }
-            | TsInsn::BrFalseLoadSig { t, .. }
-            | TsInsn::EqBrFalse { t, .. }
-            | TsInsn::EqCBrFalse { t, .. }
-            | TsInsn::Jmp { t } => *t = new_of[(*t as usize).min(n)],
-            TsInsn::CaseMaskJmp { mj, .. } => {
-                let mj = &mut mj.mj;
-                for t in mj.table.iter_mut().chain(std::iter::once(&mut mj.xz_path)) {
-                    *t = new_of[(*t as usize).min(n)];
-                }
-            }
-            TsInsn::CaseJmp { cj, .. } => {
-                for t in cj.table.iter_mut().chain(std::iter::once(&mut cj.default)) {
-                    *t = new_of[(*t as usize).min(n)];
-                }
-            }
-            _ => {}
-        }
-    }
-    *out = fused;
-}
-
-const _: () = assert!(
-    std::mem::size_of::<TsInsn>() <= 24,
-    "TsInsn grew past 24 bytes"
-);
-
-/// Calls `f` with every register `ins` defines, in place or as a destination.
-fn ts_for_each_reg_def(ins: &Insn, mut f: impl FnMut(RegId)) {
-    if let Some(d) = BytecodeCompiler::dest_reg(ins) {
-        f(d);
-    }
-    if let Some(a) = BytecodeCompiler::in_place_reg(ins) {
-        f(a);
-    }
-    match ins {
-        Insn::CmpBranchConst(_, _, _, tmp, _) => f(*tmp),
-        Insn::BinOpConstAdd2(a) => {
-            f(a.d1);
-            f(a.d2);
-        }
-        Insn::EvalExprFallback(_, d, _)
-        | Insn::LoadDynElem(d, _, _)
-        | Insn::Format(d, _)
-        | Insn::StrOp(d, _, _) => f(*d),
-        _ => {}
-    }
-}
-
-/// For each instruction index, the earliest forward branch that targets it.
-fn ts_earliest_forward_branch(insns: &[Insn]) -> Vec<Option<usize>> {
-    let mut earliest: Vec<Option<usize>> = vec![None; insns.len() + 1];
-    for (i, insn) in insns.iter().enumerate() {
-        let mut note = |t: u32| {
-            if let Some(slot) = earliest.get_mut(t as usize)
-                && t as usize > i
-                && slot.is_none()
-            {
-                *slot = Some(i);
-            }
-        };
-        match insn {
-            Insn::BranchIfFalse(_, t)
-            | Insn::BranchUnlessZero(_, t)
-            | Insn::BranchIfSignalFalse(_, t, _)
-            | Insn::CmpBranch(_, _, _, _, t)
-            | Insn::CmpBranchConst(_, _, _, _, t)
-            | Insn::Jump(t) => note(*t),
-            Insn::CaseJump(_, cj) => {
-                cj.table.iter().for_each(|&t| note(t));
-                note(cj.default);
-            }
-            Insn::CaseMaskJump(_, mj) => {
-                mj.table.iter().for_each(|&t| note(t));
-                note(mj.xz_path);
-            }
-            _ => {}
-        }
-    }
-    earliest
-}
-
-pub fn lower_two_state(
-    cb: &CompiledBlock,
-    signal_widths: &[u32],
-    signal_signed: &[bool],
-    signal_real: &[bool],
-    array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
-) -> Option<TwoStateBlock> {
-    // Constant-index array stores fold to stores on the element signal for
-    // the lowering only (see `fold_const_regs_masked`); the copy is 1:1 with
-    // the original, so every stream index below still names the same
-    // four-state instruction.
-    let folded: Option<Vec<Insn>> = if cb.instructions.iter().any(|i| {
-        matches!(
-            i,
-            Insn::NbaAssignArrayRange(..)
-                | Insn::BlockingAssignArrayRange(..)
-                | Insn::NbaAssignArray(..)
-                | Insn::BlockingAssignArray(..)
-        )
-    }) {
-        let mut v = cb.instructions.clone();
-        BytecodeCompiler::fold_const_regs_masked(&mut v, signal_widths, FOLD_STORES_LOWERING);
-        debug_assert_eq!(v.len(), cb.instructions.len());
-        Some(v)
-    } else {
-        None
-    };
-    let insns: &[Insn] = match &folded {
-        Some(v) => v.as_slice(),
-        None => cb.instructions.as_slice(),
-    };
-    let n = insns.len();
-    let mut out: Vec<TsInsn> = Vec::with_capacity(n);
-    // Static width per register. A register REDEFINED with a different width
-    // (possible for loop-var slots, which are mutable) bails: stream-order
-    // width tracking can't represent it.
-    let mut rw: Vec<Option<u32>> = vec![None; cb.num_regs as usize];
-    // Widest register defined in the block: picks the wide bank's word count.
-    let mut max_wide: u32 = 0;
-    // Process-FSM wait bookkeeping (see `TwoStateBlock::has_wait`).
-    let mut has_wait = false;
-    // Wildcard compares (`casez`/`casex`) lower to masked equalities that
-    // are exact only on an x-free selector; the x-plane executor does not
-    // get such streams (a z selector bit is a wildcard there, not an x).
-    let mut has_wild_case = false;
-    // `===` lowers to the same `Eq`/`EqC` as `==` (they agree on x-free
-    // operands); only the x-plane executor would tell them apart, so a
-    // stream with a case equality stays off it.
-    let mut has_case_eq = false;
-    let mut wait_regs: Vec<(u32, Box<[(u16, u32, bool)]>)> = Vec::new();
-    let mut skip_next = false;
-    // Resume points are moved back onto the hazard saves that follow the
-    // wait (a branch landing there runs the saves too, which is harmless).
-    let mut wait_resume_fix: Vec<(u32, u32)> = Vec::new();
-    // Constant value per register (from LoadConst), for folding const-index
-    // array writes into static element stores. Cleared on any redefinition.
-    let mut rc: Vec<Option<u64>> = vec![None; cb.num_regs as usize];
-    // §6.11.1 signedness per register. Registers stay unsigned bit patterns;
-    // the flag only decides (a) which relational compares are signed and
-    // (b) where an implicit widening would have to sign-extend — `mn!`
-    // (maybe negative) gates those, so a signed register whose value is a
-    // known non-negative constant keeps lowering exactly as before.
-    let mut sg: Vec<bool> = vec![false; cb.num_regs as usize];
-    macro_rules! mn {
-        ($r:expr) => {{
-            let r = $r as usize;
-            sg[r]
-                && !matches!((rc[r], rw[r]), (Some(v), Some(w)) if w == 0 || (v >> (w - 1)) & 1 == 0)
-        }};
-    }
-    // Once a side-effecting op is emitted, ABORTABLE ops (dynamic element
-    // reads) can no longer be admitted: an abort must leave no trace.
-    let mut side_effects = false;
-    // Staged with a skip flag: a read of a signal this block has ALREADY
-    // STORED (blocking) this evaluation is clean by construction and needs
-    // no prefilter entry — but only for STRAIGHT-LINE blocks (a store inside
-    // a branch may not execute), so the skip is applied after `has_ctrl` is
-    // known. Wide loads BEFORE any side effect are covered by the exec-time
-    // abort instead of the prefilter.
-    let mut reads_whole: Vec<(u32, bool)> = Vec::new();
-    let mut reads_slice: Vec<(u32, u16, u16, bool)> = Vec::new();
-    let mut reads_wide: Vec<(u32, bool)> = Vec::new();
-    let mut stored: Vec<u32> = Vec::new();
-    // idx_map[i] = lowered index of the first lowered insn at-or-after
-    // 4-state index i (dropped insns map to their successor). Branch targets
-    // are rewritten through it in a fixup pass.
-    let mut idx_map: Vec<u32> = Vec::with_capacity(n + 1);
-    // ≤64-bit signals are checked whole (one raw_bits each) regardless of
-    // which part is read; only WIDE signals get slice entries.
-    // A block reading many signals (an unrolled reduction reads one per
-    // trip) looks them up through an index instead of a linear scan; the
-    // list only ever grows, so the index covers a prefix of it.
-    let mut rw_index: HashMap<u32, usize> = HashMap::default();
-    let mut note_read = |sig: usize,
-                         lo: u32,
-                         w: u32,
-                         narrow: bool,
-                         skip: bool,
-                         rw_: &mut Vec<(u32, bool)>,
-                         rs_: &mut Vec<(u32, u16, u16, bool)>| {
-        if narrow {
-            let s32 = sig as u32;
-            let hit = if rw_.len() < 16 {
-                rw_.iter().position(|(x, _)| *x == s32)
-            } else {
-                for (i, &(x, _)) in rw_.iter().enumerate().skip(rw_index.len()) {
-                    rw_index.entry(x).or_insert(i);
-                }
-                rw_index.get(&s32).copied()
-            };
-            match hit {
-                Some(i) => rw_[i].1 &= skip,
-                None => rw_.push((s32, skip)),
-            }
-        } else {
-            let t = (sig as u32, lo as u16, w as u16);
-            if let Some(e) = rs_.iter_mut().find(|(a, b, c, _)| (*a, *b, *c) == t) {
-                e.3 &= skip;
-            } else {
-                rs_.push((t.0, t.1, t.2, skip));
-            }
-        }
-    };
-    // Whole-value loads need the value in one u64; selects only need the
-    // addressed slice, so they accept ANY signal width (the exec reads the
-    // slice via raw_bits_slice).
-    let sig_ok = |sig: usize| -> bool {
-        sig < signal_widths.len() && signal_widths[sig] <= 64 && !signal_real[sig]
-    };
-    let sig_ok_slice = |sig: usize| -> bool { sig < signal_widths.len() && !signal_real[sig] };
-    let sig_ok_wide = |sig: usize| -> bool {
-        sig < signal_widths.len()
-            && signal_widths[sig] > 64
-            && signal_widths[sig] <= 512
-            && !signal_real[sig]
-    };
-    // Static array span: (first_id, lo, hi) with elements proven narrow,
-    // unsigned, non-real (elements of one array share their declaration;
-    // the first element's metadata stands for all).
-    let array_span = |a: &ArrayOperand| -> Option<(usize, i64, i64)> {
-        let (first, lo, hi) = match a {
-            ArrayOperand::Dense {
-                first_id, lo, hi, ..
-            } => (*first_id, *lo, *hi),
-            ArrayOperand::Named(name) => {
-                let &(first, lo, hi) = array_first_id.get(name.as_str())?;
-                (first, lo, hi)
-            }
-        };
-        if hi < lo {
-            return None;
-        }
-        if first >= signal_widths.len()
-            || signal_widths[first] > 64
-            || signal_signed[first]
-            || signal_real[first]
-        {
-            return None;
-        }
-        Some((first, lo, hi))
-    };
-    let clean_const = |k: &Value| -> Option<u64> {
-        if k.width > 64 || k.is_real || k.is_fill {
-            return None;
-        }
-        let (v, x) = k.raw_bits();
-        if x != 0 {
-            return None;
-        }
-        let v = v & ts_mask(k.width);
-        // Bare decimal literals are SIGNED (§5.7.1), so rejecting every
-        // signed constant kept `x + 1`, `x >> 3` and `x == 5` — most of the
-        // RTL ever written — out of the islands. A NON-NEGATIVE signed
-        // constant is admissible: zero- and sign-extension agree on it, and
-        // every lowered register is unsigned by construction, so no
-        // operation's signedness can flip (§5.5.1). A negative one still
-        // bails, since its widening differs.
-        if k.is_signed && k.width > 0 && (v >> (k.width - 1)) & 1 == 1 {
-            return None;
-        }
-        Some(v)
-    };
-    // Stream-order width tracking is EXACT wherever a register's read is
-    // reached by exactly ONE of its definitions. Bailing on every
-    // differing-width redefinition threw away the `case` shape, where each
-    // arm reuses the same temp slot at its own width and every use stays
-    // inside its own arm: on the C906 SoC that single rule was the first
-    // blocker for 58% of the remaining interpreter-bound evaluations.
-    // Instead, allow the redefinition and reject only a read that a BRANCH
-    // TARGET separates from its stream-order definition -- the one place a
-    // second definition could reach it. `tcount[i]` counts branch targets at
-    // indices <= i, so "no target in between" is one integer compare.
-    let n_ins = insns.len();
-    let mut tgts: Vec<u32> = Vec::new();
-    for insn in insns.iter() {
-        match insn {
-            Insn::BranchIfFalse(_, t)
-            | Insn::BranchUnlessZero(_, t)
-            | Insn::BranchIfSignalFalse(_, t, _)
-            | Insn::CmpBranch(_, _, _, _, t)
-            | Insn::CmpBranchConst(_, _, _, _, t)
-            | Insn::Jump(t) => tgts.push(*t),
-            Insn::CaseJump(_, cj) => {
-                tgts.extend(cj.table.iter().copied());
-                tgts.push(cj.default);
-            }
-            Insn::CaseMaskJump(_, mj) => {
-                tgts.extend(mj.table.iter().copied());
-                tgts.push(mj.xz_path);
-            }
-            _ => {}
-        }
-    }
-    let mut is_tgt = vec![false; n_ins + 1];
-    for t in tgts {
-        if (t as usize) <= n_ins {
-            is_tgt[t as usize] = true;
-        }
-    }
-    let mut tcount = vec![0u32; n_ins + 1];
-    let mut tc_run = 0u32;
-    for i in 0..=n_ins {
-        if is_tgt[i] {
-            tc_run += 1;
-        }
-        tcount[i] = tc_run;
-    }
-    // A back edge can re-enter an earlier read from a LATER definition, which
-    // the forward-only reasoning above does not model.
-    let back_branch = BytecodeCompiler::has_backward_branch(insns);
-    // See `ts_raw_hazard`: a block that reads a signal it later overwrites
-    // cannot be re-run by the interpreter after a partial two-state run, and
-    // every bail is such a re-run.
-    // A hazardous ≤64-bit signal is saved at the top of the stream and
-    // restored by the executor on a bail, so the re-run starts from the
-    // values the block saw (`failures++` in a check's failing branch, with
-    // an x read later in the block, counted twice before this).
-    let hazards = match ts_raw_hazard(insns, array_first_id) {
-        Ok(h) => h,
-        Err(()) => {
-            if std::env::var_os("XEZIM_TS_DBG").is_some() {
-                TS_BAIL_AT.with(|c| c.set((usize::MAX, "RawHazard")));
-            }
-            return None;
-        }
-    };
-    for &sig in &hazards {
-        let sg = sig as usize;
-        if sg >= signal_widths.len()
-            || signal_widths[sg] > 512
-            || signal_widths[sg] == 0
-            || signal_real[sg]
-        {
-            if std::env::var_os("XEZIM_TS_DBG").is_some() {
-                TS_BAIL_AT.with(|c| c.set((usize::MAX, "RawHazard")));
-                TS_GATE_WHY.with(|c| c.set("raw hazard on a >512b/real signal"));
-            }
-            return None;
-        }
-        // A wide read-modify-write (`bus = {bus[..], ..}` on a >64-bit bus)
-        // saves the whole value: cheaper than the interpreter these blocks
-        // ran on, and it was 32% of a C910 SoC's interpreted evaluations.
-        out.push(if signal_widths[sg] > 64 {
-            TsInsn::SaveSigW { sig }
-        } else {
-            TsInsn::SaveSig { sig }
-        });
-    }
-    let mut wconf: Vec<bool> = vec![false; cb.num_regs as usize];
-    let mut wconf_list: Vec<RegId> = Vec::new();
-    let mut def_tc: Vec<u32> = vec![0; cb.num_regs as usize];
-    // Mirror of the loop index, readable from `def!` (a `for` pattern binding
-    // is not, due to macro hygiene).
-    let mut cur_i: usize;
-    // Registers holding a folded 4-state constant: (value plane, xz plane).
-    // These registers are NEVER materialized in the u64 file, so any reader
-    // outside the fold set would see an unwritten slot -- the guard at the
-    // top of the loop rejects the block instead.
-    let mut xc: Vec<Option<(u64, u64)>> = vec![None; cb.num_regs as usize];
-    let mut xc_live: Vec<RegId> = Vec::new();
-    // A `{N{bit}}` replicate wider than the register banks is not
-    // materialised: the register only remembers the bit, `rw` stays None so
-    // every ordinary consumer bails, and the store arms turn it into a fill.
-    let mut wfill: Vec<Option<u8>> = vec![None; cb.num_regs as usize];
-    // `{N{1'bx}}` wider than the banks, the x/z twin of `wfill`: the register
-    // remembers (value bit, x bit); only a blocking store may consume it.
-    let mut xfill: Vec<Option<(u8, u8)>> = vec![None; cb.num_regs as usize];
-    macro_rules! def {
-        ($rw:ident, $r:expr, $w:expr) => {{
-            let r = $r as usize;
-            let w = $w;
-            if w > max_wide {
-                max_wide = w;
-            }
-            sg[r] = false;
-            wfill[r] = None;
-            xfill[r] = None;
-            match $rw[r] {
-                Some(prev) if prev != w => {
-                    if !wconf[r] {
-                        wconf[r] = true;
-                        wconf_list.push(r as RegId);
-                    }
-                    $rw[r] = Some(w);
-                }
-                _ => $rw[r] = Some(w),
-            }
-            def_tc[r] = tcount[cur_i];
-            rc[r] = None;
-            xc[r] = None;
-        }};
-    }
-    // Tracking costs one thread-local store per instruction, so it is armed
-    // only when the dump is requested.
-    static TRACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let track = *TRACK.get_or_init(|| std::env::var("XEZIM_TS_DBG").is_ok());
-    // Runtime opcode bisection: XEZIM_TS_DENY=CaseJump,RedOr,... makes any
-    // block containing a listed 4-state opcode bail back to the interpreter,
-    // so a suspected two-state miscompile can be isolated without rebuilding.
-    static DENY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let deny = DENY.get_or_init(|| {
-        std::env::var("XEZIM_TS_DENY")
-            .map(|v| {
-                v.split(',')
-                    .map(|x| x.trim().to_string())
-                    .filter(|x| !x.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default()
-    });
-    // Names the exact condition that rejected an instruction, for arms with
-    // more than one gate. Costs nothing unless the dump is armed.
-    // A register wider than 64 bits lives in the WIDE plane file, so any
-    // TsInsn that reads `regs[r]` must prove the register is narrow first —
-    // otherwise it reads whatever the previous evaluation left in the slot.
-    macro_rules! narrow_reg {
-        ($rw:ident, $r:expr, $why:expr) => {{
-            let w = $rw[$r as usize]?;
-            if w > 64 {
-                gate!($why);
-            }
-            w
-        }};
-    }
-    macro_rules! gate {
-        ($why:expr) => {{
-            if track {
-                TS_GATE_WHY.with(|c| c.set($why));
-            }
-            return None;
-        }};
-    }
-    let bt_map = BytecodeCompiler::branch_target_map(insns);
-    // Index of each register's LAST definition (dest or in-place), for the
-    // back-edge reset below; `usize::MAX` marks the fused pair form, which
-    // the lowering handles but this table does not model.
-    let mut last_def: Vec<usize> = vec![0; cb.num_regs as usize];
-    for (j, ins) in insns.iter().enumerate() {
-        ts_for_each_reg_def(ins, |r| {
-            if let Some(slot) = last_def.get_mut(r as usize) {
-                *slot = j;
-            }
-        });
-    }
-    let earliest_branch = ts_earliest_forward_branch(insns);
-    // Index of each register's latest definition in the forward walk, for the
-    // forward-join reset below.
-    let mut walk_def: Vec<usize> = vec![0; cb.num_regs as usize];
-    for (ins_i, insn) in insns.iter().enumerate() {
-        if track {
-            TS_BAIL_AT.with(|c| c.set((ins_i, insn_opcode_name(insn))));
-            TS_GATE_WHY.with(|c| c.set("-"));
-        }
-        if !deny.is_empty() && deny.iter().any(|d| d == insn_opcode_name(insn)) {
-            gate!("bare bail at bytecode.rs:15020");
-        }
-        cur_i = ins_i;
-        // A back edge re-enters a branch target from a LATER definition, so
-        // nothing known about a register's VALUE survives the merge: a loop
-        // counter seeded by `LoadConst(i, 0)` is not 0 on the second trip,
-        // and an element read indexed by it must not become a constant
-        // element read. Widths are guarded by the phi rule below.
-        // Only a register DEFINED at or after the target can arrive here
-        // with a value the forward walk did not see; a constant set before
-        // the loop and never touched inside it stays known (clearing every
-        // register cost a c906 SoC 0.8% in lost constant-index folds).
-        if back_branch && is_tgt[ins_i] {
-            for r in 0..rc.len() {
-                if last_def[r] >= ins_i {
-                    rc[r] = None;
-                    wfill[r] = None;
-                }
-            }
-        }
-        // A forward branch can skip a definition between it and its target,
-        // so a value the walk learned there is only one of the values that
-        // reach the target. The out-of-range arm of a 2-D element index
-        // (`flat = count`, see `compile_2d_flat_index`) read as a constant
-        // index here, and the store it guards was dropped as out of range.
-        if ins_i > 0 {
-            ts_for_each_reg_def(&insns[ins_i - 1], |r| {
-                if let Some(slot) = walk_def.get_mut(r as usize) {
-                    *slot = ins_i - 1;
-                }
-            });
-        }
-        if let Some(branch) = earliest_branch[ins_i] {
-            for r in 0..rc.len() {
-                if walk_def[r] > branch {
-                    rc[r] = None;
-                    wfill[r] = None;
-                }
-            }
-        }
-        if !wconf_list.is_empty() {
-            if back_branch {
-                gate!("reg width phi (back edge)");
-            }
-            let tc = tcount[cur_i];
-            if wconf_list
-                .iter()
-                .any(|&r| tc != def_tc[r as usize] && BytecodeCompiler::insn_reads_reg(insn, r))
-            {
-                gate!("reg width phi");
-            }
-        }
-        if !xc_live.is_empty()
-            && !matches!(
-                insn,
-                Insn::Replicate(..)
-                    | Insn::Move(..)
-                    | Insn::BlockingAssign(..)
-                    | Insn::BlockingAssignRange(..)
-                    | Insn::CasezEq(..)
-                    | Insn::CasexEq(..)
-            )
-            && xc_live
-                .iter()
-                .any(|&r| xc[r as usize].is_some() && BytecodeCompiler::insn_reads_reg(insn, r))
-        {
-            gate!("x-const consumed");
-        }
-        idx_map.push(out.len() as u32);
-        if skip_next {
-            // The `WaitDelayReg` consumed by the constant fold below.
-            skip_next = false;
-            continue;
-        }
-        match insn {
-            Insn::Nop => {}
-            Insn::WaitEdge(ix) => {
-                has_wait = true;
-                let resume = ins_i as u32 + 1;
-                out.push(TsInsn::WaitEdge { ix: *ix, resume });
-                wait_resume_fix.push((resume, out.len() as u32));
-                let snap: Vec<(u16, u32, bool)> = rw
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(r, w)| w.map(|w| (r as u16, w, sg[r])))
-                    .collect();
-                wait_regs.push((resume, snap.into_boxed_slice()));
-                for &sig in &hazards {
-                    out.push(TsInsn::SaveSig { sig });
-                }
-            }
-            Insn::WaitDelayReg(_) => {
-                // Only the constant-folded form (below) lowers; a dynamic
-                // delay keeps the process on the four-state VM.
-                gate!("dynamic delay wait");
-            }
-            // No-op here: every lowered register is unsigned by construction
-            // (signed sources bail below).
-            Insn::ClearSigned(r) => sg[*r as usize] = false,
-            Insn::LoadSignal(d, sig) | Insn::LoadSignalSigned(d, sig) => {
-                let sig = *sig as usize;
-                // A signed source (an `integer` loop counter, typically) is
-                // admitted narrow only, as an unsigned bit pattern tagged
-                // signed in `sg`; wide signed sources still bail.
-                let signed = signal_signed.get(sig).copied().unwrap_or(true)
-                    || matches!(insn, Insn::LoadSignalSigned(..));
-                if signed && !sig_ok(sig) {
-                    gate!("wide signed signal");
-                }
-                if sig_ok(sig) {
-                    note_read(
-                        sig,
-                        0,
-                        signal_widths[sig],
-                        true,
-                        stored.contains(&(sig as u32)),
-                        &mut reads_whole,
-                        &mut reads_slice,
-                    );
-                    def!(rw, *d, signal_widths[sig]);
-                    sg[*d as usize] = signed;
-                    out.push(TsInsn::LoadSig {
-                        d: *d as u16,
-                        sig: sig as u32,
-                    });
-                } else if sig_ok_wide(sig) {
-                    let skip = !side_effects || stored.contains(&(sig as u32));
-                    let s32 = sig as u32;
-                    if let Some(e) = reads_wide.iter_mut().find(|(x, _)| *x == s32) {
-                        e.1 &= skip;
-                    } else {
-                        reads_wide.push((s32, skip));
-                    }
-                    def!(rw, *d, signal_widths[sig]);
-                    out.push(TsInsn::WLoadSig {
-                        d: *d as u16,
-                        sig: sig as u32,
-                    });
-                } else {
-                    gate!("signal >512b");
-                }
-            }
-            Insn::LoadConst(d, k) => {
-                if k.is_real {
-                    // `LoadConst(real ticks); WaitDelayReg(d)` — the
-                    // registration's constant-delay fold — lowers to one
-                    // wait; any other real constant bails.
-                    if let Some(Insn::WaitDelayReg(r)) = insns.get(ins_i + 1) {
-                        if r == d {
-                            has_wait = true;
-                            let resume = ins_i as u32 + 2;
-                            out.push(TsInsn::WaitDelayRaw {
-                                raw: k.to_f64().to_bits(),
-                                resume,
-                            });
-                            wait_resume_fix.push((resume, out.len() as u32));
-                            let snap: Vec<(u16, u32, bool)> = rw
-                                .iter()
-                                .enumerate()
-                                .filter_map(|(r, w)| w.map(|w| (r as u16, w, sg[r])))
-                                .collect();
-                            wait_regs.push((resume, snap.into_boxed_slice()));
-                            for &sig in &hazards {
-                                out.push(TsInsn::SaveSig { sig });
-                            }
-                            skip_next = true;
-                            continue;
-                        }
-                    }
-                    gate!("real constant");
-                }
-                if k.width > 64 {
-                    if k.width > 512 || k.is_signed {
-                        gate!("bare bail at bytecode.rs:15157");
-                    }
-                    let mut wv = vec![0u64; (k.width as usize).div_ceil(64)];
-                    if !k.words_if_clean(&mut wv) {
-                        gate!("bare bail at bytecode.rs:15161");
-                    }
-                    def!(rw, *d, k.width);
-                    out.push(TsInsn::WConst {
-                        d: *d as u16,
-                        v: wv.into_boxed_slice(),
-                    });
-                } else if k.is_fill && !k.has_xz() {
-                    // `'0` / `'1`: a fill takes the width of its consumer, so
-                    // it rides the same fill-register path as `{N{bit}}` —
-                    // the stores emit a range fill, and any other use bails.
-                    let (v, _) = k.raw_bits();
-                    def!(rw, *d, 1);
-                    rw[*d as usize] = None;
-                    wfill[*d as usize] = Some((v & 1) as u8);
-                } else if k.has_xz() {
-                    // Fold rather than reject: admitted only while it stays
-                    // a constant all the way to a store (see the loop guard).
-                    if k.is_signed || k.is_real || k.is_fill {
-                        gate!("x-const signed/real");
-                    }
-                    let Some((v, x)) = k.inline_bits() else {
-                        gate!("x-const not inline");
-                    };
-                    def!(rw, *d, k.width);
-                    let m = ts_mask(k.width);
-                    xc[*d as usize] = Some((v & m, x & m));
-                    xc_live.push(*d);
-                } else {
-                    let v = clean_const(k)?;
-                    def!(rw, *d, k.width);
-                    rc[*d as usize] = Some(v);
-                    sg[*d as usize] = k.is_signed;
-                    out.push(TsInsn::Const { d: *d as u16, v });
-                }
-            }
-            Insn::LoadSignalBit(d, sig, idx) => {
-                let sig = *sig as usize;
-                if !sig_ok_slice(sig) || *idx >= signal_widths[sig] || *idx > u16::MAX as u32 {
-                    gate!("bare bail at bytecode.rs:15197");
-                }
-                let narrow = signal_widths[sig] <= 64;
-                note_read(
-                    sig,
-                    *idx,
-                    1,
-                    narrow,
-                    stored.contains(&(sig as u32)),
-                    &mut reads_whole,
-                    &mut reads_slice,
-                );
-                def!(rw, *d, 1);
-                out.push(if narrow {
-                    TsInsn::SigBit {
-                        d: *d as u16,
-                        sig: sig as u32,
-                        bit: *idx as u16,
-                    }
-                } else {
-                    TsInsn::SigBitW {
-                        d: *d as u16,
-                        sig: sig as u32,
-                        bit: *idx as u16,
-                    }
-                });
-            }
-            Insn::LoadSignalRange(d, sig, l, r) => {
-                let sig = *sig as usize;
-                let (hi, lo) = (*l.max(r), *l.min(r));
-                if !sig_ok_slice(sig) || hi >= signal_widths[sig] || hi > u16::MAX as u32 {
-                    gate!("bare bail at bytecode.rs:15212");
-                }
-                let w = hi - lo + 1;
-                if w > 64 {
-                    if w > 512 {
-                        gate!("bare bail at bytecode.rs:15217");
-                    }
-                    // Wide slice of a signal, noted as ≤64-bit chunks.
-                    let mut off = 0;
-                    while off < w {
-                        let cw = (w - off).min(64);
-                        note_read(
-                            sig,
-                            lo + off,
-                            cw,
-                            false,
-                            stored.contains(&(sig as u32)),
-                            &mut reads_whole,
-                            &mut reads_slice,
-                        );
-                        off += 64;
-                    }
-                    def!(rw, *d, w);
-                    out.push(TsInsn::WSigRange {
-                        d: *d as u16,
-                        sig: sig as u32,
-                        lo: lo as u16,
-                        w: w as u16,
-                    });
-                    continue;
-                }
-                let narrow = signal_widths[sig] <= 64;
-                note_read(
-                    sig,
-                    lo,
-                    w,
-                    narrow,
-                    stored.contains(&(sig as u32)),
-                    &mut reads_whole,
-                    &mut reads_slice,
-                );
-                def!(rw, *d, w);
-                out.push(if narrow {
-                    TsInsn::SigRange {
-                        d: *d as u16,
-                        sig: sig as u32,
-                        lo: lo as u16,
-                        mask: ts_mask(w),
-                    }
-                } else {
-                    TsInsn::SigRangeW {
-                        d: *d as u16,
-                        sig: sig as u32,
-                        lo: lo as u16,
-                        w: w as u16,
-                        mask: ts_mask(w),
-                    }
-                });
-            }
-            Insn::BitSelect(d, base, idx) => {
-                let wb = narrow_reg!(rw, *base, "wide operand (bitsel)");
-                narrow_reg!(rw, *idx, "wide bit index");
-                def!(rw, *d, 1);
-                out.push(TsInsn::BitDyn {
-                    d: *d as u16,
-                    s: *base as u16,
-                    i: *idx as u16,
-                    w: wb,
-                });
-            }
-            Insn::BitSelectConst(d, s, idx) => {
-                let sw = rw[*s as usize]?;
-                if *idx >= sw || *idx > 511 {
-                    gate!("bare bail at bytecode.rs:15264");
-                }
-                def!(rw, *d, 1);
-                out.push(if sw > 64 {
-                    TsInsn::BitFromW {
-                        d: *d as u16,
-                        s: *s as u16,
-                        bit: *idx as u16,
-                    }
-                } else {
-                    TsInsn::Bit {
-                        d: *d as u16,
-                        s: *s as u16,
-                        bit: *idx as u8,
-                    }
-                });
-            }
-            Insn::RangeSelectConst(d, s, l, r) => {
-                let sw = rw[*s as usize]?;
-                let (hi, lo) = (*l.max(r), *l.min(r));
-                if hi >= sw || hi > 511 {
-                    gate!("bare bail at bytecode.rs:15277");
-                }
-                let w = hi - lo + 1;
-                def!(rw, *d, w);
-                out.push(if sw > 64 {
-                    if w > 64 {
-                        TsInsn::WRange {
-                            d: *d as u16,
-                            s: *s as u16,
-                            lo: lo as u16,
-                            w: w as u16,
-                        }
-                    } else {
-                        TsInsn::RangeFromW {
-                            d: *d as u16,
-                            s: *s as u16,
-                            lo: lo as u16,
-                            mask: ts_mask(w),
-                        }
-                    }
-                } else {
-                    TsInsn::Range {
-                        d: *d as u16,
-                        s: *s as u16,
-                        lo: lo as u8,
-                        mask: ts_mask(w),
-                    }
-                });
-            }
-            // A plain register copy. Lowered as `d = s | s`, which is exact
-            // (`x | x == x`) and needs no new opcode or executor arm — the
-            // wide bank has the same identity. Worth an arm at all because
-            // the TS bail census measured `Move` gating 43.8M interpreter
-            // evaluations on the C906 SoC (14.1% of all of them): the block
-            // was not doing anything two-state could not express, it just
-            // had no lowering.
-            Insn::Move(d, s) => {
-                if let Some(f) = xfill[*s as usize] {
-                    def!(rw, *d, 1);
-                    rw[*d as usize] = None;
-                    xfill[*d as usize] = Some(f);
-                    continue;
-                }
-                if let Some(bit) = wfill[*s as usize] {
-                    def!(rw, *d, 1);
-                    rw[*d as usize] = None;
-                    wfill[*d as usize] = Some(bit);
-                    continue;
-                }
-                let Some(w) = rw[*s as usize] else {
-                    gate!("move source width unknown");
-                };
-                if let Some(k) = xc[*s as usize] {
-                    def!(rw, *d, w);
-                    xc[*d as usize] = Some(k);
-                    xc_live.push(*d);
-                    continue;
-                }
-                def!(rw, *d, w);
-                sg[*d as usize] = sg[*s as usize];
-                rc[*d as usize] = rc[*s as usize];
-                let (d, s) = (*d as u16, *s as u16);
-                out.push(if w > 64 {
-                    TsInsn::WOr { d, a: s, b: s }
-                } else {
-                    TsInsn::Or { d, a: s, b: s }
-                });
-            }
-            // §11.4.11 conditional. The TS bail census measured `Select`
-            // gating 57.8M interpreter evaluations (18.6%) — muxes are
-            // everywhere in RTL and nothing about them resists two-state.
-            // Both branches must share a width: the 4-state arm yields the
-            // CHOSEN branch's own width, and a downstream `Not`/`Range` masks
-            // by the register width, so adopting the max would change those
-            // results. Unequal branches bail (conservative, still covers the
-            // ordinary same-width mux).
-            Insn::Select(d, c, a, b) => {
-                let (wc, wa, wb) = (rw[*c as usize]?, rw[*a as usize]?, rw[*b as usize]?);
-                if wa != wb {
-                    gate!("select branch widths differ");
-                }
-                if wc > 64 {
-                    gate!("wide select condition");
-                }
-                if wa > 512 {
-                    gate!("select >512b");
-                }
-                def!(rw, *d, wa);
-                sg[*d as usize] = sg[*a as usize] && sg[*b as usize];
-                let (d, c, a, b) = (*d as u16, *c as u16, *a as u16, *b as u16);
-                out.push(if wa > 64 {
-                    TsInsn::WSel { d, c, a, b }
-                } else {
-                    TsInsn::Sel {
-                        d,
-                        c,
-                        a,
-                        b,
-                        m: ts_mask(wa),
-                    }
-                });
-            }
-            Insn::BitXor(d, a, b) | Insn::BitAnd(d, a, b) | Insn::BitOr(d, a, b) => {
-                let (wa, wb) = (rw[*a as usize]?, rw[*b as usize]?);
-                let (aw, bw) = (wa > 64, wb > 64);
-                if aw != bw {
-                    // Mixed-bank operands — bail rather than model the
-                    // zero-extension across banks.
-                    gate!("mixed-width bitop");
-                }
-                let both_sg = sg[*a as usize] && sg[*b as usize];
-                if both_sg && wa != wb && (if wa < wb { mn!(*a) } else { mn!(*b) }) {
-                    gate!("signed widening (bitop)");
-                }
-                def!(rw, *d, wa.max(wb));
-                sg[*d as usize] = both_sg;
-                let (d, a, b) = (*d as u16, *a as u16, *b as u16);
-                out.push(if aw {
-                    match insn {
-                        Insn::BitXor(..) => TsInsn::WXor { d, a, b },
-                        Insn::BitAnd(..) => TsInsn::WAnd { d, a, b },
-                        _ => TsInsn::WOr { d, a, b },
-                    }
-                } else {
-                    match insn {
-                        Insn::BitXor(..) => TsInsn::Xor { d, a, b },
-                        Insn::BitAnd(..) => TsInsn::And { d, a, b },
-                        _ => TsInsn::Or { d, a, b },
-                    }
-                });
-            }
-            Insn::BitNot(d, s) => {
-                let w = rw[*s as usize]?;
-                let s_sg = sg[*s as usize];
-                def!(rw, *d, w);
-                sg[*d as usize] = s_sg;
-                out.push(if w > 64 {
-                    if w > 512 {
-                        gate!("bare bail at bytecode.rs:15409");
-                    }
-                    TsInsn::WNot {
-                        d: *d as u16,
-                        s: *s as u16,
-                        w: w as u16,
-                    }
-                } else {
-                    TsInsn::Not {
-                        d: *d as u16,
-                        s: *s as u16,
-                        mask: ts_mask(w),
-                    }
-                });
-            }
-            // Wrapping at max operand width; zero-extension is the correct
-            // §11.8.1 widening because both registers are unsigned.
-            Insn::Add(d, a, b) | Insn::Sub(d, a, b) => {
-                let (wa, wb) = (
-                    narrow_reg!(rw, *a, "wide operand (add/sub)"),
-                    narrow_reg!(rw, *b, "wide operand (add/sub)"),
-                );
-                let w = wa.max(wb);
-                let both_sg = sg[*a as usize] && sg[*b as usize];
-                if both_sg && wa != wb && (if wa < wb { mn!(*a) } else { mn!(*b) }) {
-                    gate!("signed widening (add/sub)");
-                }
-                def!(rw, *d, w);
-                sg[*d as usize] = both_sg;
-                let (d, a, b) = (*d as u16, *a as u16, *b as u16);
-                out.push(if matches!(insn, Insn::Add(..)) {
-                    TsInsn::Add {
-                        d,
-                        a,
-                        b,
-                        mask: ts_mask(w),
-                    }
-                } else {
-                    TsInsn::Sub {
-                        d,
-                        a,
-                        b,
-                        mask: ts_mask(w),
-                    }
-                });
-            }
-            // §11.4.10 logical shifts. Result width = LEFT operand width.
-            // AShr is excluded: every lowered register is unsigned, so an
-            // arithmetic shift would need sign tracking the bank lacks.
-            Insn::Shl(d, a, b) | Insn::Shr(d, a, b) => {
-                let wa = narrow_reg!(rw, *a, "wide operand (shift)");
-                narrow_reg!(rw, *b, "wide shift amount");
-                let a_sg = sg[*a as usize];
-                def!(rw, *d, wa);
-                sg[*d as usize] = a_sg;
-                let (d, a, b) = (*d as u16, *a as u16, *b as u16);
-                out.push(if matches!(insn, Insn::Shl(..)) {
-                    TsInsn::Shl {
-                        d,
-                        a,
-                        b,
-                        w: wa,
-                        mask: ts_mask(wa),
-                    }
-                } else {
-                    TsInsn::Shr { d, a, b, w: wa }
-                });
-            }
-            // 4-state table semantics (x/z selector -> default) cannot lower
-            // to the 2-state pipeline. `CaseJump` is the exception and is
-            // handled below, as is `CaseMaskJump`: the eval-site prefilter
-            // proves every signal the block reads is X-free, so their selectors
-            // cannot carry x/z and the "no pattern matches -> default" /
-            // wildcard-chain branches are unreachable, leaving a plain
-            // bounds-checked table index.
-            Insn::CaseLut(..) => return None,
-            Insn::Format(..) => return None,
-            Insn::StrOp(..) => return None,
-            Insn::BlockingAssignString(..) => return None,
-            // 1-bit results. CaseEq/CaseNeq equal Eq/Neq on X-free values.
-            Insn::CasezEq(d, a, b) | Insn::CasexEq(d, a, b) => {
-                has_wild_case = true;
-                let sw = narrow_reg!(rw, *a, "wide operand (casez)");
-                let Some(pw) = rw[*b as usize] else {
-                    gate!("casez pattern width unknown");
-                };
-                if pw > 64 {
-                    gate!("wide operand (casez)");
-                }
-                let casex = matches!(insn, Insn::CasexEq(..));
-                let (pv, px) = if let Some((v, x)) = xc[*b as usize] {
-                    (v, x)
-                } else if let Some(v) = rc[*b as usize] {
-                    (v, 0u64)
-                } else {
-                    gate!("casez pattern not const");
-                };
-                let m = ts_mask(sw.max(pw));
-                // Z (val=1,xz=1) is the wildcard for casez; casex also
-                // treats X (val=0,xz=1) as one. A literal X in a casez
-                // pattern never equals a clean selector bit.
-                let wild = if casex { px } else { px & pv };
-                let (d, a) = (*d as u16, *a as u16);
-                def!(rw, d, 1);
-                if !casex && (px & !pv) != 0 {
-                    rc[d as usize] = Some(0);
-                    out.push(TsInsn::Const { d, v: 0 });
-                } else {
-                    let mask = m & !wild;
-                    out.push(TsInsn::MaskEq {
-                        d,
-                        s: a,
-                        mask,
-                        v: pv & mask,
-                    });
-                }
-            }
-            Insn::Eq(d, a, b) | Insn::CaseEq(d, a, b) => {
-                if matches!(insn, Insn::CaseEq(..)) {
-                    has_case_eq = true;
-                }
-                let wa = narrow_reg!(rw, *a, "wide operand (eq)");
-                let wb = narrow_reg!(rw, *b, "wide operand (eq)");
-                if sg[*a as usize]
-                    && sg[*b as usize]
-                    && wa != wb
-                    && (if wa < wb { mn!(*a) } else { mn!(*b) })
-                {
-                    gate!("signed widening (eq)");
-                }
-                def!(rw, *d, 1);
-                out.push(TsInsn::Eq {
-                    d: *d as u16,
-                    a: *a as u16,
-                    b: *b as u16,
-                });
-            }
-            Insn::Neq(d, a, b) => {
-                let wa = narrow_reg!(rw, *a, "wide operand (neq)");
-                let wb = narrow_reg!(rw, *b, "wide operand (neq)");
-                if sg[*a as usize]
-                    && sg[*b as usize]
-                    && wa != wb
-                    && (if wa < wb { mn!(*a) } else { mn!(*b) })
-                {
-                    gate!("signed widening (neq)");
-                }
-                def!(rw, *d, 1);
-                out.push(TsInsn::Neq {
-                    d: *d as u16,
-                    a: *a as u16,
-                    b: *b as u16,
-                });
-            }
-            // §5.5.1: unsigned compare when either operand is unsigned —
-            // always here, since every lowered register is unsigned.
-            Insn::Lt(d, a, b) | Insn::Leq(d, a, b) | Insn::Gt(d, a, b) | Insn::Geq(d, a, b) => {
-                let wa = narrow_reg!(rw, *a, "wide operand (cmp)");
-                let wb = narrow_reg!(rw, *b, "wide operand (cmp)");
-                let both_sg = sg[*a as usize] && sg[*b as usize];
-                def!(rw, *d, 1);
-                let (d, a, b) = (*d as u16, *a as u16, *b as u16);
-                if both_sg {
-                    let kind = match insn {
-                        Insn::Lt(..) => 0,
-                        Insn::Leq(..) => 1,
-                        Insn::Gt(..) => 2,
-                        _ => 3,
-                    };
-                    out.push(TsInsn::CmpS {
-                        d,
-                        a,
-                        b,
-                        kind,
-                        sa: (64 - wa) as u8,
-                        sb: (64 - wb) as u8,
-                    });
-                    continue;
-                }
-                out.push(match insn {
-                    Insn::Lt(..) => TsInsn::Lt { d, a, b },
-                    Insn::Leq(..) => TsInsn::Leq { d, a, b },
-                    Insn::Gt(..) => TsInsn::Gt { d, a, b },
-                    _ => TsInsn::Geq { d, a, b },
-                });
-            }
-            Insn::LogNot(d, s) => {
-                narrow_reg!(rw, *s, "wide operand (lognot)");
-                def!(rw, *d, 1);
-                out.push(TsInsn::LogNot {
-                    d: *d as u16,
-                    s: *s as u16,
-                });
-            }
-            Insn::LogAnd(d, a, b) | Insn::LogOr(d, a, b) => {
-                narrow_reg!(rw, *a, "wide operand (logic)");
-                narrow_reg!(rw, *b, "wide operand (logic)");
-                def!(rw, *d, 1);
-                let (d, a, b) = (*d as u16, *a as u16, *b as u16);
-                out.push(if matches!(insn, Insn::LogAnd(..)) {
-                    TsInsn::LogAnd { d, a, b }
-                } else {
-                    TsInsn::LogOr { d, a, b }
-                });
-            }
-            Insn::BinOpConstAdd2(a) => {
-                if mn!(a.s1) || mn!(a.s2) {
-                    gate!("signed operand (addc2)");
-                }
-                // Exactly the two `AddC` lowerings the pair had before
-                // merging — in order, so a chained `s2 == d1` sees d1's
-                // freshly defined width.
-                let w1 = narrow_reg!(rw, a.s1, "wide operand (addc2)");
-                let v1 = clean_const(&a.k1)?;
-                let wr1 = w1.max(a.k1.width);
-                def!(rw, a.d1, wr1);
-                out.push(TsInsn::AddC {
-                    d: a.d1 as u16,
-                    s: a.s1 as u16,
-                    k: v1,
-                    mask: ts_mask(wr1),
-                });
-                let w2 = narrow_reg!(rw, a.s2, "wide operand (addc2)");
-                let v2 = clean_const(&a.k2)?;
-                let wr2 = w2.max(a.k2.width);
-                def!(rw, a.d2, wr2);
-                out.push(TsInsn::AddC {
-                    d: a.d2 as u16,
-                    s: a.s2 as u16,
-                    k: v2,
-                    mask: ts_mask(wr2),
-                });
-            }
-            Insn::BinOpConst(d, s, k, kind) | Insn::CmpBranchConst(kind, s, k, d, _) => {
-                if matches!(insn, Insn::CmpBranchConst(..))
-                    && !matches!(kind, BinOpConstKind::Eq | BinOpConstKind::CaseEq)
-                {
-                    gate!("unsupported constant comparison");
-                }
-                let w = narrow_reg!(rw, *s, "wide operand (binop-const)");
-                let v = clean_const(k)?;
-                let both_sg = sg[*s as usize] && k.is_signed;
-                if both_sg && w < k.width && mn!(*s) {
-                    gate!("signed widening (binop-const)");
-                }
-                match kind {
-                    BinOpConstKind::Xor => {
-                        def!(rw, *d, w.max(k.width));
-                        sg[*d as usize] = both_sg;
-                        out.push(TsInsn::XorC {
-                            d: *d as u16,
-                            s: *s as u16,
-                            k: v,
-                        });
-                    }
-                    BinOpConstKind::Eq | BinOpConstKind::CaseEq => {
-                        if matches!(kind, BinOpConstKind::CaseEq) {
-                            has_case_eq = true;
-                        }
-                        def!(rw, *d, 1);
-                        out.push(TsInsn::EqC {
-                            d: *d as u16,
-                            s: *s as u16,
-                            k: v,
-                        });
-                    }
-                    BinOpConstKind::Add => {
-                        let wr = w.max(k.width);
-                        def!(rw, *d, wr);
-                        sg[*d as usize] = both_sg;
-                        out.push(TsInsn::AddC {
-                            d: *d as u16,
-                            s: *s as u16,
-                            k: v,
-                            mask: ts_mask(wr),
-                        });
-                    }
-                    // No constant-operand two-state form for these. The
-                    // constant is materialised in the DESTINATION register,
-                    // which this instruction defines anyway, and the
-                    // register form follows; `d == s` would clobber the
-                    // source first.
-                    BinOpConstKind::And
-                    | BinOpConstKind::Or
-                    | BinOpConstKind::Mul
-                    | BinOpConstKind::Sub => {
-                        if d == s {
-                            gate!("in-place binop-const");
-                        }
-                        if k.width > 64 {
-                            gate!("bare bail at bytecode.rs:15625");
-                        }
-                        let wr = w.max(k.width);
-                        def!(rw, *d, wr);
-                        sg[*d as usize] = both_sg;
-                        let (d, s) = (*d as u16, *s as u16);
-                        out.push(TsInsn::Const { d, v });
-                        out.push(match kind {
-                            BinOpConstKind::And => TsInsn::And { d, a: s, b: d },
-                            BinOpConstKind::Or => TsInsn::Or { d, a: s, b: d },
-                            BinOpConstKind::Sub => TsInsn::Sub {
-                                d,
-                                a: s,
-                                b: d,
-                                mask: ts_mask(wr),
-                            },
-                            _ => TsInsn::Mul {
-                                d,
-                                a: s,
-                                b: d,
-                                mask: ts_mask(wr),
-                            },
-                        });
-                    }
-                }
-                if let Insn::CmpBranchConst(_, _, _, _, t) = insn {
-                    out.push(TsInsn::BrFalse { s: *d, t: *t });
-                }
-            }
-            Insn::Concat(d, parts) => {
-                let mut total = 0u32;
-                let mut any_wide = false;
-                let mut lowered: Vec<(u16, u16, bool)> = Vec::with_capacity(parts.len());
-                for &p in parts.iter() {
-                    let Some(w) = rw[p as usize] else {
-                        gate!("concat part width unknown");
-                    };
-                    if w > 512 {
-                        gate!("concat part >512b");
-                    }
-                    total += w;
-                    if w > 64 {
-                        any_wide = true;
-                    }
-                    lowered.push((p as u16, w as u16, w > 64));
-                }
-                if total == 0 || total > 512 {
-                    gate!("concat total >512b");
-                }
-                def!(rw, *d, total);
-                out.push(if total > 64 || any_wide {
-                    TsInsn::WConcat {
-                        d: *d as u16,
-                        parts: lowered.into_boxed_slice(),
-                    }
-                } else if lowered.len() == 2 {
-                    // Narrow forms: every part is ≤ 64 bits here.
-                    TsInsn::Concat2 {
-                        d: *d as u16,
-                        a: lowered[0].0,
-                        wa: lowered[0].1 as u8,
-                        b: lowered[1].0,
-                        wb: lowered[1].1 as u8,
-                    }
-                } else if lowered.len() == 3 {
-                    TsInsn::Concat3 {
-                        d: *d as u16,
-                        a: lowered[0].0,
-                        wa: lowered[0].1 as u8,
-                        b: lowered[1].0,
-                        wb: lowered[1].1 as u8,
-                        c: lowered[2].0,
-                        wc: lowered[2].1 as u8,
-                    }
-                } else {
-                    TsInsn::Concat {
-                        d: *d as u16,
-                        parts: lowered
-                            .into_iter()
-                            .map(|(r, w, _)| (r, w as u8))
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice(),
-                    }
-                });
-            }
-            Insn::Resize(r, w) => {
-                let cur = rw[*r as usize]?;
-                if *w > 512 {
-                    gate!("bare bail at bytecode.rs:15697");
-                }
-                if *w > cur && mn!(*r) {
-                    gate!("signed widening (resize)");
-                }
-                if *w > 64 {
-                    if *w > max_wide {
-                        max_wide = *w;
-                    }
-                    if cur <= 64 {
-                        out.push(TsInsn::WFromN { r: *r as u16 });
-                    } else if *w < cur {
-                        out.push(TsInsn::WMask {
-                            d: *r as u16,
-                            w: *w as u16,
-                        });
-                    }
-                    rw[*r as usize] = Some(*w);
-                    def_tc[*r as usize] = tcount[cur_i];
-                    rc[*r as usize] = None;
-                    continue;
-                }
-                if cur > 64 {
-                    out.push(TsInsn::NFromW {
-                        r: *r as u16,
-                        mask: ts_mask(*w),
-                    });
-                    rw[*r as usize] = Some(*w);
-                    def_tc[*r as usize] = tcount[cur_i];
-                    rc[*r as usize] = None;
-                    continue;
-                }
-                if *w < cur {
-                    out.push(TsInsn::Mask {
-                        d: *r as u16,
-                        mask: ts_mask(*w),
-                    });
-                }
-                // Widening zero-extends — free for an unsigned register.
-                // Redefinition width-conflict does not apply: Resize is a
-                // width CHANGE of the same value, not a second definition.
-                // It IS the point the width now dates from, though, so the
-                // phi guard measures from here (without marking a conflict,
-                // which would newly reject blocks that lower correctly today).
-                rw[*r as usize] = Some(*w);
-                def_tc[*r as usize] = tcount[cur_i];
-                // Keep const knowledge in sync with the (possible) truncation.
-                if let Some(k) = rc[*r as usize] {
-                    rc[*r as usize] = Some(k & ts_mask(*w));
-                }
-            }
-            Insn::BranchIfSignalFalse(sig, t, bit) => {
-                let sig = *sig as usize;
-                if *bit == u32::MAX {
-                    // Whole-value truthiness needs the value in one word.
-                    if !sig_ok(sig) {
-                        gate!("bare bail at bytecode.rs:15744");
-                    }
-                    note_read(
-                        sig,
-                        0,
-                        signal_widths[sig],
-                        true,
-                        stored.contains(&(sig as u32)),
-                        &mut reads_whole,
-                        &mut reads_slice,
-                    );
-                } else {
-                    if !sig_ok_slice(sig) || *bit >= signal_widths[sig] || *bit > u16::MAX as u32 {
-                        gate!("bare bail at bytecode.rs:15752");
-                    }
-                    let narrow = signal_widths[sig] <= 64;
-                    note_read(
-                        sig,
-                        *bit,
-                        1,
-                        narrow,
-                        stored.contains(&(sig as u32)),
-                        &mut reads_whole,
-                        &mut reads_slice,
-                    );
-                }
-                out.push(TsInsn::BrSigFalse {
-                    sig: sig as u32,
-                    bit: *bit,
-                    t: *t,
-                });
-            }
-            Insn::BranchIfFalse(c, t) => {
-                narrow_reg!(rw, *c, "wide branch condition");
-                out.push(TsInsn::BrFalse {
-                    s: *c as u16,
-                    t: *t,
-                });
-            }
-            // Fused compare+branch: decompose to the exact unfused lowering,
-            // reusing the embedded dead register as the compare scratch.
-            Insn::CmpBranch(kind, a, b, tmp, t) => {
-                let wa = narrow_reg!(rw, *a, "wide operand (cmpbranch)");
-                let wb = narrow_reg!(rw, *b, "wide operand (cmpbranch)");
-                let both_sg = sg[*a as usize] && sg[*b as usize];
-                if both_sg
-                    && matches!(kind, CmpKind::Eq | CmpKind::CaseEq | CmpKind::Neq)
-                    && wa != wb
-                    && (if wa < wb { mn!(*a) } else { mn!(*b) })
-                {
-                    gate!("signed widening (cmpbranch)");
-                }
-                def!(rw, *tmp, 1);
-                let (d, a, b) = (*tmp as u16, *a as u16, *b as u16);
-                if both_sg && !matches!(kind, CmpKind::Eq | CmpKind::CaseEq | CmpKind::Neq) {
-                    let k = match kind {
-                        CmpKind::Lt => 0,
-                        CmpKind::Leq => 1,
-                        CmpKind::Gt => 2,
-                        _ => 3,
-                    };
-                    out.push(TsInsn::CmpS {
-                        d,
-                        a,
-                        b,
-                        kind: k,
-                        sa: (64 - wa) as u8,
-                        sb: (64 - wb) as u8,
-                    });
-                    out.push(TsInsn::BrFalse { s: d, t: *t });
-                    continue;
-                }
-                out.push(match kind {
-                    CmpKind::Eq | CmpKind::CaseEq => TsInsn::Eq { d, a, b },
-                    CmpKind::Neq => TsInsn::Neq { d, a, b },
-                    CmpKind::Lt => TsInsn::Lt { d, a, b },
-                    CmpKind::Leq => TsInsn::Leq { d, a, b },
-                    CmpKind::Gt => TsInsn::Gt { d, a, b },
-                    CmpKind::Geq => TsInsn::Geq { d, a, b },
-                });
-                out.push(TsInsn::BrFalse { s: d, t: *t });
-            }
-            Insn::BranchUnlessZero(s, t) => {
-                narrow_reg!(rw, *s, "wide branch condition");
-                // do-while back-edge: see `TsInsn::LoopPoll`.
-                if (*t as usize) <= ins_i {
-                    out.push(TsInsn::LoopPoll);
-                }
-                out.push(TsInsn::BrNz {
-                    s: *s as u16,
-                    t: *t,
-                });
-            }
-            Insn::Jump(t) => {
-                out.push(TsInsn::Jmp { t: *t });
-            }
-            Insn::CaseJump(src, cj) => {
-                // The selector must live in the u64 register file: a wider
-                // one is kept in the wide plane file, where `regs[s]` is not
-                // its value at all.
-                let sw = rw[*src as usize]?;
-                if sw > 64 {
-                    gate!("casejump sel >64b");
-                }
-                out.push(TsInsn::CaseJmp {
-                    s: *src as u16,
-                    cj: cj.clone(),
-                });
-            }
-            Insn::CaseMaskJump(src, mj) => {
-                has_wild_case = true;
-                let sw = rw[*src as usize]?;
-                if sw > 64 {
-                    gate!("casemaskjump sel >64b");
-                }
-                if mj.lo + mj.width > 64 {
-                    gate!("casemaskjump window >=64");
-                }
-                out.push(TsInsn::CaseMaskJmp {
-                    s: *src as u16,
-                    mj: Box::new(TsCaseMaskJmp {
-                        mask: ts_mask(sw),
-                        lo: mj.lo,
-                        wmask: ts_mask(mj.width),
-                        mj: mj.clone(),
-                    }),
-                });
-            }
-            Insn::ReduceOr(d, src) => {
-                // Registers wider than 64 bits live in the WIDE plane file;
-                // `regs[s]` for such a register is whatever the previous
-                // block's evaluation left in that slot. Emitting the narrow
-                // form regardless of width made `|wide_bus` evaluate from
-                // stale garbage — on the C910 SoC that wedged the LSU after
-                // exactly 250 retired instructions (the first `|128-bit`
-                // control reduction on the store path).
-                let sw = rw[*src as usize]?;
-                def!(rw, *d, 1);
-                out.push(if sw > 64 {
-                    TsInsn::WRedOr {
-                        d: *d as u16,
-                        s: *src as u16,
-                    }
-                } else {
-                    TsInsn::RedOr {
-                        d: *d as u16,
-                        s: *src as u16,
-                    }
-                });
-            }
-            Insn::ReduceAnd(d, src) => {
-                let sw = rw[*src as usize]?;
-                def!(rw, *d, 1);
-                out.push(if sw > 64 {
-                    TsInsn::WRedAnd {
-                        d: *d as u16,
-                        s: *src as u16,
-                        w: sw as u16,
-                    }
-                } else {
-                    TsInsn::RedAnd {
-                        d: *d as u16,
-                        s: *src as u16,
-                        mask: ts_mask(sw),
-                    }
-                });
-            }
-            // A signed tag on a narrow register: the LoadSignalSigned
-            // treatment — an unsigned bit pattern marked in `sg`, which the
-            // consumers that care (`mn!`) test. `int` loop counters produce
-            // this on every iteration.
-            Insn::SetSigned(r) => {
-                let w = rw[*r as usize]?;
-                if w > 64 {
-                    gate!("wide signed");
-                }
-                sg[*r as usize] = true;
-            }
-            // Two-state registers hold no X/Z: nothing to drop.
-            Insn::DropXz(_) => {}
-            // A copy with the Resize arm's narrow rules folded in.
-            Insn::MoveResize(d, s, w) => {
-                let cur = rw[*s as usize]?;
-                if *w == 0 || *w > 64 || cur > 64 {
-                    gate!("wide move-resize");
-                }
-                if xc[*s as usize].is_some() || wfill[*s as usize].is_some() {
-                    gate!("x-const move-resize");
-                }
-                if *w > cur && mn!(*s) {
-                    gate!("signed widening (move-resize)");
-                }
-                let src_sg = sg[*s as usize];
-                let src_rc = rc[*s as usize];
-                def!(rw, *d, *w);
-                sg[*d as usize] = src_sg;
-                rc[*d as usize] = src_rc.map(|k| k & ts_mask(*w));
-                out.push(TsInsn::Range {
-                    d: *d as u16,
-                    s: *s as u16,
-                    lo: 0,
-                    mask: ts_mask(*w),
-                });
-            }
-            // `sig[lo +: W]` with a run-time `lo`: the whole signal counts
-            // as read, since the slice can land anywhere in it.
-            Insn::LoadSignalRangeDyn(d, sig, lo, w) => {
-                let sig = *sig as usize;
-                let Some(&sw) = signal_widths.get(sig) else {
-                    gate!("dyn slice source oob");
-                };
-                if signal_real[sig] || *w == 0 || *w > 64 || sw > u16::MAX as u32 {
-                    gate!("dyn slice source shape");
-                }
-                narrow_reg!(rw, *lo, "wide slice offset");
-                let s32 = sig as u32;
-                if sw > 64 {
-                    if !sig_ok_wide(sig) {
-                        gate!("dyn slice wide source");
-                    }
-                    let skip = !side_effects || stored.contains(&s32);
-                    if let Some(e) = reads_wide.iter_mut().find(|(x, _)| *x == s32) {
-                        e.1 &= skip;
-                    } else {
-                        reads_wide.push((s32, skip));
-                    }
-                } else {
-                    if !sig_ok(sig) {
-                        gate!("dyn slice source");
-                    }
-                    note_read(
-                        sig,
-                        0,
-                        sw,
-                        true,
-                        stored.contains(&s32),
-                        &mut reads_whole,
-                        &mut reads_slice,
-                    );
-                }
-                def!(rw, *d, *w);
-                out.push(TsInsn::SigRangeDyn {
-                    d: *d as u16,
-                    sig: s32,
-                    i: *lo as u16,
-                    w: *w as u16,
-                    sw,
-                    mask: ts_mask(*w),
-                });
-            }
-            // `sig[lo +: W] = v` / `<= v` with a run-time `lo`. The width is
-            // static only in the compiler's own shapes: `hi == lo` (one
-            // bit) or `hi` defined as `lo + K` immediately upstream.
-            Insn::BlockingAssignRangeDyn(sig, hi, lo, r)
-            | Insn::NbaAssignRangeDyn(sig, hi, lo, r) => {
-                let sig = *sig as usize;
-                let Some(&sw) = signal_widths.get(sig) else {
-                    gate!("dyn range dest oob");
-                };
-                if signal_real[sig] || sw > u16::MAX as u32 {
-                    gate!("dyn range dest shape");
-                }
-                let w = if hi == lo {
-                    1
-                } else {
-                    let mut k = None;
-                    for j in (0..ins_i).rev() {
-                        if bt_map[j + 1] {
-                            break;
-                        }
-                        let ins = &insns[j];
-                        if BytecodeCompiler::dest_reg(ins) == Some(*lo)
-                            || BytecodeCompiler::in_place_reg(ins) == Some(*lo)
-                        {
-                            break;
-                        }
-                        if BytecodeCompiler::dest_reg(ins) == Some(*hi)
-                            || BytecodeCompiler::in_place_reg(ins) == Some(*hi)
-                        {
-                            if let Insn::BinOpConst(_, s, kk, BinOpConstKind::Add) = ins {
-                                if *s == *lo && !kk.is_signed && !kk.has_xz() {
-                                    k = kk.to_u64();
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    match k {
-                        Some(k) if k < 64 => k as u32 + 1,
-                        _ => gate!("dyn range width"),
-                    }
-                };
-                if xc[*r as usize].is_some() || wfill[*r as usize].is_some() {
-                    gate!("x-const dyn range store");
-                }
-                narrow_reg!(rw, *lo, "wide range offset");
-                let cw = narrow_reg!(rw, *r, "wide store source");
-                if cw < w && mn!(*r) {
-                    gate!("signed widening (dyn range store)");
-                }
-                side_effects = true;
-                let nba = matches!(insn, Insn::NbaAssignRangeDyn(..));
-                if !nba {
-                    stored.push(sig as u32);
-                }
-                let (sig, i, s, w16, mask) =
-                    (sig as u32, *lo as u16, *r as u16, w as u16, ts_mask(w));
-                out.push(if nba {
-                    TsInsn::RangeStoreNbaDyn {
-                        sig,
-                        i,
-                        s,
-                        w: w16,
-                        sw,
-                        mask,
-                    }
-                } else {
-                    TsInsn::RangeStoreDyn {
-                        sig,
-                        i,
-                        s,
-                        w: w16,
-                        sw,
-                        mask,
-                    }
-                });
-            }
-            Insn::NbaAssignBitDyn(sig, idx, r) => {
-                let sig = *sig as usize;
-                if sig >= signal_widths.len() || signal_real[sig] || signal_widths[sig] > 64 {
-                    gate!("nba bit dest oob/real/wide");
-                }
-                narrow_reg!(rw, *idx, "wide bit index");
-                narrow_reg!(rw, *r, "wide store source");
-                side_effects = true;
-                out.push(TsInsn::BitStoreNbaDyn {
-                    sig: sig as u32,
-                    i: *idx as u16,
-                    s: *r as u16,
-                    w: signal_widths[sig],
-                });
-            }
-            Insn::BlockingAssignBitDyn(sig, idx, r) => {
-                let sig = *sig as usize;
-                if sig >= signal_widths.len() || signal_real[sig] {
-                    gate!("dest oob/real");
-                }
-                // A >64-bit destination is fine: the executor sets one bit in
-                // the wide planes (`ts_wide_bit_store`) instead of splicing
-                // the inline word.
-                narrow_reg!(rw, *idx, "wide bit index");
-                narrow_reg!(rw, *r, "wide store source");
-                side_effects = true;
-                stored.push(sig as u32);
-                out.push(TsInsn::BitStoreDyn {
-                    sig: sig as u32,
-                    i: *idx as u16,
-                    s: *r as u16,
-                    w: signal_widths[sig],
-                });
-            }
-            Insn::BlockingAssign(sig, r, w) => {
-                let sig = *sig as usize;
-                if let Some((v, _)) = xfill[*r as usize] {
-                    if sig >= signal_widths.len()
-                        || signal_widths[sig] != *w
-                        || signal_real[sig]
-                        || *w == 0
-                    {
-                        gate!("x-fill dest shape");
-                    }
-                    side_effects = true;
-                    stored.push(sig as u32);
-                    out.push(TsInsn::RangeFillXW {
-                        sig: sig as u32,
-                        hi: *w - 1,
-                        lo: 0,
-                        v,
-                    });
-                    continue;
-                }
-                if let Some(bit) = wfill[*r as usize] {
-                    if sig >= signal_widths.len()
-                        || signal_widths[sig] != *w
-                        || signal_real[sig]
-                        || *w == 0
-                    {
-                        gate!("fill dest shape");
-                    }
-                    side_effects = true;
-                    stored.push(sig as u32);
-                    out.push(TsInsn::RangeFillW {
-                        sig: sig as u32,
-                        hi: *w - 1,
-                        lo: 0,
-                        bit,
-                    });
-                    continue;
-                }
-                let cw = rw[*r as usize]?;
-                if let Some((v, x)) = xc[*r as usize] {
-                    // §10.4.1 with a folded constant source. Every lowered
-                    // register is unsigned, so a narrow source zero-extends:
-                    // masking to the narrower of the two widths IS the resize.
-                    if sig >= signal_widths.len()
-                        || signal_widths[sig] != *w
-                        || signal_real[sig]
-                        || *w > 64
-                    {
-                        gate!("x-const dest shape");
-                    }
-                    let m = ts_mask(cw.min(*w));
-                    side_effects = true;
-                    stored.push(sig as u32);
-                    out.push(TsInsn::ConstStoreX {
-                        sig: sig as u32,
-                        v: v & m,
-                        x: x & m,
-                    });
-                    continue;
-                }
-                // Same-width, non-real destination only: the 4-state slow
-                // path's fit/resize semantics are not reproduced here.
-                if sig >= signal_widths.len() || signal_widths[sig] != *w || signal_real[sig] {
-                    gate!("bare bail at bytecode.rs:16076");
-                }
-                if *w > 64 {
-                    // Wide store: register and destination agree exactly (a
-                    // Resize precedes otherwise); signed wide targets bail.
-                    if *w > 512 || cw != *w || signal_signed[sig] {
-                        gate!("bare bail at bytecode.rs:16082");
-                    }
-                    side_effects = true;
-                    stored.push(sig as u32);
-                    out.push(TsInsn::WStore {
-                        sig: sig as u32,
-                        s: *r as u16,
-                    });
-                } else {
-                    if cw > 64 {
-                        gate!("bare bail at bytecode.rs:16089");
-                    }
-                    if cw < *w && mn!(*r) {
-                        gate!("signed widening (store)");
-                    }
-                    side_effects = true;
-                    stored.push(sig as u32);
-                    out.push(TsInsn::Store {
-                        sig: sig as u32,
-                        s: *r as u16,
-                        mask: ts_mask(*w),
-                    });
-                }
-            }
-            Insn::NbaAssignConst(sig, k, w) => {
-                let sig = *sig as usize;
-                if sig >= signal_widths.len() || signal_real[sig] || *w > 64 {
-                    gate!("bare bail at bytecode.rs:16102");
-                }
-                let v = clean_const(k)?;
-                side_effects = true;
-                out.push(TsInsn::ConstStoreNba {
-                    sig: sig as u32,
-                    v: v & ts_mask(*w),
-                    w: *w,
-                });
-            }
-            Insn::BlockingAssignRange(sig, hi, lo, r) => {
-                let sig = *sig as usize;
-                if sig >= signal_widths.len() || signal_real[sig] {
-                    gate!("dest oob/real");
-                }
-                if let Some((v, _)) = xfill[*r as usize] {
-                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
-                    if high >= signal_widths[sig] {
-                        gate!("x-fill range past dest");
-                    }
-                    side_effects = true;
-                    stored.push(sig as u32);
-                    out.push(TsInsn::RangeFillXW {
-                        sig: sig as u32,
-                        hi: high,
-                        lo: low,
-                        v,
-                    });
-                    continue;
-                }
-                if let Some(bit) = wfill[*r as usize] {
-                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
-                    if high >= signal_widths[sig] {
-                        gate!("fill range past dest");
-                    }
-                    side_effects = true;
-                    stored.push(sig as u32);
-                    out.push(TsInsn::RangeFillW {
-                        sig: sig as u32,
-                        hi: high,
-                        lo: low,
-                        bit,
-                    });
-                    continue;
-                }
-                let wide_dest = signal_widths[sig] > 64;
-                if let Some((v, x)) = xc[*r as usize] {
-                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
-                    if high - low + 1 > 64 {
-                        gate!("range span >64");
-                    }
-                    if !wide_dest && high >= 64 {
-                        gate!("range top >=64");
-                    }
-                    if high >= signal_widths[sig] {
-                        gate!("range top past dest");
-                    }
-                    let m = ts_mask(high - low + 1);
-                    side_effects = true;
-                    stored.push(sig as u32);
-                    let px = Box::new(TsRangeStoreX {
-                        sig: sig as u32,
-                        hi: high,
-                        lo: low,
-                        v: v & m,
-                        x: x & m,
-                    });
-                    out.push(if wide_dest {
-                        TsInsn::RangeStoreXW(px)
-                    } else {
-                        TsInsn::RangeStoreX(px)
-                    });
-                    continue;
-                }
-                let Some(cw) = rw[*r as usize] else {
-                    gate!("src reg width unknown");
-                };
-                let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
-                let w = high - low + 1;
-                if cw > 64 && cw <= 512 && w == cw && wide_dest && high < signal_widths[sig] {
-                    side_effects = true;
-                    stored.push(sig as u32);
-                    out.push(TsInsn::WRangeStore {
-                        sig: sig as u32,
-                        lo: low,
-                        s: *r as u16,
-                        w,
-                    });
-                    continue;
-                }
-                if cw > 64 || w > 64 {
-                    gate!("src reg >64b");
-                }
-                if cw < w && mn!(*r) {
-                    gate!("signed widening (range store)");
-                }
-                if !wide_dest && high >= 64 {
-                    gate!("range top >=64");
-                }
-                if high >= signal_widths[sig] {
-                    gate!("range top past dest");
-                }
-                side_effects = true;
-                stored.push(sig as u32);
-                out.push(if wide_dest {
-                    TsInsn::RangeStoreW {
-                        sig: sig as u32,
-                        hi: high,
-                        lo: low,
-                        s: *r as u16,
-                        mask: ts_mask(w),
-                    }
-                } else {
-                    TsInsn::RangeStore {
-                        sig: sig as u32,
-                        hi: high,
-                        lo: low,
-                        s: *r as u16,
-                        mask: ts_mask(w),
-                    }
-                });
-            }
-            Insn::NbaAssignRange(sig, hi, lo, r) => {
-                let sig = *sig as usize;
-                if sig >= signal_widths.len() || signal_real[sig] {
-                    gate!("nba range dest oob/real");
-                }
-                if let Some(bit) = wfill[*r as usize] {
-                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
-                    if high >= signal_widths[sig] {
-                        gate!("fill range past dest");
-                    }
-                    side_effects = true;
-                    out.push(TsInsn::RangeFillNbaW {
-                        sig: sig as u32,
-                        hi: high,
-                        lo: low,
-                        bit,
-                    });
-                    continue;
-                }
-                let Some(cw) = rw[*r as usize] else {
-                    gate!("untracked source (nba range store)");
-                };
-                let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
-                let w = high - low + 1;
-                if signal_widths[sig] > 64 {
-                    // Wide destination: a ≤64-bit window spliced into the
-                    // pending value (the id_dp pipeline registers on c906).
-                    if cw > 64 && cw <= 512 && w == cw && high < signal_widths[sig] {
-                        side_effects = true;
-                        out.push(TsInsn::WRangeStoreNba {
-                            sig: sig as u32,
-                            lo: low,
-                            s: *r as u16,
-                            w,
-                        });
-                        continue;
-                    }
-                    if cw > 64 || w > 64 || high >= signal_widths[sig] {
-                        gate!("wide nba range shape");
-                    }
-                    if cw < w && mn!(*r) {
-                        gate!("signed widening (nba range store)");
-                    }
-                    side_effects = true;
-                    out.push(TsInsn::RangeStoreNbaW {
-                        sig: sig as u32,
-                        hi: high,
-                        lo: low,
-                        s: *r as u16,
-                        mask: ts_mask(w),
-                    });
-                    continue;
-                }
-                if cw > 64 || high >= 64 {
-                    gate!("wide source (nba range store)");
-                }
-                if cw < w && mn!(*r) {
-                    gate!("signed widening (nba range store)");
-                }
-                side_effects = true;
-                out.push(TsInsn::RangeStoreNba {
-                    sig: sig as u32,
-                    hi: high,
-                    lo: low,
-                    s: *r as u16,
-                    mask: ts_mask(w),
-                });
-            }
-            Insn::NbaAssign(sig, r, w) => {
-                let sig = *sig as usize;
-                if sig >= signal_widths.len() || signal_real[sig] {
-                    gate!("nba dest oob/real");
-                }
-                if let Some(bit) = wfill[*r as usize] {
-                    if signal_widths[sig] != *w || *w == 0 {
-                        gate!("fill dest shape");
-                    }
-                    side_effects = true;
-                    out.push(TsInsn::RangeFillNbaW {
-                        sig: sig as u32,
-                        hi: *w - 1,
-                        lo: 0,
-                        bit,
-                    });
-                    continue;
-                }
-                let Some(cw) = rw[*r as usize] else {
-                    gate!("untracked source (nba)");
-                };
-                if *w > 64 {
-                    if *w > 512 || cw != *w || signal_signed[sig] {
-                        gate!("wide nba dest shape");
-                    }
-                    side_effects = true;
-                    out.push(TsInsn::WStoreNba {
-                        sig: sig as u32,
-                        s: *r as u16,
-                        w: *w,
-                    });
-                } else {
-                    if cw > 64 {
-                        gate!("bare bail at bytecode.rs:16281");
-                    }
-                    if cw < *w && mn!(*r) {
-                        gate!("signed widening (nba store)");
-                    }
-                    side_effects = true;
-                    out.push(TsInsn::StoreNba {
-                        sig: sig as u32,
-                        s: *r as u16,
-                        w: *w,
-                        mask: ts_mask(*w),
-                    });
-                }
-            }
-            Insn::LoadArrayElem(d, array, idx_reg) => {
-                // Every element shares the first one's shape. Wide elements
-                // (65..=512 bits) load into the wide bank; signed and real
-                // elements stay on the four-state VM.
-                let (first, lo, hi) = match &**array {
-                    ArrayOperand::Dense {
-                        first_id, lo, hi, ..
-                    } => (*first_id, *lo, *hi),
-                    ArrayOperand::Named(name) => match array_first_id.get(name.as_str()) {
-                        Some(&t) => t,
-                        None => gate!("array unknown"),
-                    },
-                };
-                if hi < lo || first >= signal_widths.len() || signal_real[first] {
-                    gate!("array elements real/empty");
-                }
-                if signal_signed[first] {
-                    gate!("array elements signed");
-                }
-                let ew = signal_widths[first];
-                if ew > 512 {
-                    gate!("array elements >512b");
-                }
-                let wide = ew > 64;
-                let _ = side_effects;
-                // A constant, in-range index names one element: that is a
-                // plain signal load with the ordinary x-read contract, not an
-                // abortable element read — so it stays admissible after a
-                // store (`q <= mem[3][7:0]` behind a reset arm was 256 of
-                // the c906 edge bails).
-                if let Some(k) = rc[*idx_reg as usize] {
-                    let ki = k as i64;
-                    if ki < lo || ki > hi {
-                        gate!("const element out of range");
-                    }
-                    let eid = first + (ki - lo) as usize;
-                    if eid >= signal_widths.len()
-                        || signal_widths[eid] != ew
-                        || signal_signed[eid]
-                        || signal_real[eid]
-                    {
-                        gate!("const element shape");
-                    }
-                    def!(rw, *d, ew);
-                    if wide {
-                        let skip = !side_effects || stored.contains(&(eid as u32));
-                        let s32 = eid as u32;
-                        if let Some(e) = reads_wide.iter_mut().find(|(x, _)| *x == s32) {
-                            e.1 &= skip;
-                        } else {
-                            reads_wide.push((s32, skip));
-                        }
-                        out.push(TsInsn::WLoadSig {
-                            d: *d as u16,
-                            sig: s32,
-                        });
-                    } else {
-                        note_read(
-                            eid,
-                            0,
-                            ew,
-                            true,
-                            stored.contains(&(eid as u32)),
-                            &mut reads_whole,
-                            &mut reads_slice,
-                        );
-                        out.push(TsInsn::LoadSig {
-                            d: *d as u16,
-                            sig: eid as u32,
-                        });
-                    }
-                    continue;
-                }
-                // Abortable (X/out-of-range element read). Admissible after
-                // side effects too: `ts_raw_hazard` proved the four-state
-                // re-run reproduces every store made before the abort.
-                narrow_reg!(rw, *idx_reg, "wide array index");
-                def!(rw, *d, ew);
-                let op = Box::new(TsElemOp {
-                    first: first as u32,
-                    lo,
-                    hi,
-                    idx: *idx_reg as u16,
-                    s: *d as u16,
-                    w: 0,
-                    mask: 0,
-                });
-                out.push(if wide {
-                    TsInsn::WElemLoad(op)
-                } else {
-                    TsInsn::ElemLoad(op)
-                });
-            }
-            Insn::NbaAssignArray(array, idx_reg, val_reg, w) => {
-                let (first, lo, hi) = array_span(array)?;
-                let vw = narrow_reg!(rw, *val_reg, "wide store source");
-                if *w > 64 || signal_widths[first] != *w {
-                    gate!("bare bail at bytecode.rs:16339");
-                }
-                if vw < *w && mn!(*val_reg) {
-                    gate!("signed widening (array store)");
-                }
-                side_effects = true;
-                if let Some(k) = rc[*idx_reg as usize] {
-                    // Const index folds to a static element target (an
-                    // out-of-range constant mirrors the silent 4-state drop
-                    // by emitting nothing).
-                    let ki = k as i64;
-                    if ki >= lo && ki <= hi {
-                        let eid = first + (ki - lo) as usize;
-                        out.push(TsInsn::StoreNba {
-                            sig: eid as u32,
-                            s: *val_reg as u16,
-                            w: *w,
-                            mask: ts_mask(*w),
-                        });
-                    }
-                } else {
-                    narrow_reg!(rw, *idx_reg, "wide array index");
-                    out.push(TsInsn::ElemStoreNba(Box::new(TsElemOp {
-                        first: first as u32,
-                        lo,
-                        hi,
-                        idx: *idx_reg as u16,
-                        s: *val_reg as u16,
-                        w: *w,
-                        mask: ts_mask(*w),
-                    })));
-                }
-            }
-            Insn::BlockingAssignArray(array, idx_reg, val_reg, w) => {
-                let (first, lo, hi) = array_span(array)?;
-                let vw = narrow_reg!(rw, *val_reg, "wide store source");
-                if *w > 64 || signal_widths[first] != *w {
-                    gate!("bare bail at bytecode.rs:16376");
-                }
-                if vw < *w && mn!(*val_reg) {
-                    gate!("signed widening (array store)");
-                }
-                side_effects = true;
-                if let Some(k) = rc[*idx_reg as usize] {
-                    let ki = k as i64;
-                    if ki >= lo && ki <= hi {
-                        let eid = first + (ki - lo) as usize;
-                        out.push(TsInsn::Store {
-                            sig: eid as u32,
-                            s: *val_reg as u16,
-                            mask: ts_mask(*w),
-                        });
-                    }
-                } else {
-                    narrow_reg!(rw, *idx_reg, "wide array index");
-                    out.push(TsInsn::ElemStore(Box::new(TsElemOp {
-                        first: first as u32,
-                        lo,
-                        hi,
-                        idx: *idx_reg as u16,
-                        s: *val_reg as u16,
-                        w: *w,
-                        mask: ts_mask(*w),
-                    })));
-                }
-            }
-            Insn::NbaAssignArrayRead(dst, array, idx_sig, w) => {
-                let isig = *idx_sig as usize;
-                let d = *dst as usize;
-                if !sig_ok(isig) || d >= signal_widths.len() || signal_real[d] {
-                    gate!("nba array read shape");
-                }
-                let (first, lo, hi) = match &**array {
-                    ArrayOperand::Dense {
-                        first_id, lo, hi, ..
-                    } => (*first_id, *lo, *hi),
-                    ArrayOperand::Named(name) => match array_first_id.get(name.as_str()) {
-                        Some(&t) => t,
-                        None => gate!("array unknown"),
-                    },
-                };
-                if hi < lo
-                    || first >= signal_widths.len()
-                    || signal_real[first]
-                    || signal_signed[first]
-                {
-                    gate!("array elements signed/real");
-                }
-                let ew = signal_widths[first];
-                if ew > 64 {
-                    // Wide element: queue the element Value itself.
-                    if *w != ew || signal_widths[d] != ew {
-                        gate!("wide nba array read shape");
-                    }
-                    note_read(
-                        isig,
-                        0,
-                        signal_widths[isig],
-                        true,
-                        stored.contains(&(isig as u32)),
-                        &mut reads_whole,
-                        &mut reads_slice,
-                    );
-                    side_effects = true;
-                    out.push(TsInsn::WNbaFromElem(Box::new(TsNbaFromElem {
-                        dst: *dst,
-                        first: first as u32,
-                        lo,
-                        hi,
-                        idx_sig: isig as u32,
-                        w: *w,
-                    })));
-                    continue;
-                }
-                if *w > 64 {
-                    gate!("nba array read width");
-                }
-                // Historically the read was ABORTABLE (X index, X data,
-                // out-of-range), so it had to precede every side effect: a
-                // mid-block bail replays the block 4-state, and queued NBAs
-                // would double-apply. Two of the three abort sources are now
-                // gone — X element DATA is queued as a 4-state Value (the NBA
-                // queue holds Values; see the executor), and an X INDEX is
-                // impossible when the guard covers `isig`. When the array
-                // also spans the index's whole range (RAM with power-of-two
-                // depth: lo == 0, hi >= 2^idx_w - 1), out-of-range is
-                // statically impossible too — the read is then NON-abortable
-                // and may follow side effects. Anything else keeps the old
-                // ordering rule. c906: 536 edge blocks bailed here.
-                let idx_w = signal_widths[isig];
-                let statically_in_range = lo <= 0
-                    && idx_w < 63
-                    && hi >= (1i64 << idx_w) - 1
-                    && !stored.contains(&(isig as u32));
-                let _ = statically_in_range;
-                if false {
-                    gate!("bare bail at bytecode.rs:16435");
-                }
-                note_read(
-                    isig,
-                    0,
-                    signal_widths[isig],
-                    true,
-                    stored.contains(&(isig as u32)),
-                    &mut reads_whole,
-                    &mut reads_slice,
-                );
-                side_effects = true;
-                out.push(TsInsn::NbaFromElem(Box::new(TsNbaFromElem {
-                    dst: *dst,
-                    first: first as u32,
-                    lo,
-                    hi,
-                    idx_sig: isig as u32,
-                    w: *w,
-                })));
-            }
-            Insn::Mul(d, a, b) => {
-                let (wa, wb) = (rw[*a as usize]?, rw[*b as usize]?);
-                if wa > 64 || wb > 64 {
-                    gate!("bare bail at bytecode.rs:16451");
-                }
-                let w = wa.max(wb);
-                let both_sg = sg[*a as usize] && sg[*b as usize];
-                if both_sg && wa != wb && (if wa < wb { mn!(*a) } else { mn!(*b) }) {
-                    gate!("signed widening (mul)");
-                }
-                def!(rw, *d, w);
-                sg[*d as usize] = both_sg;
-                if let (Some(ka), Some(kb)) = (rc[*a as usize], rc[*b as usize]) {
-                    // Both operands are known constants (a genvar expression
-                    // the compiler left unfolded): fold at lower time.
-                    let v = ka.wrapping_mul(kb) & ts_mask(w);
-                    rc[*d as usize] = Some(v);
-                    out.push(TsInsn::Const { d: *d as u16, v });
-                } else {
-                    out.push(TsInsn::Mul {
-                        d: *d as u16,
-                        a: *a as u16,
-                        b: *b as u16,
-                        mask: ts_mask(w),
-                    });
-                }
-            }
-            Insn::Replicate(d, src, n) => {
-                let sw = rw[*src as usize]?;
-                let n = *n;
-                if n > 128 && sw == 1 && xc[*src as usize].is_none() {
-                    if let Some(k) = rc[*src as usize] {
-                        if k <= 1 {
-                            def!(rw, *d, 1);
-                            rw[*d as usize] = None;
-                            wfill[*d as usize] = Some(k as u8);
-                            continue;
-                        }
-                    }
-                }
-                if n == 0 || sw > 64 || n > 512 {
-                    gate!("bare bail at bytecode.rs:16489");
-                }
-                let total = sw.saturating_mul(n);
-                if let Some((v, x)) = xc[*src as usize] {
-                    if total > 64 {
-                        if sw != 1 || x & 1 == 0 {
-                            gate!("x-const repl >64b");
-                        }
-                        def!(rw, *d, 1);
-                        rw[*d as usize] = None;
-                        xfill[*d as usize] = Some(((v & 1) as u8, 1));
-                        continue;
-                    }
-                    let (mut rv, mut rx) = (0u64, 0u64);
-                    for i in 0..n {
-                        rv |= v << (i * sw);
-                        rx |= x << (i * sw);
-                    }
-                    def!(rw, *d, total);
-                    xc[*d as usize] = Some((rv, rx));
-                    xc_live.push(*d);
-                    continue;
-                }
-                if total == 0 || total > 512 {
-                    gate!("concat total >512b");
-                }
-                def!(rw, *d, total);
-                out.push(if total > 64 {
-                    TsInsn::WRepl {
-                        d: *d as u16,
-                        s: *src as u16,
-                        w: sw as u8,
-                        count: n as u16,
-                    }
-                } else {
-                    TsInsn::Repl {
-                        d: *d as u16,
-                        s: *src as u16,
-                        w: sw as u8,
-                        count: n as u8,
-                    }
-                });
-            }
-            Insn::StmtFallback(payload) => {
-                // Run by the interpreter in place; its reads and writes go
-                // through the four-state paths, so nothing here needs the
-                // register model to know about it — unless it carries
-                // register-backed locals, which live in the 4-state file.
-                if !payload.2.is_empty() {
-                    gate!("fallback carries locals");
-                }
-                side_effects = true;
-                out.push(TsInsn::Fallback(payload.0.clone()));
-            }
-            Insn::InitLocalColl(payload) => {
-                // Declares empty local collection storage; its writes go
-                // through the interpreter's signal paths.
-                side_effects = true;
-                out.push(TsInsn::Fallback(payload.0.clone()));
-            }
-            // The executors note each count on the save list, so a bail takes
-            // it back before the four-state re-run counts again.
-            Insn::CovHit(c) => out.push(TsInsn::CovHit(*c)),
-            _ => return None,
-        }
-    }
-    idx_map.push(out.len() as u32);
-    for &(pc, ix) in &wait_resume_fix {
-        if (pc as usize) < idx_map.len() {
-            idx_map[pc as usize] = ix;
-        }
-    }
-    // Fixup: branch targets were recorded as 4-state indices.
-    for insn in out.iter_mut() {
-        match insn {
-            TsInsn::BrSigFalse { t, .. }
-            | TsInsn::BrFalse { t, .. }
-            | TsInsn::BrNz { t, .. }
-            | TsInsn::Jmp { t } => {
-                let old = *t as usize;
-                if old >= idx_map.len() {
-                    gate!("bare bail at bytecode.rs:16557");
-                }
-                *t = idx_map[old];
-            }
-            TsInsn::CaseMaskJmp { mj, .. } => {
-                // `xz_path` is unreachable on X-free registers but is still
-                // remapped: leaving a 4-state index in a lowered stream would
-                // be a live landmine if the invariant ever weakened.
-                let mj = &mut mj.mj;
-                for t in mj.table.iter_mut().chain(std::iter::once(&mut mj.xz_path)) {
-                    let old = *t as usize;
-                    if old >= idx_map.len() {
-                        gate!("bare bail at bytecode.rs:16569");
-                    }
-                    *t = idx_map[old];
-                }
-            }
-            TsInsn::CaseJmp { cj, .. } => {
-                for t in cj.table.iter_mut().chain(std::iter::once(&mut cj.default)) {
-                    let old = *t as usize;
-                    if old >= idx_map.len() {
-                        gate!("bare bail at bytecode.rs:16578");
-                    }
-                    *t = idx_map[old];
-                }
-            }
-            _ => {}
-        }
-    }
-    // A block that stores nothing is useless to run in 2-state.
-    //
-    // This list must name EVERY store opcode. It did not: the partial-range
-    // and constant NBA stores were absent, so a block whose only side effect
-    // was a range store lowered perfectly and was then discarded here as
-    // "stores nothing". On the C906 SoC that silently rejected 176.4M
-    // interpreter evaluations — 58.4% of all of them — in blocks of exactly
-    // the shape `LoadSignalRange(r, wide, 127, 64); BlockingAssignRange(dst,
-    // 63, 0, r)` (wide-bus word shuffles). Found by labelling the arm's own
-    // gates and seeing that NONE of them fired: the bail was here, after the
-    // instruction loop, with the stamp merely naming the last instruction
-    // entered.
-    if !out.iter().any(|i| {
-        matches!(
-            i,
-            TsInsn::Store { .. }
-                | TsInsn::StoreNba { .. }
-                | TsInsn::ConstStoreNba { .. }
-                | TsInsn::RangeStore { .. }
-                | TsInsn::RangeStoreNba { .. }
-                | TsInsn::BitStoreDyn { .. }
-                | TsInsn::BitStoreNbaDyn { .. }
-                | TsInsn::RangeStoreDyn { .. }
-                | TsInsn::RangeStoreNbaDyn { .. }
-                | TsInsn::RangeFillXW { .. }
-                | TsInsn::ConstStoreX { .. }
-                | TsInsn::RangeStoreX(..)
-                | TsInsn::RangeStoreW { .. }
-                | TsInsn::RangeStoreNbaW { .. }
-                | TsInsn::RangeFillW { .. }
-                | TsInsn::RangeFillNbaW { .. }
-                | TsInsn::WRangeStore { .. }
-                | TsInsn::WRangeStoreNba { .. }
-                | TsInsn::LogOrStore { .. }
-                | TsInsn::OrRangeStore { .. }
-                | TsInsn::RangeStoreXW(..)
-                | TsInsn::ElemStore { .. }
-                | TsInsn::ElemStoreNba { .. }
-                | TsInsn::ElemStoreNbaFromSig { .. }
-                | TsInsn::NbaFromElem { .. }
-                | TsInsn::WNbaFromElem { .. }
-                | TsInsn::WStore { .. }
-                | TsInsn::WStoreNba { .. }
-        )
-    }) {
-        gate!("bare bail at bytecode.rs:16633");
-    }
-    // 512-bit wide class, on by default (XEZIM_TS_WIDE512=0 disables). It
-    // was opt-in while admitting the c906 vector-unit buses cost +5.4%:
-    // entries that x-bailed on every evaluation and never demoted. Those now
-    // sleep (see the executor's x-bail backoff), and with wide hazard saves,
-    // wide selects and x-fill stores lowering as well the class measures
-    // c906 memcpy -1.2% and C910 memcpy -2.5%, outputs identical.
-    static WIDE512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let wide512 =
-        *WIDE512.get_or_init(|| std::env::var("XEZIM_TS_WIDE512").ok().as_deref() != Some("0"));
-    if max_wide > 128 && !wide512 {
-        gate!("bare bail at bytecode.rs:16643");
-    }
-    let has_wide = out.iter().any(|i| {
-        matches!(
-            i,
-            TsInsn::WLoadSig { .. }
-                | TsInsn::WRangeStore { .. }
-                | TsInsn::WRangeStoreNba { .. }
-                | TsInsn::WRedOr { .. }
-                | TsInsn::WRedAnd { .. }
-                | TsInsn::WConst { .. }
-                | TsInsn::WXor { .. }
-                | TsInsn::WAnd { .. }
-                | TsInsn::WOr { .. }
-                | TsInsn::WSel { .. }
-                | TsInsn::WElemLoad(..)
-                | TsInsn::WNot { .. }
-                | TsInsn::WRange { .. }
-                | TsInsn::RangeFromW { .. }
-                | TsInsn::BitFromW { .. }
-                | TsInsn::WConcat { .. }
-                | TsInsn::WMask { .. }
-                | TsInsn::WFromN { .. }
-                | TsInsn::NFromW { .. }
-                | TsInsn::WStore { .. }
-                | TsInsn::WStoreNba { .. }
-                | TsInsn::WRepl { .. }
-                | TsInsn::WSigRange { .. }
-        )
-    });
-    let has_ctrl = out.iter().any(|i| {
-        matches!(
-            i,
-            TsInsn::BrSigFalse { .. }
-                | TsInsn::BrFalse { .. }
-                | TsInsn::BrNz { .. }
-                | TsInsn::Jmp { .. }
-                | TsInsn::CaseJmp { .. }
-                | TsInsn::CaseMaskJmp { .. }
-        )
-    });
-    let apply_skip = !has_ctrl;
-    let reads_whole: Vec<u32> = reads_whole
-        .into_iter()
-        .filter(|&(_, sk)| !(apply_skip && sk))
-        .map(|(x, _)| x)
-        .collect();
-    let reads_slice: Vec<(u32, u16, u16)> = reads_slice
-        .into_iter()
-        .filter(|&(_, _, _, sk)| !(apply_skip && sk))
-        .map(|(a, b, c, _)| (a, b, c))
-        .collect();
-    let reads_wide: Vec<u32> = reads_wide
-        .into_iter()
-        .filter(|&(_, sk)| !(apply_skip && sk))
-        .map(|(x, _)| x)
-        .collect();
-    let mut writes: Vec<u32> = Vec::new();
-    let mut writes_span: Vec<(u32, u32)> = Vec::new();
-    // §10.6.2: every store kind names its destination here — a block whose
-    // write a force drops must leave the two-state executor, and a store
-    // left out (a part-select `RangeStore`) kept writing a forced net.
-    for i in out.iter() {
-        match i {
-            TsInsn::LogAndStore { sig, .. }
-            | TsInsn::AndRangeStore { sig, .. }
-            | TsInsn::LogOrStore { sig, .. }
-            | TsInsn::OrRangeStore { sig, .. }
-            | TsInsn::BitStoreDyn { sig, .. }
-            | TsInsn::ConstStoreX { sig, .. }
-            | TsInsn::ConstStoreNba { sig, .. }
-            | TsInsn::RangeStore { sig, .. }
-            | TsInsn::RangeStoreNba { sig, .. }
-            | TsInsn::RangeStoreW { sig, .. }
-            | TsInsn::Store { sig, .. }
-            | TsInsn::StoreNba { sig, .. }
-            | TsInsn::BitStoreNbaDyn { sig, .. }
-            | TsInsn::RangeStoreDyn { sig, .. }
-            | TsInsn::RangeStoreNbaDyn { sig, .. }
-            | TsInsn::RangeFillXW { sig, .. }
-            | TsInsn::RangeStoreNbaW { sig, .. }
-            | TsInsn::RangeFillW { sig, .. }
-            | TsInsn::RangeFillNbaW { sig, .. }
-            | TsInsn::WRangeStore { sig, .. }
-            | TsInsn::WRangeStoreNba { sig, .. }
-            | TsInsn::WStore { sig, .. }
-            | TsInsn::WStoreNba { sig, .. } => writes.push(*sig),
-            TsInsn::RangeStoreX(p) | TsInsn::RangeStoreXW(p) => writes.push(p.sig),
-            TsInsn::NbaFromElem(op) | TsInsn::WNbaFromElem(op) => writes.push(op.dst),
-            TsInsn::ElemStoreNbaFromSig(f) => {
-                let op = &f.op;
-                writes_span.push((op.first, (op.hi - op.lo + 1).max(0) as u32));
-            }
-            TsInsn::ElemStore(op) | TsInsn::ElemStoreNba(op) => {
-                if op.hi >= op.lo {
-                    writes_span.push((op.first, (op.hi - op.lo + 1) as u32));
-                }
-            }
-            _ => {}
-        }
-    }
-    writes.sort_unstable();
-    writes.dedup();
-    writes_span.sort_unstable();
-    writes_span.dedup();
-    if !has_wait {
-        // Fusion re-indexes the stream; a wait-bearing stream keeps its
-        // four-state index map exact instead.
-        fuse_ts_pairs(&mut out);
-    }
-    // Loop back-edges poll Ctrl-C (see `TsInsn::JmpPoll`). In place, so no
-    // index moves; nothing after this point re-reads branch targets.
-    for (i, insn) in out.iter_mut().enumerate() {
-        if let TsInsn::Jmp { t } = *insn {
-            if (t as usize) <= i {
-                *insn = TsInsn::JmpPoll { t };
-            }
-        }
-    }
-    if track && std::env::var_os("XEZIM_TS_DUMP").is_some() {
-        eprintln!("[TS-DUMP] {} insns:", out.len());
-        for (i, ti) in out.iter().enumerate() {
-            eprintln!("[TS-DUMP]   {i:>3} {ti:?}");
-        }
-    }
-    // §6.24.1: DropXz is a no-op only for clean two-state registers.
-    // The X-plane executor must use the original stream for such a cast.
-    let tsx = !has_wide
-        && !has_wait
-        && !has_wild_case
-        && !has_case_eq
-        && !cb.instructions.iter().any(|i| matches!(i, Insn::DropXz(_)))
-        && out.iter().all(tsx_insn_ok);
-    Some(TwoStateBlock {
-        insns: out,
-        num_regs: cb.num_regs,
-        reads_whole: reads_whole.into_boxed_slice(),
-        reads_slice: reads_slice.into_boxed_slice(),
-        has_ctrl,
-        has_wide,
-        wide_words: if !has_wide {
-            0
-        } else if max_wide > 128 {
-            8
-        } else {
-            2
-        },
-        has_wait,
-        tsx,
-        vm_to_ts: if has_wait {
-            idx_map.clone().into_boxed_slice()
-        } else {
-            Box::new([])
-        },
-        wait_regs: wait_regs.into_boxed_slice(),
-        reads_wide: reads_wide.into_boxed_slice(),
-        writes: writes.into_boxed_slice(),
-        writes_span: writes_span.into_boxed_slice(),
-    })
-}
-
 /// §20.5 / §20.8: the system functions whose result is REAL — the
 /// conversions to real, `$realtime`, and the real math functions.
 pub(crate) fn system_function_is_real(name: &str) -> bool {
@@ -31427,6 +26306,85 @@ fn chain_has_call_base(e: &Expression) -> bool {
 /// string-valued functions, and the ones that carry their argument's type
 /// (`system_function_carries_arg`), are None. Shared by the compiler's width
 /// and signedness inference and by the interpreter, so every path agrees.
+/// The declared type of variable `name`, or of member `m` of a structure
+/// variable `v` for `name` = `v.m` (§7.2: a member keeps its declared type).
+pub(crate) fn declared_type_of<'a>(
+    name: &str,
+    decls: &'a HashMap<String, crate::ast::types::DataType>,
+    types: &'a HashMap<String, crate::ast::types::DataType>,
+) -> Option<&'a crate::ast::types::DataType> {
+    if let Some(dt) = decls.get(name) {
+        return Some(dt);
+    }
+    let (var, member) = name.rsplit_once('.')?;
+    let crate::ast::types::DataType::Struct(su) =
+        crate::compiler::elaborate::resolve_typedef_chain(decls.get(var)?, types)
+    else {
+        return None;
+    };
+    su.members
+        .iter()
+        .find(|m| m.declarators.iter().any(|d| d.name.name == member))
+        .map(|m| &m.data_type)
+}
+
+/// §7.4.1: the number of selects at which a packed array declared as
+/// `T [d1]...[dn] x` (directly, or through typedefs) reaches its NAMED
+/// element type `T`, when `T` is a signed integral type. Such an element
+/// select is signed; every other select of a packed array is unsigned
+/// ("the individual elements of the array are unsigned unless they are of a
+/// named type declared as signed"). None for any other declaration.
+pub(crate) fn signed_named_packed_elem_depth(
+    dt: &crate::ast::types::DataType,
+    types: &HashMap<String, crate::ast::types::DataType>,
+) -> Option<usize> {
+    use crate::ast::types::DataType as D;
+    /// Through plain aliases (`typedef T U;`) to the defining type.
+    fn follow<'a>(mut cur: &'a D, types: &'a HashMap<String, D>) -> Option<&'a D> {
+        for _ in 0..64 {
+            match cur {
+                D::TypeReference {
+                    name, dimensions, ..
+                } if dimensions.is_empty() => {
+                    cur = crate::compiler::elaborate::lookup_scoped_type(name, types)?;
+                }
+                _ => return Some(cur),
+            }
+        }
+        None
+    }
+    let mut cur = follow(dt, types)?;
+    let mut depth = 0usize;
+    for _ in 0..64 {
+        let D::TypeReference {
+            name, dimensions, ..
+        } = cur
+        else {
+            return None;
+        };
+        depth += dimensions.len();
+        let elem = follow(
+            crate::compiler::elaborate::lookup_scoped_type(name, types)?,
+            types,
+        )?;
+        match elem {
+            // The element is itself a packed array of a named type: an
+            // element of THAT array is one select deeper.
+            D::TypeReference { .. } => cur = elem,
+            D::IntegerAtom { .. } | D::IntegerVector { .. } | D::Enum(_) => {
+                return crate::compiler::elaborate::is_type_signed_resolved(elem, types)
+                    .then_some(depth);
+            }
+            D::Struct(su) if su.packed => {
+                return crate::compiler::elaborate::is_type_signed_resolved(elem, types)
+                    .then_some(depth);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
     Some(match name {
         "$countones"
@@ -31565,6 +26523,11 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
 
     fn const_i64(&mut self, e: &Expression) -> Option<i64> {
         self.0.fold_const_i64(e)
+    }
+
+    fn pattern_index(&mut self, e: &Expression, bounds: (i64, i64)) -> Option<i64> {
+        xezim_core::elaborate::const_eval_typed_pattern_index(e, self.0.params, bounds)
+            .or_else(|| self.0.fold_const_i64(e))
     }
 
     fn is_type_name(&mut self, name: &str) -> bool {

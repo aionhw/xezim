@@ -4,6 +4,172 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+// ═══════════════════════════════════════════════════════════════════════
+// Waveform exclusion (`--wave-suppress`)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Every scope option xezim offered was an INCLUDE list, so "dump the whole
+// design except the behavioural memories" could only be written as the
+// complement: hundreds of hand-maintained instance paths, only derivable from
+// a whole-design dump in the first place. The exclusion side is one line, and
+// it is the compact description of the same intent — a MODULE NAME for the
+// instances that share a definition, a PATH for the one subtree the user does
+// not care about. Both forms live in one list and one matcher, so VCD, FST and
+// XTrace cannot drift apart and give one design two different answers.
+
+/// One `--wave-suppress` entry, resolved against the elaborated instance tree.
+#[derive(Clone, Debug)]
+pub(crate) struct SuppressedScope {
+    /// The entry exactly as the user wrote it — every diagnostic names it back.
+    pub(crate) entry: String,
+    /// True when the entry names a MODULE definition rather than a path.
+    pub(crate) by_module: bool,
+    /// The top-relative instance paths the entry covers. A module entry expands
+    /// to every instance of that module — which is what turns 200 paths into
+    /// one line — while a path entry covers the one subtree it names.
+    pub(crate) paths: Vec<String>,
+    /// Signals the enumeration dropped under these paths.
+    pub(crate) dropped: usize,
+}
+
+/// The `--wave-suppress` list, applied inside `dump_signal_names` — the one
+/// enumeration all three dump formats share. Matching is a hash lookup per
+/// dotted prefix of a name (O(depth), never O(entries x signals)), and it runs
+/// while the names are being enumerated, so a suppressed subtree is never
+/// visited by the writer, the id tables, or the per-step change detection.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WaveSuppressor {
+    scopes: Vec<SuppressedScope>,
+    /// Top-relative instance path -> index into `scopes`. A name sits under a
+    /// suppressed subtree when the name itself (an excluded net) or one of its
+    /// dotted prefixes (an excluded instance, and everything below it) is here.
+    owner: HashMap<String, usize>,
+    /// Set when an entry names the TOP module: the whole design is excluded.
+    all: Option<usize>,
+}
+
+impl WaveSuppressor {
+    /// Which entry excludes `name`, and how much of `name` that match covers
+    /// (`0` = the whole design).  Every entry the name falls under is a
+    /// candidate, outermost first, and one that an explicit include re-admits
+    /// does not settle the question on its own: `--fst-scope top.u_h2` brings
+    /// `u_h2` back, yet the `probe` nested inside it is still excluded by the
+    /// entry that names the `probe` module.
+    fn owner_of(&self, name: &str, filters: Option<&[String]>) -> Option<(usize, usize)> {
+        let free = |plen: usize| match filters {
+            Some(fs) => !Self::readmitted(name, plen, fs),
+            None => true,
+        };
+        if let Some(i) = self.all {
+            if free(0) {
+                return Some((i, 0));
+            }
+        }
+        // A prefix that ends in element selects (`u_arr[1]`, `g[0]`) is
+        // also under an entry naming the array itself, and so is an element
+        // of an unpacked array variable (`mem[3]` under `mem`).
+        let covering = |end: usize| -> Option<(usize, usize)> {
+            let mut e = end;
+            loop {
+                if let Some(&i) = self.owner.get(&name[..e])
+                    && free(e)
+                {
+                    return Some((i, e));
+                }
+                if !name[..e].ends_with(']') {
+                    return None;
+                }
+                e = name[..e].rfind('[')?;
+            }
+        };
+        let mut cut = 0usize;
+        while let Some(p) = name[cut..].find('.') {
+            let end = cut + p;
+            if let Some(hit) = covering(end) {
+                return Some(hit);
+            }
+            cut = end + 1;
+        }
+        covering(name.len())
+    }
+
+    /// Include wins over exclude for an EXPLICIT request: a whitelist entry
+    /// that names a suppressed subtree, or something inside it, re-admits it.
+    /// Naming the whole design (`$dumpvars(0, tb_top)`, or no `--fst-scope` at
+    /// all) is not such a request — it never named the subtree.
+    fn readmitted(name: &str, plen: usize, filters: &[String]) -> bool {
+        let prefix = &name[..plen];
+        filters.iter().any(|f| {
+            f.len() >= plen
+                && f.starts_with(prefix)
+                // `top.u_h1` re-admits `top.u_h1`, `top.u_h1.a` and the
+                // element `top.u_h1[2]`, not `top.u_h10`.
+                && (f.len() == plen || matches!(f.as_bytes()[plen], b'.' | b'['))
+                // The request brings back what it names, not its siblings
+                // under the same entry.
+                && name
+                    .strip_prefix(f.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+        })
+    }
+
+    /// Whether `name` is excluded by the list, counting it against the entry
+    /// that excluded it.
+    fn excludes(&mut self, name: &str, filters: Option<&[String]>) -> bool {
+        let Some((idx, _)) = self.owner_of(name, filters) else {
+            return false;
+        };
+        if let Some(s) = self.scopes.get_mut(idx) {
+            s.dropped += 1;
+        }
+        true
+    }
+
+    /// One line per entry: what the exclusion cost the dump.  `whole_design`
+    /// says whether the INCLUDE side asked for everything (`$dumpvars(0,
+    /// tb_top)`, no `--fst-scope`); only then does an entry that matched
+    /// nothing mean a typo, so only then is it worth a warning.  With a
+    /// whitelist, an entry that never fired may simply have had nothing to do.
+    pub(crate) fn report(&self, tag: &str, whole_design: bool) {
+        for (idx, s) in self.scopes.iter().enumerate() {
+            let module = s.entry.strip_prefix("module:").unwrap_or(s.entry.as_str());
+            if s.dropped == 0 {
+                // An entry inside what an earlier entry already excludes
+                // had nothing left to match; that is no typo.
+                let covered = self.all.is_some_and(|i| i != idx)
+                    || s.paths.iter().any(|p| {
+                        self.owner_of(p, None).is_some_and(|(i, _)| i != idx)
+                            || self.owner.get(p).is_some_and(|&i| i != idx)
+                    });
+                if whole_design && !covered {
+                    eprintln!(
+                        "Warning: --wave-suppress '{}' matched no dumped signal",
+                        s.entry
+                    );
+                }
+            } else if self.all == Some(idx) {
+                eprintln!(
+                    "{} Suppressed {} signals under the top module '{}'",
+                    tag, s.dropped, module
+                );
+            } else if s.by_module {
+                eprintln!(
+                    "{} Suppressed {} signals under {} instance(s) of module '{}'",
+                    tag,
+                    s.dropped,
+                    s.paths.len(),
+                    module,
+                );
+            } else {
+                eprintln!(
+                    "{} Suppressed {} signals under scope '{}'",
+                    tag, s.dropped, s.entry
+                );
+            }
+        }
+    }
+}
+
 impl Simulator {
     // ═══════════════════════════════════════════════════════════════
     // VCD dump support ($dumpfile / $dumpvars)
@@ -51,8 +217,14 @@ impl Simulator {
         let top_dot = format!("{}.", top);
         let mut out = Vec::with_capacity(scopes.len());
         for s in scopes {
+            if s.is_empty() {
+                continue;
+            }
             if s == top {
-                return None;
+                // §21.7.1.2: depth applies independently to every scope.
+                // Keep the root alongside descendants instead of dropping them.
+                out.push(String::new());
+                continue;
             }
             out.push(
                 s.strip_prefix(top_dot.as_str())
@@ -61,6 +233,67 @@ impl Simulator {
             );
         }
         Some(out)
+    }
+
+    /// The `[N]` an indexed path segment carries in a signal-table name, or
+    /// `None` when the select is not a known integer the table could be named
+    /// by — an x/z index, a range, a non-constant expression.
+    fn dump_index_suffix(&mut self, index: &Expression) -> Option<String> {
+        Some(format!("[{}]", self.eval_expr(index).to_index()?))
+    }
+
+    /// Render a `$dumpvars` / `$fsdbDumpvars` argument into the dotted,
+    /// top-qualified spelling the signal table uses — the same spelling
+    /// `--fst-scope` takes as a raw string and `dump_name_selected` matches.
+    ///
+    /// The argument arrives as an EXPRESSION, and the parser does not keep an
+    /// indexed path inside `ExprKind::Ident`: `top.g[2].u` parses as
+    /// `MemberAccess(Index(Ident(top.g), 2), u)` and `top.vec[3]` as
+    /// `Index(Ident(top.vec), 3)`. Matching only `ExprKind::Ident` — all this
+    /// used to do — threw away every argument naming a generate-block instance
+    /// or an unpacked-array element, i.e. the only way to name ONE generated
+    /// instance, and did it silently: the filter list came back empty, which
+    /// means "no filter", and the run dumped the whole design.
+    ///
+    /// `None` means the argument is not a name at all (an arithmetic
+    /// expression, a part-select, a call). Callers must say so out loud rather
+    /// than drop it.
+    pub(super) fn dump_scope_arg(&mut self, e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.dump_scope_arg(inner),
+            ExprKind::Ident(hier) => {
+                // A package- or `$unit`-qualified root is not a signal-table
+                // path; `$root` is a marker the table's names do not carry.
+                if hier.root.is_some() {
+                    return None;
+                }
+                let skip_root =
+                    usize::from(hier.path.first().is_some_and(|s| s.name.name == "$root"));
+                let mut out = String::new();
+                for (i, seg) in hier.path.iter().enumerate().skip(skip_root) {
+                    if i > skip_root {
+                        out.push('.');
+                    }
+                    out.push_str(&seg.name.name);
+                    for sel in &seg.selects {
+                        out.push_str(&self.dump_index_suffix(sel)?);
+                    }
+                }
+                (!out.is_empty()).then_some(out)
+            }
+            ExprKind::Index { expr, index } => {
+                let mut base = self.dump_scope_arg(expr)?;
+                base.push_str(&self.dump_index_suffix(index)?);
+                Some(base)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let mut base = self.dump_scope_arg(expr)?;
+                base.push('.');
+                base.push_str(&member.name);
+                Some(base)
+            }
+            _ => None,
+        }
     }
 
     /// Whether a top-relative signal name is selected by a normalized filter
@@ -87,6 +320,9 @@ impl Simulator {
         match filters {
             None => level_ok(name),
             Some(fs) => fs.iter().any(|f| {
+                if f.is_empty() {
+                    return level_ok(name);
+                }
                 if name == f.as_str() {
                     return true;
                 }
@@ -101,6 +337,78 @@ impl Simulator {
         }
     }
 
+    /// Resolve `--wave-suppress` against the elaborated instance tree.
+    ///
+    /// Two matching rules, never ambiguous: an entry containing a `.` is a
+    /// hierarchical path — the top-module prefix is optional, because
+    /// `$dumpvars` users write it and `--fst-scope` users do not — and a bare
+    /// identifier is a MODULE name, matched against the definition of every
+    /// instance on the signal's path, so `mem_bank` covers all 200 banks
+    /// wherever they sit. `module:` (from `--wave-suppress-module`) forces the
+    /// module reading for an identifier that could also read as a path.
+    pub(super) fn wave_suppressor(&self) -> Option<WaveSuppressor> {
+        if self.wave_suppress.is_empty() {
+            return None;
+        }
+        let top = self.module.name.as_str();
+        let top_dot = format!("{}.", top);
+        // Module definition -> every instance path of it. One pass over the
+        // instance tree, so a module entry costs one lookup, not one scan per
+        // signal.
+        let mut instances_of: HashMap<&str, Vec<&str>> = HashMap::default();
+        for inst in &self.module.instances {
+            instances_of
+                .entry(inst.def_name.as_str())
+                .or_default()
+                .push(inst.path.as_str());
+        }
+        let mut s = WaveSuppressor::default();
+        for raw in &self.wave_suppress {
+            let text = raw.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let (by_module, body) = match text.strip_prefix("module:") {
+                Some(rest) => (true, rest.trim()),
+                None => (!text.contains('.'), text),
+            };
+            let idx = s.scopes.len();
+            let mut paths: Vec<String> = Vec::new();
+            // A bare name that is no module definition is a path below the
+            // top module, as a bare `--fst-scope` name is: an instance or a
+            // variable of the top module.
+            let by_module = by_module
+                && (text.starts_with("module:") || body == top || instances_of.contains_key(body));
+            if by_module {
+                if body == top {
+                    // Suppressing the top module excludes the whole design.
+                    s.all = Some(idx);
+                }
+                if let Some(v) = instances_of.get(body) {
+                    paths.extend(v.iter().map(|p| p.to_string()));
+                }
+            } else {
+                paths.push(
+                    body.strip_prefix(top_dot.as_str())
+                        .unwrap_or(body)
+                        .to_string(),
+                );
+            }
+            for p in &paths {
+                // First entry to claim a path owns its signals, so the report
+                // attributes each dropped name to exactly one entry.
+                s.owner.entry(p.clone()).or_insert(idx);
+            }
+            s.scopes.push(SuppressedScope {
+                entry: text.to_string(),
+                by_module,
+                paths,
+                dropped: 0,
+            });
+        }
+        Some(s)
+    }
+
     /// The objects a dump should carry, enumerated from the REAL signal table
     /// (`id_to_name`) rather than the lazily-synced `self.signals` mirror. That
     /// mirror is only filled by `sync_table_to_hashmap()` when `table_modified`
@@ -113,7 +421,26 @@ impl Simulator {
     /// stuck-at-x 1-bit wires beside their own scope), enum LITERALS (which
     /// `elaborate` registers as signals), and the base name of an unpacked array
     /// whose elements are dumped individually.
-    pub(super) fn dump_signal_names(&self, scopes: &[String], depth: u32) -> Vec<String> {
+    ///
+    /// `scopes`/`depth` are the INCLUDE side (`--fst-scope` + `LEVEL:`, or the
+    /// `$dumpvars` arguments): `None` means the whole design, `Some(list)` keeps
+    /// a name that is one of them or lives under one of them (one generated
+    /// or arrayed instance is named with its index, `tb_top.dut.genblk[3]`).
+    /// `depth` counts levels below the scope itself, so `depth == 1` keeps only
+    /// the scope's own variables; `0` means unlimited, and the writer applies
+    /// the writer's own depth limit.
+    ///
+    /// `sup` is the EXCLUDE side (`--wave-suppress`), owned by the caller so it
+    /// can print `WaveSuppressor::report` once the enumeration is done; `None`
+    /// enumerates the whole design, which is what the unmatched-`--fst-scope`
+    /// diagnostic needs — a scope whose signals are merely suppressed is not a
+    /// typo.
+    pub(super) fn dump_signal_names(
+        &self,
+        scopes: &[String],
+        depth: u32,
+        mut sup: Option<&mut WaveSuppressor>,
+    ) -> Vec<String> {
         let filters = Self::dump_filter_prefixes(&self.module.name, scopes);
 
         // Enum literals (`RED`/`GRN`/`BLU`) are registered as signals by
@@ -185,24 +512,68 @@ impl Simulator {
         }
 
         let mut out: Vec<String> = Vec::new();
+        // Imported parameters are lookup aliases, not declarations in this
+        // module (§26.3). Keep local declarations, including their elements.
+        let parameter_alias = |name: &str| {
+            let mut base = name;
+            let mut alias = false;
+            loop {
+                if self.module.declared_parameters.contains(base) {
+                    return false;
+                }
+                if self.module.parameters.contains_key(base)
+                    || self.module.param_decl_types.contains_key(base)
+                {
+                    alias = true;
+                }
+                let Some(end) = base.rfind(['[', '.']) else { return alias; };
+                base = &base[..end];
+            }
+        };
         let keep = |name: &str| -> bool {
             !(name.is_empty()
+                || parameter_alias(name)
                 || enum_lits.contains(name)
                 || scope_names.contains(name)
                 || expanded_bases.contains(name)
+                // Syntax 21-20 (§21.7.2.1) uses reference identifiers (§5.6),
+                // naming the variable in its model scope (§21.7.2.3 d)).
+                // Check the exact parameter key: a same-named variable can
+                // change an alias's dump kind. After the last ::, a dot
+                // keeps members and parameters below escaped scopes
+                // (§5.6.1), and [ keeps array elements on their existing
+                // path (§7.4), including real-valued elements.
+                // Own escaped parameters (§5.6.1) with neither . nor [ after
+                // the last :: (\p::W, \a.b::c) are also left out of VCD, FST
+                // and XTrace; \a::b.c and \a::b[0] are kept.
+                || (name.contains(':')
+                    && name
+                        .rsplit_once("::")
+                        .is_some_and(|(_, leaf)| !leaf.contains(['.', '[']))
+                    && self.module.parameters.contains_key(name))
                 || xezim_core::elaborate::is_delay_stage_net(name)
                 || event_bits::is_edge_alias_net(name))
                 && Self::dump_name_selected(name, filters.as_deref(), depth)
         };
+        let mut excluded = |name: &str| -> bool {
+            match sup.as_deref_mut() {
+                Some(s) => s.excludes(name, filters.as_deref()),
+                None => false,
+            }
+        };
+        // Pruned HERE, while the names are being enumerated: a suppressed
+        // subtree never reaches the writer, the identifier tables, or the
+        // per-step change detection, which is what keeps an excluded dump
+        // cheaper than an unfiltered one instead of merely smaller.
         for name in stored() {
-            if keep(name) {
+            if keep(name) && !excluded(name) {
                 out.push(name.to_string());
             }
         }
         for &(base, lo, hi) in &virtual_arrays {
             for idx in lo..=hi {
                 let name = format!("{}[{}]", base, idx);
-                if keep(&name) {
+                if keep(&name) && !excluded(&name) {
                     out.push(name);
                 }
             }
@@ -210,6 +581,20 @@ impl Simulator {
         out.sort();
         out.dedup();
         out
+    }
+
+    /// Did the INCLUDE side ask for the whole design — no scope list at all,
+    /// or only the top module (`$dumpvars(0, tb_top)`)?  `WaveSuppressor::report`
+    /// uses this to decide whether an entry that matched nothing is worth a
+    /// warning: against a whitelist the entry may simply have had nothing to do.
+    fn dump_covers_whole_design(&self, scopes: &[String]) -> bool {
+        scopes.is_empty()
+            || scopes.iter().all(|s| {
+                // An FST scope may carry its `LEVEL:` prefix; `0:top` is as
+                // much a whole-design request as `top` is.
+                let (_, scope) = Self::fst_scope_depth(s);
+                scope == self.module.name.as_str() || scope.is_empty()
+            })
     }
 
     /// The signal-table entry that BACKS each dumped name.
@@ -464,12 +849,47 @@ impl Simulator {
             }
         };
 
-        let sig_names = self.dump_signal_names(&self.vcd_filter_scopes, self.vcd_dump_depth);
+        // `--wave-suppress` is applied by the enumeration itself, then reported
+        // per entry so the user sees what the exclusion cost — and which entry
+        // never matched anything.
+        let mut sup = self.wave_suppressor();
+        let mut sig_names = if self.vcd_dump_none {
+            Vec::new()
+        } else {
+            self.dump_signal_names(&self.vcd_filter_scopes, self.vcd_dump_depth, sup.as_mut())
+        };
+        // §21.7.1.2: the objects of every `$dumpvars` call made at the start
+        // time, each with its own depth.
+        let mut earlier = String::new();
+        for (scopes, depth) in &self.vcd_earlier_selections {
+            sig_names.extend(self.dump_signal_names(scopes, *depth, sup.as_mut()));
+            earlier.push_str(&format!("; filter_scopes={:?}, depth={}", scopes, depth));
+        }
+        if !self.vcd_earlier_selections.is_empty() {
+            sig_names.sort();
+            sig_names.dedup();
+        }
+        if let Some(s) = &sup {
+            // The arguments named no object, so nothing was enumerated and the
+            // entries never had a chance to match.
+            if !self.vcd_dump_none {
+                let whole = self.vcd_dump_depth == 0
+                    && self.dump_covers_whole_design(&self.vcd_filter_scopes);
+                s.report("[VCD]", whole);
+            }
+        }
         eprintln!(
-            "[VCD] dumping {} signals (filter_scopes={:?}, depth={})",
+            "[VCD] dumping {} signals ({}, depth={}{})",
             sig_names.len(),
-            self.vcd_filter_scopes,
-            self.vcd_dump_depth
+            // `filter_scopes=[]` alone cannot tell "no filter was given" from
+            // "every filter was thrown away" — say which.
+            if self.vcd_dump_none {
+                "no $dumpvars argument named a scope or variable".to_string()
+            } else {
+                format!("filter_scopes={:?}", self.vcd_filter_scopes)
+            },
+            self.vcd_dump_depth,
+            earlier
         );
 
         // Assign VCD identifier codes. Codes are Arc<str> so the per-change
@@ -706,6 +1126,7 @@ impl Simulator {
         self.vcd_var_kinds = kinds;
         self.vcd_prev_signals = prev;
         self.vcd_writer = Some(w);
+        self.vcd_start_time = self.time;
         self.vcd_enabled = true;
         self.vcd_bytes = 0;
         self.vcd_limit_hit = false;
@@ -1242,7 +1663,14 @@ impl Simulator {
         // is empty unless something dirtied the table first) and the same
         // top-relative scope normalization, so `--xtrace-scope top.u_sub` and
         // `--xtrace-scope u_sub` both match. Sorted for deterministic IDs.
-        let sig_names: Vec<String> = self.dump_signal_names(&self.xtrace_scopes, 0);
+        let mut sup = self.wave_suppressor();
+        let sig_names: Vec<String> = self.dump_signal_names(&self.xtrace_scopes, 0, sup.as_mut());
+        if let Some(s) = &sup {
+            s.report(
+                "[XTrace]",
+                self.dump_covers_whole_design(&self.xtrace_scopes),
+            );
+        }
         if !self.xtrace_scopes.is_empty() {
             eprintln!(
                 "[XTrace] dumping {} signals (scopes={})",
@@ -1856,8 +2284,11 @@ impl Simulator {
         // A scope may carry a depth, `LEVEL:SCOPE` (§21.7.1.4: 0 = every
         // level below the scope, N = N levels starting at it). Scopes with the
         // same depth are selected together; the union keeps first-seen order.
-        let mut sig_names: Vec<String> = if self.fst_scopes.is_empty() {
-            self.dump_signal_names(&self.fst_scopes, 0)
+        let mut sup = self.wave_suppressor();
+        let mut sig_names: Vec<String> = if self.fst_dump_none {
+            Vec::new()
+        } else if self.fst_scopes.is_empty() {
+            self.dump_signal_names(&self.fst_scopes, 0, sup.as_mut())
         } else {
             let mut groups: Vec<(u32, Vec<String>)> = Vec::new();
             for sc in &self.fst_scopes {
@@ -1870,7 +2301,9 @@ impl Simulator {
             let mut seen: HashSet<String> = HashSet::default();
             let mut out = Vec::new();
             for (depth, scopes) in &groups {
-                for n in self.dump_signal_names(scopes, *depth) {
+                // One suppressor shared by every depth group, so the report
+                // below covers the whole dump.
+                for n in self.dump_signal_names(scopes, *depth, sup.as_mut()) {
                     if seen.insert(n.clone()) {
                         out.push(n);
                     }
@@ -1902,6 +2335,13 @@ impl Simulator {
             sig_names.len(),
             self.fst_scopes.len()
         );
+        if let Some(s) = &sup {
+            // `$fsdbDumpvars` named no usable argument, so nothing was
+            // enumerated and the entries never had a chance to match.
+            if !self.fst_dump_none {
+                s.report("[FST]", self.dump_covers_whole_design(&self.fst_scopes));
+            }
+        }
 
         // Name every `--fst-scope` that selected nothing. The common cause is a
         // generate block: the scopes are `gen[0]`/`gen[1]`, so a bare
@@ -1914,8 +2354,11 @@ impl Simulator {
                 .map(|sc| Self::fst_scope_depth(sc).1.to_string())
                 .collect();
             for sc in &scopes {
+                // Unsuppressed: a scope whose signals are merely excluded by
+                // `--wave-suppress` is not a typo, so it must not be reported
+                // as one.
                 if !self
-                    .dump_signal_names(std::slice::from_ref(sc), 0)
+                    .dump_signal_names(std::slice::from_ref(sc), 0, None)
                     .is_empty()
                 {
                     continue;
@@ -1924,7 +2367,7 @@ impl Simulator {
                 // exists, so a plain typo is not told to add "[0]".
                 let indexed = format!("{}[0]", sc);
                 if !self
-                    .dump_signal_names(std::slice::from_ref(&indexed), 0)
+                    .dump_signal_names(std::slice::from_ref(&indexed), 0, None)
                     .is_empty()
                 {
                     eprintln!(

@@ -831,6 +831,60 @@ impl Simulator {
     /// (`left`, `right`): a fixed unpacked array (`[7:0]` gives 7, 0), a
     /// dynamic array or queue (0 .. size-1, empty when size is 0), or any
     /// other expression as a one-element array.
+    fn dpi_is_known_open_array(&self, name: &str) -> bool {
+        self.module.arrays.contains_key(name)
+            || self.dpi_multi_dim_shape(name).is_some()
+            || self.dpi_open_array_live_size(name).is_some()
+    }
+
+    /// Resolve an open-array DPI actual expression to its storage key (§35.5.6.1).
+    /// Handles bare class members in methods, `h.m` / `this.m`, collection/member
+    /// operands (`c.d`, `c.q`, packages), and plain/hierarchical identifiers.
+    fn dpi_open_array_actual_name(&mut self, expr: &Expression) -> Option<String> {
+        let plain = match &expr.kind {
+            ExprKind::Ident(hier) => Some(self.resolve_hier_name(hier)),
+            _ => None,
+        };
+        if let Some(ref p) = plain
+            && let ExprKind::Ident(hier) = &expr.kind
+            && hier.path.len() == 1
+            && hier.root.is_none()
+            && hier.path[0].selects.is_empty()
+            && let Some(cand) = self.instance_assoc_member(p)
+            && self.dpi_is_known_open_array(&cand)
+        {
+            return Some(cand);
+        }
+        if let Some(cand) = self.handle_member_array_name(expr)
+            && self.dpi_is_known_open_array(&cand)
+        {
+            return Some(cand);
+        }
+        if let Some(cand) = self.array_operand_name(expr)
+            && self.dpi_is_known_open_array(&cand)
+        {
+            return Some(cand);
+        }
+        plain
+            .map(std::borrow::Cow::into_owned)
+            .filter(|p| self.dpi_is_known_open_array(p))
+    }
+
+    fn dpi_open_array_fallback_is_scalar(&mut self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => self.cmp_name_scalar(h),
+            ExprKind::MemberAccess { .. }
+            | ExprKind::Range(..)
+            | ExprKind::RangeSelect { .. }
+            | ExprKind::AssignmentPattern(_) => false,
+            ExprKind::Index { index, .. } => {
+                !matches!(index.kind, ExprKind::Range(..) | ExprKind::RangeSelect { .. })
+            }
+            ExprKind::Paren(inner) => self.dpi_open_array_fallback_is_scalar(inner),
+            _ => true,
+        }
+    }
+
     pub(super) fn dpi_collect_open_array(
         &mut self,
         expr: Option<&Expression>,
@@ -838,8 +892,7 @@ impl Simulator {
         let Some(e) = expr else {
             return (Vec::new(), vec![(0, -1)]);
         };
-        if let ExprKind::Ident(hier) = &e.kind {
-            let name = self.resolve_hier_name(hier);
+        if let Some(name) = self.dpi_open_array_actual_name(e) {
             // §35.5.6.1: a multi-dimensional actual (`int a[2][3]`) — every
             // element, row-major.
             if let Some(shape) = self.dpi_multi_dim_shape(&name) {
@@ -856,13 +909,13 @@ impl Simulator {
             // A dynamic array or queue also has a `module.arrays` entry, but
             // its range is storage capacity: the live size bounds it.
             let live = self.dpi_open_array_live_size(&name);
-            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&*name).copied() {
+            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&name).copied() {
                 let hi = live.map_or(hi, |n| lo + n as i64 - 1);
                 let mut out = Vec::with_capacity((hi - lo + 1).max(0) as usize);
                 // Compact-resolver fast path: if the array is in
                 // array_first_id, walk the contiguous id range with no
                 // per-element name allocation.
-                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_ref()) {
+                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_str()) {
                     for off in 0..(hi - lo + 1).max(0) as usize {
                         out.push(self.cell_read(first_id + off));
                     }
@@ -881,7 +934,7 @@ impl Simulator {
                     }
                 }
                 let (left, right) =
-                    if live.is_none() && self.module.descending_arrays.contains(&*name) {
+                    if live.is_none() && self.module.descending_arrays.contains(&name) {
                         (hi, lo)
                     } else {
                         (lo, hi)
@@ -902,6 +955,20 @@ impl Simulator {
         // is an unpacked array value — every element, not just the last.
         if let Some(r) = self.dpi_collect_pattern(e) {
             return r;
+        }
+        if !self.dpi_open_array_fallback_is_scalar(e) {
+            let key = format!("dpi_open_array:{}:{}", e.span.start, e.span.end);
+            if !self.warned_system_tasks.contains(&key) {
+                let sf = self.stall_pid_src_file(self.current_pid);
+                let msg = match self.span_file_line_in(e.span, sf) {
+                    Some(loc) => format!(
+                        "[xezim][warning] DPI open-array actual at {} could not be resolved as an unpacked array; falling back to 1-element scalar (§35.5.6.1)",
+                        loc
+                    ),
+                    None => "[xezim][warning] DPI open-array actual could not be resolved as an unpacked array; falling back to 1-element scalar (§35.5.6.1)".to_string(),
+                };
+                self.warn_system_task_once(&key, &msg);
+            }
         }
         (vec![self.eval_expr(e)], vec![(0, 0)])
     }
@@ -986,18 +1053,21 @@ impl Simulator {
     /// The element count of a dynamic array or queue actual; None for a
     /// fixed-size array.
     pub(super) fn dpi_open_array_live_size(&self, name: &str) -> Option<u64> {
-        (self.module.dynamic_arrays.contains(name)
-            || self
-                .signals
-                .contains_key(&Self::name_with_suffix(name, ".size")))
+        let is_fixed = self.module.arrays.contains_key(name)
+            && !self.module.dynamic_arrays.contains(name)
+            && !self.module.queue_vars.contains(name);
+        (!is_fixed
+            && (self.module.dynamic_arrays.contains(name)
+                || self
+                    .signals
+                    .contains_key(&Self::name_with_suffix(name, ".size"))))
         .then(|| self.get_queue_size(name))
     }
 
     /// Write an output open array back to its actual, element by element
     /// in the order `dpi_collect_open_array` read them.
     pub(super) fn dpi_writeback_open_array(&mut self, expr: &Expression, data: &[Value]) {
-        if let ExprKind::Ident(hier) = &expr.kind {
-            let name = self.resolve_hier_name(hier);
+        if let Some(name) = self.dpi_open_array_actual_name(expr) {
             if let Some(shape) = self.dpi_multi_dim_shape(&name) {
                 let elem_w = self.dpi_multi_dim_elem_width(&name);
                 for (en, d) in Self::dpi_multi_dim_names(&name, &shape).iter().zip(data) {
@@ -1011,7 +1081,7 @@ impl Simulator {
                 return;
             }
             let live = self.dpi_open_array_live_size(&name);
-            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&*name).copied() {
+            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&name).copied() {
                 let hi = live.map_or(hi, |n| lo + n as i64 - 1);
                 let elem_w = elem_w.max(1) as u32;
                 let fit = |v: &Value| {
@@ -1022,7 +1092,7 @@ impl Simulator {
                     }
                 };
                 // Compact-resolver fast path.
-                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_ref()) {
+                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_str()) {
                     for (off, d) in data.iter().enumerate().take((hi - lo + 1).max(0) as usize) {
                         let id = first_id + off;
                         let mut val = fit(d);

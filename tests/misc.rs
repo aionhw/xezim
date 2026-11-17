@@ -481,6 +481,12 @@ mod process_status_name;
 mod pure_fn_loops_compiled;
 #[path = "misc/queue_ref_formal_shadowing.rs"]
 mod queue_ref_formal_shadowing;
+#[path = "misc/ref_formal_actual_storage.rs"]
+mod ref_formal_actual_storage;
+#[path = "misc/ref_formal_struct_union_elements.rs"]
+mod ref_formal_struct_union_elements;
+#[path = "misc/rare_constraint_branches.rs"]
+mod rare_constraint_branches;
 #[path = "misc/recursive_function_in_continuous_assign.rs"]
 mod recursive_function_in_continuous_assign;
 #[path = "misc/ref_args_alias.rs"]
@@ -650,3 +656,11 @@ mod urandom_seed_input_1058;
 mod oom_trace;
 #[path = "misc/scope_randomize_without_std.rs"]
 mod scope_randomize_without_std;
+#[path = "misc/interconnect_array_drivers_1098.rs"]
+mod interconnect_array_drivers_1098;
+#[path = "misc/replication_signedness_1095.rs"]
+mod replication_signedness_1095;
+#[path = "misc/localparam_self_determined_1143.rs"]
+mod localparam_self_determined_1143;
+#[path = "misc/comb_timescale.rs"]
+mod comb_timescale;

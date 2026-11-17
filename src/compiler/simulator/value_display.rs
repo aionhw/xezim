@@ -549,7 +549,16 @@ impl Simulator {
             return Some(p.data_type.clone());
         }
         for st in &td.items {
-            if let StatementKind::VarDecl { data_type, declarators, .. } = &st.kind
+            if let StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            }
+            | StatementKind::ParamDecl {
+                data_type,
+                declarators,
+                ..
+            } = &st.kind
                 && declarators.iter().any(|d| d.name.name == name)
             {
                 return Some(data_type.clone());

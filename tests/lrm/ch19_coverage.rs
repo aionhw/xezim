@@ -5,8 +5,6 @@ use crate::harness::{Order, check};
 // §19.6.1, §19.6.2, §19.6.3: cross coverage, binsof, intersect
 #[test]
 fn c19_6_cross_coverage() {
-    // Known gap (§19.5.1): `19.5.1` reference `with 75.00`, xezim `with 62.50`
-    // Known gap (§19.5): `19.5` reference `total 77.98`, xezim `total 76.42`
     check(
         "c19_bins2",
         include_str!("sv/c19_bins2.sv"),
@@ -14,13 +12,49 @@ fn c19_6_cross_coverage() {
         Order::Exact,
         &[
             "T|19.5.1|wildcard 100.00",
+            "T|19.5.1|with 75.00",
             "T|19.5.2|transitions 62.50",
             "T|19.5|fixed split 100.00",
             "T|19.5.5|ignore auto 75.00",
             "T|19.6|cross sel 83.33",
             "T|19.6.1|cross with 28.00",
+            "T|19.5|total 77.98",
         ],
-        &["T|19.5.1|with ", "T|19.5|total 7"],
+        &[],
+    );
+}
+
+// §19.5.1.1: a `with` filter on value bins, including a filter over a
+// 32-bit range; ignoring the filter gives enc4 83.33 and enc32 17.65.
+#[test]
+fn c19_bins_with_filter() {
+    check(
+        "c19_bins_with",
+        include_str!("sv/c19_bins_with.sv"),
+        "c19_bins_with",
+        Order::Exact,
+        &[
+            "T|enc4|100.00",
+            "T|enc32|11.76",
+            "T|even|12.50",
+            "T|odd_2|0.00",
+            "T|odd_3|50.00",
+            "T|ign|50.00",
+            "T|red|33.33",
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn c19_bins_with_filter_guards() {
+    check(
+        "c19_bins_with_filter_guards",
+        include_str!("sv/c19_bins_with_filter_guards.sv"),
+        "c19_bins_with_filter_guards",
+        Order::Exact,
+        &["T|div0|100.00", "T|wide|25.00"],
+        &[],
     );
 }
 

@@ -488,6 +488,24 @@ impl Simulator {
                 "St"
             }
         }
+        // §10.6.2: a force overrides every driver of the net, so the net
+        // shows the forced value and the forced strength. The force
+        // statement carries no strength of its own, so the forced drive is
+        // strong (§28.7 default). The names of one alias group share the
+        // net's storage, so they share the force too (§10.11).
+        if let ExprKind::Ident(h) = &arg.kind {
+            let name = self.resolve_hier_name(h).into_owned();
+            if let Some(&id) = self.signal_name_to_id.get(name.as_str())
+                && let Some(fv) = self.forced_signals.get(&id)
+            {
+                return match fv.get_bit(0) {
+                    LogicBit::One => "St1".to_string(),
+                    LogicBit::Zero => "St0".to_string(),
+                    LogicBit::Z => "HiZ".to_string(),
+                    LogicBit::X => "StX".to_string(),
+                };
+            }
+        }
         // §28.12: a net several drivers resolve reports the strength they
         // resolve to (bit 0, like the value letter below).
         if let ExprKind::Ident(h) = &arg.kind
@@ -690,6 +708,25 @@ impl Simulator {
     /// enum and union properties would need the elaboration-time typedef
     /// table, which is not reachable here, so they keep the elaborated width
     /// rather than risk a wrong one.
+    pub(super) fn class_chain_has_value_params(&self, start_class: &str) -> bool {
+        let mut cur = Some(start_class);
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(c) = self.module.classes.get(cn) else {
+                break;
+            };
+            if c.param_order.iter().any(|p| !c.type_param_names.contains(p)) {
+                return true;
+            }
+            cur = c.extends.as_deref();
+        }
+        false
+    }
+
     pub(super) fn respec_packed_width(
         &self,
         decl_class: &str,
@@ -714,6 +751,10 @@ impl Simulator {
                 .or_default()
                 .insert(prop.to_string(), v);
         };
+        if !self.class_chain_has_value_params(decl_class) {
+            note(false);
+            return None;
+        }
         let cd = self.module.classes.get(decl_class)?;
         let dt = self.class_prop_decl_type(cd, prop);
         let dims = match dt {
@@ -955,21 +996,25 @@ impl Simulator {
             return None;
         }
         // `respec_packed_width` answers only for a range that is not constant
-        // on its own (its classification, without the instance).
-        let respec = self.module.classes.get(cn.as_str()).is_none_or(|c| {
-            let dims = match self.class_prop_decl_type(c, prop) {
-                Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {
-                    dimensions
-                }
-                Some(DataType::Implicit { dimensions, .. }) if !dimensions.is_empty() => dimensions,
-                _ => return false,
-            };
-            dims.iter().any(|d| {
-                matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
-                    if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
-                        || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
-            })
-        });
+        // on its own (its classification, without the instance) when the
+        // declaring class chain actually has value parameters.
+        let respec = self.class_chain_has_value_params(cn.as_str())
+            && self.module.classes.get(cn.as_str()).is_none_or(|c| {
+                let dims = match self.class_prop_decl_type(c, prop) {
+                    Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {
+                        dimensions
+                    }
+                    Some(DataType::Implicit { dimensions, .. }) if !dimensions.is_empty() => {
+                        dimensions
+                    }
+                    _ => return false,
+                };
+                dims.iter().any(|d| {
+                    matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
+                        if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
+                            || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
+                })
+            });
         if respec {
             return None;
         }

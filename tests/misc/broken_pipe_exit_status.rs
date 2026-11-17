@@ -198,11 +198,12 @@ fn invalid_sdf_keeps_its_failing_status_on_a_closed_pipe() {
     }
 }
 
-/// §8.4: a null-receiver diagnostic must retain its failing status.
+/// §8.4: a null-receiver diagnostic (a virtual method) must retain its
+/// failing status.
 #[test]
 fn null_receiver_keeps_its_failing_status_on_a_closed_pipe() {
     let src = format!(
-        "class handler;\nfunction void act(); endfunction\nendclass\n\
+        "class handler;\nvirtual function void act(); endfunction\nendclass\n\
          module t;\nhandler h;\ninitial begin\n{LINES}\n#1 h.act();\n$finish;\nend\nendmodule"
     );
     for stack in [None, Some("0")] {

@@ -345,6 +345,11 @@ impl Simulator {
                 data_type: DataType::TypeReference { name: tn, .. },
                 declarators,
                 ..
+            }
+            | StatementKind::ParamDecl {
+                data_type: DataType::TypeReference { name: tn, .. },
+                declarators,
+                ..
             } = &st.kind
                 && declarators.iter().any(|d| d.dimensions.is_empty())
             {
@@ -523,10 +528,24 @@ impl Simulator {
                 *owners.entry(base).or_default() += 1;
             }
         }
+        let package_arrays: HashSet<&str> = module
+            .pkg_var_decls
+            .keys()
+            .filter_map(|key| {
+                (module.arrays.contains_key(key)
+                    || module.arrays_2d.contains_key(key)
+                    || module.arrays_nd.contains_key(key)
+                    || module.dynamic_arrays.contains(key)
+                    || module.associative_arrays.contains_key(key))
+                .then(|| key.split_once("::").map(|(_, leaf)| leaf))
+                .flatten()
+            })
+            .collect();
         let contested: HashSet<String> = owners
             .into_iter()
             .filter(|(base, n)| {
                 *n >= 2
+                    || package_arrays.contains(*base)
                     || module.wildcard_shadowed.contains(*base)
                     || module.foreign_displaced.contains(*base)
                     // A package first hoisted after the local declaration
@@ -630,7 +649,10 @@ impl Simulator {
         use crate::ast::types::{SimpleType, UnpackedDimension as UD};
         let mut classes: Vec<String> = module.classes.keys().cloned().collect();
         classes.sort();
-        let params = module.parameters.clone();
+        // Borrow the live parameter table (only read for const bounds here);
+        // the sole writer in this function is `module.classes`, a disjoint
+        // field, so no copy is needed.
+        let params = &module.parameters;
         for cn in classes {
             let Some(cd) = module.classes.get(&cn) else {
                 continue;
@@ -682,7 +704,7 @@ impl Simulator {
                         // (see `static_fixed_arrays` in elaborate.rs).
                         Some(UD::Expression { expr, .. }) => {
                             if let Some(n) =
-                                super::elaborate::const_eval_i64_with_params(expr, Some(&params))
+                                super::elaborate::const_eval_i64_with_params(expr, Some(params))
                             {
                                 if n > 0 {
                                     cd.static_fixed_arrays.push((pname, 0, n - 1, w));
@@ -691,8 +713,8 @@ impl Simulator {
                         }
                         Some(UD::Range { left, right, .. }) => {
                             if let (Some(l), Some(r)) = (
-                                super::elaborate::const_eval_i64_with_params(left, Some(&params)),
-                                super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                                super::elaborate::const_eval_i64_with_params(left, Some(params)),
+                                super::elaborate::const_eval_i64_with_params(right, Some(params)),
                             ) {
                                 cd.static_fixed_arrays.push((pname, l.min(r), l.max(r), w));
                             }
@@ -708,8 +730,8 @@ impl Simulator {
                         .iter()
                         .map(|dm| match dm {
                             UD::Range { left, right, .. } => match (
-                                super::elaborate::const_eval_i64_with_params(left, Some(&params)),
-                                super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                                super::elaborate::const_eval_i64_with_params(left, Some(params)),
+                                super::elaborate::const_eval_i64_with_params(right, Some(params)),
                             ) {
                                 (Some(l), Some(r)) => Some((l.min(r), l.max(r))),
                                 _ => None,
@@ -717,7 +739,7 @@ impl Simulator {
                             UD::Expression { expr, .. } => {
                                 match super::elaborate::const_eval_i64_with_params(
                                     expr,
-                                    Some(&params),
+                                    Some(params),
                                 ) {
                                     Some(n) if n > 0 => Some((0, n - 1)),
                                     _ => None,
@@ -751,7 +773,7 @@ impl Simulator {
                         let cap = max_size
                             .as_ref()
                             .and_then(|e| {
-                                super::elaborate::const_eval_i64_with_params(e, Some(&params))
+                                super::elaborate::const_eval_i64_with_params(e, Some(params))
                             })
                             .map(|n| (n + 1).max(1) as u32);
                         cd.queue_properties.insert(pname, (w, cap));
@@ -760,7 +782,7 @@ impl Simulator {
                         cd.queue_properties.insert(pname, (w, None));
                     }
                     Some(UD::Expression { expr, .. }) => {
-                        match super::elaborate::const_eval_i64_with_params(expr, Some(&params)) {
+                        match super::elaborate::const_eval_i64_with_params(expr, Some(params)) {
                             Some(n) if n > 0 => {
                                 cd.array_properties.insert(pname, (0, n - 1, w));
                             }
@@ -771,8 +793,8 @@ impl Simulator {
                     }
                     Some(UD::Range { left, right, .. }) => {
                         if let (Some(l), Some(r)) = (
-                            super::elaborate::const_eval_i64_with_params(left, Some(&params)),
-                            super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                            super::elaborate::const_eval_i64_with_params(left, Some(params)),
+                            super::elaborate::const_eval_i64_with_params(right, Some(params)),
                         ) {
                             cd.array_properties.insert(pname, (l.min(r), l.max(r), w));
                         }
@@ -808,7 +830,7 @@ impl Simulator {
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
-                Value::from_str_radix(value, r, w).to_u64()
+                Value::from_literal_text(value, r, w).to_u64()
             }
             ExprKind::Paren(inner) => Self::const_expr_u64(inner, params),
             ExprKind::Ident(h) => params
@@ -1715,6 +1737,63 @@ impl Simulator {
         let phase_materialize = crate::WallTimer::now();
         Self::materialize_implicit_contassign_nets(&mut module);
         event_bits::complete_ascending_ranges(&mut module);
+        // §26.3: the runtime bare-name resolver may qualify an in-scope
+        // reference to a package parameter/variable as `pkg::name`, while
+        // packed geometry is registered under the bare name and the dot
+        // spelling the bytecode compiler uses (`pkg.name`). Mirror the
+        // geometry onto the `pkg::name` key so `pkg::Q[i]` reads slice an
+        // ELEMENT instead of degenerating to a flat bit-select
+        // (`packed_package_parameter_element`). Only for keys backed by a
+        // `::`-qualified parameter, so module-scoped dotted signals are
+        // untouched.
+        {
+            let colon_keys: Vec<String> = module
+                .parameters
+                .keys()
+                .filter(|k| k.contains("::"))
+                .map(|k| k.replace("::", "."))
+                .collect();
+            for dotted in colon_keys {
+                if let Some(&ew) = module.packed_signal_elem_widths.get(&dotted).or_else(|| {
+                    dotted
+                        .rfind('.')
+                        .and_then(|i| module.packed_signal_elem_widths.get(&dotted[i + 1..]))
+                }) {
+                    let colon = dotted.replace('.', "::");
+                    module.packed_signal_elem_widths.insert(colon, ew);
+                }
+                // The full multi-dim bounds must match the ELEM WIDTH source,
+                // so resolve the same (exact-then-bare) way.
+                if let Some(fd) = module
+                    .packed_full_dims
+                    .get(&dotted)
+                    .or_else(|| {
+                        dotted
+                            .rfind('.')
+                            .and_then(|i| module.packed_full_dims.get(&dotted[i + 1..]))
+                    })
+                    .cloned()
+                {
+                    module.packed_full_dims.insert(dotted.replace('.', "::"), fd);
+                }
+                // `var_decl_types` is consulted alongside geometry for struct
+                // members; mirror it the same way.
+                if let Some(dt) = module
+                    .var_decl_types
+                    .get(&dotted)
+                    .or_else(|| {
+                        dotted
+                            .rfind('.')
+                            .and_then(|i| module.var_decl_types.get(&dotted[i + 1..]))
+                    })
+                    .cloned()
+                {
+                    module
+                        .var_decl_types
+                        .insert(dotted.replace('.', "::"), dt);
+                }
+            }
+        }
         // §7.8: the packed type of an associative array describes its
         // ELEMENTS; the array's name is never a packed vector itself. These
         // two maps make the name read and write as one (`p[1]` of
@@ -2672,7 +2751,10 @@ impl Simulator {
         }
         // §10.11 alias unification: repoint each aliased name at the
         // canonical net's slot — ONE storage, N names. Width agreement was
-        // checked at elaboration.
+        // checked at elaboration. This runs BEFORE the identity port-net
+        // collapse (see below): the collapse re-points a name it merges onto
+        // the slot the name has NOW, so a name that lands on an alias
+        // member lands on the group's slot too.
         for (canon, other) in module.alias_pairs.iter() {
             let (Some(&cid), Some(&oid)) = (
                 signal_name_to_id.get(canon.as_str()),
@@ -3122,6 +3204,9 @@ impl Simulator {
                 // needs this — same shape as the §6.11.1 signedness loop.
                 if super::elaborate::is_type_real_resolved(dt, &module.typedef_types) {
                     for id in first_id..signal_table.len() {
+                        // §6.8, Table 6-7: real/shortreal cells start at real
+                        // 0.0; the value tag must agree with the metadata.
+                        signal_table[id] = Value::from_f64(0.0);
                         signal_real_vec[id] = true;
                     }
                 }
@@ -3145,7 +3230,11 @@ impl Simulator {
                 }
                 let n = (hi - lo + 1).max(0) as usize;
                 for id in first_id..first_id + n {
-                    signal_table[id] = Value::zero(signal_widths_vec[id]);
+                    // Reals also occur in two_state_signals; keep their
+                    // typed 0.0 from the real-inheritance loop (§6.8).
+                    if !signal_real_vec[id] {
+                        signal_table[id] = Value::zero(signal_widths_vec[id]);
+                    }
                 }
             }
         }
@@ -3314,6 +3403,7 @@ impl Simulator {
                 super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
                 }
             }
@@ -3377,6 +3467,7 @@ impl Simulator {
                 super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
                 }
             }
@@ -3397,7 +3488,7 @@ impl Simulator {
             }
             let prefix = format!("{}[", base);
             for (name, &id) in signal_name_to_id.iter() {
-                if name.starts_with(prefix.as_str()) {
+                if name.starts_with(prefix.as_str()) && !signal_real_vec[id] {
                     signal_table[id] = Value::zero(signal_widths_vec[id]);
                 }
             }
@@ -3754,6 +3845,40 @@ impl Simulator {
             }
             m
         };
+        let packed_named_signed_props: HashMap<String, usize> = module
+            .classes
+            .values()
+            .flat_map(|cd| cd.property_types.iter())
+            .filter_map(|(p, dt)| {
+                super::bytecode::signed_named_packed_elem_depth(dt, &module.typedef_types)
+                    .map(|depth| (p.clone(), depth))
+            })
+            .collect();
+        let packed_named_signed: HashMap<String, usize> = {
+            let types = &module.typedef_types;
+            let mut m: HashMap<String, usize> = HashMap::default();
+            for (name, dt) in &module.var_decl_types {
+                if let Some(depth) = super::bytecode::signed_named_packed_elem_depth(dt, types) {
+                    m.insert(name.clone(), depth);
+                }
+                // §7.2: a member of a structure variable (`st.m` with
+                // `lane_t [0:8] m`) keeps its declared type.
+                if let DataType::Struct(su) = super::elaborate::resolve_typedef_chain(dt, types) {
+                    for member in &su.members {
+                        let Some(depth) = super::bytecode::signed_named_packed_elem_depth(
+                            &member.data_type,
+                            types,
+                        ) else {
+                            continue;
+                        };
+                        for d in &member.declarators {
+                            m.insert(format!("{}.{}", name, d.name.name), depth);
+                        }
+                    }
+                }
+            }
+            m
+        };
         let addressed_statics = Self::addressed_subroutine_statics(&module, &deferred_always);
         let (hoisted_sub_static_names, hoisted_static_subroutines) =
             Self::hoist_subroutine_statics(&mut module, &addressed_statics);
@@ -3801,6 +3926,8 @@ impl Simulator {
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
             csp_cache: std::cell::RefCell::new(HashMap::default()),
             any_struct_formal_markers: false,
+            ref_park_flags: 0,
+            indexed_scopes: std::cell::OnceCell::new(),
             pattern_scratch_seq: 0,
             pattern_scratch_free: Vec::new(),
             force_epoch_gen: 0,
@@ -3900,6 +4027,7 @@ impl Simulator {
             sva_preponed: HashMap::default(),
             sva_preponed_slot: None,
             sva_owed: false,
+            sva_abort_step: false,
             sva_post_nba_busy: false,
             clocking_snapshots: HashMap::default(),
             clocking_array_leaves: HashSet::default(),
@@ -3914,6 +4042,7 @@ impl Simulator {
             clocking_edge_drive_dirty: false,
             clocking_cycle_pending: HashMap::default(),
             clocking_sig_alias: HashMap::default(),
+            clocking_output_stages: HashMap::default(),
             clocking_sig_bound_sel: HashMap::default(),
             clocking_out_skew: HashMap::default(),
             clocking_sig_out_skew: HashMap::default(),
@@ -3968,6 +4097,8 @@ impl Simulator {
             proc_settle_defer: false,
             deferred_proc_entries: Vec::new(),
             defer_epoch: 1,
+            deferred_proc_seen: Vec::new(),
+            deferred_proc_unres: false,
             t0_starts_remaining: 0,
             rand_scope_nd: HashMap::default(),
             rand_scope_nd_dyn: HashMap::default(),
@@ -4124,6 +4255,10 @@ impl Simulator {
             constraint_mode_disabled: HashMap::default(),
             static_constraint_disabled: HashSet::default(),
             randomize_depth: 0,
+            rand_solve_chain: Vec::new(),
+            rand_solve_nested: false,
+            rand_post_deferred: Vec::new(),
+            rand_post_defer_self: false,
             rand_fail_reports: HashMap::default(),
             rand_fail_hinted: false,
             randomize_budget_depth: 0,
@@ -4234,6 +4369,8 @@ impl Simulator {
             constraint_scopes: HashMap::default(),
             inline_constraint_scope: None,
             signed_class_colls: HashSet::default(),
+            coll_store_fit_cache: Default::default(),
+            coll_store_fit_next: 0,
             dep_base: HashMap::default(),
             dep_default: HashMap::default(),
             dep_names: Vec::new(),
@@ -4271,6 +4408,7 @@ impl Simulator {
             static_struct_props,
             modport_names,
             nba_fast: Vec::new(),
+            pattern_nba_leaves: None,
             // Named signals stay on the dense hot path. Unnamed large-array
             // elements use NbaFastIndex's sparse tail.
             nba_fast_index: NbaFastIndex::with_dense_prefix(named_count),
@@ -4362,6 +4500,8 @@ impl Simulator {
             warned_delay_spikes: HashSet::default(),
             warned_uncovered_patterns: HashSet::default(),
             typed_pattern_seq: 0,
+            enum_recv_cache: HashMap::default(),
+            enum_recv_cache_gen: 0,
             slice_arg_targets: HashMap::default(),
             slice_arg_seq: 0,
             t0_delay_deferred: HashSet::default(),
@@ -4380,6 +4520,7 @@ impl Simulator {
             ref_identity_stack: Vec::new(),
             pending_formal_dyn: Vec::new(),
             ref_redirect_hot: false,
+            ref_pin_users: HashMap::default(),
             cg_type_options: HashMap::default(),
             method_receiver_cache: HashMap::default(),
             hint_key_scratch: std::cell::RefCell::new(String::new()),
@@ -4518,7 +4659,10 @@ impl Simulator {
             vcd_last_time: u64::MAX,
             vcd_prev_signals: Vec::new(),
             vcd_filter_scopes: Vec::new(),
+            vcd_dump_none: false,
             vcd_dump_depth: 0,
+            vcd_earlier_selections: Vec::new(),
+            vcd_start_time: u64::MAX,
             vcd_var_kinds: Vec::new(),
             vcd_event_last: Vec::new(),
             vcd_limit: None,
@@ -4545,8 +4689,13 @@ impl Simulator {
             xtrace_to_t: u64::MAX,
             fst_file: None,
             fst_scopes: Vec::new(),
+            fst_dump_none: false,
+            wave_suppress: configured_wave_suppress(),
             fst_writer: None,
             cast_widths,
+            packed_named_signed,
+            packed_named_signed_props,
+            packed_named_sign_guard: 0,
             fn_decl_cache: HashMap::default(),
             free_fn_table: None,
             class_handle_member_types_cache: None,
@@ -4862,6 +5011,8 @@ impl Simulator {
             elem_rel_bound: Vec::new(),
             rand_tight_mode: false,
             vpi_cb: Box::default(),
+            vpi_assert: Box::default(),
+            vpi_assert_on: false,
             vpi_cb_mask: 0,
             vpi_slot_started: u64::MAX,
             stdout_unsynced: false,

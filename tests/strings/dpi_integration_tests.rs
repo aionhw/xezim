@@ -399,6 +399,80 @@ fn vpi_object_model_test() {
     );
 }
 
+/// IEEE 1800-2017 Clause 39 / Clause 40: `vpi_iterate(vpiAssertion, ...)`,
+/// `vpi_register_assertion_cb`, `vpi_remove_cb` on assertion callback handles,
+/// `vpi_control` assertion operations (`vpiAssertionDisable`,
+/// `vpiAssertionEnable`, `vpiAssertionKill`), and assertion coverage queries.
+/// See `tests/dpi/vpi_assertion.c`.
+#[test]
+fn vpi_assertion_test() {
+    let so = compile_dpi_lib("tests/dpi/vpi_assertion.c", "vpi_assertion");
+    let log = run_xezim_with_vpi_timeout(&so, "tests/dpi/vpi_assertion.sv", 60);
+    assert!(
+        log.contains("VA_ERRORS: 0"),
+        "vpi_assertion reported C-side failures:\n{}",
+        log
+    );
+    assert!(
+        log.contains("RESULT: DONE"),
+        "vpi_assertion missing RESULT: DONE:\n{}",
+        log
+    );
+    for expected in [
+        "OBJ vpiPropertyDecl top.p_a",
+        "OBJ vpiAssert top.A1",
+        "OBJ vpiPropertyInst top.p_a",
+        "OBJ vpiAssert top.A2",
+        "OBJ vpiCover top.C1",
+        "COVER C1 success=10 failure=0",
+    ] {
+        assert_eq!(
+            log.matches(expected).count(),
+            1,
+            "vpi_assertion expected single {:?}:\n{}",
+            expected,
+            log
+        );
+    }
+    assert_eq!(
+        log.lines().filter(|l| l.starts_with("OBJ ")).count(),
+        5,
+        "unexpected OBJ count:\n{}",
+        log
+    );
+    let cbs: Vec<&str> = log.lines().filter(|l| l.starts_with("CB ")).collect();
+    assert_eq!(
+        cbs,
+        [
+            "CB A1 START t=5 start=5",
+            // `vpi_remove_cb` on `extra` ensures A1 reports SUCCESS once, not twice.
+            "CB A1 SUCCESS t=5 start=5",
+            "CB A1 START t=15 start=15",
+            "CB A1 SUCCESS t=15 start=15",
+            "CB A1 START t=25 start=25",
+            "CB A1 FAILURE t=25 start=25",
+            "CB A1 DISABLE t=28 start=28",
+            "CB A1 ENABLE t=48 start=48",
+            "CB A1 START t=55 start=55",
+            "CB A1 SUCCESS t=55 start=55",
+            "CB A1 START t=65 start=65",
+            "CB A1 SUCCESS t=65 start=65",
+            "CB A2 KILL t=70 start=65",
+            "CB A1 START t=75 start=75",
+            "CB A1 SUCCESS t=75 start=75",
+            "CB A1 START t=85 start=85",
+            "CB A1 SUCCESS t=85 start=85",
+            "CB A1 START t=95 start=95",
+            "CB A1 SUCCESS t=95 start=95",
+            "CB A1 START t=105 start=105",
+            "CB A1 SUCCESS t=105 start=105",
+            "CB A2 SUCCESS t=105 start=85",
+        ],
+        "unexpected CB transcript:\n{}",
+        log
+    );
+}
+
 /// The rest of IEEE 1800-2017 clause 38: a registered `$systf` reading its own
 /// arguments (`vpiSysTfCall` / `vpiArgument`), writing an output argument,
 /// system FUNCTIONS returning a value (including `vpiSizedFunc` sizing itself
@@ -596,4 +670,82 @@ fn dpi_string_return_respects_local_declaration_shadowing() {
     let text = run_xezim_with_dpi(&so, "tests/dpi/string_return_shadow_test.sv");
     let _ = std::fs::remove_file(so);
     assert!(text.contains("TEST_PASS"), "{text}");
+}
+
+#[test]
+fn dpi_open_array_class_member_test() {
+    // IEEE 1800-2023 §35.5.6.1, Annex H.12.1-H.12.2: open-array DPI actuals
+    // resolve class-member fixed/dynamic/queue/2-D/descending arrays in both
+    // bare-in-method and object-qualified forms without cross-talk.
+    assert_dpi_pass(
+        "tests/dpi/open_array_class_member_dpi.c",
+        "open_array_class_member_dpi",
+        "tests/dpi/open_array_class_member_dpi.sv",
+    );
+}
+
+#[test]
+fn dpi_open_array_unresolved_nonscalar_warns_once() {
+    // Verify the 1-element fallback warns once per call site when a non-scalar
+    // actual cannot be resolved, and does not warn for resolved arrays.
+    let so = compile_dpi_lib(
+        "tests/dpi/open_array_class_member_dpi.c",
+        "open_array_warn_once",
+    );
+    let dir = std::env::temp_dir().join(format!("xezim_dpi_warn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sv = dir.join("warn.sv");
+    std::fs::write(
+        &sv,
+        r#"module t;
+  import "DPI-C" function int oa_check_in(
+    input string tag,
+    input int arr[],
+    input int exp_bytes,
+    input int exp_left,
+    input int exp_right,
+    input int exp_first,
+    input int exp_last
+  );
+  int mm[4];
+  int ok = 1;
+  initial begin
+    mm = '{10, 20, 30, 40};
+    ok &= oa_check_in("resolved", mm, 16, 0, 3, 10, 40);
+    for (int i = 0; i < 3; i++) begin
+      // Array slice actual falls through to the 1-element fallback and warns once.
+      void'(oa_check_in("slice", mm[0:1], 4, 0, 0, 0, 0));
+    end
+    // Scalar literal falls back without warning.
+    ok &= oa_check_in("scalar", 42, 4, 0, 0, 42, 42);
+    if (ok) $display("TEST_PASS");
+    $finish;
+  end
+endmodule
+"#,
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .arg("--dpi-lib")
+        .arg(&so)
+        .arg("--max-time")
+        .arg("1000")
+        .arg(&sv)
+        .output()
+        .expect("failed to run xezim");
+    let _ = std::fs::remove_file(&so);
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("TEST_PASS"), "stdout={stdout}\nstderr={stderr}");
+    let warns: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("DPI open-array actual"))
+        .collect();
+    assert_eq!(
+        warns.len(),
+        1,
+        "expected exactly 1 fallback warning across loop iterations, got {warns:?}\nstderr={stderr}"
+    );
 }

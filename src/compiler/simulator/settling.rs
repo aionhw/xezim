@@ -640,9 +640,8 @@ impl Simulator {
                 let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = std::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
-                if let Some(hint) = &scope_hint {
-                    *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
-                }
+                // §23.6: top-scope work must clear the caller's instance hint.
+                *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                 let mut lhs_id = self.get_lhs_signal_id(lhs);
                 if scope_hint.is_none() {
                     // The bare-lhs resolve above can itself need the hint
@@ -803,15 +802,16 @@ impl Simulator {
                 let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = std::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
-                if let Some(hint) = &scope_hint {
-                    *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
-                }
+                // §23.6: top-scope work must clear the caller's instance hint.
+                *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                 self.settle_prev_values.clear();
                 for &id in &entry.cold.write_signal_ids {
                     self.settle_prev_values
                         .push((id, self.signal_table[id].clone()));
                 }
-                // $time/%t in the body scales to the BLOCK's module timescale.
+                // §20.3.1, §20.3.3: time calls use the block's module.
+                // An absent name hint still needs an explicit top override;
+                // None would inherit the last scheduled process's timescale.
                 let saved_ts = self.timescale_scope_override.take();
                 self.timescale_scope_override = entry.cold.ts_scope();
                 self.exec_statement(stmt);
@@ -1335,6 +1335,54 @@ impl Simulator {
         }
     }
 
+    /// #35 / #1149: list the reads of a cont-assign entry that a deferring
+    /// (post-proc-write) settle skipped, for the next full settle to
+    /// re-dirty. Each id is listed once: the drain re-dirties an id only if
+    /// it is not dirty yet, so a second copy changes nothing, and an entry
+    /// that re-triggers on every settle (one with an unresolved read) is
+    /// skipped again on every blocking write of the process. `marker` lists
+    /// the out-of-range `u32::MAX` entry, which only keeps the list
+    /// non-empty; an id out of range of `dirty_signals` (the drain skips it)
+    /// is listed as that marker too.
+    fn defer_proc_reads(&mut self, ids: &[usize], mut marker: bool) {
+        let n = self.dirty_signals.len();
+        if self.deferred_proc_seen.len() < n.div_ceil(64) {
+            self.deferred_proc_seen.resize(n.div_ceil(64), 0);
+        }
+        for &id in ids {
+            if id >= n {
+                marker = true;
+                continue;
+            }
+            let (w, b) = (id >> 6, 1u64 << (id & 63));
+            if self.deferred_proc_seen[w] & b == 0 {
+                self.deferred_proc_seen[w] |= b;
+                self.deferred_proc_entries.push(id as u32);
+            }
+        }
+        if marker && !self.deferred_proc_unres {
+            self.deferred_proc_unres = true;
+            self.deferred_proc_entries.push(u32::MAX);
+        }
+    }
+
+    /// #1149: the listed-once bits of `deferred_proc_entries`, rebuilt from
+    /// the list (a restored checkpoint holds only the list).
+    pub(super) fn rebuild_deferred_proc_seen(&mut self) {
+        let n = self.dirty_signals.len();
+        self.deferred_proc_seen.clear();
+        self.deferred_proc_seen.resize(n.div_ceil(64), 0);
+        self.deferred_proc_unres = false;
+        for &sid in &self.deferred_proc_entries {
+            let sid = sid as usize;
+            if sid < n {
+                self.deferred_proc_seen[sid >> 6] |= 1u64 << (sid & 63);
+            } else {
+                self.deferred_proc_unres = true;
+            }
+        }
+    }
+
     pub(super) fn settle_combinatorial_inner(&mut self) {
         if !self.ts_sleep.is_empty() {
             self.ts_wake_sleepers();
@@ -1442,15 +1490,24 @@ impl Simulator {
             && (self.time != 0 || self.t0_starts_remaining == 0)
             && !self.deferred_proc_entries.is_empty()
         {
-            let deferred = std::mem::take(&mut self.deferred_proc_entries);
+            let mut deferred = std::mem::take(&mut self.deferred_proc_entries);
             self.defer_epoch += 1;
-            for sid in deferred {
+            for &sid in &deferred {
                 let sid = sid as usize;
-                if sid < self.dirty_signals.len() && !self.dirty_signals[sid] {
-                    self.dirty_signals[sid] = true;
-                    self.dirty_list.push(sid);
+                if sid < self.dirty_signals.len() {
+                    if let Some(w) = self.deferred_proc_seen.get_mut(sid >> 6) {
+                        *w &= !(1u64 << (sid & 63));
+                    }
+                    if !self.dirty_signals[sid] {
+                        self.dirty_signals[sid] = true;
+                        self.dirty_list.push(sid);
+                    }
                 }
             }
+            self.deferred_proc_unres = false;
+            // The list keeps its allocation for the next deferral.
+            deferred.clear();
+            self.deferred_proc_entries = deferred;
             self.dirty_any = true;
         }
         // First time-0 settle pass: don't fire `always @(list)` blocks that
@@ -2051,22 +2108,15 @@ impl Simulator {
                         continue;
                     }
                     cold.deferred_epoch.set(self.defer_epoch);
-                    self.deferred_proc_entries.extend(
-                        entries[eidx]
-                            .cold
-                            .read_signal_ids
-                            .iter()
-                            .map(|&id| id as u32),
-                    );
                     // An entry with no resolvable read (one reading only
                     // memory cells without element names) has no id to
                     // re-dirty: an out-of-range marker still makes the next
                     // full settle run, which seeds every unresolved entry.
-                    if entries[eidx].has_unresolved_reads
-                        && entries[eidx].cold.read_signal_ids.is_empty()
-                    {
-                        self.deferred_proc_entries.push(u32::MAX);
-                    }
+                    let reads = &entries[eidx].cold.read_signal_ids;
+                    self.defer_proc_reads(
+                        reads,
+                        entries[eidx].has_unresolved_reads && reads.is_empty(),
+                    );
                     continue;
                 }
                 evaluated_any = true;
@@ -2440,11 +2490,8 @@ impl Simulator {
                                         let prev_ts = self.timescale_scope_override.take();
                                         let sc = entries[eidx].cold.scope_hint.clone();
                                         self.set_m_block_scope(sc.as_deref());
-                                        if sc.is_some() {
-                                            *self.name_resolve_hint.borrow_mut() = sc;
-                                        }
-                                        self.timescale_scope_override =
-                                            entries[eidx].cold.ts_scope();
+                                        *self.name_resolve_hint.borrow_mut() = sc;
+                                        self.timescale_scope_override = entries[eidx].cold.ts_scope();
                                         Some((prev_hint, prev_ts))
                                     } else {
                                         None
@@ -2486,9 +2533,18 @@ impl Simulator {
                             }
                         }
                         CombItem::CompiledAlwaysBlock { compiled, .. } => {
-                            // P5: X-free evaluations run on u64 words (a lowered
-                            // block has no fallbacks, so none of the scope /
-                            // timescale bookkeeping below applies to it).
+                            // §20.3.1, §20.3.3: native statements can also fall
+                            // back to the interpreter. Only top needs an override
+                            // before native dispatch; the VM and two-state hooks
+                            // install theirs when reached. Non-native builds do
+                            // no time-scope work on the plan's hot path.
+                            #[cfg(feature = "jit")]
+                            let saved_ts = compiled.has_fallback.then(|| {
+                                std::mem::replace(
+                                    &mut self.timescale_scope_override,
+                                    entries[eidx].cold.ts_scope(),
+                                )
+                            });
                             if self.dispatch_comb_plan(eidx, compiled) {
                                 n_ab += 1;
                                 if self.proc_depth > 0 {
@@ -2530,10 +2586,6 @@ impl Simulator {
                                             compiled.instructions.len(),
                                         )
                                     };
-                                    // $time/%t in a fallback stmt scales to the BLOCK's
-                                    // module timescale (mirrors the edge-block dispatch).
-                                    let saved_ts = self.timescale_scope_override.take();
-                                    self.timescale_scope_override = entries[eidx].cold.ts_scope();
                                     // …and `%m` in that fallback names the BLOCK's instance.
                                     self.set_m_block_scope(
                                         entries[eidx].cold.scope_hint.as_deref(),
@@ -2544,25 +2596,39 @@ impl Simulator {
                                     // resolved the bare array name, found nothing, and
                                     // dropped every write. Pure-bytecode blocks pre-resolve
                                     // their ids, so this costs them one bool test.
+                                    // has_fallback counts statement fallbacks only. Comb blocks
+                                    // have no expression fallbacks (only edge blocks enable
+                                    // them), so without statement fallbacks this block never
+                                    // re-enters the interpreter here.
                                     let saved_hint = if compiled.has_fallback {
                                         let prev = self.name_resolve_hint.borrow().clone();
-                                        if let Some(sc) = entries[eidx].cold.scope_hint.as_ref() {
-                                            *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
-                                        }
+                                        *self.name_resolve_hint.borrow_mut() = entries[eidx].cold.scope_hint.clone();
                                         Some(prev)
                                     } else {
                                         None
                                     };
+                                    let saved_vm_ts = compiled.has_fallback.then(|| {
+                                        std::mem::replace(
+                                            &mut self.timescale_scope_override,
+                                            entries[eidx].cold.ts_scope(),
+                                        )
+                                    });
                                     self.exec_insns(insns);
+                                    if let Some(prev) = saved_vm_ts {
+                                        self.timescale_scope_override = prev;
+                                    }
                                     if let Some(prev) = saved_hint {
                                         *self.name_resolve_hint.borrow_mut() = prev;
                                     }
-                                    self.timescale_scope_override = saved_ts;
                                     n_ab += 1;
                                     if self.proc_depth > 0 {
                                         self.note_comb_ran_in_process(eidx, &entries[eidx]);
                                     }
                                 }
+                            }
+                            #[cfg(feature = "jit")]
+                            if let Some(saved_ts) = saved_ts {
+                                self.timescale_scope_override = saved_ts;
                             }
                         }
                         // The three fused arms are the settle loop's highest-volume

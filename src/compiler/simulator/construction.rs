@@ -15,24 +15,35 @@ impl Simulator {
     pub(super) fn register_dyn_member_shape(
         &mut self,
         cdef: &crate::compiler::elaborate::ElaboratedClass,
-        params: &HashMap<String, Value>,
+        overrides: &HashMap<String, Value>,
         prop: &str,
         scoped: &str,
         width: u32,
     ) {
+        let params = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: overrides,
+        };
         let fixed_tail: Option<Vec<(i64, i64)>> =
             cdef.dynamic_tail_properties.get(prop).and_then(|tail| {
                 tail.iter()
                     .map(|d| match d {
                         crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
-                            let l =
-                                super::elaborate::const_eval_i64_with_params(left, Some(params))?;
-                            let r =
-                                super::elaborate::const_eval_i64_with_params(right, Some(params))?;
+                            let l = super::elaborate::const_eval_i64_with_params_env(
+                                left,
+                                Some(&params),
+                            )?;
+                            let r = super::elaborate::const_eval_i64_with_params_env(
+                                right,
+                                Some(&params),
+                            )?;
                             Some((l.min(r), l.max(r)))
                         }
                         crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
-                            match super::elaborate::const_eval_i64_with_params(expr, Some(params)) {
+                            match super::elaborate::const_eval_i64_with_params_env(
+                                expr,
+                                Some(&params),
+                            ) {
                                 Some(n) if n > 0 => Some((0, n - 1)),
                                 _ => None,
                             }
@@ -2833,13 +2844,13 @@ impl Simulator {
                 self.module.dynamic_arrays.insert(scoped.clone());
                 // The object is not on the heap yet: its value parameters
                 // are read from the instance being built.
-                let mut params = self.module.parameters.clone();
+                let mut overrides: HashMap<String, Value> = HashMap::default();
                 for (pn, _) in &cdef.param_defaults {
                     if let Some(v) = instance.properties.get(pn) {
-                        params.insert(pn.clone(), v.clone());
+                        overrides.insert(pn.clone(), v.clone());
                     }
                 }
-                self.register_dyn_member_shape(cdef, &params, prop, &scoped, width);
+                self.register_dyn_member_shape(cdef, &overrides, prop, &scoped, width);
                 if let Some(m) = max {
                     self.module.queue_max_sizes.insert(scoped.clone(), m);
                 }
@@ -3292,6 +3303,141 @@ impl Simulator {
         self.record_output(m.clone());
         self.stdout_writeln(&m);
         self.abort_run();
+    }
+
+    /// §8.4: a method call through a null handle whose receiver is declared
+    /// `decl` (a class name, possibly specialized). Only an access to a
+    /// non-static member or a virtual method is illegal through null, so a
+    /// non-virtual method runs, bound to the declared class as §8.20 binds
+    /// it for a live object, with a null `this`. None when `decl` declares
+    /// no such method, a static one (it dispatches elsewhere) or a virtual
+    /// one (illegal through null; the caller reports it).
+    pub(super) fn call_on_null_receiver(
+        &mut self,
+        decl: &str,
+        method_name: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+        self.call_on_null_receiver_of(None, decl, method_name, args)
+    }
+
+    /// `call_on_null_receiver` for a receiver that is the variable `var`,
+    /// whose declaration names its specialization (`C #(8) h`).
+    pub(super) fn call_on_null_receiver_of(
+        &mut self,
+        var: Option<&str>,
+        decl: &str,
+        method_name: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+        let resolved = self.class_through_typedefs(decl)?;
+        let decl = resolved.as_str();
+        let base = decl.split('#').next().unwrap_or(decl).trim();
+        if method_name == "new"
+            || !self.class_has_method(base, method_name)
+            || self.is_static_method(base, method_name)
+        {
+            return None;
+        }
+        // A virtual method through null is illegal (§8.4); the caller's own
+        // handling (a report, or its later fallbacks) stays in charge.
+        let target = self.nonvirtual_target_class(base, method_name)?;
+        // §8.25: the declared specialization supplies the body's parameters.
+        let saved = self
+            .spec_for_null_receiver(var, decl)
+            .map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+        let v = self.exec_method_in_class_hierarchy(0, &target, method_name, args);
+        if let Some(prev) = saved {
+            self.current_spec = prev;
+        }
+        Some(v)
+    }
+
+    /// The declared class of a receiver expression whose value is null: a
+    /// variable, a property, an element of a collection of handles, a
+    /// function's return type.
+    pub(super) fn null_receiver_class(&mut self, expr: &Expression) -> Option<String> {
+        // With no object, a bare name is a property of the class in scope;
+        // the general lookups answer with that class itself.
+        let in_class_scope = self.this_stack.last().copied().flatten().is_none();
+        in_class_scope
+            .then(|| self.context_class_prop_class(expr))
+            .flatten()
+            .or_else(|| self.receiver_static_class(expr, 0))
+            .or_else(|| self.call_return_class(expr))
+            .or_else(|| self.get_expr_type_name(expr))
+            .and_then(|t| self.class_through_typedefs(&t))
+    }
+
+    /// The declared class of a bare property of the class whose scope is
+    /// current when no object is (`sp` in `static int y = sp.m();`, a
+    /// static property initializer).
+    fn context_class_prop_class(&self, expr: &Expression) -> Option<String> {
+        let ExprKind::Ident(h) = &expr.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let ctx = self.class_context_stack.last()?.as_deref()?;
+        self.class_prop_type_named(ctx, &h.path[0].name.name)
+    }
+
+    /// The declared return class of a call receiver: a free function
+    /// (`get_null().m()`) or a method of a live object (`h.nullh().m()`).
+    fn call_return_class(&mut self, expr: &Expression) -> Option<String> {
+        let ExprKind::Call { func, .. } = &expr.kind else {
+            return None;
+        };
+        let dt = match &func.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => self
+                .fn_decl_rc(&h.path[0].name.name)
+                .map(|fd| fd.return_type.clone())?,
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let recv = Expression::new(ExprKind::Ident(hier_prefix(h)), func.span);
+                let cls = self.receiver_class_of(&recv)?;
+                self.class_method_return_type(&cls, &h.path.last()?.name.name)?
+            }
+            ExprKind::MemberAccess { expr: recv, member } => {
+                let cls = self.receiver_class_of(recv)?;
+                self.class_method_return_type(&cls, &member.name)?
+            }
+            _ => return None,
+        };
+        match dt {
+            crate::ast::types::DataType::TypeReference { name, .. } => Some(name.name.name),
+            _ => None,
+        }
+    }
+
+    /// The class of a receiver: its object's runtime class when it is live,
+    /// else its declared class.
+    fn receiver_class_of(&self, recv: &Expression) -> Option<String> {
+        let h = self.eval_handle_expr(recv).unwrap_or(0);
+        self.receiver_static_class(recv, h)
+            .or_else(|| self.get_expr_type_name(recv))
+            .map(|c| c.split('#').next().unwrap_or(&c).trim().to_string())
+    }
+
+    /// `t` when it names a class (possibly specialized), or the class a
+    /// typedef chain from it ends at (§6.18).
+    pub(super) fn class_through_typedefs(&self, t: &str) -> Option<String> {
+        let mut t = t.trim().to_string();
+        for _ in 0..8 {
+            let base = t.split('#').next().unwrap_or(&t).trim();
+            if self.module.classes.contains_key(base) {
+                return Some(t);
+            }
+            match self.module.typedef_types.get(base) {
+                Some(crate::ast::types::DataType::TypeReference { name, .. }) => {
+                    t = name.name.name.clone();
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     pub(super) fn exec_method_call(

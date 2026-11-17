@@ -4,6 +4,17 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+struct VarDeclShape {
+    w: u32,
+    class_ref: Option<bool>,
+    plain_class: bool,
+    plain: bool,
+    two_state: bool,
+    is_real_type: bool,
+    decl_signed: bool,
+    default_v: Value,
+}
+
 impl Simulator {
     /// §10.10/§11.4.12: the elements an unpacked-array concatenation's
     /// operands contribute, in order — a queue / array operand (bare, an
@@ -153,6 +164,49 @@ impl Simulator {
         for key in self.signals.keys_with_elem_prefix(&format!("{}[", row)) {
             self.signals.remove(&key);
         }
+    }
+
+    /// Row key for `d[i] = new[n]` when the row's element type is not a class
+    /// handle (§7.5.1). Class properties use [`class_array_of_coll_key`]; module
+    /// or automatic locals use the same storage keys as reads.
+    pub(super) fn sized_new_row_lvalue(&mut self, lvalue: &Expression) -> Option<String> {
+        let ExprKind::Index { expr: base, index } = &lvalue.kind else {
+            return None;
+        };
+        if self.lvalue_container_kind(lvalue).is_some() {
+            return None;
+        }
+        let key = match &base.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                self.resolve_locator_storage(&self.resolve_hier_name(h))
+            }
+            _ => self.expr_assoc_name(base)?,
+        };
+        if !self.module.dynamic_arrays.contains(&key)
+            && self.class_dyn_row_width(&key).is_none()
+            && self
+                .coll_shape_at(&key)
+                .is_none_or(|(shape, _)| shape.dims.len() < 2)
+        {
+            return None;
+        }
+        let dt = self
+            .class_member_coll_type(&key)
+            .or_else(|| self.module.var_decl_types.get(&key))?;
+        if matches!(
+            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types),
+            DataType::TypeReference { .. }
+        ) {
+            return None;
+        }
+        // Associative outers (`int aa[string][]`) are sized by the caller's
+        // collection `new[n]` store; the early row path only runs `fill_sized_new`
+        // after `ensure_row`, which does not allocate a missing assoc entry.
+        if self.is_associative_array(&key) {
+            return None;
+        }
+        let i = self.eval_expr(index).to_i64()?;
+        Some(format!("{}[{}]", key, i))
     }
 
     /// The declared associative tail below a dynamic outer array, scoped to
@@ -416,11 +470,15 @@ impl Simulator {
                 }
                 suffixes = next;
             }
-            // §7.5.1: the element type's default (x when 4-state).
+            // §7.5.1: the element type's default (x when 4-state, real 0.0
+            // for real, §6.8).
             let four_state = self.coll_elem_starts_x(name);
+            let real = self.coll_elem_is_real(name);
             for i in keep..n {
                 for s in &suffixes {
-                    let v = if four_state {
+                    let v = if real {
+                        Value::from_f64(0.0)
+                    } else if four_state {
                         Value::new(w)
                     } else {
                         Value::zero(w)
@@ -440,8 +498,11 @@ impl Simulator {
                 .map(|&(_, _, w)| w)
                 .unwrap_or(32);
             // A class member (`<handle>#da`) has its type on the class.
+            // §6.8, Table 6-7: a real/shortreal element starts at real 0.0.
             let four_state = self.coll_elem_starts_x(name);
-            let fill = if four_state {
+            let fill = if self.coll_elem_is_real(name) {
+                Value::from_f64(0.0)
+            } else if four_state {
                 Value::new(w)
             } else {
                 Value::zero(w)
@@ -529,6 +590,9 @@ impl Simulator {
         // (§12.7.3, §12.8), across every collection shape. Publish heat once
         // after the inner runner has restored loop and method scopes.
         let mut iterations = 0;
+        // #1108: `foreach (lane[0].payload[i])`.
+        let folded = self.inst_array_member_canon(array);
+        let array = folded.as_ref().unwrap_or(array);
         self.exec_stmt_foreach_inner(stmt, array, vars, body, &mut iterations);
         self.record_ast_loop_heat(iterations);
     }
@@ -2147,24 +2211,10 @@ impl Simulator {
         v
     }
 
-    /// Outlined from `exec_statement` so the dispatcher's stack frame
-    /// stays small: this arm's locals inflated every call's frame (the
-    /// dispatcher recursed with a 7.8 KB frame per level).
-    #[inline(never)]
-    pub(super) fn exec_stmt_var_decl(
+    fn resolve_var_decl_shape<'a>(
         &mut self,
-        stmt: &Statement,
-        data_type: &DataType,
-        lifetime: &Option<crate::ast::types::Lifetime>,
-        declarators: &[VarDeclarator],
-    ) {
-        // A frame local's metadata is keyed by its bare name; another
-        // process's same-named local may own those entries now.
-        if !self.local_stack.is_empty() {
-            for d in declarators {
-                self.claim_local_meta(&d.name.name, stmt);
-            }
-        }
+        data_type: &'a DataType,
+    ) -> (std::borrow::Cow<'a, DataType>, VarDeclShape) {
         // §6.20.2 / §8.25: a local typed by a TYPE PARAMETER of the method's
         // class (`T tmp;`) has the type bound in this specialization.
         let tp_param = self.local_type_param_concrete(data_type);
@@ -2187,7 +2237,11 @@ impl Simulator {
             Some(c) => self.bound_typedef_dt(c),
             None => self.struct_with_bound_members(data_type),
         };
-        let data_type: &DataType = bound_typedef.as_ref().unwrap_or(data_type);
+        let resolved_dt: std::borrow::Cow<'a, DataType> = match bound_typedef {
+            Some(dt) => std::borrow::Cow::Owned(dt),
+            None => std::borrow::Cow::Borrowed(data_type),
+        };
+        let data_type: &DataType = resolved_dt.as_ref();
         let tp_width = tp_concrete
             .as_deref()
             .and_then(|c| self.concrete_type_width(c));
@@ -2299,6 +2353,388 @@ impl Simulator {
         // §6.11.3: the initial cell carries its declared signing before its
         // first assignment. Frame-local stores use this stable type stamp.
         default_v.is_signed = decl_signed;
+        let shape = VarDeclShape {
+            w,
+            class_ref,
+            plain_class,
+            plain,
+            two_state,
+            is_real_type,
+            decl_signed,
+            default_v,
+        };
+        (resolved_dt, shape)
+    }
+
+    fn init_class_or_covergroup_local(
+        &mut self,
+        data_type: &DataType,
+        class_name: Option<&str>,
+        init_expr: &Expression,
+    ) -> Option<Value> {
+        // §8.8: `B h = C::new(...)` builds a `C`, not the
+        // declared class (the `new` forms below).
+        let mut produced: Option<Value> = Self::typed_ctor_call(init_expr)
+            .and_then(|(prefix, args)| self.construct_typed_ctor(prefix, args));
+        if let Some(cn) = class_name.filter(|_| produced.is_none()) {
+            // `T x = new(...);` / `T x = new;` — detect the
+            // constructor form once; consumed by both the
+            // class and covergroup branches below.
+            let is_new = match &init_expr.kind {
+                ExprKind::Call { func, args } => {
+                    if let ExprKind::Ident(h) = &func.kind {
+                        if h.path.last().is_some_and(|s| s.name.name == "new") {
+                            Some(args.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                ExprKind::Ident(h) => {
+                    if h.path.last().is_some_and(|s| s.name.name == "new") {
+                        Some(vec![])
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            // §8.25: the declared type resolved to a
+            // SPECIALIZED class name `Base#(args)` (a type
+            // param bound to a nested specialization, e.g.
+            // `T tmp = new;` with T = `queue#(string)` —
+            // UVM's uvm_object_string_pool::get building
+            // the hdl-paths queue). The plain-name lookup
+            // below misses it, so the init fell to generic
+            // eval and the local read x. Mirror the
+            // assignment arm: extract the spec, carry it
+            // through `current_spec`, construct the base.
+            // §15.3/§15.4: `mailbox mb = new(2);` /
+            // `semaphore s = new(1);` as a block-local
+            // declaration — the built-in containers are not in
+            // `module.classes`, so the constructor was skipped
+            // and the local stayed null.
+            if produced.is_none() && !self.module.classes.contains_key(cn) {
+                if let (Some(kind), Some(call_args)) =
+                    (Self::container_base(cn), is_new.as_ref())
+                {
+                    let handle = self.alloc_builtin_container(kind, call_args);
+                    produced = Some(Value::from_u64(handle as u64, 32));
+                }
+            }
+            if produced.is_none() && is_new.is_some() && !self.module.classes.contains_key(cn) {
+                if let Some((base, sig)) = self.extract_spec_from_string(cn) {
+                    if let Some(class_def) = self.module.classes.get(&base).cloned() {
+                        let call_args = is_new.clone().unwrap();
+                        self.ensure_spec_statics(&base, &sig);
+                        let saved_spec = self.current_spec.clone();
+                        self.current_spec = Some((base.clone(), sig));
+                        produced = Some(self.instantiate_class(&class_def, &call_args));
+                        self.current_spec = saved_spec;
+                    }
+                }
+            }
+            if let Some(class_def) = self.module.classes.get(cn).cloned() {
+                if let Some(call_args) = is_new {
+                    // §8.12 copy constructor: `T x = new src;`
+                    // with a single CLASS-HANDLE argument
+                    // shallow-copies `src`, it does NOT run
+                    // the constructor. The assignment path
+                    // handles this; the decl-init path used
+                    // to fall straight through to construction
+                    // (passing the handle as an ignored ctor
+                    // arg), so `T x = new src;` silently ran
+                    // `new()` and produced a fresh object.
+                    if call_args.len() == 1
+                        && matches!(
+                            &call_args[0].kind,
+                            ExprKind::Ident(_)
+                                | ExprKind::MemberAccess { .. }
+                                | ExprKind::Index { .. }
+                                // `new this` in a clone
+                                // method copies the
+                                // CURRENT object (§8.12)
+                                | ExprKind::This
+                        )
+                        && self.expr_is_class_handle(&call_args[0])
+                    {
+                        let src_h = self.eval_expr(&call_args[0]).to_u64().unwrap_or(0) as usize;
+                        // §8.12: `T x = new src;` shallow-copies
+                        // `src` ONLY when src is of type T (or a
+                        // subclass of T). A single class-handle
+                        // arg of a DIFFERENT, unrelated class is
+                        // a constructor ARGUMENT, not a copy
+                        // source — e.g. `factory f = new(b)` where
+                        // b is a base_cls must call
+                        // factory::new(b), not copy-construct b.
+                        // Without this type check, the loose
+                        // `expr_is_class_handle` test treated any
+                        // class-typed arg as a copy source,
+                        // silently skipping the constructor body
+                        // (so field assignments like
+                        // `reg_type = t` never ran).
+                        let is_copy_src = src_h != 0
+                            && matches!(self.heap.get(src_h), Some(Some(src_inst))
+                                if self.class_extends(&src_inst.class_name, cn));
+                        if is_copy_src {
+                            produced = Some(self.copy_construct(src_h));
+                        }
+                    }
+                    if produced.is_none() {
+                        // Pass the declared type's `#(...)` args
+                        // (e.g. `resource#(int) r = new()`) so
+                        // the instance records its type bindings
+                        // (`T -> int`) — needed for per-spec static
+                        // member resolution (get_type vs
+                        // get_type_handle).
+                        // §8.25.1: a typedef ALIAS of a
+                        // specialization (`typedef
+                        // Box#(byte,8) ByteBox; ByteBox b
+                        // = new;`) carries no args on the
+                        // declared type — pull them from
+                        // the typedef's target, else the
+                        // instance silently gets the
+                        // class DEFAULTS.
+                        let td_args: Option<Vec<Expression>> = match data_type {
+                            crate::ast::types::DataType::TypeReference {
+                                name, type_args, ..
+                            } if type_args.is_empty() => {
+                                match self.lookup_typedef_target(&name.name.name) {
+                                    Some(crate::ast::types::DataType::TypeReference {
+                                        type_args: t2,
+                                        ..
+                                    }) if !t2.is_empty() => Some(t2.clone()),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        let scoped_args = self.scoped_class_type_args(data_type);
+                        let ta: Option<&[Expression]> = match data_type {
+                            _ if scoped_args.is_some() => scoped_args.as_deref(),
+                            crate::ast::types::DataType::TypeReference { type_args, .. }
+                                if !type_args.is_empty() =>
+                            {
+                                Some(type_args.as_slice())
+                            }
+                            _ => td_args.as_deref(),
+                        };
+                        produced = Some(self.instantiate_class_with_type_args(
+                            &class_def,
+                            &call_args,
+                            ta,
+                        ));
+                    }
+                }
+            } else if let Some(cg_def) = self.covergroup_def_for(cn) {
+                // IEEE 1800-2017 §19.8: a covergroup-typed
+                // LOCAL `cg c = new();` (declared inside a
+                // procedural block) must allocate a real
+                // covergroup instance. This branch only
+                // handled classes, so the initializer fell
+                // through to generic eval, `c` never got a
+                // cg_heap handle, and sample() /
+                // get_inst_coverage() (and the @(event)
+                // clocking registration done inside
+                // instantiate_covergroup) were silent
+                // no-ops — coverage always read 0.
+                if let Some(call_args) = is_new {
+                    produced = Some(self.instantiate_covergroup(&cg_def, &call_args));
+                }
+            }
+        }
+        produced
+    }
+
+    fn store_local_decl_value(
+        &mut self,
+        d: &VarDeclarator,
+        data_type: &DataType,
+        lifetime: &Option<crate::ast::types::Lifetime>,
+        plain: bool,
+        static_block: bool,
+        v: Value,
+    ) {
+        let mut unpacked_struct_local = false;
+        // A static process-block local lives in the signal table even
+        // under a loop's variable frame, which its block outlives.
+        let in_frame = !self.local_stack.is_empty() && !static_block;
+        if in_frame && d.dimensions.is_empty() && !plain {
+            if let crate::ast::types::DataType::Struct(su) = self.resolve_dt(data_type) {
+                if Self::spreads_member_wise(&su) {
+                    unpacked_struct_local = true;
+                    let base = d.name.name.clone();
+                    // §6.8 defaults per leaf (a 2-state member reads
+                    // 0), and packed members alias their fields.
+                    let mut leaves = Vec::new();
+                    self.unpacked_struct_leaf_defaults(&base, &su, 0, &mut leaves);
+                    for (k, _, mdt) in &leaves {
+                        self.register_packed_leaf_layout(k, mdt);
+                    }
+                    // The `<base>.` marker, as `unpacked_struct_leaf_keys`.
+                    self.any_struct_formal_markers = true;
+                    if let Some(frame) = self.local_stack.last_mut() {
+                        frame.insert(format!("{}.", base), Value::new(0));
+                        for (k, dv, _) in leaves {
+                            frame.insert(k, dv);
+                        }
+                    }
+                }
+            }
+        }
+        if unpacked_struct_local {
+            // An unpacked struct has no container of its own —
+            // its leaves ARE the storage. Seeding one anyway
+            // shadowed them: reading the bare name returned the
+            // container's x instead of the packed members, so
+            // `return s;` from a struct-returning function
+            // yielded x even though every member was set.
+            self.local_stack
+                .last_mut()
+                .map(|frame| frame.remove(&d.name.name));
+            // Record the declared type so type-directed
+            // consumers (`%s` string-member detection, `%p`)
+            // can resolve `p.member` through the typedef.
+            self.module
+                .var_decl_types
+                .insert(d.name.name.clone(), data_type.clone());
+            self.note_struct_root(&d.name.name);
+            self.note_struct_type(data_type);
+            // §6.21: each entry gets FRESH (empty) dynamic members.
+            if self.struct_colls_possible()
+                && let Some(su) = self.unpacked_struct_of(data_type)
+            {
+                self.fresh_struct_colls(&d.name.name, &su);
+            }
+            // A decl-init whose SOURCE is an unpacked-struct
+            // CLASS property (`pair_t p = o.orig;`, incl. the
+            // ternary form) must write the leaves member-wise —
+            // the whole-value `v` computed above has nothing to
+            // assemble from and left every member x.
+            if let Some(init_expr) = d.init.clone() {
+                self.init_unpacked_struct_local(d, data_type, &init_expr);
+            }
+        } else if let Some(frame) = self.local_stack.last_mut().filter(|_| in_frame) {
+            frame.insert(d.name.name.clone(), v);
+        } else {
+            self.signals.insert(d.name.name.clone(), v);
+            // §7.2: an unpacked-struct local of an `initial`/`always`
+            // block (no call frame) gets its member leaves as
+            // signals, as module-scope structs do; a member write
+            // through a selected member (`t.rows[0].level = 2`) found
+            // no leaf to land on and vanished.
+            if d.dimensions.is_empty() && !plain {
+                if let crate::ast::types::DataType::Struct(su) = self.resolve_dt(data_type) {
+                    if Self::spreads_member_wise(&su) {
+                        self.note_struct_root(&d.name.name);
+                        self.note_struct_type(data_type);
+                        let mut leaves = Vec::new();
+                        self.unpacked_struct_leaf_defaults(&d.name.name, &su, 0, &mut leaves);
+                        for (k, dv, mdt) in leaves {
+                            self.register_packed_leaf_layout(&k, &mdt);
+                            self.widths.insert(k.clone(), dv.width);
+                            // §10.7: leaf stores retain their declared signedness.
+                            if dv.is_signed {
+                                self.signed_signals.insert(k.clone());
+                            } else {
+                                self.signed_signals.remove(&k);
+                            }
+                            self.signals.insert(k, dv);
+                        }
+                        if self.struct_colls_possible() {
+                            self.fresh_struct_colls(&d.name.name, &su);
+                        }
+                        if let Some(init_expr) = d.init.clone() {
+                            self.init_unpacked_struct_local(d, data_type, &init_expr);
+                        }
+                    }
+                }
+            }
+            // §6.21/§9.3.2: an explicitly `automatic` block
+            // local is a fresh variable per block entry, and a
+            // fork child must capture ITS entry's value. With
+            // no call frame it lives in the shared signal map,
+            // so record it for `inherit_fork_child_context` to
+            // copy by value at spawn time — exactly like a
+            // for-init loop variable. The enclosing SeqBlock
+            // pops it on scope exit.
+            if matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic)) {
+                self.auto_loop_vars.push(d.name.name.clone());
+            }
+        }
+        // §6.8/§25.9/§7.3.2: a virtual-interface or tagged-union
+        // local's initializer is the assignment `name = init` — the
+        // assignment arm binds the interface instance and builds the
+        // tag + member value; evaluated as a plain expression the
+        // vif read x and the union matched no tag.
+        if let Some(init_expr) = d.init.as_ref().filter(|_| !plain) {
+            // Followed through the typedef table by reference: this
+            // runs for every non-scalar declaration with an
+            // initializer, so no resolved-type clone.
+            let via_assign = match self.typedef_chain_end(data_type) {
+                crate::ast::types::DataType::Interface { .. } => true,
+                crate::ast::types::DataType::Struct(su) => su.tagged,
+                _ => false,
+            };
+            if via_assign {
+                let lvalue = crate::ast::expr::Expression::new(
+                    crate::ast::expr::ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                        root: None,
+                        path: vec![crate::ast::expr::HierPathSegment {
+                            name: d.name.clone(),
+                            selects: Vec::new(),
+                        }],
+                        span: d.name.span,
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
+                    }),
+                    d.name.span,
+                );
+                let assign = crate::ast::stmt::Statement::new(
+                    crate::ast::stmt::StatementKind::BlockingAssign {
+                        lvalue,
+                        rvalue: init_expr.clone(),
+                    },
+                    d.name.span,
+                );
+                self.exec_statement(&assign);
+            }
+        }
+    }
+
+    /// Outlined from `exec_statement` so the dispatcher's stack frame
+    /// stays small: this arm's locals inflated every call's frame (the
+    /// dispatcher recursed with a 7.8 KB frame per level).
+    #[inline(never)]
+    pub(super) fn exec_stmt_var_decl(
+        &mut self,
+        stmt: &Statement,
+        data_type: &DataType,
+        lifetime: &Option<crate::ast::types::Lifetime>,
+        declarators: &[VarDeclarator],
+    ) {
+        // A frame local's metadata is keyed by its bare name; another
+        // process's same-named local may own those entries now.
+        if !self.local_stack.is_empty() {
+            for d in declarators {
+                self.claim_local_meta(&d.name.name, stmt);
+            }
+        }
+        let (resolved_dt, shape) = self.resolve_var_decl_shape(data_type);
+        let data_type: &DataType = resolved_dt.as_ref();
+        let VarDeclShape {
+            w,
+            class_ref,
+            plain_class,
+            plain,
+            two_state,
+            is_real_type,
+            decl_signed,
+            default_v,
+        } = shape;
         // §6.21: a local of an `initial`/`always`/`final` block is static
         // unless declared `automatic` — one variable, initialized once (its
         // initializer is not re-run when the block is entered again). Such a
@@ -2343,31 +2779,7 @@ impl Simulator {
             // the array/queue/assoc bookkeeping so e.g. a scalar `string
             // str` after a previous `string str[$]` isn't still treated
             // as a queue.
-            {
-                let nm = d.name.name.as_str();
-                if !self.decl_shadow_log.is_empty() {
-                    self.note_decl_shadow(nm, data_type);
-                }
-                // If this local shares its bare name with a caller-frame
-                // queue, preserve the caller's queue storage so it is
-                // restored when this subroutine returns (queue locals are
-                // global-by-bare-name; see `queue_frame_saves`).
-                let saved = self.save_queue_local(nm, true);
-                if !saved {
-                    self.module.dynamic_arrays.remove(nm);
-                    self.module.arrays.remove(nm);
-                    self.module.descending_arrays.remove(nm);
-                    self.module.queue_max_sizes.remove(nm);
-                }
-                self.module.associative_arrays.remove(nm);
-                self.module.packed_signal_elem_widths.remove(nm);
-                let mut size_key = std::mem::take(&mut self.queue_key_scratch);
-                size_key.clear();
-                size_key.push_str(nm);
-                size_key.push_str(".size");
-                self.signals.remove(&size_key);
-                self.queue_key_scratch = size_key;
-            }
+            self.clear_shadowed_collection_meta(&d.name.name, data_type);
             // Register a *packed*-struct local's field layout so member
             // access (`p.field`) aliases into the whole variable, as
             // module-level packed-struct signals already do. Without
@@ -2554,6 +2966,16 @@ impl Simulator {
                         data_type,
                         &self.module.parameters,
                     ) {
+                        // §6.19: its member names are constants of the block.
+                        let base_w = super::elaborate::resolve_type_width(
+                            data_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        )
+                        .max(1);
+                        for (n, v) in &m {
+                            self.declare_enum_constant(n, Value::from_u64(*v, base_w));
+                        }
                         self.type_tables_gen += 1;
                         self.module.enum_members.insert(d.name.name.clone(), m);
                         if let Some(set) = self.plain_class_types.borrow_mut().as_mut() {
@@ -2654,50 +3076,56 @@ impl Simulator {
             // §6.18/§6.20.3: a typedef'd (or type-param-bound) local
             // carries its unpacked dims on the TYPE — `my_array_t a;`
             // declared inside a task elaborated as a scalar.
-            let typedef_dims: Vec<crate::ast::types::UnpackedDimension> =
-                if d.dimensions.is_empty() && !plain_class {
-                    if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
-                        let tn = &name.name.name;
-                        let concrete = self
-                            .resolve_type_param_binding(tn)
-                            .unwrap_or_else(|| tn.clone());
-                        self.module
-                            .typedef_unpacked_dims
-                            .get(&concrete)
-                            .cloned()
-                            .or_else(|| {
-                                // CLASS-LOCAL typedef: an explicit
-                                // `C::t_t v;` scope, else the class
-                                // whose method is executing — a
-                                // `Ph::d_t dd;` local bound as a
-                                // scalar, so a later `ref` call saw
-                                // no collection to write back to.
-                                let start = name
-                                    .scopes
-                                    .first()
-                                    .map(|s| s.name.name.clone())
-                                    .or_else(|| self.class_context_stack.last().cloned().flatten())
-                                    .or_else(|| {
-                                        self.this_stack.last().copied().flatten().and_then(|h| {
-                                            self.heap
-                                                .get(h)
-                                                .and_then(|x| x.as_ref())
-                                                .map(|i| i.class_name.clone())
-                                        })
-                                    })?;
-                                Self::typedef_dims_via_tables(&self.module, &start, &concrete)
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    }
+            let typedef_dims: Vec<crate::ast::types::UnpackedDimension> = if !plain_class {
+                if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
+                    let tn = &name.name.name;
+                    let concrete = self
+                        .resolve_type_param_binding(tn)
+                        .unwrap_or_else(|| tn.clone());
+                    self.module
+                        .typedef_unpacked_dims
+                        .get(&concrete)
+                        .cloned()
+                        .or_else(|| {
+                            // CLASS-LOCAL typedef: an explicit
+                            // `C::t_t v;` scope, else the class
+                            // whose method is executing — a
+                            // `Ph::d_t dd;` local bound as a
+                            // scalar, so a later `ref` call saw
+                            // no collection to write back to.
+                            let start = name
+                                .scopes
+                                .first()
+                                .map(|s| s.name.name.clone())
+                                .or_else(|| self.class_context_stack.last().cloned().flatten())
+                                .or_else(|| {
+                                    self.this_stack.last().copied().flatten().and_then(|h| {
+                                        self.heap
+                                            .get(h)
+                                            .and_then(|x| x.as_ref())
+                                            .map(|i| i.class_name.clone())
+                                    })
+                                })?;
+                            Self::typedef_dims_via_tables(&self.module, &start, &concrete)
+                        })
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
-                };
+                }
+            } else {
+                Vec::new()
+            };
+            // §7.4.5: a local with dimensions of its own (`q_t l[$];`) puts
+            // them first, then the typedef's, as at module scope; the
+            // typedef's were dropped, so each row of `l` held one scalar.
+            let joined_dims: Vec<crate::ast::types::UnpackedDimension>;
             let dims: &Vec<crate::ast::types::UnpackedDimension> = if typedef_dims.is_empty() {
                 &d.dimensions
-            } else {
+            } else if d.dimensions.is_empty() {
                 &typedef_dims
+            } else {
+                joined_dims = d.dimensions.iter().chain(&typedef_dims).cloned().collect();
+                &joined_dims
             };
             // §7.4.2 / §8.23: a dimension sized by a constant of the
             // enclosing scope (`l[N]`, `l[N * 2]`, `l[cls::N]`) — the
@@ -2819,33 +3247,7 @@ impl Simulator {
                         .var_decl_types
                         .insert(name.clone(), data_type.clone());
                     if let Some(init) = &d.init {
-                        let lvalue = crate::ast::expr::Expression::new(
-                            crate::ast::expr::ExprKind::Ident(
-                                crate::ast::expr::HierarchicalIdentifier {
-                                    root: None,
-                                    path: vec![crate::ast::expr::HierPathSegment {
-                                        name: crate::ast::Identifier {
-                                            name: name.clone(),
-                                            span: d.name.span,
-                                        },
-                                        selects: Vec::new(),
-                                    }],
-                                    span: d.name.span,
-                                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                                    cached_resolved_name: crate::ast::cache::NameCache::new(),
-                                    bound: crate::ast::binding::Bound::UNSET,
-                                },
-                            ),
-                            d.name.span,
-                        );
-                        let assign = crate::ast::stmt::Statement::new(
-                            crate::ast::stmt::StatementKind::BlockingAssign {
-                                lvalue,
-                                rvalue: init.clone(),
-                            },
-                            d.name.span,
-                        );
-                        self.exec_statement(&assign);
+                        self.route_decl_init_via_assign(&name, init, d.name.span);
                     }
                     continue;
                 }
@@ -2994,33 +3396,7 @@ impl Simulator {
                         // init is silently dropped and the queue
                         // stays empty.
                         if let Some(init) = &d.init {
-                            let lvalue = crate::ast::expr::Expression::new(
-                                crate::ast::expr::ExprKind::Ident(
-                                    crate::ast::expr::HierarchicalIdentifier {
-                                        root: None,
-                                        path: vec![crate::ast::expr::HierPathSegment {
-                                            name: crate::ast::Identifier {
-                                                name: bare.clone(),
-                                                span: d.name.span,
-                                            },
-                                            selects: Vec::new(),
-                                        }],
-                                        span: d.name.span,
-                                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                                        cached_resolved_name: crate::ast::cache::NameCache::new(),
-                                        bound: crate::ast::binding::Bound::UNSET,
-                                    },
-                                ),
-                                d.name.span,
-                            );
-                            let assign = crate::ast::stmt::Statement::new(
-                                crate::ast::stmt::StatementKind::BlockingAssign {
-                                    lvalue,
-                                    rvalue: init.clone(),
-                                },
-                                d.name.span,
-                            );
-                            self.exec_statement(&assign);
+                            self.route_decl_init_via_assign(&bare, init, d.name.span);
                         }
                         continue;
                     }
@@ -3184,33 +3560,7 @@ impl Simulator {
                         // aggregate spread applies write the keyed
                         // elements and record the default fallback.
                         if let Some(init) = &d.init {
-                            let lvalue = crate::ast::expr::Expression::new(
-                                crate::ast::expr::ExprKind::Ident(
-                                    crate::ast::expr::HierarchicalIdentifier {
-                                        root: None,
-                                        path: vec![crate::ast::expr::HierPathSegment {
-                                            name: crate::ast::Identifier {
-                                                name: bare,
-                                                span: d.name.span,
-                                            },
-                                            selects: Vec::new(),
-                                        }],
-                                        span: d.name.span,
-                                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                                        cached_resolved_name: crate::ast::cache::NameCache::new(),
-                                        bound: crate::ast::binding::Bound::UNSET,
-                                    },
-                                ),
-                                d.name.span,
-                            );
-                            let assign = crate::ast::stmt::Statement::new(
-                                crate::ast::stmt::StatementKind::BlockingAssign {
-                                    lvalue,
-                                    rvalue: init.clone(),
-                                },
-                                d.name.span,
-                            );
-                            self.exec_statement(&assign);
+                            self.route_decl_init_via_assign(&bare, init, d.name.span);
                         }
                         continue;
                     }
@@ -3342,33 +3692,7 @@ impl Simulator {
                 // as the queue branch above already does — the pattern
                 // spread then applies every §10.9.1 form.
                 if let Some(init) = &d.init {
-                    let lvalue = crate::ast::expr::Expression::new(
-                        crate::ast::expr::ExprKind::Ident(
-                            crate::ast::expr::HierarchicalIdentifier {
-                                root: None,
-                                path: vec![crate::ast::expr::HierPathSegment {
-                                    name: crate::ast::Identifier {
-                                        name: bare.clone(),
-                                        span: d.name.span,
-                                    },
-                                    selects: Vec::new(),
-                                }],
-                                span: d.name.span,
-                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                                cached_resolved_name: crate::ast::cache::NameCache::new(),
-                                bound: crate::ast::binding::Bound::UNSET,
-                            },
-                        ),
-                        d.name.span,
-                    );
-                    let assign = crate::ast::stmt::Statement::new(
-                        crate::ast::stmt::StatementKind::BlockingAssign {
-                            lvalue,
-                            rvalue: init.clone(),
-                        },
-                        d.name.span,
-                    );
-                    self.exec_statement(&assign);
+                    self.route_decl_init_via_assign(&bare, init, d.name.span);
                 }
             } else {
                 if !matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic))
@@ -3421,185 +3745,13 @@ impl Simulator {
                         self.resolve_dt(data_type),
                         crate::ast::types::DataType::Struct(su) if Self::spreads_member_wise(&su)
                     );
+                let eff_w = w;
                 let v = if let Some(init_expr) = d.init.as_ref().filter(|_| !struct_init_later) {
-                    // §8.8: `B h = C::new(...)` builds a `C`, not the
-                    // declared class (the `new` forms below).
-                    let mut produced: Option<Value> = Self::typed_ctor_call(init_expr)
-                        .and_then(|(prefix, args)| self.construct_typed_ctor(prefix, args));
-                    if let Some(cn) = class_name.as_ref().filter(|_| produced.is_none()) {
-                        // `T x = new(...);` / `T x = new;` — detect the
-                        // constructor form once; consumed by both the
-                        // class and covergroup branches below.
-                        let is_new = match &init_expr.kind {
-                            ExprKind::Call { func, args } => {
-                                if let ExprKind::Ident(h) = &func.kind {
-                                    if h.path.last().is_some_and(|s| s.name.name == "new") {
-                                        Some(args.clone())
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            }
-                            ExprKind::Ident(h) => {
-                                if h.path.last().is_some_and(|s| s.name.name == "new") {
-                                    Some(vec![])
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => None,
-                        };
-                        // §8.25: the declared type resolved to a
-                        // SPECIALIZED class name `Base#(args)` (a type
-                        // param bound to a nested specialization, e.g.
-                        // `T tmp = new;` with T = `queue#(string)` —
-                        // UVM's uvm_object_string_pool::get building
-                        // the hdl-paths queue). The plain-name lookup
-                        // below misses it, so the init fell to generic
-                        // eval and the local read x. Mirror the
-                        // assignment arm: extract the spec, carry it
-                        // through `current_spec`, construct the base.
-                        // §15.3/§15.4: `mailbox mb = new(2);` /
-                        // `semaphore s = new(1);` as a block-local
-                        // declaration — the built-in containers are not in
-                        // `module.classes`, so the constructor was skipped
-                        // and the local stayed null.
-                        if produced.is_none() && !self.module.classes.contains_key(cn) {
-                            if let (Some(kind), Some(call_args)) =
-                                (Self::container_base(cn), is_new.as_ref())
-                            {
-                                let handle = self.alloc_builtin_container(kind, call_args);
-                                produced = Some(Value::from_u64(handle as u64, 32));
-                            }
-                        }
-                        if produced.is_none()
-                            && is_new.is_some()
-                            && !self.module.classes.contains_key(cn)
-                        {
-                            if let Some((base, sig)) = self.extract_spec_from_string(cn) {
-                                if let Some(class_def) = self.module.classes.get(&base).cloned() {
-                                    let call_args = is_new.clone().unwrap();
-                                    self.ensure_spec_statics(&base, &sig);
-                                    let saved_spec = self.current_spec.clone();
-                                    self.current_spec = Some((base.clone(), sig));
-                                    produced = Some(self.instantiate_class(&class_def, &call_args));
-                                    self.current_spec = saved_spec;
-                                }
-                            }
-                        }
-                        if let Some(class_def) = self.module.classes.get(cn).cloned() {
-                            if let Some(call_args) = is_new {
-                                // §8.12 copy constructor: `T x = new src;`
-                                // with a single CLASS-HANDLE argument
-                                // shallow-copies `src`, it does NOT run
-                                // the constructor. The assignment path
-                                // handles this; the decl-init path used
-                                // to fall straight through to construction
-                                // (passing the handle as an ignored ctor
-                                // arg), so `T x = new src;` silently ran
-                                // `new()` and produced a fresh object.
-                                if call_args.len() == 1
-                                    && matches!(
-                                        &call_args[0].kind,
-                                        ExprKind::Ident(_)
-                                            | ExprKind::MemberAccess { .. }
-                                            | ExprKind::Index { .. }
-                                            // `new this` in a clone
-                                            // method copies the
-                                            // CURRENT object (§8.12)
-                                            | ExprKind::This
-                                    )
-                                    && self.expr_is_class_handle(&call_args[0])
-                                {
-                                    let src_h = self.eval_expr(&call_args[0]).to_u64().unwrap_or(0)
-                                        as usize;
-                                    // §8.12: `T x = new src;` shallow-copies
-                                    // `src` ONLY when src is of type T (or a
-                                    // subclass of T). A single class-handle
-                                    // arg of a DIFFERENT, unrelated class is
-                                    // a constructor ARGUMENT, not a copy
-                                    // source — e.g. `factory f = new(b)` where
-                                    // b is a base_cls must call
-                                    // factory::new(b), not copy-construct b.
-                                    // Without this type check, the loose
-                                    // `expr_is_class_handle` test treated any
-                                    // class-typed arg as a copy source,
-                                    // silently skipping the constructor body
-                                    // (so field assignments like
-                                    // `reg_type = t` never ran).
-                                    let is_copy_src = src_h != 0
-                                        && matches!(self.heap.get(src_h), Some(Some(src_inst))
-                                            if self.class_extends(&src_inst.class_name, cn));
-                                    if is_copy_src {
-                                        produced = Some(self.copy_construct(src_h));
-                                    }
-                                }
-                                if produced.is_none() {
-                                    // Pass the declared type's `#(...)` args
-                                    // (e.g. `resource#(int) r = new()`) so
-                                    // the instance records its type bindings
-                                    // (`T -> int`) — needed for per-spec static
-                                    // member resolution (get_type vs
-                                    // get_type_handle).
-                                    // §8.25.1: a typedef ALIAS of a
-                                    // specialization (`typedef
-                                    // Box#(byte,8) ByteBox; ByteBox b
-                                    // = new;`) carries no args on the
-                                    // declared type — pull them from
-                                    // the typedef's target, else the
-                                    // instance silently gets the
-                                    // class DEFAULTS.
-                                    let td_args: Option<Vec<Expression>> = match data_type {
-                                        crate::ast::types::DataType::TypeReference {
-                                            name,
-                                            type_args,
-                                            ..
-                                        } if type_args.is_empty() => {
-                                            match self.lookup_typedef_target(&name.name.name) {
-                                                Some(
-                                                    crate::ast::types::DataType::TypeReference {
-                                                        type_args: t2,
-                                                        ..
-                                                    },
-                                                ) if !t2.is_empty() => Some(t2.clone()),
-                                                _ => None,
-                                            }
-                                        }
-                                        _ => None,
-                                    };
-                                    let scoped_args = self.scoped_class_type_args(data_type);
-                                    let ta: Option<&[Expression]> = match data_type {
-                                        _ if scoped_args.is_some() => scoped_args.as_deref(),
-                                        crate::ast::types::DataType::TypeReference {
-                                            type_args,
-                                            ..
-                                        } if !type_args.is_empty() => Some(type_args.as_slice()),
-                                        _ => td_args.as_deref(),
-                                    };
-                                    produced = Some(self.instantiate_class_with_type_args(
-                                        &class_def, &call_args, ta,
-                                    ));
-                                }
-                            }
-                        } else if let Some(cg_def) = self.covergroup_def_for(cn) {
-                            // IEEE 1800-2017 §19.8: a covergroup-typed
-                            // LOCAL `cg c = new();` (declared inside a
-                            // procedural block) must allocate a real
-                            // covergroup instance. This branch only
-                            // handled classes, so the initializer fell
-                            // through to generic eval, `c` never got a
-                            // cg_heap handle, and sample() /
-                            // get_inst_coverage() (and the @(event)
-                            // clocking registration done inside
-                            // instantiate_covergroup) were silent
-                            // no-ops — coverage always read 0.
-                            if let Some(call_args) = is_new {
-                                produced = Some(self.instantiate_covergroup(&cg_def, &call_args));
-                            }
-                        }
-                    }
+                    let produced = self.init_class_or_covergroup_local(
+                        data_type,
+                        class_name.as_deref(),
+                        init_expr,
+                    );
                     match produced {
                         Some(p) => p,
                         None => {
@@ -3609,10 +3761,10 @@ impl Simulator {
                             } else {
                                 None
                             };
-                            let raw = typed.unwrap_or_else(|| self.eval_expr_ctx(init_expr, w));
+                            let raw = typed.unwrap_or_else(|| self.eval_expr_ctx(init_expr, eff_w));
                             Self::fit_local_decl_init(
                                 raw,
-                                w,
+                                eff_w,
                                 data_type,
                                 two_state,
                                 is_real_type,
@@ -3624,184 +3776,12 @@ impl Simulator {
                     default_v.clone()
                 };
                 match self.widths.get_mut(d.name.name.as_str()) {
-                    Some(slot) => *slot = w,
+                    Some(slot) => *slot = eff_w,
                     None => {
-                        self.widths.insert(d.name.name.clone(), w);
+                        self.widths.insert(d.name.name.clone(), eff_w);
                     }
                 }
-                // A local variable inside a method (which has a pushed
-                // call frame) must live in THAT frame, not the global
-                // signal table — otherwise a callee's local shadows and
-                // CLOBBERS a same-named caller local that lives as a
-                // signal (initial/always blocks have no frame). This avoids
-                // a local `resource_base r` nulling an outer `r`. Reads
-                // already consult `local_stack.last()` before signals, so
-                // the method still sees its own local. No frame → module/
-                // initial scope → signal table as before.
-                // §7.2/§13.4.2: an UNPACKED-struct local declared inside
-                // a subroutine keeps each member in the frame under
-                // `<name>.<member>` — the convention formal binding
-                // already uses. Nothing seeded those keys for a local,
-                // so its member references escaped to the module signal
-                // table and landed on an unrelated same-named
-                // variable's member: the callee read the CALLER's value
-                // back and its own writes vanished. Seeding also makes
-                // each call's local FRESH, as `automatic` requires.
-                let mut unpacked_struct_local = false;
-                // A static process-block local lives in the signal table even
-                // under a loop's variable frame, which its block outlives.
-                let in_frame = !self.local_stack.is_empty() && !static_block;
-                if in_frame && d.dimensions.is_empty() && !plain {
-                    if let crate::ast::types::DataType::Struct(su) = self.resolve_dt(data_type) {
-                        if Self::spreads_member_wise(&su) {
-                            unpacked_struct_local = true;
-                            let base = d.name.name.clone();
-                            // §6.8 defaults per leaf (a 2-state member reads
-                            // 0), and packed members alias their fields.
-                            let mut leaves = Vec::new();
-                            self.unpacked_struct_leaf_defaults(&base, &su, 0, &mut leaves);
-                            for (k, _, mdt) in &leaves {
-                                self.register_packed_leaf_layout(k, mdt);
-                            }
-                            // The `<base>.` marker, as `unpacked_struct_leaf_keys`.
-                            self.any_struct_formal_markers = true;
-                            if let Some(frame) = self.local_stack.last_mut() {
-                                frame.insert(format!("{}.", base), Value::new(0));
-                                for (k, dv, _) in leaves {
-                                    frame.insert(k, dv);
-                                }
-                            }
-                        }
-                    }
-                }
-                if unpacked_struct_local {
-                    // An unpacked struct has no container of its own —
-                    // its leaves ARE the storage. Seeding one anyway
-                    // shadowed them: reading the bare name returned the
-                    // container's x instead of the packed members, so
-                    // `return s;` from a struct-returning function
-                    // yielded x even though every member was set.
-                    self.local_stack
-                        .last_mut()
-                        .map(|frame| frame.remove(&d.name.name));
-                    // Record the declared type so type-directed
-                    // consumers (`%s` string-member detection, `%p`)
-                    // can resolve `p.member` through the typedef.
-                    self.module
-                        .var_decl_types
-                        .insert(d.name.name.clone(), data_type.clone());
-                    self.note_struct_root(&d.name.name);
-                    self.note_struct_type(data_type);
-                    // §6.21: each entry gets FRESH (empty) dynamic members.
-                    if self.struct_colls_possible()
-                        && let Some(su) = self.unpacked_struct_of(data_type)
-                    {
-                        self.fresh_struct_colls(&d.name.name, &su);
-                    }
-                    // A decl-init whose SOURCE is an unpacked-struct
-                    // CLASS property (`pair_t p = o.orig;`, incl. the
-                    // ternary form) must write the leaves member-wise —
-                    // the whole-value `v` computed above has nothing to
-                    // assemble from and left every member x.
-                    if let Some(init_expr) = d.init.clone() {
-                        self.init_unpacked_struct_local(d, data_type, &init_expr);
-                    }
-                } else if let Some(frame) = self.local_stack.last_mut().filter(|_| in_frame) {
-                    frame.insert(d.name.name.clone(), v);
-                } else {
-                    self.signals.insert(d.name.name.clone(), v);
-                    // §7.2: an unpacked-struct local of an `initial`/`always`
-                    // block (no call frame) gets its member leaves as
-                    // signals, as module-scope structs do; a member write
-                    // through a selected member (`t.rows[0].level = 2`) found
-                    // no leaf to land on and vanished.
-                    if d.dimensions.is_empty() && !plain {
-                        if let crate::ast::types::DataType::Struct(su) = self.resolve_dt(data_type)
-                        {
-                            if Self::spreads_member_wise(&su) {
-                                self.note_struct_root(&d.name.name);
-                                self.note_struct_type(data_type);
-                                let mut leaves = Vec::new();
-                                self.unpacked_struct_leaf_defaults(
-                                    &d.name.name,
-                                    &su,
-                                    0,
-                                    &mut leaves,
-                                );
-                                for (k, dv, mdt) in leaves {
-                                    self.register_packed_leaf_layout(&k, &mdt);
-                                    self.widths.insert(k.clone(), dv.width);
-                                    // §10.7: a store to the leaf takes its
-                                    // signedness from this set.
-                                    if dv.is_signed {
-                                        self.signed_signals.insert(k.clone());
-                                    } else {
-                                        self.signed_signals.remove(&k);
-                                    }
-                                    self.signals.insert(k, dv);
-                                }
-                                if self.struct_colls_possible() {
-                                    self.fresh_struct_colls(&d.name.name, &su);
-                                }
-                                if let Some(init_expr) = d.init.clone() {
-                                    self.init_unpacked_struct_local(d, data_type, &init_expr);
-                                }
-                            }
-                        }
-                    }
-                    // §6.21/§9.3.2: an explicitly `automatic` block
-                    // local is a fresh variable per block entry, and a
-                    // fork child must capture ITS entry's value. With
-                    // no call frame it lives in the shared signal map,
-                    // so record it for `inherit_fork_child_context` to
-                    // copy by value at spawn time — exactly like a
-                    // for-init loop variable. The enclosing SeqBlock
-                    // pops it on scope exit.
-                    if matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic)) {
-                        self.auto_loop_vars.push(d.name.name.clone());
-                    }
-                }
-                // §6.8/§25.9/§7.3.2: a virtual-interface or tagged-union
-                // local's initializer is the assignment `name = init` — the
-                // assignment arm binds the interface instance and builds the
-                // tag + member value; evaluated as a plain expression the
-                // vif read x and the union matched no tag.
-                if let Some(init_expr) = d.init.as_ref().filter(|_| !plain) {
-                    // Followed through the typedef table by reference: this
-                    // runs for every non-scalar declaration with an
-                    // initializer, so no resolved-type clone.
-                    let via_assign = match self.typedef_chain_end(data_type) {
-                        crate::ast::types::DataType::Interface { .. } => true,
-                        crate::ast::types::DataType::Struct(su) => su.tagged,
-                        _ => false,
-                    };
-                    if via_assign {
-                        let lvalue = crate::ast::expr::Expression::new(
-                            crate::ast::expr::ExprKind::Ident(
-                                crate::ast::expr::HierarchicalIdentifier {
-                                    root: None,
-                                    path: vec![crate::ast::expr::HierPathSegment {
-                                        name: d.name.clone(),
-                                        selects: Vec::new(),
-                                    }],
-                                    span: d.name.span,
-                                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                                    cached_resolved_name: crate::ast::cache::NameCache::new(),
-                                    bound: crate::ast::binding::Bound::UNSET,
-                                },
-                            ),
-                            d.name.span,
-                        );
-                        let assign = crate::ast::stmt::Statement::new(
-                            crate::ast::stmt::StatementKind::BlockingAssign {
-                                lvalue,
-                                rvalue: init_expr.clone(),
-                            },
-                            d.name.span,
-                        );
-                        self.exec_statement(&assign);
-                    }
-                }
+                self.store_local_decl_value(d, data_type, lifetime, plain, static_block, v);
                 // Track `signed` scalars so reads carry `is_signed`
                 // (needed for signed division/modulo, comparison, and
                 // `%0d` display). A fresh decl also clears a stale
@@ -3944,7 +3924,10 @@ impl Simulator {
                 // container. Clear any stale same-named entry from another
                 // frame (var_container_types is a flat map like
                 // var_class_types) when this decl isn't a container.
-                match class_name.as_deref().and_then(Self::container_base) {
+                match class_name
+                    .as_deref()
+                    .and_then(|t| self.builtin_container_kind(t))
+                {
                     Some(k) => {
                         self.var_container_types
                             .insert(d.name.name.clone(), k.to_string());
@@ -4086,6 +4069,82 @@ impl Simulator {
         }
     }
 
+    fn exec_stmt_param_decl(
+        &mut self,
+        stmt: &Statement,
+        data_type: &DataType,
+        declarators: &[crate::ast::stmt::VarDeclarator],
+    ) {
+        if let crate::ast::types::DataType::Implicit {
+            signing,
+            dimensions,
+            ..
+        } = data_type
+            && dimensions.is_empty()
+        {
+            for d in declarators {
+                if !self.local_stack.is_empty() {
+                    self.claim_local_meta(&d.name.name, stmt);
+                }
+                let mut v = match &d.init {
+                    Some(init_expr) => {
+                        let mut val = self.eval_expr(init_expr);
+                        if val.is_fill {
+                            val.is_fill = false;
+                        }
+                        val
+                    }
+                    None => Value::new(32),
+                };
+                if !v.is_real {
+                    match signing {
+                        Some(crate::ast::types::Signing::Signed) => v.is_signed = true,
+                        Some(crate::ast::types::Signing::Unsigned) => v.is_signed = false,
+                        None => {}
+                    }
+                }
+                let eff_w = v.width;
+                let is_real = v.is_real;
+                let is_signed = !is_real && v.is_signed;
+                let is_string = d
+                    .init
+                    .as_ref()
+                    .is_some_and(|e| self.expr_is_string_valued(e));
+                match self.widths.get_mut(d.name.name.as_str()) {
+                    Some(slot) => *slot = eff_w,
+                    None => {
+                        self.widths.insert(d.name.name.clone(), eff_w);
+                    }
+                }
+                if is_signed {
+                    if !self.signed_signals.contains(d.name.name.as_str()) {
+                        self.signed_signals.insert(d.name.name.clone());
+                    }
+                } else {
+                    self.signed_signals.remove(&d.name.name);
+                }
+                if is_real {
+                    self.real_signals.insert(d.name.name.clone());
+                } else {
+                    self.real_signals.remove(&d.name.name);
+                }
+                if is_string {
+                    self.string_signals.insert(d.name.name.clone());
+                } else {
+                    self.forget_string_flag(&d.name.name);
+                }
+                self.record_frame_string_kind(&d.name.name, is_string);
+                if let Some(frame) = self.local_stack.last_mut() {
+                    frame.insert(d.name.name.clone(), v);
+                } else {
+                    self.signals.insert(d.name.name.clone(), v);
+                }
+            }
+        } else {
+            self.exec_stmt_var_decl(stmt, data_type, &None, declarators);
+        }
+    }
+
     pub fn exec_statement(&mut self, stmt: &Statement) {
         if self.finished
             || self.time > self.max_time
@@ -4167,7 +4226,10 @@ impl Simulator {
                 // and `this` are live: the commit runs later in a context
                 // where neither is.
                 let lvalue_vif;
-                let lvalue: &Expression = match self.vif_rebase_expr(lvalue) {
+                let lvalue: &Expression = match self
+                    .vif_rebase_expr(lvalue)
+                    .or_else(|| self.inst_array_member_canon(lvalue))
+                {
                     Some(r) => {
                         lvalue_vif = r;
                         &lvalue_vif
@@ -4244,8 +4306,8 @@ impl Simulator {
                     if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4 {
                         let n_val = self.eval_expr(&args[0]).to_u64().unwrap_or(1) as i64;
                         let edge_code = self.eval_expr(&args[1]).to_u64().unwrap_or(0);
-                        let val = self.eval_target_rhs(packed_lvalue, &args[3]);
-                        let saved = self.make_intra_saved_expr(val, rvalue.span);
+                        let (saved, release) =
+                            self.capture_intra_rhs(packed_lvalue, &args[3], rvalue.span);
                         let edge = match edge_code {
                             1 => Some(Edge::Posedge),
                             2 => Some(Edge::Negedge),
@@ -4276,6 +4338,7 @@ impl Simulator {
                             },
                             stmt.span,
                         ));
+                        cont.extend(release);
                         let child = self.next_pid;
                         self.next_pid += 1;
                         self.process_origin
@@ -4283,6 +4346,57 @@ impl Simulator {
                         self.event_queue.schedule(self.time, child, cont.into());
                         return;
                     }
+                }
+                // §10.10 / §10.4.2: capture all array operands now; replace
+                // the collection only when this entry reaches the NBA region.
+                if let Some(elements) = self.capture_array_rhs(lvalue, rvalue) {
+                    let d = intra_d.unwrap_or_else(|| {
+                        delay
+                            .as_ref()
+                            .map(|e| self.eval_delay_ticks(e))
+                            .unwrap_or(0)
+                    });
+                    // Fixed storage shares NBA ordering with element writes.
+                    // Put its captured leaves through the ordinary scheduler
+                    // so a later `a[i] <= v` overrides this whole-array store.
+                    if let Some(dst) = self.array_operand_name(lvalue)
+                        && !self.module.dynamic_arrays.contains(&dst)
+                        && !self.module.queue_vars.contains(&dst)
+                        && let Some((targets, _)) = self.stream_elem_order(&dst)
+                    {
+                        for (target, value) in targets.into_iter().zip(elements) {
+                            let lhs = Self::append_leaf_path(lvalue, &target[dst.len()..]);
+                            let saved = self.make_intra_saved_expr(value, rvalue.span);
+                            let delay = (d > 0).then(|| {
+                                self.make_intra_saved_expr(Value::from_u64(d, 64), stmt.span)
+                            });
+                            self.exec_statement(&Statement::new(
+                                StatementKind::NonblockingAssign {
+                                    lvalue: lhs,
+                                    delay,
+                                    rvalue: saved,
+                                },
+                                stmt.span,
+                            ));
+                        }
+                        return;
+                    }
+                    let frozen = self.freeze_lvalue_indices(lvalue);
+                    let root_frame = self.nba_root_frame(lvalue);
+                    self.enqueue_context_nba(
+                        NbaEntry {
+                            elements: Some(elements),
+                            lhs: Some(frozen),
+                            value: Value::zero(1),
+                            resolved_id: None,
+                            static_key: None,
+                            static_slice: None,
+                            this_handle: self.this_stack.last().copied().flatten(),
+                            root_frame,
+                        },
+                        d,
+                    );
+                    return;
                 }
                 // §10.8, §10.9: a pattern driven onto a packed target takes
                 // the target's declared type.
@@ -4293,6 +4407,24 @@ impl Simulator {
                 // of them, associative array) is spread member-wise.
                 if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
                     if packed_pattern.is_none() {
+                        // Fixed arrays and records use stable leaf storage. Runtime-sized
+                        // collections retain their own size/default update path.
+                        let mut root = lvalue;
+                        while let ExprKind::Index { expr, .. }
+                        | ExprKind::MemberAccess { expr, .. } = &root.kind
+                        {
+                            root = expr;
+                        }
+                        let capture = if let ExprKind::Ident(h) = &root.kind {
+                            let name = self.resolve_hier_name(h);
+                            !self.module.dynamic_arrays.contains(name.as_ref())
+                                && !self.module.queue_vars.contains(name.as_ref())
+                                && !self.is_associative_array(name.as_ref())
+                        } else {
+                            true
+                        };
+                        let previous_capture =
+                            std::mem::replace(&mut self.pattern_nba_leaves, capture.then(Vec::new));
                         let spread = if matches!(&lvalue.kind, ExprKind::Ident(_)) {
                             self.pattern_aggregate_names(lvalue)
                                 .into_iter()
@@ -4304,7 +4436,35 @@ impl Simulator {
                                     None => false,
                                 }
                         };
+                        let leaves = self.pattern_nba_leaves.take().unwrap_or_default();
+                        self.pattern_nba_leaves = previous_capture;
                         if spread {
+                            // §10.4.2, §9.4.5: evaluate every item now, then
+                            // route the captured leaves through normal NBA scheduling.
+                            let d = intra_d.unwrap_or_else(|| {
+                                delay
+                                    .as_ref()
+                                    .map(|e| self.eval_expr(e).to_u64().unwrap_or(0))
+                                    .unwrap_or(0)
+                            });
+                            for (name, value) in leaves {
+                                let split = name.find(['.', '[']).unwrap_or(name.len());
+                                let base =
+                                    Self::flat_name_ident(name[..split].to_string(), stmt.span);
+                                let target = Self::append_leaf_path(&base, &name[split..]);
+                                let saved = self.make_intra_saved_expr(value, rvalue.span);
+                                let delay = (d > 0).then(|| {
+                                    self.make_intra_saved_expr(Value::from_u64(d, 64), stmt.span)
+                                });
+                                self.exec_statement(&Statement::new(
+                                    StatementKind::NonblockingAssign {
+                                        lvalue: target,
+                                        delay,
+                                        rvalue: saved,
+                                    },
+                                    stmt.span,
+                                ));
+                            }
                             return;
                         }
                     }
@@ -4408,6 +4568,17 @@ impl Simulator {
                             });
                             if let Some((net, _)) = out_net {
                                 let net = net.clone();
+                                // §14.16: a clocking output creates a driver on
+                                // the net. Where the net has another driver, the
+                                // clockvar drives a stage of its own and the
+                                // stage joins the net's other drivers in the
+                                // resolution fold — so the drive goes to the
+                                // stage, not to the net.
+                                let stage = self
+                                    .clocking_output_stages
+                                    .get(&(cb.to_string(), net.clone()))
+                                    .cloned();
+                                let drive_net = stage.clone().unwrap_or_else(|| net.clone());
                                 let last_sels = &hier.path[hier.path.len() - 1].selects;
                                 // §14.5: a clockvar bound to a select of the
                                 // net drives through that select (#823).
@@ -4437,7 +4608,7 @@ impl Simulator {
                                             root: None,
                                             path: vec![crate::ast::expr::HierPathSegment {
                                                 name: crate::ast::Identifier {
-                                                    name: net.clone(),
+                                                    name: drive_net.clone(),
                                                     span: lvalue.span,
                                                 },
                                                 selects: last_sels.clone(),
@@ -4466,7 +4637,7 @@ impl Simulator {
                                         self.clocking_cycle_pending.entry(cb).or_default().push((
                                             n,
                                             raw_sig.to_string(),
-                                            net,
+                                            drive_net.clone(),
                                             val,
                                             target,
                                         ));
@@ -4493,21 +4664,21 @@ impl Simulator {
                                         self.clocking_edge_out_pending
                                             .entry(cb)
                                             .or_default()
-                                            .push((net, val, edge, d, target));
+                                            .push((drive_net.clone(), val, edge, d, target));
                                         return;
                                     }
                                     if let Some(t) = &target {
                                         self.drive_clocking_select(t, val, skew);
                                         return;
                                     }
-                                    if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
+                                    if let Some(&id) = self.signal_name_to_id.get(drive_net.as_str()) {
                                         self.schedule_clocking_update(id, &val, skew);
                                         return;
                                     }
                                 }
                                 self.clocking_output_pending.entry(cb).or_default().push((
                                     raw_sig.to_string(),
-                                    net,
+                                    drive_net,
                                     val,
                                     target,
                                 ));
@@ -4555,6 +4726,7 @@ impl Simulator {
                 if let Some(key) = self.nba_static_key_for_lvalue(lvalue) {
                     self.enqueue_context_nba(
                         NbaEntry {
+                            elements: None,
                             lhs: None,
                             value: val.resize_for_assign(w),
                             resolved_id: None,
@@ -4578,6 +4750,7 @@ impl Simulator {
                         // §4.6 b): a partial update to this signal is already
                         // queued; `nba_fast` would commit this one first.
                         self.nba_queue.push(NbaEntry {
+                            elements: None,
                             lhs: None,
                             value: val.resize_for_assign(w),
                             resolved_id: Some(id),
@@ -4619,6 +4792,7 @@ impl Simulator {
                         let static_key = self.nba_static_key_for_lvalue(lvalue);
                         let this_handle = self.this_stack.last().copied().flatten();
                         self.nba_queue.push(NbaEntry {
+                            elements: None,
                             lhs: Some(frozen),
                             value: qval,
                             resolved_id: None,
@@ -4663,6 +4837,7 @@ impl Simulator {
                     let this_handle = self.this_stack.last().copied().flatten();
                     self.enqueue_context_nba(
                         NbaEntry {
+                            elements: None,
                             lhs: Some(frozen),
                             value: qval,
                             resolved_id: None,
@@ -5179,7 +5354,8 @@ impl Simulator {
                 // one scan and no allocation.
                 let shadow_frame = self.local_stack.last().is_none()
                     && stmts.iter().any(|s| match &s.kind {
-                        StatementKind::VarDecl { declarators, .. } => declarators
+                        StatementKind::VarDecl { declarators, .. }
+                        | StatementKind::ParamDecl { declarators, .. } => declarators
                             .iter()
                             .any(|d| self.signal_name_to_id.contains_key(d.name.name.as_str())),
                         _ => false,
@@ -5542,6 +5718,13 @@ impl Simulator {
                         StatementKind::Return(Some(selected)),
                         stmt.span,
                     ));
+                    return;
+                }
+                // §10.9, §13.4.1: a pattern returned as an array or queue of
+                // unpacked structs is built in storage of the return type.
+                if let Some(rhs) = expr
+                    && self.return_pattern_in_storage(rhs, stmt.span)
+                {
                     return;
                 }
 
@@ -6495,9 +6678,7 @@ impl Simulator {
                             None => next,
                         };
                         next = v.wrapping_add(1);
-                        self.module
-                            .parameters
-                            .insert(m.name.name.clone(), Value::from_u64(v, base_w));
+                        self.declare_enum_constant(&m.name.name, Value::from_u64(v, base_w));
                         members.push((m.name.name.clone(), v));
                     }
                     self.module
@@ -6512,6 +6693,11 @@ impl Simulator {
                 lifetime,
                 declarators,
             } => self.exec_stmt_var_decl(stmt, data_type, lifetime, declarators),
+            StatementKind::ParamDecl {
+                data_type,
+                declarators,
+                ..
+            } => self.exec_stmt_param_decl(stmt, data_type, declarators),
             StatementKind::EventTrigger {
                 name,
                 nonblocking,

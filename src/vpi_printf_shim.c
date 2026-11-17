@@ -85,9 +85,45 @@ extern int xezim_vpi_control(int operation, int arg, void *handle);
 #define XEZIM_vpiFinish                67
 #define XEZIM_vpiSetInteractiveScope   69
 
+/* The assertion operations (IEEE 1800-2017 Clause 39.5) take an assertion
+ * handle; vpiAssertionKill also the attempt's start time, and the step
+ * operations a start time and the step constant. The system operations take
+ * nothing. Only the arguments an operation defines are read: a client may
+ * pass more, and they need not be initialized. */
+extern int xezim_vpi_control_assertion(int operation, void *handle,
+                                       void *time_p, int step);
+
+#define XEZIM_vpiAssertionDisable       620
+#define XEZIM_vpiAssertionEnable        621
+#define XEZIM_vpiAssertionReset         622
+#define XEZIM_vpiAssertionKill          623
+#define XEZIM_vpiAssertionEnableStep    624
+#define XEZIM_vpiAssertionDisableStep   625
+#define XEZIM_vpiAssertionSysOn         627
+#define XEZIM_vpiAssertionSysReset      630
+#define XEZIM_vpiAssertionSysKill       632
+
 int vpi_control(int operation, ...) {
     int arg = 0;
     void *handle = 0;
+    if (operation >= XEZIM_vpiAssertionDisable &&
+        operation <= XEZIM_vpiAssertionDisableStep) {
+        void *time_p = 0;
+        int step = 0;
+        va_list ap;
+        va_start(ap, operation);
+        handle = va_arg(ap, void *);
+        if (operation >= XEZIM_vpiAssertionKill)
+            time_p = va_arg(ap, void *);
+        if (operation == XEZIM_vpiAssertionEnableStep)
+            step = va_arg(ap, int);
+        va_end(ap);
+        return xezim_vpi_control_assertion(operation, handle, time_p, step);
+    }
+    if ((operation >= XEZIM_vpiAssertionSysOn &&
+         operation <= XEZIM_vpiAssertionSysReset) ||
+        operation == XEZIM_vpiAssertionSysKill)
+        return xezim_vpi_control_assertion(operation, 0, 0, 0);
     if (operation == XEZIM_vpiStop || operation == XEZIM_vpiFinish) {
         va_list ap;
         va_start(ap, operation);

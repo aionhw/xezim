@@ -59,7 +59,7 @@ impl Simulator {
                 // above returns first), and the shared dedupe means a literal
                 // already reported at elaboration stays quiet.
                 super::elaborate::warn_unsized_decimal_wrap(*size, base, value);
-                let mut v = Value::from_str_radix(value, r, w);
+                let mut v = Value::from_literal_text(value, r, w);
                 // Cache inline values (width <= 64)
                 if w <= 64 {
                     if let Some((vb, xz)) = v.inline_bits() {
@@ -256,7 +256,9 @@ impl Simulator {
         let saved_auto_len = self.auto_loop_vars.len();
         let mut processes = Vec::with_capacity(stmts.len());
         for s in stmts {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 self.exec_statement(s);
                 for d in declarators {
                     self.auto_loop_vars.push(d.name.name.clone());
@@ -954,7 +956,7 @@ impl Simulator {
         // general path.
         if self.ref_redirect_possible() {
             if let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(root)) {
-                h = self.get_signal_value_by_name(storage)?.to_u64()? as usize;
+                h = self.ref_alias_peek(storage)?.to_u64()? as usize;
             } else if self
                 .ref_identity_stack
                 .last()
@@ -1481,6 +1483,59 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) {
+        // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
+        // is evaluated exactly ONCE. The assign_value machinery
+        // re-evaluates the index in several candidate branches, so
+        // fold side-effecting indices before any aggregate probe. A
+        // compound assign (`x[i++] += 2`) was desugared by the parser
+        // into `x[i++] = x[i++] + 2` with a CLONED lvalue (same span)
+        // on the RHS — point that clone at the same folded index so
+        // the increment still happens once.
+        if Self::lvalue_has_incdec_index(lvalue) {
+            if let Some(new_lhs) = self.rewrite_lvalue_index_side_effects(lvalue) {
+                let new_rhs: Expression = match &rvalue.kind {
+                    ExprKind::Binary { op, left, right }
+                        if left.span == lvalue.span
+                            && std::mem::discriminant(&left.kind)
+                                == std::mem::discriminant(&lvalue.kind) =>
+                    {
+                        Expression::new(
+                            ExprKind::Binary {
+                                op: *op,
+                                left: Box::new(new_lhs.clone()),
+                                right: right.clone(),
+                            },
+                            rvalue.span,
+                        )
+                    }
+                    _ => (*rvalue).clone(),
+                };
+                // The frozen target can still be an unpacked aggregate.
+                // Keep its member-wise assignment paths instead of forcing
+                // the value-only scalar store.
+                self.exec_stmt_blocking_assign_body(stmt, &new_lhs, &new_rhs);
+                return;
+            }
+        }
+        // #1108: a whole array member of an instance-array element on either
+        // side (`w = lane[0].payload`, `lane[1].payload = '{...}`).
+        // An element select is folded where it is read or written.
+        let whole =
+            |e: &Expression| matches!(e.kind, ExprKind::MemberAccess { .. } | ExprKind::Ident(_));
+        if self.has_indexed_scopes() && (whole(lvalue) || whole(rvalue)) {
+            let l = whole(lvalue)
+                .then(|| self.inst_array_member_canon(lvalue))
+                .flatten();
+            let r = whole(rvalue)
+                .then(|| self.inst_array_member_canon(rvalue))
+                .flatten();
+            if l.is_some() || r.is_some() {
+                let lvalue = l.as_ref().unwrap_or(lvalue);
+                let rvalue = r.as_ref().unwrap_or(rvalue);
+                self.exec_stmt_blocking_assign_body(stmt, lvalue, rvalue);
+                return;
+            }
+        }
         if let Some(pattern) = self.unpacked_typed_pattern(rvalue) {
             self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
             return;
@@ -1557,14 +1612,6 @@ impl Simulator {
         }
         // (A side-effecting lvalue index is folded first, below, and
         // comes back through here.)
-        if self.indexed_colls_live()
-            && (self.may_name_indexed_coll(lvalue) || self.may_name_indexed_coll(rvalue))
-            && !Self::lvalue_has_incdec_index(lvalue)
-            && self.try_indexed_coll_assign(lvalue, rvalue)
-        {
-            self.settle_after_proc_write();
-            return;
-        }
         if (matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
             || self.lvalue_may_name_struct_coll(lvalue))
             && self.try_struct_aggregate_assign(stmt, lvalue, rvalue)
@@ -1577,39 +1624,19 @@ impl Simulator {
         if self.try_event_handle_assign(lvalue, rvalue) {
             return;
         }
-        // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
-        // is evaluated exactly ONCE. The assign_value machinery
-        // re-evaluates the index in several candidate branches, so
-        // fold side-effecting indices to literals up front. A
-        // compound assign (`x[i++] += 2`) was desugared by the parser
-        // into `x[i++] = x[i++] + 2` with a CLONED lvalue (same span)
-        // on the RHS — point that clone at the same folded index so
-        // the increment still happens once.
-        if Self::lvalue_has_incdec_index(lvalue) {
-            if let Some(new_lhs) = self.rewrite_lvalue_index_side_effects(lvalue) {
-                let new_rhs: Expression = match &rvalue.kind {
-                    ExprKind::Binary { op, left, right }
-                        if left.span == lvalue.span
-                            && std::mem::discriminant(&left.kind)
-                                == std::mem::discriminant(&lvalue.kind) =>
-                    {
-                        Expression::new(
-                            ExprKind::Binary {
-                                op: *op,
-                                left: Box::new(new_lhs.clone()),
-                                right: right.clone(),
-                            },
-                            rvalue.span,
-                        )
-                    }
-                    _ => (*rvalue).clone(),
-                };
-                // The frozen target can still be an unpacked aggregate.
-                // Keep its member-wise assignment paths instead of forcing
-                // the value-only scalar store.
-                self.exec_stmt_blocking_assign_body(stmt, &new_lhs, &new_rhs);
-                return;
-            }
+        let sized_new = Self::sized_new_parts(rvalue);
+        let row_sized_new: Option<String> = sized_new
+            .is_some()
+            .then(|| self.sized_new_row_lvalue(lvalue))
+            .flatten();
+        if self.indexed_colls_live()
+            && row_sized_new.is_none()
+            && (self.may_name_indexed_coll(lvalue) || self.may_name_indexed_coll(rvalue))
+            && !Self::lvalue_has_incdec_index(lvalue)
+            && self.try_indexed_coll_assign(lvalue, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
         }
         // LRM §25.8 virtual-interface binding. When the LHS is a
         // class-property write whose property is declared
@@ -1715,7 +1742,21 @@ impl Simulator {
         // min(n, src.size()) elements and default-initialises the rest.
         // A `d[i] = new[n]` lvalue sizes the ELEMENT of an array of
         // dynamic arrays.
-        if let Some((n_expr, src_expr)) = Self::sized_new_parts(rvalue) {
+        if let Some((n_expr, src_expr)) = sized_new {
+            if let Some(row) = row_sized_new {
+                if !self.ensure_row(&row) {
+                    let _ = self.eval_expr(n_expr);
+                    if let Some(src) = src_expr {
+                        let _ = self.eval_expr(src);
+                    }
+                    self.settle_after_proc_write();
+                    return;
+                }
+                self.module.dynamic_arrays.insert(row.clone());
+                self.fill_sized_new(&row, n_expr, src_expr);
+                self.settle_after_proc_write();
+                return;
+            }
             let target = match &lvalue.kind {
                 ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh)),
                 // `dq[1] = new[n]` on an array-of-dynamic-arrays
@@ -3857,6 +3898,13 @@ impl Simulator {
                     // `other.h = new()` with `other` a `W #(B)` builds a `B`
                     // (#596).
                     let type_name = self.member_target_class(lvalue).or(type_name);
+                    // §15.3, §15.4, §6.18: a built-in class named with its
+                    // specialization (`mailbox #(int)`) or through a typedef.
+                    let type_name = type_name.map(|tn| {
+                        self.builtin_container_kind(&tn)
+                            .map(str::to_string)
+                            .unwrap_or(tn)
+                    });
                     if let Some(tname) = type_name {
                         if tname == "semaphore" {
                             let handle = self.heap.len();

@@ -67,6 +67,9 @@ impl Simulator {
         }
         let mut blocks: Vec<String> = Vec::new();
         for (ci, con) in constraints.iter().enumerate() {
+            if con.name.name == "__back_ref__" {
+                continue;
+            }
             let name = match con.name.name.as_str() {
                 "__inline__" => "with {...}",
                 n => n,
@@ -260,6 +263,7 @@ impl Simulator {
         );
         let blocks: Vec<&str> = constraints
             .iter()
+            .filter(|c| c.name.name != "__back_ref__")
             .map(|c| match c.name.name.as_str() {
                 "__inline__" => "with {...}",
                 n => n,

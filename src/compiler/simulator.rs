@@ -358,8 +358,23 @@ fn method_boost_enabled() -> bool {
 // §25.5: a modport-qualified name resolves to the interface instance's own variable.
 // §8.14: a base static that a derived class redeclares counts as a redeclared member.
 // §7.4.1: a member of an element of an ascending packed array of structs slices from slot 0.
+// §10.9.2: structure replication in scalarized function calls.
+// §6.16: a string-collection element read through a class handle compares as a string.
+// §7.4.2: an index into an array with a negative bound is sign-extended.
+// §10.9.1, §11.8.1, §7.2.1, §7.4.1, §11.4.14: typed pattern keys, operand signs, packed elements, stream widths.
+// §23.3.2, §7.4: an element of a multidimensional array member of an instance-array element.
+// §6.19.5: enumeration methods take the receiver's declared enumeration.
+// §6.20: procedural parameters retain their own type and declaration kind.
+// Scope-specific combinational dependency resolution (§23.6).
+// Absolute packed references retain declaration geometry (§23.6, §7.4.1).
+// Class aggregate ownership and struct-field constructor typing (§8.8/§8.11).
+// Scoped memory destinations, dynamic rows, combinational time scope, and string-member local shadowing.
+// Explicit event expressions retain function-call operands and result guards.
+// Net typedef metadata and virtual-interface specialization identities.
+// Class-local shadowing keeps numeric comparisons out of string-member admission.
 // Module helper reads and queue operations retain their lexical ownership.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3083;
+// Refresh compiled methods after combining VHDL and main compiler changes.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3084;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -563,6 +578,11 @@ const RPS_TRAMPOLINE_DEPTH: usize = 300;
 /// Internal marker retrieving a §9.4.5 intra-assignment RHS value captured in
 /// `Simulator::intra_saved` (see `make_intra_saved_expr`). Never user-visible.
 const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
+/// §9.4.5, §10.9: an item of an intra-assignment pattern, captured when the
+/// statement ran. Read without being taken (a `default:` item is read once
+/// per element); `INTRA_RELEASE_MARKER` frees the items after the store.
+const INTRA_KEPT_MARKER: &str = "$__xz_intra_kept";
+const INTRA_RELEASE_MARKER: &str = "$__xz_intra_release";
 /// Internal `$__xz_vc_changed(idx, expr)`: true once `expr` differs from the
 /// value stashed in `Simulator::vc_saved[idx]` when a value-change event
 /// control (`@prop` on a non-event class property) was armed. Never
@@ -772,6 +792,38 @@ fn xtrace_options() -> XtraceOptions {
         .unwrap_or_default()
 }
 
+/// `--wave-suppress` / `--wave-suppress-file` / `--wave-suppress-module`: the
+/// waveform EXCLUDE list, shared by the VCD, FST and XTrace dumps.
+///
+/// Process-global for the same reason as `set_dpi_libs`: `simulate_multi`
+/// builds and runs the `Simulator` internally, and the exclusion applies to
+/// every dump format at once, so it is a run-wide setting rather than a
+/// per-format one. `Simulator::new` copies it into the public
+/// `wave_suppress` field, which a library user may also overwrite directly.
+fn wave_suppress_cell() -> &'static Mutex<Vec<String>> {
+    static WAVE_SUPPRESS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    WAVE_SUPPRESS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Set the waveform exclusion list. Each entry is either a hierarchical path
+/// (`tb_top.u_blk.u_bank0`, top-module prefix optional) or a bare module name
+/// (`mem_bank`), which excludes EVERY instance of that module at every depth.
+/// `--wave-suppress-module` entries are passed through with a `module:` prefix,
+/// which forces the module reading for an identifier that is also a path.
+pub fn set_wave_suppress(entries: &[String]) {
+    if let Ok(mut guard) = wave_suppress_cell().lock() {
+        *guard = entries.to_vec();
+    }
+}
+
+/// The exclusion list `Simulator::new` should start from.
+pub(crate) fn configured_wave_suppress() -> Vec<String> {
+    wave_suppress_cell()
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
 fn dpi_lib_paths() -> &'static Mutex<Vec<String>> {
     DPI_LIB_PATHS.get_or_init(|| Mutex::new(Vec::new()))
 }
@@ -961,6 +1013,18 @@ macro_rules! write_sig {
         // strings never reach a sized table slot with it consulted.
         if !__wsig_val.is_real && __wsig_id < $self.signal_signed.len() {
             __wsig_val.is_signed = $self.signal_signed[__wsig_id];
+        }
+        // §6.12/§20.5: a SHORTREAL holds an IEEE binary32 value, so a write
+        // rounds to binary32 (16777216.25 -> 16777216.0). A `real` (binary64)
+        // keeps every bit. Only a REAL write pays the type-name lookup.
+        if __wsig_val.is_real
+            && $self
+                .signal_type_names
+                .get(&__wsig_id)
+                .is_some_and(|tn| tn == "shortreal")
+        {
+            let __wsig_f = __wsig_val.to_f64() as f32 as f64;
+            __wsig_val = Value::from_f64(__wsig_f);
         }
         // LRM §9.3.1: skip writes to forced signals. The `is_empty` guard
         // keeps the common no-force case to one branch — `contains_key`
@@ -1699,8 +1763,16 @@ impl CombEntryCold {
 // §10.3.3 / §28.16: retain each delayed entry's original transition target.
 // §10.3.3 / §28.16: and the fall and turn-off delays of a select target.
 // §7.4.1: compiled members of ascending packed arrays of structs slice from slot 0.
-// 036: the vhd branch's per-entry timescale scope merged with main's 035.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB036";
+// §10.9.2: scalarized resolver calls expand structure replication.
+// §7.4.2: compiled blocks sign-extend an index into an array with a negative bound.
+// §10.3.2, §13.4, §23.6: a called function's name and frame names are not
+// unresolved reads; whole arrays through an instance-array element, named and
+// top-spelled struct-array actuals depend on their elements and members.
+// §10.9.1, §11.8.1, §7.2.1, §7.4.1, §11.4.14: typed pattern keys, operand signs, packed elements, stream widths.
+// §23.3.2, §7.4: elements of a multidimensional array member of an instance-array
+// element are read and written by the interpreter and depend on their own signals.
+// 039: retain per-entry VHDL timescale scope with current dependency lowering.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB039";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -1746,6 +1818,8 @@ pub struct SimOutput {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct NbaEntry {
+    /// §10.10: captured elements of a whole unpacked-array assignment.
+    elements: Option<Vec<Value>>,
     lhs: Option<Expression>,
     value: Value,
     resolved_id: Option<usize>,
@@ -3003,6 +3077,8 @@ impl NbaFastIndex {
 }
 
 mod aggregate_assignments;
+mod pattern_array_items;
+mod intra_pattern_shape;
 mod annex_n;
 mod aggregate_expressions;
 mod aggregate_members;
@@ -3034,6 +3110,7 @@ mod construction;
 mod coverage;
 mod dpi_imports;
 mod edges;
+mod enum_receivers;
 mod event_loop;
 mod stall_progress;
 mod expression_types;
@@ -3077,6 +3154,7 @@ mod event_stamps;
 mod module_paths;
 mod names;
 mod rand_csp;
+mod ref_aliases;
 mod rand_diag;
 
 /// Marks a `dist` target recorded by MEMBER path in `rand_order_sensitive`.
@@ -3089,6 +3167,7 @@ mod ts_x;
 mod typename;
 mod uvm_dpi;
 mod vpi_api;
+mod vpi_assert;
 mod vpi_cb;
 mod vpi_model;
 use assert_ctl::{AssertCtl, CtlIdent, CtlSite};
@@ -4162,6 +4241,13 @@ struct SvaClockedSite {
     past_names: Vec<String>,
     /// The body compiled to an evaluable property tree (see `SvaNode`).
     node: std::sync::Arc<SvaNode>,
+    /// `node` holds an `accept_on` / `reject_on` (§16.12.14), whose
+    /// condition is checked in every time step, not only at the ticks.
+    async_abort: bool,
+    /// §16.12.14: attempts an asynchronous abort settled in a time step
+    /// between ticks, reported at the next tick (or at the end of
+    /// simulation) ahead of that tick's results.
+    settled: Vec<SvaOutcome>,
     /// §16.12 `disable iff (guard)`: while the guard holds, every attempt in
     /// flight is cancelled and no new one starts. Evaluated with the current
     /// (unsampled) values, as the LRM's asynchronous reset semantics require.
@@ -4171,6 +4257,15 @@ struct SvaClockedSite {
     fired: bool,
     /// Attempts still in flight, oldest first.
     attempts: Vec<SvaState>,
+    /// IEEE 1800-2017 Clause 39 (assertion API): what the VPI reports of
+    /// each attempt in `attempts`, in the same order (`sva_take_meta` pads
+    /// it, so the engine never depends on it). Not saved: an attempt
+    /// restored from a checkpoint reports the restore time as its start.
+    #[serde(skip)]
+    attempt_meta: Vec<SvaAttemptMeta>,
+    /// The same for the attempts in `settled`.
+    #[serde(skip)]
+    settled_meta: Vec<SvaAttemptMeta>,
     /// LRM §16.9.3 `$past(<signal>, N)` per-signal value history.
     /// Each entry is `signal_name → ring of sampled values (index 0 =
     /// this cycle, index N = N cycles ago)`. Refreshed at every clock fire
@@ -4385,6 +4480,9 @@ enum SvaNode {
     And(Box<SvaNode>, Box<SvaNode>),
     Or(Box<SvaNode>, Box<SvaNode>),
     Iff(Box<SvaNode>, Box<SvaNode>),
+    /// §16.12.8 `p implies q`: both start at the same tick; holds when `p`
+    /// fails (vacuously, §16.14.8 z) or `q` holds. State: `SvaState::And`.
+    Implies(Box<SvaNode>, Box<SvaNode>),
     /// §16.12.12: arbitrary properties are started at each candidate tick.
     Until {
         left: Box<SvaNode>,
@@ -4395,6 +4493,25 @@ enum SvaNode {
     Eventually(Expression),
     /// §16.12.6 `s_always e`: fails the first tick `e` samples false.
     Always(Expression),
+    /// §16.12.14 `accept_on (cond) body` / `reject_on (cond) body`
+    /// (`accept`), and their `sync_` forms (`sync`): `cond` holding during
+    /// the evaluation of `body` aborts it, with success or failure.
+    Abort {
+        cond: Expression,
+        accept: bool,
+        sync: bool,
+        body: Box<SvaNode>,
+    },
+}
+
+/// IEEE 1800-2017 Clause 39: the per-attempt data of the assertion API
+/// (`s_vpi_attempt_info`), kept beside the attempt's evaluation state.
+#[derive(Debug, Clone, Copy, Default)]
+struct SvaAttemptMeta {
+    /// Simulation time (ticks) of the clock tick that started the attempt.
+    start_time: u64,
+    /// Clock ticks the attempt has been evaluated at.
+    clock_steps: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4451,6 +4568,14 @@ enum SvaState {
     },
     /// `s_eventually` / `s_always`, with the attempt's local variables.
     Leaf(SvaEnv),
+    /// An abort property's evaluation; `started`: its first tick is past;
+    /// `aborted`: its condition settled it.
+    Abort {
+        body: Box<SvaState>,
+        env: SvaEnv,
+        started: bool,
+        aborted: bool,
+    },
 }
 
 /// One candidate start point of a property-valued until operand.
@@ -5312,6 +5437,11 @@ struct TaskCleanup {
     pushed_method_this: bool,
     saved_spec: Option<(String, String)>,
     formal_metadata: Vec<FormalMetadataSnapshot>,
+    /// The name-keyed select metadata this activation registered for its
+    /// packed struct and packed array formals, installed again when the
+    /// process resumes (see `Simulator::reinstall_struct_formal_meta`).
+    #[serde(default)]
+    struct_formal_meta: Vec<(String, FormalMetaParts)>,
     /// The method task of a class declared inside a module runs in its
     /// object's instance (see `Simulator::modclass_depth`): the process's
     /// activation scope while this frame is on top.
@@ -6871,6 +7001,14 @@ pub struct Simulator {
     /// `unpacked_struct_leaf_keys`); gates `frame_leaf_key_of`'s per-eval
     /// probe.
     any_struct_formal_markers: bool,
+    /// Sticky bits (`REF_PARK_*`): a task has bound a formal with select
+    /// metadata, an aliased leaf of a `ref` struct formal, or a handle
+    /// formal aliased to an element. Each gates the work a process switch
+    /// does for it.
+    ref_park_flags: u8,
+    /// See `Simulator::has_indexed_scopes`.
+    #[serde(skip)]
+    indexed_scopes: std::cell::OnceCell<bool>,
     /// Scratch structs a pattern actual is spread into before its leaves bind
     /// to an unpacked-struct formal (`struct_pattern_leaf_values`). Recycled
     /// like the mailbox shadows.
@@ -7339,6 +7477,10 @@ pub struct Simulator {
     sva_preponed_slot: Option<u64>,
     /// A site's clock event is recorded (`fired`) and not evaluated yet.
     sva_owed: bool,
+    /// §16.12.14: `sva_advance` runs in a time step without a tick of the
+    /// site, so only asynchronous abort conditions are checked and nothing
+    /// else advances (`sva_abort_step_site`).
+    sva_abort_step: bool,
     /// `sva_post_nba` is running the slot's due cbReadWriteSynch batches.
     sva_post_nba_busy: bool,
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
@@ -7393,6 +7535,14 @@ pub struct Simulator {
     /// cb → [(remaining_cycles, clockvar, net, value, target)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.
     clocking_cycle_pending: HashMap<String, Vec<ClockingCycleDrive>>,
+    /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
+    /// resolved net). The snapshot/meta store the NET; reads and drives use
+    /// the clocking name, so they translate through this first.
+    /// §14.16: a clocking OUTPUT clockvar drives a stage of its own when
+    /// the net it is bound to has another driver: (block name, net) →
+    /// stage signal. The clockvar drives the stage, and the stage joins the
+    /// net's other drivers in the resolution fold.
+    clocking_output_stages: HashMap<(String, String), String>,
     /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
     /// resolved net). The snapshot/meta store the NET; reads and drives use
     /// the clocking name, so they translate through this first.
@@ -7571,6 +7721,16 @@ pub struct Simulator {
     /// writing many signals a wide entry reads would otherwise append the
     /// entry's reads once per write).
     defer_epoch: u64,
+
+    /// (#1149) One bit per signal id listed in `deferred_proc_entries`, so
+    /// each id is listed once; the drain clears the bits it consumes. An
+    /// entry that re-triggers on every settle (an unresolved read) is
+    /// deferred again on every blocking write of a process, and a long
+    /// time-0 block holds the drain back until its start batch ends.
+    deferred_proc_seen: Vec<u64>,
+    /// (#1149) Whether the `u32::MAX` marker (an entry with no resolvable
+    /// read) is in `deferred_proc_entries`.
+    deferred_proc_unres: bool,
     /// (#t0-comb-defer) Compile-time process starts still unrun in the
     /// time-0 slot. A commercial simulator queues the cont-assign /
     /// port-connect update events that a time-0 process write schedules
@@ -7620,7 +7780,8 @@ pub struct Simulator {
     /// Per-signal delay in sim ticks (0 = no delay). Indexed by signal_id.
     sdf_delays: Vec<u64>,
     /// Pending delayed signal updates: (time, signal_id, value)
-    delayed_updates: Vec<(u64, usize, Value)>,
+    // A mask limits a delayed update to the bits its driver owns (§10.3.3).
+    delayed_updates: Vec<(u64, usize, Value, Option<Value>)>,
     /// §10.3.3 / §28.16: some net may hold more than one pending update in
     /// `delayed_updates` (select drivers due at different times, see
     /// `schedule_delayed_slice_chain`). Cleared when no update is pending.
@@ -7984,6 +8145,24 @@ pub struct Simulator {
     /// for `rand` class-handle members (a cyclic object graph would otherwise
     /// recurse forever).
     randomize_depth: usize,
+    /// §18.5.9: the objects of the randomize() call being solved, outermost
+    /// first: the object `randomize()` was called on, then each rand
+    /// sub-object whose own solve is running under it. A sub-object's
+    /// constraint that reads a rand variable of an object earlier in the
+    /// chain through a handle member (`item.addr`, `item` the handle back
+    /// to the enclosing object) belongs to that object's solve.
+    rand_solve_chain: Vec<usize>,
+    /// Set by `randomize_nested_with` for the solve it starts, which then
+    /// extends `rand_solve_chain` instead of starting a chain of its own.
+    rand_solve_nested: bool,
+    /// §18.6.2: the sub-objects of the running call whose `post_randomize`
+    /// waits for the whole call to succeed. A sub-object with an item left
+    /// to an enclosing solve (see `rand_solve_chain`) is done before the
+    /// variables that item constrains have their final values, which its
+    /// `post_randomize` may read (`hist.push_back(item.addr)`).
+    rand_post_deferred: Vec<usize>,
+    /// The solve in progress left an item to an enclosing solve.
+    rand_post_defer_self: bool,
     /// Failed randomize() calls reported so far, per class or
     /// `std::randomize` call site (`rand_fail_warn`).
     rand_fail_reports: HashMap<String, u32>,
@@ -8496,6 +8675,12 @@ pub struct Simulator {
     /// elements live in the runtime map with no declared signedness of their
     /// own, so a store stamps it from here (`p.dyn[1] = 8'hff` reads -1).
     signed_class_colls: HashSet<String>,
+    /// Cache of `fit_coll_store_elem`, replaced round-robin from
+    /// `coll_store_fit_next`: (collection store name, the owning object's
+    /// class, `integral_queue_elem` of it).
+    #[allow(clippy::type_complexity)]
+    coll_store_fit_cache: [Option<(String, Option<String>, Option<(u32, bool, bool)>)>; 4],
+    coll_store_fit_next: usize,
     /// §8.25 / §8.3: classes whose base class depends on their own
     /// parameters — `class W #(type B = base) extends B;` (the base IS a type
     /// parameter) or `class W2 #(type B) extends W #(B);` (the base is such a
@@ -8631,6 +8816,10 @@ pub struct Simulator {
     class_event_prop_names: Option<std::rc::Rc<HashSet<String>>>,
     /// Fast-path NBA buffer: pre-resolved (signal_id, value) pairs.
     nba_fast: Vec<NbaFast>,
+    /// Pattern target writes collected before scheduling their NBA updates.
+    /// Empty at scheduling boundaries; never part of a checkpoint.
+    #[serde(skip)]
+    pattern_nba_leaves: Option<Vec<(String, Value)>>,
     /// Reverse index: signal_id → most recent index in `nba_fast` for that
     /// signal during the *current* NBA accumulation window. Used by the
     /// partial-range/bit NBA Insns (NbaAssignRange, NbaAssignRangeDyn,
@@ -8907,6 +9096,12 @@ pub struct Simulator {
     /// Names the storage of each typed pattern value held at once.
     #[serde(skip)]
     typed_pattern_seq: u64,
+    /// §6.19.5: the enumeration a type name denotes, for method receivers
+    /// (`enum_receivers`), valid for `type_tables_gen` of the second field.
+    #[serde(skip)]
+    enum_recv_cache: HashMap<String, Option<std::rc::Rc<enum_receivers::EnumRecvType>>>,
+    #[serde(skip)]
+    enum_recv_cache_gen: u64,
     /// §13.5: the slice actuals of the `output`, `inout` and `ref` array
     /// formals of the calls running now, by caller key (`bind_slice_array_arg`):
     /// each formal index and the slice element it copies back to.
@@ -8989,6 +9184,9 @@ pub struct Simulator {
     /// the only state in which `ref_formal_redirect_*` can rewrite anything.
     /// Maintained on push/pop/take/restore so the hot paths test one bool.
     ref_redirect_hot: bool,
+    /// §13.5.2: callee frames aliasing a property of each pinned object
+    /// (see `ref_pins_acquire`); the pin variable lives while this is > 0.
+    ref_pin_users: HashMap<usize, u32>,
     /// §19.7.1 `cg::type_option.<field>` per covergroup TYPE (weight, goal,
     /// comment, strobe, merge_instances), seeded from the body's
     /// `type_option.f = v;` items on first access.
@@ -9480,9 +9678,23 @@ pub struct Simulator {
     /// strings are ABSOLUTE (they include the top module); `dump_filter_prefixes`
     /// rewrites them to the top-RELATIVE form the signal table uses.
     vcd_filter_scopes: Vec<String>,
+    /// `$dumpvars` named arguments but not one of them was a usable name, so
+    /// the VCD dump must select NOTHING. An empty `vcd_filter_scopes` means
+    /// "no filter" = the WHOLE design, so "select nothing" has to be said out
+    /// loud; without this a `$dumpvars` whose arguments all failed to parse
+    /// failed open into a whole-design dump. Set by `$dumpvars`, cleared by
+    /// `$vcdpluson` and by any `$dumpvars` that kept at least one argument.
+    vcd_dump_none: bool,
     /// §21.7.1.4 `$dumpvars` depth argument: 0 = every level below the given
     /// scope, N = N levels starting at it.
     vcd_dump_depth: u32,
+    /// §21.7.1.2: the `(scopes, depth)` selections of the `$dumpvars` calls
+    /// executed before the latest one at the time the dump started. Each call
+    /// adds its objects to the dump (`vcd_filter_scopes` and `vcd_dump_depth`
+    /// hold the latest call's).
+    vcd_earlier_selections: Vec<(Vec<String>, u32)>,
+    /// The simulation time the VCD dump started at (`u64::MAX` before).
+    vcd_start_time: u64,
     /// §21.7.2.1 var type per `vcd_trace` entry (parallel vector). Drives both
     /// the `$var` declaration and the runtime record shape (an `event` emits a
     /// bare `1<id>` pulse, a `real` an `r<decimal>` record).
@@ -9591,6 +9803,15 @@ pub struct Simulator {
     /// Optional hierarchical scope filters for FST (same semantics as
     /// `--xtrace-scope`): keep signals whose name equals or sits under a scope.
     pub fst_scopes: Vec<String>,
+    /// `$fsdbDumpvars` named arguments but not one of them was a usable name:
+    /// the FST dump must select nothing rather than fail open into a
+    /// whole-design dump. Same purpose as `vcd_dump_none`; see there.
+    pub fst_dump_none: bool,
+    /// The waveform EXCLUDE list (`--wave-suppress`), applied by every dump
+    /// format from one matcher — see `waveforms::WaveSuppressor`. Entries are
+    /// hierarchical paths or module names, resolved against the elaborated
+    /// instance tree at dump time.
+    pub wave_suppress: Vec<String>,
     /// The FST body writer (post-header phase). `None` until `fst_start_dump`.
     /// Value packing, block compression and I/O run on a background thread
     /// (`XEZIM_DUMP_INLINE=1` keeps them here); see `fst_sink::FstSink`.
@@ -9600,6 +9821,21 @@ pub struct Simulator {
     /// signed). Built once at construction; handed to every bytecode
     /// compiler so `type'(expr)` compiles instead of falling back.
     cast_widths: HashMap<String, (u32, bool)>,
+    /// §7.4.1: variables declared as a packed array of a named signed type
+    /// (`lane_t [0:8] x`), with the number of selects that reaches that
+    /// element type (see `bytecode::signed_named_packed_elem_depth`). Built
+    /// at construction from the declared types; empty in most designs, which
+    /// keeps the element-read check to one length test.
+    #[serde(skip)]
+    packed_named_signed: HashMap<String, usize>,
+    /// The same for class properties, by property name: the names some
+    /// class declares as a packed array of a named signed type.
+    #[serde(skip)]
+    packed_named_signed_props: HashMap<String, usize>,
+    /// The `Index` expression whose signed element read is in progress (its
+    /// address), so the re-entrant evaluation reads the slice itself.
+    #[serde(skip)]
+    packed_named_sign_guard: usize,
     /// `module.functions` holds each `FunctionDeclaration` by value, so the
     /// obvious `get(name).cloned()` deep-copies a whole function AST — body,
     /// statements and all — on EVERY call. On a design that calls a function
@@ -10442,6 +10678,15 @@ pub struct Simulator {
     /// client registers callbacks.
     #[serde(skip)]
     vpi_cb: Box<vpi_cb::VpiCbState>,
+    /// Assertion callback registry (IEEE 1800-2017 Clause 39,
+    /// `vpi_assert.rs`). Untouched unless a VPI client registers assertion
+    /// callbacks.
+    #[serde(skip)]
+    vpi_assert: Box<vpi_assert::VpiAssertState>,
+    /// An assertion callback is registered: the gate every assertion hook
+    /// tests first, so a run without them pays one load and branch.
+    #[serde(skip)]
+    vpi_assert_on: bool,
     /// Bit `r` set while a callback of reason `r` is registered (plus
     /// `vpi_cb::MASK_PENDING`): the gate every callback hook tests first, so
     /// a run without VPI callbacks pays one load and branch per hook site.

@@ -1,16 +1,19 @@
 """Tests for xezim_runner.py: each option of cocotb's Runner must reach the
 xezim run with the meaning cocotb's other runners give it.
 
-Needs cocotb 2, pytest and an xezim build. From the repository root, after
-`cargo build --release`:
+Needs cocotb 2.0 or 2.1, pytest and an xezim build. From the repository
+root, after `cargo build --release`:
 
     XEZIM_BIN=$PWD/target/release/xezim python -m pytest contrib/cocotb/tests
 """
 
+import importlib.util
 import json
 import sys
 from pathlib import Path
 
+import cocotb_tools.config
+import cocotb_tools.runner
 import pytest
 
 HERE = Path(__file__).resolve().parent
@@ -18,6 +21,7 @@ HERE = Path(__file__).resolve().parent
 # the runner itself.
 sys.path[:0] = [str(HERE), str(HERE.parent)]
 
+import cocotb_tools.runner  # noqa: E402
 import xezim_runner  # noqa: E402,F401  registers "xezim"
 from cocotb_tools.check_results import get_results  # noqa: E402
 from cocotb_tools.runner import VHDL, Verilog, get_runner  # noqa: E402
@@ -78,10 +82,12 @@ def test_vhdl_is_refused(tmp_path):
 
 
 def test_defines_and_includes(tmp_path):
-    """A define's value is a number as written or a string as a string literal,
-    as with cocotb's other runners; None defines the macro with no value."""
+    """A define's value has the meaning cocotb's other runners give it: cocotb
+    2.0 writes a string as a string literal, cocotb 2.1 takes it as written.
+    None defines the macro with no value."""
     r = get_runner("xezim")
-    build(r, tmp_path, defines={"FOO": None, "MSG": "hi", "NUM": 42})
+    msg = "hi" if hasattr(cocotb_tools.runner, "_as_sv_literal") else '"hi"'
+    build(r, tmp_path, defines={"FOO": None, "MSG": msg, "NUM": 42})
     run(r, tmp_path, {"foo": 1, "msg": 0x6869, "num": 42, "inc": 5})
 
 
@@ -191,3 +197,56 @@ def test_positional_parameter_override(tmp_path):
         build_dir=tmp_path / "build", test_dir=tmp_path / "test",
     )
     assert get_results(results) == (1, 0)
+
+
+def test_vpi_lib_resolves_with_and_without_lib_name_path(monkeypatch):
+    """_vpi_lib uses config.lib_name_path (cocotb 2.1+) and falls back to
+    config.libs_dir / config.lib_name (cocotb 2.0.x)."""
+    r = get_runner("xezim")
+    assert r._vpi_lib.is_file()
+
+    monkeypatch.delattr(cocotb_tools.config, "lib_name_path", raising=False)
+    monkeypatch.setattr(
+        cocotb_tools.config,
+        "lib_name",
+        lambda iface, sim: f"stub_{iface}_{sim}.so",
+        raising=False,
+    )
+    expected = (
+        Path(cocotb_tools.config.libs_dir)
+        / f"stub_vpi_{xezim_runner._VPI_LIB_FLAVOUR}.so"
+    )
+    assert r._vpi_lib == expected
+
+
+def test_define_values_follow_runner_version(monkeypatch):
+    """Use implicit HDL conversion only with the 2.0 runner API."""
+    runner_path = Path(xezim_runner.__file__)
+    supported = getattr(cocotb_tools.runner, "SUPPORTED_RUNNERS", None)
+
+    for attr, tag in (("_as_sv_literal", "2.0"), ("as_sv_literal", "2.1")):
+        with monkeypatch.context() as mp:
+            mp.delattr(cocotb_tools.runner, "as_sv_literal", raising=False)
+            mp.delattr(cocotb_tools.runner, "_as_sv_literal", raising=False)
+            mp.setattr(
+                cocotb_tools.runner, attr, lambda v, t=tag: f"{t}:{v}", raising=False
+            )
+            if isinstance(supported, dict):
+                mp.setitem(supported, "xezim", xezim_runner.Xezim)
+            spec = importlib.util.spec_from_file_location(
+                f"_xezim_runner_probe_{tag}", runner_path
+            )
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            expected = "2.0:x" if tag == "2.0" else "x"
+            assert mod.Xezim._get_define_options(None, {"MSG": "x", "FLAG": None}) == [
+                "-D", f"MSG={expected}", "-D", "FLAG"
+            ]
+
+
+def test_supported_runners_includes_xezim():
+    """cocotb 2.1+ exposes SUPPORTED_RUNNERS; register() adds xezim to it."""
+    supported = getattr(cocotb_tools.runner, "SUPPORTED_RUNNERS", None)
+    if supported is not None:
+        assert supported["xezim"] is xezim_runner.Xezim

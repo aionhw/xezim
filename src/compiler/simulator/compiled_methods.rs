@@ -817,6 +817,11 @@ impl Simulator {
                     data_type,
                     declarators,
                     ..
+                }
+                | SK::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
                 } => {
                     if let Some(cls) = sim.typeref_class_name(data_type) {
                         for d in declarators {
@@ -872,6 +877,11 @@ impl Simulator {
         use crate::ast::stmt::StatementKind as SK;
         match &st.kind {
             SK::VarDecl {
+                data_type,
+                declarators,
+                ..
+            }
+            | SK::ParamDecl {
                 data_type,
                 declarators,
                 ..
@@ -1691,7 +1701,8 @@ impl Simulator {
         };
         fn walk(s: &crate::ast::stmt::Statement, f: &dyn Fn(&DataType) -> bool) -> bool {
             match &s.kind {
-                StatementKind::VarDecl { data_type, .. } => f(data_type),
+                StatementKind::VarDecl { data_type, .. }
+                | StatementKind::ParamDecl { data_type, .. } => f(data_type),
                 StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                     stmts.iter().any(|s| walk(s, f))
                 }
@@ -2842,6 +2853,9 @@ impl Simulator {
                         let string_fields = self.class_string_member_names(class);
                         fields.extend(string_fields.iter().cloned());
                         facts.instance_string_fields.insert(class.clone(), string_fields);
+                        facts
+                            .instance_string_colls
+                            .insert(class.clone(), self.class_string_coll_member_names(class));
                         let widths: HashMap<String, u32> = fields
                             .iter()
                             .filter_map(|f| match self.class_prop_width_fixed(class, f) {
@@ -2911,7 +2925,7 @@ impl Simulator {
                                 // a parameterized class's element width can
                                 // differ between them (§8.25).
                                 if let Some(w) = w.filter(|&w| w > 0)
-                                    && cd.param_defaults.is_empty()
+                                    && !self.class_chain_has_value_params(&c)
                                 {
                                     colls.elem_widths.insert(m.clone(), w);
                                 }
@@ -2919,6 +2933,65 @@ impl Simulator {
                             cur = cd.extends.clone();
                         }
                         facts.instance_colls.insert(class.clone(), colls);
+                        // Fixed scalar integral return types of methods in
+                        // this class's hierarchy (walked from leaf to base so
+                        // overrides win).
+                        let mut mcur = Some(class.clone());
+                        let mut mseen = HashSet::default();
+                        let class_has_vparams = self.class_chain_has_value_params(class);
+                        while let Some(mc) = mcur {
+                            if !mseen.insert(mc.clone()) {
+                                break;
+                            }
+                            let Some(mcd) = self
+                                .module
+                                .classes
+                                .get(&mc)
+                                .or_else(|| self.module.classes.get(mc.split('#').next().unwrap_or(&mc)))
+                            else {
+                                break;
+                            };
+                            for method in mcd.methods.values() {
+                                use crate::ast::decl::ClassMethodKind as Kind;
+                                let (Kind::Function(f) | Kind::Extern(f) | Kind::PureVirtual(f)) =
+                                    &method.kind
+                                else {
+                                    continue;
+                                };
+                                let mname = &f.name.name.name;
+                                if facts.method_return_types.contains_key(&(class.clone(), mname.clone())) {
+                                    continue;
+                                }
+                                let is_type_param = matches!(
+                                    &f.return_type,
+                                    DataType::TypeReference { name, .. }
+                                        if name.scopes.is_empty()
+                                            && mcd.type_param_names.contains(&name.name.name)
+                                );
+                                if is_type_param
+                                    || (class_has_vparams
+                                        && !Self::packed_dims_are_constant(&f.return_type))
+                                {
+                                    continue;
+                                }
+                                if let Some((w, signed)) = self
+                                    .scalar_formal_integral(&f.return_type)
+                                    .or_else(|| self.enum_type_info(&f.return_type))
+                                    .filter(|&(w, _)| w > 0)
+                                {
+                                    let base = class.split('#').next().unwrap_or(class).to_string();
+                                    facts
+                                        .method_return_types
+                                        .entry((class.clone(), mname.clone()))
+                                        .or_insert((w, signed));
+                                    facts
+                                        .method_return_types
+                                        .entry((base, mname.clone()))
+                                        .or_insert((w, signed));
+                                }
+                            }
+                            mcur = mcd.extends.clone();
+                        }
                         // §8.23 static methods of this class, for the
                         // null-handle dispatch at the call site. Keyed by the
                         // elaborated name AND its specialization-stripped base
@@ -3177,6 +3250,23 @@ impl Simulator {
                     }
                     compiler.set_local_typedef_types(local_typedef_types);
                     compiler.set_unresolved_type_names(unresolved_type_names);
+                    if handle != 0 && self.class_chain_has_value_params(cname) {
+                        let owners = self.prop_owners(cname);
+                        for f in &member_safe {
+                            if let Some(w) = self.class_prop_width_impl(cname, Some(handle), f)
+                                && w > 0
+                            {
+                                compiler.this_field_widths.insert(f.clone(), w);
+                                if owners
+                                    .get(f.as_str())
+                                    .and_then(|(_, cd)| cd.properties.get(f.as_str()))
+                                    .is_some_and(|sig| sig.is_signed)
+                                {
+                                    compiler.this_field_signed.insert(f.clone());
+                                }
+                            }
+                        }
+                    }
                     compiler.method_admission = Some(admission);
                     // issue-301 plan fact: multi-dim packed coll elements.
                     compiler.coll_elem_packed_dims = (*pre.coll_elem_packed_dims).clone();
@@ -3482,6 +3572,11 @@ impl Simulator {
         // compiler declines a `$cast` with such a destination instead.
         for st in body {
             if let crate::ast::stmt::StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            }
+            | crate::ast::stmt::StatementKind::ParamDecl {
                 data_type,
                 declarators,
                 ..
@@ -5068,6 +5163,23 @@ impl Simulator {
         }
     }
 
+    /// `container_base` of a type name, following a typedef chain (§6.18):
+    /// `typedef mailbox #(int) mbox_t;` makes `mbox_t` a mailbox.
+    pub(super) fn builtin_container_kind(&self, t: &str) -> Option<&'static str> {
+        let mut cur = t.to_string();
+        for _ in 0..8 {
+            if let Some(k) = Self::container_base(&cur) {
+                return Some(k);
+            }
+            let base = cur.split(['#', ' ', '(']).next().unwrap_or("").trim();
+            match self.module.typedef_types.get(base) {
+                Some(DataType::TypeReference { name, .. }) => cur = name.name.name.clone(),
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// §15.3/§15.4: if `lvalue`'s declared type is a (possibly parameterized)
     /// mailbox/semaphore, return "mailbox"/"semaphore". Consults the local
     /// container-decl map and the class-property type via the current class
@@ -5098,13 +5210,13 @@ impl Simulator {
                 .properties
                 .get(member)
                 .and_then(|s| s.type_name.as_deref())
-                .and_then(Self::container_base)
+                .and_then(|t| self.builtin_container_kind(t))
             {
                 return Some(k);
             }
             if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
                 cd.property_types.get(member)
-                && let Some(k) = Self::container_base(&name.name.name)
+                && let Some(k) = self.builtin_container_kind(&name.name.name)
             {
                 return Some(k);
             }
@@ -5141,7 +5253,7 @@ impl Simulator {
                     for key in [full.as_ref(), leaf.as_str()] {
                         if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
                             self.module.var_decl_types.get(key)
-                            && let Some(k) = Self::container_base(&name.name.name)
+                            && let Some(k) = self.builtin_container_kind(&name.name.name)
                         {
                             return Some(k);
                         }
@@ -5188,7 +5300,27 @@ impl Simulator {
                     .map(|s| s.name.name.as_str())
                     .collect::<Vec<_>>()
                     .join(".");
-                if let Some(hnd) = self.eval_ident_handle(&head)
+                // `C::mb = new()`: a static property named through its class.
+                if h.path.len() == 2 {
+                    let mut cur = Some(h.path[0].name.name.clone());
+                    while let Some(cd) = cur.as_deref().and_then(|c| self.module.classes.get(c)) {
+                        if cd.static_properties.contains(&member) {
+                            if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
+                                cd.property_types.get(&member)
+                            {
+                                return self.builtin_container_kind(&name.name.name);
+                            }
+                            break;
+                        }
+                        cur = cd.extends.clone();
+                    }
+                }
+                // A chain of handles (`o.in.mb`) is walked, not read by name.
+                let hnd = self.eval_ident_handle(&head).or_else(|| {
+                    let recv = Expression::new(ExprKind::Ident(hier_prefix(h)), lvalue.span);
+                    self.eval_handle_expr(&recv)
+                });
+                if let Some(hnd) = hnd
                     && let Some(k) = self.handle_prop_container_kind(hnd, &member)
                 {
                     return Some(k);
@@ -5206,7 +5338,7 @@ impl Simulator {
         if let Some(pn) = &prop {
             // 1. tracked local (procedural `mailbox m;`).
             if let Some(k) = self.var_container_types.get(pn) {
-                return Self::container_base(k);
+                return self.builtin_container_kind(k);
             }
             // 2. class property of the current class (walk the hierarchy).
             if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
@@ -5214,7 +5346,10 @@ impl Simulator {
                 while let Some(cn) = cur {
                     if let Some(cd) = self.module.classes.get(&cn) {
                         if let Some(sig) = cd.properties.get(pn) {
-                            if let Some(k) = sig.type_name.as_deref().and_then(Self::container_base)
+                            if let Some(k) = sig
+                                .type_name
+                                .as_deref()
+                                .and_then(|t| self.builtin_container_kind(t))
                             {
                                 return Some(k);
                             }
@@ -5225,7 +5360,7 @@ impl Simulator {
                             // declared type before giving up.
                             if let Some(crate::ast::types::DataType::TypeReference { name, .. }) =
                                 cd.property_types.get(pn)
-                                && let Some(k) = Self::container_base(&name.name.name)
+                                && let Some(k) = self.builtin_container_kind(&name.name.name)
                             {
                                 return Some(k);
                             }
@@ -5241,7 +5376,109 @@ impl Simulator {
         // 3. module-scope signal (get_expr_type_name returns "mailbox" here).
         self.get_expr_type_name(lvalue)
             .as_deref()
-            .and_then(Self::container_base)
+            .and_then(|t| self.builtin_container_kind(t))
+            // 4. a member of an unpacked struct, whatever holds the struct.
+            .or_else(|| match self.lvalue_static_type(lvalue)? {
+                DataType::TypeReference { name, .. } => {
+                    self.builtin_container_kind(&name.name.name)
+                }
+                _ => None,
+            })
+    }
+
+    /// §7.2, §8.4: the declared type of the member path `e` (`s.mb`,
+    /// `s.in.mb`, `h.s.mb`, `C::s.mb`, `q[0].mb`, `this.s.mb`), walked from
+    /// its root through struct members and class properties. The leaves of
+    /// an unpacked struct carry no type name of their own, so a member that
+    /// is a handle of a built-in class (`mailbox`, `semaphore`) was not
+    /// known to be one and `s.mb = new()` constructed nothing. None when
+    /// the path is not such a chain.
+    pub(super) fn lvalue_static_type(&self, e: &Expression) -> Option<DataType> {
+        fn collect<'a>(e: &'a Expression, out: &mut Vec<&'a str>) -> bool {
+            match &e.kind {
+                ExprKind::Ident(h) if h.root.is_none() => {
+                    out.extend(h.path.iter().map(|s| s.name.name.as_str()));
+                    true
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    collect(expr, out) && {
+                        out.push(member.name.as_str());
+                        true
+                    }
+                }
+                ExprKind::Index { expr, .. } => collect(expr, out),
+                ExprKind::This => {
+                    out.push("this");
+                    true
+                }
+                _ => false,
+            }
+        }
+        enum At {
+            Class(String),
+            Type(DataType),
+        }
+        let mut segs: Vec<&str> = Vec::new();
+        if !collect(e, &mut segs) || segs.len() < 2 {
+            return None;
+        }
+        let ctx_class = || self.class_context_stack.last().cloned().flatten();
+        let is_struct = |dt: &DataType| matches!(self.resolve_dt_ref(dt), DataType::Struct(_));
+        let root = segs[0];
+        // The struct variable may be named through its scope (`g_blk.s` of
+        // a generate block, `u.s` of an instance): the longest declared
+        // prefix of the path is the variable.
+        let struct_var = (1..segs.len()).rev().find_map(|k| {
+            let name = segs[..k].join(".");
+            let scoped = self.hint_scoped(&name);
+            scoped
+                .as_deref()
+                .and_then(|s| self.module.var_decl_types.get(s))
+                .or_else(|| self.module.var_decl_types.get(name.as_str()))
+                .filter(|dt| is_struct(dt))
+                .map(|dt| (dt.clone(), k))
+        });
+        let (mut at, rest) = if root == "this" {
+            (At::Class(ctx_class()?), &segs[1..])
+        } else if let Some((dt, k)) = struct_var {
+            (At::Type(dt), &segs[k..])
+        } else if let Some(c) = self.class_of_var(root) {
+            (At::Class(c), &segs[1..])
+        } else {
+            // A bare property of the running method's object.
+            (At::Class(ctx_class()?), &segs[..])
+        };
+        for seg in rest {
+            let class = match &at {
+                At::Class(c) => Some(c.clone()),
+                At::Type(dt) => match self.resolve_dt_ref(dt) {
+                    DataType::Struct(su) => {
+                        let m = su
+                            .members
+                            .iter()
+                            .find(|m| m.declarators.iter().any(|d| d.name.name == *seg))?;
+                        at = At::Type(m.data_type.clone());
+                        None
+                    }
+                    DataType::TypeReference { name, .. }
+                        if self.module.classes.contains_key(&name.name.name) =>
+                    {
+                        Some(name.name.name.clone())
+                    }
+                    _ => return None,
+                },
+            };
+            if let Some(c) = class {
+                let base = c.split('#').next().unwrap_or(&c).trim();
+                let owners = self.prop_owners(base);
+                let (_, cd) = owners.get(*seg)?;
+                at = At::Type(cd.property_types.get(*seg)?.clone());
+            }
+        }
+        match at {
+            At::Type(dt) => Some(dt),
+            At::Class(_) => None,
+        }
     }
 
     /// §7.2/§8.4: the class a CLASS-HANDLE member of an unpacked struct
@@ -5425,7 +5662,8 @@ impl Simulator {
     /// would abort a run over an ordinary user method named `get`.
     /// Deliberately conservative — an undeterminable type answers false.
     pub(super) fn is_declared_mailbox(&self, expr: &Expression) -> bool {
-        let says_mailbox = |t: &str| t.starts_with("mailbox") || t == "mailbox";
+        // §6.18: a typedef of a mailbox type is one too.
+        let says_mailbox = |t: &str| self.builtin_container_kind(t) == Some("mailbox");
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
             if self

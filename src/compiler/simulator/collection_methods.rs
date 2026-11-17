@@ -1459,6 +1459,7 @@ impl Simulator {
         let saved_alias = self.item_alias.take();
         let saved_iter = self.locator_iter.clone();
         self.locator_iter = iter_name.unwrap_or("item").to_string();
+        let with_class = self.bind_with_iter_class(arr, iter_name);
 
         // §7.12/§7.2.1: a PACKED-struct element binds its fields too, so
         // `find with (item.lo > 2)` slices them out of `item`.
@@ -1538,6 +1539,7 @@ impl Simulator {
         }
         self.item_alias = saved_alias;
         self.locator_iter = saved_iter;
+        self.unbind_with_iter_class(with_class);
         if let Some(f) = self.local_stack.last_mut() {
             match saved_item {
                 Some(v) => {
@@ -1895,6 +1897,7 @@ impl Simulator {
         let saved_alias = self.item_alias.take();
         let saved_iter = self.locator_iter.clone();
         self.locator_iter = iter.unwrap_or("item").to_string();
+        let with_class = self.bind_with_iter_class(arr, iter);
 
         // §7.12.2: `q.sort/.rsort with (item.expr)` sorts by the value of the
         // filter expression. When that expression is STRING-valued (e.g.
@@ -1971,6 +1974,7 @@ impl Simulator {
 
         self.item_alias = saved_alias;
         self.locator_iter = saved_iter;
+        self.unbind_with_iter_class(with_class);
         if let Some(f) = self.local_stack.last_mut() {
             if let Some(nm) = iter {
                 f.remove(nm);
@@ -2061,6 +2065,50 @@ impl Simulator {
         AssocKeyTy::Int { width, signed }
     }
 
+    /// §7.12: the iterator of an array method's `with` clause (`item`, or
+    /// the declared name) has the type of the collection's element. For a
+    /// collection of class handles, record that class in the frame, so a
+    /// method called through a null element is bound to it (§8.4). Returns
+    /// the entries displaced, for `unbind_with_iter_class`.
+    pub(super) fn bind_with_iter_class(
+        &mut self,
+        arr: &str,
+        iter: Option<&str>,
+    ) -> Option<Vec<(String, Option<String>)>> {
+        if self.module.classes.is_empty() {
+            return None;
+        }
+        let class = self.coll_elem_class(arr)?;
+        let frame = self.local_type_stack.last_mut()?;
+        Some(
+            std::iter::once("item")
+                .chain(iter.filter(|nm| *nm != "item"))
+                .map(|nm| {
+                    (
+                        nm.to_string(),
+                        frame.0.insert(nm.to_string(), class.clone()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub(super) fn unbind_with_iter_class(&mut self, saved: Option<Vec<(String, Option<String>)>>) {
+        let (Some(saved), Some(frame)) = (saved, self.local_type_stack.last_mut()) else {
+            return;
+        };
+        for (name, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(c) => {
+                    frame.0.insert(name, c);
+                }
+                None => {
+                    frame.0.remove(&name);
+                }
+            }
+        }
+    }
+
     pub(super) fn reduce_with(
         &mut self,
         arr: &str,
@@ -2096,6 +2144,7 @@ impl Simulator {
             .last()
             .and_then(|f| f.get("item.index").cloned());
         let iter_index = iter.map(|nm| format!("{}.index", nm));
+        let with_class = self.bind_with_iter_class(arr, iter);
         // §7.12.3/§7.2.1: a packed-struct element binds its fields, as for
         // the locators: `sum() with (item.code)` read 0 for every element.
         let pfields = self.coll_packed_elem_fields(arr);
@@ -2177,6 +2226,7 @@ impl Simulator {
                 f.remove(&format!("{}.{}", it, fname));
             }
         }
+        self.unbind_with_iter_class(with_class);
         // Restore the prior `item` binding (if any); drop the iterator's.
         if let Some(f) = self.local_stack.last_mut() {
             if let Some(nm) = iter {
@@ -3057,6 +3107,21 @@ impl Simulator {
         if bm == BuiltinM::Other {
             return None;
         }
+        let package_store = if !obj_name.contains([':', '.', '#', '['])
+            && self.contested_pkg_vars.contains(obj_name)
+            && !self.frame_scalar_shadows(obj_name)
+            && self.dyn_name_lookup(obj_name).is_none()
+            && self.instance_assoc_member(obj_name).is_none()
+        {
+            if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
+                self.pkg_qual_collection_key(pkg, obj_name)
+            } else {
+                self.contested_pkg_var_in_scope(obj_name)
+            }
+        } else {
+            None
+        };
+        let obj_name = package_store.as_deref().unwrap_or(obj_name);
         // Per-specialization keying for STATIC collection properties of
         // parameterized classes (e.g. `static T m_q[$]` in `uvmq#(T)`):
         // rewrite the bare member name to the spec-aware storage key so each
@@ -3069,6 +3134,11 @@ impl Simulator {
                 mname,
                 self.this_stack.last().copied().flatten().is_some()
             );
+        }
+        // §13.5.2: a built-in method of an aliased `ref` formal (`s.len()`)
+        // reads the caller's storage now; the frame keeps the call-time copy.
+        if self.ref_redirect_possible() {
+            self.ref_alias_refresh_slot(obj_name);
         }
         let _resolved = self.spec_static_coll_key(obj_name);
         let obj_name: &str = &_resolved;
@@ -3145,8 +3215,12 @@ impl Simulator {
         // signal_id), since `self.module.signals` may not be the storage.
         // §6.19.6: first/last/num take no argument; next/prev take an OPTIONAL
         // count N (default 1) — `c.next(2)` steps two forward with wrapping.
-        if (matches!(bm, BuiltinM::First | BuiltinM::Last | BuiltinM::Num) && args.is_empty())
-            || (matches!(bm, BuiltinM::Next | BuiltinM::Prev) && args.len() <= 1)
+        // A queue, dynamic or associative array of enumeration elements has
+        // its own `num`, `first`, `last`, `next` and `prev` (§7.9, §7.10).
+        if ((matches!(bm, BuiltinM::First | BuiltinM::Last | BuiltinM::Num) && args.is_empty())
+            || (matches!(bm, BuiltinM::Next | BuiltinM::Prev) && args.len() <= 1))
+            && !self.is_associative_array(obj_name)
+            && !self.module.dynamic_arrays.contains(obj_name)
         {
             let step_n: u64 = if matches!(bm, BuiltinM::Next | BuiltinM::Prev) {
                 args.first()
@@ -3972,9 +4046,16 @@ impl Simulator {
             // string wrote the key's ASCII bytes into the ref arg.
             // A key type wider than 64 bits is keyed by fixed-width hex
             // digits (`assoc_key_str`), which order as the values do.
+            // A STRING key whose KEY is a type parameter bound to `string`
+            // (`pool#(string,..)`/`VAL aa[KEY]`) reports a spurious 1024-bit
+            // index width (elaboration can't resolve the type param to
+            // `SimpleType::String`), so the hex path below would ship the
+            // key's ASCII bytes as an integer into the ref arg (e.g. "ID103"
+            // -> 2 garbage bytes). String keys are strings however they read;
+            // never treat a string-keyed array as a wide numeric key.
             let wide = self
                 .assoc_index_width_for(obj_name)
-                .filter(|&(kw, _)| kw > 64);
+                .filter(|&(kw, _)| kw > 64 && !self.is_string_keyed_array(obj_name));
             // §7.8.2, §7.9.4: string keys are strings however they read.
             let all_numeric = wide.is_none()
                 && !self.is_string_keyed_array(obj_name)
