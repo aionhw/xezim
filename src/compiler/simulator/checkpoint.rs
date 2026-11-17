@@ -1515,6 +1515,7 @@ checkpoint_state!(
     program_pids,
     prop_raw_ty_cache,
     prop_width_memo,
+    queue_elem_moves,
     queue_frame_saves,
     queue_key_scratch,
     queue_name_pool,

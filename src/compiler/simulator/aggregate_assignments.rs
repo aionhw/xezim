@@ -2274,7 +2274,188 @@ impl Simulator {
 
     /// Move queue element `from` to `to` within one queue.
     pub(super) fn queue_move_elem(&mut self, obj_name: &str, from: u64, to: u64) {
+        self.queue_elem_moves += 1;
         self.queue_copy_elem(obj_name, from, obj_name, to);
+    }
+
+    /// The placeholder element cells of queue `obj` — `Some((first id,
+    /// count))`, or `None` when it has none — if every element of `obj` is
+    /// one plain value that a by-name read or write of `obj[i]` finds in
+    /// such a cell (below `count`) or in the name-keyed store (from `count`
+    /// on). `Err` for any other queue: an element spread over several
+    /// entries (an unpacked struct, a fixed array, a collection), or a name
+    /// some other storage could answer for (a call frame, a forced name, a
+    /// packed container, a scope-qualified twin).
+    fn plain_queue_cells(&self, obj: &str) -> Result<Option<(usize, u64)>, ()> {
+        if !self.forced_names.is_empty() || self.module.arrays_2d.contains_key(obj) {
+            return Err(());
+        }
+        if self.has_coll_rows
+            && self
+                .coll_shape_at(obj)
+                .is_some_and(|(shape, depth)| shape.dims.len() > depth + 1)
+        {
+            return Err(());
+        }
+        if self.queue_elem_struct(obj).is_some() {
+            return Err(());
+        }
+        let first_elem = Self::name_with_index(obj, 0);
+        if self.module.associative_arrays.contains_key(&first_elem)
+            || self.module.dynamic_arrays.contains(&first_elem)
+        {
+            return Err(());
+        }
+        if obj.contains('.') {
+            // A name a call frame holds, `<top>.<name>` and a member of a
+            // packed container are each resolved before the element stores.
+            let below = |k: &str| {
+                k.len() > obj.len() && k.as_bytes()[obj.len()] == b'[' && k.starts_with(obj)
+            };
+            if self
+                .local_stack
+                .last()
+                .is_some_and(|l| l.keys().any(|k| below(k)))
+            {
+                return Err(());
+            }
+            let top = self.module.name.as_str();
+            if obj.len() > top.len() && obj.as_bytes()[top.len()] == b'.' && obj.starts_with(top) {
+                return Err(());
+            }
+            if obj
+                .match_indices('.')
+                .any(|(p, _)| self.module.packed_struct_fields.contains_key(&obj[..p]))
+            {
+                return Err(());
+            }
+        } else if let Some(hint) = self.name_resolve_hint.borrow().as_deref() {
+            // An undotted read tries the hinted scope's `<hint>.<name>` first.
+            if self
+                .signal_name_to_id
+                .contains_key(&format!("{}.{}", hint, first_elem))
+            {
+                return Err(());
+            }
+        }
+        let cells = match self.array_first_id.get(obj) {
+            Some(&(first, 0, hi)) if hi >= 0 && !is_packed_id(first) => {
+                Some((first, hi as u64 + 1))
+            }
+            Some(_) => return Err(()),
+            None => None,
+        };
+        // Past the cells no element has a table id of its own.
+        let past = Self::name_with_index(obj, cells.map_or(0, |(_, n)| n as i64));
+        if self.signal_name_to_id.contains_key(past.as_str())
+            || resolve_array_elem_id(&past, &self.array_first_id).is_some()
+        {
+            return Err(());
+        }
+        Ok(cells)
+    }
+
+    /// §7.10.2: shift the elements of queue `obj` (`size` of them) for the
+    /// removal of element `idx` (`open == false`: the elements above it move
+    /// down one index) or for an insertion at `idx` (`open == true`: the
+    /// elements from `idx` on move up one, and `obj[idx]` keeps its value
+    /// until the caller stores the new element). The caller sets the new
+    /// size.
+    ///
+    /// The elements held in the name-keyed store move as one run
+    /// (`SignalMap::run_remove_at` / `run_open_at`), not one by one by name,
+    /// so the cost does not grow with the queue; the placeholder cells of a
+    /// design-scope queue (at most 64) are copied cell to cell. `false`,
+    /// with nothing changed, for a queue `plain_queue_cells` does not vouch
+    /// for or whose stored elements are not exactly one run: the caller then
+    /// moves the elements one by one.
+    pub(super) fn queue_shift_fast(&mut self, obj: &str, idx: u64, size: u64, open: bool) -> bool {
+        if idx >= size {
+            // Nothing above `idx` to move.
+            return true;
+        }
+        let Ok(cells) = self.plain_queue_cells(obj) else {
+            return false;
+        };
+        let n_cells = cells.map_or(0, |(_, n)| n);
+        if size > n_cells && !self.signals.run_covers(obj, n_cells, size) {
+            return false;
+        }
+        // What a by-name element write marks besides the element: the size
+        // proxy of the name before the first `[` (§9.2.2.2).
+        let base = &obj[..obj.find('[').unwrap_or(obj.len())];
+        let touch_id = (!base.is_empty()
+            && (self.module.dynamic_arrays.contains(base)
+                || self.module.associative_arrays.contains_key(base)))
+        .then(|| {
+            self.signal_name_to_id
+                .get(Self::name_with_suffix(base, ".size").as_str())
+                .copied()
+        })
+        .flatten();
+        let touch = |me: &mut Self| {
+            if let Some(id) = touch_id {
+                me.mark_dirty_id(id);
+                me.dirty_any = true;
+            }
+        };
+        let copy_cell = |me: &mut Self, first: usize, from: u64, to: u64| {
+            let (src, dst) = (first + from as usize, first + to as usize);
+            let mut v = me.signal_table[src].clone();
+            if me.signal_signed[src] {
+                v.is_signed = true;
+            }
+            if me.store_named_cell(dst, v) {
+                touch(me);
+            }
+        };
+        // The elements from `n_cells` on, as the run holds them.
+        let tail = size.saturating_sub(n_cells);
+        if open {
+            // Highest element first, as the one-by-one move goes.
+            if tail > 0 {
+                self.signals
+                    .run_open_at(obj, n_cells, idx.max(n_cells), size);
+                touch(self);
+            }
+            if let Some((first, n)) = cells
+                && idx < n
+            {
+                if size >= n {
+                    // The last cell's element moves into the name-keyed store.
+                    let last = Self::name_with_index(obj, n as i64 - 1);
+                    if let Some(v) = self.get_signal_value_by_name(&last) {
+                        self.set_signal_value_by_name(&Self::name_with_index(obj, n as i64), v);
+                    }
+                }
+                for i in (idx..size.min(n - 1)).rev() {
+                    copy_cell(self, first, i, i + 1);
+                }
+            }
+        } else {
+            if let Some((first, n)) = cells
+                && idx < n
+            {
+                for i in idx..(size - 1).min(n - 1) {
+                    copy_cell(self, first, i + 1, i);
+                }
+                if tail > 0 {
+                    // The first name-keyed element moves into the last cell.
+                    let next = Self::name_with_index(obj, n as i64);
+                    if let Some(v) = self.get_signal_value_by_name(&next) {
+                        self.set_signal_value_by_name(&Self::name_with_index(obj, n as i64 - 1), v);
+                    }
+                }
+            }
+            if tail > 0 {
+                let at = idx.max(n_cells);
+                self.signals.run_remove_at(obj, n_cells, at, size);
+                if at + 1 < size {
+                    touch(self);
+                }
+            }
+        }
+        true
     }
 
     /// Copy every element of `src` onto `dst` and set its size (`r = q`).

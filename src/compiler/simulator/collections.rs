@@ -2749,7 +2749,7 @@ impl Simulator {
         let mut keys: Vec<String> = self
             .signals
             .elem_keys_with_prefix(&prefix)
-            .chain(static_keys.iter().map(|k| &**k))
+            .chain(static_keys.iter().map(|k| std::borrow::Cow::Borrowed(&**k)))
             .filter_map(|k| {
                 let rest = &k[prefix.len()..];
                 Self::assoc_first_key_seg(rest).map(|s| s.to_string())
@@ -3267,48 +3267,14 @@ impl Simulator {
             }
         }
         if let Some(&id) = self.signal_name_to_id.get(name) {
-            let w = self.signal_widths[id];
-            // A width-0 signal (e.g. an untracked module-scope class handle)
-            // would truncate to nothing; keep the value's natural width so a
-            // class handle (`c = factory.create_...()`) is preserved. §6.16: a
-            // string (or an element of a string collection) has no declared
-            // length either — the table width is a placeholder, and resizing to
-            // it chops the text. This is the path `push_back` takes, so without
-            // it a `string q[$]` element was still clamped to 128 characters
-            // after scalar strings had been fixed.
-            let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
-            let mut resized = if w == 0 || is_str { val } else { val.resize(w) };
-            // §6.11.1: a 2-state destination drops x/z.
-            if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
-                resized = resized.to_two_state();
-            }
-            // §6.11.1: storage keeps the SIGNAL'S declared signedness, not the
-            // rvalue's. An unsized decimal literal is signed (§5.7.1), so
-            // `barr[i] = 9` stamped is_signed onto a `bit [3:0]` element and
-            // every later read sign-extended it (-7). Strings/handles (w==0)
-            // and reals keep their value untouched.
-            if w != 0 && !is_str && !resized.is_real {
-                resized.is_signed = self.signal_signed[id];
-            }
-            if self.signal_table[id] != resized {
-                self.mark_dirty_id(id);
-                write_sig!(self, id, resized);
-                self.table_modified = true;
+            if self.store_named_cell(id, val) {
                 // §9.2.2.2: a queue / dynamic / associative ELEMENT that
                 // happens to own a table id still isn't what comb readers
                 // depend on — a variable-index read (`q[i]`) registers the
                 // collection's `.size` proxy instead. Marking only the
                 // element's own id left such a block permanently stale after
                 // `q[0] = v`, while `push_back` (which resizes) woke it fine.
-                if let Some(base) = name.find('[').map(|i| &name[..i]) {
-                    if !base.is_empty()
-                        && (self.module.dynamic_arrays.contains(base)
-                            || self.module.associative_arrays.contains_key(base))
-                    {
-                        let base = base.to_string();
-                        self.touch_queue(&base);
-                    }
-                }
+                self.touch_elem_base(name);
             }
             return;
         }
@@ -3408,6 +3374,58 @@ impl Simulator {
             }
         }
         self.signals.insert(name.to_string(), val);
+    }
+
+    /// §9.2.2.2: a changed table signal named `name` that is an element of a
+    /// queue, dynamic or associative array (`q[i]`) also marks the
+    /// collection's size proxy, which is what a variable-index reader of the
+    /// collection depends on.
+    pub(super) fn touch_elem_base(&mut self, name: &str) {
+        if let Some(base) = name.find('[').map(|i| &name[..i]) {
+            if !base.is_empty()
+                && (self.module.dynamic_arrays.contains(base)
+                    || self.module.associative_arrays.contains_key(base))
+            {
+                let base = base.to_string();
+                self.touch_queue(&base);
+            }
+        }
+    }
+
+    /// Store `val` in table cell `id` as a by-name write of the cell's name
+    /// does: fitted to the cell's width, value set and signedness, and marked
+    /// dirty when it changed. Returns whether it changed.
+    pub(super) fn store_named_cell(&mut self, id: usize, val: Value) -> bool {
+        let w = self.signal_widths[id];
+        // A width-0 signal (e.g. an untracked module-scope class handle)
+        // would truncate to nothing; keep the value's natural width so a
+        // class handle (`c = factory.create_...()`) is preserved. §6.16: a
+        // string (or an element of a string collection) has no declared
+        // length either — the table width is a placeholder, and resizing to
+        // it chops the text. This is the path `push_back` takes, so without
+        // it a `string q[$]` element was still clamped to 128 characters
+        // after scalar strings had been fixed.
+        let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
+        let mut resized = if w == 0 || is_str { val } else { val.resize(w) };
+        // §6.11.1: a 2-state destination drops x/z.
+        if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
+            resized = resized.to_two_state();
+        }
+        // §6.11.1: storage keeps the SIGNAL'S declared signedness, not the
+        // rvalue's. An unsized decimal literal is signed (§5.7.1), so
+        // `barr[i] = 9` stamped is_signed onto a `bit [3:0]` element and
+        // every later read sign-extended it (-7). Strings/handles (w==0)
+        // and reals keep their value untouched.
+        if w != 0 && !is_str && !resized.is_real {
+            resized.is_signed = self.signal_signed[id];
+        }
+        if self.signal_table[id] != resized {
+            self.mark_dirty_id(id);
+            write_sig!(self, id, resized);
+            self.table_modified = true;
+            return true;
+        }
+        false
     }
 
     pub(super) fn get_queue_size(&self, obj_name: &str) -> u64 {

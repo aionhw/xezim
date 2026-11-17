@@ -1774,12 +1774,7 @@ impl Simulator {
         // targets). Eliminating the bulk-populate saves ~150–250 MB on
         // c910-scale designs (585K signals × 2 stores × name + Value
         // duplication).
-        let signals = SignalMap {
-            map: HashMap::default(),
-            elems: HashMap::default(),
-            elem_gens: HashMap::default(),
-            elem_gen_counter: 0,
-        };
+        let signals = SignalMap::new();
         let widths: HashMap<String, u32> = HashMap::default();
         let signed_signals: HashSet<String> = HashSet::default();
         let real_signals: HashSet<String> = HashSet::default();
@@ -4655,6 +4650,7 @@ impl Simulator {
             cond_progress: 0,
             cond_waiter_rechecks: 0,
             vm_direct_calls: 0,
+            queue_elem_moves: 0,
             local_meta_reapplies: 0,
             local_meta_swaps: 0,
             local_meta_scans: 0,

@@ -226,10 +226,18 @@ impl Simulator {
                 trace.trace(frame)?;
             }
         }
-        for (name, value) in self.signals.iter() {
+        for (name, value) in self.signals.map_entries() {
             // An object's own storage is an edge FROM that object, not a root.
             if Self::class_storage_owner(name).is_none() {
                 trace.trace(&(name, value))?;
+            }
+        }
+        for (name, first, values) in self.signals.elem_runs() {
+            if Self::class_storage_owner(name).is_none() {
+                trace.elem_keys(name, first, values.len());
+                for value in values {
+                    trace.trace(value)?;
+                }
             }
         }
         for entry in self.class_statics.iter() {
@@ -349,7 +357,11 @@ impl Simulator {
                 edges.entry(handle).or_default().extend(found);
             }
         }
-        for (name, value) in self.signals.iter().chain(self.class_assoc_defaults.iter()) {
+        for (name, value) in self
+            .signals
+            .map_entries()
+            .chain(self.class_assoc_defaults.iter())
+        {
             if let Some(owner) = Self::class_storage_owner(name).filter(|&h| h < self.heap.len()) {
                 edge_trace.trace(name)?;
                 let (_, property) = name.split_once('#').unwrap();
@@ -362,6 +374,29 @@ impl Simulator {
                 }
             } else {
                 roots.trace(&(name, value))?;
+            }
+        }
+        // The elements `name[first]`, `name[first + 1]`, ... of a queue or
+        // dynamic array, traced as the keyed entries above are.
+        for (name, first, values) in self.signals.elem_runs() {
+            if let Some(owner) = Self::class_storage_owner(name).filter(|&h| h < self.heap.len()) {
+                edge_trace.elem_keys(name, first, values.len());
+                // `name[i]` names the same property as `name` does.
+                let (_, property) = name.split_once('#').unwrap();
+                if !self.class_property_has_no_handles(owner, property) {
+                    for value in values {
+                        edge_trace.trace(value)?;
+                    }
+                }
+                let found = edge_trace.drain_candidates();
+                if !found.is_empty() {
+                    edges.entry(owner).or_default().extend(found);
+                }
+            } else {
+                roots.elem_keys(name, first, values.len());
+                for value in values {
+                    roots.trace(value)?;
+                }
             }
         }
         let mut marked = super::heap_trace::SlotBits::new(self.heap.len());
@@ -439,11 +474,11 @@ impl Simulator {
         let dead_name = |name: &str| Self::class_storage_owner(name).is_some_and(&dead_handle);
         // Inherent remove maintains SignalMap's element index. HashMap::retain
         // through DerefMut would leave dangling names in that index.
-        let names: Vec<_> = self
+        let names: Vec<String> = self
             .signals
             .keys()
             .filter(|n| dead_name(n))
-            .cloned()
+            .map(|n| n.into_owned())
             .collect();
         for name in names {
             self.signals.remove(&name);

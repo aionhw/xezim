@@ -3518,8 +3518,10 @@ impl Simulator {
                         return Some(Value::zero(32));
                     }
                 }
-                for i in (0..cur_size).rev() {
-                    self.queue_move_elem(obj_name, i, i + 1);
+                if !self.queue_shift_fast(obj_name, 0, cur_size, true) {
+                    for i in (0..cur_size).rev() {
+                        self.queue_move_elem(obj_name, i, i + 1);
+                    }
                 }
                 let head = Self::name_with_index(obj_name, 0);
                 self.queue_store_elem(obj_name, &head, arg);
@@ -3531,8 +3533,10 @@ impl Simulator {
             let cur_size = self.get_queue_size(obj_name);
             if cur_size > 0 {
                 let val = self.queue_elem_value(obj_name, 0);
-                for i in 1..cur_size {
-                    self.queue_move_elem(obj_name, i, i - 1);
+                if !self.queue_shift_fast(obj_name, 0, cur_size, false) {
+                    for i in 1..cur_size {
+                        self.queue_move_elem(obj_name, i, i - 1);
+                    }
                 }
                 self.set_queue_size(obj_name, cur_size - 1);
                 return Some(val);
@@ -3637,8 +3641,10 @@ impl Simulator {
                 };
                 // Move elements member-wise: an unpacked-struct element has no
                 // container signal, so a packed copy shifts nothing at all.
-                for i in (idx..cur_size).rev() {
-                    self.queue_move_elem(obj_name, i, i + 1);
+                if !self.queue_shift_fast(obj_name, idx, cur_size, true) {
+                    for i in (idx..cur_size).rev() {
+                        self.queue_move_elem(obj_name, i, i + 1);
+                    }
                 }
                 let slot = format!("{}[{}]", obj_name, idx);
                 self.queue_store_elem(obj_name, &slot, &args[1]);
@@ -3998,8 +4004,10 @@ impl Simulator {
                     let cur_size = self.get_queue_size(obj_name) as usize;
                     if idx < cur_size {
                         // Member-wise, for the same reason as `insert`.
-                        for i in idx..cur_size - 1 {
-                            self.queue_move_elem(obj_name, (i + 1) as u64, i as u64);
+                        if !self.queue_shift_fast(obj_name, idx as u64, cur_size as u64, false) {
+                            for i in idx..cur_size - 1 {
+                                self.queue_move_elem(obj_name, (i + 1) as u64, i as u64);
+                            }
                         }
                         self.set_queue_size(obj_name, (cur_size - 1) as u64);
                     }

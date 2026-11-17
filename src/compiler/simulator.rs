@@ -3891,12 +3891,6 @@ fn signal_key_bits(k: &str) -> u64 {
     if bits == 0 { u64::MAX } else { bits }
 }
 
-/// A write to the string-keyed stores that does not name its target.
-#[inline]
-fn bump_store_gen() {
-    note_store_write(u64::MAX);
-}
-
 /// The names written since the last call.
 fn take_store_writes() -> u64 {
     STORE_WRITE_MASK.with(|m| m.replace(0))
@@ -6729,101 +6723,532 @@ impl VcdVarKind {
 /// without scanning the whole map. The `starts_with` full-map scans in the
 /// queue-frame save/restore were 25%+ of a UVM AVIP run.
 ///
-/// Reads go through `Deref<Target = HashMap<..>>`; every mutation that can
-/// add or drop a KEY must go through the inherent `insert`/`remove` below
-/// (inherent methods shadow the deref'd HashMap ones), keeping the index
-/// exact. `get_mut`-style value edits need no index work.
+/// The elements `name[i]` of a queue or dynamic array (a name with a
+/// `name.size` entry) are held in one dense run per name (`ElemRun`) instead
+/// of one map entry each, so removing or inserting an element at the front
+/// moves no other element (§7.10.2). The run is an implementation detail of
+/// the map: every accessor below serves `name[i]` from it exactly as if the
+/// key were a map entry.
+///
+/// There is no `Deref` to the inner map: every read and every mutation goes
+/// through the inherent methods below, which keep the index and the runs
+/// exact.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SignalMap {
     map: HashMap<String, Value>,
+    /// The map-held keys containing `[`, by base name. Run-held elements are
+    /// not listed here.
     elems: HashMap<String, std::collections::HashSet<String>>,
     /// Per base name, a stamp that changes whenever an element key is added
-    /// to or removed from `elems[base]` (absent = no element keys), so a
-    /// derived view of a base's key set can be cached until it changes.
+    /// to or removed from the base (absent = no element keys), so a derived
+    /// view of a base's key set can be cached until it changes.
     elem_gens: HashMap<String, u64>,
     elem_gen_counter: u64,
+    /// The dense element runs, by collection name (`q`, `12#m_q`, `@q#3`,
+    /// `u.q`, a row `aq[3]`).
+    runs: HashMap<String, ElemRun>,
+    /// Elements held in `runs`, so `len()` counts them as keys.
+    run_keys: usize,
+    /// The names in `runs` that contain `[` themselves, by base name: the
+    /// runs whose keys the element index files under another name.
+    nested_runs: HashMap<String, Vec<String>>,
+}
+
+/// The elements `name[start]`, `name[start + 1]`, ... of one collection.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ElemRun {
+    /// Index of `items[0]` (meaningless while `items` is empty).
+    start: u64,
+    items: VecDeque<Value>,
+    /// `name.size` is stored: the name is a queue or dynamic array, and the
+    /// run is kept while empty.
+    sized: bool,
+    /// Map-held keys `name[<index>]` outside the run.
+    strays: u32,
+}
+
+impl ElemRun {
+    #[inline]
+    fn end(&self) -> u64 {
+        self.start + self.items.len() as u64
+    }
+
+    #[inline]
+    fn slot(&self, i: u64) -> Option<usize> {
+        (i >= self.start && i < self.end()).then(|| (i - self.start) as usize)
+    }
+}
+
+/// `name[<n>]` with `<n>` a canonical decimal index: the collection name and
+/// the index. Any other spelling (`a[01]`, `a[-1]`, `a["k"]`, `a[1].f`) is
+/// not an element of a run.
+#[inline]
+fn split_elem_key(k: &str) -> Option<(&str, u64)> {
+    let b = k.as_bytes();
+    let n = b.len();
+    if n < 4 || b[n - 1] != b']' {
+        return None;
+    }
+    let mut i = n - 1;
+    while i > 0 && b[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    let digits = n - 1 - i;
+    if digits == 0 || digits > 9 || i < 2 || b[i - 1] != b'[' {
+        return None;
+    }
+    if digits > 1 && b[i] == b'0' {
+        return None;
+    }
+    let mut v = 0u64;
+    for &d in &b[i..n - 1] {
+        v = v * 10 + (d - b'0') as u64;
+    }
+    Some((&k[..i - 1], v))
 }
 
 impl SignalMap {
+    pub fn new() -> Self {
+        SignalMap {
+            map: HashMap::default(),
+            elems: HashMap::default(),
+            elem_gens: HashMap::default(),
+            elem_gen_counter: 0,
+            runs: HashMap::default(),
+            run_keys: 0,
+            nested_runs: HashMap::default(),
+        }
+    }
+
     fn base_of(k: &str) -> Option<&str> {
         k.find('[').map(|i| &k[..i])
     }
 
+    /// The base name the element index files `name`'s elements under.
+    #[inline]
+    fn outer_of(name: &str) -> &str {
+        Self::base_of(name).unwrap_or(name)
+    }
+
+    #[inline]
+    pub fn get(&self, k: &str) -> Option<&Value> {
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(k)
+            && let Some(run) = self.runs.get(name)
+            && let Some(s) = run.slot(i)
+        {
+            return Some(&run.items[s]);
+        }
+        self.map.get(k)
+    }
+
+    #[inline]
+    pub fn contains_key(&self, k: &str) -> bool {
+        self.get(k).is_some()
+    }
+
+    /// Stored keys, run-held elements included.
+    pub fn len(&self) -> usize {
+        self.map.len() + self.run_keys
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every stored key with its value, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (std::borrow::Cow<'_, str>, &Value)> + '_ {
+        self.map
+            .iter()
+            .map(|(k, v)| (std::borrow::Cow::Borrowed(k.as_str()), v))
+            .chain(self.runs.iter().flat_map(|(name, run)| {
+                run.items.iter().enumerate().map(move |(s, v)| {
+                    (
+                        std::borrow::Cow::Owned(format!("{}[{}]", name, run.start + s as u64)),
+                        v,
+                    )
+                })
+            }))
+    }
+
+    /// The entries the map itself holds: every key but a run's elements
+    /// (`elem_runs`).
+    pub fn map_entries(&self) -> impl Iterator<Item = (&String, &Value)> + '_ {
+        self.map.iter()
+    }
+
+    /// The element runs: a collection name, the index of its first held
+    /// element and the elements `name[first]`, `name[first + 1]`, ...
+    pub fn elem_runs(&self) -> impl Iterator<Item = (&str, u64, &VecDeque<Value>)> + '_ {
+        self.runs
+            .iter()
+            .filter(|(_, run)| !run.items.is_empty())
+            .map(|(name, run)| (name.as_str(), run.start, &run.items))
+    }
+
+    /// Every stored key, in no particular order.
+    pub fn keys(&self) -> impl Iterator<Item = std::borrow::Cow<'_, str>> + '_ {
+        self.iter().map(|(k, _)| k)
+    }
+
+    /// A key was added under or removed from base `outer`: move its stamp,
+    /// or drop it with the base's last key.
+    fn stamp_base(&mut self, outer: &str) {
+        if self.elems.contains_key(outer) || self.base_has_run_keys(outer) {
+            self.elem_gen_counter += 1;
+            match self.elem_gens.get_mut(outer) {
+                Some(g) => *g = self.elem_gen_counter,
+                None => {
+                    self.elem_gens
+                        .insert(outer.to_string(), self.elem_gen_counter);
+                }
+            }
+        } else {
+            self.elem_gens.remove(outer);
+        }
+    }
+
+    fn base_has_run_keys(&self, outer: &str) -> bool {
+        self.runs.get(outer).is_some_and(|r| !r.items.is_empty())
+            || self.nested_runs.get(outer).is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|n| self.runs.get(n).is_some_and(|r| !r.items.is_empty()))
+            })
+    }
+
+    /// File map-held key `k` in the element index.
+    fn index_key(&mut self, k: &str) {
+        if let Some(b) = Self::base_of(k) {
+            match self.elems.get_mut(b) {
+                Some(set) => {
+                    set.insert(k.to_string());
+                }
+                None => {
+                    self.elems
+                        .entry(b.to_string())
+                        .or_default()
+                        .insert(k.to_string());
+                }
+            }
+            self.stamp_base(b);
+        }
+    }
+
+    /// Drop map-held key `k` from the element index.
+    fn unindex_key(&mut self, k: &str) {
+        if let Some(b) = Self::base_of(k) {
+            self.unlist_key(k, b);
+            self.stamp_base(b);
+        }
+    }
+
+    /// Take map-held key `k` off base `b`'s list, leaving the stamp alone.
+    fn unlist_key(&mut self, k: &str, b: &str) {
+        if let Some(set) = self.elems.get_mut(b) {
+            set.remove(k);
+            if set.is_empty() {
+                self.elems.remove(b);
+            }
+        }
+    }
+
     pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
         note_store_write(signal_key_bits(&k));
-        if let Some(b) = Self::base_of(&k) {
-            if !self.map.contains_key(&k) {
-                self.elems
-                    .entry(b.to_string())
-                    .or_default()
-                    .insert(k.clone());
-                self.elem_gen_counter += 1;
-                self.elem_gens.insert(b.to_string(), self.elem_gen_counter);
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(&k)
+            && let Some(run) = self.runs.get_mut(name)
+        {
+            if let Some(s) = run.slot(i) {
+                return Some(std::mem::replace(&mut run.items[s], v));
+            }
+            // A key the map already holds stays there.
+            if run.strays == 0 || !self.map.contains_key(&k) {
+                let adopted = if run.items.is_empty() {
+                    run.start = i;
+                    run.items.push_back(v);
+                    None
+                } else if i == run.end() {
+                    run.items.push_back(v);
+                    None
+                } else if i + 1 == run.start {
+                    run.start = i;
+                    run.items.push_front(v);
+                    None
+                } else {
+                    Some(v)
+                };
+                match adopted {
+                    None => {
+                        let absorb = run.strays > 0;
+                        self.run_keys += 1;
+                        let name = name.to_string();
+                        if absorb {
+                            self.absorb_strays(&name);
+                        }
+                        self.stamp_base(Self::outer_of(&name));
+                        return None;
+                    }
+                    Some(v) => {
+                        run.strays += 1;
+                        self.index_key(&k);
+                        return self.map.insert(k, v);
+                    }
+                }
+            }
+            return self.map.insert(k, v);
+        }
+        if !self.map.contains_key(&k) {
+            self.index_key(&k);
+            if let Some(name) = k.strip_suffix(".size") {
+                let name = name.to_string();
+                let prev = self.map.insert(k, v);
+                self.note_sized(&name);
+                return prev;
             }
         }
         self.map.insert(k, v)
     }
 
+    /// `name.size` was stored: `name` is a queue or dynamic array, so its
+    /// elements are kept in a run from now on. Elements the map already
+    /// holds move into it (the contiguous ones, from the lowest index).
+    fn note_sized(&mut self, name: &str) {
+        if let Some(run) = self.runs.get_mut(name) {
+            run.sized = true;
+            return;
+        }
+        let outer = Self::outer_of(name);
+        let mut held: Vec<u64> = match self.elems.get(outer) {
+            Some(set) => set
+                .iter()
+                .filter_map(|k| {
+                    split_elem_key(k)
+                        .filter(|(n, _)| *n == name)
+                        .map(|(_, i)| i)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        held.sort_unstable();
+        let mut run = ElemRun {
+            sized: true,
+            strays: held.len() as u32,
+            ..ElemRun::default()
+        };
+        if let Some(&first) = held.first() {
+            run.start = first;
+        }
+        if outer.len() != name.len() {
+            self.nested_runs
+                .entry(outer.to_string())
+                .or_default()
+                .push(name.to_string());
+        }
+        self.runs.insert(name.to_string(), run);
+        if !held.is_empty() {
+            self.absorb_strays(name);
+        }
+    }
+
+    /// Move the map-held keys adjacent to `name`'s run into it.
+    fn absorb_strays(&mut self, name: &str) {
+        loop {
+            let Some(run) = self.runs.get(name) else {
+                return;
+            };
+            if run.strays == 0 {
+                return;
+            }
+            // An empty run restarts at the index it last began at.
+            let empty = run.items.is_empty();
+            let above = if empty { run.start } else { run.end() };
+            let below = if empty {
+                None
+            } else {
+                run.start.checked_sub(1)
+            };
+            let mut took = false;
+            for (back, i) in [(true, Some(above)), (false, below)] {
+                let Some(i) = i else { continue };
+                let key = format!("{}[{}]", name, i);
+                if let Some(v) = self.map.remove(&key) {
+                    // The key stays stored: the base's stamp does not move.
+                    self.unlist_key(&key, Self::outer_of(name));
+                    let run = self.runs.get_mut(name).unwrap();
+                    if back {
+                        if run.items.is_empty() {
+                            run.start = i;
+                        }
+                        run.items.push_back(v);
+                    } else {
+                        run.start = i;
+                        run.items.push_front(v);
+                    }
+                    run.strays -= 1;
+                    self.run_keys += 1;
+                    took = true;
+                }
+            }
+            if !took {
+                return;
+            }
+        }
+    }
+
+    /// Forget `name`'s run once it holds nothing and `name.size` is gone.
+    fn drop_idle_run(&mut self, name: &str) {
+        if self
+            .runs
+            .get(name)
+            .is_some_and(|r| r.items.is_empty() && !r.sized && r.strays == 0)
+        {
+            self.runs.remove(name);
+            let outer = Self::outer_of(name);
+            if outer.len() != name.len()
+                && let Some(names) = self.nested_runs.get_mut(outer)
+            {
+                names.retain(|n| n != name);
+                if names.is_empty() {
+                    self.nested_runs.remove(outer);
+                }
+            }
+        }
+    }
+
     pub fn remove(&mut self, k: &str) -> Option<Value> {
         note_store_write(signal_key_bits(k));
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(k)
+            && let Some(run) = self.runs.get_mut(name)
+        {
+            if let Some(s) = run.slot(i) {
+                let last = run.items.len() - 1;
+                let v = if s == last {
+                    run.items.pop_back()
+                } else if s == 0 {
+                    run.start += 1;
+                    run.items.pop_front()
+                } else {
+                    // A hole: the shorter side leaves the run for the map.
+                    let v = run.items.remove(s);
+                    let (lo, moved): (u64, Vec<Value>) = if s <= last / 2 {
+                        let lo = run.start;
+                        run.start = i + 1;
+                        (lo, run.items.drain(..s).collect())
+                    } else {
+                        (i + 1, run.items.drain(s..).collect())
+                    };
+                    run.strays += moved.len() as u32;
+                    self.run_keys -= moved.len();
+                    for (j, mv) in moved.into_iter().enumerate() {
+                        let key = format!("{}[{}]", name, lo + j as u64);
+                        self.index_key(&key);
+                        self.map.insert(key, mv);
+                    }
+                    v
+                };
+                self.run_keys -= 1;
+                self.drop_idle_run(name);
+                self.stamp_base(Self::outer_of(name));
+                return v;
+            }
+            let r = self.map.remove(k);
+            if r.is_some() {
+                run.strays -= 1;
+                self.unindex_key(k);
+                self.drop_idle_run(name);
+            }
+            return r;
+        }
         let r = self.map.remove(k);
         if r.is_some() {
-            if let Some(b) = Self::base_of(k) {
-                if let Some(set) = self.elems.get_mut(b) {
-                    set.remove(k);
-                    if set.is_empty() {
-                        self.elems.remove(b);
-                        self.elem_gens.remove(b);
-                    } else {
-                        self.elem_gen_counter += 1;
-                        self.elem_gens.insert(b.to_string(), self.elem_gen_counter);
-                    }
-                }
+            self.unindex_key(k);
+            if let Some(name) = k.strip_suffix(".size")
+                && let Some(run) = self.runs.get_mut(name)
+            {
+                run.sized = false;
+                self.drop_idle_run(name);
             }
         }
         r
     }
 
-    /// An in-place edit of one stored value, noted under its key's names
-    /// (other `&mut` access through `DerefMut` notes every name).
+    /// An in-place edit of one stored value, noted under its key's names.
     pub fn get_mut(&mut self, k: &str) -> Option<&mut Value> {
         note_store_write(signal_key_bits(k));
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(k)
+            && let Some(run) = self.runs.get_mut(name)
+            && let Some(s) = run.slot(i)
+        {
+            return Some(&mut run.items[s]);
+        }
         self.map.get_mut(k)
+    }
+
+    /// The runs whose keys the element index files under `outer`.
+    fn runs_under<'a>(&'a self, outer: &'a str) -> impl Iterator<Item = (&'a str, &'a ElemRun)> {
+        self.runs
+            .get(outer)
+            .map(|r| (outer, r))
+            .into_iter()
+            .chain(
+                self.nested_runs
+                    .get(outer)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|n| self.runs.get(n).map(|r| (n.as_str(), r))),
+            )
+            .filter(|(_, r)| !r.items.is_empty())
+    }
+
+    /// Whether every key `name[i]` begins with `prefix`, which ends in `[`.
+    #[inline]
+    fn run_under_prefix(name: &str, prefix: &str) -> bool {
+        name.starts_with(prefix) || (prefix.len() == name.len() + 1 && prefix.starts_with(name))
     }
 
     /// All stored keys beginning with `prefix`, which must end with `[`.
     /// Served from the element index: only the owning base name's keys are
     /// touched, never the whole map. Handles nested-bracket prefixes
     /// (`q[0].f[`) by indexing on the OUTERMOST base and filtering.
+    /// A run's keys come highest index first, so a caller removing them in
+    /// this order shrinks the run from its end.
     pub fn keys_with_elem_prefix(&self, prefix: &str) -> Vec<String> {
         debug_assert!(prefix.ends_with('['));
-        let base = &prefix[..prefix.len() - 1];
-        let outer = Self::base_of(base).unwrap_or(base);
-        self.elems
-            .get(outer)
-            .map(|set| {
-                set.iter()
-                    .filter(|k| k.starts_with(prefix))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.elem_keys_with_prefix(prefix)
+            .map(|k| k.into_owned())
+            .collect()
     }
 
-    /// Keys of every `base[...]` element currently stored, unordered.
+    /// Keys of every `base[...]` element currently stored, unordered (a
+    /// run's keys highest index first, see `keys_with_elem_prefix`).
     pub fn elem_keys(&self, base: &str) -> Vec<String> {
-        self.elems
+        let mut keys: Vec<String> = self
+            .elems
             .get(base)
             .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // The index files nothing under a name with a bracket in it.
+        if !base.contains('[') {
+            for (name, run) in self.runs_under(base) {
+                keys.extend(
+                    (run.start..run.end())
+                        .rev()
+                        .map(|i| format!("{}[{}]", name, i)),
+                );
+            }
+        }
+        keys
     }
 
     /// Borrowing form of `keys_with_elem_prefix`: the element keys under
-    /// `prefix` (which must end in `[`) without cloning them.
+    /// `prefix` (which must end in `[`), cloning none of the map-held ones.
     pub fn elem_keys_with_prefix<'a>(
         &'a self,
         prefix: &'a str,
-    ) -> impl Iterator<Item = &'a str> + 'a {
+    ) -> impl Iterator<Item = std::borrow::Cow<'a, str>> + 'a {
         let base = &prefix[..prefix.len().saturating_sub(1)];
         let outer = Self::base_of(base).unwrap_or(base);
         self.elems
@@ -6831,6 +7256,16 @@ impl SignalMap {
             .into_iter()
             .flat_map(|set| set.iter().map(|k| k.as_str()))
             .filter(move |k| k.starts_with(prefix))
+            .map(std::borrow::Cow::Borrowed)
+            .chain(
+                self.runs_under(outer)
+                    .filter(move |(name, _)| Self::run_under_prefix(name, prefix))
+                    .flat_map(|(name, run)| {
+                        (run.start..run.end())
+                            .rev()
+                            .map(move |i| std::borrow::Cow::Owned(format!("{}[{}]", name, i)))
+                    }),
+            )
     }
 
     /// The element-key stamp of the outermost base of `prefix` (which ends
@@ -6847,25 +7282,114 @@ impl SignalMap {
     /// `obj`; this replaces a scan of the whole map.
     pub fn any_key_with_prefix(&self, prefix: &str) -> bool {
         let Some(outer) = Self::base_of(prefix) else {
-            return self.map.keys().any(|k| k.starts_with(prefix));
+            return self.map.keys().any(|k| k.starts_with(prefix))
+                || self
+                    .runs
+                    .iter()
+                    .any(|(name, run)| !run.items.is_empty() && name.starts_with(prefix));
         };
         self.elems
             .get(outer)
             .is_some_and(|set| set.iter().any(|k| k.starts_with(prefix)))
+            || self
+                .runs_under(outer)
+                .any(|(name, run)| Self::run_has_key_with_prefix(name, run, prefix))
+    }
+
+    /// Whether a key `name[i]` of the non-empty `run` begins with `prefix`.
+    fn run_has_key_with_prefix(name: &str, run: &ElemRun, prefix: &str) -> bool {
+        if prefix.len() <= name.len() {
+            return name.starts_with(prefix);
+        }
+        let Some(rest) = prefix.strip_prefix(name).and_then(|r| r.strip_prefix('[')) else {
+            return false;
+        };
+        // `rest` has to begin `<index>]`, the whole remainder of a key.
+        let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+        match &rest[digits..] {
+            "" => (run.start..run.end()).any(|i| i.to_string().starts_with(rest)),
+            "]" => split_elem_key(prefix).is_some_and(|(_, i)| run.slot(i).is_some()),
+            _ => false,
+        }
+    }
+
+    /// Whether `name`'s run holds every element `name[lo]` .. `name[hi - 1]`
+    /// and nothing else is stored under `name[`: no element outside the run,
+    /// and no member, row or size of an element (`name[i].f`, `name[i][j]`,
+    /// `name[i].size`). Then the collection's elements from `lo` on are
+    /// exactly the run's items, in order.
+    pub fn run_covers(&self, name: &str, lo: u64, hi: u64) -> bool {
+        let Some(run) = self.runs.get(name) else {
+            return false;
+        };
+        if run.strays != 0 || run.items.is_empty() || run.start != lo || run.end() < hi {
+            return false;
+        }
+        let outer = Self::outer_of(name);
+        let below = |k: &str| {
+            k.len() > name.len() && k.as_bytes()[name.len()] == b'[' && k.starts_with(name)
+        };
+        !self
+            .elems
+            .get(outer)
+            .is_some_and(|set| set.iter().any(|k| below(k)))
+            && !self
+                .nested_runs
+                .get(outer)
+                .is_some_and(|names| names.iter().any(|n| below(n)))
+    }
+
+    /// Remove element `name[idx]` of a collection of `size` elements whose
+    /// run starts at `lo` (`run_covers(name, lo, size)` holds): the elements
+    /// above it move down one index. Elements a shrink left behind at or past
+    /// `size` are dropped.
+    pub fn run_remove_at(&mut self, name: &str, lo: u64, idx: u64, size: u64) -> Option<Value> {
+        note_store_write(signal_key_bits(name));
+        let run = self.runs.get_mut(name)?;
+        debug_assert!(run.start == lo && lo <= idx && idx < size && run.end() >= size);
+        let live = (size - lo) as usize;
+        let before = run.items.len();
+        run.items.truncate(live);
+        let v = if idx == lo {
+            run.items.pop_front()
+        } else {
+            run.items.remove((idx - lo) as usize)
+        };
+        self.run_keys -= before - run.items.len();
+        self.stamp_base(Self::outer_of(name));
+        v
+    }
+
+    /// Open a slot at `name[idx]` in a collection of `size` elements whose
+    /// run starts at `lo` (`run_covers(name, lo, size)` holds): the elements
+    /// from `idx` on move up one index, and `name[idx]` keeps its value until
+    /// it is stored. Elements a shrink left behind at or past `size` are
+    /// dropped.
+    pub fn run_open_at(&mut self, name: &str, lo: u64, idx: u64, size: u64) -> bool {
+        note_store_write(signal_key_bits(name));
+        let Some(run) = self.runs.get_mut(name) else {
+            return false;
+        };
+        debug_assert!(run.start == lo && lo <= idx && idx < size && run.end() >= size);
+        let live = (size - lo) as usize;
+        let before = run.items.len();
+        run.items.truncate(live);
+        let s = (idx - lo) as usize;
+        let keep = run.items[s].clone();
+        if s == 0 {
+            run.items.push_front(keep);
+        } else {
+            run.items.insert(s, keep);
+        }
+        self.run_keys = self.run_keys + run.items.len() - before;
+        self.stamp_base(Self::outer_of(name));
+        true
     }
 }
 
-impl std::ops::Deref for SignalMap {
-    type Target = HashMap<String, Value>;
-    fn deref(&self) -> &Self::Target {
-        &self.map
-    }
-}
-
-impl std::ops::DerefMut for SignalMap {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        bump_store_gen();
-        &mut self.map
+impl Default for SignalMap {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -9483,6 +10007,10 @@ pub struct Simulator {
     /// Compiled-to-compiled calls dispatched directly (`vm_try_direct_call_from`),
     /// without the interpreter's binding (`[PROF] vm_direct_calls`).
     vm_direct_calls: u64,
+    /// Queue elements a `pop_front`, `push_front`, `insert` or `delete`
+    /// moved one at a time by name, because the queue's elements are not a
+    /// single run of plain values (`[PROF] queue_elem_moves`).
+    queue_elem_moves: u64,
     /// Checks of the running process's claims for displaced local metadata
     /// (`reapply_local_meta`, `[PROF] local_meta_reapplies`), the displaced
     /// declarations installed again (`[PROF] local_meta_swaps`), and the
