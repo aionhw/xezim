@@ -8,6 +8,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Keep package variables in their lexical scope in compiled module helpers, and retain per-element storage for unsafe record-array uses.
+
+- **Performance:** Bound VHDL driver lookups to one signal and release analysis tables before parsing generated source.
+
+- **Diagnostics:** Include VHDL lowering stages and table sizes in memory traces.
+
 ### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
 
 **Performance**
