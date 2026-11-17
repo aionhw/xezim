@@ -198,3 +198,75 @@ endmodule
 "#;
     assert_eq!(lines(src), vec!["outv=2"]);
 }
+
+fn forced_compiled_lines(src: &str) -> (Vec<String>, String) {
+    use std::process::Command;
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "xezim_helper_scope_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("top.sv");
+    std::fs::write(&path, src).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(["--sv2017", "--no-cache", "-s", "top"])
+        .arg(&path)
+        .env("XEZIM_COMPILE_METHODS", "1")
+        .env("XEZIM_METHOD_TIER", "0")
+        .env("XEZIM_FALLBACK_SITES", "1")
+        .env("XEZIM_JIT", "0")
+        .env_remove("XEZIM_METHOD_CACHE")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    let rows = stdout
+        .lines()
+        .filter(|line| line.starts_with("T|"))
+        .map(str::to_owned)
+        .collect();
+    std::fs::remove_dir_all(dir).unwrap();
+    (rows, stderr)
+}
+
+fn large_reader(name: &str, tail: &str) -> String {
+    format!(
+        "function automatic int {name}(input int x); logic [8:0] r; r=0;\n{}\n{tail}\nendfunction",
+        big_body(300)
+    )
+}
+
+/// §13.4: exercise the delegated compiled body, rather than the small
+/// edge-inlined body used by the ordinary module-signal check above.
+#[test]
+fn delegated_module_signal_reader_runs_compiled() {
+    let source = format!(
+        "module top; int q=7; {} initial begin $display(\"T|value=%0d q=%0d\",get(0),q); $finish; end endmodule",
+        large_reader("get", "return q+r-r;")
+    );
+    let (rows, trace) = forced_compiled_lines(&source);
+    assert_eq!(rows, ["T|value=7 q=7"]);
+    assert!(
+        trace.contains("runs-compiled scope=__free_fn__.get"),
+        "{trace}"
+    );
+}
+
+/// §26.3: a package variable keeps its package binding when a module has
+/// the same name, including a package callee inlined into a module helper.
+#[test]
+fn package_signal_names_do_not_bind_to_module_signals() {
+    let direct = format!(
+        "package p; int q=7; {} endpackage module top; int q=99; initial begin $display(\"T|value=%0d q=%0d\",p::get(0),q); $finish; end endmodule",
+        large_reader("get", "return q+r-r;")
+    );
+    assert_eq!(forced_compiled_lines(&direct).0, ["T|value=7 q=99"]);
+    let nested = format!(
+        "package p; int q=7; function automatic int get(input int x); return q+x; endfunction endpackage module top; int q=99; {} initial begin $display(\"T|value=%0d q=%0d\",wrap(0),q); $finish; end endmodule",
+        large_reader("wrap", "return p::get(r-r);")
+    );
+    assert_eq!(forced_compiled_lines(&nested).0, ["T|value=7 q=99"]);
+}
