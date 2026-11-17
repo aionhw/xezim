@@ -15477,6 +15477,9 @@ mod finished_process_lifetime_tests;
 #[cfg(test)]
 mod class_heap_lifetime_tests;
 
+#[cfg(test)]
+mod signal_map_tests;
+
 mod heap_trace;
 
 mod heap_gc;

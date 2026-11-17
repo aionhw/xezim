@@ -383,3 +383,5 @@ mod dyn_array_of_dyn_array_rows;
 mod pattern_array_items;
 #[path = "collections/struct_concat_forms.rs"]
 mod struct_concat_forms;
+#[path = "collections/queue_front_shift.rs"]
+mod queue_front_shift;
