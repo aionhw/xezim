@@ -800,6 +800,66 @@ fn binsof_hier_cross_item() {
     check(BINSOF_HIER_CROSS_ITEM, &["--relax-cross-hier-item"]);
 }
 
+const BINSOF_HIER_CROSS_DISAMBIG: &str = r#"// A cross can list a coverpoint `u` and a hierarchical item `w.sig`. Under
+// XEZIM_RELAX_CROSS_HIER_ITEM, `binsof(u.lo)` must stay bin `lo` of coverpoint
+// `u`, while `binsof(w.sig)` names the hierarchical item.
+//
+// X has 4 bins; ignoring (lo, *) and (*, 0) leaves (hi, 1), which is sampled,
+// so X covers 100%. X2 has 4 bins less the illegal (hi, 0); (lo, 0) and
+// (hi, 1) are sampled, so X2 covers 2 of 3. `binsof(s.inner.field)` must parse
+// as the full item, not `s` plus bin `inner`.
+//
+// Every line should print PASS. Without the switch, parsing stops at the dot
+// in `binsof(w.sig)`.
+typedef struct packed { logic field; } inner_t;
+module leaf;
+  logic sig;
+endmodule
+module leaf2;
+  inner_t inner;
+endmodule
+
+module t;
+  leaf w();
+  leaf2 s();
+  bit par;
+  int fails = 0;
+  covergroup cg;
+    option.per_instance = 1;
+    u: coverpoint par { bins lo = {0}; bins hi = {1}; }
+    X: cross u, w.sig {
+      ignore_bins par_lo = binsof(u.lo);
+      ignore_bins sig_0  = binsof(w.sig) intersect {1'b0};
+    }
+    X2: cross u, s.inner.field {
+      illegal_bins bad =
+        binsof(s.inner.field) intersect {1'b0} && binsof(u) intersect {1'b1};
+    }
+  endgroup
+
+  task automatic check(string label, bit ok);
+    if (ok) $display("PASS %s", label);
+    else begin $display("FAIL %s", label); fails++; end
+  endtask
+
+  initial begin
+    cg c = new();
+    w.sig = 0; par = 0; s.inner.field = 0; c.sample();
+    w.sig = 1; par = 1; s.inner.field = 1; c.sample();
+    check("X covers 100", c.X.get_inst_coverage() == 100.0);
+    check("X2 binsof hier path covers 66.67", c.X2.get_inst_coverage() >= 66.0 && c.X2.get_inst_coverage() <= 67.5);
+    if (fails == 0) $display("ALL PASS"); else $display("%0d FAILED", fails);
+    $finish;
+  end
+endmodule
+"#;
+
+/// §19.6.1: `binsof` disambiguates coverpoint bins vs hierarchical cross items.
+#[test]
+fn binsof_hier_cross_disambig() {
+    check(BINSOF_HIER_CROSS_DISAMBIG, &["--relax-cross-hier-item"]);
+}
+
 /// The environment variable is the same switch, and a run without it is
 /// not served the relaxed run's cached design.
 #[test]
