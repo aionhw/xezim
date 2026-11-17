@@ -16,6 +16,7 @@ module top;
   event e;
   initial begin
     a <= {a,6};
+    if(a.size()!=2) $fatal(1,"NBA committed in active region");
     f <= {f[1],f[2],9};
     b <= s;
     d <= {d,3};
