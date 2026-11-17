@@ -1278,3 +1278,5 @@ mod part_select_index_once;
 mod undeclared_type_name;
 #[path = "classes/duplicate_class_definition.rs"]
 mod duplicate_class_definition;
+#[path = "classes/property_shadowed_by_outer_name.rs"]
+mod property_shadowed_by_outer_name;
