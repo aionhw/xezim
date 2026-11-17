@@ -6067,3 +6067,62 @@ fn check_undeclared_type_names(
     f.errs.sort();
     errs.extend(f.errs);
 }
+
+#[cfg(test)]
+mod instance_view_tests {
+    use super::*;
+
+    /// §26.3 (#721): the package constants are held once for the whole lint
+    /// run, not once per instance. Each instance's table holds its own
+    /// parameters; the scope it folds in reads both.
+    #[test]
+    fn instances_share_one_table_of_package_constants() {
+        let mut src = String::from("package cfg;\n");
+        for i in 0..40 {
+            src.push_str(&format!("  parameter int K{i} = {i};\n"));
+        }
+        src.push_str(
+            "endpackage\n\
+             module leaf #(parameter int N = 1) (); localparam int M = N + cfg::K7; endmodule\n\
+             module top;\n",
+        );
+        for i in 0..25 {
+            src.push_str(&format!("  leaf #(.N({i})) u{i} ();\n"));
+        }
+        src.push_str("endmodule\n");
+        let (_, elab) = xezim_core::parse_and_elaborate_multi(
+            &[src],
+            Some("top"),
+            &[],
+            &["views.sv".to_string()],
+            &[],
+        )
+        .expect("elaborate");
+        let views = InstanceViews::build(&elab);
+        assert_eq!(views.scoped.len(), 40);
+        assert!(views.scoped.keys().all(|k| k.starts_with("cfg::K")));
+        let leaves = views.of("leaf");
+        assert_eq!(leaves.len(), 25);
+        // 25 instances x 40 constants were 1,000 copied entries.
+        let own: usize = leaves.iter().map(|view| view.len()).sum();
+        assert_eq!(own, 25 * 2, "N and M of each instance");
+        assert!(
+            leaves
+                .iter()
+                .all(|view| view.keys().all(|k| !k.contains("::")))
+        );
+        // A scope reads its own parameter and the shared constant alike.
+        let mut seen = Vec::new();
+        for view in leaves {
+            let scope = ConstScope::instance(&elab, view, &views.scoped);
+            let n = scope.param("N").and_then(|v| v.to_i64()).expect("own N");
+            let m = scope.param("M").and_then(|v| v.to_i64()).expect("own M");
+            assert_eq!(m, n + 7);
+            let k = scope.param("cfg::K7").expect("shared constant");
+            assert!(std::ptr::eq(k, &views.scoped["cfg::K7"]));
+            seen.push(n);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (0..25).collect::<Vec<i64>>());
+    }
+}
