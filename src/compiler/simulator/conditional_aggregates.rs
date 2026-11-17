@@ -1087,7 +1087,16 @@ impl Simulator {
         self.module.descending_arrays.remove(name);
         match &value.kind {
             AggregateKind::Scalar { value, .. } => {
-                self.signals.insert(name.into(), value.clone());
+                // §10.10: storing an element must update its live member cells,
+                // including change notification. Temporaries and queue leaves
+                // without registered cells retain their map-backed storage.
+                if self.signal_name_to_id.contains_key(name)
+                    || resolve_array_elem_id(name, &self.array_first_id).is_some()
+                {
+                    self.set_signal_value_by_name(name, value.clone());
+                } else {
+                    self.signals.insert(name.into(), value.clone());
+                }
             }
             AggregateKind::Struct(fields) => {
                 for (field, value) in fields {
