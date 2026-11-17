@@ -3282,6 +3282,14 @@ impl Simulator {
             };
             // Distribute `ordered` MSB-first to each target in source order.
             let total = ordered.width as usize;
+            // A `with [range]` / slice operand targets a sub-range of a
+            // collection (§11.4.14.4): only the selected elements are
+            // written, the rest of the array is unmodified. Resolve each
+            // operand's ordered element list once (the with-range bounds are
+            // evaluated a single time, per "the expression is evaluated
+            // immediately before its corresponding array is streamed").
+            let operand_elems: Vec<Option<(Vec<String>, u32)>> =
+                exprs.iter().map(|e| self.stream_operand_elems(e)).collect();
             // Compute fixed-width targets; last target may be dynamic (remainder).
             let mut fixed_ws: Vec<u32> = Vec::new();
             let mut dyn_last: Option<String> = None;
@@ -3310,7 +3318,14 @@ impl Simulator {
                         }
                     }
                 }
-                fixed_ws.push(self.infer_lhs_width(e));
+                // A collection-with-range operand maps a whole number of
+                // elements: names.len() × element width.
+                fixed_ws.push(
+                    operand_elems[i]
+                        .as_ref()
+                        .map(|(ns, ew)| (ns.len() as u32) * ew)
+                        .unwrap_or_else(|| self.infer_lhs_width(e)),
+                );
             }
             let fixed_total: u32 = fixed_ws.iter().sum();
             let mut msb = total; // bit position just above the MSB
@@ -3347,6 +3362,31 @@ impl Simulator {
                             self.set_signal_value_by_name(&ename, slice_v);
                         }
                     }
+                } else if let Some((names, ew)) = operand_elems[i].as_ref() {
+                    // Collection-with-range target: unpack the operand's
+                    // portion of the stream into the selected elements,
+                    // MSB-first, leaving the array's other elements alone.
+                    let w = (names.len() as usize) * (*ew as usize);
+                    if w == 0 {
+                        continue;
+                    }
+                    let hi = msb.saturating_sub(1);
+                    let lo = msb.saturating_sub(w);
+                    let portion = if hi >= lo {
+                        ordered.range_select(hi, lo)
+                    } else {
+                        Value::zero(w as u32)
+                    };
+                    let ew = *ew as usize;
+                    for (k, en) in names.iter().enumerate() {
+                        let piece = if (k + 1) * ew <= w {
+                            portion.range_select(w - k * ew - 1, w - (k + 1) * ew)
+                        } else {
+                            Value::zero(ew as u32)
+                        };
+                        self.set_signal_value_by_name(en, piece.resize(ew as u32));
+                    }
+                    msb = lo;
                 } else {
                     let w = self.infer_lhs_width(e) as usize;
                     if w == 0 {

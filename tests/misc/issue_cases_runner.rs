@@ -797,3 +797,25 @@ fn issue_1178_package_import_width_typedef_cousins() {
     assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
     assert!(msgs.iter().any(|m| m == "TEST PASSED"), "{:#?}", msgs);
 }
+
+/// Issue #1197: stream concatenations with a `with [ array_range ]` operand
+/// (§11.4.14.4). Only the selected elements stream on pack, and on unpack
+/// only those elements are written (the rest of a fixed array is unmodified).
+/// Covers `[lo:hi]`, `[lo+:w]`, `[lo-:w]`, the single-item `[i]` form,
+/// constant ranges, `<<8`, the literal-slice `q[a:b]` cousins, a queue
+/// operand, and the LHS unpack side. Expected values were
+/// checked against the reference simulators and the LRM. Verified
+/// byte-for-byte against reference simulators.
+#[test]
+fn issue_1197_stream_with_range() {
+    let msgs = outputs(
+        include_str!("../issue_cases/stream_with_range_1197.sv"),
+        100_000,
+    );
+    assert!(
+        msgs.iter().any(|m| m == "PASS"),
+        "stream `with [range]` must all pass: {:#?}",
+        msgs
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+}

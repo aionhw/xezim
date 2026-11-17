@@ -122,6 +122,111 @@ impl Simulator {
         Some((names, ew))
     }
 
+    /// §11.4.14: the element names (in stream order) of a stream operand
+    /// that is a one-dimensional unpacked collection — a bare `arr`, or a
+    /// `with [range]` / slice sub-range `arr[lo:hi]` / `arr[lo+:w]` /
+    /// `arr[lo-:w]` / single `arr[i]` — together with each element's width.
+    /// The with-range bounds are evaluated once here, sharing the pack and
+    /// unpack paths (§11.4.14.4: "the expression is evaluated immediately
+    /// before its corresponding array is streamed"). `None` when `p` is not
+    /// such a collection operand (the caller streams the expression as a
+    /// value instead).
+    pub(super) fn stream_operand_elems(
+        &mut self,
+        p: &Expression,
+    ) -> Option<(Vec<String>, u32)> {
+        use crate::ast::expr::RangeKind;
+        let inner = match &p.kind {
+            ExprKind::Paren(i) => i.as_ref(),
+            _ => p,
+        };
+        // (base expression, resolved [lo,hi] inclusive, single-index [i]).
+        enum Sel<'a> {
+            All,
+            Single(&'a Expression),
+            Range {
+                kind: RangeKind,
+                left: &'a Expression,
+                right: &'a Expression,
+            },
+        }
+        let (base_expr, sel) = match &inner.kind {
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => (inner, Sel::All),
+            ExprKind::Index { expr, index } => {
+                (expr.as_ref(), Sel::Single(index))
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => (
+                expr.as_ref(),
+                Sel::Range {
+                    kind: *kind,
+                    left,
+                    right,
+                },
+            ),
+            _ => return None,
+        };
+        let name = self
+            .array_operand_name(base_expr)
+            // `array_operand_name` recognizes 1-D arrays/queues and class
+            // members but not 2-D/ND unpacked arrays; fall back to the bare
+            // resolved name so those stream whole too (the old pack logic's
+            // `ExprKind::Ident` fallback). `stream_elem_order` returns None
+            // for anything that is not an unpacked collection, so a
+            // non-collection fallback name just yields None.
+            .or_else(|| match &base_expr.kind {
+                ExprKind::Ident(h) if !self.ident_shadowed_by_non_collection(h) => {
+                    Some(self.resolve_hier_name(h).to_string())
+                }
+                _ => None,
+            })?;
+        // Bare whole collection: stream every element.
+        let (all_names, ew) = self.stream_elem_order(&name)?;
+        let (lo, hi) = match sel {
+            Sel::All => return Some((all_names, ew)),
+            Sel::Single(idx) => {
+                let v = self.eval_expr(idx).to_i64()?;
+                (v, v)
+            }
+            Sel::Range { kind, left, right } => {
+                let l = self.eval_expr(left).to_i64()?;
+                let r = self.eval_expr(right).to_i64()?;
+                match kind {
+                    RangeKind::Constant => (l.min(r), l.max(r)),
+                    RangeKind::IndexedUp => {
+                        if r < 0 {
+                            return None;
+                        }
+                        (l, l + r - 1)
+                    }
+                    RangeKind::IndexedDown => {
+                        if r < 0 {
+                            return None;
+                        }
+                        (l - r + 1, l)
+                    }
+                }
+            }
+        };
+        // Keep only the elements whose declared index lies in [lo, hi], in
+        // the base array's existing stream order.
+        let prefix = format!("{}[", name);
+        let chosen: Vec<String> = all_names
+            .into_iter()
+            .filter(|n| {
+                n.strip_prefix(&prefix)
+                    .and_then(|tail| tail.strip_suffix(']'))
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .is_some_and(|i| i >= lo && i <= hi)
+            })
+            .collect();
+        (!chosen.is_empty()).then_some((chosen, ew))
+    }
+
     /// §6.24.3: the operand of a cast to an integral type may be an
     /// UNPACKED array or queue (`int'(barr)`, `24'(q)`): its elements are
     /// packed left to right, which is `{>>{operand}}`. The operand read the

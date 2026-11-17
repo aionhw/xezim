@@ -33,7 +33,6 @@ fn c11_4_3_unary_minus_unsigned_display() {
 // §11.3.2, §11.6.1, §11.8.1: expression bit lengths, signedness, operand sizing
 #[test]
 fn c11_6_expression_bit_lengths() {
-    // Known gap (§11.4.14.4): `11.4.14.4` reference `0000000100000002`, xezim `X000000000000000`
     // Known gap (§11.4.3): `11.4.3l` reference `255 -1.500000`, xezim `-1 -1.500000`
     check(
         "c11_more",
@@ -97,6 +96,7 @@ fn c11_6_expression_bit_lengths() {
             "T|11.8.1w|-4",
             "T|11.8.1x|4",
             "T|11.8.1y|-4",
+            "T|11.4.14.4|0000000100000002",
             "T|11.5.1g|adbe df",
             "T|11.5.1h|dead00ef",
             "T|11.5.1i|c0",
@@ -107,7 +107,7 @@ fn c11_6_expression_bit_lengths() {
             "T|11.4.5e|1",
             "T|11.4.2c|xxxx",
         ],
-        &["T|11.4.14.4|", "T|11.4.3l|"],
+        &["T|11.4.3l|"],
     );
 }
 
