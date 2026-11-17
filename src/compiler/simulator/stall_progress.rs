@@ -135,7 +135,7 @@ impl Simulator {
         d.queued(self.reactive_conts.iter());
         d.queued(self.deferred_clocking_conts.iter());
         d.queued(self.nba_region_waiters.iter());
-        for waiter in &self.event_waiters {
+        for waiter in self.event_waiters.iter() {
             d.value(&(
                 waiter.pid,
                 waiter.remaining_events,

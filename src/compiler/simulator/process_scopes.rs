@@ -168,7 +168,7 @@ impl Simulator {
         if let Some(c) = self.event_queue.pending_stmts_for(pid) {
             return Some(c);
         }
-        if let Some(w) = self.event_waiters.iter().find(|w| w.pid == pid) {
+        if let Some(w) = self.event_waiters.first_of_pid(pid) {
             return Some(&w.continuation);
         }
         if let Some((_, c)) = self.condition_waiters.iter().find(|(p, _)| *p == pid) {
@@ -3102,7 +3102,7 @@ impl Simulator {
                                     pc.pushed_frame(cont, resume_at),
                                     is_clk_ev,
                                 );
-                                self.event_waiters.push(w);
+                                self.park_event_waiter(w);
                             }
                             return;
                         }
@@ -5332,25 +5332,7 @@ impl Simulator {
                 );
             }
         }
-        for i in 0..self.event_waiters.len() {
-            for j in 0..self.event_waiters[i].resolved_sensitivities.len() {
-                let sid = self.event_waiters[i].resolved_sensitivities[j].signal_id;
-                // A cell of a memory stored without element names (arena or
-                // bulk) has no edge snapshot; its waiter compares against
-                // its own `captured_prev`.
-                if sid >= self.prev_val.len() {
-                    continue;
-                }
-                snap_one(
-                    sid,
-                    &self.signal_table,
-                    &self.signal_widths,
-                    &mut self.prev_val,
-                    &mut self.prev_xz,
-                    &mut self.prev_wide,
-                );
-            }
-        }
+        self.snapshot_waiter_signals();
         for i in 0..self.cg_event_waiters.len() {
             for j in 0..self.cg_event_waiters[i].1.len() {
                 let sid = self.cg_event_waiters[i].1[j].signal_id;

@@ -1958,7 +1958,7 @@ impl Simulator {
                         } else {
                             let w =
                                 self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), clk);
-                            self.event_waiters.push(w);
+                            self.park_event_waiter(w);
                         }
                         f.pc = npc;
                         break;
@@ -2048,7 +2048,7 @@ impl Simulator {
                         } else {
                             let w =
                                 self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), clk);
-                            self.event_waiters.push(w);
+                            self.park_event_waiter(w);
                         }
                     }
                 }
@@ -4593,7 +4593,7 @@ impl Simulator {
                         {
                             {
                                 let w = self.make_event_waiter(pid, sens, cont);
-                                self.event_waiters.push(w);
+                                self.park_event_waiter(w);
                             }
                         } else {
                             eprintln!(
@@ -4896,7 +4896,7 @@ impl Simulator {
                                 }];
                                 {
                                     let w = self.make_event_waiter_kind(pid, sens, cont, false);
-                                    self.event_waiters.push(w);
+                                    self.park_event_waiter(w);
                                 }
                                 return;
                             }
@@ -4957,7 +4957,7 @@ impl Simulator {
                                 }
                             } else if has_real {
                                 let w = self.make_event_waiter_kind(pid, sens, cont, is_clk_ev);
-                                self.event_waiters.push(w);
+                                self.park_event_waiter(w);
                             } else {
                                 // `@(x)` where x is not a real signal — a
                                 // procedural local that was NBA-assigned then
@@ -5165,7 +5165,7 @@ impl Simulator {
                                     pc.resume_at(pc.start + i + 1),
                                 );
                                 waiter.remaining_events = n;
-                                self.event_waiters.push(waiter);
+                                self.park_event_waiter(waiter);
                                 return;
                             }
                         }

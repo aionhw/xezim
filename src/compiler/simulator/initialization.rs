@@ -4672,7 +4672,18 @@ impl Simulator {
             intra_saved_next: 0,
             vc_saved: HashMap::default(),
             event_triggered_time: EventStampStore::default(),
-            event_waiters: Vec::new(),
+            event_waiters: Default::default(),
+            // The index is told of a write where the dirty-driven edge scan
+            // is, so it needs that scan's write notes.
+            waiter_index_on: std::env::var("XEZIM_WAITER_INDEX")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+                && std::env::var("XEZIM_DIRTY_EDGE")
+                    .map(|v| v != "0" && !v.is_empty())
+                    .unwrap_or(true),
+            waiter_index_shadow: std::env::var("XEZIM_WAITER_INDEX_SHADOW")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
             instance_event_waiters: InstanceEventWaiters::default(),
             late_resume_epoch: 0,
             fe_trusted_types: HashSet::default(),

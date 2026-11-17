@@ -517,7 +517,7 @@ impl Simulator {
                 if waiter.value_ctx.is_some() {
                     self.rebase_value_terms(&mut waiter);
                 }
-                self.event_waiters.push(waiter);
+                self.park_event_waiter(waiter);
             }
             if let Some(h) = saved_hint {
                 *self.name_resolve_hint.borrow_mut() = h;
@@ -563,7 +563,7 @@ impl Simulator {
     pub(super) fn park_clocking_guard(&mut self, w: EventWaiter) {
         match w.resolved_sensitivities.iter().find_map(|t| t.iff.clone()) {
             Some(g) => self.deferred_clocking_guarded.push((w, g)),
-            None => self.event_waiters.push(w),
+            None => self.park_event_waiter(w),
         }
     }
 

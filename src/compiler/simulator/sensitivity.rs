@@ -3552,16 +3552,15 @@ impl Simulator {
         {
             return;
         }
-        let mut order: Vec<usize> = (0..self.event_waiters.len()).collect();
-        order.sort_by_key(|&i| self.event_waiters[i].parked_time);
+        let mut order: Vec<&EventWaiter> = self.event_waiters.iter().collect();
+        order.sort_by_key(|w| w.parked_time);
         eprintln!(
             "[xezim][hang-report] {} event waiter(s), {} condition waiter(s) parked at sim time {}; oldest first:",
             self.event_waiters.len(),
             self.condition_waiters.len(),
             self.time
         );
-        for &i in order.iter().take(max_n) {
-            let w = &self.event_waiters[i];
+        for &w in order.iter().take(max_n) {
             let age = self.time.saturating_sub(w.parked_time);
             let mut sens_desc: Vec<String> = Vec::new();
             for (k, sid) in w.resolved_sensitivities.iter().enumerate() {

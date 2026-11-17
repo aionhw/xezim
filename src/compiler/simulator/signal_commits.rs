@@ -531,7 +531,7 @@ impl Simulator {
         }
         self.signal_commit_plan.resize(self.signal_table.len(), 0);
         for id in 0..self.signal_commit_plan.len() {
-            if self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0) {
+            if self.waiter_signal_hooked(id) {
                 self.signal_commit_plan[id] |= 1;
             }
             if self.armed_input_set(id) {
@@ -542,6 +542,13 @@ impl Simulator {
 
     #[inline(always)]
     pub(super) fn note_edge_write(&mut self, id: usize) {
+        // Parked-waiter index — see the write_sig! twin. The in-place write
+        // paths end here without the old value, so every write is noted.
+        if id < self.event_waiters.watch.len()
+            && self.event_waiters.watch[id] & event_waiters::WATCH_ANY != 0
+        {
+            self.event_waiters.note_write(id);
+        }
         // §9.2 re-trigger recording (always on) — see the write_sig! twin.
         if self.in_edge_block || self.in_edge_cont {
             if let Some(&p) = self.sig_to_edge_pos.get(id) {
@@ -2269,8 +2276,8 @@ impl Simulator {
         let ports = std::mem::take(&mut self.time0_port_edges);
         let aliases = std::mem::take(&mut self.time0_alias_edges);
         let top = format!("{}.", self.module.name);
-        let mut rearm: Vec<(usize, usize, (u64, u64))> = Vec::new();
-        for (wi, w) in self.event_waiters.iter().enumerate() {
+        let mut rearm: Vec<(u64, usize, (u64, u64))> = Vec::new();
+        for (wi, w) in self.event_waiters.iter_seq() {
             if w.is_clocking || self.process_origin.get(&w.pid).map(|o| o.1) != Some("always block")
             {
                 continue;
@@ -2303,7 +2310,7 @@ impl Simulator {
             return;
         }
         for (wi, k, prev) in rearm {
-            self.event_waiters[wi].captured_prev[k] = prev;
+            self.event_waiters.set_captured_prev(wi, k, prev);
         }
         self.edge_forced_fire = fire;
         self.check_edges();

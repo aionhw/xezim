@@ -1205,7 +1205,7 @@ impl Simulator {
         }
         // Blocked on @(...) — if it is also a top spinner, something keeps
         // re-triggering it at this timestamp.
-        if let Some(w) = self.event_waiters.iter().find(|w| w.pid == pid) {
+        if let Some(w) = self.event_waiters.first_of_pid(pid) {
             let sens = w
                 .resolved_sensitivities
                 .iter()

@@ -389,183 +389,162 @@ impl Simulator {
         self.name_wake_rank = names;
     }
 
-    /// Detect which parked event waiters' sensitivities fired (against
-    /// their own captured_prev baselines) and remove them from the parked
-    /// list, refreshing the baseline of everyone left. Returns the (pid,
-    /// continuation) pairs to run. Shared by the classic post-edge-block
-    /// drain and the commercial-order pre-edge-block drain (see
-    /// XEZIM_WAITERS_FIRST in check_edges_inner).
-    pub(super) fn drain_triggered_event_waiters(&mut self) -> Vec<(usize, ProcCont)> {
-        if self.event_waiters.is_empty() {
-            return Vec::new();
-        }
-        let mut waiters = std::mem::take(&mut self.event_waiters);
-        self.prof_waiter_iters += waiters.len() as u64;
-        let mut triggered_conts = std::mem::take(&mut self.triggered_conts_buf);
-        triggered_conts.clear();
-        // Wake rank of each entry of `triggered_conts`, kept only from the
-        // first nonzero rank on: empty means every wakeup is depth 0.
-        let mut ranks: Vec<u8> = Vec::new();
-        // In place: a parked waiter that does not fire stays where it is
-        // (the old drain moved every waiter through a swap vector each tick).
-        waiters.retain_mut(|waiter| {
-            let mut triggered = false;
-            let mut rank = 0u8;
-            let mut moved = false;
-            let mut deferred_ix = usize::MAX;
-            let saved_hint = waiter
-                .value_ctx
-                .as_ref()
-                .map(|c| self.name_resolve_hint.replace(c.scope.clone()));
-            for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
-                let (pv, px) = waiter.captured_prev[i];
-                let pw = waiter.captured_prev_wide[i].as_ref();
-                if !self.term_fires(sid, pv, px, pw) {
-                    continue;
-                }
-                moved = true;
-                // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the
-                // guard `g` holds at edge time. A false guard re-arms the
-                // waiter (it stays in event_waiters for the next edge)
-                // rather than resuming the process. The guard is evaluated
-                // in the WAITING PROCESS's context (`eval_waiter_condition`
-                // swaps in that pid's parked class frames + scope): a
-                // class-task guard like `vif.sig_grant[master_id] === 1`
-                // reads its virtual interface through the object's `this`
-                // frame and `master_id` from the parked locals — a bare
-                // module-scope eval cannot resolve either name and reads X,
-                // so the waiter would never fire (ubus arbitration).
-                let guard_ok = match sid.iff.as_deref() {
-                    // §14.13: a CLOCKING event (`@(cb iff g)`) occurs after
-                    // the block samples, so its guard must read this edge's
-                    // clockvars — judged in the Reactive region instead
-                    // (`resolve_deferred_clocking_guards`). Evaluated here it
-                    // read the previous edge's sample.
-                    Some(_) if waiter.is_clocking => true,
-                    // Fast path: a waiter with no parked context, drained
-                    // from the top level, sees the module scope directly.
-                    Some(g)
-                        if !self.process_contexts.contains_key(&waiter.pid)
-                            && self.process_context_is_default() =>
-                    {
-                        self.eval_expr(g).is_true()
-                    }
-                    Some(g) => self.eval_waiter_condition(waiter.pid, g),
-                    None => true,
-                };
-                // §9.4.2: a non-trivial event expression fires only when its
-                // VALUE changed since arm — `a=2;b=1` leaving `a+b` at 3 is
-                // not an event, however many operands moved — and an edge
-                // (`@(posedge v[3])`) is judged on that value's LSB.
-                let value_ok = match (&sid.value_of, waiter.guard_prev.get(i)) {
-                    (Some(e), Some(Some(prev))) => {
-                        let e = e.clone();
-                        let prev = prev.clone();
-                        let cur = self.eval_expr(&e);
-                        value_event_fires(sid.edge, &prev, &cur)
-                    }
-                    _ => true,
-                };
-                if guard_ok && value_ok {
-                    triggered = true;
-                    rank = sid.wake_rank;
-                    if waiter.is_clocking && sid.iff.is_some() {
-                        deferred_ix = i;
-                    }
-                    break;
-                }
+    /// Examine one parked waiter for `drain_triggered_event_waiters`: did
+    /// one of its terms see its event against the waiter's `captured_prev`
+    /// baseline? A waiter that fires hands its continuation to
+    /// `triggered_conts` (with its wake rank in `ranks`) or to the clocking
+    /// lists and leaves; one that stays takes the current values as its new
+    /// baseline. Returns whether it stays parked.
+    ///
+    /// With every term's signal still at the baseline this changes nothing,
+    /// which is what lets the drain skip a waiter none of whose signals was
+    /// written (see `event_waiters`).
+    pub(super) fn examine_event_waiter(
+        &mut self,
+        waiter: &mut EventWaiter,
+        triggered_conts: &mut Vec<(usize, ProcCont)>,
+        ranks: &mut Vec<u8>,
+    ) -> bool {
+        let mut triggered = false;
+        let mut rank = 0u8;
+        let mut moved = false;
+        let mut deferred_ix = usize::MAX;
+        let saved_hint = waiter
+            .value_ctx
+            .as_ref()
+            .map(|c| self.name_resolve_hint.replace(c.scope.clone()));
+        for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
+            let (pv, px) = waiter.captured_prev[i];
+            let pw = waiter.captured_prev_wide[i].as_ref();
+            if !self.term_fires(sid, pv, px, pw) {
+                continue;
             }
-            if deferred_ix != usize::MAX {
-                self.hold_clocking_guard(waiter, deferred_ix);
-                if let Some(h) = saved_hint {
-                    *self.name_resolve_hint.borrow_mut() = h;
+            moved = true;
+            // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the
+            // guard `g` holds at edge time. A false guard re-arms the
+            // waiter (it stays in event_waiters for the next edge)
+            // rather than resuming the process. The guard is evaluated
+            // in the WAITING PROCESS's context (`eval_waiter_condition`
+            // swaps in that pid's parked class frames + scope): a
+            // class-task guard like `vif.sig_grant[master_id] === 1`
+            // reads its virtual interface through the object's `this`
+            // frame and `master_id` from the parked locals — a bare
+            // module-scope eval cannot resolve either name and reads X,
+            // so the waiter would never fire (ubus arbitration).
+            let guard_ok = match sid.iff.as_deref() {
+                // §14.13: a CLOCKING event (`@(cb iff g)`) occurs after
+                // the block samples, so its guard must read this edge's
+                // clockvars — judged in the Reactive region instead
+                // (`resolve_deferred_clocking_guards`). Evaluated here it
+                // read the previous edge's sample.
+                Some(_) if waiter.is_clocking => true,
+                // Fast path: a waiter with no parked context, drained
+                // from the top level, sees the module scope directly.
+                Some(g)
+                    if !self.process_contexts.contains_key(&waiter.pid)
+                        && self.process_context_is_default() =>
+                {
+                    self.eval_expr(g).is_true()
                 }
-                return false;
-            }
-            if triggered && waiter.remaining_events > 1 {
-                waiter.remaining_events -= 1;
-                triggered = false;
-            }
-            let keep = if triggered {
-                sim_dbg_eprintln!(
-                    "[DEBUG] waiter for process {} triggered at time {}",
-                    waiter.pid,
-                    self.time
-                );
-                if waiter.is_clocking {
-                    // §14.13: resume in the Reactive region, not here in the
-                    // Active region — defer the continuation past apply_nba +
-                    // tick_clocking_blocks so it reads post-edge state and this
-                    // cycle's clocking samples.
-                    let cont = std::mem::replace(&mut waiter.continuation, ProcCont::empty());
-                    self.deferred_clocking_conts.push((waiter.pid, cont));
-                } else {
-                    let cont = std::mem::replace(&mut waiter.continuation, ProcCont::empty());
-                    if rank != 0 || !ranks.is_empty() {
-                        if ranks.capacity() == 0 {
-                            ranks = std::mem::take(&mut self.wake_rank_buf);
-                            ranks.clear();
-                        }
-                        ranks.resize(triggered_conts.len(), 0);
-                        ranks.push(rank);
-                    }
-                    triggered_conts.push((waiter.pid, cont));
-                }
-                false
-            } else {
-                // Refresh this waiter's `captured_prev` baseline to each
-                // sensitivity signal's CURRENT value so that a qualifying
-                // edge occurring over multiple steps is detected.
-                //
-                // Without this, a waiter armed while its signal sits at the
-                // edge-target level can never see the NEXT edge: e.g. a
-                // process resumes on the first `@(posedge clk)` at t=5
-                // (clk=1) and immediately re-arms on the next line; its
-                // captured_prev is frozen at 1, so when clk later goes
-                // 1→0→1 the Posedge test `!pb_one && cb_one` stays false
-                // (pb_one clings to the stale 1) and the second posedge is
-                // lost — the process strands (see
-                // tests/bound_module / sequential_event_waits). Tracking the
-                // running level here preserves the same-tick NBA-region
-                // semantics captured_prev was added for (a waiter still
-                // won't fire on an edge that completed BEFORE it armed, since
-                // at arm time captured_prev already equals current), while
-                // catching cross-tick transitions through the target level.
-                for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
-                    waiter.captured_prev[i] = self.term_raw_bits(sid.signal_id);
-                    if let Some(v) = self.term_wide_value(sid.signal_id) {
-                        waiter.captured_prev_wide[i] = Some(v);
-                    }
-                }
-                // An operand moved but no expression term fired: re-baseline
-                // the expression values (an edge may arrive in steps), and
-                // follow a moved index to the cell it selects now.
-                if moved && waiter.value_ctx.is_some() {
-                    self.rebase_value_terms(waiter);
-                }
-                true
+                Some(g) => self.eval_waiter_condition(waiter.pid, g),
+                None => true,
             };
+            // §9.4.2: a non-trivial event expression fires only when its
+            // VALUE changed since arm — `a=2;b=1` leaving `a+b` at 3 is
+            // not an event, however many operands moved — and an edge
+            // (`@(posedge v[3])`) is judged on that value's LSB.
+            let value_ok = match (&sid.value_of, waiter.guard_prev.get(i)) {
+                (Some(e), Some(Some(prev))) => {
+                    let e = e.clone();
+                    let prev = prev.clone();
+                    let cur = self.eval_expr(&e);
+                    value_event_fires(sid.edge, &prev, &cur)
+                }
+                _ => true,
+            };
+            if guard_ok && value_ok {
+                triggered = true;
+                rank = sid.wake_rank;
+                if waiter.is_clocking && sid.iff.is_some() {
+                    deferred_ix = i;
+                }
+                break;
+            }
+        }
+        if deferred_ix != usize::MAX {
+            self.hold_clocking_guard(waiter, deferred_ix);
             if let Some(h) = saved_hint {
                 *self.name_resolve_hint.borrow_mut() = h;
             }
-            keep
-        });
-        self.event_waiters = waiters;
-        // Within-region process resumption order is LRM-indeterminate
-        // (§4.7), but the reference simulator wakes the LAST-armed waiter
-        // first — and this campaign matches the reference's observable
-        // ordering so differential runs stay comparable. Registration order
-        // is FIFO; reverse to LIFO at the single hand-off point.
-        triggered_conts.reverse();
-        // §4.4/§10.3: a continuous assignment's update is its own active
-        // event, so a net it drives changes — and wakes its waiters — only
-        // after every waiter of its source has been scheduled. Order the
-        // wakeups by scheduling depth (`build_sig_wake_rank`), keeping LIFO
-        // within a depth.
-        if !ranks.is_empty() {
-            self.order_wakeups_by_rank(&mut triggered_conts, ranks);
+            return false;
         }
-        triggered_conts
+        if triggered && waiter.remaining_events > 1 {
+            waiter.remaining_events -= 1;
+            triggered = false;
+        }
+        let keep = if triggered {
+            sim_dbg_eprintln!(
+                "[DEBUG] waiter for process {} triggered at time {}",
+                waiter.pid,
+                self.time
+            );
+            if waiter.is_clocking {
+                // §14.13: resume in the Reactive region, not here in the
+                // Active region — defer the continuation past apply_nba +
+                // tick_clocking_blocks so it reads post-edge state and this
+                // cycle's clocking samples.
+                let cont = std::mem::replace(&mut waiter.continuation, ProcCont::empty());
+                self.deferred_clocking_conts.push((waiter.pid, cont));
+            } else {
+                let cont = std::mem::replace(&mut waiter.continuation, ProcCont::empty());
+                if rank != 0 || !ranks.is_empty() {
+                    if ranks.capacity() == 0 {
+                        *ranks = std::mem::take(&mut self.wake_rank_buf);
+                        ranks.clear();
+                    }
+                    ranks.resize(triggered_conts.len(), 0);
+                    ranks.push(rank);
+                }
+                triggered_conts.push((waiter.pid, cont));
+            }
+            false
+        } else {
+            // Refresh this waiter's `captured_prev` baseline to each
+            // sensitivity signal's CURRENT value so that a qualifying
+            // edge occurring over multiple steps is detected.
+            //
+            // Without this, a waiter armed while its signal sits at the
+            // edge-target level can never see the NEXT edge: e.g. a
+            // process resumes on the first `@(posedge clk)` at t=5
+            // (clk=1) and immediately re-arms on the next line; its
+            // captured_prev is frozen at 1, so when clk later goes
+            // 1→0→1 the Posedge test `!pb_one && cb_one` stays false
+            // (pb_one clings to the stale 1) and the second posedge is
+            // lost — the process strands (see
+            // tests/bound_module / sequential_event_waits). Tracking the
+            // running level here preserves the same-tick NBA-region
+            // semantics captured_prev was added for (a waiter still
+            // won't fire on an edge that completed BEFORE it armed, since
+            // at arm time captured_prev already equals current), while
+            // catching cross-tick transitions through the target level.
+            for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
+                waiter.captured_prev[i] = self.term_raw_bits(sid.signal_id);
+                if let Some(v) = self.term_wide_value(sid.signal_id) {
+                    waiter.captured_prev_wide[i] = Some(v);
+                }
+            }
+            // An operand moved but no expression term fired: re-baseline
+            // the expression values (an edge may arrive in steps), and
+            // follow a moved index to the cell it selects now.
+            if moved && waiter.value_ctx.is_some() {
+                self.rebase_value_terms(waiter);
+            }
+            true
+        };
+        if let Some(h) = saved_hint {
+            *self.name_resolve_hint.borrow_mut() = h;
+        }
+        keep
     }
 
     /// §9.4.2: an operand of `w`'s expression terms moved without an event.

@@ -949,7 +949,8 @@ impl Simulator {
         self.quiet_bits.resize(n.div_ceil(64), 0);
         for id in 0..n {
             let armed = self.armed_input_set(id);
-            let edge = self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0);
+            // An edge signal, or one a parked waiter is indexed under.
+            let edge = self.waiter_signal_hooked(id);
             if !armed && !edge {
                 self.quiet_bits[id >> 6] |= 1u64 << (id & 63);
             }
@@ -1294,7 +1295,7 @@ impl Simulator {
             self.gate_lane[eidx] = self.gate_ops.len() as u32;
             self.gate_ops.push(*op);
             let armed = self.armed_input_set(id);
-            let edge = self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0);
+            let edge = self.waiter_signal_hooked(id);
             let wide = self.signal_widths.get(id).copied().unwrap_or(65) > 64;
             self.gate_obs
                 .push((armed as u8) | ((edge as u8) << 1) | ((wide as u8) << 2));

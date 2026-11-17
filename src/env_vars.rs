@@ -1031,6 +1031,14 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Scheduling: run event waiters before edge blocks (0/1)",
     ),
     (
+        "XEZIM_WAITER_INDEX",
+        "Scheduling: 0 examines every parked @(...) waiter at each scheduling pass instead of only those whose signals were written (default 1; needs XEZIM_DIRTY_EDGE)",
+    ),
+    (
+        "XEZIM_WAITER_INDEX_SHADOW",
+        "Scheduling: 1 examines every parked @(...) waiter and stops on one the waiter index would have skipped although its signal changed",
+    ),
+    (
         "XEZIM_XZ_STATS",
         "Print X/Z-bit population statistics for the signal table",
     ),

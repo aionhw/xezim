@@ -5596,7 +5596,7 @@ impl Simulator {
                             let sens = self.event_to_sens(e);
                             let is_clk_ev = self.is_clocking_event(e);
                             let w = self.make_event_waiter_kind(wpid, sens, wake, is_clk_ev);
-                            self.event_waiters.push(w);
+                            self.park_event_waiter(w);
                         }
                         self.sync_wait(id);
                     }
@@ -5678,7 +5678,7 @@ impl Simulator {
                         let pid = self.cg_this.unwrap_or(0); // placeholder
                         {
                             let w = self.make_event_waiter_kind(pid, sens, cont.into(), is_clk_ev);
-                            self.event_waiters.push(w);
+                            self.park_event_waiter(w);
                         }
                         self.break_flag = true;
                         return;
@@ -5982,7 +5982,7 @@ impl Simulator {
                             // (UVM's run-phase watchdog timer).
                             self.event_queue.remove_pid(pid);
                         }
-                        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        self.event_waiters.remove_pids(&to_kill);
                         self.instance_event_waiters.remove_pids(to_kill.iter());
                         for q in self.mailbox_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
@@ -6011,7 +6011,7 @@ impl Simulator {
                         self.process_parents.remove(&pid);
                         self.process_contexts.remove(&pid);
                         self.event_queue.remove_pid(pid);
-                        self.event_waiters.retain(|w| w.pid != pid);
+                        self.event_waiters.remove_pid(pid);
                         self.instance_event_waiters.remove_pid(pid);
                         for q in self.mailbox_get_waiters.values_mut() {
                             q.retain(|w| w.pid != pid);
@@ -6066,7 +6066,7 @@ impl Simulator {
                             // (UVM's run-phase watchdog timer).
                             self.event_queue.remove_pid(pid);
                         }
-                        self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                        self.event_waiters.remove_pids(&to_kill);
                         self.instance_event_waiters.remove_pids(to_kill.iter());
                         for q in self.mailbox_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
@@ -6127,7 +6127,7 @@ impl Simulator {
                     // §9.6.2: incl. its future-time #delay (see above).
                     self.event_queue.remove_pid(pid);
                 }
-                self.event_waiters.retain(|w| !to_kill.contains(&w.pid));
+                self.event_waiters.remove_pids(&to_kill);
                 self.instance_event_waiters.remove_pids(to_kill.iter());
                 self.condition_waiters.retain(|(p, _)| !to_kill.contains(p));
                 self.ready_condition_waiters

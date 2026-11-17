@@ -1139,6 +1139,15 @@ macro_rules! write_sig {
                     $self.changed_edge_pos.push(__ep as usize);
                 }
             }
+            // Parked-waiter index: queue a watched signal that changed, for
+            // the next waiter drain and the next snapshot. One length
+            // compare while no waiter is indexed.
+            if __wsig_changed
+                && __wsig_id < $self.event_waiters.watch.len()
+                && $self.event_waiters.watch[__wsig_id] & event_waiters::WATCH_ANY != 0
+            {
+                $self.event_waiters.note_write(__wsig_id);
+            }
             // §9.2 re-trigger: a blocking write to an edge-sensitive signal
             // made WHILE an edge block executes must re-run edge detection
             // for that signal (drain_edge_exec_rescan) — record its position.
@@ -3090,6 +3099,7 @@ mod coverage;
 mod dpi_imports;
 mod edges;
 mod enum_receivers;
+mod event_waiters;
 mod event_loop;
 mod stall_progress;
 mod expression_types;
@@ -9537,8 +9547,16 @@ pub struct Simulator {
     /// (i.e. the event has been triggered in the same time slot as the
     /// query). EventTrigger handler stamps this.
     event_triggered_time: EventStampStore,
-    /// Processes waiting for signal edge events (@(posedge clk), etc.)
-    event_waiters: Vec<EventWaiter>,
+    /// Processes waiting for signal edge events (@(posedge clk), etc.),
+    /// with the per-signal index a drain picks the ones to examine by.
+    event_waiters: event_waiters::EventWaiters,
+    /// `XEZIM_WAITER_INDEX` (default on, and only with the dirty-driven
+    /// edge scan, whose write notes it shares): a drain examines the
+    /// waiters whose signals were written, not every parked waiter.
+    waiter_index_on: bool,
+    /// `XEZIM_WAITER_INDEX_SHADOW=1`: examine every waiter anyway and stop
+    /// on one the index would have skipped although its signal moved.
+    waiter_index_shadow: bool,
     /// Processes parked on a class-field named event (`@m_event` inside a
     /// method on `this`). Woken directly by `fire_instance_event` when the
     /// matching `->m_event` runs; see `InstanceEventWaiter`.
