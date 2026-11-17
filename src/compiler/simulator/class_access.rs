@@ -722,6 +722,11 @@ impl Simulator {
                 }
                 let mut stripped = hier.clone();
                 stripped.path[0].name.name = bare.to_string();
+                // §3.12.1: the unit's storage has this flat name; a scope
+                // hint must not find a module's declaration of the name.
+                if self.unit_scope_decl_exists(bare) {
+                    stripped.root = Some("$root".to_string());
+                }
                 stripped.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                 stripped.cached_resolved_name = crate::ast::cache::NameCache::new();
                 let resolved = self.resolve_hier_name_uncached(&stripped);
