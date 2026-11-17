@@ -4718,7 +4718,16 @@ impl Simulator {
         let mut i = 0;
         while i < self.delayed_updates.len() {
             if self.delayed_updates[i].0 <= self.time {
-                let (_, id, mut val) = self.delayed_updates.swap_remove(i);
+                let (_, id, mut val, mask) = self.delayed_updates.swap_remove(i);
+                if let Some(mask) = mask {
+                    // Merge at maturity, not when the driver first schedules.
+                    // Other bits may have changed in the intervening time.
+                    for bit in 0..val.width as usize {
+                        if mask.get_bit_code(bit) != 1 {
+                            val.set_bit_code(bit, self.signal_table[id].get_bit_code(bit));
+                        }
+                    }
+                }
                 // The committed value carries the TARGET's signedness — a
                 // delayed NBA of a signed 32-bit literal into a plain
                 // `reg [3:0]` must not read back signed (-7 for 4'b1001).
@@ -4763,7 +4772,7 @@ impl Simulator {
 
     /// Get the next time a delayed update is due (for time advancement).
     pub(super) fn next_delayed_time(&self) -> Option<u64> {
-        let a = self.delayed_updates.iter().map(|(t, _, _)| *t).min();
+        let a = self.delayed_updates.iter().map(|(t, _, _, _)| *t).min();
         let b = self
             .delayed_nba
             .iter()
@@ -4815,7 +4824,7 @@ impl Simulator {
     /// the pulse was narrower than the delay — the pending update must be
     /// dropped (no visible glitch), not left to fire.
     pub(super) fn cancel_delayed(&mut self, id: usize) {
-        self.delayed_updates.retain(|(_, sid, _)| *sid != id);
+        self.delayed_updates.retain(|(_, sid, _, _)| *sid != id);
     }
 
     /// §10.3.3 inertial delay: is an update of `id` to exactly `val` already
@@ -4826,7 +4835,7 @@ impl Simulator {
     pub(super) fn delayed_update_pending_is(&self, id: usize, val: &Value) -> bool {
         self.delayed_updates
             .iter()
-            .any(|(_, sid, v)| *sid == id && v == val)
+            .any(|(_, sid, v, _)| *sid == id && v == val)
     }
 
     /// Schedule a delayed signal update with an explicit delay (inertial delay model).
@@ -4926,8 +4935,8 @@ impl Simulator {
         };
         let target_time = self.time + delay;
         // Inertial delay: remove any pending update for this signal
-        self.delayed_updates.retain(|(_, sid, _)| *sid != id);
-        self.delayed_updates.push((target_time, id, val));
+        self.delayed_updates.retain(|(_, sid, _, _)| *sid != id);
+        self.delayed_updates.push((target_time, id, val, None));
     }
 
     /// Schedule a delayed update to a SLICE of `id`, composing against the
@@ -4959,7 +4968,7 @@ impl Simulator {
         let mut first = None;
         let mut more = false;
         if self.delayed_slice_chains {
-            for (k, (_, sid, _)) in self.delayed_updates.iter().enumerate() {
+            for (k, (_, sid, _, _)) in self.delayed_updates.iter().enumerate() {
                 if *sid == id {
                     if first.is_some() {
                         more = true;
@@ -4972,7 +4981,7 @@ impl Simulator {
             first = self
                 .delayed_updates
                 .iter()
-                .position(|(_, sid, _)| *sid == id);
+                .position(|(_, sid, _, _)| *sid == id);
         }
         // One pending update that only this slice changes (its own earlier
         // change, the usual inertial reschedule) or that is due at `target`
@@ -4984,7 +4993,7 @@ impl Simulator {
                 .is_some_and(|mp| mp.table_of(id).is_some())
         {
             let merges = !more && {
-                let (t, _, v) = &self.delayed_updates[k];
+                let (t, _, v, _) = &self.delayed_updates[k];
                 *t == target || {
                     let current = &self.signal_table[id];
                     let mut others = v.clone();
@@ -4998,6 +5007,16 @@ impl Simulator {
                 self.schedule_delayed_slice_chain(id, lo as usize, sel_w as usize, sel_val, target);
                 return;
             }
+        }
+        let mut mask = first.map_or_else(
+            || {
+                let width = self.signal_table[id].width;
+                (lo != 0 || sel_w != width).then(|| Value::zero(width))
+            },
+            |k| self.delayed_updates[k].3.clone(),
+        );
+        if let Some(mask) = &mut mask {
+            for bit in lo..lo + sel_w { mask.set_bit_code(bit as usize, 1); }
         }
         let pending = first.map(|k| self.delayed_updates[k].2.clone());
         let in_flight = pending.is_some();
@@ -5018,6 +5037,11 @@ impl Simulator {
             self.cancel_delayed(id);
         } else {
             self.schedule_delayed_with_delay(id, merged, delay);
+            if !self.module_paths.as_ref().is_some_and(|mp| mp.table_of(id).is_some()) {
+                for entry in &mut self.delayed_updates {
+                    if entry.1 == id { entry.3 = mask.clone(); }
+                }
+            }
         }
     }
 
@@ -5042,8 +5066,8 @@ impl Simulator {
             .delayed_updates
             .iter()
             .enumerate()
-            .filter(|(_, (_, sid, _))| *sid == id)
-            .map(|(k, (t, _, _))| (*t, k))
+            .filter(|(_, (_, sid, _, _))| *sid == id)
+            .map(|(k, (t, _, _, _))| (*t, k))
             .collect();
         chain.sort_unstable();
         // The slice is already scheduled to take these bits: keep its time.
@@ -5057,6 +5081,11 @@ impl Simulator {
         let current = self.signal_table[id].clone();
         let mut base = current.clone();
         for &(t, k) in &chain {
+            if let Some(mask) = &mut self.delayed_updates[k].3 {
+                // Cancel this slice's old event; only its new due time owns
+                // these bits. Later snapshots retain values for composition.
+                for bit in lo..lo + sel_w { mask.set_bit_code(bit, u8::from(t == target)); }
+            }
             let v = &mut self.delayed_updates[k].2;
             for i in 0..sel_w {
                 let bit = if t < target {
@@ -5075,13 +5104,17 @@ impl Simulator {
                 base.set_bit_code(lo + i, sel_val.get_bit_code(i));
             }
             chain.push((target, self.delayed_updates.len()));
-            self.delayed_updates.push((target, id, base));
+            let mut mask = Value::zero(base.width);
+            for bit in lo..lo + sel_w { mask.set_bit_code(bit, 1); }
+            self.delayed_updates.push((target, id, base, Some(mask)));
             chain.sort_unstable();
         }
         let mut prev = current;
         let mut drop: Vec<usize> = Vec::new();
         for &(_, k) in &chain {
-            if self.delayed_updates[k].2 == prev {
+            if self.delayed_updates[k].2 == prev
+                || self.delayed_updates[k].3.as_ref().is_some_and(|m| (0..m.width as usize).all(|bit| m.get_bit_code(bit) == 0))
+            {
                 drop.push(k);
             } else {
                 prev = self.delayed_updates[k].2.clone();

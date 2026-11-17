@@ -288,11 +288,11 @@ impl Simulator {
         let mut pending: Vec<(u64, Value)> = self
             .delayed_updates
             .iter()
-            .filter(|(_, sid, _)| *sid == id)
-            .map(|(t, _, v)| (*t, v.clone()))
+            .filter(|(_, sid, _, _)| *sid == id)
+            .map(|(t, _, v, _)| (*t, v.clone()))
             .collect();
         pending.sort_by_key(|(t, _)| *t);
-        self.delayed_updates.retain(|(_, sid, _)| *sid != id);
+        self.delayed_updates.retain(|(_, sid, _, _)| *sid != id);
         let width = (old.width as usize).min(val.width as usize);
         // (when, bit) for every bit that changes.
         let mut when: Vec<(u64, usize)> = Vec::new();
@@ -333,7 +333,7 @@ impl Simulator {
         // is queued at the current time; the scheduler applies it in the
         // next delta of this time step.
         for (at, v) in steps.into_iter().rev() {
-            self.delayed_updates.push((at, id, v));
+            self.delayed_updates.push((at, id, v, None));
         }
     }
 }

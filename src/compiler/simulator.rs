@@ -369,7 +369,8 @@ fn method_boost_enabled() -> bool {
 // Absolute packed references retain declaration geometry (§23.6, §7.4.1).
 // Class aggregate ownership and struct-field constructor typing (§8.8/§8.11).
 // Scoped memory destinations, dynamic rows and combinational time scope.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_307f;
+// Explicit event expressions retain function-call operands and result guards.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3080;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -7710,7 +7711,8 @@ pub struct Simulator {
     /// Per-signal delay in sim ticks (0 = no delay). Indexed by signal_id.
     sdf_delays: Vec<u64>,
     /// Pending delayed signal updates: (time, signal_id, value)
-    delayed_updates: Vec<(u64, usize, Value)>,
+    // A mask limits a delayed update to the bits its driver owns (§10.3.3).
+    delayed_updates: Vec<(u64, usize, Value, Option<Value>)>,
     /// §10.3.3 / §28.16: some net may hold more than one pending update in
     /// `delayed_updates` (select drivers due at different times, see
     /// `schedule_delayed_slice_chain`). Cleared when no update is pending.

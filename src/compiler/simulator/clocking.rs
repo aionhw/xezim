@@ -129,8 +129,8 @@ impl Simulator {
         let when = self.time.saturating_add(delay);
         let value = self.fit_clocking_value(id, val);
         self.delayed_updates
-            .retain(|(t, sid, _)| *sid != id || *t != when);
-        self.delayed_updates.push((when, id, value));
+            .retain(|(t, sid, _, _)| *sid != id || *t != when);
+        self.delayed_updates.push((when, id, value, None));
     }
 
     /// §14.3: an output with an edge skew is driven on that edge of the

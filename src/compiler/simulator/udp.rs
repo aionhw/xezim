@@ -793,8 +793,8 @@ impl Simulator {
             let base_code = self
                 .delayed_updates
                 .iter()
-                .find(|(_, sid, _)| *sid == id)
-                .map(|(_, _, v)| v.get_bit_code(bit))
+                .find(|(_, sid, _, _)| *sid == id)
+                .map(|(_, _, v, _)| v.get_bit_code(bit))
                 .unwrap_or_else(|| self.signal_table[id].get_bit_code(bit));
             if base_code != new_code {
                 let mut sel = Value::new(1);

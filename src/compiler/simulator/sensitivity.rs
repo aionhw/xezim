@@ -2581,25 +2581,26 @@ impl Simulator {
         None
     }
 
-    /// Does event expression `e` select (an index or a part-select) anywhere
-    /// outside a call?
-    pub(super) fn event_expr_selects(e: &Expression) -> bool {
+    /// Does the event expression need value evaluation for selects or calls?
+    pub(super) fn event_expr_needs_value_wait(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Index { .. } | ExprKind::RangeSelect { .. } => true,
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => Self::event_expr_selects(x),
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => Self::event_expr_needs_value_wait(x),
             ExprKind::Binary { left, right, .. } => {
-                Self::event_expr_selects(left) || Self::event_expr_selects(right)
+                Self::event_expr_needs_value_wait(left) || Self::event_expr_needs_value_wait(right)
             }
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
-                Self::event_expr_selects(condition)
-                    || Self::event_expr_selects(then_expr)
-                    || Self::event_expr_selects(else_expr)
+                Self::event_expr_needs_value_wait(condition)
+                    || Self::event_expr_needs_value_wait(then_expr)
+                    || Self::event_expr_needs_value_wait(else_expr)
             }
-            ExprKind::Concatenation(parts) => parts.iter().any(Self::event_expr_selects),
+            ExprKind::Concatenation(parts) => parts.iter().any(Self::event_expr_needs_value_wait),
+            ExprKind::Call { .. } | ExprKind::SystemCall { .. } => true,
+            ExprKind::NamedArg { expr: Some(x), .. } => Self::event_expr_needs_value_wait(x),
             _ => false,
         }
     }
@@ -2612,7 +2613,8 @@ impl Simulator {
     ) {
         match &e.kind {
             ExprKind::Ident(h) => out.push(h),
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
+            ExprKind::NamedArg { expr: Some(x), .. }
+            | ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
                 Self::collect_select_operands(x, out)
             }
             ExprKind::Index { expr, index } => {
@@ -2639,7 +2641,9 @@ impl Simulator {
                 Self::collect_select_operands(then_expr, out);
                 Self::collect_select_operands(else_expr, out);
             }
-            ExprKind::Concatenation(parts) => {
+            ExprKind::Call { args: parts, .. }
+            | ExprKind::SystemCall { args: parts, .. }
+            | ExprKind::Concatenation(parts) => {
                 for p in parts {
                     Self::collect_select_operands(p, out);
                 }
@@ -2719,7 +2723,7 @@ impl Simulator {
                 let Some(e) = &s.value_of else {
                     return false;
                 };
-                if !Self::event_expr_selects(e) {
+                if !Self::event_expr_needs_value_wait(e) {
                     return false;
                 }
                 return s.edge != EdgeKind::AnyEdge
@@ -2797,10 +2801,14 @@ impl Simulator {
         fn collect_ident_names<'a>(e: &'a Expression, out: &mut Vec<&'a HierarchicalIdentifier>) {
             match &e.kind {
                 ExprKind::Ident(h) => out.push(h),
-                ExprKind::Paren(inner) => collect_ident_names(inner, out),
+                ExprKind::NamedArg { expr: Some(inner), .. }
+                | ExprKind::Paren(inner) => collect_ident_names(inner, out),
                 ExprKind::RangeSelect { expr, .. } => collect_ident_names(expr, out),
                 ExprKind::Index { expr, .. } => collect_ident_names(expr, out),
-                ExprKind::Concatenation(parts) => {
+                // §9.4.2: call arguments are operands of an explicit event.
+                ExprKind::Call { args: parts, .. }
+                | ExprKind::SystemCall { args: parts, .. }
+                | ExprKind::Concatenation(parts) => {
                     for p in parts {
                         collect_ident_names(p, out);
                     }
@@ -2974,7 +2982,7 @@ impl Simulator {
                     // Not inside a class method: there the operands are
                     // reached through handles (`vif.data[0]`), which only
                     // the waiting process can evaluate.
-                    let selects = Self::event_expr_selects(&ee.expr)
+                    let selects = Self::event_expr_needs_value_wait(&ee.expr)
                         && self.this_stack.last().copied().flatten().is_none();
                     let mut idents = Vec::new();
                     if selects {
@@ -3116,10 +3124,16 @@ impl Simulator {
                     // VALUE change, not on any operand write — attach the
                     // term expression so the wake path can compare against
                     // the armed value (guard_prev).
+                    let mut value_expr = &ee.expr;
+                    while let ExprKind::Paren(inner) = &value_expr.kind {
+                        value_expr = inner;
+                    }
                     if selects
                         || matches!(
-                            &ee.expr.kind,
-                            ExprKind::Binary { .. }
+                            &value_expr.kind,
+                            ExprKind::Call { .. }
+                                | ExprKind::SystemCall { .. }
+                                | ExprKind::Binary { .. }
                                 | ExprKind::Unary { .. }
                                 | ExprKind::Conditional { .. }
                         )
@@ -4099,7 +4113,8 @@ impl Simulator {
                 self.collect_selected_cells(left, out);
                 self.collect_selected_cells(right, out);
             }
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
+            ExprKind::NamedArg { expr: Some(x), .. }
+            | ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
                 self.collect_selected_cells(x, out)
             }
             ExprKind::Binary { left, right, .. } => {
@@ -4115,7 +4130,9 @@ impl Simulator {
                 self.collect_selected_cells(then_expr, out);
                 self.collect_selected_cells(else_expr, out);
             }
-            ExprKind::Concatenation(parts) => {
+            ExprKind::Call { args: parts, .. }
+            | ExprKind::SystemCall { args: parts, .. }
+            | ExprKind::Concatenation(parts) => {
                 for p in parts {
                     self.collect_selected_cells(p, out);
                 }

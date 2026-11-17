@@ -512,8 +512,27 @@ impl Simulator {
         }
 
         let mut out: Vec<String> = Vec::new();
+        // Imported parameters are lookup aliases, not declarations in this
+        // module (§26.3). Keep local declarations, including their elements.
+        let parameter_alias = |name: &str| {
+            let mut base = name;
+            let mut alias = false;
+            loop {
+                if self.module.declared_parameters.contains(base) {
+                    return false;
+                }
+                if self.module.parameters.contains_key(base)
+                    || self.module.param_decl_types.contains_key(base)
+                {
+                    alias = true;
+                }
+                let Some(end) = base.rfind(['[', '.']) else { return alias; };
+                base = &base[..end];
+            }
+        };
         let keep = |name: &str| -> bool {
             !(name.is_empty()
+                || parameter_alias(name)
                 || enum_lits.contains(name)
                 || scope_names.contains(name)
                 || expanded_bases.contains(name)
