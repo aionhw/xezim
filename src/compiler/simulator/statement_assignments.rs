@@ -3285,11 +3285,21 @@ impl Simulator {
             // A `with [range]` / slice operand targets a sub-range of a
             // collection (§11.4.14.4): only the selected elements are
             // written, the rest of the array is unmodified. Resolve each
-            // operand's ordered element list once (the with-range bounds are
-            // evaluated a single time, per "the expression is evaluated
-            // immediately before its corresponding array is streamed").
-            let operand_elems: Vec<Option<(Vec<String>, u32)>> =
-                exprs.iter().map(|e| self.stream_operand_elems(e)).collect();
+            // RANGED operand's ordered element list once (the with-range
+            // bounds are evaluated a single time, per "the expression is
+            // evaluated immediately before its corresponding array is
+            // streamed"). A bare whole array has no such element list — it
+            // streams whole via the `assign_value` fast path below.
+            let operand_elems: Vec<Option<(Vec<String>, u32)>> = exprs
+                .iter()
+                .map(|e| {
+                    if Self::stream_operand_has_range(e) {
+                        self.stream_operand_elems(e)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             // Compute fixed-width targets; last target may be dynamic (remainder).
             let mut fixed_ws: Vec<u32> = Vec::new();
             let mut dyn_last: Option<String> = None;
