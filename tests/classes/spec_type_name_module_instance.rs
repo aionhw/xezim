@@ -31,7 +31,7 @@ package p;
   endclass
   class reader;
     static function bit probe();
-      clk_rst_if vif;
+      virtual clk_rst_if vif;
       return db#(virtual clk_rst_if)::get("vif", vif);
     endfunction
   endclass
