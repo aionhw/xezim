@@ -29,6 +29,8 @@ mod drive_strength_pull;
 mod dump_formats_agree;
 #[path = "gates/dump_merged_sv.rs"]
 mod dump_merged_sv;
+#[path = "gates/dump_qualified_parameters.rs"]
+mod dump_qualified_parameters;
 #[path = "gates/dumpflush.rs"]
 mod dumpflush;
 #[path = "gates/enum_continuous_delay.rs"]
