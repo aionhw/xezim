@@ -3932,7 +3932,13 @@ impl Simulator {
             module
                 .input_port_actuals
                 .iter()
-                .map(|(f, _, ts)| (f.strip_prefix(top.as_str()).unwrap_or(f).to_string(), *ts))
+                .map(|port| {
+                    let f = port.formal();
+                    (
+                        f.strip_prefix(top.as_str()).unwrap_or(f).to_string(),
+                        port.two_state(),
+                    )
+                })
                 .collect()
         };
         let class_real_props = Self::collect_class_real_props(&module);

@@ -2061,8 +2061,13 @@ impl Simulator {
             .module
             .input_port_actuals
             .iter()
-            .filter(|(formal, ..)| scopes.contains(Self::port_formal_inst(formal)))
-            .map(|(formal, actual, _)| (Self::port_formal_inst(formal).to_string(), actual.clone()))
+            .filter(|port| scopes.contains(Self::port_formal_inst(port.formal())))
+            .map(|port| {
+                (
+                    Self::port_formal_inst(port.formal()).to_string(),
+                    port.actual().clone(),
+                )
+            })
             .collect();
         let mut port_ids: HashMap<String, Vec<usize>> = HashMap::default();
         for (inst, actual) in &actuals {
@@ -2171,7 +2176,8 @@ impl Simulator {
                 .then_some(cur)
         };
         let mut ports = Vec::new();
-        for (formal, actual, two_state) in &self.module.input_port_actuals {
+        for port in &self.module.input_port_actuals {
+            let (formal, actual, two_state) = (port.formal(), port.actual(), port.two_state());
             let ExprKind::Ident(h) = &actual.kind else {
                 continue;
             };
@@ -2191,7 +2197,7 @@ impl Simulator {
             };
             let inst = Self::port_formal_inst(formal);
             let inst = inst.strip_prefix(top.as_str()).unwrap_or(inst);
-            let prev = Self::alias_t0_prev(if *two_state { 2 } else { 1 }, self.signal_widths[id]);
+            let prev = Self::alias_t0_prev(if two_state { 2 } else { 1 }, self.signal_widths[id]);
             if prev != cur {
                 ports.push((inst.to_string(), id, prev, cur));
             }
