@@ -163,3 +163,6 @@ mod format_unknown_spec_no_eval;
 
 #[path = "strings/p_format_aggregates_566.rs"]
 mod p_format_aggregates_566;
+
+#[path = "strings/format_backslash_literal.rs"]
+mod format_backslash_literal;
