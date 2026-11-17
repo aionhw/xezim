@@ -529,3 +529,5 @@ mod intra_delay_pattern_item_width;
 
 #[path = "scheduling/parked_waiter_signal_index.rs"]
 mod parked_waiter_signal_index;
+#[path = "scheduling/replication_pattern_capture.rs"]
+mod replication_pattern_capture;
