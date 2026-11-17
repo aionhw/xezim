@@ -749,6 +749,57 @@ fn cross_hier_item_629() {
     check(CROSS_HIER_ITEM_629, &["--relax-cross-hier-item"]);
 }
 
+const BINSOF_HIER_CROSS_ITEM: &str = r#"// IEEE 1800-2017 19.6.1: bins_expression is a coverpoint label, optionally
+// `. bin_identifier`. Some simulators also allow a hierarchical reference that
+// names a cross item (`binsof(u.ena)` when `cross u.ena, cp_par` was given).
+//
+// The illegal bin is ena==0 && par==1. Samples avoid it.
+// Three legal tuples cover every product bin left after the illegal bin definition
+// (ena==0 && par==1 is excluded) -> 100.00%.
+//
+// Every line should print PASS. Without the switch, parsing stops at the dot in
+// `binsof(u.ena)`.
+module leaf;
+  logic ena;
+endmodule
+
+module t;
+  leaf u();
+  bit par;
+  int fails = 0;
+  covergroup cg;
+    option.per_instance = 1;
+    cp_par : coverpoint par;
+    X_ena  : cross u.ena, cp_par {
+      illegal_bins off_hi =
+        binsof(u.ena) intersect {1'b0} && binsof(cp_par) intersect {1'b1};
+    }
+  endgroup
+
+  task automatic check(string label, bit ok);
+    if (ok) $display("PASS %s", label);
+    else begin $display("FAIL %s", label); fails++; end
+  endtask
+
+  initial begin
+  cg c = new();
+    u.ena = 0; par = 0; c.sample();
+    u.ena = 1; par = 0; c.sample();
+    u.ena = 1; par = 1; c.sample();
+    u.ena = 1; par = 1; c.sample();
+    check("cross parses and covers 100.00", c.X_ena.get_inst_coverage() == 100.0);
+    if (fails == 0) $display("ALL PASS"); else $display("%0d FAILED", fails);
+    $finish;
+  end
+endmodule
+"#;
+
+/// §19.6.1: `binsof(hier_item)` in a cross select expression (#629 extension).
+#[test]
+fn binsof_hier_cross_item() {
+    check(BINSOF_HIER_CROSS_ITEM, &["--relax-cross-hier-item"]);
+}
+
 /// The environment variable is the same switch, and a run without it is
 /// not served the relaxed run's cached design.
 #[test]
