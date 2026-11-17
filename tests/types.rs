@@ -785,3 +785,5 @@ mod struct_param_localparam_type;
 mod wide_packed_select_store;
 #[path = "types/nd_struct_array_members_1240.rs"]
 mod nd_struct_array_members_1240;
+#[path = "types/nettype_driver_delays_1204.rs"]
+mod nettype_driver_delays_1204;
