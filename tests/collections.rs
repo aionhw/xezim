@@ -376,3 +376,6 @@ mod review_typedef_row_class_properties_216;
 
 #[path = "collections/dyn_array_of_dyn_array_rows.rs"]
 mod dyn_array_of_dyn_array_rows;
+
+#[path = "collections/pattern_array_items.rs"]
+mod pattern_array_items;
