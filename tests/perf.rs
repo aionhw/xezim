@@ -67,3 +67,5 @@ mod class_aggregate_resolution;
 mod parked_waiter_index;
 #[path = "perf/queue_shift_counters.rs"]
 mod queue_shift_counters;
+#[path = "perf/select_store_counters.rs"]
+mod select_store_counters;

@@ -775,3 +775,5 @@ mod real_relational_unknown_bits;
 
 #[path = "types/struct_param_localparam_type.rs"]
 mod struct_param_localparam_type;
+#[path = "types/wide_packed_select_store.rs"]
+mod wide_packed_select_store;
