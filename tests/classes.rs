@@ -1285,3 +1285,6 @@ mod duplicate_class_definition;
 mod virtual_type_specialization_231;
 #[path = "classes/property_shadowed_by_outer_name.rs"]
 mod property_shadowed_by_outer_name;
+
+#[path = "classes/method_cache_local_shadow.rs"]
+mod method_cache_local_shadow;

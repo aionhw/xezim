@@ -772,3 +772,6 @@ mod net_typedef_metadata_1212;
 
 #[path = "types/real_relational_unknown_bits.rs"]
 mod real_relational_unknown_bits;
+
+#[path = "types/struct_param_localparam_type.rs"]
+mod struct_param_localparam_type;
