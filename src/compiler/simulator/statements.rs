@@ -4344,6 +4344,31 @@ impl Simulator {
                             .map(|e| self.eval_delay_ticks(e))
                             .unwrap_or(0)
                     });
+                    // Fixed storage shares NBA ordering with element writes.
+                    // Put its captured leaves through the ordinary scheduler
+                    // so a later `a[i] <= v` overrides this whole-array store.
+                    if let Some(dst) = self.array_operand_name(lvalue)
+                        && !self.module.dynamic_arrays.contains(&dst)
+                        && !self.module.queue_vars.contains(&dst)
+                        && let Some((targets, _)) = self.stream_elem_order(&dst)
+                    {
+                        for (target, value) in targets.into_iter().zip(elements) {
+                            let lhs = Self::append_leaf_path(lvalue, &target[dst.len()..]);
+                            let saved = self.make_intra_saved_expr(value, rvalue.span);
+                            let delay = (d > 0).then(|| {
+                                self.make_intra_saved_expr(Value::from_u64(d, 64), stmt.span)
+                            });
+                            self.exec_statement(&Statement::new(
+                                StatementKind::NonblockingAssign {
+                                    lvalue: lhs,
+                                    delay,
+                                    rvalue: saved,
+                                },
+                                stmt.span,
+                            ));
+                        }
+                        return;
+                    }
                     let frozen = self.freeze_lvalue_indices(lvalue);
                     let root_frame = self.nba_root_frame(lvalue);
                     self.enqueue_context_nba(
