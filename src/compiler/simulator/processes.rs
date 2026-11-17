@@ -2480,7 +2480,9 @@ impl Simulator {
 
     /// §10.10: capture a one-dimensional unpacked array in element order.
     pub(super) fn capture_array_rhs(
-        &mut self, lhs: &Expression, rhs: &Expression,
+        &mut self,
+        lhs: &Expression,
+        rhs: &Expression,
     ) -> Option<Vec<Value>> {
         let dst = self.array_operand_name(lhs)?;
         if self.is_associative_array(&dst)
@@ -2491,11 +2493,17 @@ impl Simulator {
             return None;
         }
         let mut rhs = rhs;
-        while let ExprKind::Paren(inner) = &rhs.kind { rhs = inner; }
+        while let ExprKind::Paren(inner) = &rhs.kind {
+            rhs = inner;
+        }
         let mut items = Vec::new();
         fn flatten<'a>(e: &'a Expression, out: &mut Vec<&'a Expression>) {
             match &e.kind {
-                ExprKind::Concatenation(xs) => for x in xs { flatten(x, out); },
+                ExprKind::Concatenation(xs) => {
+                    for x in xs {
+                        flatten(x, out);
+                    }
+                }
                 ExprKind::Paren(x) => flatten(x, out),
                 _ => out.push(e),
             }
@@ -2503,13 +2511,18 @@ impl Simulator {
         if let ExprKind::AssignmentPattern(xs) = &rhs.kind {
             // Positional patterns include already captured intra-assignment
             // operands. Keyed/default patterns retain their existing path.
-            if !xs.iter().all(|x| matches!(x, AssignmentPatternItem::Ordered(_))) {
+            if !xs
+                .iter()
+                .all(|x| matches!(x, AssignmentPatternItem::Ordered(_)))
+            {
                 return None;
             }
             return Some(xs.iter().map(|x| self.eval_expr(x.expr())).collect());
         }
-        if !matches!(rhs.kind, ExprKind::Concatenation(_) | ExprKind::RangeSelect { .. } | ExprKind::Call { .. })
-            && self.array_operand_name(rhs).is_none()
+        if !matches!(
+            rhs.kind,
+            ExprKind::Concatenation(_) | ExprKind::RangeSelect { .. } | ExprKind::Call { .. }
+        ) && self.array_operand_name(rhs).is_none()
         {
             return None;
         }
@@ -2517,10 +2530,15 @@ impl Simulator {
         Some(self.unpacked_concat_operand_values(items))
     }
 
-    pub(super) fn saved_array_pattern(&mut self, values: Vec<Value>, span: crate::ast::Span) -> Expression {
-        let items = values.into_iter().map(|v|
-            AssignmentPatternItem::Ordered(self.make_intra_saved_expr(v, span))
-        ).collect();
+    pub(super) fn saved_array_pattern(
+        &mut self,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Expression {
+        let items = values
+            .into_iter()
+            .map(|v| AssignmentPatternItem::Ordered(self.make_intra_saved_expr(v, span)))
+            .collect();
         Expression::new(ExprKind::AssignmentPattern(items), span)
     }
 

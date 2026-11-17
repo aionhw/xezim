@@ -4338,20 +4338,27 @@ impl Simulator {
                 // §10.10 / §10.4.2: capture all array operands now; replace
                 // the collection only when this entry reaches the NBA region.
                 if let Some(elements) = self.capture_array_rhs(lvalue, rvalue) {
-                    let d = intra_d.unwrap_or_else(|| delay.as_ref()
-                        .map(|e| self.eval_delay_ticks(e)).unwrap_or(0));
+                    let d = intra_d.unwrap_or_else(|| {
+                        delay
+                            .as_ref()
+                            .map(|e| self.eval_delay_ticks(e))
+                            .unwrap_or(0)
+                    });
                     let frozen = self.freeze_lvalue_indices(lvalue);
                     let root_frame = self.nba_root_frame(lvalue);
-                    self.enqueue_context_nba(NbaEntry {
-                        elements: Some(elements),
-                        lhs: Some(frozen),
-                        value: Value::zero(1),
-                        resolved_id: None,
-                        static_key: None,
-                        static_slice: None,
-                        this_handle: self.this_stack.last().copied().flatten(),
-                        root_frame,
-                    }, d);
+                    self.enqueue_context_nba(
+                        NbaEntry {
+                            elements: Some(elements),
+                            lhs: Some(frozen),
+                            value: Value::zero(1),
+                            resolved_id: None,
+                            static_key: None,
+                            static_slice: None,
+                            this_handle: self.this_stack.last().copied().flatten(),
+                            root_frame,
+                        },
+                        d,
+                    );
                     return;
                 }
                 // §10.8, §10.9: a pattern driven onto a packed target takes
