@@ -3056,6 +3056,7 @@ impl NbaFastIndex {
 }
 
 mod aggregate_assignments;
+mod pattern_array_items;
 mod annex_n;
 mod aggregate_expressions;
 mod aggregate_members;

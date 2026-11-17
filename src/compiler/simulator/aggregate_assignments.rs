@@ -374,7 +374,7 @@ impl Simulator {
 
     /// §10.4.2: collect target writes only; RHS function side effects remain
     /// immediate because item evaluation runs outside the capture context.
-    fn write_pattern_leaf(&mut self, target: &str, value: Value) {
+    pub(super) fn write_pattern_leaf(&mut self, target: &str, value: Value) {
         if let Some(leaves) = &mut self.pattern_nba_leaves {
             leaves.push((target.to_string(), value));
         } else {
@@ -1116,6 +1116,8 @@ impl Simulator {
             ExprKind::AssignmentPattern(sub) => {
                 self.assign_pattern_items_over_dims(target, dt, lists, sub);
             }
+            // §10.9.1, §10.10: an unpacked array value supplies the elements.
+            _ if self.assign_array_item(target, lists, dt, e) => {}
             _ => {
                 for idx in first {
                     self.assign_pattern_over_dims(&format!("{}[{}]", target, idx), dt, rest, e);
@@ -1650,7 +1652,7 @@ impl Simulator {
     /// For an array operand that is a whole array or a row of a multi-
     /// dimensional unpacked array (`q`, `q[1]`), the dimensions left below the
     /// selected indices and the leaf-path suffixes in declared order.
-    fn unpacked_row_suffixes(&mut self, expr: &Expression) -> Option<Vec<String>> {
+    pub(super) fn unpacked_row_suffixes(&mut self, expr: &Expression) -> Option<Vec<String>> {
         let mut idx_exprs: Vec<&Expression> = Vec::new();
         let mut cur = expr;
         while let ExprKind::Index { expr: inner, index } = &cur.kind {
@@ -3794,22 +3796,29 @@ impl Simulator {
     }
 
     /// Assign `e` to every leaf of the sub-array `base` spanning `dims`
-    /// (`m = '{default:0}` on a multi-dimensional array).
+    /// (`m = '{default:0}` on a multi-dimensional array). An unpacked array
+    /// value supplies the elements of the first sub-array it matches
+    /// (§10.9.1, §10.10); `descending` orders its elements.
     pub(super) fn fill_dims(
         &mut self,
         base: &str,
         dims: &[(i64, i64)],
         dt: &DataType,
         e: &Expression,
+        descending: &[bool],
     ) {
         if dims.is_empty() {
             self.assign_pattern_or_leaf(base, dt, e);
             return;
         }
+        if self.assign_array_item_dims(base, dims, descending, dt, e) {
+            return;
+        }
         let (lo, hi) = dims[0];
+        let inner_desc = descending.get(1..).unwrap_or(&[]);
         for i in lo..=hi {
             let target = format!("{}[{}]", base, i);
-            self.fill_dims(&target, &dims[1..], dt, e);
+            self.fill_dims(&target, &dims[1..], dt, e, inner_desc);
         }
     }
 
@@ -3842,7 +3851,7 @@ impl Simulator {
                     ExprKind::AssignmentPattern(sub) if !sub.is_empty() => {
                         self.assign_pattern_array(&target, &dims[1..], dt, sub, inner_desc);
                     }
-                    _ => self.fill_dims(&target, &dims[1..], dt, e),
+                    _ => self.fill_dims(&target, &dims[1..], dt, e, inner_desc),
                 }
             } else {
                 self.assign_pattern_or_leaf(&target, dt, e);
