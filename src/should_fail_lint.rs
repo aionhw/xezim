@@ -24,7 +24,7 @@ use xezim_core::ast::stmt::{Statement, StatementKind, VarDeclarator};
 use xezim_core::ast::types::{
     DataType, EnumType, IntegerAtomType, PackedDimension, PortDirection, Signing, UnpackedDimension,
 };
-use xezim_core::elaborate::ElaboratedModule;
+use xezim_core::elaborate::{ElaboratedModule, ParamEnv, ParamLookup};
 
 /// The elaboration's parameter table type (`ElaboratedModule::parameters`).
 type ParamMap = xezim_core::hasher::HashMap<String, Value>;
@@ -240,6 +240,7 @@ fn check_items_in_scopes(
     local_types: &std::collections::HashSet<String>,
     errs: &mut Vec<String>,
 ) {
+    let scoped = &views.scoped;
     let views = if scope.top { &[][..] } else { views.of(name) };
     if views.is_empty() {
         for it in items {
@@ -250,7 +251,7 @@ fn check_items_in_scopes(
     let mut seen: HashSet<String> = HashSet::default();
     let mut found = Vec::new();
     for view in views {
-        let scope = ConstScope::instance(scope.elab, view);
+        let scope = ConstScope::instance(scope.elab, view, scoped);
         for it in items {
             check_module_item(it, scope, local_types, true, &mut found);
         }
@@ -681,25 +682,32 @@ impl Drop for ParamLeaves {
 struct ConstScope<'a> {
     elab: &'a ElaboratedModule,
     top: bool,
-    inst: Option<&'a ParamMap>,
+    inst: Option<ParamEnv<'a>>,
 }
 
 /// The parameters of every instance of each non-top definition, keyed by the
 /// definition's name, each with the instance path stripped from its keys
-/// (`u.v.N` of instance `u.v` is `N`) and joined by the package and class
-/// constants (`pkg::N`), which every scope reads by that spelling (§26.3).
+/// (`u.v.N` of instance `u.v` is `N`). An instance's view is its own table
+/// laid over `scoped`, the package and class constants (`pkg::N`), which
+/// every scope reads by that spelling (§26.3); the two never share a key,
+/// since a stripped key holds no `::`. Copying the constants into the table
+/// of every instance instead held instances x constants entries (#721).
 /// A bare top-level key is NOT part of a child's view: the child's own `N`
 /// is registered as `u.N`, and a `$unit` or top-module `N` it could see is
 /// told apart from nothing by the flat table.
 struct InstanceViews {
     by_def: HashMap<String, Vec<ParamMap>>,
+    scoped: ParamMap,
 }
 
 impl InstanceViews {
     fn build(elab: &ElaboratedModule) -> Self {
         let mut by_def: HashMap<String, Vec<ParamMap>> = HashMap::default();
         if elab.instances.is_empty() {
-            return InstanceViews { by_def };
+            return InstanceViews {
+                by_def,
+                scoped: ParamMap::default(),
+            };
         }
         // Instance path -> (definition, index of its view in `by_def`).
         let mut slots: HashMap<&str, (&str, usize)> = HashMap::default();
@@ -711,10 +719,10 @@ impl InstanceViews {
                 (inst.def_name.as_str(), views.len() - 1),
             );
         }
-        let mut scoped: Vec<(&String, &Value)> = Vec::new();
+        let mut scoped = ParamMap::default();
         for (key, value) in &elab.parameters {
             if key.contains("::") {
-                scoped.push((key, value));
+                scoped.insert(key.clone(), value.clone());
                 continue;
             }
             // The longest instance path the key starts with owns it.
@@ -728,19 +736,11 @@ impl InstanceViews {
                 pos = dot;
             }
         }
-        if !scoped.is_empty() {
-            for views in by_def.values_mut() {
-                for view in views.iter_mut() {
-                    for (key, value) in &scoped {
-                        view.insert((*key).clone(), (*value).clone());
-                    }
-                }
-            }
-        }
-        InstanceViews { by_def }
+        InstanceViews { by_def, scoped }
     }
 
-    /// The views of the instances of `def`, empty when it is not instantiated.
+    /// The own tables of the instances of `def`, empty when it is not
+    /// instantiated.
     fn of(&self, def: &str) -> &[ParamMap] {
         self.by_def.get(def).map_or(&[], Vec::as_slice)
     }
@@ -765,27 +765,34 @@ impl<'a> ConstScope<'a> {
         }
     }
 
-    /// The scope of one instance of a non-top definition (#893).
-    fn instance(elab: &'a ElaboratedModule, view: &'a ParamMap) -> Self {
+    /// The scope of one instance of a non-top definition (#893): its own
+    /// table `view` over the constants every scope reads (`scoped`).
+    fn instance(elab: &'a ElaboratedModule, view: &'a ParamMap, scoped: &'a ParamMap) -> Self {
         ConstScope {
             elab,
             top: false,
-            inst: Some(view),
+            inst: Some(ParamEnv::Overlay {
+                base: scoped,
+                top: view,
+            }),
         }
     }
 
     /// The table a constant of this scope folds against.
-    fn params(&self) -> &'a ParamMap {
+    fn params(&self) -> ParamEnv<'a> {
         match self.inst {
             Some(view) if !self.top => view,
-            _ => &self.elab.parameters,
+            _ => ParamEnv::Single(&self.elab.parameters),
         }
     }
 
     /// The parameter `name` of this scope, when the scope knows it.
     fn param(&self, name: &str) -> Option<&'a Value> {
         if self.top || self.inst.is_some() {
-            self.params().get(name)
+            match self.params() {
+                ParamEnv::Single(table) => table.get(name),
+                ParamEnv::Overlay { base, top } => top.get(name).or_else(|| base.get(name)),
+            }
         } else {
             None
         }
@@ -801,7 +808,7 @@ impl<'a> ConstScope<'a> {
                 return Folded::Hidden;
             }
         }
-        match xezim_core::elaborate::const_eval_i64_with_params(e, Some(self.params())) {
+        match xezim_core::elaborate::const_eval_i64_with_params_env(e, Some(&self.params())) {
             Some(v) => Folded::Value(v),
             None => Folded::NotConstant,
         }
@@ -833,9 +840,9 @@ impl<'a> ConstScope<'a> {
         if !known {
             return 0;
         }
-        xezim_core::elaborate::resolve_type_width(
+        xezim_core::elaborate::resolve_type_width_env(
             dt,
-            Some(self.params()),
+            Some(&self.params()),
             Some(&self.elab.typedefs),
         )
     }
@@ -1291,7 +1298,7 @@ fn stream_width(exprs: &[Expression], vw: &std::collections::HashMap<String, u32
 /// measured 1 bit and §6.19 REJECTED a perfectly legal design. A lint must not
 /// fire on a width it could not determine.
 fn dim_names_resolve(dt: &DataType, scope: ConstScope) -> bool {
-    fn expr_known(e: &Expression, params: &ParamMap) -> bool {
+    fn expr_known(e: &Expression, params: ParamEnv) -> bool {
         match &e.kind {
             ExprKind::Number(_) => true,
             ExprKind::Paren(x) => expr_known(x, params),
