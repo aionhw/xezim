@@ -116,3 +116,7 @@ mod review_select_continuous_delay;
 
 #[path = "gates/ascending_udp_port_1201.rs"]
 mod ascending_udp_port_1201;
+#[path = "gates/delayed_slice_ownership_1215.rs"]
+mod delayed_slice_ownership_1215;
+#[path = "gates/parameter_wave_scope_1213.rs"]
+mod parameter_wave_scope_1213;

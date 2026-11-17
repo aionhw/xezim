@@ -519,3 +519,5 @@ mod struct_array_actual_paths_1110;
 
 #[path = "scheduling/pattern_nba_1199.rs"]
 mod pattern_nba_1199;
+#[path = "scheduling/event_call_operands_1205.rs"]
+mod event_call_operands_1205;
