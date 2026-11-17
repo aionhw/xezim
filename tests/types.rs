@@ -113,6 +113,8 @@ mod divide_operand_width;
 mod division_operand_width;
 #[path = "types/dollar_lvalue_and_assoc_width.rs"]
 mod dollar_lvalue_and_assoc_width;
+#[path = "types/duplicate_typedef.rs"]
+mod duplicate_typedef;
 #[path = "types/enum_base_and_packed_members.rs"]
 mod enum_base_and_packed_members;
 #[path = "types/enum_cross_cast_assignment.rs"]

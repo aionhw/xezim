@@ -9,6 +9,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 ### Unreleased
 
 - **Correctness:** Reject duplicate package definitions (§3.13, §26.2).
+- **Correctness:** Reject differing duplicate typedef definitions and warn on identical cross-file typedefs (§3.13, §6.18).
 
 - **Correctness:** Preserve virtual-interface specialization identity, typedef net signing and packed members, and captured array values in deferred assignments (core #231, #1212, #1217).
 - **Correctness:** Resolve unqualified names inside class methods in active routine frames, `this` properties, and class statics before caller frames and module signals (§23.9, §8.11).
