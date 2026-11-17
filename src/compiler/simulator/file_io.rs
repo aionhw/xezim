@@ -289,11 +289,20 @@ impl Simulator {
         }
         while let Some(fc) = fi.next() {
             if fc == '%' {
+                let suppress = if fi.peek() == Some(&'*') {
+                    fi.next();
+                    true
+                } else {
+                    false
+                };
                 let mut width = String::new();
                 while fi.peek().is_some_and(|c| c.is_ascii_digit()) {
                     width.push(fi.next().unwrap());
                 }
-                let w: usize = width.parse().unwrap_or(usize::MAX);
+                // §21.3.4.3 leaves a maximum field width of 0 undefined; treat 0
+                // as "no maximum", matching the reference simulator and the
+                // display-side meaning of `%0d` (§21.2.1.3).
+                let w: usize = width.parse().ok().filter(|&n| n != 0).unwrap_or(usize::MAX);
                 let Some(spec) = fi.next() else { break };
                 if spec == '%' {
                     si = skip_ws(&s, si);
@@ -309,7 +318,7 @@ impl Simulator {
                     }
                     let v = Value::from_u64(s[si] as u64, 8);
                     si += 1;
-                    if oi < outs.len() {
+                    if !suppress && oi < outs.len() {
                         self.assign_value(&outs[oi], &v);
                         oi += 1;
                         assigned += 1;
@@ -326,8 +335,8 @@ impl Simulator {
                         if si == start {
                             break;
                         }
-                        let text: String = s[start..si].iter().collect();
-                        if oi < outs.len() {
+                        if !suppress && oi < outs.len() {
+                            let text: String = s[start..si].iter().collect();
                             self.assign_value(&outs[oi], &Value::from_string(&text));
                             oi += 1;
                             assigned += 1;
@@ -343,7 +352,7 @@ impl Simulator {
                         let text: String = s[start..si].iter().collect();
                         match text.parse::<f64>() {
                             Ok(f) => {
-                                if oi < outs.len() {
+                                if !suppress && oi < outs.len() {
                                     self.assign_value(&outs[oi], &Value::from_f64(f));
                                     oi += 1;
                                     assigned += 1;
@@ -388,21 +397,17 @@ impl Simulator {
                         {
                             break;
                         }
-                        // Parse at the destination's width, not a fixed 32: a
-                        // 160-bit field has to keep all 160 bits of the token.
-                        let dest_width = if oi < outs.len() {
-                            self.infer_lhs_width(&outs[oi]).max(1)
-                        } else {
-                            32
-                        };
-                        let mut v = Value::from_str_radix(&text, radix, dest_width);
-                        if neg {
-                            v = Self::negate_twos_complement(v);
-                        } else {
-                            v.is_signed = signed;
-                        }
                         si = si2;
-                        if oi < outs.len() {
+                        if !suppress && oi < outs.len() {
+                            // Parse at the destination's width, not a fixed 32: a
+                            // 160-bit field has to keep all 160 bits of the token.
+                            let dest_width = self.infer_lhs_width(&outs[oi]).max(1);
+                            let mut v = Value::from_str_radix(&text, radix, dest_width);
+                            if neg {
+                                v = Self::negate_twos_complement(v);
+                            } else {
+                                v.is_signed = signed;
+                            }
                             self.assign_value(&outs[oi], &v);
                             oi += 1;
                             assigned += 1;

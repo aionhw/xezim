@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Treat a `0` field width in `$fscanf` and `$sscanf` as unbounded and honor `%*` assignment suppression (§21.3.4.3).
+
 - **Correctness:** Track function-call operands in explicit event controls, preserve neighboring bits when delayed slice drivers mature, and omit imported parameter aliases from waveform scopes (#1205, #1213, #1215).
 
 - **Correctness:** Preserve top-level combinational time units, resolve memory task destinations by scope, and size and write dynamic-array rows (#1202, #1206, #1207).
