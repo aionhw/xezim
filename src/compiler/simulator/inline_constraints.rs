@@ -122,6 +122,158 @@ impl Simulator {
         Some((names, ew))
     }
 
+    /// True when a stream operand is a `with [range]` / slice sub-range
+    /// (`Index` or `RangeSelect`) — the form the LHS unpack handles element by
+    /// element, leaving the rest of the array unmodified. A bare whole
+    /// collection (`Ident`/`MemberAccess`) is false: it streams whole via the
+    /// `assign_value` fast path on the LHS and via `stream_elem_order` on the
+    /// pack side.
+    pub(super) fn stream_operand_has_range(e: &Expression) -> bool {
+        let inner = match &e.kind {
+            ExprKind::Paren(i) => i.as_ref(),
+            _ => e,
+        };
+        matches!(
+            inner.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+        )
+    }
+
+    /// §11.4.14: the element names (in stream order) of a stream operand
+    /// that is a one-dimensional unpacked collection — a bare `arr`, or a
+    /// `with [range]` / slice sub-range `arr[lo:hi]` / `arr[lo+:w]` /
+    /// `arr[lo-:w]` / single `arr[i]` — together with each element's width.
+    /// The with-range bounds are evaluated once here, sharing the pack and
+    /// unpack paths (§11.4.14.4: "the expression is evaluated immediately
+    /// before its corresponding array is streamed"). `None` when `p` is not
+    /// such a collection operand (the caller streams the expression as a
+    /// value instead).
+    pub(super) fn stream_operand_elems(&mut self, p: &Expression) -> Option<(Vec<String>, u32)> {
+        use crate::ast::expr::RangeKind;
+        let inner = match &p.kind {
+            ExprKind::Paren(i) => i.as_ref(),
+            _ => p,
+        };
+        // (base expression, resolved [lo,hi] inclusive, single-index [i]).
+        enum Sel<'a> {
+            All,
+            Single(&'a Expression),
+            Range {
+                kind: RangeKind,
+                left: &'a Expression,
+                right: &'a Expression,
+            },
+        }
+        let (base_expr, sel) = match &inner.kind {
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => (inner, Sel::All),
+            ExprKind::Index { expr, index } => (expr.as_ref(), Sel::Single(index)),
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => (
+                expr.as_ref(),
+                Sel::Range {
+                    kind: *kind,
+                    left,
+                    right,
+                },
+            ),
+            _ => return None,
+        };
+        let name = self
+            .array_operand_name(base_expr)
+            // `array_operand_name` recognizes 1-D arrays/queues and class
+            // members but not 2-D/ND unpacked arrays; fall back to the bare
+            // resolved name so those stream whole too (the old pack logic's
+            // `ExprKind::Ident` fallback). `stream_elem_order` returns None
+            // for anything that is not an unpacked collection, so a
+            // non-collection fallback name just yields None.
+            .or_else(|| match &base_expr.kind {
+                ExprKind::Ident(h) if !self.ident_shadowed_by_non_collection(h) => {
+                    Some(self.resolve_hier_name(h).to_string())
+                }
+                _ => None,
+            })?;
+        match sel {
+            // Bare whole collection: stream every element (needed by the
+            // pack side; the LHS side routes whole arrays through the single
+            // `assign_value` fast path instead of this).
+            Sel::All => self.stream_elem_order(&name),
+            Sel::Single(idx) => {
+                let i = self.eval_expr(idx).to_i64()?;
+                self.stream_ranged_elem_names(&name, i, i)
+            }
+            Sel::Range { kind, left, right } => {
+                let l = self.eval_expr(left).to_i64()?;
+                let r = self.eval_expr(right).to_i64()?;
+                // IndexedUp/Down widths are values (counts), not indices, so
+                // a negative width is invalid.
+                if r < 0 && matches!(kind, RangeKind::IndexedUp | RangeKind::IndexedDown) {
+                    return None;
+                }
+                let (lo, hi) = match kind {
+                    RangeKind::Constant => (l.min(r), l.max(r)),
+                    RangeKind::IndexedUp => (l, l + r - 1),
+                    RangeKind::IndexedDown => (l - r + 1, l),
+                };
+                self.stream_ranged_elem_names(&name, lo, hi)
+            }
+        }
+    }
+
+    /// Element names (and element width) of a ONE-DIMENSIONAL unpacked
+    /// collection (`name`) restricted to the declared-index range `[lo, hi]`,
+    /// in the base array's stream order (§11.4.14.4 with-clause / slice).
+    /// Builds ONLY the selected names — a small `with [range]` / slice over a
+    /// huge array allocates just the chosen element-name strings, not a full
+    /// copy of the array's entire element list. The §11.4.14.4 `with` clause
+    /// applies to one-dimensional unpacked arrays, so a multi-dimensional
+    /// collection (or a non-collection `name`) returns `None` here.
+    fn stream_ranged_elem_names(
+        &mut self,
+        name: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Option<(Vec<String>, u32)> {
+        // Declared bounds and direction of the single dimension, in the same
+        // form `stream_elem_order` uses (declared left/right; a descending
+        // `[3:0]` decl stores (3,0) and streams high→low, left bound first).
+        let (dl, dh, descending): (i64, i64, bool) = if self.module.dynamic_arrays.contains(name) {
+            (0, self.get_queue_size(name) as i64 - 1, false)
+        } else if let Some(&(alo, ahi, _)) = self.module.arrays.get(name) {
+            let (l0, r0) = match self.module.unpacked_decl_dims.get(name) {
+                Some(d) if d.len() == 1 => d[0],
+                _ if self.module.descending_arrays.contains(name) => (ahi, alo),
+                _ => (alo, ahi),
+            };
+            (l0.min(r0), l0.max(r0), l0 > r0)
+        } else {
+            // Not a 1-D fixed array or dynamic/queue collection.
+            return None;
+        };
+        let lo = lo.max(dl);
+        let hi = hi.min(dh);
+        if lo > hi {
+            return None;
+        }
+        let ew = self
+            .lookup_signal_width(&format!("{name}[0]"))
+            .or_else(|| self.module.arrays.get(name).map(|t| t.2))
+            .unwrap_or(8)
+            .max(1);
+        // Stream order for a descending decl runs high→low (left bound
+        // first), matching the whole-array traversal `stream_elem_order`.
+        let idx: Vec<i64> = if descending {
+            (lo..=hi).rev().collect()
+        } else {
+            (lo..=hi).collect()
+        };
+        let names: Vec<String> = idx.into_iter().map(|i| format!("{name}[{i}]")).collect();
+        Some((names, ew))
+    }
+
     /// §6.24.3: the operand of a cast to an integral type may be an
     /// UNPACKED array or queue (`int'(barr)`, `24'(q)`): its elements are
     /// packed left to right, which is `{>>{operand}}`. The operand read the
