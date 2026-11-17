@@ -2523,11 +2523,25 @@ impl Simulator {
             }
             // §11.6.1: each item in the element type, as without the delay.
             let shape = self.intra_element_shape(&dst);
-            return Some(
-                xs.iter()
-                    .map(|x| self.intra_item_value(shape.as_ref(), x.expr()))
-                    .collect(),
-            );
+            let mut values = Vec::new();
+            for x in xs {
+                match &x.expr().kind {
+                    // §10.9.1 `'{n{a, b}}`: the items, read once, repeated
+                    // n times.
+                    ExprKind::Replication { count, exprs } => {
+                        let n = self.eval_expr(count).to_u64().unwrap_or(0) as usize;
+                        let once: Vec<Value> = exprs
+                            .iter()
+                            .map(|e| self.intra_item_value(shape.as_ref(), e))
+                            .collect();
+                        for _ in 0..n {
+                            values.extend(once.iter().cloned());
+                        }
+                    }
+                    _ => values.push(self.intra_item_value(shape.as_ref(), x.expr())),
+                }
+            }
+            return Some(values);
         }
         if !matches!(
             rhs.kind,
