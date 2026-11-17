@@ -1764,6 +1764,60 @@ fn merged_sv_files_for_top(top: &str, texts: &[String]) -> Option<Vec<usize>> {
 }
 
 /// Record — and, for a repeat, STRIP — compilation-unit-scope (`$unit`)
+/// non-forward `typedef` definitions in `text`.
+///
+/// Mirrors [`strip_duplicate_unit_subroutines`] so adopted `-v`/`-y` library
+/// files that each carry a `$unit` typedef of the same name leave a merged
+/// dump that still compiles standalone (§3.13, §6.18).
+fn strip_duplicate_unit_typedefs(
+    text: &str,
+    seen: &mut std::collections::HashSet<String>,
+) -> (String, usize) {
+    let tokens = xezim::lexer::Lexer::new(text).tokenize();
+    let mut parser = sv_parser::parse::Parser::new(tokens);
+    let ast = parser.parse_source_text();
+    let mut spans: Vec<(usize, usize, String)> = Vec::new();
+    for desc in &ast.descriptions {
+        let td = match desc {
+            xezim::ast::Description::TypedefDecl(td) => td,
+            xezim::ast::Description::PackageItem(xezim::ast::decl::PackageItem::Typedef(td)) => td,
+            _ => continue,
+        };
+        if td.forward || matches!(td.data_type, xezim::ast::types::DataType::Void(_)) {
+            continue;
+        }
+        if !seen.insert(td.name.name.clone())
+            && td.span.start < td.span.end
+            && td.span.end <= text.len()
+            && text.is_char_boundary(td.span.start)
+            && text.is_char_boundary(td.span.end)
+        {
+            spans.push((td.span.start, td.span.end, td.name.name.clone()));
+        }
+    }
+    if spans.is_empty() {
+        return (text.to_string(), 0);
+    }
+    spans.sort_by_key(|(s, _, _)| *s);
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut stripped = 0usize;
+    for (start, end, name) in spans {
+        if start < cursor {
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str(&format!(
+            "/* [xezim] duplicate $unit typedef '{name}' suppressed; first definition kept */"
+        ));
+        cursor = end;
+        stripped += 1;
+    }
+    out.push_str(&text[cursor..]);
+    (out, stripped)
+}
+
+/// Record — and, for a repeat, STRIP — compilation-unit-scope (`$unit`)
 /// `task`/`function` definitions in `text`.
 ///
 /// `--dump-merged-sv` concatenates whole adopted library files, but a `-v`/`-y`
@@ -1907,8 +1961,10 @@ fn append_adopted_libs_to_merged(
     // Seed from the primary sources already in the file, so a library copy of
     // a task the design itself defines is suppressed too.
     let mut seen_subs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_typedefs: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Ok(primary) = std::fs::read_to_string(merged_out) {
         let _ = strip_duplicate_unit_subroutines(&primary, &mut seen_subs);
+        let _ = strip_duplicate_unit_typedefs(&primary, &mut seen_typedefs);
     }
     for (path, mods) in &adopted {
         // Preprocess with the SAME context the -v/-y indexing pass used
@@ -1944,8 +2000,9 @@ fn append_adopted_libs_to_merged(
             let (_decl, refs, _bind) = scan_units_and_refs(&text);
             lib_refs.extend(refs);
         }
-        let (text, nstrip) = strip_duplicate_unit_subroutines(&text, &mut seen_subs);
-        nstripped += nstrip;
+        let (text, nt) = strip_duplicate_unit_typedefs(&text, &mut seen_typedefs);
+        let (text, ns) = strip_duplicate_unit_subroutines(&text, &mut seen_subs);
+        nstripped += nt + ns;
         extra.push_str(&format!(
             "\n// ===== adopted library file: {} ({}; needed for: {}) =====\n",
             path.display(),
@@ -1994,9 +2051,9 @@ fn append_adopted_libs_to_merged(
         }
         added.sort_unstable();
         for fi in &added {
-            let (text, nstrip) =
-                strip_duplicate_unit_subroutines(&primary_texts[*fi], &mut seen_subs);
-            nstripped += nstrip;
+            let (text, nt) = strip_duplicate_unit_typedefs(&primary_texts[*fi], &mut seen_typedefs);
+            let (text, ns) = strip_duplicate_unit_subroutines(&text, &mut seen_subs);
+            nstripped += nt + ns;
             extra.push_str(&format!(
                 "
 // ===== primary file re-added: {} (referenced only from an adopted library) =====
@@ -2032,7 +2089,7 @@ fn append_adopted_libs_to_merged(
         nmods,
         merged_out,
         if nstripped > 0 {
-            format!(" (suppressed {nstripped} duplicate $unit task/function definition(s))")
+            format!(" (suppressed {nstripped} duplicate $unit definition(s))")
         } else {
             String::new()
         }
