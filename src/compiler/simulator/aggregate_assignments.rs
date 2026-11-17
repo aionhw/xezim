@@ -2370,8 +2370,9 @@ impl Simulator {
     /// for or whose stored elements are not exactly one run: the caller then
     /// moves the elements one by one.
     pub(super) fn queue_shift_fast(&mut self, obj: &str, idx: u64, size: u64, open: bool) -> bool {
-        if idx >= size {
-            // Nothing above `idx` to move.
+        if idx >= size || (!open && idx + 1 == size) {
+            // Nothing above `idx` to move: the caller's new size is the
+            // whole change.
             return true;
         }
         let Ok(cells) = self.plain_queue_cells(obj) else {
