@@ -1,8 +1,8 @@
 //! Interface/modport shape battery — every expectation byte-verified
-//! against the reference simulator (2026-08-18 audit). One KNOWN GAP is
-//! deliberately absent: §25.5.4 modport EXPRESSIONS
-//! (`modport lo8 (output .b(word[7:0]));`) are rejected by the parser —
-//! the reference accepts them. Add a test here when that lands.
+//! against the reference simulator (2026-08-18 audit), except the
+//! method-prototype cases at the end: iverilog and Verilator do not
+//! support explicit modport prototypes, so their expectations follow
+//! IEEE 1800-2023 and the fixtures are checked with slang.
 
 use xezim::simulate;
 
@@ -311,4 +311,72 @@ fn nested_interface_instance_members() {
         outs(NESTED_INTERFACE_INSTANCE_MEMBERS, "P"),
         ["P8 x=5a y=a5",]
     );
+}
+
+// IEEE 1800-2023 §25.3 Syntax 25-1 / §25.7: method prototypes and
+// name-only imports share the existing modport task/function call path.
+#[test]
+fn modport_task_prototype_before_signal() {
+    assert_eq!(
+        outs(
+            include_str!("modport_method_prototypes/task_before_signal.sv"),
+            ""
+        ),
+        ["value=37", "PASS"]
+    );
+}
+
+#[test]
+fn modport_mixed_method_prototypes() {
+    assert_eq!(
+        outs(
+            include_str!("modport_method_prototypes/mixed_prototypes.sv"),
+            "T|"
+        ),
+        ["T|call=61", "T|observe=56 count=9", "T|last=59"]
+    );
+}
+
+#[test]
+fn modport_name_only_imports_and_views() {
+    assert_eq!(
+        outs(
+            include_str!("modport_method_prototypes/name_only_and_views.sv"),
+            "T|"
+        ),
+        ["T|observe=37", "T|expr=37", "T|state=37 9 11"]
+    );
+}
+
+#[test]
+fn modport_export_task_prototype() {
+    assert_eq!(
+        outs(include_str!("modport_method_prototypes/export_view.sv"), ""),
+        ["value=37", "PASS"]
+    );
+}
+
+// Syntax 25-1 / Annex A.2.6 footnote 25: require a callable name, a
+// well-formed tf_port_list and the modport separator; no method specifier.
+#[test]
+fn modport_malformed_prototypes_are_rejected() {
+    for (member, message) in [
+        ("import task (input int n)", "expected identifier"),
+        ("import task put(input int n int)", "expected RParen"),
+        (
+            "import task put(input int n) input value",
+            "expected ',' or ')' after modport prototype",
+        ),
+        ("import function :final int get()", "modport prototype"),
+        ("import task put(input int n;", "expected RParen"),
+    ] {
+        let src = format!(
+            "interface bus_if; int value; task put(input int n); endtask
+                           modport user({member}); endinterface module top; endmodule"
+        );
+        let err = simulate(&src, 1000)
+            .err()
+            .expect("malformed prototype accepted");
+        assert!(err.contains(message), "{member}: {err}");
+    }
 }
