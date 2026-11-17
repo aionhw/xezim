@@ -234,6 +234,8 @@ mod compiled_method_string_members;
 mod compiled_method_foreach;
 #[path = "classes/compiled_method_local_colls.rs"]
 mod compiled_method_local_colls;
+#[path = "classes/compiled_method_queue_literal_arg.rs"]
+mod compiled_method_queue_literal_arg;
 
 #[path = "classes/compiled_method_void.rs"]
 mod compiled_method_void;
