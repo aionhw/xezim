@@ -62,3 +62,6 @@ mod const_index_array_arming;
 
 #[path = "perf/class_aggregate_resolution.rs"]
 mod class_aggregate_resolution;
+
+#[path = "perf/parked_waiter_index.rs"]
+mod parked_waiter_index;

@@ -526,3 +526,6 @@ mod event_call_operands_1205;
 mod array_capture_1217;
 #[path = "scheduling/intra_delay_pattern_item_width.rs"]
 mod intra_delay_pattern_item_width;
+
+#[path = "scheduling/parked_waiter_signal_index.rs"]
+mod parked_waiter_signal_index;
