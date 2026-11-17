@@ -1288,3 +1288,8 @@ mod property_shadowed_by_outer_name;
 
 #[path = "classes/method_cache_local_shadow.rs"]
 mod method_cache_local_shadow;
+
+#[path = "classes/randomize_size_from_sub_object.rs"]
+mod randomize_size_from_sub_object;
+#[path = "classes/randomize_size_from_sub_object_ipv4.rs"]
+mod randomize_size_from_sub_object_ipv4;
