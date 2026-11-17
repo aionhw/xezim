@@ -2924,6 +2924,10 @@ impl Simulator {
             self.prof_waiter_iters
         );
         chatter!(
+            "[PROF] implicit_net_scope_steps={}",
+            initialization::IMPLICIT_NET_SCOPE_STEPS.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        chatter!(
             "[PROF] clocks_only_detect={} nba_elided={} (iters with clocks-only scan / NBAs dropped at eval because value matched signal_table)",
             self.prof_clocks_only_detect,
             self.prof_nba_elided

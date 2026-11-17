@@ -13,6 +13,11 @@ fn trace_array_storage(name: &str, cells: usize, width: u32) -> xezim_core::oom_
     scope
 }
 
+/// Scopes `materialize_implicit_contassign_nets` walked while placing
+/// implicit nets, for the profile (`[PROF] implicit_net_scope_steps`).
+pub(super) static IMPLICIT_NET_SCOPE_STEPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl Simulator {
     /// `XEZIM_MEM_CENSUS` end-of-run class-heap line: live object slots,
     /// property entries, and the heap bytes of their names.
@@ -907,24 +912,32 @@ impl Simulator {
 
         fn best_scope_for_leaves(
             leaves: &HashSet<String>,
-            existing: &HashSet<&str>,
             parents_by_leaf: &HashMap<&str, Vec<&str>>,
         ) -> Option<String> {
             let mut best_parent: Option<String> = None;
             let mut best_score = 0usize;
             let mut best_depth = 0usize;
+            // A parent's score is the number of leaves it declares. A leaf
+            // has no `.`, so `parent.leaf` exists exactly when `parent` is
+            // in that leaf's list: count the lists instead of formatting
+            // and looking up every (parent, leaf) pair.
+            let mut scores: HashMap<&str, usize> = HashMap::default();
+            let mut steps = 0u64;
+            for leaf in leaves {
+                if let Some(parents) = parents_by_leaf.get(leaf.as_str()) {
+                    steps += parents.len() as u64;
+                    for &parent in parents {
+                        *scores.entry(parent).or_default() += 1;
+                    }
+                }
+            }
+            IMPLICIT_NET_SCOPE_STEPS.fetch_add(steps, std::sync::atomic::Ordering::Relaxed);
             for leaf in leaves {
                 let Some(parents) = parents_by_leaf.get(leaf.as_str()) else {
                     continue;
                 };
                 for parent in parents {
-                    let mut score = 0usize;
-                    for candidate_leaf in leaves {
-                        let candidate = format!("{}.{}", parent, candidate_leaf);
-                        if existing.contains(candidate.as_str()) {
-                            score += 1;
-                        }
-                    }
+                    let score = scores.get(parent).copied().unwrap_or(0);
                     let depth = parent.split('.').count();
                     if score > best_score
                         || (score == best_score && depth > best_depth)
@@ -982,6 +995,7 @@ impl Simulator {
         }
 
         let mut to_create: HashSet<String> = HashSet::default();
+        let mut best_scopes: HashMap<Vec<String>, Option<String>> = HashMap::default();
         for ca in &module.continuous_assigns {
             let mut leaves = HashSet::default();
             let mut reads = HashSet::default();
@@ -998,6 +1012,16 @@ impl Simulator {
             if leaves.is_empty() {
                 continue;
             }
+            // The scope only places a leaf that is not declared yet: with
+            // every leaf declared there is nothing to create.
+            let mut missing = leaves
+                .iter()
+                .filter(|leaf| !existing.contains(leaf.as_str()));
+            let lone_missing = match (missing.next(), missing.next()) {
+                (None, _) => continue,
+                (Some(leaf), None) => Some(leaf.as_str()),
+                _ => None,
+            };
             let lhs_raw = ident_raw(&ca.lhs);
             let rhs_raw = ident_raw(&ca.rhs);
             let lhs_leaf = ident_leaf(&ca.lhs);
@@ -1007,8 +1031,34 @@ impl Simulator {
                 lhs_raw.as_deref().and_then(|raw| parent_n(raw, 1))
             } else if lhs_leaf.is_some() && rhs_leaf.is_none() {
                 rhs_raw.as_deref().and_then(|raw| parent_n(raw, 1))
+            } else if lone_missing.is_some_and(|lone| {
+                leaves.iter().all(|leaf| {
+                    leaf.as_str() == lone
+                        || parents_by_leaf
+                            .get(leaf.as_str())
+                            .is_none_or(|p| p.is_empty())
+                })
+            }) {
+                // The search picks a scope among those declaring one of the
+                // leaves. When the one undeclared leaf (an unpacked array's
+                // name has no signal of its own) is also the only one other
+                // scopes declare, whichever scope wins declares it and
+                // nothing is created. The search walks every such scope,
+                // once per assign: it was quadratic in the instance count
+                // for an array element connected to a like-named port of
+                // each instance.
+                None
             } else {
-                best_scope_for_leaves(&leaves, &existing, &parents_by_leaf)
+                // The same leaves in the same order give the same scope.
+                let key: Vec<String> = leaves.iter().cloned().collect();
+                match best_scopes.get(&key) {
+                    Some(scope) => scope.clone(),
+                    None => {
+                        let scope = best_scope_for_leaves(&leaves, &parents_by_leaf);
+                        best_scopes.insert(key, scope.clone());
+                        scope
+                    }
+                }
             };
 
             let Some(scope) = scope else {
