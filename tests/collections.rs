@@ -371,6 +371,8 @@ mod review_queue_of_queues_push_1086;
 
 #[path = "collections/assoc_struct_delete_1124.rs"]
 mod assoc_struct_delete_1124;
+#[path = "collections/collection_concat_nonblocking_delayed.rs"]
+mod collection_concat_nonblocking_delayed;
 #[path = "collections/review_typedef_row_class_properties_216.rs"]
 mod review_typedef_row_class_properties_216;
 
