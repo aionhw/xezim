@@ -498,6 +498,8 @@ mod instance_struct_members_root_1046;
 mod shared_net_initializer_targets;
 #[path = "hierarchy/negative_genvar_cached.rs"]
 mod negative_genvar_cached;
+#[path = "hierarchy/unit_storage_one_object_721.rs"]
+mod unit_storage_one_object_721;
 #[path = "hierarchy/unit_storage_shared_bodies_721.rs"]
 mod unit_storage_shared_bodies_721;
 #[path = "hierarchy/net_alias_groups_1092.rs"]

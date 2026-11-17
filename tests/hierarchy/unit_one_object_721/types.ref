@@ -1,0 +1,20 @@
+T|mon 2 1234
+T|r1 comb blue
+T|r2 comb blue
+T|r1 vec 12ff
+T|r2 vec 12ff
+T|r2 wait at 1
+T|r1 wait at 1
+T|mon 20 12ff
+T|r1 0 12ff 2.25 s0w BLUE a3 9 w
+T|r1 20 2 5 4 1 3 9 11 22
+T|r1 init 15 15
+T|r2 0 12ff 2.25 s0w BLUE a3 9 w
+T|r2 20 2 5 4 1 3 9 11 22
+T|r2 init 15 15
+T|r2 event at 2
+T|r1 event at 2
+T|top fix[0]=1
+T|top fix[1]=20
+T|top fix[2]=3
+T|top s0w 7 '{8, 9}

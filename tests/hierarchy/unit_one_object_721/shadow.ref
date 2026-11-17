@@ -1,0 +1,12 @@
+T|sh local=100 unit=5 arr=8 uarr=2
+T|sh after addg local=100 unit=6
+T|sh after setarr arr=8 uarr=30
+T|sh k.get=36 geth=7
+T|sh after sset local=100 unit=60
+T|sh end local=101 unit=61
+T|blk block=7 unit=61 f=8
+T|blk outer=61
+T|child g=61 arr=30
+T|par.gb0 h=0 uh=50 g=-1 ug=1061
+T|par.gb1 h=1 uh=50 g=-1 ug=1061
+T|top g=1061 h=50 arr=30 p.g=-1 s.g=101

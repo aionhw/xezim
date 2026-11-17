@@ -1,0 +1,5 @@
+T|child g=5 k=5
+T|child saw 9
+T|top local=77 unit=9 k=9
+T|top local=77 unit=19
+T|child saw 19

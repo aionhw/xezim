@@ -1,0 +1,7 @@
+T|topb cnt=1 at 1
+T|prg cnt=2
+T|topb cnt=2 at 2
+T|topb cnt=7 at 3
+T|topb cnt=207 at 4
+T|topa cnt=207 log='{1, 2, 30, 40, 40, 50, 51} i.x=1
+T|topb end cnt=207 n=7
