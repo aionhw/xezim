@@ -2521,7 +2521,13 @@ impl Simulator {
             {
                 return None;
             }
-            return Some(xs.iter().map(|x| self.eval_expr(x.expr())).collect());
+            // §11.6.1: each item in the element type, as without the delay.
+            let shape = self.intra_element_shape(&dst);
+            return Some(
+                xs.iter()
+                    .map(|x| self.intra_item_value(shape.as_ref(), x.expr()))
+                    .collect(),
+            );
         }
         if !matches!(
             rhs.kind,
@@ -2589,7 +2595,8 @@ impl Simulator {
                 return (self.make_intra_saved_expr(v, span), None);
             }
             let mut slots = Vec::new();
-            let captured = self.capture_intra_pattern(inner, &mut slots);
+            let shape = self.intra_target_shape(lvalue);
+            let captured = self.capture_intra_pattern(inner, &mut slots, shape.as_ref());
             let args = slots
                 .iter()
                 .map(|&idx| Self::intra_slot_literal(idx, span))
@@ -2610,35 +2617,47 @@ impl Simulator {
         (self.make_intra_saved_expr(val, span), None)
     }
 
-    /// The pattern `e` with each item's value captured (`capture_intra_rhs`).
-    fn capture_intra_pattern(&mut self, e: &Expression, slots: &mut Vec<u64>) -> Expression {
+    /// The pattern `e` with each item's value captured (`capture_intra_rhs`),
+    /// each in the type of the element `shape` matches it to, if known.
+    fn capture_intra_pattern(
+        &mut self,
+        e: &Expression,
+        slots: &mut Vec<u64>,
+        shape: Option<&super::intra_pattern_shape::ItemShape>,
+    ) -> Expression {
         use crate::ast::expr::AssignmentPatternItem as Item;
         match &e.kind {
-            ExprKind::Paren(inner) => self.capture_intra_pattern(inner, slots),
+            ExprKind::Paren(inner) => self.capture_intra_pattern(inner, slots, shape),
             ExprKind::AssignmentPattern(items) => {
+                let shapes = match shape {
+                    Some(s) => self.intra_item_shapes(s, items),
+                    None => Vec::new(),
+                };
                 let mut out = Vec::with_capacity(items.len());
-                for item in items {
+                for (k, item) in items.iter().enumerate() {
+                    let sh = shapes.get(k).and_then(Option::as_ref);
                     out.push(match item {
-                        Item::Ordered(x) => Item::Ordered(self.capture_intra_pattern(x, slots)),
+                        Item::Ordered(x) => Item::Ordered(self.capture_intra_pattern(x, slots, sh)),
                         Item::Named(n, x) => {
-                            Item::Named(n.clone(), self.capture_intra_pattern(x, slots))
+                            Item::Named(n.clone(), self.capture_intra_pattern(x, slots, sh))
                         }
                         Item::Typed(t, x) => {
-                            Item::Typed(t.clone(), self.capture_intra_pattern(x, slots))
+                            Item::Typed(t.clone(), self.capture_intra_pattern(x, slots, sh))
                         }
-                        Item::Default(x) => Item::Default(self.capture_intra_pattern(x, slots)),
+                        Item::Default(x) => Item::Default(self.capture_intra_pattern(x, slots, sh)),
                         Item::Keyed(k, x) => {
-                            Item::Keyed(k.clone(), self.capture_intra_pattern(x, slots))
+                            Item::Keyed(k.clone(), self.capture_intra_pattern(x, slots, sh))
                         }
                     });
                 }
                 Expression::new(ExprKind::AssignmentPattern(out), e.span)
             }
-            // `'{n{a, b}}`: the count stays, the items are captured.
+            // `'{n{a, b}}`: the count stays, the items are captured, each
+            // matched to an element as the replication is.
             ExprKind::Replication { count, exprs } => {
                 let mut out = Vec::with_capacity(exprs.len());
                 for x in exprs {
-                    out.push(self.capture_intra_pattern(x, slots));
+                    out.push(self.capture_intra_pattern(x, slots, shape));
                 }
                 Expression::new(
                     ExprKind::Replication {
@@ -2649,7 +2668,7 @@ impl Simulator {
                 )
             }
             _ => {
-                let val = self.eval_expr(e);
+                let val = self.intra_item_value(shape, e);
                 let idx = self.intra_saved_next;
                 self.intra_saved_next += 1;
                 self.intra_saved.insert(idx, val);
