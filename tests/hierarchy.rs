@@ -460,6 +460,8 @@ mod time0_port_edge;
 mod child_constant_checks_893;
 #[path = "hierarchy/child_constant_package_scope_721.rs"]
 mod child_constant_package_scope_721;
+#[path = "hierarchy/const_function_instance_scope_721.rs"]
+mod const_function_instance_scope_721;
 
 #[path = "hierarchy/generate_rename_scope.rs"]
 mod generate_rename_scope;
