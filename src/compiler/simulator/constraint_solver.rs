@@ -1298,7 +1298,7 @@ impl Simulator {
                 }
             }
             for _ in 0..256 {
-                if !self.take_randomize_budget(handle, &class_name, &constraints) {
+                if !self.take_randomize_budget(handle, &class_name, &constraints, &rand_colls) {
                     break;
                 }
                 for (name, width) in &rand_props {
@@ -1544,15 +1544,25 @@ impl Simulator {
             .map(|(k, ds)| (k.clone(), ds.iter().map(|d| (d.0, d.2)).collect()))
             .collect();
         let mut back_ref_added = false;
+        let mut prior_props: Option<HashMap<String, Value>> = None;
         for trial in 0..trials {
             let deferred_trial_mark = self.rand_post_deferred.len();
             // Ctrl-C / SIGTERM: stop searching and let the run shut down.
             if interrupt_requested() {
+                if let Some(saved) = prior_props.take() {
+                    self.restore_instance_props(handle, saved);
+                }
                 self.take_interrupt();
                 break;
             }
-            if !self.take_randomize_budget(handle, &class_name, &constraints) {
+            if !self.take_randomize_budget(handle, &class_name, &constraints, &rand_colls) {
+                if let Some(saved) = prior_props.take() {
+                    self.restore_instance_props(handle, saved);
+                }
                 break;
+            }
+            if let Some(saved) = prior_props.take() {
+                self.restore_instance_props(handle, saved);
             }
             if trial > 0 && trial < REDEAL_TRIALS {
                 for (k, ds) in self.dist_decks.iter_mut().filter(|(k, _)| k.0 == handle) {
@@ -2781,42 +2791,50 @@ impl Simulator {
                     *e = (*e).max(n);
                 }
             }
+            let mut sizes_ok = true;
             let mut pinned_elems: HashSet<String> = HashSet::default();
             if !rand_colls.is_empty() {
-                self.solve_array_sizes(&rand_colls, &constraints);
-                // Fresh random baseline for every element of a dynamic /
-                // associative member (fixed arrays keep the legacy pool pass).
-                // §18.4.1: a CLASS-element collection (`rand obj arr[]`) holds
-                // object handles that are randomized RECURSIVELY — never drawn
-                // as scalars, or the handle is overwritten with junk.
-                for c in &rand_colls {
-                    if c.kind == CollKind::Fixed || c.is_object_elem {
-                        continue;
+                sizes_ok = self.solve_array_sizes(&rand_colls, &constraints);
+                if sizes_ok {
+                    // Fresh random baseline for every element of a dynamic /
+                    // associative member (fixed arrays keep the legacy pool pass).
+                    // §18.4.1: a CLASS-element collection (`rand obj arr[]`) holds
+                    // object handles that are randomized RECURSIVELY — never drawn
+                    // as scalars, or the handle is overwritten with junk.
+                    for c in &rand_colls {
+                        if c.kind == CollKind::Fixed || c.is_object_elem {
+                            continue;
+                        }
+                        for key in self.coll_elem_keys(c) {
+                            let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
+                            let members = array_enums
+                                .get(&c.prop)
+                                .and_then(|tn| self.module.enum_members.get(tn))
+                                .filter(|m| !m.is_empty());
+                            let v = if let Some(members) = members {
+                                let values: Vec<u64> = members.iter().map(|m| m.1).collect();
+                                let i = self.cur_rng().gen_range(0..values.len());
+                                Value::from_u64(values[i], c.width)
+                            } else {
+                                self.draw_elem(c.width, prev)
+                            };
+                            self.write_coll_elem(&key, v);
+                        }
                     }
-                    for key in self.coll_elem_keys(c) {
-                        let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
-                        let members = array_enums
-                            .get(&c.prop)
-                            .and_then(|tn| self.module.enum_members.get(tn))
-                            .filter(|m| !m.is_empty());
-                        let v = if let Some(members) = members {
-                            let values: Vec<u64> = members.iter().map(|m| m.1).collect();
-                            let i = self.cur_rng().gen_range(0..values.len());
-                            Value::from_u64(values[i], c.width)
-                        } else {
-                            self.draw_elem(c.width, prev)
-                        };
-                        self.write_coll_elem(&key, v);
+                    self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
+                    self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
+                    for (cs, scalars) in &unique_colls {
+                        self.enforce_unique_coll(handle, cs, scalars, &constraints, &pinned_elems);
                     }
+                    self.enforce_conditional_unique_colls(
+                        handle,
+                        &constraints,
+                        &rand_colls,
+                        &pinned_elems,
+                    );
                 }
-                self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
-                self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
-                for (cs, scalars) in &unique_colls {
-                    self.enforce_unique_coll(handle, cs, scalars, &constraints, &pinned_elems);
-                }
-                self.enforce_conditional_unique_colls(handle, &constraints, &rand_colls, &pinned_elems);
             }
-            {
+            if sizes_ok {
                 fn collect_unique_items<'a>(
                     item: &'a ConstraintItem,
                     out: &mut Vec<&'a ConstraintItem>,
@@ -2862,50 +2880,55 @@ impl Simulator {
                         break;
                     }
                 }
-            }
 
-            // §18.5.8.2: `arr.sum() == K` cannot be met by rejection over a wide
-            // domain — distribute a random valid assignment onto the elements so
-            // their total lands exactly on the target (respecting per-element
-            // ranges and any element already pinned by another constraint).
-            if !rand_colls.is_empty() {
-                self.solve_array_sum_eqs(&constraints, &rand_colls, &rand_set, &mut pinned_elems);
-            }
+                // §18.5.8.2: `arr.sum() == K` cannot be met by rejection over a wide
+                // domain — distribute a random valid assignment onto the elements so
+                // their total lands exactly on the target (respecting per-element
+                // ranges and any element already pinned by another constraint).
+                if !rand_colls.is_empty() {
+                    self.solve_array_sum_eqs(
+                        &constraints,
+                        &rand_colls,
+                        &rand_set,
+                        &mut pinned_elems,
+                    );
+                }
 
-            // §18.5.7 foreach over a PACKED vector's bits (`foreach
-            // (possible[i]) if (possible[i]) pattern[i] dist …; else
-            // pattern[i] == 0;`). Not a rand COLLECTION, so every collection
-            // arm skips it, and `constraint_unmodeled` then excused it from
-            // the satisfaction check — the guard bits were silently ignored.
-            // Pin the bits deterministically here, after the draws.
-            for con in &constraints {
-                for item in &con.items {
+                // §18.5.7 foreach over a PACKED vector's bits (`foreach
+                // (possible[i]) if (possible[i]) pattern[i] dist …; else
+                // pattern[i] == 0;`). Not a rand COLLECTION, so every collection
+                // arm skips it, and `constraint_unmodeled` then excused it from
+                // the satisfaction check — the guard bits were silently ignored.
+                // Pin the bits deterministically here, after the draws.
+                for con in &constraints {
+                    for item in &con.items {
+                        self.apply_packed_bit_foreach(handle, item, &rand_set);
+                    }
+                }
+                for item in inline {
                     self.apply_packed_bit_foreach(handle, item, &rand_set);
                 }
             }
-            for item in inline {
-                self.apply_packed_bit_foreach(handle, item, &rand_set);
-            }
 
             let mut fe_failed = false;
-            let mut all_ok =
-                self.rand_items_accept(handle, &constraints, &rand_colls, &mut fe_failed);
+            let mut all_ok = sizes_ok
+                && self.rand_items_accept(handle, &constraints, &rand_colls, &mut fe_failed);
             // Repairs can overwrite the baseline. Check the implicit enum
             // domain too, including when all explicit constraints are off.
-            for c in &rand_colls {
-                if let Some(tn) = array_enums.get(&c.prop) {
-                    let values: Vec<u64> = self.module.enum_members[tn]
-                        .iter()
-                        .map(|m| m.1)
-                        .collect();
-                    for key in self.coll_elem_keys(c) {
-                        if !self
-                            .read_coll_elem(&key)
-                            .and_then(|v| v.to_u64())
-                            .is_some_and(|v| values.contains(&v))
-                        {
-                            all_ok = false;
-                            fe_failed = true;
+            if sizes_ok {
+                for c in &rand_colls {
+                    if let Some(tn) = array_enums.get(&c.prop) {
+                        let values: Vec<u64> =
+                            self.module.enum_members[tn].iter().map(|m| m.1).collect();
+                        for key in self.coll_elem_keys(c) {
+                            if !self
+                                .read_coll_elem(&key)
+                                .and_then(|v| v.to_u64())
+                                .is_some_and(|v| values.contains(&v))
+                            {
+                                all_ok = false;
+                                fe_failed = true;
+                            }
                         }
                     }
                 }
@@ -2968,8 +2991,8 @@ impl Simulator {
                 let sized = rand_colls.iter().any(|c| {
                     c.kind == CollKind::Dyn
                         && !c.is_object_elem
-                        && !(sub_objs.is_empty() && Self::csp_size_solved(c, &constraints))
-                });
+                        && !Self::csp_size_solved(c, &constraints)
+                }) || self.csp_subs_have_dyn(&sub_objs);
                 csp_runs += 1;
                 // §18.5.4: the first joint solve keeps each dist target in
                 // the item its trial dealt. Repairing the trial's values, it
@@ -3088,10 +3111,10 @@ impl Simulator {
             }
 
             self.rand_post_deferred.truncate(deferred_trial_mark);
-            if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                for (name, val) in backup {
-                    inst.properties.insert(name, val);
-                }
+            if trial + 1 == trials {
+                self.restore_instance_props(handle, backup);
+            } else {
+                prior_props = Some(backup);
             }
         }
 
@@ -3138,6 +3161,14 @@ impl Simulator {
         self.this_stack.pop();
         self.class_context_stack.pop();
         Value::zero(32)
+    }
+
+    fn restore_instance_props(&mut self, handle: usize, saved: HashMap<String, Value>) {
+        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+            for (name, val) in saved {
+                inst.properties.insert(name, val);
+            }
+        }
     }
 
     fn append_unique_colls(
