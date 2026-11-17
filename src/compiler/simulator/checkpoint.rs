@@ -35,7 +35,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // §13.5.2: TaskCleanup::struct_formal_meta, Simulator::ref_park_flags.
 // §10.3.3: delayed updates retain the mask of bits owned by their driver.
 // Whole-array NBA entries carry captured element values.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x0d";
+// §7.10: SignalMap holds queue and dynamic-array elements in runs; two profile counters.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x0e";
 
 #[derive(Default)]
 struct Session {
