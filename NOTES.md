@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Store an assignment pattern item that is an unpacked array (a variable, a row or a function result) element by element into the sub-array it matches, positionally, by key or through `default:`, instead of zeros (#1233).
+
 - **Correctness:** Preserve virtual-interface specialization identity, typedef net signing and packed members, and captured array values in deferred assignments (core #231, #1212, #1217).
 
 - **Correctness:** Track function-call operands in explicit event controls, preserve neighboring bits when delayed slice drivers mature, and omit imported parameter aliases from waveform scopes (#1205, #1213, #1215).
