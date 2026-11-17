@@ -2842,7 +2842,10 @@ impl Simulator {
             // (`for i in 0..sz VAR[i] = …`); without this growth the
             // unpacked `.size()` stayed 0 and every later field read
             // desynced (PCKSZ errors / X compare).
-            if !self.is_associative_array(&an) {
+            let is_fixed_array = self.module.arrays.contains_key(&an)
+                && !self.module.dynamic_arrays.contains(&an)
+                && !self.module.queue_vars.contains(&an);
+            if !self.is_associative_array(&an) && !is_fixed_array {
                 let kval = idx_val.to_i64().unwrap_or(0);
                 if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
                     self.set_queue_size(&an, kval as u64 + 1);

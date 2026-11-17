@@ -671,3 +671,81 @@ fn dpi_string_return_respects_local_declaration_shadowing() {
     let _ = std::fs::remove_file(so);
     assert!(text.contains("TEST_PASS"), "{text}");
 }
+
+#[test]
+fn dpi_open_array_class_member_test() {
+    // IEEE 1800-2023 §35.5.6.1, Annex H.12.1-H.12.2: open-array DPI actuals
+    // resolve class-member fixed/dynamic/queue/2-D/descending arrays in both
+    // bare-in-method and object-qualified forms without cross-talk.
+    assert_dpi_pass(
+        "tests/dpi/open_array_class_member_dpi.c",
+        "open_array_class_member_dpi",
+        "tests/dpi/open_array_class_member_dpi.sv",
+    );
+}
+
+#[test]
+fn dpi_open_array_unresolved_nonscalar_warns_once() {
+    // Verify the 1-element fallback warns once per call site when a non-scalar
+    // actual cannot be resolved, and does not warn for resolved arrays.
+    let so = compile_dpi_lib(
+        "tests/dpi/open_array_class_member_dpi.c",
+        "open_array_warn_once",
+    );
+    let dir = std::env::temp_dir().join(format!("xezim_dpi_warn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sv = dir.join("warn.sv");
+    std::fs::write(
+        &sv,
+        r#"module t;
+  import "DPI-C" function int oa_check_in(
+    input string tag,
+    input int arr[],
+    input int exp_bytes,
+    input int exp_left,
+    input int exp_right,
+    input int exp_first,
+    input int exp_last
+  );
+  int mm[4];
+  int ok = 1;
+  initial begin
+    mm = '{10, 20, 30, 40};
+    ok &= oa_check_in("resolved", mm, 16, 0, 3, 10, 40);
+    for (int i = 0; i < 3; i++) begin
+      // Array slice actual falls through to the 1-element fallback and warns once.
+      void'(oa_check_in("slice", mm[0:1], 4, 0, 0, 0, 0));
+    end
+    // Scalar literal falls back without warning.
+    ok &= oa_check_in("scalar", 42, 4, 0, 0, 42, 42);
+    if (ok) $display("TEST_PASS");
+    $finish;
+  end
+endmodule
+"#,
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .arg("--dpi-lib")
+        .arg(&so)
+        .arg("--max-time")
+        .arg("1000")
+        .arg(&sv)
+        .output()
+        .expect("failed to run xezim");
+    let _ = std::fs::remove_file(&so);
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr={stderr}\nstdout={stdout}");
+    assert!(stdout.contains("TEST_PASS"), "stdout={stdout}\nstderr={stderr}");
+    let warns: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("DPI open-array actual"))
+        .collect();
+    assert_eq!(
+        warns.len(),
+        1,
+        "expected exactly 1 fallback warning across loop iterations, got {warns:?}\nstderr={stderr}"
+    );
+}
