@@ -5016,7 +5016,9 @@ impl Simulator {
             |k| self.delayed_updates[k].3.clone(),
         );
         if let Some(mask) = &mut mask {
-            for bit in lo..lo + sel_w { mask.set_bit_code(bit as usize, 1); }
+            for bit in lo..lo + sel_w {
+                mask.set_bit_code(bit as usize, 1);
+            }
         }
         let pending = first.map(|k| self.delayed_updates[k].2.clone());
         let in_flight = pending.is_some();
@@ -5039,7 +5041,9 @@ impl Simulator {
             self.schedule_delayed_with_delay(id, merged, delay);
             if !self.module_paths.as_ref().is_some_and(|mp| mp.table_of(id).is_some()) {
                 for entry in &mut self.delayed_updates {
-                    if entry.1 == id { entry.3 = mask.clone(); }
+                    if entry.1 == id {
+                        entry.3 = mask.clone();
+                    }
                 }
             }
         }
@@ -5084,7 +5088,9 @@ impl Simulator {
             if let Some(mask) = &mut self.delayed_updates[k].3 {
                 // Cancel this slice's old event; only its new due time owns
                 // these bits. Later snapshots retain values for composition.
-                for bit in lo..lo + sel_w { mask.set_bit_code(bit, u8::from(t == target)); }
+                for bit in lo..lo + sel_w {
+                    mask.set_bit_code(bit, u8::from(t == target));
+                }
             }
             let v = &mut self.delayed_updates[k].2;
             for i in 0..sel_w {
@@ -5105,7 +5111,9 @@ impl Simulator {
             }
             chain.push((target, self.delayed_updates.len()));
             let mut mask = Value::zero(base.width);
-            for bit in lo..lo + sel_w { mask.set_bit_code(bit, 1); }
+            for bit in lo..lo + sel_w {
+                mask.set_bit_code(bit, 1);
+            }
             self.delayed_updates.push((target, id, base, Some(mask)));
             chain.sort_unstable();
         }
@@ -5113,7 +5121,9 @@ impl Simulator {
         let mut drop: Vec<usize> = Vec::new();
         for &(_, k) in &chain {
             if self.delayed_updates[k].2 == prev
-                || self.delayed_updates[k].3.as_ref().is_some_and(|m| (0..m.width as usize).all(|bit| m.get_bit_code(bit) == 0))
+                || self.delayed_updates[k].3.as_ref().is_some_and(|m| {
+                    (0..m.width as usize).all(|bit| m.get_bit_code(bit) == 0)
+                })
             {
                 drop.push(k);
             } else {
