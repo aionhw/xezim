@@ -26,7 +26,7 @@ impl Simulator {
         // A process parked by `#0` in the Inactive-region queue (§4.4.2.3)
         // is suspended, not finished — its continuation resumes after the
         // NBA region of the current tick.
-        if self.inactive_queue.iter().any(|(p, _)| *p == pid) {
+        if self.inactive_queue.contains_pid(pid) {
             return true;
         }
         if self.nba_region_waiters.iter().any(|(p, _)| *p == pid) {

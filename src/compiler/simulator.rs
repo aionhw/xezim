@@ -9457,7 +9457,7 @@ pub struct Simulator {
     /// `#0` visible after it, so entries parked here are promoted back into
     /// the event queue only at the END of the current tick, after
     /// `apply_nba` has run (see `promote_inactive_to_active`).
-    inactive_queue: Vec<(usize, ProcCont)>,
+    inactive_queue: PidVec<ProcCont>,
     /// Processes waiting for the NBA region to commit (e.g.
     /// `uvm_wait_for_nba_region`: `nba <= next_nba; @(nba)` where `nba` is a
     /// procedural variable). Resumed in `run_one_tick` after all active +

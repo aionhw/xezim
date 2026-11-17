@@ -4650,7 +4650,7 @@ impl Simulator {
             cond_waiter_conditions: HashMap::default(),
             cond_waiter_gate: HashMap::default(),
             cond_repass_recheck: HashMap::default(),
-            inactive_queue: Vec::new(),
+            inactive_queue: PidVec::default(),
             nba_region_waiters: Vec::new(),
             cond_progress: 0,
             cond_waiter_rechecks: 0,
