@@ -606,8 +606,10 @@ impl Simulator {
         for k in keys {
             if let Some(sig) = module.pkg_var_decls.get(&k).cloned() {
                 let (_, base) = k.split_once("::").unwrap();
-                if let Some(ty) = module.var_decl_types.get(base).cloned() {
-                    module.var_decl_types.entry(k.clone()).or_insert(ty);
+                if let Some(ty) = module.var_decl_types.get_shared(base).cloned() {
+                    if !module.var_decl_types.contains_key(&k) {
+                        module.var_decl_types.insert_shared(k.clone(), ty);
+                    }
                 }
                 if module.string_signals.contains(base) {
                     module.string_signals.insert(k.clone());

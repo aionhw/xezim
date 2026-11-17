@@ -1672,7 +1672,7 @@ impl Simulator {
                 .unwrap_or_default()
         };
         FormalMetaParts {
-            declared_type: self.module.var_decl_types.get(name).cloned(),
+            declared_type: self.module.var_decl_types.get_shared(name).cloned(),
             packed_fields: self.module.packed_struct_fields.get(name).cloned(),
             packed_element_widths,
             packed_dimensions: self.module.packed_full_dims.get(name).cloned(),
@@ -2003,7 +2003,11 @@ impl Simulator {
                 }
             }
         }
-        put(&mut self.module.var_decl_types, name, saved.declared_type);
+        put(
+            self.module.var_decl_types.as_map_mut(),
+            name,
+            saved.declared_type,
+        );
         put(
             &mut self.module.packed_struct_fields,
             name,

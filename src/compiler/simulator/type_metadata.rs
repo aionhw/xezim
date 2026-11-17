@@ -281,7 +281,7 @@ impl Simulator {
             container: self.var_container_types.get(name).cloned(),
             type_args: self.var_type_args.get(name).cloned(),
             decl_types: pick(
-                &m.var_decl_types,
+                m.var_decl_types.as_map(),
                 name,
                 &pfx,
                 members,
@@ -364,7 +364,7 @@ impl Simulator {
         flag(&mut self.string_signals, name, meta.string);
         let m = &mut self.module;
         keyed(
-            &mut m.var_decl_types,
+            m.var_decl_types.as_map_mut(),
             name,
             &out.decl_types,
             &meta.decl_types,

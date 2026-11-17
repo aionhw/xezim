@@ -1486,7 +1486,7 @@ impl Simulator {
         // A root is a declared variable: a bare name, or one scoped by an
         // instance path (`top2.h` when several top modules run) — not a
         // member path below another declared variable.
-        fn is_root(vdt: &HashMap<String, DataType>, k: &str, extra: &[char]) -> bool {
+        fn is_root(vdt: &xezim_core::decl_types::DeclTypeMap, k: &str, extra: &[char]) -> bool {
             !k.contains(['[', ':'])
                 && !k.contains(extra)
                 && k.rsplit_once('.').is_none_or(|(parent, _)| {

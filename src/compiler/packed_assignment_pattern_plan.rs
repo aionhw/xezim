@@ -292,7 +292,7 @@ pub(crate) fn is_packed(ty: &DataType, r: &mut dyn PatternTypeResolver) -> bool 
 /// it connects (`port_aliases`, formal to actual) takes that net's type.
 pub(crate) fn declared_type<'t>(
     name: &str,
-    types: &'t std::collections::HashMap<String, DataType, impl std::hash::BuildHasher>,
+    types: &'t xezim_core::decl_types::DeclTypeMap,
     aliases: Option<&std::collections::HashMap<String, String, impl std::hash::BuildHasher>>,
 ) -> Option<&'t DataType> {
     let mut cur = name;

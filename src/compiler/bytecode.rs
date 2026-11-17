@@ -2225,7 +2225,7 @@ pub struct BytecodeCompiler<'a> {
     packed_full_dims: Option<&'a HashMap<String, Vec<(i64, i64)>>>,
     /// Declared variable types, for the type a pattern assigned to a
     /// variable takes (§10.8).
-    var_decl_types: Option<&'a HashMap<String, crate::ast::types::DataType>>,
+    var_decl_types: Option<&'a xezim_core::decl_types::DeclTypeMap>,
     /// Unpacked dimensions of typedefs (`typedef int arr_t[3]`), by the
     /// `typedef_types` key: such a type is not packed.
     typedef_unpacked_dims: Option<&'a HashMap<String, Vec<crate::ast::types::UnpackedDimension>>>,
@@ -3252,7 +3252,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.packed_full_dims = Some(d);
     }
 
-    pub fn set_var_decl_types(&mut self, t: &'a HashMap<String, crate::ast::types::DataType>) {
+    pub fn set_var_decl_types(&mut self, t: &'a xezim_core::decl_types::DeclTypeMap) {
         self.var_decl_types = Some(t);
     }
 
@@ -9780,7 +9780,9 @@ impl<'a> BytecodeCompiler<'a> {
             scoped.and_then(|q| m.get(q)).or_else(|| m.get(raw))
         }
         let (scoped, raw) = (scoped.as_deref(), raw.as_str());
-        let declared = self.var_decl_types.and_then(|m| lookup(m, scoped, raw));
+        let declared = self
+            .var_decl_types
+            .and_then(|m| scoped.and_then(|q| m.get(q)).or_else(|| m.get(raw)));
         let (Some(mut dt), Some(types)) = (declared, self.typedef_types) else {
             // No declaration on record (a net, say): the packed shape tables
             // decide, and a name in neither is a plain vector.
@@ -25988,7 +25990,7 @@ fn chain_has_call_base(e: &Expression) -> bool {
 /// variable `v` for `name` = `v.m` (§7.2: a member keeps its declared type).
 pub(crate) fn declared_type_of<'a>(
     name: &str,
-    decls: &'a HashMap<String, crate::ast::types::DataType>,
+    decls: &'a xezim_core::decl_types::DeclTypeMap,
     types: &'a HashMap<String, crate::ast::types::DataType>,
 ) -> Option<&'a crate::ast::types::DataType> {
     if let Some(dt) = decls.get(name) {
