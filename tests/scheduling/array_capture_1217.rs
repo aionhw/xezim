@@ -99,3 +99,35 @@ endmodule
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn whole_array_and_element_nbas_keep_source_order() {
+    let out = xezim::simulate(
+        r#"module top;
+ int q[$]='{1,2}; int d[]='{1,2}; int f[2]='{1,2};
+ initial begin
+  q <= {3,4}; q[0] <= 7;
+  d <= {3,4}; d[0] <= 7;
+  f <= {3,4}; f[0] <= 7;
+  #1; $display("first q=%p d=%p f=%p",q,d,f);
+  q[0] <= 8; q <= {5,6};
+  d[0] <= 8; d <= {5,6};
+  f[0] <= 8; f <= {5,6};
+  #1; $display("last q=%p d=%p f=%p",q,d,f);
+  $finish;
+ end
+endmodule
+"#,
+        10,
+    )
+    .unwrap();
+    let lines: Vec<_> = out.output.iter().map(|o| o.message.as_str()).collect();
+    assert!(
+        lines.contains(&"first q='{7, 4} d='{7, 4} f='{7, 4}"),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"last q='{5, 6} d='{5, 6} f='{5, 6}"),
+        "{lines:?}"
+    );
+}
