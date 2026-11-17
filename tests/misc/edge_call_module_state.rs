@@ -200,6 +200,10 @@ endmodule
 }
 
 fn forced_compiled_lines(src: &str) -> (Vec<String>, String) {
+    compiled_lines_with_trace(src, true)
+}
+
+fn compiled_lines_with_trace(src: &str, trace: bool) -> (Vec<String>, String) {
     use std::process::Command;
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
@@ -215,7 +219,7 @@ fn forced_compiled_lines(src: &str) -> (Vec<String>, String) {
         .arg(&path)
         .env("XEZIM_COMPILE_METHODS", "1")
         .env("XEZIM_METHOD_TIER", "0")
-        .env("XEZIM_FALLBACK_SITES", "1")
+        .env("XEZIM_FALLBACK_SITES", if trace { "1" } else { "0" })
         .env("XEZIM_JIT", "0")
         .env_remove("XEZIM_METHOD_CACHE")
         .output()
@@ -247,8 +251,11 @@ fn delegated_module_signal_reader_runs_compiled() {
         "module top; int q=7; {} initial begin $display(\"T|value=%0d q=%0d\",get(0),q); $finish; end endmodule",
         large_reader("get", "return q+r-r;")
     );
-    let (rows, trace) = forced_compiled_lines(&source);
+    let (quiet_rows, quiet_trace) = compiled_lines_with_trace(&source, false);
+    let (rows, trace) = compiled_lines_with_trace(&source, true);
     assert_eq!(rows, ["T|value=7 q=7"]);
+    assert_eq!(quiet_rows, rows);
+    assert!(!quiet_trace.contains("runs-compiled scope="));
     assert!(
         trace.contains("runs-compiled scope=__free_fn__.get"),
         "{trace}"
@@ -269,4 +276,51 @@ fn package_signal_names_do_not_bind_to_module_signals() {
         large_reader("wrap", "return p::get(r-r);")
     );
     assert_eq!(forced_compiled_lines(&nested).0, ["T|value=7 q=99"]);
+}
+
+/// §13.3, §13.4.1: an inlined helper's locals belong to its activation.
+/// The mixed-language helpers exercise register locals around interpreted
+/// aggregate work. Diagnostic tracing must not change their values.
+#[test]
+fn mixed_helper_fallbacks_keep_their_frames_with_and_without_tracing() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vhdl/mixed");
+    for name in ["mixed_inout_port", "mixed_record"] {
+        let expected = std::fs::read_to_string(dir.join(format!("{name}.golden"))).unwrap();
+        for trace in ["0", "1"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
+                .arg("--no-cache")
+                .arg(dir.join(format!("{name}.sv")))
+                .arg(dir.join(format!("{name}.vhd")))
+                .env("XEZIM_COMPILE_METHODS", "1")
+                .env("XEZIM_METHOD_TIER", "0")
+                .env("XEZIM_METHOD_STMT_FALLBACK", "1")
+                .env("XEZIM_FALLBACK_SITES", trace)
+                .env("XEZIM_JIT", "0")
+                .env_remove("XEZIM_METHOD_CACHE")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{name}, trace={trace}:\n{stderr}");
+            let actual = stdout
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("=== xezim")
+                        && !line.starts_with("git ")
+                        && !line.starts_with("Simulation finished at time")
+                        && !line.starts_with("[xezim]")
+                        && !line.starts_with("[warn]")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                actual.trim_end(),
+                expected.trim_end(),
+                "{name}, trace={trace}:\n{stderr}"
+            );
+        }
+    }
 }
