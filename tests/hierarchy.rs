@@ -55,6 +55,8 @@ mod dump_merged_sv_library_dedup;
 mod dump_merged_sv_top_pruning;
 #[path = "hierarchy/duplicate_package_definition.rs"]
 mod duplicate_package_definition;
+#[path = "hierarchy/duplicate_definition_warning.rs"]
+mod duplicate_definition_warning;
 #[path = "hierarchy/expression_port_actuals.rs"]
 mod expression_port_actuals;
 #[path = "hierarchy/final_blocks_hierarchy.rs"]
