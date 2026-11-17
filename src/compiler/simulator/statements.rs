@@ -4446,6 +4446,47 @@ impl Simulator {
                     }
                     return;
                 }
+                // §10.10, §10.4.2: an unpacked array concatenation, or a whole
+                // queue, written to a collection is spliced element by element.
+                // Its elements are read now and the blocking store runs in the
+                // NBA region. A frame local or ref formal keeps the paths below.
+                let frame_target = match &lvalue.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 => {
+                        let n = &h.path[0].name.name;
+                        self.local_stack.last().is_some_and(|m| m.contains_key(n))
+                            || self
+                                .ref_binding_stack
+                                .last()
+                                .is_some_and(|m| m.contains_key(n))
+                    }
+                    _ => false,
+                };
+                if intra_cycles.is_none()
+                    && packed_pattern.is_none()
+                    && !frame_target
+                    && self.nba_static_key_for_lvalue(lvalue).is_none()
+                    && let Some(cap) = self.capture_collection_rhs(lvalue, rvalue)
+                {
+                    let d = match intra_d {
+                        Some(d) => d,
+                        None => delay
+                            .as_ref()
+                            .map(|de| self.eval_expr(de).to_u64().unwrap_or(0))
+                            .unwrap_or(0),
+                    };
+                    let entry = NbaEntry {
+                        lhs: Some(lvalue.clone()),
+                        value: Value::zero(1),
+                        resolved_id: None,
+                        static_key: None,
+                        static_slice: None,
+                        this_handle: self.this_stack.last().copied().flatten(),
+                        root_frame: None,
+                        collection: Some(Box::new(cap)),
+                    };
+                    self.enqueue_context_nba(entry, d);
+                    return;
+                }
                 let val = match (packed_pattern, &rvalue.kind) {
                     (Some(v), _) => v,
                     (None, ExprKind::AssignmentPattern(_)) => self.eval_expr(rvalue),
@@ -4670,6 +4711,7 @@ impl Simulator {
                             static_slice: None,
                             this_handle: None,
                             root_frame: self.nba_root_frame(lvalue),
+                            collection: None,
                         },
                         d,
                     );
@@ -4693,6 +4735,7 @@ impl Simulator {
                             static_slice: None,
                             this_handle: None,
                             root_frame: None,
+                            collection: None,
                         });
                     } else if let Some(id) = id_opt {
                         // Track via index map so subsequent partial-NBAs
@@ -4734,6 +4777,7 @@ impl Simulator {
                             static_slice: None,
                             this_handle,
                             root_frame: self.nba_root_frame(lvalue),
+                            collection: None,
                         });
                     }
                 } else if let Some(id) = self.resolve_nba_target(lvalue) {
@@ -4778,6 +4822,7 @@ impl Simulator {
                             static_slice: None,
                             this_handle,
                             root_frame: self.nba_root_frame(lvalue),
+                            collection: None,
                         },
                         d,
                     );

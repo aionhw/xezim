@@ -2511,6 +2511,12 @@ impl Simulator {
             }
             return self.capture_intra_rhs(lvalue, &selected, span);
         }
+        // §10.10: an unpacked array concatenation, or a whole queue, into a
+        // collection is read element by element now.
+        if let Some(cap) = self.capture_collection_rhs(lvalue, inner) {
+            let release = Self::intra_release_statement(&cap.slots, span);
+            return (cap.rhs, Some(release));
+        }
         if matches!(inner.kind, ExprKind::AssignmentPattern(_)) {
             // A packed target shapes the pattern now; its value is the one
             // evaluation of the items (a second would repeat their calls).
@@ -2519,20 +2525,7 @@ impl Simulator {
             }
             let mut slots = Vec::new();
             let captured = self.capture_intra_pattern(inner, &mut slots);
-            let args = slots
-                .iter()
-                .map(|&idx| Self::intra_slot_literal(idx, span))
-                .collect();
-            let release = Statement::new(
-                StatementKind::Expr(Expression::new(
-                    ExprKind::SystemCall {
-                        name: INTRA_RELEASE_MARKER.to_string(),
-                        args,
-                    },
-                    span,
-                )),
-                span,
-            );
+            let release = Self::intra_release_statement(&slots, span);
             return (captured, Some(release));
         }
         let val = self.eval_target_rhs(lvalue, rhs);
@@ -2594,7 +2587,25 @@ impl Simulator {
         }
     }
 
-    fn intra_slot_literal(idx: u64, span: crate::ast::Span) -> Expression {
+    /// The statement that frees the saved items `slots` after their store.
+    fn intra_release_statement(slots: &[u64], span: crate::ast::Span) -> Statement {
+        let args = slots
+            .iter()
+            .map(|&idx| Self::intra_slot_literal(idx, span))
+            .collect();
+        Statement::new(
+            StatementKind::Expr(Expression::new(
+                ExprKind::SystemCall {
+                    name: INTRA_RELEASE_MARKER.to_string(),
+                    args,
+                },
+                span,
+            )),
+            span,
+        )
+    }
+
+    pub(super) fn intra_slot_literal(idx: u64, span: crate::ast::Span) -> Expression {
         Expression::new(
             ExprKind::Number(NumberLiteral::Integer {
                 size: None,

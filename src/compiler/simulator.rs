@@ -1832,6 +1832,10 @@ struct NbaEntry {
     /// With the root's declared class, which selects a property a derived
     /// class redeclares (§8.14), when one is known.
     root_frame: Option<(String, Value, Option<String>)>,
+    /// §10.10, §10.4.2: a collection right-hand side read when the NBA was
+    /// scheduled (`q <= {q, v}`), stored to `lhs` by the blocking store in
+    /// the NBA region; `value` is unused then.
+    collection: Option<Box<collection_nba::CapturedCollection>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -3068,6 +3072,7 @@ mod class_members;
 mod class_methods;
 mod class_specialization;
 mod class_array_constants;
+mod collection_nba;
 mod property_initialization;
 mod clocking;
 mod collection_methods;

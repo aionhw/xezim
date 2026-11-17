@@ -4062,6 +4062,7 @@ impl Simulator {
                 static_key: key,
                 static_slice: Some((dst as u32, src as u32, len as u32)),
                 this_handle: None,
+                collection: None,
             },
             delay,
         );
@@ -4542,14 +4543,23 @@ impl Simulator {
                 } else {
                     false
                 };
-                let value = if let Some((dst, src, len)) = entry.static_slice {
-                    let mut stored = self.eval_expr(&lhs);
-                    stored.copy_bits_from(dst as usize, &entry.value, src as usize, len as usize);
-                    stored
+                if let Some(cap) = entry.collection {
+                    self.store_captured_collection(lhs, *cap);
                 } else {
-                    entry.value
-                };
-                self.assign_value(&lhs, &value);
+                    let value = if let Some((dst, src, len)) = entry.static_slice {
+                        let mut stored = self.eval_expr(&lhs);
+                        stored.copy_bits_from(
+                            dst as usize,
+                            &entry.value,
+                            src as usize,
+                            len as usize,
+                        );
+                        stored
+                    } else {
+                        entry.value
+                    };
+                    self.assign_value(&lhs, &value);
+                }
                 if pushed_root {
                     self.pop_local_frame();
                 }
