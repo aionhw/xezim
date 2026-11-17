@@ -1078,6 +1078,18 @@ impl Simulator {
                 }
             }
         }
+        // §23.9 / §6.21: a non-class formal or local of the active routine
+        // (unless typed via an unresolved class type parameter resolved below)
+        // shadows any `this` property or outer class variable of the same name.
+        if !self.method_local_base.is_empty()
+            && self.method_local_shadows(vname)
+            && !self
+                .var_class_types
+                .get(vname)
+                .is_some_and(|c| self.resolve_type_param_binding(c).is_some())
+        {
+            return None;
+        }
         // Member of `this` (the current object) — IEEE 1800-2023 §8.14:
         // inside a class method, properties of `this` take precedence over
         // outer / unrelated procedural locals in `var_class_types`.
@@ -1096,6 +1108,32 @@ impl Simulator {
                     if let Some(c) = self.bound_prop_class(inst, vname, &tn) {
                         return Some(c);
                     }
+                    return None;
+                }
+                // Non-class property of `this` (`string`, `int`, queue, etc.):
+                // `class_prop_type_named` returns None for builtins, so stop
+                // here rather than falling through to an outer/module var.
+                if let Some((_, cd)) = self.prop_owners(&inst.class_name).get(vname) {
+                    if !cd.static_properties.contains(vname)
+                        || cd.string_properties.contains(vname)
+                    {
+                        return None;
+                    }
+                } else if self.class_declares_nonstatic_collection(&inst.class_name, vname) {
+                    return None;
+                }
+            }
+        }
+        if let Some(Some(cls)) = self.class_context_stack.last() {
+            if let Some(tn) = self.class_prop_type_named(cls, vname) {
+                if self.module.classes.contains_key(&tn) || tn.contains('#') {
+                    return Some(tn);
+                }
+                return None;
+            }
+            if let Some((_, cd)) = self.prop_owners(cls).get(vname) {
+                if cd.static_properties.contains(vname) && cd.string_properties.contains(vname) {
+                    return None;
                 }
             }
         }

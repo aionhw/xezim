@@ -2104,7 +2104,10 @@ impl Simulator {
             // here rather than at one call site.
             ExprKind::Ident(hier) if hier.path.len() == 1 => {
                 let name = &hier.path[0].name.name;
-                if self.local_stack.iter().rev().any(|m| m.contains_key(name)) {
+                // Only the active routine's own frames shadow `this.<name>`
+                // (§23.9, §6.21); a caller's frame below `method_local_base`
+                // must not hide a class property of the same name.
+                if self.method_local_shadows(name) {
                     return false;
                 }
                 (self.this_stack.last().copied().flatten(), name.clone())
@@ -2130,17 +2133,22 @@ impl Simulator {
             }
             _ => return false,
         };
-        let handle = match handle_opt {
-            Some(h) => h,
-            None => return false,
-        };
-        let inst = match self.heap.get(handle).and_then(|c| c.as_ref()) {
-            Some(i) => i,
+        let class_name: &str = match handle_opt {
+            Some(h) => match self.heap.get(h).and_then(|c| c.as_ref()) {
+                Some(i) => &i.class_name,
+                None => return false,
+            },
+            None if matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() == 1) => {
+                match self.class_context_stack.last().and_then(|c| c.as_deref()) {
+                    Some(cls) => cls,
+                    None => return false,
+                }
+            }
             None => return false,
         };
         // Does a class on the inheritance chain declare `prop` as a string
         // property?
-        self.class_string_props_of(&inst.class_name)
+        self.class_string_props_of(class_name)
             .iter()
             .any(|p| *p == prop)
     }
@@ -2241,8 +2249,8 @@ impl Simulator {
                 }
                 let name = seg.name.name.as_str();
                 // §8.7: a bare property name inside a method is `this.<name>`
-                // unless a local or formal shadows it (§6.21).
-                if !self.local_stack.iter().any(|m| m.contains_key(name)) {
+                // unless a local or formal of the active routine shadows it (§6.21).
+                if !self.method_local_shadows(name) {
                     let cls: Option<String> = match self.this_stack.last().copied().flatten() {
                         Some(hd) => self
                             .heap
@@ -2446,10 +2454,25 @@ impl Simulator {
     /// state.  Used by `class_member_is_string` (a `&self` method) to resolve
     /// `obj.<prop>` where `obj` is a local whose stored `Value` is the handle.
     pub(super) fn peek_local_handle(&self, name: &str) -> Option<usize> {
-        // Innermost-out search of the call frames.
-        for m in self.local_stack.iter().rev() {
+        // Innermost-out search of the active routine's frames.
+        let base = self.method_local_base.last().copied().unwrap_or(0);
+        for m in self.local_stack.get(base..).unwrap_or(&[]).iter().rev() {
             if let Some(v) = m.get(name) {
                 return v.to_u64().map(|h| h as usize);
+            }
+        }
+        // Class property of `this` shadows an outer/module variable (§23.9, §8.11).
+        if let Some(Some(handle)) = self.this_stack.last() {
+            if let Some(inst) = self.heap.get(*handle).and_then(|o| o.as_ref()) {
+                let key = self
+                    .shadowed_prop_key(name, false)
+                    .unwrap_or_else(|| name.to_string());
+                if let Some(v) = inst.properties.get(&key) {
+                    return v.to_u64().map(|h| h as usize);
+                }
+                if self.class_declares_property(&inst.class_name, name) {
+                    return None;
+                }
             }
         }
         // A module-scope class-handle declaration (`holder h;` in a `module`,

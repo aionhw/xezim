@@ -1436,6 +1436,7 @@ impl Simulator {
         let n = h.path[0].name.name.as_str();
         let m = member.name.as_str();
         if matches!(m, "size" | "num" | "triggered" | "status")
+            || Self::is_parenless_zero_arg_builtin(m)
             || matches!(n, "super" | "this" | "process")
             || self.name_stats_on
             || self.rand_receiver.is_some()
@@ -6010,9 +6011,24 @@ impl Simulator {
                 // the empty leading bytes and always returned 0.
                 if let ExprKind::Ident(_hier) = &expr.kind {
                     let nm = base_nm.as_deref().unwrap_or("");
-                    // The running task frame decides for its own formals: a
-                    // string flag another frame left on the name is not it.
-                    if self.frame_name_is_string(nm) {
+                    let active_cls = self
+                        .this_stack
+                        .last()
+                        .copied()
+                        .flatten()
+                        .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+                        .map(|i| i.class_name.as_str())
+                        .or_else(|| self.class_context_stack.last().and_then(|c| c.as_deref()));
+                    let is_str = _hier.path.len() == 1
+                        && !self.method_local_shadows(nm)
+                        && active_cls.is_some_and(|c| self.class_declares_property(c, nm));
+                    if if is_str {
+                        self.class_member_is_string(expr)
+                    } else {
+                        // The running task frame decides for its own formals: a
+                        // string flag another frame left on the name is not it.
+                        self.frame_name_is_string(nm)
+                    } {
                         let content = self.eval_expr(expr).sv_string_bytes();
                         let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
                         let byte = content.get(i).copied().unwrap_or(0);

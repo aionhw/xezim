@@ -8866,6 +8866,7 @@ impl<'a> BytecodeCompiler<'a> {
                     && h.root.is_none()
                     && h.path.len() == 1
                     && h.path[0].selects.is_empty()
+                    && !self.local_var_regs.contains_key(raw.as_str())
                     && self.string_member_names.contains(raw.as_str())
                 {
                     return true;
