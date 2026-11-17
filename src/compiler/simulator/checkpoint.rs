@@ -1553,6 +1553,7 @@ checkpoint_state!(
     sampled_watches,
     saw_fatal,
     sdf_delays,
+    select_store_copies,
     semaphore_get_waiters,
     semaphores,
     sensitivity_trigger_count,

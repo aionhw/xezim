@@ -2141,6 +2141,29 @@ impl Simulator {
         Some(changed)
     }
 
+    /// Whether storing `val`'s bits (bit 0 up) over `cur[lsb..=msb]`, clipped
+    /// to `cur`'s width, changes a bit.
+    fn range_store_differs(cur: &Value, lsb: usize, msb: usize, val: &Value) -> bool {
+        let top = msb.min((cur.width as usize).saturating_sub(1));
+        (lsb..=top).any(|i| cur.get_bit(i) != val.get_bit(i - lsb))
+    }
+
+    /// Store `val`'s bits (bit 0 up) over `cur[lsb..=msb]`, clipped to
+    /// `cur`'s width, in the stored value itself. Returns whether a bit
+    /// changed.
+    fn range_store(cur: &mut Value, lsb: usize, msb: usize, val: &Value) -> bool {
+        let top = msb.min((cur.width as usize).saturating_sub(1));
+        let mut changed = false;
+        for i in lsb..=top {
+            let nb = val.get_bit(i - lsb);
+            if cur.get_bit(i) != nb {
+                cur.set_bit(i, nb);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Outlined from `assign_value_inner` (see `exec_stmt_blocking_assign`): keeps
     /// the dispatcher's stack frame small.
     #[inline(never)]
@@ -2279,6 +2302,54 @@ impl Simulator {
                         return false; // §11.5.1: x/z index selects nothing
                     }
                     let idx = idx_v.to_i64().unwrap_or(i64::MIN);
+                    // A variable stored whole in one known place — the call
+                    // frame or a table signal — takes the element in place.
+                    // Reading the vector out, setting the element's bits and
+                    // storing it back copied and compared the whole vector
+                    // several times for each element written: a loop filling
+                    // a 1-Mibit buffer spent its time there.
+                    if let Some(store) = self.whole_var_store(&base) {
+                        let width = match store {
+                            VarStore::Frame => self.frame_get(&base).map_or(0, |v| v.width),
+                            VarStore::Table(id) => self.signal_table[id].width,
+                        };
+                        if width > elem_w {
+                            if let Some(lo) = self
+                                .packed_elem_lsb(&pkey, idx, elem_w)
+                                .filter(|lo| lo + (elem_w as usize) <= width as usize)
+                            {
+                                let piece = val.resize(elem_w);
+                                match store {
+                                    VarStore::Frame => {
+                                        if let Some(cur) = self
+                                            .local_stack
+                                            .last_mut()
+                                            .and_then(|l| l.get_mut(&*base))
+                                        {
+                                            return cur.copy_bits_from(
+                                                lo,
+                                                &piece,
+                                                0,
+                                                elem_w as usize,
+                                            );
+                                        }
+                                    }
+                                    VarStore::Table(id) => {
+                                        if let Some(changed) =
+                                            self.splice_signal_bits(id, lo, &piece)
+                                        {
+                                            if changed {
+                                                self.touch_elem_base(&base);
+                                            }
+                                            return changed;
+                                        }
+                                    }
+                                }
+                            } else {
+                                return false;
+                            }
+                        }
+                    }
                     // Frame-aware storage: subroutine locals live in
                     // the call frame, module vars in the signal maps —
                     // get/set_local_or_signal covers both.
@@ -2292,6 +2363,7 @@ impl Simulator {
                     if let Some(key) = storage_key {
                         if let Some(mut cur) = self.get_local_or_signal(&key) {
                             if cur.width > elem_w {
+                                self.select_store_copies += u64::from(cur.width > 64);
                                 let piece = val.resize(elem_w);
                                 let Some(lo) = self.packed_elem_lsb(&pkey, idx, elem_w) else {
                                     return false;
@@ -2684,24 +2756,26 @@ impl Simulator {
                     // not itself a leaf and the phantom-element path below
                     // still applies.
                     if i >= 0
-                        && let Some(cur) = self
+                        && self
                             .local_stack
                             .last()
-                            .and_then(|f| f.get(base.as_ref()))
-                            .cloned()
+                            .is_some_and(|f| f.contains_key(base.as_ref()))
                         && !self.frame_name_is_string(&base)
                     {
+                        // The frame's value takes the bit in place: a copy
+                        // of the whole local for each bit written made a
+                        // bit loop over a wide local quadratic.
                         let bit = i as usize;
-                        if bit < cur.width as usize {
+                        if let Some(cur) = self
+                            .local_stack
+                            .last_mut()
+                            .and_then(|f| f.get_mut(base.as_ref()))
+                            && bit < cur.width as usize
+                        {
                             let nb = val.bits_first();
-                            let old = cur.get_bit(bit);
-                            let changed = old != nb;
+                            let changed = cur.get_bit(bit) != nb;
                             if changed {
-                                let mut nv = cur;
-                                nv.set_bit(bit, nb);
-                                if let Some(frame) = self.local_stack.last_mut() {
-                                    frame.insert(base.to_string(), nv);
-                                }
+                                cur.set_bit(bit, nb);
                             }
                             return changed;
                         }
@@ -5838,19 +5912,12 @@ impl Simulator {
                                 _ => (msb, lsb),
                             };
                             if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                if let Some(cur) = inst.properties.get(&fname).cloned() {
-                                    let width = cur.width as usize;
-                                    let mut nv = cur.clone();
-                                    let mut changed = false;
-                                    for i in lsb..=msb.min(width.saturating_sub(1)) {
-                                        let nb = val.get_bit(i - lsb);
-                                        if nv.get_bit(i) != nb {
-                                            nv.set_bit(i, nb);
-                                            changed = true;
-                                        }
-                                    }
-                                    if changed {
-                                        inst.properties.insert(fname, nv);
+                                // The property takes the bits in place (§11.5.1); it is
+                                // noted as written only when one changes.
+                                if let Some(cur) = inst.properties.get(&fname) {
+                                    let changed = Self::range_store_differs(cur, lsb, msb, val);
+                                    if changed && let Some(cur) = inst.properties.get_mut(&fname) {
+                                        Self::range_store(cur, lsb, msb, val);
                                     }
                                     return changed;
                                 }
@@ -5862,39 +5929,20 @@ impl Simulator {
                         // local_stack frame
                         if !self.local_stack.is_empty() {
                             let last_idx = self.local_stack.len() - 1;
-                            if let Some(cur) = self.local_stack[last_idx].get(&bare).cloned() {
-                                let width = cur.width as usize;
-                                let mut nv = cur.clone();
-                                let mut changed = false;
-                                for i in lsb..=msb.min(width.saturating_sub(1)) {
-                                    let nb = val.get_bit(i - lsb);
-                                    if nv.get_bit(i) != nb {
-                                        nv.set_bit(i, nb);
-                                        changed = true;
-                                    }
-                                }
-                                if changed {
-                                    self.local_stack[last_idx].insert(bare.clone(), nv);
-                                }
-                                return changed;
+                            if let Some(cur) = self.local_stack[last_idx].get_mut(&bare) {
+                                // The local takes the bits in place.
+                                return Self::range_store(cur, lsb, msb, val);
                             }
                         }
                         // this.<prop>
                         if let Some(Some(handle)) = self.this_stack.last().copied() {
                             if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                if let Some(cur) = inst.properties.get(&bare).cloned() {
-                                    let width = cur.width as usize;
-                                    let mut nv = cur.clone();
-                                    let mut changed = false;
-                                    for i in lsb..=msb.min(width.saturating_sub(1)) {
-                                        let nb = val.get_bit(i - lsb);
-                                        if nv.get_bit(i) != nb {
-                                            nv.set_bit(i, nb);
-                                            changed = true;
-                                        }
-                                    }
-                                    if changed {
-                                        inst.properties.insert(bare, nv);
+                                // The property takes the bits in place (§11.5.1); it is
+                                // noted as written only when one changes.
+                                if let Some(cur) = inst.properties.get(&bare) {
+                                    let changed = Self::range_store_differs(cur, lsb, msb, val);
+                                    if changed && let Some(cur) = inst.properties.get_mut(&bare) {
+                                        Self::range_store(cur, lsb, msb, val);
                                     }
                                     return changed;
                                 }
@@ -5903,19 +5951,12 @@ impl Simulator {
                     }
                     // signals slow-path
                     let name = self.resolve_hier_name(hier);
-                    if let Some(cur) = self.signals.get(&*name).cloned() {
-                        let width = cur.width as usize;
-                        let mut nv = cur.clone();
-                        let mut changed = false;
-                        for i in lsb..=msb.min(width.saturating_sub(1)) {
-                            let nb = val.get_bit(i - lsb);
-                            if nv.get_bit(i) != nb {
-                                nv.set_bit(i, nb);
-                                changed = true;
-                            }
-                        }
+                    if let Some(cur) = self.signals.get(&*name) {
+                        let changed = Self::range_store_differs(cur, lsb, msb, val);
                         if changed {
-                            self.signals.insert(name.to_string(), nv);
+                            if let Some(cur) = self.signals.get_mut(&*name) {
+                                Self::range_store(cur, lsb, msb, val);
+                            }
                             self.mark_dirty(&name);
                         }
                         return changed;
@@ -5948,19 +5989,12 @@ impl Simulator {
                         if self.receiver_may_be_handle(base) {
                             let pname = member.name.clone();
                             if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                if let Some(cur) = inst.properties.get(&pname).cloned() {
-                                    let width = cur.width as usize;
-                                    let mut nv = cur.clone();
-                                    let mut changed = false;
-                                    for i in lsb..=msb.min(width.saturating_sub(1)) {
-                                        let nb = val.get_bit(i - lsb);
-                                        if nv.get_bit(i) != nb {
-                                            nv.set_bit(i, nb);
-                                            changed = true;
-                                        }
-                                    }
-                                    if changed {
-                                        inst.properties.insert(pname, nv);
+                                // The property takes the bits in place (§11.5.1); it is
+                                // noted as written only when one changes.
+                                if let Some(cur) = inst.properties.get(&pname) {
+                                    let changed = Self::range_store_differs(cur, lsb, msb, val);
+                                    if changed && let Some(cur) = inst.properties.get_mut(&pname) {
+                                        Self::range_store(cur, lsb, msb, val);
                                     }
                                     return changed;
                                 }

@@ -3428,6 +3428,97 @@ impl Simulator {
         false
     }
 
+    /// Where the variable `name` is stored, when a by-name read
+    /// (`get_local_or_signal`) and a by-name write (`set_local_or_signal`)
+    /// of it both address that one place: the innermost call frame, or a
+    /// table signal. `None` for every other name (a name-keyed entry, a
+    /// packed member, a scope-qualified twin a read would prefer): the
+    /// caller then reads and writes the whole value by name.
+    pub(super) fn whole_var_store(&self, name: &str) -> Option<VarStore> {
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|l| l.contains_key(name))
+        {
+            return Some(VarStore::Frame);
+        }
+        let id = *self.signal_name_to_id.get(name)?;
+        if !name.contains('.')
+            && let Some(hint) = self.name_resolve_hint.borrow().as_deref()
+        {
+            // An undotted read tries the hinted scope's `<hint>.<name>`
+            // first; a write does not.
+            let mut k = self.hint_key_scratch.borrow_mut();
+            k.clear();
+            k.push_str(hint);
+            k.push('.');
+            k.push_str(name);
+            if self
+                .signal_name_to_id
+                .get(k.as_str())
+                .is_some_and(|&h| h != id)
+            {
+                return None;
+            }
+        }
+        (!is_packed_id(id)).then_some(VarStore::Table(id))
+    }
+
+    /// §11.5.1/§7.4.1: replace bits `[lo, lo + piece.width)` of table signal
+    /// `id` by `piece`, editing the stored value in place: no copy of the
+    /// whole vector, and only the written bits are compared. The marks a
+    /// changed store leaves are those of a whole-value store of the same
+    /// result (`store_named_cell`). Returns whether a bit changed.
+    ///
+    /// `None`, with nothing done, when a whole-value store does more than
+    /// set bits and has to run instead: a forced or traced signal, a string,
+    /// a real, a value the table does not hold at the signal's declared
+    /// width and signedness, x/z bits headed into a 2-state signal, or a
+    /// range outside the vector.
+    pub(super) fn splice_signal_bits(
+        &mut self,
+        id: usize,
+        lo: usize,
+        piece: &Value,
+    ) -> Option<bool> {
+        if is_packed_id(id)
+            || self.warn_x
+            || self.value_trace_ids.is_some()
+            || (!self.forced_signals.is_empty() && self.forced_signals.contains_key(&id))
+            || self.signal_is_string.get(id).copied().unwrap_or(false)
+            || piece.is_real
+            || piece.is_fill
+        {
+            return None;
+        }
+        let w = self.signal_widths[id];
+        let cur = &self.signal_table[id];
+        if w == 0
+            || cur.width != w
+            || cur.is_real
+            || cur.is_fill
+            || cur.is_signed != self.signal_signed[id]
+            || lo.checked_add(piece.width as usize)? > w as usize
+            || (self.signal_two_state.get(id).copied().unwrap_or(false) && piece.has_xz())
+        {
+            return None;
+        }
+        if !self.signal_table[id].copy_bits_from(lo, piece, 0, piece.width as usize) {
+            return Some(false);
+        }
+        self.mark_dirty_id(id);
+        let (v, x) = self.signal_table[id].raw_bits();
+        if id < self.signal_has_xz.len() {
+            self.signal_has_xz[id] = u8::from(x != 0);
+        }
+        if id < self.signal_inline_bits.len() {
+            self.signal_inline_bits[id] = [v, x];
+        }
+        write_sig_done!(self, id, true);
+        self.table_modified = true;
+        Some(true)
+    }
+
     pub(super) fn get_queue_size(&self, obj_name: &str) -> u64 {
         let raw = if let Some(v) = self.signals.get(&Self::name_with_suffix(obj_name, ".size")) {
             v.to_u64().unwrap_or(0)

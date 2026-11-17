@@ -4651,6 +4651,7 @@ impl Simulator {
             cond_waiter_rechecks: 0,
             vm_direct_calls: 0,
             queue_elem_moves: 0,
+            select_store_copies: 0,
             local_meta_reapplies: 0,
             local_meta_swaps: 0,
             local_meta_scans: 0,

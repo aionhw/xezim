@@ -999,6 +999,96 @@ macro_rules! vcd_mark {
     }};
 }
 
+/// The bookkeeping of a completed store into `signal_table[id]` (`changed`:
+/// whether the stored value differs from the one it replaced): what
+/// `write_sig!` does once the new value is in the table. A store that edits
+/// the table value in place ends with this, so it leaves the same marks as a
+/// whole-value `write_sig!`.
+macro_rules! write_sig_done {
+    ($self:ident, $id:expr_2021, $changed:expr_2021) => {{
+        let __wsig_id = $id;
+        let __wsig_changed = $changed;
+        // Expression-backed procedural assignments use per-signal
+        // generations as their sensitivity set. Keep the usual no-active-
+        // assignment path to one branch; only real value changes advance
+        // the generation.
+        if __wsig_changed
+            && !$self.active_force_exprs.is_empty()
+            && __wsig_id < $self.active_force_signal_epochs.len()
+        {
+            $self.active_force_signal_epochs[__wsig_id] =
+                $self.active_force_signal_epochs[__wsig_id].wrapping_add(1);
+            $self.force_epoch_gen = $self.force_epoch_gen.wrapping_add(1);
+        }
+        // Incremental VCD: mark this write dirty (no-op when the dump is off
+        // or the full scan is forced). Superset-safe — the flush re-checks
+        // prev vs cur, so marking an unchanged write costs only a skip.
+        vcd_mark!($self, __wsig_id);
+        // O1 measurement: stamp the signal's last-change phase.
+        if $self.event_measure && !$self.armed_edge && __wsig_id < $self.sig_last_change.len() {
+            $self.sig_last_change[__wsig_id] = $self.event_phase;
+        }
+        // Arm only gateable edge blocks that actually read this signal.
+        // The dense bitmap keeps unrelated writes a single cheap branch;
+        // positive hits use the sparse CSR fanout built after compile.
+        if $self.armed_edge
+            && ((__wsig_id >> 6) < $self.armed_input_bitmap.len())
+            && ($self.armed_input_bitmap[__wsig_id >> 6] >> (__wsig_id & 63)) & 1 != 0
+        {
+            let (lo, hi) = $self.armed_input_ranges[__wsig_id];
+            for __k in lo as usize..hi as usize {
+                let __bi = $self.armed_input_blocks[__k] as usize;
+                $self.edge_block_armed[__bi] |= EDGE_ARMED;
+            }
+        }
+        // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
+        // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
+        // the borrow stays a direct field access in macro-expanded contexts.
+        if ($self.dirty_edge || $self.dirty_edge_shadow)
+            && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
+        {
+            let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
+            if __ep >= 0 && !$self.edge_pos_seen[__ep as usize] {
+                $self.edge_pos_seen[__ep as usize] = true;
+                $self.changed_edge_pos.push(__ep as usize);
+            }
+        }
+        // Parked-waiter index: queue a watched signal that changed, for
+        // the next waiter drain and the next snapshot. One length
+        // compare while no waiter is indexed.
+        if __wsig_changed
+            && __wsig_id < $self.event_waiters.watch.len()
+            && $self.event_waiters.watch[__wsig_id] & event_waiters::WATCH_ANY != 0
+        {
+            $self.event_waiters.note_write(__wsig_id);
+        }
+        // §9.2 re-trigger: a blocking write to an edge-sensitive signal
+        // made WHILE an edge block executes must re-run edge detection
+        // for that signal (drain_edge_exec_rescan) — record its position.
+        // One bool load when not inside an edge block.
+        if ($self.in_edge_block || $self.in_edge_cont)
+            && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
+        {
+            let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
+            if __ep >= 0 && !$self.edge_exec_seen[__ep as usize] {
+                $self.edge_exec_seen[__ep as usize] = true;
+                $self.edge_exec_wrote.push(__ep as usize);
+            }
+        }
+        // §38.36.1 cbValueChange: report the change right away, in the
+        // region of the write. One emptiness check while nothing is
+        // watched. Writes that bypass this macro are caught by the poll
+        // at the end of each settle and delta (`vpi_cb::vpi_checkpoint`).
+        // The dispatcher takes the raw self-pointer: this macro expands
+        // under live borrows of other fields.
+        if !$self.dpi_value_change_cbs.is_empty()
+            && $self.dpi_value_change_cbs.contains_key(&__wsig_id)
+        {
+            vpi_cb::vpi_vc_written($self.vpi_self_ptr, __wsig_id);
+        }
+    }};
+}
+
 macro_rules! write_sig {
     ($self:ident, $id:expr_2021, $val:expr_2021) => {{
         let __wsig_id = $id;
@@ -1094,84 +1184,7 @@ macro_rules! write_sig {
                 }
             }
             $self.signal_table[__wsig_id] = __wsig_val;
-            // Expression-backed procedural assignments use per-signal
-            // generations as their sensitivity set. Keep the usual no-active-
-            // assignment path to one branch; only real value changes advance
-            // the generation.
-            if __wsig_changed
-                && !$self.active_force_exprs.is_empty()
-                && __wsig_id < $self.active_force_signal_epochs.len()
-            {
-                $self.active_force_signal_epochs[__wsig_id] =
-                    $self.active_force_signal_epochs[__wsig_id].wrapping_add(1);
-                $self.force_epoch_gen = $self.force_epoch_gen.wrapping_add(1);
-            }
-            // Incremental VCD: mark this write dirty (no-op when the dump is off
-            // or the full scan is forced). Superset-safe — the flush re-checks
-            // prev vs cur, so marking an unchanged write costs only a skip.
-            vcd_mark!($self, __wsig_id);
-            // O1 measurement: stamp the signal's last-change phase.
-            if $self.event_measure && !$self.armed_edge && __wsig_id < $self.sig_last_change.len() {
-                $self.sig_last_change[__wsig_id] = $self.event_phase;
-            }
-            // Arm only gateable edge blocks that actually read this signal.
-            // The dense bitmap keeps unrelated writes a single cheap branch;
-            // positive hits use the sparse CSR fanout built after compile.
-            if $self.armed_edge
-                && ((__wsig_id >> 6) < $self.armed_input_bitmap.len())
-                && ($self.armed_input_bitmap[__wsig_id >> 6] >> (__wsig_id & 63)) & 1 != 0
-            {
-                let (lo, hi) = $self.armed_input_ranges[__wsig_id];
-                for __k in lo as usize..hi as usize {
-                    let __bi = $self.armed_input_blocks[__k] as usize;
-                    $self.edge_block_armed[__bi] |= EDGE_ARMED;
-                }
-            }
-            // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
-            // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
-            // the borrow stays a direct field access in macro-expanded contexts.
-            if ($self.dirty_edge || $self.dirty_edge_shadow)
-                && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
-            {
-                let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
-                if __ep >= 0 && !$self.edge_pos_seen[__ep as usize] {
-                    $self.edge_pos_seen[__ep as usize] = true;
-                    $self.changed_edge_pos.push(__ep as usize);
-                }
-            }
-            // Parked-waiter index: queue a watched signal that changed, for
-            // the next waiter drain and the next snapshot. One length
-            // compare while no waiter is indexed.
-            if __wsig_changed
-                && __wsig_id < $self.event_waiters.watch.len()
-                && $self.event_waiters.watch[__wsig_id] & event_waiters::WATCH_ANY != 0
-            {
-                $self.event_waiters.note_write(__wsig_id);
-            }
-            // §9.2 re-trigger: a blocking write to an edge-sensitive signal
-            // made WHILE an edge block executes must re-run edge detection
-            // for that signal (drain_edge_exec_rescan) — record its position.
-            // One bool load when not inside an edge block.
-            if ($self.in_edge_block || $self.in_edge_cont)
-                && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
-            {
-                let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
-                if __ep >= 0 && !$self.edge_exec_seen[__ep as usize] {
-                    $self.edge_exec_seen[__ep as usize] = true;
-                    $self.edge_exec_wrote.push(__ep as usize);
-                }
-            }
-            // §38.36.1 cbValueChange: report the change right away, in the
-            // region of the write. One emptiness check while nothing is
-            // watched. Writes that bypass this macro are caught by the poll
-            // at the end of each settle and delta (`vpi_cb::vpi_checkpoint`).
-            // The dispatcher takes the raw self-pointer: this macro expands
-            // under live borrows of other fields.
-            if !$self.dpi_value_change_cbs.is_empty()
-                && $self.dpi_value_change_cbs.contains_key(&__wsig_id)
-            {
-                vpi_cb::vpi_vc_written($self.vpi_self_ptr, __wsig_id);
-            }
+            write_sig_done!($self, __wsig_id, __wsig_changed);
         }
     }};
 }
@@ -7393,6 +7406,15 @@ impl Default for SignalMap {
     }
 }
 
+/// The single place a whole variable is stored (`Simulator::whole_var_store`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VarStore {
+    /// The innermost call frame.
+    Frame,
+    /// The table signal with this id.
+    Table(usize),
+}
+
 /// Mid-exec ts aborts tolerated per block before demotion.
 const TS_ABORT_DEMOTE: u16 = 8;
 /// Flag bit in a `ts_save_list` id marking a wide save entry (signal ids
@@ -10011,6 +10033,10 @@ pub struct Simulator {
     /// moved one at a time by name, because the queue's elements are not a
     /// single run of plain values (`[PROF] queue_elem_moves`).
     queue_elem_moves: u64,
+    /// Stores to an element or member of a packed vector wider than 64 bits
+    /// that read the whole vector out and stored it back instead of editing
+    /// it in place (`[PROF] select_store_copies`).
+    select_store_copies: u64,
     /// Checks of the running process's claims for displaced local metadata
     /// (`reapply_local_meta`, `[PROF] local_meta_reapplies`), the displaced
     /// declarations installed again (`[PROF] local_meta_swaps`), and the

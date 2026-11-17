@@ -4636,13 +4636,22 @@ impl Simulator {
                 two_state,
                 signed,
             } => {
-                let whole = self
+                // Read the member's bits out of the stored value: a copy of
+                // the whole property for every member read cost a full
+                // vector copy per element of a wide packed array.
+                let absent;
+                let whole = match self
                     .heap
                     .get(*handle)
                     .and_then(|o| o.as_ref())
                     .and_then(|i| i.properties.get(prop))
-                    .cloned()
-                    .unwrap_or_else(|| Value::zero(*total));
+                {
+                    Some(v) => v,
+                    None => {
+                        absent = Value::zero(*total);
+                        &absent
+                    }
+                };
                 let mut out = Value::zero((*w).max(1));
                 for i in 0..*w {
                     out.set_bit(i as usize, whole.get_bit((off + i) as usize));
@@ -4667,13 +4676,19 @@ impl Simulator {
                 w,
                 cell_w,
             } => {
-                let cell = self
+                let absent;
+                let cell = match self
                     .heap
                     .get(*handle)
                     .and_then(|o| o.as_ref())
                     .and_then(|i| i.properties.get(key))
-                    .cloned()
-                    .unwrap_or_else(|| Value::zero((*cell_w).max(1)));
+                {
+                    Some(v) => v,
+                    None => {
+                        absent = Value::zero((*cell_w).max(1));
+                        &absent
+                    }
+                };
                 let mut out = Value::zero((*w).max(1));
                 for i in 0..*w {
                     out.set_bit(i as usize, cell.get_bit((off + i) as usize));
@@ -4704,6 +4719,17 @@ impl Simulator {
                 } else {
                     val.clone()
                 };
+                // A property stored at its full width takes the member's
+                // bits in place (§7.4.1): reading the whole value out,
+                // setting them and storing it back copied and compared the
+                // whole vector for each member written.
+                if val.width >= *w
+                    && let Some(Some(inst)) = self.heap.get_mut(*handle)
+                    && inst.properties.get(prop).is_some_and(|c| c.width == *total)
+                    && let Some(cur) = inst.properties.get_mut(prop)
+                {
+                    return cur.copy_bits_from(*off as usize, val, 0, *w as usize);
+                }
                 let mut whole = self
                     .heap
                     .get(*handle)
@@ -4714,6 +4740,7 @@ impl Simulator {
                 if whole.width != *total {
                     whole = whole.resize(*total);
                 }
+                self.select_store_copies += u64::from(*total > 64);
                 let before = whole.clone();
                 for i in 0..*w {
                     whole.set_bit((off + i) as usize, val.get_bit(i as usize));
@@ -4741,7 +4768,15 @@ impl Simulator {
                 cell_w,
             } => {
                 // Read-modify-write the one cell: the packed-array member (or
-                // the part-selected element) is a bit field of it.
+                // the part-selected element) is a bit field of it. A cell
+                // already at its width is edited in place.
+                if val.width >= *w
+                    && let Some(Some(inst)) = self.heap.get_mut(*handle)
+                    && inst.properties.get(key).is_some_and(|c| c.width >= *cell_w)
+                    && let Some(cur) = inst.properties.get_mut(key)
+                {
+                    return cur.copy_bits_from(*off as usize, val, 0, *w as usize);
+                }
                 let mut cell = self
                     .heap
                     .get(*handle)
@@ -4752,6 +4787,7 @@ impl Simulator {
                 if cell.width < *cell_w {
                     cell = cell.resize(*cell_w);
                 }
+                self.select_store_copies += u64::from(*cell_w > 64);
                 let before = cell.clone();
                 for i in 0..*w {
                     cell.set_bit((off + i) as usize, val.get_bit(i as usize));

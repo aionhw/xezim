@@ -2912,6 +2912,7 @@ impl Simulator {
         );
         chatter!("[PROF] vm_direct_calls={}", self.vm_direct_calls);
         chatter!("[PROF] queue_elem_moves={}", self.queue_elem_moves);
+        chatter!("[PROF] select_store_copies={}", self.select_store_copies);
         chatter!("[PROF] local_meta_reapplies={}", self.local_meta_reapplies);
         chatter!(
             "[PROF] local_meta_swaps={} local_meta_scans={}",
