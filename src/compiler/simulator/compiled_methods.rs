@@ -3308,6 +3308,7 @@ impl Simulator {
                         .filter(|p| !p.is_empty())
                         .or_else(|| self.module.class_decl_pkg.get(cname).map(String::as_str))
                         .map(|p| (p.to_string(), &self.module.parameters));
+                    compiler.method_pkg_imports = Some(&self.module.def_pkg_imports);
                     compiler.class_scoped_enums = Some(match &self.class_scoped_enum_cache {
                         Some(rc) => rc.clone(),
                         None => {

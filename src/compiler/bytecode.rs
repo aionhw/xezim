@@ -2039,6 +2039,12 @@ pub struct BytecodeCompiler<'a> {
     /// compiled in method mode, and the table holding its `pkg::name`
     /// parameters.
     pub method_pkg: Option<(String, &'a HashMap<String, Value>)>,
+    /// §26.3: every package's imports (`def_pkg_imports`), for the names a
+    /// package's code reads through them.
+    pub method_pkg_imports: Option<&'a HashMap<String, Vec<(String, Option<String>)>>>,
+    /// The declaring package of each inlined callee on `inlining_stack`
+    /// (`None`: a callee declared outside a package).
+    inline_pkg_stack: Vec<Option<String>>,
     /// String-typed formal names (plan-provided). Any use of one outside the
     /// pass-through surface (read, compare, assign, concat, call arg, return)
     /// bails: indexing/string-methods/arith take interpreter-only paths.
@@ -2449,6 +2455,8 @@ impl<'a> BytecodeCompiler<'a> {
             method_ret_is_collection: false,
             free_function_mode: false,
             method_pkg: None,
+            method_pkg_imports: None,
+            inline_pkg_stack: Vec::new(),
             string_formal_names: HashSet::default(),
             string_member_names: HashSet::default(),
             coll_member_names: HashSet::default(),
@@ -4535,6 +4543,8 @@ impl<'a> BytecodeCompiler<'a> {
         }
         self.local_var_regs
             .insert(fd.name.name.name.clone(), (ret_slot, ret_w));
+        let callee_pkg = self.inlined_callee_pkg(&name, fd.span, false);
+        self.inline_pkg_stack.push(callee_pkg);
         self.inlining_stack.push(name);
         // AST fallback MUST be off inside an inlined body. `emit_fallback`
         // defers a statement to the AST interpreter, which resolves names
@@ -4574,6 +4584,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.named_block_patches = saved_named_block_patches;
         self.allow_ast_fallback = saved_fallback;
         self.inlining_stack.pop();
+        self.inline_pkg_stack.pop();
         self.local_var_regs = saved_locals;
         self.local_var_is_string = saved_local_strings;
         self.local_var_is_real = saved_local_reals;
@@ -5320,6 +5331,11 @@ impl<'a> BytecodeCompiler<'a> {
             // interpreter carrying the formals and locals it names (see
             // `fb_carry`); one that cannot be carried fails the inline, and
             // the call keeps the ordinary interpreted path.
+            let callee_pkg = self
+                .tasks
+                .and_then(|t| t.get(task_name))
+                .and_then(|td| self.inlined_callee_pkg(task_name, td.span, true));
+            self.inline_pkg_stack.push(callee_pkg);
             self.inlining_stack.push(task_name.to_string());
             let saved_ret = self.inline_ret;
             let saved_ret_jumps = std::mem::take(&mut self.inline_ret_jumps);
@@ -5346,6 +5362,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.loop_continue_patches = saved_continue_patches;
             self.named_block_patches = saved_named_block_patches;
             self.inlining_stack.pop();
+            self.inline_pkg_stack.pop();
             self.inline_foreign -= foreign as u32;
             self.m_labels = saved_labels;
             self.local_var_regs = saved_locals;
@@ -12367,8 +12384,10 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn lookup_signal_id(&self, hier: &HierarchicalIdentifier) -> Option<usize> {
-        if self.own_pkg_param(hier).is_some() {
-            return None;
+        // §26.3: package code's own parameter is a constant; its own (or
+        // imported) variable is that package's signal.
+        if let Some(key) = self.own_pkg_key(hier) {
+            return self.signal_name_to_id.get(key.as_str()).copied();
         }
         let raw = Self::hier_raw_cow(hier);
         let raw: &str = &raw;
@@ -12520,19 +12539,24 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     /// §26.3: a bare name in a body declared in package P that neither the
-    /// frame nor the class declares names P's own parameter, ahead of a
-    /// same-named one of the design (the interpreter's `resolve_hier_name`
-    /// order): its `P::name` key and value. Not inside an inlined callee,
-    /// whose package may differ.
-    fn own_pkg_param(&self, hier: &HierarchicalIdentifier) -> Option<(String, &'a Value)> {
-        let (pkg, params) = self.method_pkg.as_ref()?;
+    /// frame nor the class declares names P's own parameter or variable,
+    /// else one P imports (an explicit import, or the one wildcard import
+    /// that supplies it), ahead of a same-named one of the design (the
+    /// interpreter's `resolve_hier_name` order): its qualified key. Inside
+    /// an inlined callee P is the callee's package, and a callee declared
+    /// outside a package resolves as before.
+    fn own_pkg_key(&self, hier: &HierarchicalIdentifier) -> Option<String> {
+        let (method_pkg, params) = self.method_pkg.as_ref()?;
+        let pkg = match self.inline_pkg_stack.last() {
+            Some(callee_pkg) => callee_pkg.as_deref()?,
+            None => method_pkg.as_str(),
+        };
         let [seg] = hier.path.as_slice() else {
             return None;
         };
         let n = seg.name.name.as_str();
         if hier.root.is_some()
             || n.contains("::")
-            || !self.inlining_stack.is_empty()
             || self.local_var_regs.contains_key(n)
             || self.local_array_regs.contains_key(n)
             || self.local_coll_names.contains(n)
@@ -12545,12 +12569,80 @@ impl<'a> BytecodeCompiler<'a> {
         {
             return None;
         }
+        let has = |q: &str| params.contains_key(q) || self.signal_name_to_id.contains_key(q);
+        // Only where the bare name names something else: an uncontested
+        // package parameter is also registered bare with its own value, and
+        // that spelling keeps its packed shape (`C[i]` of a `[3:0][7:0]`
+        // parameter selects an element).
+        let contested = |q: String| -> Option<String> {
+            match params.get(q.as_str()) {
+                Some(v) => match params.get(n) {
+                    Some(bare) => (bare != v).then_some(q),
+                    // No bare parameter: only a same-named signal contests.
+                    None => self.signal_name_to_id.contains_key(n).then_some(q),
+                },
+                // A package variable keeps its `pkg::name` spelling only
+                // when another declaration took the bare name.
+                None => Some(q),
+            }
+        };
         let key = format!("{pkg}::{n}");
+        if has(&key) {
+            return contested(key);
+        }
+        // §26.3: a name `pkg` imports (`import gp::*;` inside `pkg`).
+        let imports = self.method_pkg_imports?.get(pkg)?;
+        let mut wildcard: Option<String> = None;
+        for (src, item) in imports {
+            let q = format!("{src}::{n}");
+            match item.as_deref() {
+                Some(leaf) if leaf == n && has(&q) => return contested(q),
+                None if has(&q) => {
+                    // Two wildcard imports supplying it: no guess.
+                    if wildcard.is_some() {
+                        return None;
+                    }
+                    wildcard = Some(q);
+                }
+                _ => {}
+            }
+        }
+        wildcard.and_then(contested)
+    }
+
+    /// §26.3: the package that declares the subroutine `name` being inlined
+    /// into package code (`None` outside package code, or for a subroutine
+    /// declared outside a package): `P` of a `P::name` call, else the package
+    /// whose `P::name` entry is this very declaration.
+    fn inlined_callee_pkg(&self, name: &str, span: crate::ast::Span, task: bool) -> Option<String> {
+        self.method_pkg.as_ref()?;
+        if let Some((pkg, _)) = name.rsplit_once("::") {
+            return Some(pkg.to_string());
+        }
+        let suffix = format!("::{name}");
+        let owner = |k: &String| k.strip_suffix(suffix.as_str()).map(str::to_string);
+        if task {
+            let t = self.tasks?;
+            t.iter()
+                .find(|(k, td)| k.ends_with(suffix.as_str()) && td.span == span)
+                .and_then(|(k, _)| owner(k))
+        } else {
+            let f = self.functions?;
+            f.iter()
+                .find(|(k, fd)| k.ends_with(suffix.as_str()) && fd.span == span)
+                .and_then(|(k, _)| owner(k))
+        }
+    }
+
+    /// `own_pkg_key` when it names a parameter: its key and value.
+    fn own_pkg_param(&self, hier: &HierarchicalIdentifier) -> Option<(String, &'a Value)> {
+        let key = self.own_pkg_key(hier)?;
+        let (_, params) = self.method_pkg.as_ref()?;
         let value = params.get(key.as_str())?;
         Some((key, value))
     }
 
-    /// `e` with its root spelled `P::name` when `own_pkg_param` answers it, so
+    /// `e` with its root spelled `P::name` when `own_pkg_key` answers it, so
     /// a select or member of the parameter takes the qualified name's shape.
     fn own_pkg_qualified(&self, e: &Expression) -> Option<Expression> {
         self.method_pkg.as_ref()?;
@@ -12564,7 +12656,7 @@ impl<'a> BytecodeCompiler<'a> {
         let ExprKind::Ident(h) = &root.kind else {
             return None;
         };
-        let (key, _) = self.own_pkg_param(h)?;
+        let key = self.own_pkg_key(h)?;
         let mut q = e.clone();
         let mut root = &mut q;
         loop {
