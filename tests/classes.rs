@@ -43,6 +43,8 @@ mod class_formal_named_like_struct;
 mod class_formal_typedef_widen;
 #[path = "classes/param_typedef_formal_fast_call.rs"]
 mod param_typedef_formal_fast_call;
+#[path = "classes/param_typedef_formal_direct_call_shapes.rs"]
+mod param_typedef_formal_direct_call_shapes;
 #[path = "classes/implicit_formal_width_1044.rs"]
 mod implicit_formal_width_1044;
 #[path = "classes/class_interface_same_name.rs"]
