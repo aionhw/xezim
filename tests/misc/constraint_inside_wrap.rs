@@ -3,8 +3,10 @@
 //! the relations over such an operand must keep propagating once all but
 //! one of its variables are fixed — the solver used to wait for the
 //! evaluator until every variable was guessed and gave up. Also §11.4.13:
-//! a range bound is computed at the operand's width (`-2147483648` is
-//! INT_MIN, not +2^31).
+//! a range bound is computed at the operand's width (`32'sh8000_0000` is
+//! INT_MIN, not +2^31). §5.7.1 (#1120): `-2147483648` is a 33-bit signed
+//! number, so a comparison with it is 33 bits wide and `c + 4000` does not
+//! wrap there: `c >= 2147479648` lies outside both ranges as well as 3.
 
 use xezim::simulate;
 
@@ -86,8 +88,10 @@ fn inside_value_lists_widths_and_negation() {
     $display("T|M1 ok=%0d v=%0d", ok, (c + 4000) inside {[4003:4004], [5000:5000]});
     ok = std::randomize(c) with { c + 4000 inside {4010, [4003:4003]}; c != 3; };
     $display("T|M2 ok=%0d c=%0d", ok, c);
-    ok = std::randomize(c) with { !(c + 4000 inside {[-2147483648:4002], [4004:2147483647]}); };
+    ok = std::randomize(c) with { !(c + 4000 inside {[32'sh8000_0000:4002], [4004:2147483647]}); };
     $display("T|M3 ok=%0d c=%0d", ok, c);
+    ok = std::randomize(c) with { !(c + 4000 inside {[-2147483648:4002], [4004:2147483647]}); };
+    $display("T|M3w ok=%0d v=%0d", ok, c == 3 || c >= 2147479648);
     ok = std::randomize(c) with { c - 5 inside {[0:0]}; };
     $display("T|M4 ok=%0d c=%0d", ok, c);
     ok = std::randomize(c, d) with { c + d inside {[7:7]}; d == 1000000; };
@@ -122,6 +126,7 @@ endmodule
         "T|M1 ok=1 v=1",
         "T|M2 ok=1 c=10",
         "T|M3 ok=1 c=3",
+        "T|M3w ok=1 v=1",
         "T|M4 ok=1 c=5",
         "T|M6 ok=1 c=-999993",
         "T|M7 ok=1 u=3",
