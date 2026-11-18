@@ -30,6 +30,22 @@ impl Simulator {
     /// the drive's indices frozen when it executed.
     pub(super) fn drive_clocking_select(&mut self, target: &Expression, val: Value, skew: u64) {
         let span = target.span;
+        // §14.16.2: drives of one output that mature together take effect
+        // in the order they were issued. A whole drive of the output issued
+        // before this one and maturing with it waits in `delayed_updates`,
+        // which commits apart from the nonblocking updates (after them, at
+        // the current time), so it moves into the nonblocking queue ahead of
+        // this drive. This drive is recorded so a whole drive issued after
+        // it queues behind it (`schedule_clocking_update`).
+        if let Some(id) = self.clocking_select_signal(target) {
+            let when = self.time.saturating_add(skew);
+            for value in self.take_clocking_whole_drives(id, when) {
+                self.queue_clocking_whole_nba(id, value, skew);
+            }
+            let now = self.time;
+            self.clocking_select_due.retain(|&(t, _)| t >= now);
+            self.clocking_select_due.push((when, id));
+        }
         let rvalue = self.make_intra_saved_expr(val, span);
         let delay = (skew > 0).then(|| {
             Expression::new(
@@ -125,30 +141,68 @@ impl Simulator {
     /// §14.16.2: only synchronous drives of one output that mature in the
     /// same time step replace each other. Different skews remain pending;
     /// the inertial gate-delay queue would cancel the earlier drive. A select
-    /// drive of the output due at the same time commits in the NBA region, so
-    /// the whole drive queues behind it there and the later drive wins.
+    /// drive of the output due at the same time commits as a nonblocking
+    /// update, so the whole drive queues behind it there and the later drive
+    /// wins.
     pub(super) fn schedule_clocking_update(&mut self, id: usize, val: &Value, delay: u64) {
         let when = self.time.saturating_add(delay);
         let value = self.fit_clocking_value(id, val);
         self.delayed_updates
             .retain(|(t, sid, _, _)| *sid != id || *t != when);
-        if delay > 0 && self.partial_nba_due(id, when) {
-            self.enqueue_context_nba(
-                NbaEntry {
-                    elements: None,
-                    lhs: None,
-                    value,
-                    resolved_id: Some(id),
-                    static_key: None,
-                    static_slice: None,
-                    this_handle: None,
-                    root_frame: None,
-                },
-                delay,
-            );
+        if self
+            .clocking_select_due
+            .iter()
+            .any(|&(t, sid)| t == when && sid == id)
+        {
+            self.queue_clocking_whole_nba(id, value, delay);
             return;
         }
         self.delayed_updates.push((when, id, value, None));
+    }
+
+    /// The whole drives of signal `id` waiting in `delayed_updates` to
+    /// mature at `when`, removed from it in the order they were scheduled.
+    fn take_clocking_whole_drives(&mut self, id: usize, when: u64) -> Vec<Value> {
+        let mut taken = Vec::new();
+        if self.delayed_updates.is_empty() {
+            return taken;
+        }
+        self.delayed_updates.retain(|(t, sid, v, mask)| {
+            let due = *sid == id && *t == when && mask.is_none();
+            if due {
+                taken.push(v.clone());
+            }
+            !due
+        });
+        taken
+    }
+
+    /// Queue a whole drive of signal `id` as a nonblocking update `delay`
+    /// ticks from now, behind the updates already queued for that time. A
+    /// later select of the signal in this time step merges into it.
+    fn queue_clocking_whole_nba(&mut self, id: usize, value: Value, delay: u64) {
+        if delay == 0 && !self.nba_behind_queued_partial(id) {
+            self.nba_fast_index.insert(id, self.nba_fast.len());
+            self.nba_fast.push(NbaFast {
+                block_index: 0,
+                signal_id: id,
+                value,
+            });
+            return;
+        }
+        self.enqueue_context_nba(
+            NbaEntry {
+                elements: None,
+                lhs: None,
+                value,
+                resolved_id: Some(id),
+                static_key: None,
+                static_slice: None,
+                this_handle: None,
+                root_frame: None,
+            },
+            delay,
+        );
     }
 
     /// §14.3: an output with an edge skew is driven on that edge of the
@@ -349,11 +403,7 @@ impl Simulator {
                         .copied()
                         .unwrap_or(dskew);
                     if let Some(t) = target {
-                        if skew > 0 {
-                            self.drive_clocking_select(&t, val, skew);
-                        } else {
-                            self.assign_value(&t, &val);
-                        }
+                        self.drive_clocking_select(&t, val, skew);
                         continue;
                     }
                     if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
@@ -478,6 +528,10 @@ impl Simulator {
                         self.clocking_mirror_dirty = true;
                     }
                 }
+                    // §14.16.2: a select drive commits as a nonblocking
+                    // update at any skew, `#0` included, so it takes its
+                    // place among the other drives of the output that
+                    // mature in this time step (`drive_clocking_select`).
             }
             self.clocking_snapshots.insert(cb.clone(), snap);
         }

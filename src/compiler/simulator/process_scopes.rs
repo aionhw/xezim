@@ -4186,27 +4186,16 @@ impl Simulator {
         !self.nba_queued_partial_ids.is_empty() && self.nba_queued_partial_ids.contains(&id)
     }
 
-    /// Whether a future nonblocking update of part of signal `id` is waiting
-    /// in `delayed_nba_queue` to commit at time `when`. The lvalues are read
-    /// outside any method, so a clocking select issued from a class task,
-    /// whose target is the bound net's own name, resolves to that net.
-    pub(super) fn partial_nba_due(&mut self, id: usize, when: u64) -> bool {
-        let queue = std::mem::take(&mut self.delayed_nba_queue);
+    /// The signal a clocking select drive writes (`net[0]`, `net[3:2]`).
+    /// The target is read outside any method: a select issued from a class
+    /// task names the bound net by its own name, which the method-scope
+    /// lookup would read as a possible class property.
+    pub(super) fn clocking_select_signal(&mut self, target: &Expression) -> Option<usize> {
         let mut ids = Vec::new();
         self.this_stack.push(None);
-        for (t, entry) in &queue {
-            let Some(lhs) = &entry.lhs else { continue };
-            if *t != when
-                || entry.static_key.is_some()
-                || !Self::cond_expr_is_effect_free(lhs, false)
-            {
-                continue;
-            }
-            self.partial_nba_signal_ids(lhs, &mut ids);
-        }
+        self.partial_nba_signal_ids(target, &mut ids);
         self.this_stack.pop();
-        self.delayed_nba_queue = queue;
-        ids.contains(&id)
+        ids.first().copied()
     }
 
     /// The signals a partial nonblocking lvalue writes: a concatenation

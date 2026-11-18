@@ -1219,6 +1219,7 @@ checkpoint_state!(
     clocking_array_leaves,
     clocking_output_pending,
     clocking_cycle_pending,
+    clocking_select_due,
     clocking_edge_out_pending,
     clocking_edge_drive_dirty,
     clocking_prev_clock,

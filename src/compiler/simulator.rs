@@ -8065,6 +8065,11 @@ pub struct Simulator {
     /// the net it is bound to has another driver: (block name, net) →
     /// stage signal. The clockvar drives the stage, and the stage joins the
     /// net's other drivers in the resolution fold.
+    /// §14.16.2: clocking select drives waiting for their maturity as
+    /// nonblocking updates: (maturity time, signal). A whole drive of the
+    /// same signal maturing with one queues behind it, so the drives take
+    /// effect in the order they were issued.
+    clocking_select_due: Vec<(u64, usize)>,
     clocking_output_stages: HashMap<(String, String), String>,
     /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
     /// resolved net). The snapshot/meta store the NET; reads and drives use

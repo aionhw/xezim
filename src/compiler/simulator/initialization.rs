@@ -4094,6 +4094,7 @@ impl Simulator {
             clocking_mirror_dirty: false,
             clocking_edge_drive_dirty: false,
             clocking_cycle_pending: HashMap::default(),
+            clocking_select_due: Vec::new(),
             clocking_sig_alias: HashMap::default(),
             clocking_output_stages: HashMap::default(),
             clocking_sig_bound_sel: HashMap::default(),
