@@ -38,7 +38,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // §7.10: SignalMap holds queue and dynamic-array elements in runs; two profile counters.
 // §8.23 / §25.9: ClassMemberNames::vif_typedef_leaves.
 // §13.5.1: MethodAdmission::coll_formal_positions.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x0f";
+// §14.16.2: Simulator::clocking_select_due, the pending clocking select drives.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x10";
 
 #[derive(Default)]
 struct Session {
