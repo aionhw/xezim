@@ -59,6 +59,46 @@ fn c14_5_clocking_expr_iface() {
     );
 }
 
+// §14.5, §14.13: a clocking input bound to an expression samples the value
+// the expression takes from its operands' samples: arithmetic, a
+// concatenation with a select, signed, wide, X, conditional and comparison
+// roots, at #1step, #0 and #2 skews, at the expression's width, and
+// `@(cb.sum)` fires on a changed sample; a same-named outer variable is
+// not sampled instead.
+#[test]
+fn c14_5_clockvar_expression_binding() {
+    check(
+        "14.5_clockvar_expression_binding",
+        include_str!("sv/14.5_clockvar_expression_binding.sv"),
+        "c145e",
+        Order::Exact,
+        &[
+            "T|ev|t=5 sum=4",
+            "T|a|sum=4 ins=2d7 cat=00110 s0=13 s2=23",
+            "T|b|ng=4 sgx=-2 wide=00000000000000000000 xx=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx cnd=5 un=a red=0",
+            "T|c|bits sum=32 ins=11 cat=5",
+            "T|ev|t=15 sum=8",
+            "T|d|t=16 sum=8 s0=18 s2=23",
+        ],
+        &[],
+    );
+}
+
+// §14.5: an input bound to an expression with a unary root samples it.
+// (Expected values from §11.4; the reference simulator does not parse a
+// unary root here.)
+#[test]
+fn c14_5_clockvar_expression_unary_root() {
+    check(
+        "14.5_clockvar_expression_unary",
+        include_str!("sv/14.5_clockvar_expression_unary.sv"),
+        "c145u",
+        Order::Exact,
+        &["T|u|un=a red=0 ng=4"],
+        &[],
+    );
+}
+
 // §14.4: Output skew (default output #2)
 #[test]
 fn c14_16_clocking_output_skew() {
@@ -273,26 +313,6 @@ fn c14_16_2_clocking_select_then_whole_drive() {
     );
 }
 
-// §14.4, §14.16: an edge skew applies to a selected output and to an output
-// whose net another clockvar names, and edge-plus-delay drives made a cycle
-// apart each reach the net.
-#[test]
-fn c14_4_clocking_edge_skew_select_alias_and_delay() {
-    check(
-        "c14_edge_select_alias",
-        include_str!("sv/c14_edge_select_alias.sv"),
-        "c14es",
-        Order::Multiset,
-        &[
-            "T|chg|t=20000 q=1",
-            "T|chg|t=20000 sel=01",
-            "T|chg|t=25000 t=1",
-            "T|chg|t=25000 w=01",
-            "T|chg|t=35000 t=0",
-        ],
-        &[],
-    );
-}
 // §14.16.2: select and whole drives of one output that mature together take
 // effect in issue order, and the output changes once, at a `#0` skew (at
 // the clocking event and between events), at a `#2` skew, and for `##1`
@@ -318,3 +338,23 @@ fn c14_16_2_clocking_drive_order_across_skews() {
     );
 }
 
+// §14.4, §14.16: an edge skew applies to a selected output and to an output
+// whose net another clockvar names, and edge-plus-delay drives made a cycle
+// apart each reach the net.
+#[test]
+fn c14_4_clocking_edge_skew_select_alias_and_delay() {
+    check(
+        "c14_edge_select_alias",
+        include_str!("sv/c14_edge_select_alias.sv"),
+        "c14es",
+        Order::Multiset,
+        &[
+            "T|chg|t=20000 q=1",
+            "T|chg|t=20000 sel=01",
+            "T|chg|t=25000 t=1",
+            "T|chg|t=25000 w=01",
+            "T|chg|t=35000 t=0",
+        ],
+        &[],
+    );
+}
