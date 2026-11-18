@@ -21122,6 +21122,15 @@ impl<'a> BytecodeCompiler<'a> {
                         ));
                         return true;
                     }
+                    // Any other class-scope name (a collection member,
+                    // static or not) must not fall through to a same-named
+                    // module signal, as on the bare read path.
+                    if !self.local_var_regs.contains_key(bare)
+                        && self.class_shadow_names.contains(bare)
+                    {
+                        self.bail("method_class_shadow");
+                        return false;
+                    }
                 }
                 if let Some(id) = self.lookup_signal_id(hier) {
                     if self.signal_is_string_name(hier) {
