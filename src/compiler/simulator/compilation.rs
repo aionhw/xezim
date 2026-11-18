@@ -252,9 +252,9 @@ impl Simulator {
                 (
                     n.clone(),
                     cd.is_default,
-                    cd.default_output_skew.clone(),
+                    cd.default_output_skew.as_deref().cloned(),
                     out_per_sig,
-                    cd.default_input_skew.clone(),
+                    cd.default_input_skew.as_deref().cloned(),
                     in_per_sig,
                 )
             })

@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Performance:** Compact declaration-shape tables and allocate optional AST payloads and resolved-name cache values on demand.
+
 - **Performance:** Avoid unnecessary name scans and module-item copies while preparing flat designs, and release parsing scratch memory before definition indexing.
 
 - **Performance:** Reduce procedural AST storage by allocating optional timing payloads only when present.

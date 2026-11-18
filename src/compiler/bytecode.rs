@@ -5086,7 +5086,11 @@ impl<'a> BytecodeCompiler<'a> {
                         let eff_dt = if untyped
                             && let crate::ast::types::DataType::Implicit { signing, .. } = data_type
                         {
-                            Some(self.untyped_param_effective_dt(signing, d.init.as_ref(), st.span))
+                            Some(self.untyped_param_effective_dt(
+                                signing,
+                                d.init.as_deref(),
+                                st.span,
+                            ))
                         } else {
                             None
                         };
@@ -5658,7 +5662,7 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::VarDecl { declarators, .. }
             | StatementKind::ParamDecl { declarators, .. } => declarators
                 .iter()
-                .all(|decl| decl.init.as_ref().map(&expr_simple).unwrap_or(true)),
+                .all(|decl| decl.init.as_deref().map(&expr_simple).unwrap_or(true)),
             StatementKind::NonblockingAssign { lvalue, rvalue, .. }
             | StatementKind::BlockingAssign { lvalue, rvalue } => {
                 // A SELF-READING array update (`ptr[i] <= ptr[i] + 1`) is
@@ -14508,7 +14512,11 @@ impl<'a> BytecodeCompiler<'a> {
                     let eff_dt = if untyped
                         && let crate::ast::types::DataType::Implicit { signing, .. } = data_type
                     {
-                        Some(self.untyped_param_effective_dt(signing, decl.init.as_ref(), stmt.span))
+                        Some(self.untyped_param_effective_dt(
+                            signing,
+                            decl.init.as_deref(),
+                            stmt.span,
+                        ))
                     } else {
                         None
                     };

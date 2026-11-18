@@ -37,7 +37,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // Whole-array NBA entries carry captured element values.
 // 0x0e: procedural sequence/fork bodies use shared copy-on-write storage.
 // 0x0f: optional assignment delays and inferred assertion clocks are boxed.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x0f";
+// 0x10: compact declaration payloads and cold module constructs.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x10";
 
 #[derive(Default)]
 struct Session {
