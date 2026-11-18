@@ -194,7 +194,7 @@ fn design_cache_key(
     hash.text("qualified-package-array-storage-and-pr-validation-v3");
     hash.text(env!("CARGO_PKG_VERSION"));
     // Record packing changes generated VHDL storage before SV elaboration.
-    hash.text("xezim-design-cache-vhd1");
+    hash.text("xezim-design-cache-vhd2");
     hash.text(&config.semantic_salt);
     hash.text(top_module_name.unwrap_or(""));
     // An elaboration with unobserved-port elision on leaves nets out, so it

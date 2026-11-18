@@ -375,7 +375,8 @@ fn method_boost_enabled() -> bool {
 // Module helper reads and queue operations retain their lexical ownership.
 // Refresh compiled methods after combining VHDL and main compiler changes.
 // Module helper fallbacks retain callee frames independently of tracing.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3085;
+// Refresh helper layouts after pending-only VHDL driver lowering.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3086;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
