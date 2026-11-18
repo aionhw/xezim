@@ -514,6 +514,27 @@ impl Simulator {
         let mut out: Vec<String> = Vec::new();
         // Imported parameters are lookup aliases, not declarations in this
         // module (§26.3). Keep local declarations, including their elements.
+        // A package's parameters are registered design-wide under their bare
+        // names too, imported or not: `LIM[0]` of `other::LIM` reached only
+        // as `other::LIM[1]` (#1213). Such a bare name is the package's
+        // unless this module declares it itself (shadowing a wildcard
+        // import, or colliding with a package it never imported).
+        let package_params: HashSet<&str> = self
+            .module
+            .parameters
+            .keys()
+            .chain(self.module.param_decl_types.keys())
+            .filter_map(|k| {
+                let (pkg, rest) = k.split_once("::")?;
+                let leaf = rest.split(['[', '.']).next()?;
+                (self.module.packages.contains(pkg) && !leaf.contains(':')).then_some(leaf)
+            })
+            .collect();
+        let package_param = |base: &str| {
+            package_params.contains(base)
+                && !self.module.wildcard_shadowed.contains(base)
+                && !self.module.foreign_package_names.contains(base)
+        };
         let parameter_alias = |name: &str| {
             let mut base = name;
             let mut alias = false;
@@ -523,6 +544,7 @@ impl Simulator {
                 }
                 if self.module.parameters.contains_key(base)
                     || self.module.param_decl_types.contains_key(base)
+                    || package_param(base)
                 {
                     alias = true;
                 }
