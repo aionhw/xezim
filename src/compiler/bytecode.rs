@@ -2035,6 +2035,10 @@ pub struct BytecodeCompiler<'a> {
     /// variables, statics) are unresolvable storage for the compiled block
     /// — any read of one declines the whole body (see the Ident arm).
     free_function_mode: bool,
+    /// §26.3: the package that declares the subroutine or class being
+    /// compiled in method mode, and the table holding its `pkg::name`
+    /// parameters.
+    pub method_pkg: Option<(String, &'a HashMap<String, Value>)>,
     /// String-typed formal names (plan-provided). Any use of one outside the
     /// pass-through surface (read, compare, assign, concat, call arg, return)
     /// bails: indexing/string-methods/arith take interpreter-only paths.
@@ -2444,6 +2448,7 @@ impl<'a> BytecodeCompiler<'a> {
             method_result_is_string: false,
             method_ret_is_collection: false,
             free_function_mode: false,
+            method_pkg: None,
             string_formal_names: HashSet::default(),
             string_member_names: HashSet::default(),
             coll_member_names: HashSet::default(),
@@ -12362,6 +12367,9 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn lookup_signal_id(&self, hier: &HierarchicalIdentifier) -> Option<usize> {
+        if self.own_pkg_param(hier).is_some() {
+            return None;
+        }
         let raw = Self::hier_raw_cow(hier);
         let raw: &str = &raw;
         // Targeted override for for-loop variables — see for_loop_var_ids
@@ -12511,9 +12519,79 @@ impl<'a> BytecodeCompiler<'a> {
             .cloned()
     }
 
+    /// §26.3: a bare name in a body declared in package P that neither the
+    /// frame nor the class declares names P's own parameter, ahead of a
+    /// same-named one of the design (the interpreter's `resolve_hier_name`
+    /// order): its `P::name` key and value. Not inside an inlined callee,
+    /// whose package may differ.
+    fn own_pkg_param(&self, hier: &HierarchicalIdentifier) -> Option<(String, &'a Value)> {
+        let (pkg, params) = self.method_pkg.as_ref()?;
+        let [seg] = hier.path.as_slice() else {
+            return None;
+        };
+        let n = seg.name.name.as_str();
+        if hier.root.is_some()
+            || n.contains("::")
+            || !self.inlining_stack.is_empty()
+            || self.local_var_regs.contains_key(n)
+            || self.local_array_regs.contains_key(n)
+            || self.local_coll_names.contains(n)
+            || self.local_const_vars.contains_key(n)
+            || self.method_bound_names.contains(n)
+            || self.class_shadow_names.contains(n)
+            || self.bare_member_names.contains(n)
+            || self.string_member_names.contains(n)
+            || self.class_const_names.contains(n)
+        {
+            return None;
+        }
+        let key = format!("{pkg}::{n}");
+        let value = params.get(key.as_str())?;
+        Some((key, value))
+    }
+
+    /// `e` with its root spelled `P::name` when `own_pkg_param` answers it, so
+    /// a select or member of the parameter takes the qualified name's shape.
+    fn own_pkg_qualified(&self, e: &Expression) -> Option<Expression> {
+        self.method_pkg.as_ref()?;
+        let mut root = e;
+        while let ExprKind::Index { expr, .. }
+        | ExprKind::RangeSelect { expr, .. }
+        | ExprKind::MemberAccess { expr, .. } = &root.kind
+        {
+            root = &**expr;
+        }
+        let ExprKind::Ident(h) = &root.kind else {
+            return None;
+        };
+        let (key, _) = self.own_pkg_param(h)?;
+        let mut q = e.clone();
+        let mut root = &mut q;
+        loop {
+            root = match &mut root.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => &mut **expr,
+                ExprKind::Ident(h) => {
+                    h.path[0].name.name = key;
+                    h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                    h.cached_resolved_name = crate::ast::cache::NameCache::new();
+                    h.bound = crate::ast::binding::Bound::UNSET;
+                    return Some(q);
+                }
+                _ => return None,
+            };
+        }
+    }
+
     fn lookup_param_value(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
         if let Some(value) = self.method_enum_constant(hier) {
             return Some(value);
+        }
+        if let Some((_, value)) = self.own_pkg_param(hier)
+            && hier.path[0].selects.is_empty()
+        {
+            return Some(value.clone());
         }
         let params = self.params?;
         let raw = Self::hier_raw_cow(hier);
@@ -16354,6 +16432,9 @@ impl<'a> BytecodeCompiler<'a> {
         ctx_width: u32,
         unsigned_context: bool,
     ) -> Option<RegId> {
+        if let Some(q) = self.own_pkg_qualified(expr) {
+            return self.compile_expr_typed(&q, ctx_width, unsigned_context);
+        }
         // §10.8: only a pattern, or a parenthesised or conditional operand
         // holding one, takes the context type; other operands start without.
         let pattern_ctx = self.pattern_ctx.take();
@@ -23005,6 +23086,9 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn expr_max_width(&self, expr: &Expression) -> u32 {
+        if let Some(q) = self.own_pkg_qualified(expr) {
+            return self.expr_max_width(&q);
+        }
         if let Some((_, m)) = self.formal_struct_member(expr) {
             return m.width;
         }
