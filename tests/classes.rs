@@ -244,6 +244,8 @@ mod compiled_method_string_coll_member_assign;
 mod compiled_method_queue_literal_arg;
 #[path = "classes/compiled_method_coll_formal_actual.rs"]
 mod compiled_method_coll_formal_actual;
+#[path = "classes/static_collection_through_handle.rs"]
+mod static_collection_through_handle;
 
 #[path = "classes/compiled_method_void.rs"]
 mod compiled_method_void;
