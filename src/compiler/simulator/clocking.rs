@@ -280,6 +280,136 @@ impl Simulator {
         self.eval_expr(&e)
     }
 
+    /// §14.5: the signals an expression bound to a clocking input reads, in
+    /// first-use order. A name that is not a signal (a parameter folded
+    /// away, a function) is left to the expression.
+    pub(super) fn clocking_expr_operands(e: &Expression, ids: &NameMap, out: &mut Vec<String>) {
+        if let Some(segs) = Self::flatten_member_path(e) {
+            let net = segs.join(".");
+            if ids.contains_key(net.as_str()) && !out.contains(&net) {
+                out.push(net);
+            }
+            return;
+        }
+        let mut walk = |x: &Expression| Self::clocking_expr_operands(x, ids, out);
+        match &e.kind {
+            ExprKind::Unary { operand, .. } => walk(operand),
+            ExprKind::Binary { left, right, .. } => {
+                walk(left);
+                walk(right);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                walk(condition);
+                walk(then_expr);
+                walk(else_expr);
+            }
+            ExprKind::Paren(x) => walk(x),
+            ExprKind::Concatenation(parts) => parts.iter().for_each(walk),
+            ExprKind::Replication { count, exprs } => {
+                walk(count);
+                exprs.iter().for_each(walk);
+            }
+            ExprKind::Index { expr, index } => {
+                walk(expr);
+                walk(index);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                walk(expr);
+                walk(left);
+                walk(right);
+            }
+            ExprKind::Call { args, .. } | ExprKind::SystemCall { args, .. } => {
+                args.iter().for_each(walk)
+            }
+            ExprKind::Inside { expr, ranges } => {
+                walk(expr);
+                ranges.iter().for_each(walk);
+            }
+            _ => {}
+        }
+    }
+
+    /// §14.5: `e` with each operand in `ops` replaced by its sample in
+    /// `snap`, kept in `intra_saved` under the slots pushed to `slots`.
+    fn clocking_expr_over_samples(
+        &mut self,
+        e: &mut Expression,
+        ops: &[(String, String)],
+        snap: &HashMap<String, Value>,
+        slots: &mut Vec<u64>,
+    ) {
+        if let Some(segs) = Self::flatten_member_path(e) {
+            let net = segs.join(".");
+            if let Some((_, hidden)) = ops.iter().find(|(n, _)| *n == net)
+                && let Some(v) = snap.get(hidden)
+            {
+                let idx = self.intra_saved_next;
+                self.intra_saved_next += 1;
+                self.intra_saved.insert(idx, v.clone());
+                slots.push(idx);
+                *e = Expression::new(
+                    ExprKind::SystemCall {
+                        name: INTRA_KEPT_MARKER.to_string(),
+                        args: vec![Self::intra_slot_literal(idx, e.span)],
+                    },
+                    e.span,
+                );
+            }
+            return;
+        }
+        let mut subs: Vec<&mut Expression> = Vec::new();
+        match &mut e.kind {
+            ExprKind::Unary { operand, .. } => subs.push(operand),
+            ExprKind::Binary { left, right, .. } => {
+                subs.push(left);
+                subs.push(right);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                subs.push(condition);
+                subs.push(then_expr);
+                subs.push(else_expr);
+            }
+            ExprKind::Paren(x) => subs.push(x),
+            ExprKind::Concatenation(parts) => subs.extend(parts.iter_mut()),
+            ExprKind::Replication { count, exprs } => {
+                subs.push(count);
+                subs.extend(exprs.iter_mut());
+            }
+            ExprKind::Index { expr, index } => {
+                subs.push(expr);
+                subs.push(index);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                subs.push(expr);
+                subs.push(left);
+                subs.push(right);
+            }
+            ExprKind::Call { args, .. } | ExprKind::SystemCall { args, .. } => {
+                subs.extend(args.iter_mut())
+            }
+            ExprKind::Inside { expr, ranges } => {
+                subs.push(expr);
+                subs.extend(ranges.iter_mut());
+            }
+            _ => {}
+        }
+        for x in subs {
+            self.clocking_expr_over_samples(x, ops, snap, slots);
+        }
+    }
+
     pub(super) fn tick_clocking_blocks(&mut self) {
         if self.clocking_meta.is_empty() {
             return;
@@ -402,6 +532,10 @@ impl Simulator {
                         .and_then(|m| m.get(&raw))
                         .copied()
                         .unwrap_or(dskew);
+                    // §14.16.2: a select drive commits as a nonblocking
+                    // update at any skew, `#0` included, so it takes its
+                    // place among the other drives of the output that
+                    // mature in this time step (`drive_clocking_select`).
                     if let Some(t) = target {
                         self.drive_clocking_select(&t, val, skew);
                         continue;
@@ -510,6 +644,26 @@ impl Simulator {
                     }
                 }
             }
+            // §14.5: an expression-bound input samples the expression over
+            // its operands' samples, taken above under their hidden names.
+            if !self.clocking_sig_bound_expr.is_empty()
+                && let Some(exprs) = self.clocking_sig_bound_expr.remove(skey)
+            {
+                for (vis, (e, ops)) in &exprs {
+                    let mut x = e.clone();
+                    let mut slots = Vec::new();
+                    self.clocking_expr_over_samples(&mut x, ops, &snap, &mut slots);
+                    let v = self.eval_expr(&x);
+                    for idx in slots {
+                        self.intra_saved.remove(&idx);
+                    }
+                    for (_, hidden) in ops {
+                        snap.remove(hidden);
+                    }
+                    snap.insert(vis.clone(), v);
+                }
+                self.clocking_sig_bound_expr.insert(skey.to_string(), exprs);
+            }
             // §14.13: publish each fresh sample to its hidden mirror signal so
             // `@(cb.sig)` fires at THIS edge, and only on an actual change.
             let mirror: Vec<(String, Value)> = snap
@@ -528,10 +682,6 @@ impl Simulator {
                         self.clocking_mirror_dirty = true;
                     }
                 }
-                    // §14.16.2: a select drive commits as a nonblocking
-                    // update at any skew, `#0` included, so it takes its
-                    // place among the other drives of the output that
-                    // mature in this time step (`drive_clocking_select`).
             }
             self.clocking_snapshots.insert(cb.clone(), snap);
         }

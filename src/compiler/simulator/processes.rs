@@ -2717,7 +2717,7 @@ impl Simulator {
         }
     }
 
-    fn intra_slot_literal(idx: u64, span: crate::ast::Span) -> Expression {
+    pub(super) fn intra_slot_literal(idx: u64, span: crate::ast::Span) -> Expression {
         Expression::new(
             ExprKind::Number(NumberLiteral::Integer {
                 size: None,

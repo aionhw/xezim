@@ -4098,6 +4098,7 @@ impl Simulator {
             clocking_sig_alias: HashMap::default(),
             clocking_output_stages: HashMap::default(),
             clocking_sig_bound_sel: HashMap::default(),
+            clocking_sig_bound_expr: HashMap::default(),
             clocking_out_skew: HashMap::default(),
             clocking_sig_out_skew: HashMap::default(),
             clocking_out_edge: HashMap::default(),

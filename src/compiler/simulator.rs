@@ -2480,6 +2480,10 @@ const WHEEL_SIZE: usize = 4096;
 /// Prefix of the hidden per-clocking-input sample mirror signals (§14.13).
 /// Not expressible in SV source, so it can never collide with a user name.
 const CB_SAMPLE_PREFIX: &str = "__xz_cbsample.";
+/// §14.5: the hidden clocking names of the operand samples of a clockvar
+/// bound to an expression (`__xz_cbop.sum.0`), and the unresolvable net name
+/// the clockvar itself is registered under. Unreachable from SV source.
+const CB_OPERAND_PREFIX: &str = "__xz_cbop.";
 
 /// IEEE 1800-2023 §14.4: `#1step` in the clocking skew maps. An input with no
 /// declared skew samples with 1step too (§14.3 default), so the default-input
@@ -4988,6 +4992,9 @@ enum FsmWait {
 
 type ClockingOutputDrive = (String, String, Value, Option<Expression>);
 type ClockingCycleDrive = (u64, String, String, Value, Option<Expression>);
+/// §14.5: an expression a clockvar is bound to and its operand nets, each
+/// with the hidden clocking name of its sample.
+type ClockingBoundExpr = (Expression, Vec<(String, String)>);
 type ClockingEdgeDrive = (String, Value, EdgeKind, u64, Option<Expression>);
 
 /// One clocking block's per-tick poll state: its clock resolved to a
@@ -8058,6 +8065,11 @@ pub struct Simulator {
     /// cb → [(remaining_cycles, clockvar, net, value, target)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.
     clocking_cycle_pending: HashMap<String, Vec<ClockingCycleDrive>>,
+    /// §14.16.2: clocking select drives waiting for their maturity as
+    /// nonblocking updates: (maturity time, signal). A whole drive of the
+    /// same signal maturing with one queues behind it, so the drives take
+    /// effect in the order they were issued.
+    clocking_select_due: Vec<(u64, usize)>,
     /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
     /// resolved net). The snapshot/meta store the NET; reads and drives use
     /// the clocking name, so they translate through this first.
@@ -8065,11 +8077,6 @@ pub struct Simulator {
     /// the net it is bound to has another driver: (block name, net) →
     /// stage signal. The clockvar drives the stage, and the stage joins the
     /// net's other drivers in the resolution fold.
-    /// §14.16.2: clocking select drives waiting for their maturity as
-    /// nonblocking updates: (maturity time, signal). A whole drive of the
-    /// same signal maturing with one queues behind it, so the drives take
-    /// effect in the order they were issued.
-    clocking_select_due: Vec<(u64, usize)>,
     clocking_output_stages: HashMap<(String, String), String>,
     /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
     /// resolved net). The snapshot/meta store the NET; reads and drives use
@@ -8080,6 +8087,13 @@ pub struct Simulator {
     /// BASE net; a sample applies the select to the base's sample, a drive
     /// writes through it (#823).
     clocking_sig_bound_sel: HashMap<String, HashMap<String, Expression>>,
+    /// §14.5 a clockvar bound to an expression (`input sum = a + 1;`,
+    /// `input i = {op, ra, rb[3:1]};`): cb → (clocking name → (the bound
+    /// expression, each operand net with the hidden clocking name of its
+    /// sample)). Each operand is sampled as a clocking input of its own, with
+    /// the clockvar's skew; the clockvar's sample is the expression evaluated
+    /// over those samples.
+    clocking_sig_bound_expr: HashMap<String, HashMap<String, ClockingBoundExpr>>,
     /// §14.4 per-cb default OUTPUT skew in ticks (absent = #0).
     clocking_out_skew: HashMap<String, u64>,
     /// §14.4 per-signal output-skew overrides: cb → (resolved net → ticks).
