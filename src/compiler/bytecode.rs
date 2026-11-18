@@ -8963,9 +8963,11 @@ impl<'a> BytecodeCompiler<'a> {
     /// read through an admitted handle chain? Mirrors `dotted_string_member`
     /// for collection members, so `obj.m_q[i]` (a referenced object's string
     /// collection element) is typed as a string by `string_cmp` instead of
-    /// falling to the integral X-padded compare (§6.16/§7.10).
+    /// falling to the integral X-padded compare (§6.16/§7.10). A collection
+    /// is not a heap-slot field (`instance_fields`), so the declared class's
+    /// `instance_string_colls` alone admits it.
     fn dotted_string_coll(&self, base: &Expression, member: &str) -> bool {
-        if !self.method_handle_chain_ok(base) || !self.method_instance_field_ok(base, member) {
+        if !self.method_handle_chain_ok(base) {
             return false;
         }
         let class = self.method_handle_chain_class(base);

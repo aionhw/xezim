@@ -1005,6 +1005,11 @@ impl Simulator {
     /// Statics are excluded (per-class cells), and so are names some class
     /// redeclares (§8.14): a base class's copy is stored under a qualified
     /// key the bare `StoreClassMember`/`LoadClassMember` spelling misses.
+    /// `string_properties` also lists unpacked arrays, queues and associative
+    /// arrays of strings (§7.4, §7.8, §7.10). Their elements live in the
+    /// collection tables, not the heap slot, so they are excluded as well
+    /// and keep the AST path, like any other collection member
+    /// (`class_nonloadable_member_names_for`).
     pub(super) fn class_string_member_names(&self, cname: &str) -> HashSet<String> {
         let mut out = HashSet::default();
         let mut seen = HashSet::default();
@@ -1014,7 +1019,13 @@ impl Simulator {
                 break;
             }
             for p in cd.string_properties.iter() {
-                if !cd.static_properties.contains(p) && !self.shadowed_prop_names.contains(p) {
+                let unpacked = cd.array_properties.contains_key(p)
+                    || cd.queue_properties.contains_key(p)
+                    || cd.assoc_properties.contains_key(p);
+                if !unpacked
+                    && !cd.static_properties.contains(p)
+                    && !self.shadowed_prop_names.contains(p)
+                {
                     out.insert(p.clone());
                 }
             }

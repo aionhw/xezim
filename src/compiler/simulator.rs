@@ -372,7 +372,8 @@ fn method_boost_enabled() -> bool {
 // Explicit event expressions retain function-call operands and result guards.
 // Net typedef metadata and virtual-interface specialization identities.
 // Class-local shadowing keeps numeric comparisons out of string-member admission.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3082;
+// §7.10: string collection members stay out of string-member admission.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3083;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
