@@ -8304,6 +8304,18 @@ pub struct Simulator {
     /// by `CombItem::TimingCheck{idx}`).
     timing_checks: Vec<timing_checks::TimingCheckRt>,
     timing_watches: Vec<timing_checks::TcWatch>,
+    /// The conditions of the timing checks, compiled on first use
+    /// (`timing_checks::TcCond`): check `i`'s start at `timing_cond_base[i]`,
+    /// one per condition it has. They depend on the design only, so a
+    /// checkpoint neither holds nor resets them.
+    #[serde(skip)]
+    timing_cond_base: Vec<u32>,
+    #[serde(skip)]
+    timing_conds: Vec<timing_checks::TcCond>,
+    /// Condition evaluations of the timing checks: compiled, interpreted
+    /// (`[PROF] timing_conds`).
+    #[serde(skip)]
+    timing_cond_evals: [u64; 2],
     /// Like `has_udp`: timing checks keep per-check state, so their comb
     /// entries force the serial settle.
     has_timing_checks: bool,

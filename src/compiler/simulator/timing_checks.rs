@@ -172,6 +172,35 @@ const COND_DATA: u8 = 2;
 const COND_STAMP: u8 = 4;
 const COND_CHECK: u8 = 8;
 
+/// How one condition of a check is evaluated. Library cells condition
+/// nearly every check (`&&& (en == 1'b1)`), and a clock shared by many
+/// cells evaluates thousands of them per edge, so a condition is compiled
+/// to bytecode the first time it is evaluated instead of being walked by
+/// the interpreter on every event, which resolved each of its names by
+/// string on every evaluation.
+#[derive(Default)]
+pub(super) enum TcCond {
+    /// Not evaluated yet.
+    #[default]
+    Unbuilt,
+    /// The bytecode compiler declined it: the interpreter evaluates it.
+    Interp,
+    /// A §31.7 scalar condition over a one-bit signal (`en`, `~en`,
+    /// `en == 1'b1`, `en !== 1'b0`, ...): enabled when the signal's level
+    /// (0, 1, 2 = x/z) is in `levels` (bit per level). The library-cell
+    /// shape, read straight from the signal; audited like `Code`.
+    Level { sig: usize, levels: u8, audits: u8 },
+    /// Its bytecode and the register that holds its value. The first
+    /// `audits` evaluations also run the interpreter; a disagreement
+    /// leaves the condition to the interpreter for good.
+    Code {
+        insns: Box<[super::bytecode::Insn]>,
+        num_regs: u32,
+        reg: super::bytecode::RegId,
+        audits: u8,
+    },
+}
+
 /// The parts of a check that events rarely read: diagnostics, SDF matching
 /// and the condition expressions.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -425,6 +454,9 @@ impl Simulator {
             .iter()
             .filter(|(on, _)| *on)
             .fold(0u8, |a, (_, bit)| a | bit);
+            self.timing_cond_base.push(self.timing_conds.len() as u32);
+            self.timing_conds
+                .extend((0..conds.count_ones()).map(|_| TcCond::Unbuilt));
             self.timing_checks.push(TimingCheckRt {
                 kind,
                 notifier,
@@ -820,34 +852,220 @@ impl Simulator {
         }
     }
 
-    /// `$setuphold`/`$recrem` timecheck and timestamp conditions.
-    fn timing_window_conds(
-        &self,
-        idx: usize,
-    ) -> (Option<Arc<Expression>>, Option<Arc<Expression>>) {
-        let rt = &self.timing_checks[idx];
-        if rt.conds & (COND_STAMP | COND_CHECK) == 0 {
-            return (None, None);
+    /// Is condition `bit` (`COND_*`) of check `idx` enabled? A check
+    /// without that condition is.
+    fn timing_cond_on(&mut self, idx: usize, bit: u8) -> bool {
+        let conds = self.timing_checks[idx].conds;
+        if conds & bit == 0 {
+            return true;
         }
-        (rt.cold.check_cond.clone(), rt.cold.stamp_cond.clone())
+        let slot = self.timing_cond_base[idx] as usize + (conds & (bit - 1)).count_ones() as usize;
+        if matches!(self.timing_conds[slot], TcCond::Unbuilt) {
+            self.timing_conds[slot] = self.compile_timing_cond(idx, bit);
+        }
+        if let TcCond::Level {
+            sig,
+            levels,
+            audits,
+        } = self.timing_conds[slot]
+        {
+            self.timing_cond_evals[0] += 1;
+            let (v, x) = self.signal_table[sig].raw_bits();
+            let on = levels >> level(v, x, 0) & 1 != 0;
+            if audits > 0 {
+                if self.timing_cond_interp(idx, bit) != on {
+                    self.timing_conds[slot] = TcCond::Interp;
+                    return !on;
+                }
+                self.timing_conds[slot] = TcCond::Level {
+                    sig,
+                    levels,
+                    audits: audits - 1,
+                };
+            }
+            return on;
+        }
+        let TcCond::Code { .. } = &self.timing_conds[slot] else {
+            self.timing_cond_evals[1] += 1;
+            return self.timing_cond_interp(idx, bit);
+        };
+        self.timing_cond_evals[0] += 1;
+        // Moved out while it runs: the VM borrows the simulator mutably.
+        let TcCond::Code {
+            insns,
+            num_regs,
+            reg,
+            audits,
+        } = std::mem::take(&mut self.timing_conds[slot])
+        else {
+            unreachable!()
+        };
+        if self.vm_regs.len() < num_regs as usize {
+            self.vm_regs.resize(num_regs as usize, Value::zero(1));
+        }
+        self.exec_insns(&insns);
+        let on = self.vm_regs[reg as usize].is_true();
+        if audits > 0 && self.timing_cond_interp(idx, bit) != on {
+            self.timing_conds[slot] = TcCond::Interp;
+            return !on;
+        }
+        self.timing_conds[slot] = TcCond::Code {
+            insns,
+            num_regs,
+            reg,
+            audits: audits.saturating_sub(1),
+        };
+        on
+    }
+
+    /// The expression of condition `bit` of check `idx`.
+    fn timing_cond_expr(&self, idx: usize, bit: u8) -> Option<&Arc<Expression>> {
+        let cold = &self.timing_checks[idx].cold;
+        match bit {
+            COND_REF => cold.reference.cond.as_ref(),
+            COND_DATA => cold.data.as_ref().and_then(|d| d.cond.as_ref()),
+            COND_STAMP => cold.stamp_cond.as_ref(),
+            _ => cold.check_cond.as_ref(),
+        }
+    }
+
+    /// Condition `bit` of check `idx` through the interpreter.
+    fn timing_cond_interp(&mut self, idx: usize, bit: u8) -> bool {
+        let c = self.timing_cond_expr(idx, bit).cloned();
+        self.timing_cond_true(&c)
+    }
+
+    /// Compile condition `bit` of check `idx` (a pure expression over
+    /// signals, already in the flat namespace) as a standalone expression.
+    fn compile_timing_cond(&self, idx: usize, bit: u8) -> TcCond {
+        let Some(e) = self.timing_cond_expr(idx, bit) else {
+            return TcCond::Interp;
+        };
+        if !Self::cond_expr_is_effect_free(e, true) {
+            return TcCond::Interp;
+        }
+        if let Some((sig, levels)) = self.timing_cond_levels(e) {
+            return TcCond::Level {
+                sig,
+                levels,
+                audits: COND_AUDIT_EVALS,
+            };
+        }
+        let mut compiler = super::bytecode::BytecodeCompiler::new(
+            &self.signal_name_to_id,
+            &self.signal_signed,
+            &self.signal_widths,
+            &self.module.arrays,
+            &self.widths,
+        );
+        compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
+        compiler.set_ast_fallback(false);
+        compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
+        compiler.set_functions(&self.module.functions);
+        compiler.set_params(&self.module.parameters);
+        compiler.set_param_leaf_idx(self.param_leaf_index());
+        compiler.set_cast_widths(&self.cast_widths);
+        compiler.set_packed_struct_fields(
+            self.bc_packed_fields
+                .as_ref()
+                .unwrap_or(&self.module.packed_struct_fields),
+        );
+        compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+        compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+        compiler.set_typedef_types(&self.module.typedef_types);
+        compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
+        compiler.set_assoc_arrays(&self.module.associative_arrays);
+        compiler.set_packed_full_dims(&self.module.packed_full_dims);
+        Self::set_pattern_type_tables(&self.module, &mut compiler);
+        compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
+        compiler.set_arrays_2d(&self.module.arrays_2d);
+        compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
+        compiler.set_array_first_id(&self.array_first_id);
+        compiler.set_string_signals(&self.module.string_signals);
+        compiler.set_signal_real(&self.signal_real);
+        compiler.top_module_name = Some(self.module.name.clone());
+        let Some(reg) = compiler.compile_root_expr(e) else {
+            return TcCond::Interp;
+        };
+        let block = compiler.finish();
+        TcCond::Code {
+            insns: block.instructions.into_boxed_slice(),
+            num_regs: block.num_regs,
+            reg,
+            audits: COND_AUDIT_EVALS,
+        }
+    }
+
+    /// §31.7 `scalar_timing_check_condition` over a one-bit unsigned
+    /// signal: the signal and the levels (bit per level 0, 1, 2 = x/z) that
+    /// enable the check. An x or z level fails `==`, `!=` and a bare
+    /// reference (the condition is then x), and passes only `!==`.
+    fn timing_cond_levels(&self, e: &Expression) -> Option<(usize, u8)> {
+        const L0: u8 = 1;
+        const L1: u8 = 2;
+        const LX: u8 = 4;
+        let signal = |e: &Expression| -> Option<usize> {
+            let ExprKind::Ident(h) = &strip_parens(e).kind else {
+                return None;
+            };
+            if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+                return None;
+            }
+            let id = self.resolve_ident_id(h, None)?;
+            (self.signal_widths[id] == 1
+                && !self.signal_signed[id]
+                && !self.signal_real.get(id).copied().unwrap_or(false))
+            .then_some(id)
+        };
+        // `scalar_constant`: 1'b0, 1'b1, 'b0, 'b1, 0, 1 (§31.7).
+        let scalar = |e: &Expression| -> Option<u8> {
+            let ExprKind::Number(NumberLiteral::Integer { size, value, .. }) =
+                &strip_parens(e).kind
+            else {
+                return None;
+            };
+            if size.is_some_and(|w| w != 1) {
+                return None;
+            }
+            match value.as_str() {
+                "0" => Some(0),
+                "1" => Some(1),
+                _ => None,
+            }
+        };
+        let e = strip_parens(e);
+        match &e.kind {
+            ExprKind::Ident(_) => Some((signal(e)?, L1)),
+            ExprKind::Unary {
+                op: UnaryOp::BitNot | UnaryOp::LogNot,
+                operand,
+            } => Some((signal(operand)?, L0)),
+            ExprKind::Binary { op, left, right } => {
+                let (sig, c) = match (signal(left), scalar(right)) {
+                    (Some(sg), Some(c)) => (sg, c),
+                    _ => (signal(right)?, scalar(left)?),
+                };
+                let (is, not) = if c == 1 { (L1, L0) } else { (L0, L1) };
+                let levels = match op {
+                    BinaryOp::Eq | BinaryOp::CaseEq => is,
+                    BinaryOp::Neq => not,
+                    BinaryOp::CaseNeq => not | LX,
+                    _ => return None,
+                };
+                Some((sig, levels))
+            }
+            _ => None,
+        }
     }
 
     fn timing_role_event(&mut self, idx: usize, role: u8) {
-        let rt = &self.timing_checks[idx];
         let bit = if role == ROLE_DATA {
             COND_DATA
         } else {
             COND_REF
         };
-        if rt.conds & bit != 0 {
-            let cond = if role == ROLE_DATA {
-                rt.cold.data.as_ref().and_then(|d| d.cond.clone())
-            } else {
-                rt.cold.reference.cond.clone()
-            };
-            if !self.timing_cond_true(&cond) {
-                return;
-            }
+        if !self.timing_cond_on(idx, bit) {
+            return;
         }
         let now = self.time;
         match role {
@@ -865,9 +1083,8 @@ impl Simulator {
                 hold,
                 recrem,
             } => {
-                let (check, stamp) = self.timing_window_conds(idx);
                 if let Some(td) = self.timing_checks[idx].data_time {
-                    if self.timing_cond_true(&check) {
+                    if self.timing_cond_on(idx, COND_CHECK) {
                         let delta = td as i64 - now as i64;
                         if window_hit(delta, setup, hold) {
                             let limit = if delta < 0 { setup } else { hold };
@@ -875,7 +1092,7 @@ impl Simulator {
                         }
                     }
                 }
-                if self.timing_cond_true(&stamp) {
+                if self.timing_cond_on(idx, COND_STAMP) {
                     self.timing_checks[idx].ref_time = Some(now);
                 }
             }
@@ -974,9 +1191,8 @@ impl Simulator {
                 hold,
                 recrem,
             } => {
-                let (check, stamp) = self.timing_window_conds(idx);
                 if let Some(tr) = self.timing_checks[idx].ref_time {
-                    if self.timing_cond_true(&check) {
+                    if self.timing_cond_on(idx, COND_CHECK) {
                         let delta = now as i64 - tr as i64;
                         if window_hit(delta, setup, hold) {
                             let limit = if delta < 0 { setup } else { hold };
@@ -984,7 +1200,7 @@ impl Simulator {
                         }
                     }
                 }
-                if self.timing_cond_true(&stamp) {
+                if self.timing_cond_on(idx, COND_STAMP) {
                     self.timing_checks[idx].data_time = Some(now);
                 }
             }
