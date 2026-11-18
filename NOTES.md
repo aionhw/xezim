@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Store every element of a replication pattern (`'{2{7}}`) written to a one-dimensional array, queue or dynamic array by a nonblocking assignment or an intra-assignment delay, instead of only the first (#1263).
+
 - **Correctness:** Reject duplicate package definitions (§3.13, §26.2).
 - **Correctness:** Reject differing duplicate typedef definitions and warn on identical cross-file typedefs (§3.13, §6.18).
 - **Correctness:** Warn on redefined interfaces, programs and primitives (§3.13, §25.3).
