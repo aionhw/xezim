@@ -2701,20 +2701,83 @@ impl Simulator {
                 )
             }
             _ => {
+                // §10.9.1: an array matched to a sub-array (`'{wc, wc}`)
+                // supplies its elements, read now.
+                if matches!(
+                    shape,
+                    Some(super::intra_pattern_shape::ItemShape::Array { .. })
+                ) && let Some(elems) = self.array_item_elements(e)
+                {
+                    let rows = elems
+                        .into_iter()
+                        .map(|(suffix, v)| {
+                            let path = suffix
+                                .split('[')
+                                .filter(|c| !c.is_empty())
+                                .map(|c| c.trim_end_matches(']').to_string())
+                                .collect();
+                            (path, v)
+                        })
+                        .collect();
+                    return self.kept_element_pattern(rows, e.span, slots);
+                }
                 let val = self.intra_item_value(shape, e);
-                let idx = self.intra_saved_next;
-                self.intra_saved_next += 1;
-                self.intra_saved.insert(idx, val);
-                slots.push(idx);
-                Expression::new(
-                    ExprKind::SystemCall {
-                        name: INTRA_KEPT_MARKER.to_string(),
-                        args: vec![Self::intra_slot_literal(idx, e.span)],
-                    },
-                    e.span,
-                )
+                self.kept_item(val, e.span, slots)
             }
         }
+    }
+
+    /// A captured value as an item of the pattern the delayed store runs.
+    fn kept_item(
+        &mut self,
+        val: Value,
+        span: crate::ast::Span,
+        slots: &mut Vec<u64>,
+    ) -> Expression {
+        let idx = self.intra_saved_next;
+        self.intra_saved_next += 1;
+        self.intra_saved.insert(idx, val);
+        slots.push(idx);
+        Expression::new(
+            ExprKind::SystemCall {
+                name: INTRA_KEPT_MARKER.to_string(),
+                args: vec![Self::intra_slot_literal(idx, span)],
+            },
+            span,
+        )
+    }
+
+    /// Captured array elements, each with its index path, as a pattern
+    /// nested by dimension in declared order.
+    fn kept_element_pattern(
+        &mut self,
+        rows: Vec<(Vec<String>, Value)>,
+        span: crate::ast::Span,
+        slots: &mut Vec<u64>,
+    ) -> Expression {
+        let mut items = Vec::new();
+        let mut rows = rows.into_iter().peekable();
+        while let Some((mut path, v)) = rows.next() {
+            if path.len() <= 1 {
+                items.push(AssignmentPatternItem::Ordered(
+                    self.kept_item(v, span, slots),
+                ));
+                continue;
+            }
+            let head = path.remove(0);
+            let mut group = vec![(path, v)];
+            while rows.peek().is_some_and(|(p, _)| p.first() == Some(&head)) {
+                let Some((mut p, v)) = rows.next() else {
+                    break;
+                };
+                p.remove(0);
+                group.push((p, v));
+            }
+            items.push(AssignmentPatternItem::Ordered(
+                self.kept_element_pattern(group, span, slots),
+            ));
+        }
+        Expression::new(ExprKind::AssignmentPattern(items), span)
     }
 
     pub(super) fn intra_slot_literal(idx: u64, span: crate::ast::Span) -> Expression {
