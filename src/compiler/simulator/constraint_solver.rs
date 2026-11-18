@@ -1191,22 +1191,50 @@ impl Simulator {
                         continue;
                     };
                     let is_randc = matches!(rq, crate::ast::types::RandQualifier::Randc);
-                    let w = resolve_type_width(
-                        &m.data_type,
-                        Some(&self.module.parameters),
-                        Some(&self.module.typedefs),
-                    )
-                    .max(1);
+                    let w = self
+                        .declared_packed_type(&m.data_type)
+                        .map(|(_, _, w)| w)
+                        .unwrap_or_else(|| {
+                            resolve_type_width(
+                                &m.data_type,
+                                Some(&self.module.parameters),
+                                Some(&self.module.typedefs),
+                            )
+                        })
+                        .max(1);
                     let et = self.struct_member_enum_key(&m.data_type);
                     let signed = super::elaborate::is_type_signed_resolved(
                         &m.data_type,
                         &self.module.typedef_types,
                     );
                     for d in &m.declarators {
+                        // §18.4: a class handle is never drawn as a value;
+                        // drawing one overwrote the object reference.
+                        if let DataType::TypeReference { name, .. } = &m.data_type
+                            && self.module.classes.contains_key(&name.name.name)
+                        {
+                            continue;
+                        }
                         if signed {
                             unpacked_agg_signed.insert(format!("{}.{}", prop, d.name.name));
                         }
-                        members.push((d.name.name.clone(), w, is_randc, et.clone()));
+                        // §18.4: a fixed unpacked member contributes each
+                        // element's cell; the aggregate itself has no value.
+                        let indices = self.member_elem_indices(&d.dimensions);
+                        if let Some(indices) = indices {
+                            for tuple in indices {
+                                let mut name = d.name.name.clone();
+                                for i in tuple {
+                                    name.push_str(&format!("[{i}]"));
+                                }
+                                if signed {
+                                    unpacked_agg_signed.insert(format!("{prop}.{name}"));
+                                }
+                                members.push((name, w, is_randc, et.clone()));
+                            }
+                        } else {
+                            members.push((d.name.name.clone(), w, is_randc, et.clone()));
+                        }
                     }
                 }
                 unpacked_agg_props.push((prop.clone(), members));

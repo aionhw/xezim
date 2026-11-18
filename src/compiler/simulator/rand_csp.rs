@@ -8067,6 +8067,14 @@ impl Simulator {
                 v.push(member.name.clone());
                 Some(v)
             }
+            // §18.4: `rg.item[0]`, an element of a fixed array member of an
+            // unpacked struct, is a solver variable of its own.
+            ExprKind::Index { expr, index } => {
+                let mut path = Self::csp_member_path(expr)?;
+                let i = super::elaborate::const_eval_i64_with_params(index, None)?;
+                path.last_mut()?.push_str(&format!("[{i}]"));
+                Some(path)
+            }
             _ => None,
         }
     }
@@ -9514,6 +9522,21 @@ impl Simulator {
     /// up its class chain; a class type parameter stands for the type this
     /// object bound to it.
     fn csp_prop_decl_type(&self, owner: usize, name: &str) -> Option<DataType> {
+        // §18.4: a member of an unpacked-struct property (`rg.item[0]`) has
+        // the declared type its member path leads to.
+        if let Some((root, tail)) = name.split_once('.') {
+            let mut dt = self.csp_prop_decl_type(owner, root)?;
+            for part in tail.split('.') {
+                let member = part.split('[').next()?;
+                let (next, unpacked) = self.member_decl_type(&dt, member)?;
+                let selects = part.bytes().filter(|&b| b == b'[').count();
+                if selects != unpacked.len() {
+                    return None;
+                }
+                dt = next;
+            }
+            return Some(dt);
+        }
         let class = self
             .heap
             .get(owner)
