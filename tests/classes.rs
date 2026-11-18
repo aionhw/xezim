@@ -1329,3 +1329,7 @@ mod named_param_typedef_spec;
 mod scoped_vif_typedef_local;
 #[path = "classes/subroutine_actual_width_1256.rs"]
 mod subroutine_actual_width_1256;
+#[path = "classes/packed_member_foreach_1192.rs"]
+mod packed_member_foreach_1192;
+#[path = "classes/unpacked_struct_packed_member_1192.rs"]
+mod unpacked_struct_packed_member_1192;
