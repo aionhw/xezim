@@ -789,3 +789,5 @@ mod nd_struct_array_members_1240;
 mod nettype_driver_delays_1204;
 #[path = "types/inside_compiled_forms.rs"]
 mod inside_compiled_forms;
+#[path = "types/nettype_declaration_initializer_drivers.rs"]
+mod nettype_declaration_initializer_drivers;
