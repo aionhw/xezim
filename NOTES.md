@@ -189,6 +189,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   instead of 66.2 G instructions, against 1.58 G with `+nospecify` (§31.7,
   #1246, reported by Ganesh-TNL).
 
+* Calling a class method whose formal, return or local is sized by a class
+  parameter, or that evaluates `$bits` of such a type, no longer copies the
+  design's whole parameter table on every call. A call cost time linear in the
+  design's parameter count, about 0.14 ms per call with 8,000 unrelated
+  parameters; the reported case now runs in the same 277 M instructions with
+  8,000 parameters as with none (§8.25, #1276, contributed by auty1395).
+
 **Command line**
 
 * `$dumpvars` and `$fsdbDumpvars` accept indexed scope arguments: a
@@ -710,6 +717,117 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   handle (`p.h.len.rand_mode(0)`) apply to that sub-object, so its
   `randomize()` and that of the enclosing object hold the member; the mode was
   recorded on the enclosing object and never applied (§18.8, §18.9, #1259).
+
+* A compiled method that calls another compiled method directly passes an
+  argument to a formal typed by a class typedef sized by a class parameter
+  (`typedef logic [AW-1:0] addr_t;`) at the receiver's width; it was truncated
+  to 1 bit from the 1,001st call on, so `m.exists(a)` missed keys it held
+  (§8.25, §13.5.1, #1271, contributed by auty1395).
+
+* A class typedef of a class-parameter typedef (`typedef addr_t addr2_t;`)
+  sizes formals, locals and returns by the receiver's specialization instead
+  of as 1 bit, and `obj.m = new`, `this.m = new` and `this.arr[i] = new`
+  construct the specialization the member is declared with instead of the
+  default one (§6.18, §8.8, §8.25, #1271, reported by auty1395).
+
+* A compiled method's whole-value assignment to a static or instance
+  collection member, or to a member that redeclares a base-class member,
+  writes that member when a module variable has the same name; it wrote the
+  module variable (§8.9, §23.9, #1287, contributed by auty1395).
+
+* A fill literal (`'0`, `'1`, `'x`, `'z`) whose other operand is a `real`,
+  `shortreal` or `realtime` is converted at its self-determined one bit: `one
+  == '1` is 1 for `one = 1.0` and `2.0 + '1` is 3.0. It was widened to 64 bits
+  first, so `'1` read as 2^64 - 1 in comparisons, arithmetic, parameters and
+  class methods (§5.7.1, §11.8.2, #1278, contributed by ds54e).
+
+* `inside` compares a real operand or a real set member numerically: `r inside
+  {u}` for `r = 4294967295.0` and `u = 32'hffffffff`, `1 inside {1.0}`, a
+  negative integer and the items of an interpreted `case (r) inside` compared
+  bit encodings (§11.4.13, §11.4.5, §12.5.4, #1281, contributed by ds54e). A
+  `case inside` in compiled code matches its items as the `inside` operator
+  does: a wildcard item such as `4'b10??` never matched in an `always_comb`
+  (§12.5.4, #1281).
+
+* A variable, literal or struct connected to an input port of a user-defined
+  nettype drives the port's net, which the nettype's resolution function
+  resolves; the port read the actual directly, a regression in 0.11.6 for a
+  `real` variable (§23.3.3, §6.6.7, #1280, reported by ds54e).
+
+* A stream operand with `with [ array_range ]` packs and unpacks only the
+  selected elements and leaves the rest of the array unmodified. The range is
+  evaluated when its array is streamed, so it can read a length unpacked
+  earlier in the same statement; an unpack grows a dynamic array or queue to
+  the range (§11.4.14.4, #1197, contributed by Thomasb81).
+
+* An edge-sensitive block whose input changes in the final combinational
+  settle of an edge cascade runs in the same time step: chained nettype relays
+  and their integral counterparts lagged one update behind (§9.4.2, #1239,
+  contributed by Thomasb81).
+
+* Each continuous driver of a user-defined nettype net keeps its own delay in
+  front of the resolution function, and the net's declaration initializer is
+  one of its drivers, constant or not, at top level or in an instance
+  (§10.3.3, §6.6.7, §10.3.1, #1204, contributed by Thomasb81).
+
+* Four or more continuous assignments with one read set no longer loop for
+  ever in the time-0 settle when they inline a function whose `if` or `case`
+  compiles to a fused compare-and-branch or a jump table, and a continuous
+  assignment in an instance that reads a cell of a memory too large to name
+  its elements re-evaluates when the memory is written (§9.2.2.1, §10.3.2,
+  #1284, reported by Ganesh-TNL).
+
+* A blocking assignment of a pattern whose items read the target (`a = '{a[1],
+  a[0]}`) reads every item before it writes the target, for arrays, queues,
+  structs, class properties, associative arrays and function locals (§10.4.1,
+  §10.9.1, §10.9.2, #1274, reported by chuanseng-ng; test contributed by
+  chuanseng-ng).
+
+* A compiled class method or subroutine of a package reads its own package's
+  parameters, variables and imported names ahead of a same-named declaration
+  of the calling module, and a package function reached only from another
+  package's code runs in its own package (§26.3, #1285, contributed by
+  auty1395).
+
+* The formals, return types and locals of a package's subroutines and class
+  methods are sized by the package's parameters, whoever calls them, and
+  `logic a [N]` in an instance of a module that imports `N` from the only
+  package declaring it is a fixed-size array (§26.3, §7.4.2,
+  aionhw/xezim-core#253, aionhw/xezim-core#254, contributed by auty1395).
+
+* A class nested in a parameterized class and named through a specialization
+  (`alpha #(.W(4))::req`) keeps its own constructor, methods, statics and base
+  class when another class nests a class of the same name; a class property
+  typed by the class's own typedef is sized by the class's `localparam`s; and
+  a named property or sequence that two packages declare runs the body of the
+  package in scope, with `import pkg::prop;` importing it (§6.18, §8.23,
+  §8.25, §16.8, §26.3, #1273, reported by Ganesh-TNL).
+
+* An unsized signed decimal number of more than 32 bits has its full value and
+  width, sign bit included, in parameters, constant expressions, `$bits` and
+  run-time expressions alike, and the 32-bit wrap warning is gone:
+  `2000000000000` read -199023255552 at run time and -1454759936 in a
+  parameter; `3000000000` is now 33 bits (§5.7.1, #1120, reported by ds54e).
+
+* A part-select with negative or ascending bounds of a multidimensional packed
+  array is written to the selected elements, in blocking, nonblocking and
+  continuous assignments, class properties and associative-array elements, and
+  a nonblocking element-range write to a multidimensional packed array writes
+  the whole range (`q[2:1] <= v` on `logic [3:0][7:0] q` wrote 2 bits)
+  (§7.4.1, §11.5.1, #1193, reported by Ganesh-TNL).
+
+* A `foreach` constraint over an array of fixed shape reached through a struct
+  member, a sub-object or a row of a multidimensional array, or with omitted
+  loop variables, is solved instead of dropped; a member of a packed struct or
+  union member of an unpacked-struct class property is addressed as a slice of
+  it; rand array and union members of an unpacked-struct property are drawn at
+  their real shape; and constraints on a sub-object's selected members reach
+  its solve (§7.2.1, §18.4, §18.5.8.1, §18.5.9, #1192, reported by
+  Ganesh-TNL).
+
+* The elements of a package array parameter are left out of the waveform scope
+  of a module that does not declare them (§21.7.2.3, §26.3, #1213, reported by
+  ds54e).
 
 ### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
 
