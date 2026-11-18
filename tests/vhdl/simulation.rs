@@ -1,12 +1,11 @@
-//! VHDL designs simulated end to end: each `designs/<name>.vhd` runs through
-//! `xezim` and its output and exit status must equal `designs/<name>.golden`
-//! and `designs/<name>.exit`, produced by GHDL 4.1 (`designs/regen.sh`). A
-//! difference is a semantic or formatting difference from GHDL. GHDL run
-//! options go in `designs/<name>.args`, simulator settings that only xezim
-//! reads (`KEY=VALUE` environment lines) in `designs/<name>.env`.
-
-//! The assertion-driven `pending_*` cases specify their expected successful
-//! completion from §10.5.2 and §14.7 and are checked on the frozen baseline.
+//! VHDL designs simulated end to end: each source is checked against its
+//! expected output and exit status. Existing reference cases can be
+//! regenerated with `designs/regen.sh`; per-case run options and simulator
+//! environment settings are read from `.args` and `.env` files.
+//!
+//! The assertion-driven `pending_*` cases specify expected completion from
+//! IEEE 1076. The activity regression fails on the frozen baseline; the
+//! other pending-driver regressions also pass on that baseline.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -641,4 +640,18 @@ fn pending_driver_transitive_procedure_delay() {
 #[test]
 fn pending_driver_procedure_force_and_release() {
     check("pending_force_procedure");
+}
+
+/// §10.5.2.2, §14.7.3: pending whole words and scalar writes preserve
+/// source order, including arrays of packed words and equal-value writes.
+#[test]
+fn pending_partial_write_precedence() {
+    check("pending_partial_precedence");
+}
+
+/// §16.2.4, §14.7.3: scalar part activity includes equal transactions,
+/// excludes untouched siblings, and feeds quiet deadlines before resolution.
+#[test]
+fn pending_partial_activity_and_quiet() {
+    check("pending_partial_activity");
 }
