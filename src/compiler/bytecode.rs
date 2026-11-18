@@ -39,9 +39,11 @@ pub(crate) struct MethodAdmission {
     /// class's `get(output ...)` vs another's input-only `get`) from
     /// spuriously declining the other call's compile.
     pub writeback_positions: HashMap<(String, String), HashSet<usize>>,
-    /// Formal positions with unpacked dimensions, keyed by method name across
-    /// all classes.
-    pub coll_formal_positions: HashMap<String, HashSet<usize>>,
+    /// Formal positions with unpacked dimensions (directly or through a
+    /// typedef), keyed like `writeback_positions` by the class that declares
+    /// the method; free functions and tasks under the class `""` and their
+    /// unqualified name.
+    pub coll_formal_positions: HashMap<(String, String), HashSet<usize>>,
     /// Direct supervclass (extends target, spec args stripped) per declared
     /// class. `emit_arg_slot_writeback` walks this chain to gather the
     /// non-input formal positions inherited by a receiver's class.
@@ -6620,6 +6622,113 @@ impl<'a> BytecodeCompiler<'a> {
         // names this compiler bound, so a hit here is by construction one of
         // those, not a design signal that happens to be dotted.
         self.local_var_regs.get(&seg.name.name).copied()
+    }
+
+    /// §13.5.1, §7.10, §10.10: does a call pass an actual where the callee
+    /// declares an unpacked-array formal? Every compiled call hands each
+    /// actual to the interpreter's binder as the packed value of one
+    /// register, which no unpacked array is: a collection literal arrived as
+    /// its packed bits split into elements (`{"nop"}` as three one-byte
+    /// strings) and a returned collection as an empty one. Such a call stays
+    /// on the interpreter. The formal positions are those of the class that
+    /// declares the method on the receiver's chain when the receiver's class
+    /// is known (`this`, `super`, a typed handle, a class scope), else the
+    /// union over every class, free function and task of that name.
+    fn call_has_coll_formal_actual(&self, func: &Expression, args: &[Expression]) -> bool {
+        let (class, method): (Option<String>, &str) = match &func.kind {
+            ExprKind::MemberAccess { expr: base, member } => {
+                let class = match &base.kind {
+                    ExprKind::This => self.method_class.clone(),
+                    ExprKind::Ident(h)
+                        if h.root.is_none()
+                            && h.path.len() == 1
+                            && h.path[0].selects.is_empty()
+                            && h.path[0].name.name == "super" =>
+                    {
+                        self.method_class_parent.clone()
+                    }
+                    ExprKind::Ident(h)
+                        if h.root.is_none()
+                            && h.path.len() == 1
+                            && h.path[0].selects.is_empty()
+                            && self
+                                .scope_static_receivers
+                                .contains(h.path[0].name.name.as_str()) =>
+                    {
+                        Some(h.path[0].name.name.clone())
+                    }
+                    _ => self.method_handle_chain_class(base),
+                };
+                (class, member.name.as_str())
+            }
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                let m = h.path[0].name.name.as_str();
+                let class = self
+                    .class_method_names
+                    .contains(m)
+                    .then(|| self.method_class.clone())
+                    .flatten();
+                (class, m)
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 => (
+                Some(h.path[0].name.name.clone()),
+                h.path[1].name.name.as_str(),
+            ),
+            _ => return false,
+        };
+        self.coll_formal_actual(class.as_deref(), method, args.iter())
+    }
+
+    /// See `call_has_coll_formal_actual`: `class` is the receiver's declared
+    /// class when known. An empty actual takes the formal's default; a named
+    /// actual is checked whatever its position.
+    fn coll_formal_actual<'e>(
+        &self,
+        class: Option<&str>,
+        method: &str,
+        args: impl Iterator<Item = &'e Expression>,
+    ) -> bool {
+        let Some(admission) = self.method_admission.as_ref() else {
+            return false;
+        };
+        let table = &admission.coll_formal_positions;
+        if table.is_empty() {
+            return false;
+        }
+        let mut positions: HashSet<usize> = HashSet::default();
+        match class
+            .map(|c| c.split('#').next().unwrap_or(c))
+            .filter(|c| admission.instance_fields.contains_key(*c))
+        {
+            Some(base) => {
+                let mut cur = Some(base);
+                let mut guard = 0;
+                while let Some(c) = cur
+                    && guard < 128
+                {
+                    if let Some(pos) = table.get(&(c.to_string(), method.to_string())) {
+                        positions.extend(pos.iter().copied());
+                    }
+                    cur = admission.class_parents.get(c).map(|s| s.as_str());
+                    guard += 1;
+                }
+            }
+            None => {
+                for ((_, m), pos) in table.iter() {
+                    if m == method {
+                        positions.extend(pos.iter().copied());
+                    }
+                }
+            }
+        }
+        if positions.is_empty() {
+            return false;
+        }
+        args.enumerate().any(|(i, arg)| match &arg.kind {
+            ExprKind::Empty => false,
+            ExprKind::NamedArg { .. } => true,
+            _ => positions.contains(&i),
+        })
     }
 
     /// class-perf row 2 (non-input formals): after a call whose args were
@@ -15980,6 +16089,11 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Call { args, .. } => args.iter().collect(),
             _ => return None,
         };
+        // §8.7, §13.5.1: an unpacked-array formal of the constructor.
+        if self.coll_formal_actual(Some(class), "new", args.iter().copied()) {
+            self.bail("method_coll_literal_actual");
+            return None;
+        }
         let call_start = self.insns.len();
         let call_next = self.next_reg;
         let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
@@ -18698,26 +18812,7 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 // A register holds one value, so `{"a", "b"}` cannot reach an
                 // unpacked collection formal as separate elements.
-                let callee = match &func.kind {
-                    ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
-                    ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
-                    _ => None,
-                };
-                if self.method_mode
-                    && let Some(positions) = callee.and_then(|m| {
-                        self.method_admission.as_ref()?.coll_formal_positions.get(m)
-                    })
-                    && positions.iter().any(|&i| {
-                        args.get(i).is_some_and(|arg| {
-                            matches!(
-                                arg.kind,
-                                ExprKind::Concatenation(_)
-                                    | ExprKind::Replication { .. }
-                                    | ExprKind::AssignmentPattern(_)
-                            )
-                        })
-                    })
-                {
+                if self.method_mode && self.call_has_coll_formal_actual(func, args) {
                     self.bail("method_coll_literal_actual");
                     return None;
                 }

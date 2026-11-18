@@ -3056,10 +3056,27 @@ impl Simulator {
                                 if self.formal_is_unpacked_collection(class, port) {
                                     facts
                                         .coll_formal_positions
-                                        .entry(name.clone())
+                                        .entry((class.clone(), name.clone()))
                                         .or_default()
                                         .insert(index);
                                 }
+                            }
+                        }
+                    }
+                    // §13.5.1: a free function or task called from a method
+                    // body binds its unpacked formals the same way.
+                    let free_ports = (self.module.functions.iter())
+                        .map(|(n, f)| (n, &f.ports))
+                        .chain(self.module.tasks.iter().map(|(n, t)| (n, &t.ports)));
+                    for (key, ports) in free_ports {
+                        let name = key.rsplit(['.', ':']).next().unwrap_or(key);
+                        for (index, port) in ports.iter().enumerate() {
+                            if self.formal_is_unpacked_collection("", port) {
+                                facts
+                                    .coll_formal_positions
+                                    .entry((String::new(), name.to_string()))
+                                    .or_default()
+                                    .insert(index);
                             }
                         }
                     }
