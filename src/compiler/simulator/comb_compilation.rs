@@ -1552,6 +1552,25 @@ impl Simulator {
                 // first value. An array of the packed arena has no per-cell
                 // ids: the read stays unresolved.
                 let mut packed_array_read = false;
+                // #1284, §10.3.2: an element read of an array stored without
+                // element names (`u.mem[5]`, one of the reads a dynamic index
+                // `u.mem[idx]` stands for) changes at run time, but no
+                // dependency edge can name its cell: the entry re-evaluates
+                // at every settle, as an always block reading one does and
+                // as a top-level read already did. The member-strip fallback
+                // below took it for a member of the instance `u` and
+                // depended on `u`, which no write dirties, so the
+                // assignment kept its first value.
+                if !found
+                    && self.read_names_unnamed_cell(
+                        r,
+                        scope_hint.as_deref(),
+                        ca_lhs_scope.unwrap_or_default(),
+                    )
+                {
+                    unresolved_count += 1;
+                    continue;
+                }
                 if !found && r.contains('.') {
                     let scopes = if read_is_rooted {
                         [None, None]
