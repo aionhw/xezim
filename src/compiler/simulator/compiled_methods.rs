@@ -1642,7 +1642,7 @@ impl Simulator {
     pub(super) fn free_call_pkg(
         &mut self,
         call_name: &str,
-        decl_name: &str,
+        fd: &crate::ast::decl::FunctionDeclaration,
     ) -> Option<std::rc::Rc<str>> {
         if let Some(p) = self.free_call_pkgs.get(call_name) {
             return p.clone();
@@ -1650,10 +1650,8 @@ impl Simulator {
         let p: Option<std::rc::Rc<str>> = match call_name.rsplit_once("::") {
             Some((pkg, _)) => Some(std::rc::Rc::from(pkg)),
             None => self
-                .module
-                .func_decl_scope
-                .get(decl_name)
-                .map(|p| std::rc::Rc::from(p.as_str())),
+                .subroutine_decl_scope(&fd.name.name.name, fd.span, false)
+                .map(std::rc::Rc::from),
         };
         self.free_call_pkgs.insert(call_name.to_string(), p.clone());
         p
@@ -3212,6 +3210,11 @@ impl Simulator {
                         &self.module.queue_vars,
                     );
                     compiler.method_enum_constants = method_enum_constants;
+                    compiler.method_pkg = cname
+                        .strip_prefix("__free_fn__")
+                        .filter(|p| !p.is_empty())
+                        .or_else(|| self.module.class_decl_pkg.get(cname).map(String::as_str))
+                        .map(|p| (p.to_string(), &self.module.parameters));
                     compiler.class_scoped_enums = Some(match &self.class_scoped_enum_cache {
                         Some(rc) => rc.clone(),
                         None => {

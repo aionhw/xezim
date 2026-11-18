@@ -2202,7 +2202,7 @@ impl Simulator {
                 // compiler bound to `P::name` names it outright; any other
                 // callee runs in its declaring scope.
                 let pkg = match &fd {
-                    Some(fd) => self.free_call_pkg(&fname.0, &fd.name.name.name),
+                    Some(fd) => self.free_call_pkg(&fname.0, fd),
                     None => None,
                 };
                 // Fast dispatch when this callee has a compiled block
