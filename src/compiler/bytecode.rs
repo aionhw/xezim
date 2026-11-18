@@ -15563,9 +15563,15 @@ impl<'a> BytecodeCompiler<'a> {
                                 }
                             }
                         }
+                        let start = self.insns.len();
+                        let start_reg = self.next_reg;
                         if self.compile_expr(e, 0).is_some() {
                             return true;
                         }
+                        // A call can be emitted before its write-back
+                        // declines; the fallback below runs it again.
+                        self.truncate_insns(start);
+                        self.next_reg = start_reg;
                         self.bail("Expr_Call_stmt");
                         return self.emit_fallback(stmt);
                     }
