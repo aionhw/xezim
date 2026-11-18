@@ -661,29 +661,7 @@ impl Simulator {
         layout: &ClassArrayLayout,
     ) -> Vec<(i64, Value)> {
         let indices = layout.indices();
-        // §10.9.1: an explicit index wins over a type key, which wins over
-        // default. Reuse the common positional/key/default/replication binder.
-        let typed = items.iter().find_map(|item| match item {
-            AssignmentPatternItem::Typed(dt, value)
-                if self.pattern_type_matches(&layout.data_type, dt) =>
-            {
-                Some(value)
-            }
-            _ => None,
-        });
-        let mut adjusted;
-        let items = if let Some(value) = typed {
-            adjusted = items
-                .iter()
-                .filter(|item| !matches!(item, AssignmentPatternItem::Default(_)))
-                .cloned()
-                .collect::<Vec<_>>();
-            adjusted.push(AssignmentPatternItem::Default(value.clone()));
-            adjusted.as_slice()
-        } else {
-            items
-        };
-        let elements = self.pattern_elems(items, &indices);
+        let elements = self.pattern_elems_for_type(items, &indices, &layout.data_type);
         indices
             .into_iter()
             .zip(elements)

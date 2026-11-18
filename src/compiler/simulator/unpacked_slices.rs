@@ -399,11 +399,14 @@ impl Simulator {
                     .unwrap_or(i64::MIN)
             })
             .collect();
-        let elems = self.pattern_elems(items, &indices);
         let dt = self
             .class_member_coll_type(&dst.root_name)
             .cloned()
             .or_else(|| self.p_elem_type(&dst.root_name));
+        let elems = match dt.as_ref() {
+            Some(dt) => self.pattern_elems_for_type(items, &indices, dt),
+            None => self.pattern_elems(items, &indices),
+        };
         Some(
             elems
                 .into_iter()

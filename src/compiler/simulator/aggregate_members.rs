@@ -4319,15 +4319,34 @@ impl Simulator {
         let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue) else {
             return false;
         };
-        let Some(m0) = su
-            .members
-            .first()
-            .and_then(|m| m.declarators.first())
-            .map(|d| d.name.name.clone())
+        let Some(first_key) = self
+            .unpacked_struct_leaf_keys("X", &su)
+            .into_iter()
+            .next()
+            .map(|(k, _, _)| k)
         else {
             return false;
         };
-        let probe = Self::append_member_expr(lvalue, &m0);
+        let Some(suffix) = first_key.strip_prefix("X.") else {
+            return false;
+        };
+        let mut probe = lvalue.clone();
+        for seg in suffix.split('.') {
+            if let Some(open) = seg.find('[') {
+                probe = Self::append_member_expr(&probe, &seg[..open]);
+                let mut rest = &seg[open..];
+                while let Some(end) = rest.find(']') {
+                    let idx_str = &rest[1..end];
+                    let Ok(idx) = idx_str.parse::<i64>() else {
+                        return false;
+                    };
+                    probe = Self::index_expr(&probe, idx);
+                    rest = &rest[end + 1..];
+                }
+            } else {
+                probe = Self::append_member_expr(&probe, seg);
+            }
+        }
         self.class_unpacked_leaf(&probe).is_some()
     }
 
@@ -4339,8 +4358,18 @@ impl Simulator {
         rvalue: &Expression,
         su: &crate::ast::types::StructUnionType,
     ) {
+        self.assign_class_unpacked_elem_with_types(lvalue, rvalue, su, &[]);
+    }
+
+    pub(super) fn assign_class_unpacked_elem_with_types(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+        su: &crate::ast::types::StructUnionType,
+        outer_types: &[(DataType, Expression)],
+    ) {
         let items = match &self.unpacked_pattern(rvalue).kind {
-            ExprKind::AssignmentPattern(its) => Some(its.as_slice()),
+            ExprKind::AssignmentPattern(its) => Some(its.clone()),
             _ => None,
         };
         // A call is one value. Spreading `mk().a` and `mk().b` would re-run it.
@@ -4356,74 +4385,216 @@ impl Simulator {
                 return;
             }
         }
-        let mut ordered: Vec<_> = items
-            .unwrap_or(&[])
+        let Some(its) = items.as_deref() else {
+            for m in &su.members {
+                for md in &m.declarators {
+                    let mn = md.name.name.as_str();
+                    let lhs_f = Self::append_member_expr(lvalue, mn);
+                    let rhs_f = Self::append_member_expr(rvalue, mn);
+                    if let Some(inner) = self.unpacked_struct_of(&m.data_type) {
+                        self.assign_class_unpacked_elem(&lhs_f, &rhs_f, &inner);
+                    } else {
+                        let w = resolve_type_width(
+                            &m.data_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        )
+                        .max(1);
+                        let v = self.eval_expr_ctx(&rhs_f, w);
+                        self.assign_value(&lhs_f, &v);
+                    }
+                }
+            }
+            return;
+        };
+        let member_names: Vec<String> = su
+            .members
             .iter()
-            .filter_map(|it| match it {
-                AssignmentPatternItem::Ordered(e) => Some(e),
-                _ => None,
+            .flat_map(|m| m.declarators.iter().map(|md| md.name.name.clone()))
+            .collect();
+        let mut combined_types: Vec<(DataType, Expression)> = its
+            .iter()
+            .filter_map(|item| {
+                if let AssignmentPatternItem::Named(id, _) = item
+                    && member_names.iter().any(|m| m == &id.name)
+                {
+                    return None;
+                }
+                self.array_pattern_type_key(item)
+                    .map(|(dt, e)| (dt, e.clone()))
             })
             .collect();
-        if let Some(expanded) = self.struct_replication_items(
-            su,
-            items.unwrap_or(&[]),
-            su.members.iter().map(|m| m.declarators.len()).sum(),
-        ) {
-            ordered = expanded;
-        }
-        let mut k = 0usize;
-        for m in &su.members {
-            for md in &m.declarators {
-                let mn = md.name.name.as_str();
-                let lhs_f = Self::append_member_expr(lvalue, mn);
-                // §10.9.1: named and type keys take precedence over the
-                // positional/default items, including constructor initializers.
-                let rhs_f = if let Some(its) = items {
-                    let selected = its
-                        .iter()
-                        .find_map(|it| match it {
-                            AssignmentPatternItem::Named(id, e) if id.name == mn => Some(e),
-                            _ => None,
-                        })
-                        .or_else(|| {
-                            its.iter().find_map(|it| match it {
-                                AssignmentPatternItem::Typed(dt, e)
-                                    if self.pattern_type_matches(&m.data_type, dt) =>
-                                {
-                                    Some(e)
-                                }
-                                _ => None,
-                            })
-                        })
-                        .or_else(|| ordered.get(k).copied())
-                        .or_else(|| {
-                            its.iter().find_map(|it| match it {
-                                AssignmentPatternItem::Default(e) => Some(e),
-                                _ => None,
-                            })
-                        });
-                    let Some(e) = selected else {
-                        k += 1;
-                        continue;
-                    };
-                    e.clone()
+        combined_types.extend(outer_types.iter().cloned());
+
+        let bound: Vec<_> = self
+            .bind_struct_pattern_items(su, its)
+            .into_iter()
+            .map(|(mn, mdt, dims, e, explicit)| (mn, mdt, dims, e.cloned(), explicit))
+            .collect();
+        for (mn, mdt, dims, e, explicit) in bound {
+            let lhs_f = Self::append_member_expr(lvalue, &mn);
+            let matched_outer = if !outer_types.is_empty() && dims.is_empty() {
+                outer_types
+                    .iter()
+                    .rev()
+                    .find(|(kt, _)| self.pattern_type_matches(&mdt, kt))
+                    .map(|(_, v)| v.clone())
+            } else {
+                None
+            };
+            let (rhs_f, rhs_outer, rhs_explicit) = if let Some(ov) = matched_outer {
+                (ov, outer_types, true)
+            } else if let Some(e) = e {
+                (e, if explicit { outer_types } else { combined_types.as_slice() }, explicit)
+            } else if !combined_types.is_empty()
+                && (!dims.is_empty()
+                    || self.unpacked_struct_of(&mdt).is_some()
+                    || crate::compiler::packed_assignment_pattern_plan::is_packed_aggregate(
+                        &mdt, self,
+                    ))
+            {
+                (
+                    Expression::new(ExprKind::AssignmentPattern(Vec::new()), rvalue.span),
+                    combined_types.as_slice(),
+                    false,
+                )
+            } else {
+                continue;
+            };
+
+            if !dims.is_empty() {
+                if let Some(lists) = self.member_dim_indices(&dims) {
+                    self.assign_class_unpacked_array_member(
+                        &lhs_f,
+                        &mdt,
+                        &lists,
+                        Some(&rhs_f),
+                        rhs_outer,
+                    );
+                }
+                continue;
+            }
+            if let Some(inner) = self.unpacked_struct_of(&mdt) {
+                self.assign_class_unpacked_elem_with_types(&lhs_f, &rhs_f, &inner, rhs_outer);
+            } else if !rhs_explicit && !rhs_outer.is_empty() {
+                if let Some(v) = self.eval_packed_with_outer_types(&rhs_f, &mdt, rhs_outer) {
+                    self.assign_value(&lhs_f, &v);
                 } else {
-                    Self::append_member_expr(rvalue, mn)
-                };
-                if let Some(inner) = self.unpacked_struct_of(&m.data_type) {
-                    self.assign_class_unpacked_elem(&lhs_f, &rhs_f, &inner);
-                } else {
-                    let w = resolve_type_width(
-                        &m.data_type,
-                        Some(&self.module.parameters),
-                        Some(&self.module.typedefs),
-                    )
-                    .max(1);
-                    let v = self.eval_expr_ctx(&rhs_f, w);
+                    let v = self.eval_pattern_leaf_value(&mdt, &rhs_f, None);
                     self.assign_value(&lhs_f, &v);
                 }
-                k += 1;
+            } else {
+                let v = self.eval_pattern_leaf_value(&mdt, &rhs_f, None);
+                self.assign_value(&lhs_f, &v);
             }
+        }
+    }
+
+    fn assign_class_unpacked_array_member(
+        &mut self,
+        lhs: &Expression,
+        elem_dt: &DataType,
+        lists: &[Vec<i64>],
+        rhs: Option<&Expression>,
+        outer_types: &[(DataType, Expression)],
+    ) {
+        let Some((indices, rest)) = lists.split_first() else {
+            let matched = outer_types
+                .iter()
+                .rev()
+                .find(|(kt, _)| self.pattern_type_matches(elem_dt, kt))
+                .map(|(_, v)| v);
+            let Some(val) = matched.or(rhs) else {
+                return;
+            };
+            if let Some(inner) = self.unpacked_struct_of(elem_dt) {
+                self.assign_class_unpacked_elem_with_types(lhs, val, &inner, outer_types);
+            } else if !outer_types.is_empty()
+                && let Some(v) = self.eval_packed_with_outer_types(val, elem_dt, outer_types)
+            {
+                self.assign_value(lhs, &v);
+            } else {
+                let v = self.eval_pattern_leaf_value(elem_dt, val, None);
+                self.assign_value(lhs, &v);
+            }
+            return;
+        };
+        if let Some(r) = rhs
+            && let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(r).kind
+        {
+            if rest.is_empty() {
+                let elems: Vec<Option<Expression>> = self
+                    .pattern_elems_for_type(items, indices, elem_dt)
+                    .into_iter()
+                    .map(|o| o.cloned())
+                    .collect();
+                let mut combined: Vec<(DataType, Expression)> = items
+                    .iter()
+                    .filter_map(|it| {
+                        self.array_pattern_type_key(it)
+                            .map(|(dt, e)| (dt, e.clone()))
+                    })
+                    .collect();
+                combined.extend(outer_types.iter().cloned());
+                let matched_outer = outer_types
+                    .iter()
+                    .rev()
+                    .find(|(kt, _)| self.pattern_type_matches(elem_dt, kt))
+                    .map(|(_, v)| v);
+                for (k, &idx) in indices.iter().enumerate() {
+                    let elem_lhs = Self::index_expr(lhs, idx);
+                    let cell_rhs = matched_outer
+                        .cloned()
+                        .or_else(|| elems.get(k).and_then(|o| o.clone()));
+                    if let Some(cr) = cell_rhs {
+                        let cell_outer = if matched_outer.is_some() {
+                            outer_types
+                        } else {
+                            combined.as_slice()
+                        };
+                        self.assign_class_unpacked_array_member(
+                            &elem_lhs,
+                            elem_dt,
+                            &[],
+                            Some(&cr),
+                            cell_outer,
+                        );
+                    }
+                }
+                return;
+            }
+            let mut combined: Vec<(DataType, Expression)> = items
+                .iter()
+                .filter_map(|it| {
+                    self.array_pattern_type_key(it)
+                        .map(|(dt, e)| (dt, e.clone()))
+                })
+                .collect();
+            combined.extend(outer_types.iter().cloned());
+            let items_owned = items.clone();
+            let elems: Vec<Option<Expression>> = self
+                .pattern_elems(&items_owned, indices)
+                .into_iter()
+                .map(|o| o.cloned())
+                .collect();
+            for (k, &idx) in indices.iter().enumerate() {
+                let elem_lhs = Self::index_expr(lhs, idx);
+                let sub = elems.get(k).and_then(|o| o.clone()).unwrap_or_else(|| {
+                    Expression::new(ExprKind::AssignmentPattern(Vec::new()), r.span)
+                });
+                self.assign_class_unpacked_array_member(
+                    &elem_lhs,
+                    elem_dt,
+                    rest,
+                    Some(&sub),
+                    &combined,
+                );
+            }
+            return;
+        }
+        for &idx in indices {
+            let elem_lhs = Self::index_expr(lhs, idx);
+            self.assign_class_unpacked_array_member(&elem_lhs, elem_dt, rest, rhs, outer_types);
         }
     }
 

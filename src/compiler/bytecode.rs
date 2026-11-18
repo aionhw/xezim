@@ -9842,38 +9842,54 @@ impl<'a> BytecodeCompiler<'a> {
     /// element.
     fn declared_pattern_ctx(&mut self, lv: &Expression) -> Option<crate::ast::types::DataType> {
         use crate::compiler::packed_assignment_pattern_plan as pp;
-        let (h, elem) = match &lv.kind {
-            ExprKind::Ident(h) => (h, false),
-            ExprKind::Index { expr, .. } => match &expr.kind {
-                ExprKind::Ident(h) => (h, true),
-                _ => return None,
-            },
-            _ => return None,
+        let mut cur = lv;
+        let mut index_count = 0usize;
+        loop {
+            match &cur.kind {
+                ExprKind::Paren(inner) => cur = inner,
+                ExprKind::Index { expr, .. } => {
+                    index_count += 1;
+                    cur = expr;
+                }
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
         };
         if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
             return None;
         }
         let raw = Self::hier_raw_name(h);
         let scoped = self.scope_hint.as_deref().map(|sc| cat_dot(sc, &raw));
-        let (ty, w) = [scoped.as_deref(), Some(raw.as_ref())]
+        let (ty, unpacked, w) = [scoped.as_deref(), Some(raw.as_ref())]
             .into_iter()
             .flatten()
             .find_map(|n| {
                 // A port collapsed onto the net it connects takes that
                 // net's declared type (`port_aliases`, formal to actual).
                 let ty = pp::declared_type(n, self.var_decl_types?, self.port_aliases)?;
-                let w = if elem {
-                    if self.multi_dim_arrays.is_some_and(|m| m.contains(n)) {
+                let is_multi = self.multi_dim_arrays.is_some_and(|m| m.contains(n));
+                if self.arrays.contains_key(n) {
+                    if is_multi {
                         return None;
                     }
-                    self.arrays.get(n)?.2
+                    let w = self.arrays.get(n)?.2;
+                    Some((ty.clone(), 1usize, w))
                 } else {
+                    if is_multi {
+                        return None;
+                    }
                     let id = *self.signal_name_to_id.get(n)?;
-                    *self.signal_widths.get(id)?
-                };
-                Some((ty.clone(), w))
+                    let w = *self.signal_widths.get(id)?;
+                    Some((ty.clone(), 0usize, w))
+                }
             })?;
-        (pp::packed_width(&ty, &mut BcPatternTypeResolver(self)) == Some(w)).then_some(ty)
+        let packed_selects = index_count.checked_sub(unpacked)?;
+        if pp::packed_width(&ty, &mut BcPatternTypeResolver(self)) != Some(w) {
+            return None;
+        }
+        pp::peel_packed_dims(&ty, packed_selects, &mut BcPatternTypeResolver(self))
     }
 
     /// §10.8: the type of an assignment target, for the pattern `rvalue`
@@ -26930,16 +26946,7 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
         if self.0.params.is_some_and(|p| p.contains_key(name)) {
             return false;
         }
-        let span = crate::ast::Span::dummy();
-        let tn = crate::ast::types::TypeName {
-            scopes: Vec::new(),
-            name: crate::ast::Identifier {
-                name: name.to_string(),
-                span,
-            },
-            span,
-            bound: Default::default(),
-        };
+        let tn = crate::compiler::packed_assignment_pattern_plan::parse_type_name_str(name);
         self.0.typedef_type_entry(&tn, None).is_some()
     }
 

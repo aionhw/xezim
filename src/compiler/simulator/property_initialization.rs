@@ -376,19 +376,65 @@ impl Simulator {
                     if let Some(su) = self.class_prop_struct(handle, &pname) {
                         if Self::spreads_member_wise(&su) {
                             let base = prop_ident_expr(&pname);
-                            let elems = self.pattern_elems(items, &indices);
+                            let prop_dt = cdef.property_types.get(&pname).cloned();
+                            let outer_types: Vec<(DataType, Expression)> = items
+                                .iter()
+                                .filter_map(|it| {
+                                    self.array_pattern_type_key(it)
+                                        .map(|(dt, e)| (dt, e.clone()))
+                                })
+                                .collect();
+                            let items_no_default: Vec<AssignmentPatternItem> = items
+                                .iter()
+                                .filter(|it| !matches!(it, AssignmentPatternItem::Default(_)))
+                                .cloned()
+                                .collect();
+                            let explicit_elems: Vec<bool> = match prop_dt.as_ref() {
+                                Some(dt) => self.pattern_elems_for_type(&items_no_default, &indices, dt),
+                                None => self.pattern_elems(&items_no_default, &indices),
+                            }
+                            .into_iter()
+                            .map(|e| e.is_some())
+                            .collect();
+                            let elems = match prop_dt.as_ref() {
+                                Some(dt) => self.pattern_elems_for_type(items, &indices, dt),
+                                None => self.pattern_elems(items, &indices),
+                            };
                             let owned: Vec<(usize, Option<Expression>)> =
                                 elems.into_iter().map(|e| e.cloned()).enumerate().collect();
                             for (k, e) in owned {
-                                if let Some(e) = e {
-                                    let elem = Self::index_expr(&base, indices[k]);
-                                    self.assign_class_unpacked_elem(&elem, &e, &su);
-                                }
+                                let Some(e) = e.or_else(|| {
+                                    (!outer_types.is_empty()).then(|| {
+                                        Expression::new(
+                                            ExprKind::AssignmentPattern(Vec::new()),
+                                            init.span,
+                                        )
+                                    })
+                                }) else {
+                                    continue;
+                                };
+                                let elem = Self::index_expr(&base, indices[k]);
+                                let slot_outer: &[_] =
+                                    if explicit_elems.get(k).copied().unwrap_or(false) {
+                                        &[]
+                                    } else {
+                                        &outer_types
+                                    };
+                                self.assign_class_unpacked_elem_with_types(
+                                    &elem,
+                                    &e,
+                                    &su,
+                                    slot_outer,
+                                );
                             }
                             continue;
                         }
                     }
-                    let elems = self.pattern_elems(items, &indices);
+                    let prop_dt = cdef.property_types.get(&pname).cloned();
+                    let elems = match prop_dt.as_ref() {
+                        Some(dt) => self.pattern_elems_for_type(items, &indices, dt),
+                        None => self.pattern_elems(items, &indices),
+                    };
                     for (k, e) in elems.into_iter().enumerate() {
                         if let Some(e) = e {
                             let en = format!("{}[{}]", scoped, indices[k]);

@@ -11,6 +11,7 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 /// What a captured pattern item is matched to.
+#[derive(Clone)]
 pub(super) enum ItemShape {
     /// `depth` (at least 1) further unpacked dimensions of `elem`.
     Array { elem: DataType, depth: usize },
@@ -100,29 +101,61 @@ impl Simulator {
         match shape {
             ItemShape::Array { elem, depth } => items
                 .iter()
-                .map(|item| match item {
-                    Item::Typed(..) => None,
-                    _ => Some(self.array_shape(elem.clone(), depth - 1)),
+                .map(|item| {
+                    if matches!(item, Item::Typed(..))
+                        && !matches!(
+                            Self::unparen(item.expr()).kind,
+                            ExprKind::AssignmentPattern(_)
+                        )
+                    {
+                        return Some(self.item_shape(elem));
+                    }
+                    Some(self.array_shape(elem.clone(), depth - 1))
                 })
                 .collect(),
             ItemShape::Struct(su) => {
-                let mut members: Vec<Option<(&str, ItemShape)>> = su
+                let all_members: Vec<(&str, &DataType, ItemShape)> = su
                     .members
                     .iter()
                     .flat_map(|m| {
+                        let mdt = &m.data_type;
                         m.declarators.iter().map(move |md| {
                             let shape = if md.dimensions.is_empty() {
-                                self.item_shape(&m.data_type)
+                                self.item_shape(mdt)
                             } else {
                                 ItemShape::Array {
-                                    elem: m.data_type.clone(),
+                                    elem: mdt.clone(),
                                     depth: md.dimensions.len(),
                                 }
                             };
-                            Some((md.name.name.as_str(), shape))
+                            (md.name.name.as_str(), mdt, shape)
                         })
                     })
                     .collect();
+                let mut members: Vec<Option<(&str, ItemShape)>> = all_members
+                    .iter()
+                    .map(|(n, _, s)| Some((*n, s.clone())))
+                    .collect();
+                let type_shape = |key_dt: &DataType| -> Option<ItemShape> {
+                    let mut matched: Option<ItemShape> = None;
+                    for (_, mdt, sh) in &all_members {
+                        let DataType::TypeReference { name, .. } = key_dt else {
+                            if std::mem::discriminant(&self.resolve_dt(mdt))
+                                == std::mem::discriminant(&self.resolve_dt(key_dt))
+                            {
+                                matched = Some(sh.clone());
+                            }
+                            continue;
+                        };
+                        let DataType::TypeReference { name: mname, .. } = mdt else {
+                            continue;
+                        };
+                        if mname.name.name == name.name.name {
+                            matched = Some(sh.clone());
+                        }
+                    }
+                    matched
+                };
                 let mut pos = 0;
                 items
                     .iter()
@@ -131,11 +164,20 @@ impl Simulator {
                             pos += 1;
                             members.get_mut(pos - 1)?.take().map(|(_, s)| s)
                         }
-                        Item::Named(n, _) => members
-                            .iter_mut()
-                            .find(|m| m.as_ref().is_some_and(|(mn, _)| *mn == n.name))?
-                            .take()
-                            .map(|(_, s)| s),
+                        Item::Named(n, _) => {
+                            if let Some(m) = members
+                                .iter_mut()
+                                .find(|m| m.as_ref().is_some_and(|(mn, _)| *mn == n.name))
+                            {
+                                return m.take().map(|(_, s)| s);
+                            }
+                            self.array_pattern_type_key(item)
+                                .and_then(|(dt, _)| type_shape(&dt))
+                        }
+                        Item::Typed(_, _) | Item::Keyed(_, _) => {
+                            let (dt, _) = self.array_pattern_type_key(item)?;
+                            type_shape(&dt)
+                        }
                         _ => None,
                     })
                     .collect()

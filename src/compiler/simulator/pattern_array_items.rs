@@ -23,34 +23,6 @@ impl Simulator {
         )
     }
 
-    /// `assign_array_item` over the sub-array spanning `dims` (normalized
-    /// bounds); `descending[k]` puts dimension `k`'s left bound at `hi`.
-    pub(super) fn assign_array_item_dims(
-        &mut self,
-        target: &str,
-        dims: &[(i64, i64)],
-        descending: &[bool],
-        dt: &DataType,
-        e: &Expression,
-    ) -> bool {
-        let e = Self::unparen(e);
-        if dims.is_empty() || !Self::may_be_array_item(e) {
-            return false;
-        }
-        let lists: Vec<Vec<i64>> = dims
-            .iter()
-            .enumerate()
-            .map(|(k, &(lo, hi))| {
-                if descending.get(k).copied().unwrap_or(false) {
-                    (lo..=hi).rev().collect()
-                } else {
-                    (lo..=hi).collect()
-                }
-            })
-            .collect();
-        self.assign_array_item(target, &lists, dt, e)
-    }
-
     /// §10.9.1, §10.10: store the unpacked array value `e` to the sub-array
     /// `target` whose dimensions list their indices in declared order, left
     /// bound first. Every source element is read before any is written, and
