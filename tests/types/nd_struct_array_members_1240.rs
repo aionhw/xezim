@@ -115,6 +115,34 @@ endmodule
     );
 }
 
+/// §7.6: a whole multi-dimensional array of structs, a row of one and an
+/// element copy member by member.
+#[test]
+fn nd_struct_array_copies_whole_by_row_and_by_element() {
+    let msgs = run(r##"
+typedef struct {int v; logic [3:0] w;} S;
+module top;
+  S a2[2][2], b2[2][2];
+  S c3[2][2][2], d3[2][2][2];
+  int i1[2][2], j1[2][2];
+  initial begin
+    a2[1][0].v = 7; a2[1][1].w = 5; a2[0][1].v = 4;
+    c3[1][1][0].v = 9;
+    i1[1][0] = 3;
+    b2 = a2;
+    j1 = i1;
+    d3 = c3;
+    $display("b2=%0d %0d j1=%0d d3=%0d", b2[1][0].v, b2[1][1].w, j1[1][0], d3[1][1][0].v);
+    b2[1] = a2[0];
+    $display("row=%0d", b2[1][1].v);
+    b2[0][0] = a2[1][0];
+    $display("elem=%0d", b2[0][0].v);
+  end
+endmodule
+"##);
+    assert_eq!(msgs, ["b2=7 5 j1=3 d3=9", "row=4", "elem=7"]);
+}
+
 /// §23.3, §25, §27: the arrays of an instance, an interface instance and a
 /// generate block, and a three-dimensional one read by `always_comb`.
 #[test]
