@@ -4989,7 +4989,14 @@ impl Simulator {
         class_name: &str,
         method: &str,
     ) -> Vec<usize> {
-        let Some(md) = self.method_defining_class(class_name, method) else {
+        // §6.18, §8.23, §8.25.1: a class-scope receiver may be a typedef of
+        // the class, a class type parameter or a `C#(..)` text; it names the
+        // class the call itself dispatches to (`exec_class_scope_static_call`).
+        // Only a name that is no class pays for the resolution.
+        let Some(md) = self.method_defining_class(class_name, method).or_else(|| {
+            let (base, _) = self.resolve_class_scope_prefix(class_name)?;
+            self.method_defining_class(&base, method)
+        }) else {
             return Vec::new();
         };
         // §13.5: task and function formals bind the same way; a task callee
@@ -5047,6 +5054,9 @@ impl Simulator {
         base: usize,
         n: usize,
     ) -> (Vec<Expression>, bool) {
+        if n == 0 {
+            return (Vec::new(), false);
+        }
         let pos = self.vm_writeback_scalar_positions(class_name, method);
         if pos.is_empty() || self.local_stack.is_empty() {
             let mut args = Vec::with_capacity(n);

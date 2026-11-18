@@ -6645,7 +6645,13 @@ impl<'a> BytecodeCompiler<'a> {
             // Non-input formal positions (output/inout/ref) that apply to
             // THIS call. Keyed by declaring class so one class's `get(output`
             // can't spuriously decline an un-related input-only `get`.
-            let affected: Option<HashSet<usize>> = if rc == UNTYPED {
+            // §6.18, §8.25.1: a class-scope receiver that names no class (a
+            // typedef of one, a type parameter) is resolved only at run time,
+            // so it takes the name-global rule too.
+            let base = rc.split('#').next().unwrap_or(rc);
+            let affected: Option<HashSet<usize>> = if rc == UNTYPED
+                || !admission.instance_fields.contains_key(base)
+            {
                 // Unresolvable receiver: fall back to the conservative
                 // name-global rule (union over every class that declares a
                 // non-input formal for this method name).
@@ -6662,7 +6668,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // declares `method`. A non-input formal an ancestor declares
                 // is inherited, so this is conservative-safe.
                 let mut acc: HashSet<usize> = HashSet::default();
-                let mut cur = Some(rc.split('#').next().unwrap_or(rc));
+                let mut cur = Some(base);
                 let mut guard = 0;
                 while let Some(c) = cur
                     && guard < 128
