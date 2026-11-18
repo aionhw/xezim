@@ -237,6 +237,8 @@ mod packed_struct_array_local;
 mod packed_struct_array_param_pattern_in_instance;
 #[path = "types/packed_struct_formal_member.rs"]
 mod packed_struct_formal_member;
+#[path = "types/packed_struct_formal_member_elements.rs"]
+mod packed_struct_formal_member_elements;
 #[path = "types/packed_struct_member_width.rs"]
 mod packed_struct_member_width;
 #[path = "types/param_cb_isolation.rs"]

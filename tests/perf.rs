@@ -71,3 +71,5 @@ mod queue_shift_counters;
 mod select_store_counters;
 #[path = "perf/timing_check_conditions.rs"]
 mod timing_check_conditions;
+#[path = "perf/struct_formal_member_calls.rs"]
+mod struct_formal_member_calls;
