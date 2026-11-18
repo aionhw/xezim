@@ -2445,19 +2445,20 @@ impl Simulator {
             .max(1);
             let param = self.array_formal_key(port);
             self.module.arrays.insert(param.clone(), (lo, hi, w));
-            let ordered: Vec<Expression> =
-                self.pattern_ordered(items).into_iter().cloned().collect();
-            let default = items.iter().find_map(|it| match it {
-                AssignmentPatternItem::Default(e) => Some(e.clone()),
-                _ => None,
-            });
-            for (j, idx) in (lo..=hi).enumerate() {
-                let idx = if descending { hi - (idx - lo) } else { idx };
-                let Some(e) = ordered.get(j).or(default.as_ref()) else {
-                    break;
-                };
-                let e = e.clone();
-                self.assign_pattern_or_leaf(&format!("{}[{}]", param, idx), dt, &e);
+            let indices: Vec<i64> = if descending {
+                (lo..=hi).rev().collect()
+            } else {
+                (lo..=hi).collect()
+            };
+            let elems: Vec<Option<Expression>> = self
+                .pattern_elems_for_type(items, &indices, dt)
+                .into_iter()
+                .map(|o| o.cloned())
+                .collect();
+            for (idx, item) in indices.into_iter().zip(elems) {
+                if let Some(e) = item {
+                    self.assign_pattern_or_leaf(&format!("{}[{}]", param, idx), dt, &e);
+                }
             }
             return Some((param, String::new(), lo, hi));
         }
