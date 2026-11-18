@@ -379,7 +379,8 @@ fn method_boost_enabled() -> bool {
 // §6.18, §6.16, §13.5.1, §8.9: typedef write-back receivers, string-collection members, unpacked-formal actuals, static collections.
 // §5.7.1, §11.8.2, §11.4.13, §12.5.4: fill operands of real operators fold at one bit; real,
 // fill and negative-member `inside` and non-constant `case inside` items run interpreted.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3086;
+// §8.9, §23.9, §6.18, §8.25: bare stores to class-scope shadow names decline; class typedef chains size formals.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3087;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
