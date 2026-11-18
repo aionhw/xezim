@@ -36,7 +36,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // §10.3.3: delayed updates retain the mask of bits owned by their driver.
 // Whole-array NBA entries carry captured element values.
 // 0x0e: procedural sequence/fork bodies use shared copy-on-write storage.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x0e";
+// 0x0f: optional assignment delays and inferred assertion clocks are boxed.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x0f";
 
 #[derive(Default)]
 struct Session {

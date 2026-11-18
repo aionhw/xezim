@@ -4373,7 +4373,7 @@ impl Simulator {
                             self.exec_statement(&Statement::new(
                                 StatementKind::NonblockingAssign {
                                     lvalue: lhs,
-                                    delay,
+                                    delay: delay.map(Box::new),
                                     rvalue: saved,
                                 },
                                 stmt.span,
@@ -4459,7 +4459,7 @@ impl Simulator {
                                 self.exec_statement(&Statement::new(
                                     StatementKind::NonblockingAssign {
                                         lvalue: target,
-                                        delay,
+                                        delay: delay.map(Box::new),
                                         rvalue: saved,
                                     },
                                     stmt.span,
@@ -4501,7 +4501,7 @@ impl Simulator {
                         self.exec_statement(&Statement::new(
                             StatementKind::NonblockingAssign {
                                 lvalue: leaf_lvalue,
-                                delay: delay_expr.clone(),
+                                delay: delay_expr.clone().map(Box::new),
                                 rvalue: saved,
                             },
                             stmt.span,
@@ -6388,7 +6388,7 @@ impl Simulator {
                             Some((events.clone(), (**body).clone()))
                         }
                         _ if a.inferred_clock.is_some() => Some((
-                            vec![a.inferred_clock.clone().unwrap()],
+                            vec![a.inferred_clock.as_deref().unwrap().clone()],
                             resolved_expr.clone(),
                         )),
                         _ => match self.clocking_meta.get("__xz_default_clocking") {
