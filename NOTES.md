@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Performance:** Compact completed syntax lists before building elaboration tables.
+
 - **Performance:** Allocate optional case-arm guards and patterns only when present, retain unchanged nested root blocks during required scope rewriting, and group large VHDL startup lists into shared sequential blocks.
 
 - **Performance:** Compact declaration-shape tables and allocate optional AST payloads and resolved-name cache values on demand.
