@@ -8,6 +8,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Read the elements of an assignment pattern item that is an unpacked array (`wb = #1 '{wc, r}`, a row, or `default:`) when a statement with an intra-assignment delay or event control runs, and store them into the matching sub-array, instead of zeros (#1291).
 - **Correctness:** Reject duplicate package definitions (§3.13, §26.2).
 - **Correctness:** Reject differing duplicate typedef definitions and warn on identical cross-file typedefs (§3.13, §6.18).
 - **Correctness:** Warn on redefined interfaces, programs and primitives (§3.13, §25.3).
