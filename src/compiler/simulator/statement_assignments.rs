@@ -2209,6 +2209,11 @@ impl Simulator {
                         {
                             mtn = Some(b);
                         }
+                        if let Some(t) = mtn.as_deref()
+                            && self.construct_covergroup_into(t, lvalue, rvalue)
+                        {
+                            return;
+                        }
                         if let Some(mcls) = mtn.as_deref().and_then(|t| {
                             self.resolve_typedef_spec(t)
                                 .map(|(b, s)| (b.clone(), Some((b, s))))
@@ -2439,6 +2444,11 @@ impl Simulator {
                     } else {
                         None
                     };
+                    if let Some(t) = elem_cls.as_deref()
+                        && self.construct_covergroup_into(t, lvalue, rvalue)
+                    {
+                        return;
+                    }
                     // The element type is often a TYPEDEF alias (e.g.
                     // `typedef elem_pool pool_t;` or a parameterized alias).
                     // The maps above record the TYPEDEF name, which isn't a key in

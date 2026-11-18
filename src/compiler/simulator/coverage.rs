@@ -76,10 +76,37 @@ impl Simulator {
         self.module.covergroups.get(tname).cloned()
     }
 
+    /// §19.3, §19.4: `cg[i] = new(args)` whose element type `tname` is a
+    /// covergroup builds an instance of that covergroup into the element.
+    /// The target's type says what `new` builds (§8.7): left to the plain
+    /// assignment, `new(args)` was taken for the enclosing class's
+    /// constructor, which a constructor re-entered until the stack
+    /// overflowed. False when `tname` names no covergroup.
+    pub(super) fn construct_covergroup_into(
+        &mut self,
+        tname: &str,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> bool {
+        if self.module.covergroups.is_empty() || self.module.classes.contains_key(tname) {
+            return false;
+        }
+        let Some(cg_def) = self.covergroup_def_for(tname) else {
+            return false;
+        };
+        let args: &[Expression] = match &rvalue.kind {
+            ExprKind::Call { args, .. } => args,
+            _ => &[],
+        };
+        let handle = self.instantiate_covergroup(&cg_def, args);
+        self.assign_value(lvalue, &handle);
+        true
+    }
+
     pub(super) fn instantiate_covergroup(
         &mut self,
         cg_def: &CovergroupDeclaration,
-        _args: &[Expression],
+        args: &[Expression],
     ) -> Value {
         let handle = self.cg_heap.len();
         let owner = self
@@ -109,7 +136,7 @@ impl Simulator {
             ctor_args: {
                 let mut bound = Vec::new();
                 for (i, port) in cg_def.ports.iter().enumerate() {
-                    let v = if let Some(a) = _args.get(i) {
+                    let v = if let Some(a) = args.get(i) {
                         self.eval_expr(a)
                     } else if let Some(d) = &port.default {
                         self.eval_expr(d)
@@ -125,7 +152,7 @@ impl Simulator {
                 .iter()
                 .enumerate()
                 .filter(|(_, p)| matches!(p.direction, crate::ast::types::PortDirection::Ref))
-                .filter_map(|(i, p)| _args.get(i).map(|a| (p.name.name.clone(), a.clone())))
+                .filter_map(|(i, p)| args.get(i).map(|a| (p.name.name.clone(), a.clone())))
                 .collect(),
             class_params: owner
                 .map(|h| {
