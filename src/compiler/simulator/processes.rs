@@ -3817,7 +3817,10 @@ impl Simulator {
                                         );
                                     } else {
                                         // Preserve first-call lifetimes and checkpoint numbering.
-                                        let mut cont: Vec<Statement> = td.items.to_vec();
+                                        let mut cont: Vec<Statement> =
+                                            crate::ast::cache::with_fresh_scope_caches(|| {
+                                                td.items.to_vec()
+                                            });
                                         cont.push(Statement::new(
                                             StatementKind::ScopePop,
                                             stmt.span,
@@ -3852,7 +3855,8 @@ impl Simulator {
                             // bare free-task arm above (Stage 1).
                             self.push_instance_task_context(&mut cleanup);
                             self.task_cleanup.push(cleanup);
-                            let mut cont: Vec<Statement> = td.items.to_vec();
+                            let mut cont: Vec<Statement> =
+                                crate::ast::cache::with_fresh_scope_caches(|| td.items.to_vec());
                             cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
                             self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                             return;
@@ -3899,7 +3903,10 @@ impl Simulator {
                                         );
                                     } else {
                                         // Preserve first-call lifetimes and checkpoint numbering.
-                                        let mut cont: Vec<Statement> = td.items.to_vec();
+                                        let mut cont: Vec<Statement> =
+                                            crate::ast::cache::with_fresh_scope_caches(|| {
+                                                td.items.to_vec()
+                                            });
                                         cont.push(Statement::new(
                                             StatementKind::ScopePop,
                                             stmt.span,
