@@ -437,6 +437,195 @@ impl Simulator {
         ) || matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() > 1)
     }
 
+    /// §7.4.1/§11.5.1: the declared range `(left, right)` of `name` when the
+    /// innermost call frame holds it as a plain one-dimensional packed vector
+    /// (a task or function local, formal or return variable): the leftmost
+    /// bound labels the most significant bit, so `n[0]` of `reg [0:7] n` is
+    /// bit 7 and `n[1]` of `reg [8:1] n` is bit 0. A declaration that
+    /// registered no range is `[w-1:0]`. None for a name the frame does not
+    /// hold and for a real, string, collection, packed array or struct,
+    /// whose selects keep their own paths. The frame's variable hides a
+    /// design variable of its name, whose range belongs to the design.
+    pub(super) fn frame_vector_range(&self, name: &str) -> Option<(i64, i64)> {
+        let cur = self.local_stack.last()?.get(name)?;
+        if cur.is_real || cur.width == 0 {
+            return None;
+        }
+        let m = &self.module;
+        if m.packed_signal_elem_widths.contains_key(name)
+            || m.packed_struct_fields.contains_key(name)
+            || m.arrays.contains_key(name)
+            || m.dynamic_arrays.contains(name)
+            || m.associative_arrays.contains_key(name)
+            || m.queue_vars.contains(name)
+            || self.dyn_name_lookup(name).is_some()
+            || self.frame_name_is_string(name)
+        {
+            return None;
+        }
+        match m.packed_full_dims.get(name).map(Vec::as_slice) {
+            None => Some((cur.width as i64 - 1, 0)),
+            Some(&[(l, r)]) if l.abs_diff(r) + 1 == u64::from(cur.width) => Some((l, r)),
+            Some(_) => None,
+        }
+    }
+
+    /// Whether the frame variable `name` has a 2-state declared type
+    /// (§6.11.2: it stores and reads x/z bits as 0).
+    fn frame_var_two_state(&self, name: &str) -> bool {
+        self.module.var_decl_types.get(name).is_some_and(|dt| {
+            super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types)
+        })
+    }
+
+    /// The physical bits `[lo, hi]` a bit-select (`right` is None) or a
+    /// part-select of a vector declared `range` names, from its labels
+    /// (§11.5.1: `b +: w` is labels b..b+w-1, `b -: w` is b-w+1..b); bits
+    /// outside the vector are included, to be dropped by the caller. None
+    /// when a bound is x/z or an indexed width is not positive: the select
+    /// then names no bits.
+    fn frame_select_bits(
+        &mut self,
+        range: (i64, i64),
+        kind: Option<RangeKind>,
+        left: &Expression,
+        right: Option<&Expression>,
+    ) -> Option<(i64, i64)> {
+        let a = self.eval_expr(left).to_index()?;
+        let b = match (kind, right) {
+            (Some(kind), Some(right)) => {
+                let n = self.eval_expr(right).to_index()?;
+                match kind {
+                    RangeKind::Constant => n,
+                    RangeKind::IndexedUp if n > 0 => a.checked_add(n - 1)?,
+                    RangeKind::IndexedDown if n > 0 => a.checked_sub(n - 1)?,
+                    _ => return None,
+                }
+            }
+            _ => a,
+        };
+        let (pa, pb) = (
+            super::event_bits::label_to_phys(range, a),
+            super::event_bits::label_to_phys(range, b),
+        );
+        Some((pa.min(pb), pa.max(pb)))
+    }
+
+    /// §7.4.1/§11.5.1: read a bit-select (`right` is None) or a part-select
+    /// of a plain vector the innermost call frame holds, at the bits its
+    /// declared range labels (`frame_vector_range`). Bits outside the vector
+    /// read x, or 0 in a 2-state variable. None when `base` is not such a
+    /// variable.
+    pub(super) fn frame_vector_select_read(
+        &mut self,
+        base: &Expression,
+        kind: Option<RangeKind>,
+        left: &Expression,
+        right: Option<&Expression>,
+    ) -> Option<Value> {
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        let name = self.frame_bound_bare_name(h)?;
+        let range = self.frame_vector_range(name)?;
+        let w = match self.frame_select_bits(range, kind, left, right) {
+            Some((lo, hi)) => {
+                let cur = self.frame_get(name)?;
+                let v = cur.range_select_signed(hi, lo);
+                if v.has_xz() && (lo < 0 || hi >= i64::from(cur.width)) {
+                    // Out-of-range bits read as the variable's default.
+                    if self.frame_var_two_state(name) {
+                        let cur = self.local_stack.last()?.get(name)?;
+                        let mut z = Value::zero(v.width);
+                        let first = lo.max(0);
+                        let last = hi.min(i64::from(cur.width) - 1);
+                        if first <= last {
+                            z.copy_bits_from(
+                                (first - lo) as usize,
+                                cur,
+                                first as usize,
+                                (last - first + 1) as usize,
+                            );
+                        }
+                        return Some(z);
+                    }
+                }
+                return Some(v);
+            }
+            None => match (kind, right) {
+                // §11.5.1: an x/z bound reads x at the select's width; an
+                // indexed width is a constant expression.
+                (Some(RangeKind::Constant), _) | (None, _) => 1,
+                (Some(_), Some(r)) => self
+                    .eval_expr(r)
+                    .to_index()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(1),
+                (Some(_), None) => 1,
+            },
+        };
+        Some(if self.frame_var_two_state(name) {
+            Value::zero(w)
+        } else {
+            Value::new(w)
+        })
+    }
+
+    /// §7.4.1/§11.5.1: write `val` through a bit-select (`right` is None) or
+    /// a part-select of a plain vector the innermost call frame holds, at the
+    /// bits its declared range labels (`frame_vector_range`). The write arms
+    /// below resolve the label against the design's range tables, which hold
+    /// module variables only, so `n[0] = 1'b1` on a local `reg [0:7] n` set
+    /// bit 0 instead of bit 7, and a local beside a same-named design
+    /// variable wrote that variable. Bits outside the vector, and a select
+    /// with an x/z bound, write nothing. None when `base` is not such a
+    /// variable.
+    pub(super) fn frame_vector_select_write(
+        &mut self,
+        base: &Expression,
+        kind: Option<RangeKind>,
+        left: &Expression,
+        right: Option<&Expression>,
+        val: &Value,
+    ) -> Option<bool> {
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        let name = self.frame_bound_bare_name(h)?;
+        let range = self.frame_vector_range(name)?;
+        let Some((lo, hi)) = self.frame_select_bits(range, kind, left, right) else {
+            return Some(false);
+        };
+        let n = u32::try_from(hi - lo + 1).ok()?;
+        let mut v = if val.is_real {
+            Self::real_to_int(val.to_f64(), n)
+        } else {
+            val.resize_for_assign(n)
+        };
+        // §6.11.2: a 2-state variable stores x/z bits as 0.
+        if v.has_xz() && self.frame_var_two_state(name) {
+            v = v.to_two_state();
+        }
+        let width = i64::from(self.local_stack.last()?.get(name)?.width);
+        let (first, last) = (lo.max(0), hi.min(width - 1));
+        if first > last {
+            return Some(false);
+        }
+        let changed = self.local_stack.last_mut()?.get_mut(name)?.copy_bits_from(
+            first as usize,
+            &v,
+            (first - lo) as usize,
+            (last - first + 1) as usize,
+        );
+        // §6.21: a static local's live cell takes the write too.
+        if changed && let Some(key) = self.packed_local_static_key(name) {
+            let cur = self.local_stack.last()?.get(name)?.clone();
+            self.static_local_vars.insert(key, cur);
+        }
+        Some(changed)
+    }
+
     /// A select of a select of a variable the innermost call frame owns (a
     /// task or function local, formal or return value): `p[1][3:0]`,
     /// `p[0][7]`, `p[i][j][k +: 2]`, `a[i].f[3]`, `s.m[1][7:4]`. Returns the

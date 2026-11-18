@@ -5065,6 +5065,14 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // §7.4.1/§11.5.1: a bit of a vector the call frame holds, at
+                // the bit its declared range labels; it hides a design
+                // variable of its name.
+                if !self.local_stack.is_empty()
+                    && let Some(v) = self.frame_vector_select_read(expr, None, index, None)
+                {
+                    return v;
+                }
                 // #1108: an element of an array member of an instance-array
                 // element (`lane[0].nest[1][j]`).
                 if let Some(base) = self.inst_array_member_canon(expr) {
@@ -6330,6 +6338,13 @@ impl Simulator {
                 kind,
                 ..
             } => {
+                // §7.4.1/§11.5.1: a part of a vector the call frame holds.
+                if !self.local_stack.is_empty()
+                    && let Some(v) =
+                        self.frame_vector_select_read(expr, Some(*kind), left, Some(right))
+                {
+                    return v;
+                }
                 // §11.5.1: a part-select into a multi-dimensional packed
                 // associative array element selects whole packed elements.
                 if !self.module.associative_arrays.is_empty()

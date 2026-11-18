@@ -2180,6 +2180,13 @@ impl Simulator {
         if let Some(r) = self.assoc_elem_bit_write(expr, index, val) {
             return r;
         }
+        // §7.4.1/§11.5.1: a bit of a vector the call frame holds, at the bit
+        // its declared range labels.
+        if !self.local_stack.is_empty()
+            && let Some(r) = self.frame_vector_select_write(expr, None, index, None, val)
+        {
+            return r;
+        }
         if self.has_coll_rows {
             match self.ensure_assoc_row(expr) {
                 Err(()) => return false,
@@ -5321,6 +5328,14 @@ impl Simulator {
                 right,
                 kind,
             } => {
+                // §7.4.1/§11.5.1: a part of a vector the call frame holds, at
+                // the bits its declared range labels.
+                if !self.local_stack.is_empty()
+                    && let Some(r) =
+                        self.frame_vector_select_write(expr, Some(*kind), left, Some(right), val)
+                {
+                    return r;
+                }
                 // §11.5.1: a part-select bound may be NEGATIVE, and a write
                 // through a partially out-of-range select stores only the bits
                 // that DO land in the vector (`bit [3:0] x; x[4:-1] <= 6'b101010`
