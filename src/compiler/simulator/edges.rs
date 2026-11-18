@@ -971,7 +971,7 @@ impl Simulator {
             b.stmt = Statement::new(
                 StatementKind::SeqBlock {
                     name: None,
-                    stmts: vec![st, marker],
+                    stmts: vec![st, marker].into(),
                 },
                 span,
             );

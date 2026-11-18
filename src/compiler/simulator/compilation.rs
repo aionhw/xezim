@@ -1706,7 +1706,7 @@ impl Simulator {
             let span = ib.stmt.span;
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
-                other => vec![Statement::new(other, span)],
+                other => vec![Statement::new(other, span)].into(),
             };
             let pid = self.next_pid;
             self.next_pid += 1;
@@ -1719,7 +1719,7 @@ impl Simulator {
             }
             self.process_origin
                 .insert(pid, (span, "static initializer"));
-            self.event_queue.schedule(0, pid, stmts.into());
+            self.event_queue.schedule(0, pid, stmts.into_vec().into());
         }
         // §16.5/§16.14: declarative concurrent assertions exist before
         // Active processes run, including an initial clock's time-zero edge.
@@ -1824,10 +1824,10 @@ impl Simulator {
                     };
                     let stmts = match ib.stmt.kind {
                         StatementKind::SeqBlock { stmts, .. } => stmts,
-                        other => vec![Statement::new(other, ib.stmt.span)],
+                        other => vec![Statement::new(other, ib.stmt.span)].into(),
                     };
                     let is_blocking = stmts.iter().any(|st| self.stmt_is_blocking(st));
-                    (scope, span, block_label, is_blocking, None, Some(stmts))
+                    (scope, span, block_label, is_blocking, None, Some(stmts.into_vec()))
                 }
                 InitItem::Lazy(p) => {
                     let scope = p.scope();
@@ -1912,7 +1912,7 @@ impl Simulator {
                         let wrapped = Statement::new(
                             StatementKind::SeqBlock {
                                 name: None,
-                                stmts: stmts.clone(),
+                                stmts: stmts.clone().into(),
                             },
                             span,
                         );
@@ -1957,9 +1957,9 @@ impl Simulator {
         for ib in std::mem::take(&mut self.module.program_initial_blocks) {
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
-                other => vec![Statement::new(other, ib.stmt.span)],
+                other => vec![Statement::new(other, ib.stmt.span)].into(),
             };
-            self.pending_reactive.push((stmts, ib.scope));
+            self.pending_reactive.push((stmts.into_vec(), ib.scope));
         }
         // The reactive region of time 0 runs at the end of the time-0 slot;
         // make sure that slot exists even when no module process starts

@@ -2053,7 +2053,7 @@ impl Simulator {
                 let wrap = |items: &[Statement], span| Statement {
                     kind: StatementKind::SeqBlock {
                         name: None,
-                        stmts: items.to_vec(),
+                        stmts: items.to_vec().into(),
                     },
                     span,
                 };

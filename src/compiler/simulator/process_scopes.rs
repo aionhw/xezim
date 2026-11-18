@@ -1260,7 +1260,7 @@ impl Simulator {
                         name: routine.to_string(),
                         span,
                     }),
-                    stmts: std::mem::take(items).into_vec(),
+                    stmts: std::mem::take(items),
                 },
                 span,
             );
@@ -1400,7 +1400,7 @@ impl Simulator {
         if !allocate.is_empty() {
             let block = |stmts: Vec<Statement>| super::elaborate::InitialBlock {
                 stmt: Statement::new(
-                    StatementKind::SeqBlock { name: None, stmts },
+                    StatementKind::SeqBlock { name: None, stmts: stmts.into() },
                     crate::ast::Span::dummy(),
                 ),
                 scope: String::new(),
@@ -1611,7 +1611,7 @@ impl Simulator {
                 stmt: Statement::new(
                     StatementKind::SeqBlock {
                         name: None,
-                        stmts: decls,
+                        stmts: decls.into(),
                     },
                     span,
                 ),
@@ -1811,7 +1811,7 @@ impl Simulator {
     pub(super) fn spliced_body(body: &Statement) -> Vec<Statement> {
         match &body.kind {
             StatementKind::SeqBlock { stmts, name: None } if !Self::stmts_declare_vars(stmts) => {
-                stmts.clone()
+                stmts.to_vec()
             }
             _ => vec![body.clone()],
         }

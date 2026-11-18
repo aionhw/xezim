@@ -2374,7 +2374,7 @@ impl Simulator {
                                             stmts: {
                                                 let mut v = vec![*body.clone()];
                                                 v.extend_from_slice(&stmts[1..]);
-                                                v
+                                                v.into()
                                             },
                                         },
                                         stmt.span,
@@ -2390,7 +2390,7 @@ impl Simulator {
                                 Statement::new(
                                     StatementKind::SeqBlock {
                                         name: name.clone(),
-                                        stmts: new_stmts,
+                                        stmts: new_stmts.into(),
                                     },
                                     stmt.span,
                                 ),

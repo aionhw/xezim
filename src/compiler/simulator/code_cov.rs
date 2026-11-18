@@ -122,7 +122,7 @@ fn block(mut v: Vec<Statement>, span: Span) -> Statement {
         Statement::new(
             StatementKind::SeqBlock {
                 name: None,
-                stmts: v,
+                stmts: v.into(),
             },
             span,
         )
@@ -372,8 +372,8 @@ impl Instr<'_> {
         let rebuilt = |kind| Statement::new(kind, span);
         match s.kind {
             StatementKind::SeqBlock { name, stmts } => {
-                let stmts = self.stmts(stmts);
-                out.push(rebuilt(StatementKind::SeqBlock { name, stmts }));
+                let stmts = self.stmts(stmts.to_vec());
+                out.push(rebuilt(StatementKind::SeqBlock { name, stmts: stmts.into() }));
             }
             // Each fork branch stays one process.
             StatementKind::ParBlock {

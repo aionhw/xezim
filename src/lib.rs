@@ -912,7 +912,7 @@ pub fn defer_static_syscall_inits(
                         name: format!("{}{}", compiler::simulator::M_ROOT_MARK, p.name.name),
                         span,
                     }),
-                    stmts: vec![block.stmt],
+                    stmts: vec![block.stmt].into(),
                 },
                 span,
             );
@@ -920,7 +920,7 @@ pub fn defer_static_syscall_inits(
             block.stmt = Statement::new(
                 StatementKind::SeqBlock {
                     name: None,
-                    stmts: vec![scoped],
+                    stmts: vec![scoped].into(),
                 },
                 span,
             );
