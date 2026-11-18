@@ -2089,97 +2089,109 @@ impl Simulator {
             // delegation pattern under test) are still dispatched here.
             // The `uvm_` prefix is the well-defined boundary between user
             // code and the pre-supported library classes.
+            let frag_of = |e: &Expression| -> Option<String> {
+                // Check for `this_type` BEFORE expr_to_spec_fragment
+                // resolves it to just the base class name (without the
+                // specialization suffix).
+                if let ExprKind::Ident(h) = &e.kind {
+                    if h.path.len() == 1 {
+                        let nm = &h.path[0].name.name;
+                        if nm == "this_type" || nm == "this" {
+                            if let Some((b, s)) = &self.current_spec {
+                                return Some(format!("{}#({})", b, s));
+                            }
+                        }
+                        // A type arg that is a TYPEDEF of a parameterized
+                        // class (`cb_type cb_q[$]` where `typedef
+                        // uvm_event_callback#(T) cb_type;`): expand it via
+                        // `resolve_typedef_spec` so the base's own type
+                        // args are carried (and their bare params resolved
+                        // through `current_spec`). `expr_to_spec_fragment`
+                        // on the raw typedef ident otherwise returns ONLY
+                        // the base class name — dropping the `#(T)`, so
+                        // the missing param is afterwards filled with its
+                        // DECLARED DEFAULT (`uvm_object`) instead of the
+                        // enclosing `T` (`string`). That made the string /
+                        // `uvm_object` event callbacks key differently and
+                        // the string event's `get_all` missed its callback.
+                        if self.module.typedef_types.contains_key(nm.as_str())
+                            || self.lookup_typedef_target(nm.as_str()).is_some()
+                        {
+                            if let Some((tb, ts)) = self.resolve_typedef_spec(&nm) {
+                                return Some(format!("{}#({})", tb, ts));
+                            }
+                        }
+                    }
+                }
+                let frag = self.expr_to_spec_fragment(e)?;
+                // §8.25: a bare SELF-REFERENCE — the argument names the
+                // class whose specialization context we are resolving in
+                // (`uvm_object_registry#(C,"C") type_id`, written by
+                // `uvm_object_utils(C)`) — denotes the CURRENT
+                // specialization `C#(sig)`, not the default. Without
+                // this, a static method entered through a specialization
+                // (`C#(T2)::get_type()`, or `v.get_type()` on a null `v`
+                // declared `C#(T2)`) keyed the registry on the default
+                // `C`, so the factory created default-specialized objects
+                // and the `$cast` in `uvm_create_on` correctly rejected
+                // them.
+                //
+                // Only inside that class's own declaration (or a derived
+                // one): elsewhere the bare name IS the default
+                // specialization — a non-parameterized class whose typedef
+                // names `C` must not read `C#(sig)` just because its method
+                // happens to run under an active `C#(sig)` context.
+                if let Some((b, s)) = &self.current_spec {
+                    if frag == *b && self.inside_class_decl_of(b) {
+                        return Some(format!("{}#({})", b, s));
+                    }
+                }
+                // Resolve bare type-param names (e.g. `T`, `this_type`)
+                // through the active specialization so the typedef's
+                // specialization carries concrete values.
+                if frag == "this_type" || frag == "this" {
+                    if let Some((b, s)) = &self.current_spec {
+                        return Some(format!("{}#({})", b, s));
+                    }
+                }
+                let frag = self.substitute_spec_params(&frag);
+                // Check if frag is a type/value param of the spec base
+                if let Some((b, s)) = &self.current_spec {
+                    if let Some(cd) = self.get_class_def(b) {
+                        if cd.type_param_names.iter().any(|t| t == &frag)
+                            || cd.param_order.iter().any(|t| t == &frag)
+                        {
+                            if let Some(resolved) =
+                                self.resolve_type_param_with(&frag, &self.current_spec)
+                            {
+                                return Some(resolved);
+                            }
+                            // Try value param resolution
+                            let idx = cd.param_order.iter().position(|t| t == &frag);
+                            if let Some(idx) = idx {
+                                let sig_frags = Self::split_spec_args(s);
+                                if let Some(v) = sig_frags.get(idx) {
+                                    return Some(v.trim().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(frag)
+            };
+            // §8.25, §23.10.2.2: a named assignment `.W(W)` names a parameter
+            // of the class being specialized, so only its value resolves in
+            // the enclosing specialization. Substituted as one fragment, the
+            // name was replaced too (`.16(16)` in `outer #(16)`), matched no
+            // parameter, and the default specialization was used.
             let frags: Vec<String> = type_args
                 .iter()
-                .filter_map(|e| {
-                    // Check for `this_type` BEFORE expr_to_spec_fragment
-                    // resolves it to just the base class name (without the
-                    // specialization suffix).
-                    if let ExprKind::Ident(h) = &e.kind {
-                        if h.path.len() == 1 {
-                            let nm = &h.path[0].name.name;
-                            if nm == "this_type" || nm == "this" {
-                                if let Some((b, s)) = &self.current_spec {
-                                    return Some(format!("{}#({})", b, s));
-                                }
-                            }
-                            // A type arg that is a TYPEDEF of a parameterized
-                            // class (`cb_type cb_q[$]` where `typedef
-                            // uvm_event_callback#(T) cb_type;`): expand it via
-                            // `resolve_typedef_spec` so the base's own type
-                            // args are carried (and their bare params resolved
-                            // through `current_spec`). `expr_to_spec_fragment`
-                            // on the raw typedef ident otherwise returns ONLY
-                            // the base class name — dropping the `#(T)`, so
-                            // the missing param is afterwards filled with its
-                            // DECLARED DEFAULT (`uvm_object`) instead of the
-                            // enclosing `T` (`string`). That made the string /
-                            // `uvm_object` event callbacks key differently and
-                            // the string event's `get_all` missed its callback.
-                            if self.module.typedef_types.contains_key(nm.as_str())
-                                || self.lookup_typedef_target(nm.as_str()).is_some()
-                            {
-                                if let Some((tb, ts)) = self.resolve_typedef_spec(&nm) {
-                                    return Some(format!("{}#({})", tb, ts));
-                                }
-                            }
-                        }
-                    }
-                    let frag = self.expr_to_spec_fragment(e)?;
-                    // §8.25: a bare SELF-REFERENCE — the argument names the
-                    // class whose specialization context we are resolving in
-                    // (`uvm_object_registry#(C,"C") type_id`, written by
-                    // `uvm_object_utils(C)`) — denotes the CURRENT
-                    // specialization `C#(sig)`, not the default. Without
-                    // this, a static method entered through a specialization
-                    // (`C#(T2)::get_type()`, or `v.get_type()` on a null `v`
-                    // declared `C#(T2)`) keyed the registry on the default
-                    // `C`, so the factory created default-specialized objects
-                    // and the `$cast` in `uvm_create_on` correctly rejected
-                    // them.
-                    //
-                    // Only inside that class's own declaration (or a derived
-                    // one): elsewhere the bare name IS the default
-                    // specialization — a non-parameterized class whose typedef
-                    // names `C` must not read `C#(sig)` just because its method
-                    // happens to run under an active `C#(sig)` context.
-                    if let Some((b, s)) = &self.current_spec {
-                        if frag == *b && self.inside_class_decl_of(b) {
-                            return Some(format!("{}#({})", b, s));
-                        }
-                    }
-                    // Resolve bare type-param names (e.g. `T`, `this_type`)
-                    // through the active specialization so the typedef's
-                    // specialization carries concrete values.
-                    if frag == "this_type" || frag == "this" {
-                        if let Some((b, s)) = &self.current_spec {
-                            return Some(format!("{}#({})", b, s));
-                        }
-                    }
-                    let frag = self.substitute_spec_params(&frag);
-                    // Check if frag is a type/value param of the spec base
-                    if let Some((b, s)) = &self.current_spec {
-                        if let Some(cd) = self.get_class_def(b) {
-                            if cd.type_param_names.iter().any(|t| t == &frag)
-                                || cd.param_order.iter().any(|t| t == &frag)
-                            {
-                                if let Some(resolved) =
-                                    self.resolve_type_param_with(&frag, &self.current_spec)
-                                {
-                                    return Some(resolved);
-                                }
-                                // Try value param resolution
-                                let idx = cd.param_order.iter().position(|t| t == &frag);
-                                if let Some(idx) = idx {
-                                    let sig_frags = Self::split_spec_args(s);
-                                    if let Some(v) = sig_frags.get(idx) {
-                                        return Some(v.trim().to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Some(frag)
+                .filter_map(|e| match &e.kind {
+                    ExprKind::NamedArg {
+                        name,
+                        expr: Some(x),
+                    } => Some(format!(".{}({})", name.name, frag_of(x)?)),
+                    _ => frag_of(e),
                 })
                 .collect();
             let sig = frags.join(",");
