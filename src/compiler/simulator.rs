@@ -1790,7 +1790,10 @@ struct CombEntryCold {
 // real operand, a fill or a negative member run on the interpreter's matcher.
 // §5.7.1, §7.4.1: unsized signed decimal widths with a sign bit; multidimensional
 // packed range nonblocking writes are left to the interpreter.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB041";
+// §10.3.2, §9.2.2.1: shared-read batches leave out members with fused branches or jump
+// tables, chain fusion relocates branches within one process class, and an instance's
+// read of an unnamed memory cell stays unresolved.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB042";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
