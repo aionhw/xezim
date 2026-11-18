@@ -11767,14 +11767,18 @@ impl<'a> BytecodeCompiler<'a> {
                 .any(|v| v.is_fill || (v.is_signed && v.to_i64().is_some_and(|x| x < 0)))
     }
 
-    /// §12.5.4: true when matching every item of a `case inside` by `===`
-    /// is the `inside` match: each item an x/z-free integral constant (no
-    /// range, no wildcard bit, no array) and a selector compared as an
-    /// integral (see `inside_needs_numeric_eq`).
+    /// §12.5.4: true when the compiled chain matches every item of a `case
+    /// inside` as the `inside` operator does: an x/z-free integral constant
+    /// by `===`, an unsigned constant with x/z bits by the masked compare of
+    /// `case_inside_wildcard_item` (an unsigned selector of at most 64 bits,
+    /// `wild_sel_w`), and a selector compared as an integral (see
+    /// `inside_needs_numeric_eq`). A range, an array or any other item is
+    /// not.
     fn case_inside_matches_by_case_eq(
         &mut self,
         sel: &Expression,
         items: &[crate::ast::stmt::CaseItem],
+        wild_sel_w: Option<u32>,
     ) -> bool {
         let mut members: Vec<Value> = Vec::new();
         for it in items.iter().filter(|it| !it.is_default) {
@@ -11782,13 +11786,49 @@ impl<'a> BytecodeCompiler<'a> {
                 return false;
             }
             for p in &it.patterns {
-                match self.inside_member_const(p) {
-                    Some(v) => members.push(v),
-                    None => return false,
+                if let Some(v) = self.inside_member_const(p) {
+                    members.push(v);
+                } else if wild_sel_w.is_none_or(|w| self.case_inside_wildcard_item(p, w).is_none())
+                {
+                    return false;
                 }
             }
         }
         !self.inside_needs_numeric_eq(sel, &members)
+    }
+
+    /// §11.4.6, §12.5.4: an unsigned integral constant `case inside` item
+    /// with x/z bits as the (care mask, value) pair its `==?` match compares
+    /// under, both 64 bits wide: the item's x/z bits match anything, and
+    /// every other bit — the zero extension to the selector's width
+    /// included — must be known and equal. `sel_w` is the unsigned
+    /// selector's width; the selector register, zero-extended, is masked and
+    /// compared by `===`, so an x/z selector bit under the mask matches
+    /// nothing, as `==?` makes it x.
+    fn case_inside_wildcard_item(&mut self, p: &Expression, sel_w: u32) -> Option<(Value, Value)> {
+        let v = match &p.kind {
+            ExprKind::Number(num) => self.eval_number_static(num)?,
+            ExprKind::Ident(h) => self.lookup_param_value(h)?,
+            ExprKind::Paren(inner) => return self.case_inside_wildcard_item(inner, sel_w),
+            _ => return None,
+        };
+        if v.is_real || v.is_fill || v.is_signed || v.width == 0 || v.width > 64 || sel_w > 64 {
+            return None;
+        }
+        let (val, xz) = v.inline_bits()?;
+        let width_mask = if v.width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << v.width) - 1
+        };
+        if xz & width_mask == 0 {
+            return None;
+        }
+        let care = !(xz & width_mask);
+        Some((
+            Value::from_u64(care, 64),
+            Value::from_u64(val & care & width_mask, 64),
+        ))
     }
 
     /// A set-membership member as a compile-time CONSTANT with no x/z bits —
@@ -14818,9 +14858,23 @@ impl<'a> BytecodeCompiler<'a> {
                 // agrees with that only for an integral selector and x/z-free
                 // integral constant items; anything else leaves the statement
                 // to the interpreter's matcher.
-                if matches!(kind, crate::ast::stmt::CaseKind::CaseInside)
-                    && !self.case_inside_matches_by_case_eq(expr, items)
+                let inside_kind = matches!(kind, crate::ast::stmt::CaseKind::CaseInside);
+                // The masked compare reads the selector at its own width, so an
+                // operation selector (sized with the items, below) keeps `===`.
+                let wild_sel_w = if inside_kind
+                    && !matches!(
+                        expr.kind,
+                        ExprKind::Binary { .. }
+                            | ExprKind::Unary { .. }
+                            | ExprKind::Conditional { .. }
+                    )
+                    && self.expr_signedness(expr) == Some(false)
                 {
+                    Some(self.expr_max_width(expr)).filter(|w| (1..=64).contains(w))
+                } else {
+                    None
+                };
+                if inside_kind && !self.case_inside_matches_by_case_eq(expr, items, wild_sel_w) {
                     self.bail("Stmt_CaseInside");
                     return self.emit_fallback(stmt);
                 }
@@ -14892,7 +14946,21 @@ impl<'a> BytecodeCompiler<'a> {
                         // Compile pattern match: val === pattern (or casez/casex
                         // wildcard match per CaseKind).
                         for pat in &item.patterns {
-                            if let Some(pat_reg) = self.compile_expr(pat, 0) {
+                            // §12.5.4: a wildcard `case inside` item compares
+                            // the masked selector with its known bits.
+                            let wild =
+                                wild_sel_w.and_then(|w| self.case_inside_wildcard_item(pat, w));
+                            let cmp_reg = if let Some((mask, known)) = wild {
+                                let mask_reg = self.alloc_reg();
+                                self.emit(Insn::LoadConst(mask_reg, Box::new(mask)));
+                                let masked = self.alloc_reg();
+                                self.emit(Insn::BitAnd(masked, val_reg, mask_reg));
+                                let known_reg = self.alloc_reg();
+                                self.emit(Insn::LoadConst(known_reg, Box::new(known)));
+                                let cmp_reg = self.alloc_reg();
+                                self.emit(Insn::CaseEq(cmp_reg, masked, known_reg));
+                                Some(cmp_reg)
+                            } else if let Some(pat_reg) = self.compile_expr(pat, 0) {
                                 let cmp_reg = self.alloc_reg();
                                 self.emit(match kind {
                                     crate::ast::stmt::CaseKind::Casez => {
@@ -14903,6 +14971,11 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                     _ => Insn::CaseEq(cmp_reg, val_reg, pat_reg),
                                 });
+                                Some(cmp_reg)
+                            } else {
+                                None
+                            };
+                            if let Some(cmp_reg) = cmp_reg {
                                 let branch_idx = self.insns.len();
                                 self.emit(Insn::BranchIfFalse(cmp_reg, 0));
                                 if !self.compile_stmt(&item.stmt) {
