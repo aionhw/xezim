@@ -240,6 +240,8 @@ mod compiled_method_regs_across_settle;
 mod typedef_static_call_actual;
 #[path = "classes/compiled_method_string_coll_member_assign.rs"]
 mod compiled_method_string_coll_member_assign;
+#[path = "classes/compiled_method_queue_literal_arg.rs"]
+mod compiled_method_queue_literal_arg;
 
 #[path = "classes/compiled_method_void.rs"]
 mod compiled_method_void;
