@@ -2806,9 +2806,12 @@ impl Simulator {
         }
         // §7.2: an element of an unpacked-struct array is its member leaves.
         let elem_su = self
-            .p_elem_type(&rbase)
-            .or_else(|| self.p_elem_type(&lbase))
-            .and_then(|dt| self.unpacked_struct_of(&dt));
+            .nd_elem_struct(&rbase)
+            .or_else(|| self.nd_elem_struct(&lbase))
+            .or_else(|| {
+                self.p_elem_type(&rbase)
+                    .and_then(|dt| self.unpacked_struct_of(&dt))
+            });
         for (ls, rs) in lsfx.iter().zip(rsfx.iter()) {
             if let Some(su) = &elem_su {
                 let (d, s) = (format!("{}{}", lbase, ls), format!("{}{}", rbase, rs));
