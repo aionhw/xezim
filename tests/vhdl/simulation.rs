@@ -655,3 +655,10 @@ fn pending_partial_write_precedence() {
 fn pending_partial_activity_and_quiet() {
     check("pending_partial_activity");
 }
+
+/// §10.5.2, §14.7.2, §16.2.4: assertion-driven scalar pending transactions
+/// preserve repeated writes, static field/slice order, activity and resolution.
+#[test]
+fn singleton_pending_scalar_parts() {
+    check("singleton_pending_parts");
+}
