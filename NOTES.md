@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Performance:** Avoid unnecessary name scans and module-item copies while preparing flat designs, and release parsing scratch memory before definition indexing.
+
 - **Performance:** Reduce procedural AST storage by allocating optional timing payloads only when present.
 
 - **Correctness:** Keep task continuation owners and contextual caches private to their call sites.
