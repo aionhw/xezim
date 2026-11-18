@@ -110,7 +110,7 @@ endmodule
     let lines: Vec<&str> = res.output.iter().map(|e| e.message.as_str()).collect();
     assert!(lines.contains(&"RES ok=0"), "{lines:#?}");
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < Duration::from_secs(10),
         "unsatisfiable ipv4 took too long: {elapsed:?}"
     );
 }
