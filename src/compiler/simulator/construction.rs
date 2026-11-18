@@ -498,6 +498,17 @@ impl Simulator {
     }
 
     pub(super) fn params_with_class_spec(&mut self) -> Option<HashMap<String, Value>> {
+        let spec = self.class_spec_value_params()?;
+        let mut m = self.module.parameters.clone();
+        m.extend(spec);
+        Some(m)
+    }
+
+    /// Just the active specialization's value parameters that
+    /// `params_with_class_spec` overlays on `module.parameters`, for a
+    /// caller that stacks them with `ParamEnv::Overlay` instead of copying
+    /// every design parameter.
+    pub(super) fn class_spec_value_params(&mut self) -> Option<HashMap<String, Value>> {
         let (base, _) = self.current_spec.clone()?;
         let names: Vec<String> = {
             let cd = self.module.classes.get(&base)?;
@@ -510,7 +521,7 @@ impl Simulator {
         if names.is_empty() {
             return None;
         }
-        let mut m = self.module.parameters.clone();
+        let mut m = HashMap::default();
         for n in names {
             if let Some(v) = self.resolve_value_param_from_spec(&n) {
                 m.insert(n, v);

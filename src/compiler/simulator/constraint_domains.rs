@@ -315,10 +315,10 @@ impl Simulator {
             _ => return None,
         };
         let range_ok = |d: &crate::ast::types::PackedDimension,
-                        p: Option<&HashMap<String, Value>>| match d {
+                        p: Option<&super::elaborate::ParamEnv>| match d {
             crate::ast::types::PackedDimension::Range { left, right, .. } => {
-                crate::elaborate::const_eval_i64_with_params(left, p).is_some()
-                    && crate::elaborate::const_eval_i64_with_params(right, p).is_some()
+                crate::elaborate::const_eval_i64_with_params_env(left, p).is_some()
+                    && crate::elaborate::const_eval_i64_with_params_env(right, p).is_some()
             }
             _ => true,
         };
@@ -332,9 +332,12 @@ impl Simulator {
             _ => self.inherited_param_spec(&ctx),
         };
         let saved = std::mem::replace(&mut self.current_spec, spec);
-        let from_spec = self.params_with_class_spec();
+        let from_spec = self.class_spec_value_params();
         self.current_spec = saved;
-        let mut m = from_spec.unwrap_or_else(|| self.module.parameters.clone());
+        // The class's own values, stacked on the design parameters rather
+        // than copied over them: this runs on every call of a method with
+        // such a formal.
+        let mut top = from_spec.unwrap_or_default();
         let mut cur = Some(ctx);
         let mut guard = 0;
         while let Some(cn) = cur {
@@ -346,24 +349,32 @@ impl Simulator {
                 break;
             };
             for (pname, pdefault) in &cd.param_defaults {
-                if m.contains_key(pname) {
+                if top.contains_key(pname) || self.module.parameters.contains_key(pname) {
                     continue;
                 }
+                let env = super::elaborate::ParamEnv::Overlay {
+                    base: &self.module.parameters,
+                    top: &top,
+                };
                 if let Some(v) = pdefault
                     .as_ref()
-                    .and_then(|e| crate::elaborate::const_eval_i64_with_params(e, Some(&m)))
+                    .and_then(|e| crate::elaborate::const_eval_i64_with_params_env(e, Some(&env)))
                 {
-                    m.insert(pname.clone(), Value::from_u64(v as u64, 32));
+                    top.insert(pname.clone(), Value::from_u64(v as u64, 32));
                 }
             }
             cur = cd.extends.clone();
         }
-        if !dims.iter().all(|d| range_ok(d, Some(&m))) {
+        let env = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: &top,
+        };
+        if !dims.iter().all(|d| range_ok(d, Some(&env))) {
             return None;
         }
-        Some(crate::elaborate::resolve_type_width(
+        Some(crate::elaborate::resolve_type_width_env(
             dt,
-            Some(&m),
+            Some(&env),
             Some(&self.module.typedefs),
         ))
         .filter(|w| *w > 0)
