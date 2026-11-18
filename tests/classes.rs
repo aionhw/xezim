@@ -234,6 +234,8 @@ mod compiled_method_string_members;
 mod compiled_method_foreach;
 #[path = "classes/compiled_method_local_colls.rs"]
 mod compiled_method_local_colls;
+#[path = "classes/compiled_method_regs_across_settle.rs"]
+mod compiled_method_regs_across_settle;
 
 #[path = "classes/compiled_method_void.rs"]
 mod compiled_method_void;
