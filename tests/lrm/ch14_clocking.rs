@@ -293,3 +293,28 @@ fn c14_4_clocking_edge_skew_select_alias_and_delay() {
         &[],
     );
 }
+// §14.16.2: select and whole drives of one output that mature together take
+// effect in issue order, and the output changes once, at a `#0` skew (at
+// the clocking event and between events), at a `#2` skew, and for `##1`
+// drives.
+#[test]
+fn c14_16_2_clocking_drive_order_across_skews() {
+    check(
+        "c14_drive_order_skews",
+        include_str!("sv/c14_drive_order_skews.sv"),
+        "c14do",
+        Order::Multiset,
+        &[
+            "T|za|t=5000 za=1010",
+            "T|zb|t=5000 zb=1011",
+            "T|yh|t=7000 yh=0011",
+            "T|yg|t=7000 yg=1011",
+            "T|zc|t=15000 zc=1010",
+            "T|zd|t=15000 zd=1011",
+            "T|ye|t=17000 ye=1011",
+            "T|yf|t=17000 yf=1010",
+        ],
+        &[],
+    );
+}
+
