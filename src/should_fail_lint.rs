@@ -1143,7 +1143,7 @@ fn check_stream_widths(items: &[ModuleItem], scope: ConstScope, errs: &mut Vec<S
                     check_stream_decl(
                         &d.data_type,
                         decl.dimensions.is_empty(),
-                        &decl.init,
+                        decl.init.as_deref(),
                         &decl.name.name,
                         &vw,
                         scope,
@@ -1183,7 +1183,7 @@ fn check_stmt_stream(
             check_stream_decl(
                 data_type,
                 decl.dimensions.is_empty(),
-                &decl.init,
+                decl.init.as_deref(),
                 &decl.name.name,
                 vw,
                 scope,
@@ -1196,7 +1196,7 @@ fn check_stmt_stream(
 fn check_stream_decl(
     dt: &DataType,
     dims_empty: bool,
-    init: &Option<Expression>,
+    init: Option<&Expression>,
     name: &str,
     vw: &std::collections::HashMap<String, u32>,
     scope: ConstScope,
@@ -3103,7 +3103,7 @@ fn check_pattern_counts(
             let Some(Expression {
                 kind: ExprKind::AssignmentPattern(pat),
                 ..
-            }) = &v.init
+            }) = v.init.as_deref()
             else {
                 continue;
             };
@@ -3261,10 +3261,10 @@ fn check_select_depth(items: &[ModuleItem], errs: &mut Vec<String>) {
                 }
             }
             ModuleItem::NetDeclaration(d) => {
-                exprs.extend(d.declarators.iter().filter_map(|v| v.init.as_ref()))
+                exprs.extend(d.declarators.iter().filter_map(|v| v.init.as_deref()))
             }
             ModuleItem::DataDeclaration(d) => {
-                exprs.extend(d.declarators.iter().filter_map(|v| v.init.as_ref()))
+                exprs.extend(d.declarators.iter().filter_map(|v| v.init.as_deref()))
             }
             ModuleItem::InitialConstruct(i) => stmts.push(&i.stmt),
             ModuleItem::AlwaysConstruct(a) => stmts.push(&a.stmt),

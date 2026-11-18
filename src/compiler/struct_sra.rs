@@ -430,7 +430,7 @@ impl Ctx<'_> {
                                             span: d.name.span,
                                         },
                                         dimensions: Vec::new(),
-                                        init,
+                                        init: init.map(Box::new),
                                         span: d.span,
                                     }],
                                 },

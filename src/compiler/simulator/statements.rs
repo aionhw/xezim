@@ -2690,7 +2690,7 @@ impl Simulator {
                 let assign = crate::ast::stmt::Statement::new(
                     crate::ast::stmt::StatementKind::BlockingAssign {
                         lvalue,
-                        rvalue: init_expr.clone(),
+                        rvalue: init_expr.as_ref().clone(),
                     },
                     d.name.span,
                 );
