@@ -8,6 +8,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Track selected VHDL signal activity from applied transactions, including equal-value writes, without marking untouched elements active.
+
+- **Performance:** Reuse generated VHDL process bodies and omit future queues for proven immediate partial drivers.
+
 - **Performance:** Parse generated VHDL module items in bounded token groups and omit transaction queues for proven implicit-zero whole-signal drivers.
 
 - **Correctness:** Keep interpreter fallbacks in module helpers bound to the callee's frame, and make tracing independent of lexical resolution.
