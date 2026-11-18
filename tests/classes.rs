@@ -236,6 +236,8 @@ mod compiled_method_foreach;
 mod compiled_method_local_colls;
 #[path = "classes/compiled_method_regs_across_settle.rs"]
 mod compiled_method_regs_across_settle;
+#[path = "classes/typedef_static_call_actual.rs"]
+mod typedef_static_call_actual;
 
 #[path = "classes/compiled_method_void.rs"]
 mod compiled_method_void;
