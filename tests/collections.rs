@@ -387,3 +387,5 @@ mod struct_concat_forms;
 mod queue_front_shift;
 #[path = "collections/stream_with_range_1197.rs"]
 mod stream_with_range_1197;
+#[path = "collections/stream_with_range_unpack.rs"]
+mod stream_with_range_unpack;
