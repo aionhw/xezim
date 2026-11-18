@@ -6275,9 +6275,10 @@ impl Simulator {
                     // (common `@(clk) <expr>` shape) and stored in
                     // `module.property_decls`.
                     let resolved_expr: Expression = match &a.expr.kind {
-                        ExprKind::Ident(h) if h.path.len() == 1 => {
-                            let name = &h.path[0].name.name;
-                            if let Some(body) = self.module.property_decls.get(name).cloned() {
+                        ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
+                            if let Some(name) = self.sva_named_key(&a.expr) =>
+                        {
+                            if let Some(body) = self.module.property_decls.get(&name).cloned() {
                                 body
                             } else {
                                 a.expr.clone()
@@ -6293,15 +6294,18 @@ impl Simulator {
                         // was silently dropped: it never passed, never
                         // failed, and read as always-true.
                         ExprKind::Call { func, args } => {
-                            let pname: Option<String> = match &func.kind {
-                                ExprKind::Ident(h)
-                                    if !h.path.is_empty()
-                                        && h.path.iter().all(|s| s.selects.is_empty()) =>
-                                {
-                                    Some(h.path.last().unwrap().name.name.clone())
-                                }
-                                _ => None,
-                            };
+                            // §26.3: `pkg::p(...)` names that package's
+                            // property; any other dotted name its leaf.
+                            let pname: Option<String> =
+                                self.sva_named_key(func).or_else(|| match &func.kind {
+                                    ExprKind::Ident(h)
+                                        if !h.path.is_empty()
+                                            && h.path.iter().all(|s| s.selects.is_empty()) =>
+                                    {
+                                        Some(h.path.last().unwrap().name.name.clone())
+                                    }
+                                    _ => None,
+                                });
                             let resolved = pname.and_then(|n| {
                                 let body = self.module.property_decls.get(&n).cloned()?;
                                 let formals = self

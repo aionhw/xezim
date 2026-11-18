@@ -200,13 +200,43 @@ impl Simulator {
         }
     }
 
+    /// §16.8, §16.12, §26.3: the `property_decls` key of the named sequence
+    /// or property a reference names: `name`, or `pkg::name` when it is
+    /// qualified by its package (as written, or as the elaborator spells a
+    /// reference to a name two packages declare), so each package keeps its
+    /// own body.
+    pub(super) fn sva_named_key(&self, e: &Expression) -> Option<String> {
+        let qualified = |pkg: &str, leaf: &str| {
+            let q = format!("{pkg}::{leaf}");
+            self.module.property_decls.contains_key(&q).then_some(q)
+        };
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                match h.path.as_slice() {
+                    [one] => Some(one.name.name.clone()),
+                    [pkg, leaf] => qualified(&pkg.name.name, &leaf.name.name),
+                    _ => None,
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    qualified(&h.path[0].name.name, &member.name)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub(super) fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {
         if depth > 16 {
             return e.clone();
         }
         match &e.kind {
-            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                let name = h.path[0].name.name.as_str();
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
+                if let Some(key) = self.sva_named_key(e) =>
+            {
+                let name = key.as_str();
                 if self.module.sequences.contains(name)
                     && self
                         .module
@@ -224,12 +254,7 @@ impl Simulator {
             // `s(x, y)`: a named sequence / property with formals — the
             // body with the actuals substituted.
             ExprKind::Call { func, args } => {
-                let name = match &func.kind {
-                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                        Some(h.path[0].name.name.clone())
-                    }
-                    _ => None,
-                };
+                let name = self.sva_named_key(func);
                 if let Some(name) = name {
                     if let Some(body) = self.module.property_decls.get(&name).cloned() {
                         let formals = self
