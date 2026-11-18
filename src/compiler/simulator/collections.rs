@@ -2123,7 +2123,10 @@ impl Simulator {
                         }
                     }
                 }
-                let frag = self.expr_to_spec_fragment(e)?;
+                let frag = match self.expr_to_spec_fragment(e) {
+                    Some(f) => f,
+                    None => self.fold_enclosing_param_expr(e)?,
+                };
                 // §8.25: a bare SELF-REFERENCE — the argument names the
                 // class whose specialization context we are resolving in
                 // (`uvm_object_registry#(C,"C") type_id`, written by

@@ -2578,6 +2578,35 @@ impl Simulator {
         super::elaborate::const_eval_i64_with_params(e, Some(&ptab)).map(|n| n.to_string())
     }
 
+    /// §8.25, §6.20.2: a constant expression over the ACTIVE specialization's
+    /// value parameters (`W/4` in a typedef of `outer_c #(16)`), folded to
+    /// the number it names there. `fold_package_const_expr` knows only
+    /// literals and package parameters, so the argument was dropped and the
+    /// parameter took its default.
+    pub(super) fn fold_enclosing_param_expr(&self, e: &Expression) -> Option<String> {
+        if !matches!(
+            e.kind,
+            ExprKind::Binary { .. }
+                | ExprKind::Unary { .. }
+                | ExprKind::Paren(_)
+                | ExprKind::Conditional { .. }
+        ) {
+            return None;
+        }
+        let (b, s) = self.current_spec.as_ref()?;
+        let cd = self.get_class_def(b)?;
+        let bound: Vec<String> = Self::split_spec_args(s)
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .collect();
+        let names = &cd.param_order[..cd.param_order.len().min(bound.len())];
+        let mut ptab: HashMap<String, Value> = HashMap::default();
+        if !self.bind_default_operands(e, names, &bound, &mut ptab) {
+            return None;
+        }
+        super::elaborate::const_eval_i64_with_params(e, Some(&ptab)).map(|n| n.to_string())
+    }
+
     /// `pkg::NAME` when `pkg` is a package of the design: the key
     /// `module.parameters` holds that package's parameter under. None for a
     /// bare name or any other scope.
