@@ -1594,6 +1594,17 @@ impl Simulator {
         }
         // (A side-effecting lvalue index is folded first, below, and
         // comes back through here.)
+        // §10.4.1: a pattern whose items read the target is evaluated
+        // whole before the target is written (`a = '{a[1], a[0]}`).
+        let self_read = self.self_reading_pattern(lvalue, rvalue);
+        if matches!(self_read, Some(pattern_self_read::SelfRead::Elements))
+            && let Some(values) = self.capture_array_rhs(lvalue, rvalue)
+        {
+            let saved = self.saved_array_pattern(values, rvalue.span);
+            self.exec_stmt_blocking_assign_body(stmt, lvalue, &saved);
+            return;
+        }
+        let snapshot = self_read.is_some();
         if (matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
             || self.lvalue_may_name_struct_coll(lvalue))
             && self.try_struct_aggregate_assign(stmt, lvalue, rvalue)
@@ -1668,7 +1679,11 @@ impl Simulator {
         // unpacked array spreads over the row's elements. Ahead of the
         // packed-target store below, which took the row for one value.
         if let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(rvalue).kind
-            && self.assign_unpacked_row_pattern(lvalue, items)
+            && if snapshot {
+                self.store_pattern_after_reads(|s| s.assign_unpacked_row_pattern(lvalue, items))
+            } else {
+                self.assign_unpacked_row_pattern(lvalue, items)
+            }
         {
             self.settle_after_proc_write();
             return;
@@ -1681,6 +1696,18 @@ impl Simulator {
             && let Some(v) = self.eval_in_packed_type(rvalue, &ty)
         {
             self.assign_value(lvalue, &v);
+            self.settle_after_proc_write();
+            return;
+        }
+        if let ExprKind::AssignmentPattern(items) = &rvalue.kind
+            && snapshot
+            && matches!(&lvalue.kind, ExprKind::Ident(_))
+            && self.store_pattern_after_reads(|s| {
+                s.pattern_aggregate_names(lvalue)
+                    .into_iter()
+                    .any(|n| s.assign_pattern_aggregate(&n, items))
+            })
+        {
             self.settle_after_proc_write();
             return;
         }

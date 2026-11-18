@@ -3080,6 +3080,7 @@ impl NbaFastIndex {
 mod aggregate_assignments;
 mod pattern_array_items;
 mod intra_pattern_shape;
+mod pattern_self_read;
 mod annex_n;
 mod aggregate_expressions;
 mod aggregate_members;
