@@ -76,6 +76,8 @@ mod streaming_op_compiles;
 mod submodule_gate_net_delays;
 #[path = "gates/timing_checks_kinds.rs"]
 mod timing_checks_kinds;
+#[path = "gates/timing_check_condition_x.rs"]
+mod timing_check_condition_x;
 #[path = "gates/timing_checks_notifier.rs"]
 mod timing_checks_notifier;
 #[path = "gates/tran_and_implicit_nets.rs"]
