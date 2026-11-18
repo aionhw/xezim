@@ -1301,3 +1301,5 @@ mod randomize_size_sub_object_forms;
 mod rand_mode_sub_object_member;
 #[path = "classes/named_param_typedef_spec.rs"]
 mod named_param_typedef_spec;
+#[path = "classes/subroutine_actual_width_1256.rs"]
+mod subroutine_actual_width_1256;
