@@ -20167,7 +20167,13 @@ impl<'a> BytecodeCompiler<'a> {
             } => {
                 // §7.4.1/§11.5.1: ascending or element-of-collection bases
                 // need label mapping the stores below do not emit — AST only.
-                if self.sel_base_needs_ast(expr) {
+                // So does a multidimensional packed base, whose select names
+                // elements, not bits (the blocking store bails on it too).
+                let packed_elements = match &expr.kind {
+                    ExprKind::Ident(h) => self.packed_elem_width_of(h).is_some_and(|w| w > 1),
+                    _ => false,
+                };
+                if self.sel_base_needs_ast(expr) || packed_elements {
                     self.bail("nba_range_base_maps");
                     return false;
                 }
