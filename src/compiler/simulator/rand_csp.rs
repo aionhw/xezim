@@ -10387,6 +10387,78 @@ impl Simulator {
         Some((p, flo, fw))
     }
 
+    /// §7.4.1/§18.5.8.1: `e` as a slice of a solver variable, placed by the
+    /// declared geometry of the class property it selects into — a field of
+    /// an element of a packed-array member of a packed struct (`g.item[1].key`),
+    /// or a field of a member of an unpacked-struct property (`rg.item[0].key`,
+    /// the variable `rg.item[0]`). Only indices the solver already knows are
+    /// frozen, never a trial value of a random selector; a bound `foreach`
+    /// variable is one of them.
+    fn csp_declared_member_slice(
+        &mut self,
+        csp: &Csp,
+        e: &Expression,
+        konst: &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>,
+    ) -> Option<(usize, u32, u32, bool)> {
+        fn freeze(
+            me: &mut Simulator,
+            e: &Expression,
+            k: &mut dyn FnMut(&mut Simulator, &Expression) -> Option<i64>,
+        ) -> Option<Expression> {
+            let mut out = e.clone();
+            match &mut out.kind {
+                ExprKind::Ident(h) => {
+                    for seg in &mut h.path {
+                        for i in &mut seg.selects {
+                            let n = k(me, i)?;
+                            *i = Simulator::literal_of(&Simulator::signed_loop_val(n), i.span);
+                        }
+                    }
+                }
+                ExprKind::MemberAccess { expr, .. } => **expr = freeze(me, expr, k)?,
+                ExprKind::Index { expr, index } => {
+                    **expr = freeze(me, expr, k)?;
+                    let n = k(me, index)?;
+                    **index = Simulator::literal_of(&Simulator::signed_loop_val(n), index.span);
+                }
+                ExprKind::This => {}
+                _ => return None,
+            }
+            Some(out)
+        }
+        if csp.scope.is_some() || !self.chain_may_name_struct_prop(e) {
+            return None;
+        }
+        let target = freeze(self, e, konst)?;
+        let (owner, prop, off, width) = match self.class_agg_member(&target)? {
+            ClassAggRef::Packed {
+                handle,
+                prop,
+                off,
+                w,
+                ..
+            } => (handle, prop, off, w),
+            ClassAggRef::UnpackedSlice {
+                handle,
+                key,
+                off,
+                w,
+                ..
+            } => (handle, key, off, w),
+            ClassAggRef::Unpacked { handle, key, w } => (handle, key, 0, w),
+        };
+        let name = if owner == csp.handle {
+            prop
+        } else {
+            format!("{}.{}", csp.sub_prefixes.get(&owner)?, prop)
+        };
+        let &v = csp.scalars.get(&name)?;
+        if self.csp_var_no_slices(csp, v) || off.checked_add(width)? > csp.vars[v].width {
+            return None;
+        }
+        Some((v, off, width, off == 0 && width == csp.vars[v].width))
+    }
+
     /// `e` as (base, lsb, width, whole): a whole scalar, a field, or a select
     /// of either.
     fn csp_slice_base_k(
@@ -10396,6 +10468,9 @@ impl Simulator {
         konst: &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>,
     ) -> Option<(usize, u32, u32, bool)> {
         let e = Self::unparen(e);
+        if let Some(slice) = self.csp_declared_member_slice(csp, e, konst) {
+            return Some(slice);
+        }
         let var_of = |me: &Self, n: &str| -> Option<usize> {
             let &v = csp.scalars.get(n)?;
             (!me.csp_var_no_slices(csp, v)).then_some(v)

@@ -31,19 +31,26 @@ impl Simulator {
         inline: &[crate::ast::decl::ConstraintItem],
     ) -> Value {
         let cons = self.active_constraints(handle);
-        for con in &cons {
-            for item in &con.items {
-                // Constructs the checker has no view of (foreach/solve/unique)
-                // are skipped rather than reported as violations.
-                if Self::constraint_unmodeled(item) {
-                    continue;
-                }
-                if !self.check_constraint_item(handle, item) {
-                    return Value::zero(32);
-                }
-            }
-        }
-        for item in inline {
+        // §18.11.1: `randomize(null)` checks every constraint. The checker
+        // has no view of a loop, so a `foreach` over an array of fixed shape
+        // is checked iteration by iteration; one over a collection is still
+        // skipped below.
+        let mut items: Vec<crate::ast::decl::ConstraintItem> = cons
+            .iter()
+            .flat_map(|c| c.items.iter().cloned())
+            .chain(inline.iter().cloned())
+            .collect();
+        let class = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|o| o.class_name.clone());
+        self.class_context_stack.push(class);
+        self.expand_fixed_foreach_items(&mut items, true);
+        self.class_context_stack.pop();
+        for item in &items {
+            // Constructs the checker has no view of (foreach/solve/unique)
+            // are skipped rather than reported as violations.
             if Self::constraint_unmodeled(item) {
                 continue;
             }

@@ -1240,6 +1240,24 @@ impl Simulator {
         // `class_context_stack`; without pushing it the call fell through to the
         // "unknown name" path and silently yielded 0.
         self.class_context_stack.push(Some(class_name.clone()));
+        // §18.5.8.1: a `foreach` over an array of fixed declared shape that
+        // the solvers do not model as written (`g.item` of a packed-struct
+        // property, a row of a 2-D array, an omitted loop variable) iterates
+        // a known index set whatever the array's random values: unroll it
+        // here, before either solver extracts its constraints.
+        for con in &mut constraints {
+            self.expand_fixed_foreach_items(&mut con.items, false);
+        }
+        let expanded_inline: Option<Vec<ConstraintItem>> = inline
+            .iter()
+            .any(|it| self.expand_fixed_foreach(it, false).is_some())
+            .then(|| {
+                let mut items = inline.to_vec();
+                self.expand_fixed_foreach_items(&mut items, false);
+                items
+            });
+        let inline: &[ConstraintItem] = expanded_inline.as_deref().unwrap_or(inline);
+
         let mut has_post = self.class_has_method(&class_name, "post_randomize");
         let deferred_entry_len = self.rand_post_deferred.len();
         // §18.6.2: every randomized child waits for the enclosing solve.
