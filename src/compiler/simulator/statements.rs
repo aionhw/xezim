@@ -5441,7 +5441,7 @@ impl Simulator {
                     self.process_origin.insert(pid, (s.span, FORK_CHILD_ORIGIN));
                     self.inherit_fork_child_context(pid);
                     self.inherit_fork_m_scope(pid, self.current_pid, block_name.as_ref());
-                    let frame = self.fork_child_frame(s);
+                    let frame = self.fork_child_frame(s, stmts);
                     self.event_queue
                         .schedule(self.time, pid, ProcCont::from_frame(frame));
                     child_set.insert(pid);

@@ -8,6 +8,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Keep task continuation owners and contextual caches private to their call sites.
+
+- **Performance:** Reuse unchanged root process bodies when scope conversion is unnecessary.
+
 - **Performance:** Share procedural block bodies until rewritten, and borrow module items during scope registration.
 
 - **Performance:** Share declaration-order snapshots while checking module helper functions, blocks and conditions.

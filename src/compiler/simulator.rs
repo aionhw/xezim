@@ -379,7 +379,8 @@ fn method_boost_enabled() -> bool {
 // Refresh generated process calls and selected VHDL activity tracking.
 // Refresh proven single-leaf pending driver layouts.
 // Refresh cached procedural bodies after copy-on-write block storage.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3089;
+// Refresh task frames after restoring private nested contextual caches.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3090;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never

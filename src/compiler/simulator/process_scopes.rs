@@ -4,6 +4,10 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+// Synchronous fork sources belong to callable syntax, which is rebuilt
+// independently after a checkpoint. Keep their derived frame cache cold.
+pub(super) const SYNCHRONOUS_FORK_FRAME_KIND: u8 = 9;
+
 impl Simulator {
     /// §9.6.2: identity of a statement frame (its address).
     pub(super) fn frame_key(f: &Arc<[Statement]>) -> usize {
@@ -2800,16 +2804,30 @@ impl Simulator {
         f
     }
 
-    pub(super) fn fork_child_frame(&mut self, s: &Statement) -> Arc<[Statement]> {
-        let key = (s as *const Statement as usize, 5u8);
+    pub(super) fn fork_child_frame(
+        &mut self,
+        s: &Statement,
+        source: &crate::ast::shared_vec::SharedVec<Statement>,
+    ) -> Arc<[Statement]> {
+        debug_assert!(source.iter().any(|node| std::ptr::eq(node, s)));
+        let key = (s as *const Statement as usize, SYNCHRONOUS_FORK_FRAME_KIND);
         if let Some((_, f)) = self.blocking_cont_cache.get(&key)
             && f.first().is_some_and(|st| st.span == s.span)
         {
             return f.clone();
         }
         let f: Arc<[Statement]> = Arc::from(std::slice::from_ref(s));
-        self.blocking_cont_cache
-            .insert(key, (Arc::clone(&f), f.clone()));
+        // §9.3.2: the key addresses the original child, not its frame copy.
+        // Retain its exact backing allocation, including in explicit clone
+        // modes; this owner is a lifetime anchor and is never executed.
+        let owner = Arc::from(vec![Statement::new(
+            StatementKind::SeqBlock {
+                name: None,
+                stmts: Arc::clone(source.as_arc()).into(),
+            },
+            s.span,
+        )]);
+        self.blocking_cont_cache.insert(key, (owner, f.clone()));
         f
     }
 
@@ -2907,7 +2925,9 @@ impl Simulator {
             return None;
         }
         let mut cont: Vec<Statement> = Vec::with_capacity(td.items.len() + 1);
-        cont.extend_from_slice(&td.items);
+        // §13.3/§23.6: continuation caches key nested statement addresses.
+        // Own this site's tree and contextual caches before executing it.
+        crate::ast::cache::with_fresh_scope_caches(|| cont.extend_from_slice(&td.items));
         cont.push(Statement::new(StatementKind::ScopePop, call_span));
         let frame: Arc<[Statement]> = Arc::from(cont);
         self.task_frame_cache
@@ -2931,7 +2951,8 @@ impl Simulator {
             unreachable!("class_task_body_frame takes tasks only")
         };
         let mut cont: Vec<Statement> = Vec::with_capacity(td.items.len() + 1);
-        cont.extend_from_slice(&td.items);
+        // Each method call site owns its nested continuation/cache identity.
+        crate::ast::cache::with_fresh_scope_caches(|| cont.extend_from_slice(&td.items));
         cont.push(Statement::new(StatementKind::ScopePop, call_span));
         let f: Arc<[Statement]> = Arc::from(cont);
         self.class_task_frame_cache
