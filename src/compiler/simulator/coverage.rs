@@ -155,10 +155,16 @@ impl Simulator {
             ctor_args: {
                 let mut bound = Vec::new();
                 for (i, port) in cg_def.ports.iter().enumerate() {
+                    // §13.5, §11.6.1: an input actual (or default) is
+                    // context-determined by its formal, so `new(x + y)` over
+                    // 8-bit operands into an `int` formal keeps the carry.
                     let v = if let Some(a) = args.get(i) {
-                        self.eval_expr(a)
+                        match self.actual_context_width(port) {
+                            Some(w) => self.eval_expr_ctx(a, w),
+                            None => self.eval_expr(a),
+                        }
                     } else if let Some(d) = &port.default {
-                        self.eval_expr(d)
+                        self.eval_formal_default(port, d)
                     } else {
                         Value::zero(32)
                     };
