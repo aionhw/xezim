@@ -329,6 +329,28 @@ fn issue_317_clocking_iff_sees_this_edge() {
     assert!(msgs.iter().any(|m| m == "PASS"), "{:#?}", msgs);
 }
 
+/// Issue #1241: a clocking block input bound to an EXPRESSION
+/// (`input sum = a + 1;`) samples X instead of the expression's value
+/// (IEEE 1800-2023 §14.5, §14.13). Arithmetic, concatenation, part-select,
+/// signed arithmetic, conditional and constant defaults must all sample their
+/// values at the clocking edge. Matched byte-for-byte against the reference
+/// simulator.
+#[test]
+fn issue_1241_clocking_input_expression() {
+    let msgs = outputs(
+        include_str!("../issue_cases/clocking_input_expr_1241.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.contains("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "PASS"), "{:#?}", msgs);
+    assert!(
+        msgs.iter().any(|m| m.contains("sum=4") && m.contains("cat=")
+            && m.contains("sx=5") && m.contains("mux=10") && m.contains("ci=42")),
+        "{:#?}",
+        msgs
+    );
+}
+
 /// Issue #312 follow-up (reporter's survey, 41 cases): `foreach` and the
 /// collection methods over typedef'd associative arrays, dynamic arrays and
 /// queues at package, module, class, interface and block scope, every case
