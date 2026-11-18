@@ -294,14 +294,31 @@ impl Simulator {
             return None;
         }
         // A typedef of the class (`typedef bit [W-1:0] vec_t;`) stands for
-        // the type it names.
+        // the type it names, and so does a class typedef of such a typedef
+        // (`typedef vec_t word_t;`, §6.18).
         let local;
         let dt = match dt {
             DataType::TypeReference {
                 name, dimensions, ..
             } if dimensions.is_empty() && !name.has_scope() => {
                 let ctx = self.class_context_stack.last().cloned().flatten()?;
-                local = self.class_local_typedef(&ctx, &name.name.name)?.clone();
+                let mut target = self.class_local_typedef(&ctx, &name.name.name)?;
+                for _ in 0..16 {
+                    let DataType::TypeReference {
+                        name, dimensions, ..
+                    } = target
+                    else {
+                        break;
+                    };
+                    if !dimensions.is_empty() || name.has_scope() {
+                        break;
+                    }
+                    match self.class_local_typedef(&ctx, &name.name.name) {
+                        Some(next) => target = next,
+                        None => break,
+                    }
+                }
+                local = target.clone();
                 &local
             }
             _ => dt,
