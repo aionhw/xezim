@@ -98,6 +98,47 @@ impl Simulator {
         true
     }
 
+    /// §9.4.5: the elements of the unpacked array named by `e` (a whole
+    /// array or a row of one, not a call) read now, each with its leaf path
+    /// below `e` (`[1][0]`), in declared order. None when `e` names no
+    /// unpacked array or its elements are unpacked structs.
+    pub(super) fn array_item_elements(&mut self, e: &Expression) -> Option<Vec<(String, Value)>> {
+        let e = Self::unparen(e);
+        if !Self::may_be_array_item(e) || matches!(e.kind, ExprKind::Call { .. }) {
+            return None;
+        }
+        let capture = self.pattern_nba_leaves.take();
+        let out = self.array_item_elements_now(e);
+        self.pattern_nba_leaves = capture;
+        out.filter(|v| !v.is_empty() && v.iter().all(|(s, _)| !s.contains('.')))
+    }
+
+    fn array_item_elements_now(&mut self, e: &Expression) -> Option<Vec<(String, Value)>> {
+        if let Some(suffixes) = self.unpacked_row_suffixes(e) {
+            return Some(
+                suffixes
+                    .into_iter()
+                    .map(|s| {
+                        let v = self.eval_expr(&Self::append_leaf_path(e, &s));
+                        (s, v)
+                    })
+                    .collect(),
+            );
+        }
+        let src = self.foreach_check_operand_name(e)?;
+        if self.is_associative_array(&src) {
+            return None;
+        }
+        let (names, _) = self.stream_elem_order(&src)?;
+        names
+            .iter()
+            .map(|n| {
+                let v = self.get_signal_value_by_name(n)?;
+                Some((n.get(src.len()..)?.to_string(), v))
+            })
+            .collect()
+    }
+
     /// The elements of the unpacked array `e` in declared order, left bound
     /// first and rows before columns: a whole array or a row of one, a queue
     /// or dynamic array, or a call returning an unpacked array (which runs
