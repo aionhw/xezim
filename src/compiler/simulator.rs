@@ -380,7 +380,8 @@ fn method_boost_enabled() -> bool {
 // §5.7.1, §11.8.2, §11.4.13, §12.5.4: fill operands of real operators fold at one bit; real,
 // fill and negative-member `inside` and non-constant `case inside` items run interpreted.
 // §8.9, §23.9, §6.18, §8.25: bare stores to class-scope shadow names decline; class typedef chains size formals.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3087;
+// §5.7.1, §7.4.1: unsized signed decimal widths with a sign bit; multidimensional packed range NBAs decline.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3088;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1785,7 +1786,9 @@ struct CombEntryCold {
 // callees reading module parameters inline.
 // §12.5.4, §11.4.13: `case inside` with a wildcard, range or real item and `inside` with a
 // real operand, a fill or a negative member run on the interpreter's matcher.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB040";
+// §5.7.1, §7.4.1: unsized signed decimal widths with a sign bit; multidimensional
+// packed range nonblocking writes are left to the interpreter.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB041";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
