@@ -4186,6 +4186,29 @@ impl Simulator {
         !self.nba_queued_partial_ids.is_empty() && self.nba_queued_partial_ids.contains(&id)
     }
 
+    /// Whether a future nonblocking update of part of signal `id` is waiting
+    /// in `delayed_nba_queue` to commit at time `when`. The lvalues are read
+    /// outside any method, so a clocking select issued from a class task,
+    /// whose target is the bound net's own name, resolves to that net.
+    pub(super) fn partial_nba_due(&mut self, id: usize, when: u64) -> bool {
+        let queue = std::mem::take(&mut self.delayed_nba_queue);
+        let mut ids = Vec::new();
+        self.this_stack.push(None);
+        for (t, entry) in &queue {
+            let Some(lhs) = &entry.lhs else { continue };
+            if *t != when
+                || entry.static_key.is_some()
+                || !Self::cond_expr_is_effect_free(lhs, false)
+            {
+                continue;
+            }
+            self.partial_nba_signal_ids(lhs, &mut ids);
+        }
+        self.this_stack.pop();
+        self.delayed_nba_queue = queue;
+        ids.contains(&id)
+    }
+
     /// The signals a partial nonblocking lvalue writes: a concatenation
     /// contributes each element's, a select the signal of its base, anything
     /// else the signal [`Self::packed_nba_base_slice`] finds.

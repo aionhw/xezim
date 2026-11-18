@@ -124,12 +124,30 @@ impl Simulator {
 
     /// §14.16.2: only synchronous drives of one output that mature in the
     /// same time step replace each other. Different skews remain pending;
-    /// the inertial gate-delay queue would cancel the earlier drive.
+    /// the inertial gate-delay queue would cancel the earlier drive. A select
+    /// drive of the output due at the same time commits in the NBA region, so
+    /// the whole drive queues behind it there and the later drive wins.
     pub(super) fn schedule_clocking_update(&mut self, id: usize, val: &Value, delay: u64) {
         let when = self.time.saturating_add(delay);
         let value = self.fit_clocking_value(id, val);
         self.delayed_updates
             .retain(|(t, sid, _, _)| *sid != id || *t != when);
+        if delay > 0 && self.partial_nba_due(id, when) {
+            self.enqueue_context_nba(
+                NbaEntry {
+                    elements: None,
+                    lhs: None,
+                    value,
+                    resolved_id: Some(id),
+                    static_key: None,
+                    static_slice: None,
+                    this_handle: None,
+                    root_frame: None,
+                },
+                delay,
+            );
+            return;
+        }
         self.delayed_updates.push((when, id, value, None));
     }
 
