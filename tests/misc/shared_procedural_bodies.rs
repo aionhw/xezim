@@ -81,3 +81,34 @@ endmodule
         "PASS shared fork bodies",
     );
 }
+
+/// §9.4.2.3/§10.4.2: shared root syntax must preserve edge iff guards,
+/// conditional assignments and NBA updates across repeated activations.
+#[test]
+fn unchanged_root_body_preserves_iff_and_repeated_nba_updates() {
+    passes(
+        r#"
+module top;
+  bit clk = 0, enable = 1;
+  logic [7:0] q = 1;
+  always @(posedge clk iff enable) begin
+    if (q > 9) q <= q - 3;
+    else q <= q + 7;
+  end
+  initial begin
+    #1; clk = 1; #1;
+    if (q !== 8) $fatal(1, "first edge");
+    clk = 0; #1; clk = 1; #1;
+    if (q !== 15) $fatal(1, "second edge");
+    enable = 0; clk = 0; #1; clk = 1; #1;
+    if (q !== 15) $fatal(1, "disabled edge");
+    enable = 1; clk = 0; #1; clk = 1; #1;
+    if (q !== 12) $fatal(1, "conditional NBA");
+    $display("PASS shared root edge body");
+    $finish;
+  end
+endmodule
+"#,
+        "PASS shared root edge body",
+    );
+}
