@@ -385,3 +385,5 @@ mod pattern_array_items;
 mod struct_concat_forms;
 #[path = "collections/queue_front_shift.rs"]
 mod queue_front_shift;
+#[path = "collections/pattern_self_read.rs"]
+mod pattern_self_read;
