@@ -3875,13 +3875,15 @@ impl Simulator {
         // the declared width and stamp; other packed formals keep width.
         use crate::ast::types::DataType as DT;
         let mut coerce: Vec<(Box<str>, u32, Option<bool>)> = Vec::with_capacity(f.ports.len());
-        for port in f.ports.iter() {
+        for (i, port) in f.ports.iter().enumerate() {
             let dt = &port.data_type;
             let c = if self.typeref_names_class(dt) || Self::is_string_data_type(dt) {
                 (0, None)
             } else if matches!(dt, DT::TypeReference { .. }) {
                 if let Some((pw, signed)) = self.scalar_formal_integral(dt) {
-                    (pw, Some(signed))
+                    // `scalar_formal_integral` sizes a class typedef from module
+                    // scope; the plan's width is this specialization's.
+                    (pre.formal_widths.get(i).copied().unwrap_or(pw), Some(signed))
                 } else if self.type_is_signed_concrete(dt) {
                     (0, Some(true))
                 } else {
