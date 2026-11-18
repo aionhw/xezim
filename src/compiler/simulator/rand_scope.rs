@@ -97,6 +97,36 @@ impl Simulator {
             }
         }
     }
+    /// §18.8, §18.9: `obj.sub.x.rand_mode(0)` and
+    /// `obj.sub.c.constraint_mode(0)` name the random variable or constraint
+    /// `x` / `c` of the object `obj.sub`, not a member `sub.x` of `obj`, so
+    /// the randomize() of `obj.sub` (on its own or as a sub-object) sees the
+    /// mode. Descend from `h` through the leading parts of the dotted
+    /// `target` that are class-handle properties holding an object.
+    pub(super) fn rand_mode_owner(&self, mut h: usize, target: &str) -> (usize, String) {
+        let mut parts: Vec<&str> = target.split('.').collect();
+        while parts.len() > 1 {
+            let p = parts[0];
+            if p.contains('[') || self.prop_class_type(h, p).is_none() {
+                break;
+            }
+            let Some(next) = self
+                .heap
+                .get(h)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get(p))
+                .and_then(|v| v.to_u64())
+                .map(|v| v as usize)
+                .filter(|&v| v != 0 && self.heap.get(v).is_some_and(|o| o.is_some()))
+            else {
+                break;
+            };
+            h = next;
+            parts.remove(0);
+        }
+        (h, parts.join("."))
+    }
+
     /// §18.8: the object and element key (`arr[2]`, `m[1][0]`) a
     /// `rand_mode` receiver names when it selects an element of an unpacked
     /// rand array: `obj.arr[i]`, or `arr[i]` inside the class.

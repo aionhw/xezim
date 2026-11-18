@@ -2822,6 +2822,13 @@ impl Simulator {
                         } else {
                             None
                         };
+                        let (h_val, target_name) = match target_name {
+                            Some(t) if t.contains('.') => {
+                                let (h, t) = self.rand_mode_owner(h_val, &t);
+                                (h, Some(t))
+                            }
+                            t => (h_val, t),
+                        };
                         // §18.5.11: a static constraint block's mode is shared
                         // by every instance of the class — route it to the
                         // class-wide flag, not this instance's set.
