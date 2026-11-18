@@ -323,3 +323,81 @@ fn uvm_dpi_builtins_2020_regex_and_polling() {
         ]
     );
 }
+
+/// An empty pattern matches every string, as glibc's regcomp has it, on
+/// every host (BSD libc rejects it with REG_EMPTY). UVM 1.2 builds one from
+/// an empty scope (`uvm_config_db::set(null, "", ...)`), and `//` strips to
+/// one; each compile path must accept it without touching `uvm_re_buffer`.
+const EMPTY_PATTERN_SRC: &str = r#"
+module top;
+  import "DPI-C" function void uvm_dump_re_cache();
+  import "DPI-C" function string uvm_glob_to_re(string glob);
+  import "DPI-C" context function int uvm_re_match(string re, string str);
+  import "DPI-C" function chandle uvm_dpi_regcomp(string regex);
+  import "DPI-C" function int uvm_dpi_regexec(chandle preg, string str);
+  import "DPI-C" function chandle uvm_re_comp(string re, bit deglob);
+  import "DPI-C" function int uvm_re_exec(chandle rexp, string str);
+  import "DPI-C" function string uvm_re_buffer();
+  export "DPI-C" function m__uvm_report_dpi;
+  function void m__uvm_report_dpi(int severity, string id, string message, int verbosity,
+                                  string filename, int line);
+    $display("REPORT sev=%0d id=%s %s", severity, id, message);
+  endfunction
+  initial begin
+    string re;
+    chandle h;
+    re = uvm_glob_to_re("");
+    $display("T|match '%s' %0d %0d %0d", re, uvm_re_match(re, ""),
+             uvm_re_match(re, "uvm_test_top.env"), uvm_re_match("//", "x"));
+    h = uvm_dpi_regcomp("");
+    $display("T|regcomp null=%0d m=%0d", h == null, uvm_dpi_regexec(h, "abc"));
+    h = uvm_re_comp("//", 0);
+    $display("T|comp null=%0d m=%0d", h == null, uvm_re_exec(h, "abc"));
+    $display("T|buffer '%s'", uvm_re_buffer());
+  end
+endmodule
+"#;
+
+#[test]
+fn uvm_dpi_builtins_empty_pattern_matches_everything() {
+    let sim = simulate_multi(
+        &[EMPTY_PATTERN_SRC.to_string()],
+        100,
+        Some("top"),
+        &[],
+        &[],
+        None,
+        false,
+        None,
+        None,
+        &[],
+        &[],
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .expect("simulate failed");
+    let got: Vec<String> = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone())
+        .filter(|m| m.starts_with("T|") || m.starts_with("REPORT"))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            "T|match '' 0 0 0",
+            "T|regcomp null=0 m=0",
+            "T|comp null=0 m=0",
+            "T|buffer ''",
+        ]
+    );
+}
