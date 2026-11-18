@@ -302,6 +302,8 @@ mod compiled_nonvirtual_dispatch;
 mod compiled_pkg_fn_scope;
 #[path = "classes/compiled_pkg_param_scope.rs"]
 mod compiled_pkg_param_scope;
+#[path = "classes/bare_name_scopes_1273.rs"]
+mod bare_name_scopes_1273;
 #[path = "classes/compiled_task_wait_analysis.rs"]
 mod compiled_task_wait_analysis;
 #[path = "classes/compiled_method_type_param_members.rs"]
