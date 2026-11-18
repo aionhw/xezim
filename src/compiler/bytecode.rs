@@ -16542,7 +16542,19 @@ impl<'a> BytecodeCompiler<'a> {
         {
             return self.compile_pattern(expr, ctx_width, pattern_ctx);
         }
-        let result = self.compile_expr_inner(expr, ctx_width, unsigned_context)?;
+        // §13.5.2: a call lowering can emit its call before a write-back of
+        // an output or inout actual declines it. Whatever then runs the
+        // expression in the interpreter (a statement fallback, `void'(...)`)
+        // makes the call itself, so the compiled one must not stay.
+        let call_start =
+            matches!(expr.kind, ExprKind::Call { .. }).then(|| (self.insns.len(), self.next_reg));
+        let Some(result) = self.compile_expr_inner(expr, ctx_width, unsigned_context) else {
+            if let Some((start, first_reg)) = call_start {
+                self.truncate_insns(start);
+                self.next_reg = first_reg;
+            }
+            return None;
+        };
         // §7.4.1: an element of a packed array of a named signed type
         // (`lane_t [0:8] x; x[1]`) is signed; the slice that read it is not.
         if matches!(expr.kind, ExprKind::Index { .. }) && self.packed_named_select_signed(expr) {
