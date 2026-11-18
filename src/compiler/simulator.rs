@@ -381,7 +381,9 @@ fn method_boost_enabled() -> bool {
 // fill and negative-member `inside` and non-constant `case inside` items run interpreted.
 // §8.9, §23.9, §6.18, §8.25: bare stores to class-scope shadow names decline; class typedef chains size formals.
 // §5.7.1, §7.4.1: unsized signed decimal widths with a sign bit; multidimensional packed range NBAs decline.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3088;
+// §26.3: package code reads its own package's parameters, variables and imports, and an
+// inlined package callee its own, ahead of the design's same-named declarations.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3089;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
