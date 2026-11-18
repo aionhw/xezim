@@ -664,3 +664,6 @@ mod comb_batch_branches_1284;
 
 #[path = "misc/declaration_order_snapshots.rs"]
 mod declaration_order_snapshots;
+
+#[path = "misc/shared_procedural_bodies.rs"]
+mod shared_procedural_bodies;
