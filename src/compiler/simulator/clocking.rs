@@ -62,7 +62,7 @@ impl Simulator {
         self.exec_statement(&Statement::new(
             StatementKind::NonblockingAssign {
                 lvalue: target.clone(),
-                delay,
+                delay: delay.map(Box::new),
                 rvalue,
             },
             span,
