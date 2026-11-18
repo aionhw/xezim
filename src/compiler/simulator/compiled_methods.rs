@@ -1659,6 +1659,22 @@ impl Simulator {
         p
     }
 
+    /// Does `body` declare, at any depth, a virtual-interface local (also
+    /// through a class-scoped typedef, `decl_is_virtual_iface`)?
+    fn declares_vif_local(&self, body: &[Statement]) -> bool {
+        use crate::ast::stmt::StatementKind;
+        body.iter().any(|s| match &s.kind {
+            StatementKind::VarDecl { data_type, .. } => self.decl_is_virtual_iface(data_type),
+            _ => self.declares_vif_local_in(&Self::sub_stmts(s)),
+        })
+    }
+
+    fn declares_vif_local_in(&self, stmts: &[&Statement]) -> bool {
+        stmts
+            .iter()
+            .any(|s| self.declares_vif_local(std::slice::from_ref(*s)))
+    }
+
     /// class-perf free-function tier: run a package/module-scope FUNCTION
     /// body as bytecode, reusing `try_run_compiled_method`'s entire plan +
     /// admission + block-cache machinery under a SYNTHETIC class name. The
@@ -1880,6 +1896,16 @@ impl Simulator {
             // read bit i, so a hot function read the wrong bit or x (#650).
             if self.declares_offset_packed_range(ports, body) {
                 trace_decline("offset-packed-range");
+                self.compiled_method_skip.insert((cid, mid, spec_id));
+                return None;
+            }
+            // §25.9, Table 6-7: a virtual-interface local starts null and an
+            // assignment binds it to an interface instance, both through the
+            // interpreter's declaration and assignment arms. Compiled it was
+            // an integral register: `v == null` read 0 before any
+            // assignment, and an assignment bound nothing.
+            if self.declares_vif_local(body) {
+                trace_decline("vif-local");
                 self.compiled_method_skip.insert((cid, mid, spec_id));
                 return None;
             }
