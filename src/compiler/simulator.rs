@@ -377,7 +377,8 @@ fn method_boost_enabled() -> bool {
 // §13.5, §11.6.1: compiled import calls and calls handed to the interpreter size
 // integral input actuals by their formals; a method with a vif local declines (§25.9).
 // §6.18, §6.16, §13.5.1, §8.9: typedef write-back receivers, string-collection members, unpacked-formal actuals, static collections.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3085;
+// §13.5.2: a call statement whose output actual declines write-back falls back without its compiled call.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3086;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never

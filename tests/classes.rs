@@ -318,6 +318,8 @@ mod compiled_method_string_loop;
 mod compiled_method_super;
 #[path = "classes/compiled_method_tiering.rs"]
 mod compiled_method_tiering;
+#[path = "classes/compiled_method_writeback_actual_once.rs"]
+mod compiled_method_writeback_actual_once;
 #[path = "classes/constraint_algebra_inherit.rs"]
 mod constraint_algebra_inherit;
 #[path = "classes/constraint_array_sum.rs"]
