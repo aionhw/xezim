@@ -46,6 +46,68 @@ endmodule
     assert_eq!(u(&sim, "t_paren"), 5, "as does @(cb)");
 }
 
+/// §14.10, §9.4.2: `@cb` waits for the block's clocking event on the edge
+/// the block declares, as `@(cb)` does.
+#[test]
+fn bare_clocking_event_waits_for_the_declared_edge() {
+    let src = r#"
+`timescale 1ns/1ns
+module top;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  clocking cbn @(negedge clk);
+  endclocking
+  clocking cbe @(edge clk);
+  endclocking
+  int t_neg, t_paren, t_rep, t_any;
+  initial begin @cbn;   t_neg   = $time; end
+  initial begin @(cbn); t_paren = $time; end
+  initial begin repeat (2) @cbn; t_rep = $time; end
+  initial begin #6 @cbe; t_any = $time; end
+  initial #40 $finish;
+endmodule
+"#;
+    let sim = simulate(src, 200).expect("simulate failed");
+    assert_eq!(u(&sim, "t_neg"), 10, "@cbn waits for the negedge");
+    assert_eq!(u(&sim, "t_paren"), 10, "as does @(cbn)");
+    assert_eq!(u(&sim, "t_rep"), 20, "repeat (2) @cbn waits two negedges");
+    assert_eq!(u(&sim, "t_any"), 10, "@cbe wakes on either edge");
+}
+
+/// The same in an interface task, called directly and through a virtual
+/// interface.
+#[test]
+fn bare_clocking_event_in_an_interface_task_waits_for_the_declared_edge() {
+    let src = r#"
+`timescale 1ns/1ns
+interface clk_if (input logic clk);
+  clocking cb @(posedge clk);
+  endclocking
+  clocking cbn @(negedge clk);
+  endclocking
+  task automatic wait_n_clks(int n);
+    repeat (n) @cbn;
+  endtask
+endinterface
+module top;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  clk_if u_if (.clk(clk));
+  virtual clk_if vif;
+  int t_task, t_vif;
+  initial begin
+    vif = u_if;
+    u_if.wait_n_clks(2); t_task = $time;
+    vif.wait_n_clks(1);  t_vif  = $time;
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 200).expect("simulate failed");
+    assert_eq!(u(&sim, "t_task"), 20, "two negedges from t=0");
+    assert_eq!(u(&sim, "t_vif"), 30, "one more negedge through the vif");
+}
+
 /// Successive `@cb` steps advance one clock each, rather than all firing at
 /// t=0 — the shape a sampling loop actually uses.
 #[test]
