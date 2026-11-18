@@ -2515,7 +2515,27 @@ impl Simulator {
                     None => self.module.arrays_nd.get(&param).map_or(32, |t| t.1),
                 };
                 let out_default = self.output_formal_elem_default(port, w);
+                // §7.2, §13.5.1: an element of an unpacked-struct array is
+                // its member leaves, as in the one-dimensional case below.
+                let elem_su = self
+                    .p_elem_type(&caller)
+                    .or_else(|| self.p_elem_type(&param))
+                    .and_then(|dt| self.unpacked_struct_of(&dt));
                 for sfx in &suffixes {
+                    if let Some(su) = &elem_su {
+                        let d = format!("{}{}", param, sfx);
+                        if out_default.is_some() {
+                            let mut leaves = Vec::new();
+                            self.unpacked_struct_leaf_defaults(&d, su, 0, &mut leaves);
+                            for (k, dv, _) in leaves {
+                                self.signals.insert(k, dv);
+                            }
+                        } else {
+                            let s = format!("{}{}", caller, sfx);
+                            self.copy_unpacked_struct(&d, &s, &su.clone());
+                        }
+                        continue;
+                    }
                     let v = match &out_default {
                         Some(d) => Some(d.clone()),
                         None => self.get_signal_value_by_name(&format!("{}{}", caller, sfx)),
@@ -2784,7 +2804,17 @@ impl Simulator {
         if !(l_nd || r_nd) || (lbase == rbase && lsfx == rsfx) {
             return false;
         }
+        // §7.2: an element of an unpacked-struct array is its member leaves.
+        let elem_su = self
+            .p_elem_type(&rbase)
+            .or_else(|| self.p_elem_type(&lbase))
+            .and_then(|dt| self.unpacked_struct_of(&dt));
         for (ls, rs) in lsfx.iter().zip(rsfx.iter()) {
+            if let Some(su) = &elem_su {
+                let (d, s) = (format!("{}{}", lbase, ls), format!("{}{}", rbase, rs));
+                self.copy_unpacked_struct(&d, &s, &su.clone());
+                continue;
+            }
             let v = self
                 .get_signal_value_by_name(&format!("{}{}", rbase, rs))
                 .unwrap_or_else(|| Value::zero(32));
@@ -2847,7 +2877,17 @@ impl Simulator {
             }
             if let Some(sfxs) = self.nd_formal_suffixes(param) {
                 if param != caller {
+                    let elem_su = self
+                        .p_elem_type(param)
+                        .or_else(|| self.p_elem_type(caller))
+                        .and_then(|dt| self.unpacked_struct_of(&dt));
                     for sfx in sfxs {
+                        if let Some(su) = &elem_su {
+                            let (d, s) =
+                                (format!("{}{}", caller, sfx), format!("{}{}", param, sfx));
+                            self.copy_unpacked_struct(&d, &s, &su.clone());
+                            continue;
+                        }
                         if let Some(v) = self.get_signal_value_by_name(&format!("{}{}", param, sfx))
                         {
                             self.set_signal_value_by_name(&format!("{}{}", caller, sfx), v);

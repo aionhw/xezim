@@ -608,8 +608,29 @@ impl Simulator {
         let ew = self
             .coll_elem_width(&lb)
             .or_else(|| self.coll_elem_width(&rb));
+        // §7.2: an element of an unpacked-struct array compares member by
+        // member.
+        let leaves = self
+            .p_elem_type(&lb)
+            .or_else(|| self.p_elem_type(&rb))
+            .and_then(|dt| self.unpacked_struct_of(&dt))
+            .map(|su| self.struct_leaf_suffixes(&su));
         let mut acc = PatCmp::Equal;
         for (a, b) in ls.iter().zip(rs.iter()) {
+            if let Some(sfx) = &leaves {
+                for s in sfx {
+                    let lv = self.struct_leaf_value(&format!("{lb}{a}.{s}"));
+                    let rv = self.struct_leaf_value(&format!("{rb}{b}.{s}"));
+                    acc = acc.and(match (lv, rv) {
+                        (Some(x), Some(y)) => Self::struct_leaf_cmp(&x, &y, mode),
+                        _ => PatCmp::Unequal,
+                    });
+                }
+                if acc == PatCmp::Unequal {
+                    break;
+                }
+                continue;
+            }
             let lv = self.get_signal_value_by_name(&format!("{}{}", lb, a));
             let rv = self.get_signal_value_by_name(&format!("{}{}", rb, b));
             let (Some(lv), Some(rv)) = (lv, rv) else {
