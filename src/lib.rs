@@ -194,7 +194,7 @@ fn design_cache_key(
     hash.text("qualified-package-array-storage-and-pr-validation-v3");
     hash.text(env!("CARGO_PKG_VERSION"));
     // Record packing changes generated VHDL storage before SV elaboration.
-    hash.text("xezim-design-cache-vhd4");
+    hash.text("xezim-design-cache-vhd5");
     hash.text(&config.semantic_salt);
     hash.text(top_module_name.unwrap_or(""));
     // An elaboration with unobserved-port elision on leaves nets out, so it
@@ -914,7 +914,7 @@ pub fn defer_static_syscall_inits(
                         name: format!("{}{}", compiler::simulator::M_ROOT_MARK, p.name.name),
                         span,
                     }),
-                    stmts: vec![block.stmt],
+                    stmts: vec![block.stmt].into(),
                 },
                 span,
             );
@@ -922,7 +922,7 @@ pub fn defer_static_syscall_inits(
             block.stmt = Statement::new(
                 StatementKind::SeqBlock {
                     name: None,
-                    stmts: vec![scoped],
+                    stmts: vec![scoped].into(),
                 },
                 span,
             );

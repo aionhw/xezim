@@ -1539,9 +1539,9 @@ impl Simulator {
             Self::rename_instance_locals(&mut ib.stmt, &ib.scope);
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
-                other => vec![Statement::new(other, ib.stmt.span)],
+                other => vec![Statement::new(other, ib.stmt.span)].into(),
             };
-            self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
+            self.run_process_stmts(pid, &ProcCont::from_vec(stmts.into_vec()));
         } else {
             self.run_process_stmts(pid, stmts);
         }
@@ -5437,7 +5437,7 @@ impl Simulator {
                         let while_body = Statement::new(
                             StatementKind::SeqBlock {
                                 name: None,
-                                stmts: body_stmts,
+                                stmts: body_stmts.into(),
                             },
                             stmt.span,
                         );

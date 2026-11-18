@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Performance:** Share procedural block bodies until rewritten, and borrow module items during scope registration.
+
 - **Performance:** Share declaration-order snapshots while checking module helper functions, blocks and conditions.
 
 - **Performance:** Store immediate writes to one proven scalar leaf in a single pending value and flag.

@@ -4280,7 +4280,7 @@ impl<'a> BytecodeCompiler<'a> {
         // Unwrap the body, through one level of begin/end.
         let items: Vec<Statement> = match fd.items.as_slice() {
             [one] => match &one.kind {
-                StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                StatementKind::SeqBlock { stmts, .. } => stmts.to_vec(),
                 _ => vec![one.clone()],
             },
             other => other.to_vec(),
@@ -5492,7 +5492,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
         let items: Vec<Statement> = match fd.items.as_slice() {
             [one] => match &one.kind {
-                StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                StatementKind::SeqBlock { stmts, .. } => stmts.to_vec(),
                 _ => vec![one.clone()],
             },
             other => other.to_vec(),
@@ -6399,7 +6399,7 @@ impl<'a> BytecodeCompiler<'a> {
                 body = Statement::new(
                     StatementKind::SeqBlock {
                         name: Some(n.clone()),
-                        stmts: vec![body],
+                        stmts: vec![body].into(),
                     },
                     stmt.span,
                 );
@@ -13626,7 +13626,7 @@ impl<'a> BytecodeCompiler<'a> {
             Statement::new(
                 StatementKind::SeqBlock {
                     name: block_name,
-                    stmts: kept,
+                    stmts: kept.into(),
                 },
                 body.span,
             )
