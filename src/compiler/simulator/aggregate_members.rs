@@ -715,17 +715,18 @@ impl Simulator {
         if dimensions.is_empty() {
             return Some(base);
         }
-        let params = match self.this_stack.last().copied().flatten() {
-            Some(h) => std::borrow::Cow::Owned(self.instance_param_scope(h)),
-            None => std::borrow::Cow::Borrowed(&self.module.parameters),
+        let values: HashMap<String, Value> = match self.this_stack.last().copied().flatten() {
+            Some(h) => self.instance_value_params(h).into_iter().collect(),
+            None => HashMap::default(),
         };
+        let params = self.instance_param_env(&values);
         let mut w = u64::from(base);
         for d in dimensions {
             let crate::ast::types::PackedDimension::Range { left, right, .. } = d else {
                 return None;
             };
-            let l = crate::elaborate::const_eval_i64_with_params(left, Some(params.as_ref()))?;
-            let r = crate::elaborate::const_eval_i64_with_params(right, Some(params.as_ref()))?;
+            let l = crate::elaborate::const_eval_i64_with_params_env(left, Some(&params))?;
+            let r = crate::elaborate::const_eval_i64_with_params_env(right, Some(&params))?;
             w = w.checked_mul((l - r).unsigned_abs() + 1)?;
         }
         u32::try_from(w).ok()
@@ -942,9 +943,13 @@ impl Simulator {
             return None;
         }
         let b = self.bind_type_params_in(dt, &|n| self.resolve_type_param_binding(n))?;
-        let spec = self.params_with_class_spec();
-        let params = spec.as_ref().unwrap_or(&self.module.parameters);
-        let w = resolve_type_width(&b, Some(params), Some(&self.module.typedefs));
+        let spec = self.class_spec_value_params();
+        let params = self.spec_param_env(&spec);
+        let w = super::elaborate::resolve_type_width_env(
+            &b,
+            Some(&params),
+            Some(&self.module.typedefs),
+        );
         Some(w).filter(|w| *w > 0)
     }
 
@@ -4074,6 +4079,24 @@ impl Simulator {
             params.entry(n).or_insert(v);
         }
         params
+    }
+
+    /// `instance_param_scope` borrowed rather than copied, for a lookup on
+    /// every method call (#1276): `values` holds `instance_value_params`
+    /// of the object, and a design parameter of the same name keeps its
+    /// precedence, as there.
+    pub(super) fn instance_param_env<'a>(
+        &'a self,
+        values: &'a HashMap<String, Value>,
+    ) -> super::elaborate::ParamEnv<'a> {
+        if values.is_empty() {
+            super::elaborate::ParamEnv::Single(&self.module.parameters)
+        } else {
+            super::elaborate::ParamEnv::Overlay {
+                base: values,
+                top: &self.module.parameters,
+            }
+        }
     }
 
     /// The class value parameters bound on object `handle`, leaf class first

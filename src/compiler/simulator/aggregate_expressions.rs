@@ -2998,13 +2998,13 @@ impl Simulator {
                         // resolve a bare TYPE-PARAMETER name through its
                         // declared default AST (`parameter type T = logic
                         // [W-1:0]`), which likewise sizes from W.
-                        let spec = self.params_with_class_spec();
-                        let params = spec.as_ref().unwrap_or(&self.module.parameters);
                         let resolved_dt = self.class_type_param_default(dt);
                         let target = resolved_dt.as_ref().unwrap_or(dt);
-                        let w = super::elaborate::resolve_type_width(
+                        let spec = self.class_spec_value_params();
+                        let params = self.spec_param_env(&spec);
+                        let w = super::elaborate::resolve_type_width_env(
                             target,
-                            Some(params),
+                            Some(&params),
                             Some(&self.module.typedefs),
                         )
                         .max(1);
@@ -3049,11 +3049,11 @@ impl Simulator {
                                 span: arg.span,
                             };
                             if let Some(dflt) = self.class_type_param_default(&as_ty) {
-                                let spec = self.params_with_class_spec();
-                                let params = spec.as_ref().unwrap_or(&self.module.parameters);
-                                let w = super::elaborate::resolve_type_width(
+                                let spec = self.class_spec_value_params();
+                                let params = self.spec_param_env(&spec);
+                                let w = super::elaborate::resolve_type_width_env(
                                     &dflt,
-                                    Some(params),
+                                    Some(&params),
                                     Some(&self.module.typedefs),
                                 )
                                 .max(1);
@@ -3152,8 +3152,10 @@ impl Simulator {
                             && !self.module.typedef_unpacked_dims.contains_key(&*name)
                             && let Some(dt) = self.module.typedef_types.get(&*name).cloned()
                         {
-                            let params = self.instance_param_scope(this_h);
-                            let w = super::elaborate::resolve_type_width(
+                            let values: HashMap<String, Value> =
+                                self.instance_value_params(this_h).into_iter().collect();
+                            let params = self.instance_param_env(&values);
+                            let w = super::elaborate::resolve_type_width_env(
                                 &dt,
                                 Some(&params),
                                 Some(&self.module.typedefs),

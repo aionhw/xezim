@@ -497,16 +497,25 @@ impl Simulator {
             .map(|(_, d)| d.clone())
     }
 
-    pub(super) fn params_with_class_spec(&mut self) -> Option<HashMap<String, Value>> {
-        let spec = self.class_spec_value_params()?;
-        let mut m = self.module.parameters.clone();
-        m.extend(spec);
-        Some(m)
+    /// The design parameters with `spec` (`class_spec_value_params`) laid
+    /// over them, borrowed: copying the design's whole parameter table on
+    /// every evaluation inside a class method cost time linear in the
+    /// design's parameter count (#1276).
+    pub(super) fn spec_param_env<'a>(
+        &'a self,
+        spec: &'a Option<HashMap<String, Value>>,
+    ) -> super::elaborate::ParamEnv<'a> {
+        match spec {
+            Some(top) => super::elaborate::ParamEnv::Overlay {
+                base: &self.module.parameters,
+                top,
+            },
+            None => super::elaborate::ParamEnv::Single(&self.module.parameters),
+        }
     }
 
-    /// Just the active specialization's value parameters that
-    /// `params_with_class_spec` overlays on `module.parameters`, for a
-    /// caller that stacks them with `ParamEnv::Overlay` instead of copying
+    /// Just the active specialization's value parameters, which
+    /// `spec_param_env` lays over `module.parameters` instead of copying
     /// every design parameter.
     pub(super) fn class_spec_value_params(&mut self) -> Option<HashMap<String, Value>> {
         let (base, _) = self.current_spec.clone()?;

@@ -2259,8 +2259,14 @@ impl Simulator {
                     Some(&self.module.typedefs),
                 )
             } else {
-                let scope = self.instance_param_scope(handle);
-                resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs))
+                let values: HashMap<String, Value> =
+                    self.instance_value_params(handle).into_iter().collect();
+                let scope = self.instance_param_env(&values);
+                super::elaborate::resolve_type_width_env(
+                    &pre.return_type,
+                    Some(&scope),
+                    Some(&self.module.typedefs),
+                )
             };
             if w > 0 { w } else { pre.static_result_width }
         } else {
@@ -4139,10 +4145,10 @@ impl Simulator {
         // width resolution is fully deterministic. Mirror it so the block
         // cache key matches.
         let result_width = if pre.param_able_result {
-            let scope = self.instance_param_scope(0);
+            // Handle 0 binds no class parameters: the design table alone.
             let w = super::elaborate::resolve_type_width(
                 &pre.return_type,
-                Some(&scope),
+                Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
             if w > 0 { w } else { pre.static_result_width }

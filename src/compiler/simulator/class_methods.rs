@@ -2867,8 +2867,14 @@ impl Simulator {
                         let w = match static_dyn_w {
                             Some(w) => w,
                             None => {
-                                let scope = self.instance_param_scope(handle);
-                                resolve_type_width(rt, Some(&scope), Some(&self.module.typedefs))
+                                let values: HashMap<String, Value> =
+                                    self.instance_value_params(handle).into_iter().collect();
+                                let scope = self.instance_param_env(&values);
+                                super::elaborate::resolve_type_width_env(
+                                    rt,
+                                    Some(&scope),
+                                    Some(&self.module.typedefs),
+                                )
                             }
                         };
                         if w > 0 && w != ret.width {

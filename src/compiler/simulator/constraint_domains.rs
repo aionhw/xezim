@@ -151,8 +151,8 @@ impl Simulator {
                 dimensions,
                 ..
             } if !dimensions.is_empty() => {
-                let spec_params = self.params_with_class_spec();
-                let params = spec_params.as_ref().unwrap_or(&self.module.parameters);
+                let spec_params = self.class_spec_value_params();
+                let params = self.spec_param_env(&spec_params);
                 let mut s = String::from(match kind {
                     V::Bit => "bit",
                     V::Logic => "logic",
@@ -165,8 +165,8 @@ impl Simulator {
                     let crate::ast::types::PackedDimension::Range { left, right, .. } = d else {
                         return None;
                     };
-                    let l = super::elaborate::const_eval_i64_with_params(left, Some(params))?;
-                    let r = super::elaborate::const_eval_i64_with_params(right, Some(params))?;
+                    let l = super::elaborate::const_eval_i64_with_params_env(left, Some(&params))?;
+                    let r = super::elaborate::const_eval_i64_with_params_env(right, Some(&params))?;
                     s.push_str(&format!("[{l}:{r}]"));
                 }
                 Some(s)
