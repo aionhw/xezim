@@ -662,3 +662,10 @@ fn pending_partial_activity_and_quiet() {
 fn singleton_pending_scalar_parts() {
     check("singleton_pending_parts");
 }
+
+/// §14.7.5.2: a startup list crossing the batching boundary runs ordinary
+/// processes in order before the postponed initialization pass.
+#[test]
+fn initialization_batch_order() {
+    check("initialization_batches");
+}

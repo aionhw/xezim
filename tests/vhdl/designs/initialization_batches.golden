@@ -1,0 +1,6 @@
+initialization_batches.vhd:9:9:@0ms:(report note): first ordinary
+initialization_batches.vhd:11:9:@0ms:(report note): ordinary at batch boundary
+initialization_batches.vhd:13:9:@0ms:(report note): last ordinary
+initialization_batches.vhd:20:5:@0ms:(report note): postponed after ordinary
+initialization_batches.vhd:26:5:@1ns:(report note): PASS initialization batches
+simulation finished @1ns
