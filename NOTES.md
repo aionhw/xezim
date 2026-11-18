@@ -176,6 +176,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the compile from 136.06 G to 53.51 G instructions, with the same artifact
   and simulation output (#721).
 
+* An automatic function that reads an element of a packed-array member of a
+  packed-struct formal (`c.gain_shift[ci]`), or that calls a helper reading
+  its module's `localparam`, is compiled into the calling block instead of
+  running every call on the interpreter. The reported wide `always_ff` design
+  runs in 8.27 G instead of 400.8 G instructions, its hot section in 1.9 s
+  instead of 90 s (§7.4.1, §6.20, §13.4, #1245, reported by Ganesh-TNL).
+
+* The `&&&` conditions and the timestamp and timecheck conditions of timing
+  checks are compiled when first evaluated instead of interpreted at every
+  event. The reported gated-clock capture pipeline runs 400 frames in 3.82 G
+  instead of 66.2 G instructions, against 1.58 G with `+nospecify` (§31.7,
+  #1246, reported by Ganesh-TNL).
+
 **Command line**
 
 * `$dumpvars` and `$fsdbDumpvars` accept indexed scope arguments: a
@@ -574,6 +587,129 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   typedef with several members whose ranges read parameters made the names
   kept for the port-width diagnostic come out in a different order each time
   (§7.2, #721).
+
+* A replication pattern (`'{2{7}}`) written to a one-dimensional unpacked
+  array, a queue or a dynamic array by a nonblocking assignment or an
+  intra-assignment delay stores every element, each item read once in the
+  element type, instead of only the first (§10.9.1, §10.4.2, §9.4.5, #1263,
+  contributed by chuanseng-ng).
+
+* Synchronous drives of one clocking output that mature in the same time step
+  apply in the order they were issued, select and whole drives alike, so a
+  whole drive after a select drive wins (§14.16.2, #1267, contributed by
+  auty1395). The order also holds, and the output changes once, for a `#0`
+  output skew, for a select drive after a whole drive and for `##N` drives; a
+  `#0` select drive issued between clocking events commits with the other
+  drives instead of at once (§14.16.2, #1267).
+
+* A select of a package parameter (`p::C[k]`) in a continuous assignment that
+  writes another scope (a generate block's net, a child's port, a hierarchical
+  target) reads the parameter in a module that imports nothing, instead of X
+  (§26.3, §23.6, aionhw/xezim-core#246, contributed by auty1395).
+
+* Under `--relax-cross-hier-item`, `binsof()` in a cross's bin selects can
+  name a hierarchical cross item (`binsof(u.sig)`, `binsof(u.s.sig)`);
+  `cp.bin` keeps its standard meaning when `cp` is a cross item (§19.6.1,
+  aionhw/xezim-core#243, contributed by auty1395).
+
+* Each member of an element of a multi-dimensional unpacked array of unpacked
+  structures has a signal of its own, so a continuous assignment or
+  `always_comb` reading `a[0][0].v` wakes when it changes, and such arrays are
+  copied, compared and passed by value member by member, in modules, generate
+  blocks, instances and interfaces (§7.4.2, §7.2, §10.3.2, §13.5.1, #1240,
+  reported by ds54e).
+
+* A clocking input bound to an expression (`input sum = a + 1;`, `input i =
+  {op, ra, rb[3:1]};`) samples the expression over its operands' samples, at
+  every input skew and at the expression's width, instead of X or a same-named
+  variable (§14.5, §14.13, #1241, reported by ds54e).
+
+* An element of an array of covergroups, `cg[i] = new(args)` (a class
+  property, a local or a handle's member), is constructed as the covergroup.
+  It was taken for a call of the enclosing class's constructor: a constructor
+  recursed until the stack overflowed, a method re-ran the constructor and
+  left the element null. Building an instance of a covergroup type declared
+  outside a class no longer drops the object's other instances of that type,
+  and the constructor's actuals bind by name (§19.3, §19.4, §8.7, §13.5.4,
+  #1251, reported by git-hevangel).
+
+* A local, formal or class property typed by a virtual-interface typedef
+  reached through a class scope (`cfg_t::vif_t v = cfg.get_vif(i);`,
+  `pkg::C::vif_t`, a base class's typedef) is a virtual interface: its
+  initializer binds the instance and it starts null. It was evaluated as a
+  plain value and a call through it ran nothing. A compiled class method no
+  longer starts a virtual-interface local at x (§6.18, §8.23, §25.9, #1252,
+  reported by git-hevangel).
+
+* A class typedef written with named parameter assignments (`typedef drv_c
+  #(.W(W)) drv_t;`) and read through the enclosing class's specialization
+  keeps the parameter names, and an argument that is an expression of the
+  enclosing parameters (`#(W, W/4)`) is folded; `type_id::create()` and static
+  calls through the typedef used the default specialization (§8.25,
+  §23.10.2.2, #1254, reported by git-hevangel).
+
+* The input actual of an imported subroutine, of a task and of a covergroup
+  constructor is evaluated at its formal's width, in the interpreter and in
+  compiled class methods: `f(a | (b << 1))` over one-bit operands and `f(x +
+  y)` over 8-bit operands into an `int` formal lost the shifted bit and the
+  carry. A formal written with neither a type nor a direction (`input int a,
+  b`) takes the previous formal's type; an import passed it to C as an svLogic
+  (§13.5, §11.6.1, §11.8.1, §35.5.6, #1256, reported by git-hevangel).
+
+* Class-property events compare by the event object they hold: `s.tick ==
+  m.tick` and `s.tick == null` read x; after `s.tick = m.tick` they compare
+  equal (§15.5.5, #1265, contributed by auty1395).
+
+* A compiled class method, compiled module function or compiled process loop
+  that waits in an interpreted call keeps `this`, its formals, locals, loop
+  counters and held operands: the combinational logic a write in that call
+  triggers (an `always_comb` the two-state plan declines, a continuous
+  assignment a `release` re-drives) is evaluated on a register file of its
+  own. Before, a loop bounded by a member ran zero times after the call,
+  locals read stray values, and some designs looped forever (§4.5, §9.2.2.2,
+  §13.4, §8.11, #1250, reported by git-hevangel).
+
+* A static method called from a compiled method through a typedef of a class,
+  a class-scoped typedef or a class type parameter (`typedef db#(T) cfg_t;
+  cfg_t::get(x)`, `uvm_config_object::get`) writes its `output`, `inout` and
+  `ref` actuals back; the caller's variable kept its old value (§6.18, §8.23,
+  §8.25.1, §13.5.2, #1255, reported by git-hevangel).
+
+* A whole-collection read or write of a class member that is a queue, dynamic,
+  fixed-size or associative array of `string` works in a compiled method (`q =
+  {q, other}`, `q = other`, `obj.q = {obj.q, "x"}`); the member kept its old
+  value, so riscv-dv's generated program had no `main:` section (§6.16, §7.10,
+  §10.10, #1269, reported by auty1395).
+
+* A compiled method's call that passes an actual for an unpacked-array formal
+  of a method, static method, task, free function or constructor binds the
+  whole collection: `show({"nop"})` against `string s[$]` bound three one-byte
+  strings and a returned queue arrived empty (§7.10, §10.10, §13.5.1, #1257,
+  reported by auty1395; #1258, contributed by auty1395).
+
+* A static associative array, queue or dynamic array reached through an object
+  handle, `this`, `super` or an inherited static handle (`h.aa`,
+  `sc.shared.seen.last(k)`) or as `Cls::aa` names the class's one store:
+  element writes, traversal methods, by-value, `ref`, `inout` and `output`
+  actuals, patterns and concatenations through a handle reached nothing, and a
+  compiled method read `this.fa[i]` as 0 (§8.9, §8.15, §8.23, §7.8, §13.5.1,
+  #1253, reported by git-hevangel).
+
+* A conditioned timing check is enabled when its `==` or `!=` condition reads
+  x or z and disabled when a `!==` condition does, and a multi-bit condition
+  is taken through its LSB; these were inverted (§31.7, #1246, reported by
+  Ganesh-TNL).
+
+* The sizes of dynamic arrays are solved jointly with the `rand` sub-object
+  fields they depend on, a negative or oversized exact `.size()` target is
+  rejected at once, and a randomize budget that runs out names the failed
+  `.size()` constraint (§18.4, §18.5.8.1, §18.5.9, #1259, contributed by
+  shabbarvejlani).
+
+* `rand_mode` and `constraint_mode` of a member named through a sub-object
+  handle (`p.h.len.rand_mode(0)`) apply to that sub-object, so its
+  `randomize()` and that of the enclosing object hold the member; the mode was
+  recorded on the enclosing object and never applied (§18.8, §18.9, #1259).
 
 ### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
 
