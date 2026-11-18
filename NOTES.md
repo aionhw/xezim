@@ -65,15 +65,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   evaluations and 84.7 M instructions (§10.3.2, §13.4, #1126, reported by
   ds54e).
 
-* Compilation-unit variables and nets are copied only into the module,
-  interface and program definitions that name them, directly, through a unit
-  subroutine they call or through a unit class, instead of into every
-  definition and every instance. A synthetic design with 4,000 module
+* Compilation-unit variables and nets are no longer copied into every
+  module, interface and program definition and every instance. A synthetic design with 4,000 module
   definitions, 200 unit declarations and four instances peaks at 107 MiB
   instead of 1,500 MiB, and 4,096 instances beside 64 unused unit nets at
-  161 MiB instead of 1,734 MiB. A hierarchical name such as `inst.v` no
-  longer finds a unit variable in an instance whose module does not name it,
-  as the LRM and the reference simulator agree (§3.12.1, §6.7, §23.6, #721,
+  161 MiB instead of 1,734 MiB. A hierarchical name such as `inst.v` does
+  not find a unit variable in an instance, whether or not the instance's
+  module names it, as the LRM and the reference simulator agree (§3.12.1, §6.7, §23.6, #721,
   reported by amal-khailtash).
 
 * Instances whose parameter values prepare the same module body (a generate
@@ -83,6 +81,100 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   each peak at 290 MiB instead of 1,252 MiB, with 32 continuous assignments
   at 261 MiB instead of 1,751 MiB; instances with equal parameters drop from
   322 to 273 MiB (§23.10, §27, §6.7, #721, reported by amal-khailtash).
+
+* A process parked on an event control is examined when a signal named in
+  its event expression is written, not at every scheduling pass. Waiters on
+  whole signals (level and edge terms, `or`-lists, `iff` guards, named
+  events, ports, hierarchical and virtual-interface names) and on plain
+  expressions of signals (`@(v[3])`, a port connected to a select) are
+  followed this way; clocking events, array cells picked by a variable index,
+  memory cells and terms with a function call are examined at every pass as
+  before. The order in which one event wakes its waiters is unchanged. 8,192
+  cells with `always @(za or zb)` around a task that suspends on `#0`, idle
+  beside a free-running clock, took 656.8 million parked-waiter examinations
+  for 20,000 cycles and now take 1.39 million; with the two changes below
+  the run drops from 448.7 G to 18.8 G instructions. 1,024 cells armed
+  through `.za(wl[i])` take 6.87 G instead of 33.9 G for 5,000 cycles.
+  `XEZIM_WAITER_INDEX=0` restores the examination of every waiter (§9.4.2,
+  #1194, reported by Ganesh-TNL).
+
+* Setting up a design no longer searches every instance scope for each
+  continuous assignment or port connection that names an unpacked array
+  element whose array shares its name with a signal of the instances: the
+  search places implicit nets, and is skipped when it has none to place.
+  8,192 instances with a port connected to `zq[i]` are set up in under
+  0.1 seconds instead of 8.8 (§6.10, §23.3.3, #1194, reported by
+  Ganesh-TNL).
+
+* Asking whether a process is parked on `#0` no longer scans the queue of
+  processes parked there, which made a burst of wake-ups quadratic: 8,192
+  processes woken by one event and each suspending on `#0` cost 33 million
+  comparisons per event (§4.4.2.3, #1194, reported by Ganesh-TNL).
+
+* `pop_front`, `push_front`, `insert` and `delete(i)` on a queue no longer take time
+  proportional to the queue's length: the elements of a queue or dynamic array are kept
+  as one run and move as a block, instead of one at a time through a by-name read and
+  write. A loop of 30,000 `pop_front` calls on a queue that grows to 30,000 elements runs
+  in 0.31 s instead of 396 s (2.3 G instead of 3,127 G instructions), with the
+  same cost for every 5,000-pop interval instead of 9.5 s rising to 129 s; module,
+  package, class-property, static, task-local, `ref`-argument and instance-array queues
+  all gain. Queues of unpacked structs, of fixed arrays and of queues keep the
+  element-by-element move. `XEZIM_PROFILE_TIMING=1` prints `[PROF] queue_elem_moves=`, the
+  number of elements still moved one at a time (§7.10.2, #1211, reported by Ganesh-TNL).
+
+* An interpreted store to one element, part-select or bit of a wide packed vector edits
+  the stored vector in place instead of reading the whole vector out, copying it,
+  comparing it and storing it back: module variables, class properties and task or
+  function locals. A loop gathering queued beats into a 1-Mibit
+  packed buffer (`frame_buf[i] = beat_q.pop_front();`) costs 188 µs per 32-element
+  execution instead of 1,908 µs, and the reported test case runs in about 18 s instead of
+  86 s (107.8 G instead of 322.7 G instructions). The loop itself is still
+  interpreted, and a read of one element of a wide vector still copies it.
+  `[PROF] select_store_copies=` counts the stores that copied a whole vector
+  (§7.4.1, §11.5.1, #1210, reported by Ganesh-TNL).
+
+* The second-pass lint folds a child module's constants against one table of
+  package and class constants shared by all instances, instead of copying
+  every `pkg::N` into a table per instance. A design with 16,000 package
+  constants and 4,000 instances compiles in 3.0 s and 139 MB
+  instead of 74.9 s and 8.97 GB (§26.3, #721, reported by amal-khailtash).
+
+* A constant function call reads the module parameter table in place while it
+  sizes its formals, locals and return value; each call used to copy the
+  whole table, so N instances that each call one function cost N x N. With
+  6,000 such instances the inlining phase takes 0.42 s instead of 48.6 s
+  (§13.4.3, #721, reported by amal-khailtash).
+
+* The expression connected to an input port is held once per instance for the
+  instance's deferred bodies and its time-0 port record, not copied into
+  each. The 64-instance, 128-port concatenation fixture of the report peaks at
+  1,113 MB instead of 1,629 MB; the connection assignment keeps its own
+  copy (§23.3.3, #721, reported by amal-khailtash).
+
+* The signals of one declaration share one copy of its declared type across
+  the instances of the module, instead of a copy of the type tree per signal.
+  Ranges written with parameters still resolve per instance, and a type that
+  names a typedef of the instance stays per instance. 4,096 signals of a
+  128-member packed struct peak at 114 MB instead of 548 MB; 131,072
+  4,096-bit signals at 243 MB instead of 329 MB (§6.8, #721,
+  reported by amal-khailtash).
+
+* A compilation-unit DPI import is copied only into the definitions that name
+  it, directly or through a compilation-unit subroutine they call, and a
+  compilation-unit constant read by its bare name only into the definitions
+  that read it; a constant reached through a hierarchical name, a type, a
+  class or a bind directive is still visible in every definition. With 200
+  unused imports and 2,000 definitions the compile peaks at 117 MiB instead
+  of 1,259 MiB; with 200 constants each read by ten of the definitions, at
+  129 MiB instead of 1,742 MiB and 1.0 s instead of 6.9 s. Instances no
+  longer list compilation-unit constants their module does not read
+  (§3.12.1, §23.9, §35.5.4, #721, reported by amal-khailtash).
+
+* On a synthetic five-level design of 26,200 instances and 377,915 signals
+  these changes together bring the peak RSS of `--compile` from 1,746 to
+  1,208 MiB, the memory held after instance expansion from 833 to 703 MiB
+  and the compile from 136.06 G to 53.51 G instructions, with the same artifact
+  and simulation output (#721).
 
 **Command line**
 
@@ -461,6 +553,27 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   array is a class property (`h.m_amb[1]`) or an input port of a child
   module, as it is for a module variable (§7.4.1, #1107, reported by
   Ganesh-TNL).
+
+* A compilation-unit variable or net is one object for the whole compilation
+  unit. Every module instance that named it had a private copy, so a write
+  from one module, or through a unit function, task or class, was not seen by
+  another module, `always @(unit_var)` in another module never woke, and a
+  unit net driven from two modules was two nets. The hierarchy root now
+  declares the unit's storage once (the top module; with several top modules
+  the scope above them) and every module, interface, program, generate block,
+  library module, unit subroutine and unit class names that storage. A
+  module's own declaration of the name still shadows it, there and in the
+  top module, and `$unit::name` names the unit's object from any scope,
+  including from a unit subroutine or a unit class method called in a module
+  that shadows the name. `$dumpvars` shows a unit variable once, in the top
+  module's scope, and no longer in each instance. 8,000 instances reading
+  four unit declarations elaborate 24,006 signals instead of 56,006 and peak
+  at 124 MiB instead of 171 MiB (§3.12.1, #721, reported by amal-khailtash).
+
+* The compiled artifact of a design is the same on every run. A struct
+  typedef with several members whose ranges read parameters made the names
+  kept for the port-width diagnostic come out in a different order each time
+  (§7.2, #721).
 
 ### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
 
