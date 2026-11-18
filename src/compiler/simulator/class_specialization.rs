@@ -1234,9 +1234,17 @@ impl Simulator {
                         .iter()
                         .filter(|(p, _)| !cd.virtual_iface_properties.contains_key(p.as_str()))
                         .filter_map(|(p, dt)| {
-                            if !matches!(dt, DataType::TypeReference { .. }) {
+                            let DataType::TypeReference { name, .. } = dt else {
                                 return None;
-                            }
+                            };
+                            // §8.23: through a class scope (`cfg_t::vif_t pv;`)
+                            // the typedef is the scope's class's, not a
+                            // same-named bare one.
+                            let dt = if name.scopes.is_empty() {
+                                dt
+                            } else {
+                                self.class_scope_typedef_target(name).unwrap_or(dt)
+                            };
                             match Self::resolve_type_ref(dt, &self.module.typedef_types) {
                                 DataType::Interface { name, modport, .. } => {
                                     Some((p.clone(), (name.name.clone(), modport.map(|m| m.name))))

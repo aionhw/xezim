@@ -4318,6 +4318,97 @@ impl Simulator {
         }
     }
 
+    /// §6.18, §8.23, A.2.2.1 `[ class_scope ] type_identifier`: the target of
+    /// a virtual-interface typedef reached through a class scope —
+    /// `C::vif_t`, `C#(8)::vif_t`, `cfg_t::vif_t` (a typedef of a
+    /// specialization), `pkg::C::vif_t`, or a base class's typedef through a
+    /// derived class. Elaboration keys a class typedef `<class>::<leaf>` and
+    /// the bare leaf only when one class declares it, so the scope as written
+    /// reached nothing and the declaration was not a virtual interface. None
+    /// for a leaf no class declares as a virtual-interface typedef.
+    pub(super) fn class_scope_vif_typedef(
+        &self,
+        name: &crate::ast::types::TypeName,
+    ) -> Option<&DataType> {
+        if name.scopes.is_empty()
+            || !self
+                .class_member_names()
+                .vif_typedef_leaves
+                .contains(name.name.name.as_str())
+        {
+            return None;
+        }
+        self.class_scope_typedef_target(name)
+    }
+
+    /// The class a scope names and that class's typedef `name.name`, walking
+    /// its bases. Not gated: `class_scope_vif_typedef` is the cheap entry.
+    pub(super) fn class_scope_typedef_target(
+        &self,
+        name: &crate::ast::types::TypeName,
+    ) -> Option<&DataType> {
+        let leaf = name.name.name.as_str();
+        if let Some(dt) = self.module.typedef_types.get(&name.qualified()) {
+            return Some(dt);
+        }
+        let n = name.scopes.len();
+        let link = &name.scopes.last()?.name.name;
+        let class = (n >= 2)
+            .then(|| format!("{}::{}", name.scopes[n - 2].name.name, link))
+            .and_then(|q| self.resolve_class_scope_prefix(&q))
+            .or_else(|| self.resolve_class_scope_prefix(link))
+            .map(|(c, _)| c)?;
+        let mut cur = Some(class);
+        for _ in 0..64 {
+            let c = cur?;
+            let base = c.split('#').next().unwrap_or(&c);
+            let cd = self.module.classes.get(base)?;
+            let qualified = format!("{base}::{leaf}");
+            if let Some(dt) = cd
+                .typedef_targets
+                .get(leaf)
+                .or_else(|| cd.typedef_targets.get(&qualified))
+                .or_else(|| self.module.typedef_types.get(&qualified))
+            {
+                return Some(dt);
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// `resolve_typedef_chain`, following a class-scoped virtual-interface
+    /// typedef through the class its scope names first (see
+    /// `class_scope_vif_typedef`): the qualified key alone missed it, and
+    /// the bare leaf may be another scope's typedef.
+    pub(super) fn typedef_chain_scoped<'a>(&'a self, dt: &'a DataType) -> &'a DataType {
+        let mut cur = dt;
+        for _ in 0..64 {
+            let DataType::TypeReference { name, .. } = cur else {
+                break;
+            };
+            let next = self
+                .class_scope_vif_typedef(name)
+                .or_else(|| super::elaborate::lookup_scoped_type(name, &self.module.typedef_types));
+            match next {
+                Some(n) if !std::ptr::eq(n, cur) => cur = n,
+                _ => break,
+            }
+        }
+        cur
+    }
+
+    /// `dt_is_virtual_iface`, also through a class scope.
+    pub(super) fn decl_is_virtual_iface(&self, dt: &DataType) -> bool {
+        match self.typedef_chain_scoped(dt) {
+            DataType::Interface { .. } => true,
+            DataType::TypeReference { name, .. } => {
+                self.module.interfaces.contains(&name.name.name)
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn dt_is_virtual_iface(dt: &DataType, module: &ElaboratedModule) -> bool {
         match super::elaborate::resolve_typedef_chain(dt, &module.typedef_types) {
             DataType::Interface { .. } => true,
@@ -4334,7 +4425,8 @@ impl Simulator {
         use crate::ast::types::DataType;
         // §6.18 / §25.9: package variables retain their declared typedef;
         // its resolved interface type carries the binding semantics too.
-        match super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types) {
+        // §8.23: so does a class-scoped one (`cfg_t::vif_t`).
+        match self.typedef_chain_scoped(dt) {
             DataType::Interface { .. } => true,
             DataType::TypeReference { name, .. } => {
                 let n = &name.name.name;

@@ -4044,6 +4044,8 @@ struct ClassMemberNames {
     /// Typedef names (module or class scope) whose target is a class-scoped
     /// type (`typedef R::elem_t et_t;`).
     scoped_typedefs: HashSet<String>,
+    /// Class typedef names whose target is a virtual interface (§25.9).
+    vif_typedef_leaves: HashSet<String>,
     /// Names that may prefix a class-scope reference without being a
     /// class: class parameters and typedef names.
     scope_prefixes: HashSet<String>,

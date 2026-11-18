@@ -355,6 +355,24 @@ impl Simulator {
                         .map(|(n, _)| n.clone()),
                 );
             }
+            // Class typedefs of a virtual interface (`typedef virtual bus_if
+            // vif_t;`), by leaf: the names `class_scope_typedef_target`
+            // looks up through a class scope. A leaf several classes declare
+            // is keyed `<class>::<leaf>`.
+            let mut vif_typedef_leaves: HashSet<String> = HashSet::default();
+            for cd in self.module.classes.values() {
+                vif_typedef_leaves.extend(
+                    cd.typedef_targets
+                        .iter()
+                        .filter(|(_, dt)| {
+                            matches!(
+                                Self::resolve_type_ref_borrowed(dt, &self.module.typedef_types),
+                                DataType::Interface { .. }
+                            )
+                        })
+                        .map(|(n, _)| n.rsplit("::").next().unwrap_or(n).to_string()),
+                );
+            }
             // Names that can prefix `name::member` without being a class
             // key: class parameters and typedef names (module or class
             // scope) — see `class_scope_member_value`.
@@ -399,6 +417,7 @@ impl Simulator {
                 subroutine_suffixes,
                 alias_typedefs,
                 scoped_typedefs,
+                vif_typedef_leaves,
                 scope_prefixes,
                 param_first,
                 params,
@@ -567,12 +586,19 @@ impl Simulator {
 
     /// `dt` followed through bare typedef names in `typedef_types`, by
     /// reference (no resolved-type clone). Stops at the first non-alias.
+    /// A class-scoped virtual-interface typedef (`cfg_t::vif_t`, §8.23) is
+    /// followed too, so its local's initializer binds the interface.
     pub(super) fn typedef_chain_end<'a>(&'a self, dt: &'a DataType) -> &'a DataType {
         let mut cur = dt;
         for _ in 0..16 {
             match cur {
-                DataType::TypeReference { name, .. } if name.scopes.is_empty() => {
-                    match self.module.typedef_types.get(&name.name.name) {
+                DataType::TypeReference { name, .. } => {
+                    let next = if name.scopes.is_empty() {
+                        self.module.typedef_types.get(&name.name.name)
+                    } else {
+                        self.class_scope_vif_typedef(name)
+                    };
+                    match next {
                         Some(next) if !std::ptr::eq(next, cur) => cur = next,
                         _ => break,
                     }
