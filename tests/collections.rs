@@ -389,3 +389,5 @@ mod queue_front_shift;
 mod stream_with_range_1197;
 #[path = "collections/stream_with_range_unpack.rs"]
 mod stream_with_range_unpack;
+#[path = "collections/pattern_self_read.rs"]
+mod pattern_self_read;
