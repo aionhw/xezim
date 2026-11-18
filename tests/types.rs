@@ -791,3 +791,5 @@ mod nettype_driver_delays_1204;
 mod inside_compiled_forms;
 #[path = "types/nettype_declaration_initializer_drivers.rs"]
 mod nettype_declaration_initializer_drivers;
+#[path = "types/unsized_decimal_width_1120.rs"]
+mod unsized_decimal_width_1120;
