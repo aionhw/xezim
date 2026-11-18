@@ -2748,9 +2748,15 @@ impl Simulator {
                 }
                 _ => {
                     let mut val = if arg_supplied(i) {
+                        // §13.5, §11.6.1: as a function's (`exec_function_call`),
+                        // a task's input actual is context-determined by its
+                        // formal; `t(x + y)` over 8-bit operands lost the carry.
                         let value = match self.formal_pattern_value(port, &args[i]) {
                             Some(v) => v,
-                            None => self.eval_expr(&args[i]),
+                            None => match self.actual_context_width(port) {
+                                Some(w) => self.eval_expr_ctx(&args[i], w),
+                                None => self.eval_expr(&args[i]),
+                            },
                         };
                         self.vif_argument_value(port, &args[i], value)
                     } else if let Some(def) = &port.default {
