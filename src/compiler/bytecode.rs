@@ -7900,10 +7900,6 @@ impl<'a> BytecodeCompiler<'a> {
     /// True when `fd`'s body reads only its formals, its own declared locals
     /// and compile-time constants — i.e. its result depends on nothing but the
     /// arguments. Conservative: any construct not understood here says "no".
-    fn fn_is_pure(&self, fd: &FunctionDeclaration) -> bool {
-        self.fn_is_pure_in(fd, None)
-    }
-
     /// `prefix` is the instance scope the function was registered under
     /// (`u0` for a key `u0.onehot`). Elaboration rewrites an instantiated
     /// module's function body to instance-qualified names, so its OWN
@@ -8044,13 +8040,14 @@ impl<'a> BytecodeCompiler<'a> {
                     let head_bound = n
                         .split_once('.')
                         .is_some_and(|(head, _)| bound.contains(head));
-                    if n.contains('.') && !bound.contains(n) && !head_bound && !ext {
+                    // §6.20: a parameter is a constant, not module state, in
+                    // either spelling; an instance's function body names its
+                    // module's `localparam` instance-qualified (`u0.W`).
+                    let param = me.params.is_some_and(|p| p.contains_key(n));
+                    if n.contains('.') && !bound.contains(n) && !head_bound && !ext && !param {
                         return false;
                     }
-                    let known = ext
-                        || head_bound
-                        || bound.contains(n)
-                        || me.params.is_some_and(|p| p.contains_key(n));
+                    let known = ext || head_bound || bound.contains(n) || param;
                     known
                         && h.path[0]
                             .selects
@@ -8120,9 +8117,12 @@ impl<'a> BytecodeCompiler<'a> {
                         return false;
                     }
                     let name = BytecodeCompiler::hier_raw_name(h);
-                    if let Some(fd2) = me.functions.and_then(|f| {
-                        f.get(&name)
-                            .or_else(|| name.rsplit('.').next().and_then(|leaf| f.get(leaf)))
+                    if let Some((key, fd2)) = me.functions.and_then(|f| {
+                        f.get_key_value(&name).or_else(|| {
+                            name.rsplit('.')
+                                .next()
+                                .and_then(|leaf| f.get_key_value(leaf))
+                        })
                     }) {
                         // Input-only callees here (an output arg would write a
                         // caller name this walker cannot track). A callee that
@@ -8161,7 +8161,8 @@ impl<'a> BytecodeCompiler<'a> {
                             // Delegation (CallFreeFunction) exists in method
                             // mode only; module code keeps inlining pure
                             // callees alone.
-                            && ((me.method_mode && scalar_ports && arity_le) || me.fn_is_pure(fd2));
+                            && ((me.method_mode && scalar_ports && arity_le)
+                                || me.fn_is_pure_in(fd2, pfx2));
                     }
                     // Not a declared function — a DPI IMPORT is still a
                     // legitimate callee: the interpreter executes it through
@@ -8298,6 +8299,12 @@ impl<'a> BytecodeCompiler<'a> {
                     // A block's declarations are visible to the statements that
                     // FOLLOW them, so thread one scope through the sequence.
                     let mut inner = bound.clone();
+                        // The callee is judged in the scope it was registered
+                        // under, as a direct call judges it: an instance's
+                        // function body names its own result and its
+                        // module's parameters instance-qualified (`u0.f`,
+                        // `u0.W`), which the bare walk took for module state.
+                        let pfx2 = key.rsplit_once('.').map(|(p, _)| p);
                     stmts.iter().all(|s| stmt_ok(s, &mut inner, me, ext))
                 }
                 StatementKind::If {
