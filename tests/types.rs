@@ -779,3 +779,5 @@ mod real_relational_unknown_bits;
 mod struct_param_localparam_type;
 #[path = "types/wide_packed_select_store.rs"]
 mod wide_packed_select_store;
+#[path = "types/nd_struct_array_members_1240.rs"]
+mod nd_struct_array_members_1240;
