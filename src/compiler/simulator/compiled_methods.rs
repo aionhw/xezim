@@ -1014,7 +1014,21 @@ impl Simulator {
                 break;
             }
             for p in cd.string_properties.iter() {
-                if !cd.static_properties.contains(p) && !self.shadowed_prop_names.contains(p) {
+                // §6.16, §7: `string_properties` lists every property declared
+                // `string`, collections of strings too (`string q[$]`); only a
+                // scalar is a string member. A collection of strings
+                // (`class_string_coll_member_names`) is read and written
+                // element-wise, never as one packed value.
+                let unpacked = cd.queue_properties.contains_key(p)
+                    || cd.assoc_properties.contains_key(p)
+                    || cd.array_properties.contains_key(p)
+                    || cd.array_nd_properties.contains_key(p)
+                    || cd.array_of_coll_properties.contains_key(p)
+                    || cd.prop_coll_shapes.contains_key(p);
+                if !unpacked
+                    && !cd.static_properties.contains(p)
+                    && !self.shadowed_prop_names.contains(p)
+                {
                     out.insert(p.clone());
                 }
             }
