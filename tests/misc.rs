@@ -664,3 +664,6 @@ mod replication_signedness_1095;
 mod localparam_self_determined_1143;
 #[path = "misc/comb_timescale.rs"]
 mod comb_timescale;
+
+#[path = "misc/declaration_order_snapshots.rs"]
+mod declaration_order_snapshots;
