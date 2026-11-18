@@ -241,6 +241,49 @@ endmodule
     assert_eq!(u(&sim, "int_eq"), 1, "ordinary integral == is unaffected");
 }
 
+/// §15.5.5: after `h1.ce = h2.ce` the two class properties name one event
+/// object and compare equal. A nulled property equals null and another
+/// nulled property; a live one equals neither.
+#[test]
+fn class_event_assignment_compares_by_object() {
+    let src = r#"
+module top;
+  class holder;
+    event ce;
+    function logic same(holder o); return this.ce == o.ce; endfunction
+  endclass
+  holder h1, h2, h3, h4;
+  logic distinct, merged, differ, via_this, live_null, nulled, nulls_eq, rebound, rebound_null;
+  initial begin
+    h1 = new(); h2 = new(); h3 = new(); h4 = new();
+    distinct = (h1.ce == h2.ce);
+    h1.ce = h2.ce;
+    merged = (h1.ce == h2.ce);
+    differ = (h1.ce != h2.ce);
+    via_this = h1.same(h2);
+    live_null = (h1.ce == null);
+    h3.ce = null;
+    h4.ce = null;
+    nulled = (h3.ce == null);
+    nulls_eq = (h3.ce == h4.ce);
+    h3.ce = h2.ce;
+    rebound = (h3.ce == h1.ce);
+    rebound_null = (h3.ce == null);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "distinct"), 0, "distinct objects are not equal");
+    assert_eq!(u(&sim, "merged"), 1, "the assignment shares one object");
+    assert_eq!(u(&sim, "differ"), 0, "!= agrees with ==");
+    assert_eq!(u(&sim, "via_this"), 1, "so does `this.ce` in a method");
+    assert_eq!(u(&sim, "live_null"), 0, "a live event is not null");
+    assert_eq!(u(&sim, "nulled"), 1, "a nulled event equals null");
+    assert_eq!(u(&sim, "nulls_eq"), 1, "two nulled events are equal");
+    assert_eq!(u(&sim, "rebound"), 1, "a nulled event can take an object");
+    assert_eq!(u(&sim, "rebound_null"), 0, "and is then not null");
+}
+
 /// The behaviours that already worked and must keep working: a plain event,
 /// `.triggered` scoping to one slot, `->>` deferring to the NBA region, and
 /// N triggers in one slot waking a waiter once.
