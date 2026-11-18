@@ -3053,6 +3053,13 @@ impl Simulator {
                                         .or_default()
                                         .insert(index);
                                 }
+                                if self.formal_is_unpacked_collection(class, port) {
+                                    facts
+                                        .coll_formal_positions
+                                        .entry(name.clone())
+                                        .or_default()
+                                        .insert(index);
+                                }
                             }
                         }
                     }
@@ -4990,6 +4997,24 @@ impl Simulator {
             }),
             crate::ast::Span::dummy(),
         )
+    }
+
+    /// Is `port`, a formal of a method of `class_name`, declared with unpacked
+    /// dimensions, either directly or through a typedef?
+    fn formal_is_unpacked_collection(
+        &self,
+        class_name: &str,
+        port: &crate::ast::decl::FunctionPort,
+    ) -> bool {
+        if !port.dimensions.is_empty() {
+            return true;
+        }
+        let DataType::TypeReference { name, .. } = &port.data_type else {
+            return false;
+        };
+        Self::typedef_dims_via_tables(&self.module, class_name, &name.qualified())
+            .or_else(|| Self::typedef_dims_via_tables(&self.module, class_name, &name.name.name))
+            .is_some_and(|dims| !dims.is_empty())
     }
 
     /// class-perf row 2: argument positions of `class_name::method` whose

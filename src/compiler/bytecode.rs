@@ -39,6 +39,9 @@ pub(crate) struct MethodAdmission {
     /// class's `get(output ...)` vs another's input-only `get`) from
     /// spuriously declining the other call's compile.
     pub writeback_positions: HashMap<(String, String), HashSet<usize>>,
+    /// Formal positions with unpacked dimensions, keyed by method name across
+    /// all classes.
+    pub coll_formal_positions: HashMap<String, HashSet<usize>>,
     /// Direct supervclass (extends target, spec args stripped) per declared
     /// class. `emit_arg_slot_writeback` walks this chain to gather the
     /// non-input formal positions inherited by a receiver's class.
@@ -18691,6 +18694,31 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(r);
                     }
                     self.bail("Expr_Call_random_mode");
+                    return None;
+                }
+                // A register holds one value, so `{"a", "b"}` cannot reach an
+                // unpacked collection formal as separate elements.
+                let callee = match &func.kind {
+                    ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                    ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                    _ => None,
+                };
+                if self.method_mode
+                    && let Some(positions) = callee.and_then(|m| {
+                        self.method_admission.as_ref()?.coll_formal_positions.get(m)
+                    })
+                    && positions.iter().any(|&i| {
+                        args.get(i).is_some_and(|arg| {
+                            matches!(
+                                arg.kind,
+                                ExprKind::Concatenation(_)
+                                    | ExprKind::Replication { .. }
+                                    | ExprKind::AssignmentPattern(_)
+                            )
+                        })
+                    })
+                {
+                    self.bail("method_coll_literal_actual");
                     return None;
                 }
                 // class-perf method-mode: `this.m(a,..)` / `<classhandle>.m(a,..)`
