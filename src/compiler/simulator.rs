@@ -377,7 +377,9 @@ fn method_boost_enabled() -> bool {
 // §13.5, §11.6.1: compiled import calls and calls handed to the interpreter size
 // integral input actuals by their formals; a method with a vif local declines (§25.9).
 // §6.18, §6.16, §13.5.1, §8.9: typedef write-back receivers, string-collection members, unpacked-formal actuals, static collections.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3085;
+// §5.7.1, §11.8.2, §11.4.13, §12.5.4: fill operands of real operators fold at one bit; real,
+// fill and negative-member `inside` and non-constant `case inside` items run interpreted.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3086;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1780,7 +1782,9 @@ struct CombEntryCold {
 // element are read and written by the interpreter and depend on their own signals.
 // §7.4.1, §6.20: elements of packed-array members of struct formals and nested
 // callees reading module parameters inline.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB039";
+// §12.5.4, §11.4.13: `case inside` with a wildcard, range or real item and `inside` with a
+// real operand, a fill or a negative member run on the interpreter's matcher.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB040";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
