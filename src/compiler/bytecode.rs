@@ -1580,8 +1580,14 @@ struct FormalMember {
     width: u32,
     signed: bool,
     /// Declared range (`[7:4]`) that selects on the member are labeled by;
-    /// None for a 1-bit member without one.
+    /// None for a 1-bit member without one, or one of several dimensions.
     dim: Option<(i64, i64)>,
+    /// The packed dimensions of a multi-dimensional packed-array member
+    /// (`logic [3:0][4:0] sh`), outermost first: a select on it picks an
+    /// element (`compile_formal_member_elem`), not a bit.
+    elems: Option<Box<[(i64, i64)]>>,
+    /// The struct is 2-state: an out-of-range element reads 0, not x.
+    two_state: bool,
 }
 
 /// `format!("{}.{}", scope, name)` without the formatting machinery: the
@@ -2607,14 +2613,15 @@ impl<'a> BytecodeCompiler<'a> {
         if fields.is_empty() || fields.iter().any(|&(_, off, w)| w == 0 || off + w > width) {
             return None;
         }
-        if !el::is_type_two_state_resolved(dt, types) && Self::has_two_state_member(dt, types) {
+        let two_state = el::is_type_two_state_resolved(dt, types);
+        if !two_state && Self::has_two_state_member(dt, types) {
             return None;
         }
         Some(
             fields
                 .into_iter()
                 .filter_map(|(n, off, width)| {
-                    let (signed, dim) = self.struct_member_type(dt, &n)?;
+                    let (signed, dim, elems) = self.struct_member_type(dt, &n)?;
                     Some((
                         n,
                         FormalMember {
@@ -2622,6 +2629,8 @@ impl<'a> BytecodeCompiler<'a> {
                             width,
                             signed,
                             dim,
+                            elems,
+                            two_state,
                         },
                     ))
                 })
@@ -2631,13 +2640,17 @@ impl<'a> BytecodeCompiler<'a> {
 
     /// Signedness and declared range of the member at dotted `path` (`p.hi`)
     /// of a packed struct. None when it, or a member on the way to it, has
-    /// more than one dimension or one that does not span its bits (a packed
-    /// array of wider elements): a select on it picks elements, not bits.
+    /// a dimension that does not span its bits (a packed array of wider
+    /// elements): a select on it picks elements, not bits. The exception is
+    /// a member declared directly as a multi-dimensional packed array of a
+    /// built-in vector type (`logic [3:0][4:0] sh`): its dimensions come
+    /// back as the third item, and its elements are unsigned (§7.4.1).
+    #[allow(clippy::type_complexity)]
     fn struct_member_type(
         &self,
         dt: &crate::ast::types::DataType,
         path: &str,
-    ) -> Option<(bool, Option<(i64, i64)>)> {
+    ) -> Option<(bool, Option<(i64, i64)>, Option<Box<[(i64, i64)]>>)> {
         use crate::compiler::elaborate as el;
         let (params, typedefs, types) = (self.params?, self.typedefs?, self.typedef_types?);
         let crate::ast::types::DataType::Struct(su) = el::resolve_typedef_chain(dt, types) else {
@@ -2652,10 +2665,23 @@ impl<'a> BytecodeCompiler<'a> {
             .find(|m| m.declarators.iter().any(|d| d.name.name == head))?;
         let q = el::type_query_dims_of(&m.data_type, Some(params), Some(typedefs), Some(types));
         let w = el::resolve_type_width(&m.data_type, Some(params), Some(typedefs));
-        let dim = match q.dims[..] {
-            [] => q.whole,
-            [d] => Some(d),
-            _ => return None,
+        let signed = || el::is_type_signed_resolved(&m.data_type, types);
+        let dim = match q.dims.len() {
+            0 => q.whole,
+            1 => Some(q.dims[0]),
+            _ => {
+                let direct = matches!(
+                    m.data_type,
+                    crate::ast::types::DataType::IntegerVector { ref dimensions, .. }
+                        if dimensions.len() == q.dims.len()
+                );
+                let bits = q
+                    .dims
+                    .iter()
+                    .try_fold(1u64, |a, &(l, r)| a.checked_mul(l.abs_diff(r) + 1));
+                return (rest.is_none() && direct && bits == Some(u64::from(w)))
+                    .then(|| (signed(), None, Some(q.dims.into_boxed_slice())));
+            }
         };
         match dim {
             Some((l, r)) if l.abs_diff(r) + 1 != u64::from(w) => return None,
@@ -2664,7 +2690,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
         match rest {
             Some(r) => self.struct_member_type(&m.data_type, r),
-            None => Some((el::is_type_signed_resolved(&m.data_type, types), dim)),
+            None => Some((signed(), dim, None)),
         }
     }
 
@@ -2732,6 +2758,125 @@ impl<'a> BytecodeCompiler<'a> {
             self.emit(Insn::SetSigned(dest));
         }
         Some(dest)
+    }
+
+    /// An index chain (`c.sh[i]`, `c.m3[i][j]`) on a multi-dimensional
+    /// packed-array member of a register-bound packed-struct formal: the
+    /// formal's register, the member, and the indices, outermost first.
+    fn formal_member_chain<'e>(
+        &self,
+        expr: &'e Expression,
+    ) -> Option<(RegId, &FormalMember, Vec<&'e Expression>)> {
+        let mut cur = expr;
+        let mut idx = Vec::new();
+        while let ExprKind::Index { expr: inner, index } = &cur.kind {
+            idx.push(&**index);
+            cur = inner;
+        }
+        if idx.is_empty() {
+            return None;
+        }
+        let (slot, m) = self.formal_struct_member(cur)?;
+        m.elems.as_ref()?;
+        idx.reverse();
+        Some((slot, m, idx))
+    }
+
+    /// §7.4.1, §11.5.1: an element (or a bit) of a packed-array member of a
+    /// packed-struct formal is a slice of the member, and the member a
+    /// constant slice of the formal's register. Each index selects from the
+    /// element the previous one selected, so an index outside its own
+    /// dimension (or an x/z one) reads x instead of a neighbouring element.
+    /// The elements are unsigned. `None` when `expr` is not such a chain;
+    /// `Some(None)` when it is but does not compile (the caller bails).
+    fn compile_formal_member_elem(&mut self, expr: &Expression) -> Option<Option<RegId>> {
+        let (slot, m, idx) = self.formal_member_chain(expr)?;
+        let (off, width, two_state) = (m.off, m.width, m.two_state);
+        let dims: Vec<(i64, i64)> = m.elems.as_deref()?.to_vec();
+        if idx.len() > dims.len() {
+            return Some(None);
+        }
+        let mut cur = self.alloc_reg();
+        self.emit(Insn::RangeSelectConst(cur, slot, off + width - 1, off));
+        for (j, index) in idx.iter().enumerate() {
+            let (l, r) = dims[j];
+            let size = l.abs_diff(r) + 1;
+            let ew = Self::formal_member_chain_width_of(&dims, j + 1);
+            let dest = self.alloc_reg();
+            if let Some(label) = self.fold_const(index).and_then(|v| v.to_index()) {
+                let phys = Self::label_to_phys((l, r), label);
+                if phys < 0 || phys as u64 >= size {
+                    // Out of range: x, or 0 for a 2-state struct (§7.4.6);
+                    // the interpreter decides.
+                    return Some(None);
+                }
+                let lo = phys as u32 * ew;
+                self.emit(Insn::RangeSelectConst(dest, cur, lo + ew - 1, lo));
+            } else {
+                // A wider index could alias into range in the 32-bit
+                // position arithmetic; a 2-state struct reads 0, not x,
+                // out of range. Both stay on the interpreter.
+                if two_state || self.expr_max_width(index) > 32 {
+                    return Some(None);
+                }
+                let Some(i) = self.compile_expr(index, 0) else {
+                    return Some(None);
+                };
+                // Physical element position: `label - lo` on a descending
+                // range, `hi - label` on an ascending one.
+                let pos = self.alloc_reg();
+                let k = self.alloc_reg();
+                let (lo_b, hi_b) = (l.min(r), l.max(r));
+                if l >= r {
+                    self.emit(Insn::LoadConst(
+                        k,
+                        Box::new(Value::from_u64(lo_b as u32 as u64, 32)),
+                    ));
+                    self.emit(Insn::Sub(pos, i, k));
+                } else {
+                    self.emit(Insn::LoadConst(
+                        k,
+                        Box::new(Value::from_u64(hi_b as u32 as u64, 32)),
+                    ));
+                    self.emit(Insn::Sub(pos, k, i));
+                }
+                self.emit(Insn::Resize(pos, 32));
+                let ew_reg = self.alloc_reg();
+                self.emit(Insn::LoadConst(
+                    ew_reg,
+                    Box::new(Value::from_u64(u64::from(ew), 32)),
+                ));
+                let lo = self.alloc_reg();
+                self.emit(Insn::Mul(lo, pos, ew_reg));
+                self.emit(Insn::Resize(lo, 32));
+                self.emit(Insn::RangeSelectW(dest, cur, lo, ew, true));
+            }
+            cur = dest;
+        }
+        Some(Some(cur))
+    }
+
+    /// Is `base` of a part-select a packed-array member of a struct formal,
+    /// or an element of it above its last dimension?
+    fn formal_member_elem_range(&self, base: &Expression) -> bool {
+        let mut cur = base;
+        let mut layers = 0usize;
+        while let ExprKind::Index { expr: inner, .. } = &cur.kind {
+            cur = inner;
+            layers += 1;
+        }
+        self.formal_struct_member(cur)
+            .and_then(|(_, m)| m.elems.as_deref())
+            .is_some_and(|dims| layers + 1 != dims.len())
+    }
+
+    /// The width of what a `formal_member_chain` of `depth` indices
+    /// selects: an element of the dimension it stops at, or one bit.
+    fn formal_member_chain_width_of(dims: &[(i64, i64)], depth: usize) -> u32 {
+        dims[depth.min(dims.len())..]
+            .iter()
+            .map(|&(l, r)| (l.abs_diff(r) + 1) as u32)
+            .product()
     }
 
     /// Metadata for a packed-array member of a packed struct. The elaborated
@@ -8156,6 +8301,12 @@ impl<'a> BytecodeCompiler<'a> {
                         let scalar_ports = fd2.ports.iter().all(|p| p.dimensions.is_empty());
                         let arity_le = fd2.ports.len() >= args.len();
                         let args_ok = args.iter().all(|a| expr_ok(a, bound, me, ext));
+                        // The callee is judged in the scope it was registered
+                        // under, as a direct call judges it: an instance's
+                        // function body names its own result and its
+                        // module's parameters instance-qualified (`u0.f`,
+                        // `u0.W`), which the bare walk took for module state.
+                        let pfx2 = key.rsplit_once('.').map(|(p, _)| p);
                         return input_only
                             && args_ok
                             // Delegation (CallFreeFunction) exists in method
@@ -8299,12 +8450,6 @@ impl<'a> BytecodeCompiler<'a> {
                     // A block's declarations are visible to the statements that
                     // FOLLOW them, so thread one scope through the sequence.
                     let mut inner = bound.clone();
-                        // The callee is judged in the scope it was registered
-                        // under, as a direct call judges it: an instance's
-                        // function body names its own result and its
-                        // module's parameters instance-qualified (`u0.f`,
-                        // `u0.W`), which the bare walk took for module state.
-                        let pfx2 = key.rsplit_once('.').map(|(p, _)| p);
                     stmts.iter().all(|s| stmt_ok(s, &mut inner, me, ext))
                 }
                 StatementKind::If {
@@ -12899,7 +13044,11 @@ impl<'a> BytecodeCompiler<'a> {
             layers += 1;
         }
         if let Some((_, m)) = self.formal_struct_member(cur) {
-            return if layers == 0 { m.dim } else { None };
+            return match &m.elems {
+                Some(dims) => dims.get(layers).copied(),
+                None if layers == 0 => m.dim,
+                None => None,
+            };
         }
         let ExprKind::Ident(h) = &cur.kind else {
             return None;
@@ -16911,6 +17060,14 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Paren(inner) => self.compile_expr_typed(inner, ctx_width, unsigned_context),
             ExprKind::Index { expr, index } => {
+                // A register-bound formal shadows every other reading of
+                // the name (see `compile_formal_member_elem`).
+                if let Some(r) = self.compile_formal_member_elem(whole) {
+                    if r.is_none() {
+                        self.bail("formal_member_elem");
+                    }
+                    return r;
+                }
                 // §13.4.1, §7.4.1: two or more indices into a packed-array
                 // member of a call result (`mk().f0[i][j]`) have no shape
                 // here: past the first, each was a bit select of the
@@ -17417,6 +17574,13 @@ impl<'a> BytecodeCompiler<'a> {
                 let dest = self.alloc_reg();
                 self.emit(Insn::BitSelect(dest, base, idx));
                 Some(dest)
+            }
+            // §7.4.1: a part-select of a packed-array member of a struct
+            // formal above its last dimension selects elements; only the
+            // bits of a last-dimension element are compiled.
+            ExprKind::RangeSelect { expr, .. } if self.formal_member_elem_range(expr) => {
+                self.bail("formal_member_elem_range");
+                None
             }
             ExprKind::RangeSelect {
                 expr,
@@ -22036,6 +22200,9 @@ impl<'a> BytecodeCompiler<'a> {
         if let Some((_, m)) = self.formal_struct_member(e) {
             return Some(m.signed);
         }
+        if self.formal_member_chain(e).is_some() {
+            return Some(false);
+        }
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer { signed, .. }) => Some(*signed),
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(false),
@@ -22479,6 +22646,11 @@ impl<'a> BytecodeCompiler<'a> {
     fn expr_max_width(&self, expr: &Expression) -> u32 {
         if let Some((_, m)) = self.formal_struct_member(expr) {
             return m.width;
+        }
+        if let Some((_, m, idx)) = self.formal_member_chain(expr)
+            && let Some(dims) = m.elems.as_deref()
+        {
+            return Self::formal_member_chain_width_of(dims, idx.len());
         }
         match &expr.kind {
             ExprKind::Ident(hier) => self
