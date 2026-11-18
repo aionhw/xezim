@@ -642,7 +642,17 @@ impl Simulator {
         // formal named like a design net (`uj_imm(logic [31:0] instruction_i)`
         // beside a decoder port `instruction_i`) made the calling assign
         // depend on that unrelated net — and trip the elided-port report.
-        let leaf = name.rsplit('.').next().unwrap_or(name);
+        // A scope-qualified registration such as `pkg::f` retains the
+        // declared name `f` for its implicit return variable (§13.4.1).
+        let declared_name = fdecl.name.name.name.as_str();
+        let leaf = if name
+            .strip_suffix(declared_name)
+            .is_some_and(|scope| scope.ends_with("::"))
+        {
+            declared_name
+        } else {
+            name.rsplit('.').next().unwrap_or(name)
+        };
         let mut frame: HashSet<&str> = fdecl.ports.iter().map(|p| p.name.name.as_str()).collect();
         frame.insert(leaf);
         // A top-level local's initializer may read a design variable that
