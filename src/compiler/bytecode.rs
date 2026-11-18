@@ -9269,7 +9269,10 @@ impl<'a> BytecodeCompiler<'a> {
     /// collection element) is typed as a string by `string_cmp` instead of
     /// falling to the integral X-padded compare (§6.16/§7.10).
     fn dotted_string_coll(&self, base: &Expression, member: &str) -> bool {
-        if !self.method_handle_chain_ok(base) || !self.method_instance_field_ok(base, member) {
+        // The declared class's string-collection set already leaves out
+        // statics and redeclared names; such a member is no scalar field
+        // (`instance_fields`), so that set does not admit it.
+        if !self.method_handle_chain_ok(base) {
             return false;
         }
         let class = self.method_handle_chain_class(base);
