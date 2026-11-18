@@ -1293,3 +1293,7 @@ mod method_cache_local_shadow;
 mod randomize_size_from_sub_object;
 #[path = "classes/randomize_size_from_sub_object_ipv4.rs"]
 mod randomize_size_from_sub_object_ipv4;
+#[path = "classes/randomize_size_sub_object_forms.rs"]
+mod randomize_size_sub_object_forms;
+#[path = "classes/rand_mode_sub_object_member.rs"]
+mod rand_mode_sub_object_member;
