@@ -135,6 +135,8 @@ mod vpi_mcd_and_time_queries;
 mod vpi_net_kinds;
 #[path = "strings/vpi_object_model_walk.rs"]
 mod vpi_object_model_walk;
+#[path = "strings/vpi_package_resolver_deposit.rs"]
+mod vpi_package_resolver_deposit;
 #[path = "strings/vpi_routines.rs"]
 mod vpi_routines;
 #[path = "strings/vpi_sva_sampling.rs"]
