@@ -787,3 +787,5 @@ mod wide_packed_select_store;
 mod nd_struct_array_members_1240;
 #[path = "types/nettype_driver_delays_1204.rs"]
 mod nettype_driver_delays_1204;
+#[path = "types/inside_compiled_forms.rs"]
+mod inside_compiled_forms;
