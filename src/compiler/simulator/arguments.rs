@@ -786,20 +786,24 @@ impl Simulator {
         &self,
         port: &crate::ast::decl::FunctionPort,
     ) -> Option<u32> {
-        if !Self::actual_ctx_shape(port) {
-            return None;
-        }
-        let dt = &port.data_type;
-        let fixed = matches!(dt, DataType::IntegerAtom { .. }) || Self::packed_dims_are_constant(dt);
-        fixed
+        Self::actual_ctx_fixed(port)
             .then(|| {
                 super::elaborate::resolve_type_width(
-                    dt,
+                    &port.data_type,
                     Some(&self.module.parameters),
                     Some(&self.module.typedefs),
                 )
             })
             .filter(|w| *w > 0)
+    }
+
+    /// The formals `actual_context_width` answers for: an integral input
+    /// whose width is fixed by its declaration. The compiled call lowerings
+    /// ask the same question so compiled and interpreted calls agree.
+    pub(crate) fn actual_ctx_fixed(port: &crate::ast::decl::FunctionPort) -> bool {
+        Self::actual_ctx_shape(port)
+            && (matches!(port.data_type, DataType::IntegerAtom { .. })
+                || Self::packed_dims_are_constant(&port.data_type))
     }
 
     /// Parameter-free arithmetic bounds (including macro-expanded `[64-1:0]`)

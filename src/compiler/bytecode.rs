@@ -3971,8 +3971,11 @@ impl<'a> BytecodeCompiler<'a> {
             let call_start = self.insns.len();
             let call_next = self.next_reg;
             let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
-            for a in &args {
-                match self.compile_expr(a, 0) {
+            for (i, a) in args.iter().enumerate() {
+                // §13.5, §11.6.1: an integral input actual is evaluated at
+                // its formal's width, as the interpreter's import call does.
+                let w = self.actual_ctx_width_of(&idf.ports, i, &name, true);
+                match self.compile_expr(a, w) {
                     Some(r) => arg_values.push(r),
                     None => {
                         ok = false;
@@ -8810,6 +8813,33 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         &ports[i].data_type
+    }
+
+    /// The context width of the actual of formal `i` of a call the compiled
+    /// code delegates to the interpreter (an import, an impure function):
+    /// the formal's width where the interpreter binds at it
+    /// (`Simulator::actual_ctx_fixed`; for an import also a typedef of a
+    /// fixed-width integral type, `Simulator::dpi_typedef_ctx_type`), else 0
+    /// (self-determined).
+    fn actual_ctx_width_of(
+        &self,
+        ports: &[crate::ast::decl::FunctionPort],
+        i: usize,
+        callee: &str,
+        import: bool,
+    ) -> u32 {
+        use crate::compiler::simulator::Simulator;
+        let Some(p) = ports.get(i) else {
+            return 0;
+        };
+        if Simulator::actual_ctx_fixed(p) {
+            return self.port_effective_width(ports, i, Some(callee));
+        }
+        match self.typedef_types {
+            Some(tt) if import => Simulator::dpi_typedef_ctx_type(p, tt)
+                .map_or(0, |dt| self.decl_width_in(&dt, Some(callee))),
+            _ => 0,
+        }
     }
 
     fn port_effective_width(
