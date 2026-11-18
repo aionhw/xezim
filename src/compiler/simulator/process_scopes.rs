@@ -616,6 +616,7 @@ impl Simulator {
                                     )
                                         && super::bytecode::BytecodeCompiler::static_local_carries(
                                             &d.name.name,
+                                            Some(&*data_type),
                                             rest,
                                         )))
                         })
