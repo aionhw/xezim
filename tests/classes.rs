@@ -1299,3 +1299,5 @@ mod randomize_size_from_sub_object_ipv4;
 mod randomize_size_sub_object_forms;
 #[path = "classes/rand_mode_sub_object_member.rs"]
 mod rand_mode_sub_object_member;
+#[path = "classes/named_param_typedef_spec.rs"]
+mod named_param_typedef_spec;
