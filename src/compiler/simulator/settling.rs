@@ -5,6 +5,26 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// Install a register file of the evaluation's own for the bytecode of
+    /// the combinational logic a settle evaluates, and return the caller's.
+    /// A compiled method or process loop that waits in an interpreted call
+    /// keeps `this`, its formals, locals and held operands in `vm_regs`; the
+    /// logic a write in that call triggers is a separate evaluation (§4.5,
+    /// §9.2.2.2, §10.3) and must not change what the subroutine owns (§13.4,
+    /// §13.5, §8.11). A pointer swap and a pool pop in steady state.
+    #[inline]
+    pub(super) fn enter_private_regs(&mut self) -> Vec<Value> {
+        let own = self.vm_regs_pool.pop().unwrap_or_default();
+        std::mem::replace(&mut self.vm_regs, own)
+    }
+
+    /// Put the caller's register file back (see `enter_private_regs`).
+    #[inline]
+    pub(super) fn leave_private_regs(&mut self, caller: Vec<Value>) {
+        let own = std::mem::replace(&mut self.vm_regs, caller);
+        self.vm_regs_pool.push(own);
+    }
+
     pub(super) fn settle_combinatorial(&mut self) {
         if self.finished {
             return;
@@ -235,6 +255,7 @@ impl Simulator {
         let mut next_seed = std::mem::take(&mut self.bsp_next_seed);
         next_seed.clear();
         let mut view = std::mem::take(&mut self.signal_table);
+        let caller_regs = self.enter_private_regs();
         let mut vm_regs = std::mem::take(&mut self.vm_regs);
         let mut dirtied: Vec<u32> = Vec::new();
         let mut par_scratch: Vec<usize> = Vec::new();
@@ -532,6 +553,7 @@ impl Simulator {
 
         self.signal_table = view;
         self.vm_regs = vm_regs;
+        self.leave_private_regs(caller_regs);
         // Restore reusable buffers (retain capacity for the next call).
         seed_list.clear();
         self.settle_triggered_list = seed_list;
@@ -842,6 +864,10 @@ impl Simulator {
             }
             CombItem::CompiledContAssign { compiled, .. }
             | CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                // Inside a settle the file is already the settle's own; a
+                // `release`, a force refresh or a time-0 replay outside one
+                // can run while a compiled caller waits (§13.4).
+                let caller_regs = (!self.settling).then(|| self.enter_private_regs());
                 if self.vm_regs.len() < compiled.num_regs as usize {
                     self.vm_regs
                         .resize(compiled.num_regs as usize, Value::zero(1));
@@ -864,6 +890,9 @@ impl Simulator {
                 self.exec_insns(insns);
                 if let Some(saved_ts) = saved_ts {
                     self.timescale_scope_override = saved_ts;
+                }
+                if let Some(caller_regs) = caller_regs {
+                    self.leave_private_regs(caller_regs);
                 }
             }
             CombItem::FusedGate { op } => {
@@ -1628,6 +1657,7 @@ impl Simulator {
             self.settling = false;
             return;
         }
+        let caller_regs = self.enter_private_regs();
 
         // Chaotic-iteration loop: drain a sorted worklist of triggered
         // entries each pass. New triggers added during a pass (via worklist
@@ -2942,6 +2972,7 @@ impl Simulator {
         if total_iters > self.max_settle_iters {
             self.max_settle_iters = total_iters;
         }
+        self.leave_private_regs(caller_regs);
         self.settling = false;
     }
 

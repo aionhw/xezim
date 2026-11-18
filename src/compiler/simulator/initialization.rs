@@ -4501,6 +4501,7 @@ impl Simulator {
             edge_block_insn_len: Vec::new(),
             vm_regs: Vec::new(),
             foreach_arena: Vec::new(),
+            vm_regs_pool: Vec::new(),
             clock_generators: Vec::new(),
             clock_gen_src: Vec::new(),
             t0_timing_free: HashSet::default(),

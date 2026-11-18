@@ -9471,6 +9471,14 @@ pub struct Simulator {
     /// The cursor is a `u32` (never `usize::MAX`-sentinel — the executor
     /// compares against `keys.len()`).
     foreach_arena: Vec<(Vec<Value>, u32)>,
+    /// Spare register files for the combinational and continuous-assignment
+    /// bytecode a settle evaluates (`enter_private_regs`). A compiled method
+    /// or process loop waiting in an interpreted call keeps its live
+    /// registers in `vm_regs`; a settle that call starts runs on a file of
+    /// its own (§13.4, §8.11). A stack, so evaluations may nest; the files
+    /// hold stale scratch only.
+    #[serde(skip)]
+    vm_regs_pool: Vec<Vec<Value>>,
     /// Built-in clock generators (optimized always #N clk = ~clk)
     clock_generators: Vec<ClockGen>,
     /// Source position of every clock generator, for its time-0 rank:

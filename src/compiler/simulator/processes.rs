@@ -929,6 +929,8 @@ impl Simulator {
             match &entry.item {
                 CombItem::AlwaysBlock { .. } => self.eval_ast_comb_entry(&entry),
                 CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                    // §13.4: see `enter_private_regs`.
+                    let caller_regs = (!self.settling).then(|| self.enter_private_regs());
                     if self.vm_regs.len() < compiled.num_regs as usize {
                         self.vm_regs
                             .resize(compiled.num_regs as usize, Value::zero(1));
@@ -954,6 +956,9 @@ impl Simulator {
                         *self.name_resolve_hint.borrow_mut() = prev;
                     }
                     self.timescale_scope_override = saved_ts;
+                    if let Some(caller_regs) = caller_regs {
+                        self.leave_private_regs(caller_regs);
+                    }
                 }
                 _ => {}
             }
