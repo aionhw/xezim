@@ -1142,6 +1142,8 @@ mod class_param_local_width_681;
 mod class_param_sized_method_widths;
 #[path = "classes/class_param_formal_width_per_spec.rs"]
 mod class_param_formal_width_per_spec;
+#[path = "classes/class_param_typedef_chain.rs"]
+mod class_param_typedef_chain;
 #[path = "classes/randc_wide_699.rs"]
 mod randc_wide_699;
 
