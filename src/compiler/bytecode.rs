@@ -23,6 +23,30 @@ use xezim_core::hasher::{HashMap, HashSet};
 /// leaves are not all plain signals (array or union members).
 pub type UnpackedStructLeaves = HashMap<usize, Vec<(String, String)>>;
 
+/// §13.4.2/§23.10: function-table suffixes shared by compilers using
+/// the same declarations, preserving admission of external state reads.
+pub(crate) struct FunctionScopeIndex<'a> {
+    functions: &'a HashMap<String, FunctionDeclaration>,
+    qualified_leaves: HashSet<&'a str>,
+}
+
+impl<'a> FunctionScopeIndex<'a> {
+    pub(crate) fn new(functions: &'a HashMap<String, FunctionDeclaration>) -> Self {
+        let qualified_leaves = functions
+            .keys()
+            .filter_map(|name| name.rsplit_once('.').map(|(_, leaf)| leaf))
+            .collect();
+        Self {
+            functions,
+            qualified_leaves,
+        }
+    }
+
+    pub(crate) fn qualified_leaf_count(&self) -> usize {
+        self.qualified_leaves.len()
+    }
+}
+
 const MAX_INLINE_DEPTH: usize = 8;
 
 /// The most instructions a call inlined into an edge block may add when its
@@ -2135,6 +2159,7 @@ pub struct BytecodeCompiler<'a> {
     /// and narrows the fallback to just the inner $write/$display.
     tasks: Option<&'a HashMap<String, TaskDeclaration>>,
     functions: Option<&'a HashMap<String, FunctionDeclaration>>,
+    function_scope_index: Option<&'a FunctionScopeIndex<'a>>,
     /// A scalarized stand-in for the next `compile_pure_call`'s callee (see
     /// `compile_struct_member_call`); taken at the function-table lookup.
     struct_call_fd: Option<FunctionDeclaration>,
@@ -2453,6 +2478,7 @@ impl<'a> BytecodeCompiler<'a> {
             allow_expr_fallback: false,
             tasks: None,
             functions: None,
+            function_scope_index: None,
             struct_call_fd: None,
             unpacked_structs: None,
             dpi_import_fds: None,
@@ -3652,6 +3678,14 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_functions(&mut self, functions: &'a HashMap<String, FunctionDeclaration>) {
         self.functions = Some(functions);
+        self.function_scope_index = None;
+    }
+
+    /// Bind the index and its declaration table together. Replacing the
+    /// table through `set_functions` clears this borrowed index.
+    pub(crate) fn set_function_scope_index(&mut self, index: &'a FunctionScopeIndex<'a>) {
+        self.set_functions(index.functions);
+        self.function_scope_index = Some(index);
     }
 
     /// DPI import prototypes by SV-visible name. A compiled body may call an
@@ -8226,6 +8260,9 @@ impl<'a> BytecodeCompiler<'a> {
             return hit;
         }
         let ok = self.functions.is_some_and(|f| {
+            if let Some(index) = self.function_scope_index {
+                return !index.qualified_leaves.contains(name);
+            }
             let suffix = format!(".{}", name);
             !f.keys().any(|k| k.ends_with(suffix.as_str()))
         });
@@ -23393,7 +23430,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.method_string_ret_names = string_method_names.clone();
         // class-perf P2: the free-function table, for CallFreeFunction
         // lowering and string-return typing of free callees.
-        self.functions = Some(functions);
+        self.set_functions(functions);
         self.pkg_enum_consts = pkg_enum_consts.clone();
         self.static_member_names = static_member_names.clone();
         self.class_const_names = class_const_names.clone();
@@ -23526,6 +23563,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_string_ret_names.clear();
             self.pkg_enum_consts.clear();
             self.functions = None;
+            self.function_scope_index = None;
             self.dpi_import_fds = None;
             self.method_class = None;
             self.handle_member_types = None;

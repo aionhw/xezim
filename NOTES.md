@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Performance:** Avoid repeated function-name scans and unused write censuses during simulator setup.
+
 - **Performance:** Compact completed syntax lists before building elaboration tables.
 
 - **Performance:** Allocate optional case-arm guards and patterns only when present, retain unchanged nested root blocks during required scope rewriting, and group large VHDL startup lists into shared sequential blocks.

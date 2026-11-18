@@ -1664,7 +1664,7 @@ impl Simulator {
     pub(super) fn build_unpacked_struct_sens(&self) -> HashMap<String, Vec<usize>> {
         let mut names: HashSet<&str> = HashSet::default();
         for (name, dt) in &self.module.var_decl_types {
-            if let DataType::Struct(su) = self.resolve_dt(dt)
+            if let DataType::Struct(su) = self.resolve_dt_ref(dt)
                 && !su.packed
                 && matches!(su.kind, crate::ast::types::StructUnionKind::Struct)
             {
