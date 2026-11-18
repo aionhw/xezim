@@ -22262,10 +22262,10 @@ impl<'a> BytecodeCompiler<'a> {
                 value,
                 cached_val,
             } => {
-                // §5.7.1 — see `Value::unsized_literal_width`.
+                // §5.7.1 — see `Value::unsized_integer_width`.
                 let w = match size {
                     Some(sz) => *sz,
-                    None => Value::unsized_literal_width(
+                    None => Value::unsized_integer_width(
                         value,
                         match base {
                             NumberBase::Binary => 2,
@@ -22273,6 +22273,7 @@ impl<'a> BytecodeCompiler<'a> {
                             NumberBase::Hex => 16,
                             NumberBase::Decimal => 10,
                         },
+                        *signed,
                     ),
                 };
                 // §5.7.1: unsized all-x/all-z literal is a FILL (see
@@ -22292,9 +22293,6 @@ impl<'a> BytecodeCompiler<'a> {
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
-                // §5.7 (issue #31): compiled-path literals warn here — once
-                // per literal string, deduped with the elaboration/AST sites.
-                crate::compiler::elaborate::warn_unsized_decimal_wrap(*size, base, value);
                 let mut v = Value::from_literal_text(value, r, w);
                 // Same inline cache the AST evaluator keeps on this node: a
                 // literal in a declared range is re-evaluated for every
@@ -22385,7 +22383,9 @@ impl<'a> BytecodeCompiler<'a> {
         match &e.kind {
             ExprKind::Paren(i) => self.lrm_self_width(i),
             ExprKind::Number(NumberLiteral::Integer { size: Some(sz), .. }) => *sz,
-            ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => 32,
+            ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
+                super::elaborate::number_literal_width(n)
+            }
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => 1,
             ExprKind::Unary { op, operand } => match op {
                 UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => self.lrm_self_width(operand),

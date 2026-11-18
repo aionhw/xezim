@@ -31,7 +31,7 @@ impl Simulator {
                     Some(sz) => *sz,
                     None => match cached {
                         Some((_, _, cw)) => cw,
-                        None => Value::unsized_literal_width(value, r_for_w),
+                        None => Value::unsized_integer_width(value, r_for_w, *signed),
                     },
                 };
                 // §5.7.1: an unsized all-x/all-z literal ('bx, 'hz, 'b?) is a
@@ -53,12 +53,6 @@ impl Simulator {
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
-                // §5.7 (issue #31): a PROCEDURAL-only literal never passes
-                // through elaboration const-eval, so the wrap warning has to
-                // fire here too. Slow path only (the cached-value fast path
-                // above returns first), and the shared dedupe means a literal
-                // already reported at elaboration stays quiet.
-                super::elaborate::warn_unsized_decimal_wrap(*size, base, value);
                 let mut v = Value::from_literal_text(value, r, w);
                 // Cache inline values (width <= 64)
                 if w <= 64 {

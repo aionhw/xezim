@@ -597,7 +597,9 @@ impl Simulator {
                 super::bytecode::system_function_result(name).map(|(w, _)| w)
             }
             ExprKind::Number(NumberLiteral::Integer { size: Some(sz), .. }) => Some(*sz),
-            ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
+            ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
+                Some(super::elaborate::number_literal_width(n))
+            }
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
             ExprKind::Ident(h) => {
                 let n = self.resolve_hier_name(h);
@@ -1550,7 +1552,9 @@ impl Simulator {
                 }
                 (1, false)
             }
-            ExprKind::Number(NumberLiteral::Integer { size, .. }) => (size.unwrap_or(32), true),
+            ExprKind::Number(n @ NumberLiteral::Integer { .. }) => {
+                (super::elaborate::number_literal_width(n), true)
+            }
             ExprKind::Concatenation(p) => {
                 let mut total = 0;
                 let mut st = true;

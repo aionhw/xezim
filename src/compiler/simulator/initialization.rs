@@ -820,23 +820,24 @@ impl Simulator {
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer {
                 size,
+                signed,
                 base,
                 value,
                 cached_val,
                 ..
             }) => {
-                let w = size.unwrap_or(32);
-                if let Some((vb, xz, cw)) = cached_val.get() {
-                    if cw == w {
-                        return Value::from_inline(vb, xz, w).to_u64();
-                    }
-                }
                 let r = match base {
                     NumberBase::Binary => 2,
                     NumberBase::Octal => 8,
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
+                let w = size.unwrap_or_else(|| Value::unsized_integer_width(value, r, *signed));
+                if let Some((vb, xz, cw)) = cached_val.get() {
+                    if cw == w {
+                        return Value::from_inline(vb, xz, w).to_u64();
+                    }
+                }
                 Value::from_literal_text(value, r, w).to_u64()
             }
             ExprKind::Paren(inner) => Self::const_expr_u64(inner, params),

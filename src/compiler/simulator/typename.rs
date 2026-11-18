@@ -702,16 +702,15 @@ impl Simulator {
         use crate::ast::expr::{BinaryOp as B, UnaryOp as U};
         match &e.kind {
             ExprKind::Paren(i) => self.typename_integral_expr(i),
-            ExprKind::Number(NumberLiteral::Integer {
-                size,
-                signed,
-                value,
-                ..
-            }) => {
+            ExprKind::Number(n @ NumberLiteral::Integer { signed, value, .. }) => {
                 let four = value
                     .chars()
                     .any(|c| matches!(c, 'x' | 'X' | 'z' | 'Z' | '?'));
-                Some(TnType::generic(size.unwrap_or(32), *signed, four))
+                Some(TnType::generic(
+                    super::elaborate::number_literal_width(n),
+                    *signed,
+                    four,
+                ))
             }
             ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) => Some(TnType::generic(
                 1,
