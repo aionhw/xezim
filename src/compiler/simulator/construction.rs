@@ -1887,12 +1887,59 @@ impl Simulator {
                 return Some(ta.clone());
             }
         }
+        if let Some(ta) = self.member_target_type_args(lvalue) {
+            return Some(ta);
+        }
         if let ExprKind::Ident(lh) = &lvalue.kind {
             if let Some(leaf) = lh.path.last() {
                 if let Some(ta) = self.this_property_type_args(&leaf.name.name) {
                     return Some(ta);
                 }
             }
+        }
+        None
+    }
+
+    /// §8.8, §8.25: `obj.m = new` (or `this.m = new`) where the class of
+    /// `obj` declares `C #(args) m;` constructs that specialization, as a
+    /// bare `m = new` in a method of `obj` would. Only where `args` mean the
+    /// same in the running scope: `obj` is `this`, or the declaring class
+    /// has no parameters (a parameterized owner's member specialization is
+    /// `receiver_member_spec`'s).
+    fn member_target_type_args(&self, lvalue: &Expression) -> Option<Vec<Expression>> {
+        let (owner, prop) = match &lvalue.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (self.eval_handle_expr(expr)?, member.name.as_str())
+            }
+            ExprKind::Ident(h)
+                if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                (
+                    self.eval_ident_handle(&h.path[0].name.name)?,
+                    h.path[1].name.name.as_str(),
+                )
+            }
+            _ => return None,
+        };
+        if owner == 0 {
+            return None;
+        }
+        let is_this = self.this_stack.last().copied().flatten() == Some(owner);
+        let mut cur = Some(self.heap.get(owner)?.as_ref()?.class_name.clone());
+        for _ in 0..64 {
+            let cn = cur?;
+            let cd = self.module.classes.get(&cn)?;
+            if cd.properties.contains_key(prop) {
+                if !is_this && self.class_is_parameterized(&cn) {
+                    return None;
+                }
+                return cd
+                    .property_type_args
+                    .get(prop)
+                    .filter(|ta| !ta.is_empty())
+                    .cloned();
+            }
+            cur = cd.extends.clone();
         }
         None
     }
