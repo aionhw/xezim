@@ -5,6 +5,9 @@
 //! options go in `designs/<name>.args`, simulator settings that only xezim
 //! reads (`KEY=VALUE` environment lines) in `designs/<name>.env`.
 
+//! The assertion-driven `pending_*` cases specify their expected successful
+//! completion from §10.5.2 and §14.7 and are checked on the frozen baseline.
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -617,4 +620,25 @@ fn array_word_drivers() {
 #[test]
 fn numeric_meta_compare() {
     check("numeric_meta_compare");
+}
+
+/// §10.5.2, §14.7.3: implicit-zero transactions update on the next delta;
+/// equal-value writes retain activity, and the last write wins.
+#[test]
+fn pending_driver_activity_and_delta_replacement() {
+    check("pending_activity");
+}
+
+/// §4.2.2.3, §10.5.2: a transitive procedure write shares the process's
+/// projected waveform, including its delayed transactions.
+#[test]
+fn pending_driver_transitive_procedure_delay() {
+    check("pending_procedure_delay");
+}
+
+/// §10.5.2.1, §14.7.3.1: a procedure's force holds the effective value
+/// while the ordinary driver continues to update, and release sees it.
+#[test]
+fn pending_driver_procedure_force_and_release() {
+    check("pending_force_procedure");
 }
