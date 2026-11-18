@@ -2296,6 +2296,30 @@ impl Simulator {
         None
     }
 
+    /// The `.member` / `[index]` steps of a leaf suffix such as
+    /// `.item[1].key`; `None` for anything else.
+    fn member_suffix_steps(suffix: &str) -> Option<Vec<MemberSel>> {
+        let mut steps = Vec::new();
+        let mut rest = suffix;
+        while !rest.is_empty() {
+            if let Some(r) = rest.strip_prefix('.') {
+                let end = r.find(['.', '[']).unwrap_or(r.len());
+                if end == 0 {
+                    return None;
+                }
+                steps.push(MemberSel::Member(r[..end].to_string()));
+                rest = &r[end..];
+            } else if let Some(r) = rest.strip_prefix('[') {
+                let end = r.find(']')?;
+                steps.push(MemberSel::Index(r[..end].parse().ok()?));
+                rest = &r[end + 1..];
+            } else {
+                return None;
+            }
+        }
+        Some(steps)
+    }
+
     /// One candidate split: `base` names the property, `suffix` addresses a
     /// leaf beneath it. `None` when the property is not an unpacked struct or
     /// the suffix names no leaf of it — which is what lets the caller try
@@ -2320,10 +2344,19 @@ impl Simulator {
         } else {
             format!("X{}", suffix)
         };
-        let (_, w, _) = self
+        let Some((_, w, _)) = self
             .unpacked_struct_leaf_keys("X", &su)
             .into_iter()
-            .find(|(k, ..)| *k == probe)?;
+            .find(|(k, ..)| *k == probe)
+        else {
+            // §7.2.1: not a leaf of its own — a member below a packed
+            // struct/union member (`s.e.key`) slices that member's cell.
+            if !suffix.starts_with('.') {
+                return None;
+            }
+            let steps = Self::member_suffix_steps(suffix)?;
+            return self.unpacked_member_select(handle, &prop, &su, &steps);
+        };
         Some(ClassAggRef::Unpacked {
             handle,
             key: format!("{}{}", prop, suffix),
@@ -2642,6 +2675,41 @@ impl Simulator {
             let tail = &rest[i..];
             if tail.is_empty() {
                 return Some(ClassAggRef::Unpacked { handle, key, w: mw });
+            }
+            // §7.2.1/§7.3.1: a member of a PACKED struct or union member (or
+            // of an element of a packed array of them) is a bit slice of that
+            // member's one cell, as it is of a packed-struct variable; it has
+            // no cell of its own.
+            if tail.iter().any(|s| matches!(s, MemberSel::Member(_)))
+                && let Some(inner) = self.packed_struct_with_dims(&dt).map(|s| s.into_owned())
+                && !Self::spreads_member_wise(&inner)
+            {
+                let (fields, iw) = self.packed_agg_layout_with(&inner, &inst_params);
+                let ClassAggRef::Packed { off, w, .. } = self.packed_member_walk(
+                    handle,
+                    &key,
+                    &inner,
+                    &inner,
+                    &fields,
+                    iw.max(1),
+                    &inst_params,
+                    tail,
+                    0,
+                    mw,
+                )?
+                else {
+                    return None;
+                };
+                if off.checked_add(w)? > mw {
+                    return None;
+                }
+                return Some(ClassAggRef::UnpackedSlice {
+                    handle,
+                    key,
+                    off,
+                    w,
+                    cell_w: mw,
+                });
             }
             let (off, w) = self.packed_array_slice(&dt, &inst_params, mw, tail)?;
             return Some(ClassAggRef::UnpackedSlice {
