@@ -1,6 +1,91 @@
 //! Regression tests for bytecode compilation and lowering.
 use super::*;
 
+/// IEEE 1800-2023 §13.4.2: a bare callee with an instance-qualified twin
+/// cannot borrow the top declaration's external names during inlining.
+#[test]
+fn function_scope_index_matches_suffix_guard_and_resets_with_table() {
+    let (_, module) = xezim_core::parse_and_elaborate_multi(
+        &["module top; function int calc(); calc = 1; endfunction endmodule".into()],
+        Some("top"),
+        &[],
+        &[],
+        &[],
+    )
+    .expect("elaborate function template");
+    let fd = module.functions.get("calc").expect("calc declaration");
+    let functions: HashMap<_, _> = [
+        "calc",
+        "u.calc",
+        "u.nested.calc",
+        "u.pkg::calc",
+        "u.calc_suffix",
+        "u.calc2",
+    ]
+    .into_iter()
+    .map(|name| (name.to_string(), fd.clone()))
+    .collect();
+    let empty = HashMap::default();
+    let index = FunctionScopeIndex::new(&functions);
+    let empty_index = FunctionScopeIndex::new(&empty);
+    assert_eq!(index.qualified_leaf_count(), 4);
+    let signals = NameMap::default();
+    let arrays = HashMap::default();
+    let widths = HashMap::default();
+    let mut compiler = BytecodeCompiler::new(&signals, &[], &[], &arrays, &widths);
+    assert!(!compiler.callee_ext_reads_ok("calc"));
+    assert!(compiler.callee_ext_reads_ok("u.calc"));
+    compiler.set_functions(&functions);
+    let names = ["", "calc", "calc2", "calc_suffix", "pkg::calc", "other", "u.calc"];
+    let expected: Vec<_> = names
+        .iter()
+        .map(|name| compiler.callee_ext_reads_ok(name))
+        .collect();
+    assert_eq!(expected, [true, false, false, false, false, true, true]);
+    compiler.set_function_scope_index(&index);
+    for (name, expected) in names.into_iter().zip(expected) {
+        assert_eq!(compiler.callee_ext_reads_ok(name), expected, "{name}");
+    }
+    compiler.set_functions(&empty);
+    assert!(compiler.function_scope_index.is_none());
+    assert!(compiler.callee_ext_reads_ok("calc"));
+    compiler.set_function_scope_index(&index);
+    assert!(!compiler.callee_ext_reads_ok("calc"));
+    compiler.set_function_scope_index(&empty_index);
+    assert!(compiler.callee_ext_reads_ok("calc"));
+}
+
+#[test]
+fn function_scope_index_preserves_method_fact_cache() {
+    let (_, module) = xezim_core::parse_and_elaborate_multi(
+        &["module top; function int calc(); calc = 1; endfunction endmodule".into()],
+        Some("top"),
+        &[],
+        &[],
+        &[],
+    )
+    .expect("elaborate function template");
+    let fd = module.functions.get("calc").expect("calc declaration");
+    let functions: HashMap<_, _> = [("calc".into(), fd.clone()), ("u.calc".into(), fd.clone())]
+        .into_iter()
+        .collect();
+    let index = FunctionScopeIndex::new(&functions);
+    let signals = NameMap::default();
+    let arrays = HashMap::default();
+    let widths = HashMap::default();
+    let mut compiler = BytecodeCompiler::new(&signals, &[], &[], &arrays, &widths);
+    let admission = std::rc::Rc::new(MethodAdmission::default());
+    compiler.method_admission = Some(admission.clone());
+    compiler.set_function_scope_index(&index);
+    assert!(!compiler.callee_ext_reads_ok("calc"));
+    assert!(compiler.callee_ext_reads_ok("other"));
+    assert!(compiler.callee_ext_reads_ok("u.calc"));
+    let facts = admission.fn_facts.ext_reads_ok.borrow();
+    assert_eq!(facts.get("calc"), Some(&false));
+    assert_eq!(facts.get("other"), Some(&true));
+    assert!(!facts.contains_key("u.calc"));
+}
+
 #[test]
 fn concrete_typedef_kinds_keep_scopes_and_runtime_type_parameters() {
     use crate::ast::types::{DataType as D, IntegerAtomType as A, TypeName};

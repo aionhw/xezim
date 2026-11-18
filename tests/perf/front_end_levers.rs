@@ -464,3 +464,41 @@ fn lazy_child_always_blocks_match_eager_trees() {
     // reference counts 2; a span-keyed site shared the first one's clock).
     assert!(lazy.contains("R|rc=2"), "{lazy}");
 }
+
+/// IEEE 1800-2023 §§10.11, 13.4: empty collapse work preserves explicit
+/// aliases and called procedural code, including the diagnostic census.
+#[test]
+fn zero_continuous_assign_census_preserves_procedural_aliases() {
+    let out = run(
+        "empty_collapse",
+        r#"
+module tb;
+  logic [7:0] state, result;
+  wire [7:0] a, b;
+  alias a = b;
+  function automatic integer next_value(input integer n);
+    state = n + 1;
+    next_value = state;
+  endfunction
+  initial begin
+    result = next_value(4);
+    force a = 8'h5c;
+    #1;
+    $display("T|state=%0d result=%0d alias=%h", state, result, b);
+    release a;
+    $finish;
+  end
+endmodule
+"#,
+        &[("XEZIM_BUF_CENSUS", "1")],
+    );
+    assert_eq!(t_lines(&out), ["T|state=5 result=5 alias=5c"], "{out}");
+    let census: Vec<_> = out
+        .lines()
+        .filter(|line| line.starts_with("[BUF-CENSUS]"))
+        .collect();
+    assert_eq!(
+        census, ["[BUF-CENSUS] cont_assigns=0 identity=0 identity_single_driver=0"; 2],
+        "{out}"
+    );
+}
