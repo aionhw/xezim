@@ -211,3 +211,121 @@ endmodule
     assert_eq!(u(&sim, "fc"), 10, "instance member + localparam");
     assert_eq!(u(&sim, "bx"), 5, "class-scope static written by ctor store");
 }
+
+/// §8.9 / §10.10: whole-value assignments to static queue, dynamic and
+/// fixed array members inside a compiled static method write the shared
+/// collection store, not a scalar class-static cell.
+#[test]
+fn static_collection_whole_assignments() {
+    if !gate_on() {
+        return;
+    }
+    let src = r#"
+module top;
+  class C;
+    static int iq[$];
+    static string sq[$];
+    static int da[];
+    static int src[$];
+    static int dst[$];
+    static int fa[2];
+    static int fb[2];
+    static function void fill();
+      iq = {7};
+      sq = {"a", "b"};
+      da = {5, 6, 7};
+      dst = src;
+      iq = {iq, src};
+      fb = fa;
+    endfunction
+  endclass
+  int iq_n, iq_last, sq_n, da_n, dst_n, fb1;
+  initial begin
+    C::src.push_back(4);
+    C::fa[1] = 9;
+    C::fill();
+    iq_n = C::iq.size();
+    iq_last = C::iq[$];
+    sq_n = C::sq.size();
+    da_n = C::da.size();
+    dst_n = C::dst.size();
+    fb1 = C::fb[1];
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulation should run");
+    assert_eq!(u(&sim, "iq_n"), 2, "int queue literal, then concat");
+    assert_eq!(u(&sim, "iq_last"), 4, "concat appends the source queue");
+    assert_eq!(u(&sim, "sq_n"), 2, "string queue literal");
+    assert_eq!(u(&sim, "da_n"), 3, "dynamic array literal");
+    assert_eq!(u(&sim, "dst_n"), 1, "whole queue copy");
+    assert_eq!(u(&sim, "fb1"), 9, "whole fixed array copy");
+}
+
+/// §8.9: a static queue that redeclares an inherited scalar static keeps
+/// whole-value assignments in the derived class's collection store.
+#[test]
+fn static_collection_shadows_inherited_scalar_static() {
+    if !gate_on() {
+        return;
+    }
+    let src = r#"
+module top;
+  class B;
+    static int q;
+  endclass
+  class D extends B;
+    static int q[$];
+    static function void fill();
+      q = {7, 8};
+    endfunction
+  endclass
+  int q_n, b_q;
+  initial begin
+    D::fill();
+    q_n = D::q.size();
+    b_q = B::q;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulation should run");
+    assert_eq!(u(&sim, "q_n"), 2, "derived static queue literal");
+    assert_eq!(u(&sim, "b_q"), 0, "inherited scalar static untouched");
+}
+
+/// §8.9: a whole-value store to a static or instance queue member that
+/// shares its name with a module variable writes the member, not the
+/// module variable.
+#[test]
+fn collection_member_store_skips_module_variable() {
+    if !gate_on() {
+        return;
+    }
+    let src = r#"
+module top;
+  int q = 5;
+  int r = 6;
+  class C;
+    static int q[$];
+    int r[$];
+    function void fill();
+      q = {7, 8};
+      r = {9};
+    endfunction
+  endclass
+  C c;
+  int q_n, r_n;
+  initial begin
+    c = new;
+    c.fill();
+    q_n = C::q.size();
+    r_n = c.r.size();
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulation should run");
+    assert_eq!(u(&sim, "q_n"), 2, "static queue member literal");
+    assert_eq!(u(&sim, "r_n"), 1, "instance queue member literal");
+    assert_eq!(u(&sim, "q"), 5, "module variable q untouched");
+    assert_eq!(u(&sim, "r"), 6, "module variable r untouched");
+}
