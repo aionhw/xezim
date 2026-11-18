@@ -254,6 +254,25 @@ fn c14_16_2_clocking_last_wins_no_glitch() {
     );
 }
 
+// §14.16.2: a whole drive replaces a select of the same output issued
+// before it in the same cycle, at the clocking event, between events, and
+// from a class task.
+#[test]
+fn c14_16_2_clocking_select_then_whole_drive() {
+    check(
+        "c14_select_then_whole",
+        include_str!("sv/c14_select_then_whole.sv"),
+        "c14sw",
+        Order::Exact,
+        &[
+            "T|a|t=7000 a=1010",
+            "T|b|t=17000 b=1010",
+            "T|c|t=27000 c=1010",
+        ],
+        &[],
+    );
+}
+
 // §14.4, §14.16: an edge skew applies to a selected output and to an output
 // whose net another clockvar names, and edge-plus-delay drives made a cycle
 // apart each reach the net.
