@@ -108,6 +108,17 @@ impl Simulator {
         cg_def: &CovergroupDeclaration,
         args: &[Expression],
     ) -> Value {
+        // §13.5.3, §13.5.4: the actuals bind like any subroutine call's,
+        // `.name(expr)` to the named formal and an omitted one from its
+        // default; they were taken by position only.
+        let named;
+        let args: &[Expression] = match Self::normalize_call_args(&cg_def.ports, args) {
+            Some(v) => {
+                named = v;
+                &named
+            }
+            None => args,
+        };
         let handle = self.cg_heap.len();
         let owner = self
             .this_stack
