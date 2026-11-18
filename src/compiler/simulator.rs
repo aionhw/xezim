@@ -374,7 +374,9 @@ fn method_boost_enabled() -> bool {
 // Class-local shadowing keeps numeric comparisons out of string-member admission.
 // §7.4.1, §6.20: elements of packed-array members of struct formals and nested
 // callees reading module parameters inline.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3083;
+// §13.5, §11.6.1: compiled import calls and calls handed to the interpreter size
+// integral input actuals by their formals; a method with a vif local declines (§25.9).
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3084;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
