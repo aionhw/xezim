@@ -1516,6 +1516,60 @@ impl Simulator {
         true
     }
 
+    /// §10.4.1: whether an item of the pattern `rvalue` reads the variable
+    /// that `lvalue` writes (its root name, as any segment of a name in the
+    /// item). Keys and replication counts are constant expressions and are
+    /// not looked at; a function reading the target is not seen either.
+    fn pattern_reads_target(lvalue: &Expression, rvalue: &Expression) -> bool {
+        use crate::ast::expr::AssignmentPatternItem as Item;
+        let mut root = lvalue;
+        while let ExprKind::Index { expr, .. }
+        | ExprKind::RangeSelect { expr, .. }
+        | ExprKind::MemberAccess { expr, .. }
+        | ExprKind::Paren(expr) = &root.kind
+        {
+            root = expr;
+        }
+        // `this.arr = '{this.arr[1], ...}`: any `this` in an item may read it.
+        let var = match &root.kind {
+            ExprKind::Ident(h) => match h.path.first() {
+                Some(s) => s.name.name.as_str(),
+                None => return false,
+            },
+            ExprKind::This => "this",
+            _ => return false,
+        };
+        fn reads(e: &Expression, var: &str) -> bool {
+            match &e.kind {
+                ExprKind::AssignmentPattern(items) => items.iter().any(|item| match item {
+                    Item::Ordered(x)
+                    | Item::Named(_, x)
+                    | Item::Typed(_, x)
+                    | Item::Default(x)
+                    | Item::Keyed(_, x) => reads(x, var),
+                }),
+                ExprKind::Replication { exprs, .. } => exprs.iter().any(|x| reads(x, var)),
+                ExprKind::Paren(x) => reads(x, var),
+                _ => {
+                    let mut hit = false;
+                    super::elaborate::for_each_sub_expr(e, &mut |x| {
+                        hit |= match &x.kind {
+                            ExprKind::Ident(h) => h.path.iter().any(|s| s.name.name == var),
+                            ExprKind::This => var == "this",
+                            // `arr = '{this.arr[1], ...}`
+                            ExprKind::MemberAccess { expr, member } => {
+                                matches!(expr.kind, ExprKind::This) && member.name == var
+                            }
+                            _ => false,
+                        };
+                    });
+                    hit
+                }
+            }
+        }
+        reads(rvalue, var)
+    }
+
     pub(super) fn exec_stmt_blocking_assign_body(
         &mut self,
         stmt: &Statement,
@@ -1577,6 +1631,25 @@ impl Simulator {
         }
         if let Some(pattern) = self.unpacked_typed_pattern(rvalue) {
             self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
+            return;
+        }
+        // §10.4.1, §10.9.1, §10.9.2: the right-hand side is evaluated before
+        // the target is written, but a pattern store reads each item just
+        // before it writes that item's element, so a pattern reading its own
+        // target (`a = '{a[1], a[0]}`) read elements it had already written.
+        // Capture every item first, as an intra-assignment delay does (keys,
+        // nesting and element types kept), then store the captured values.
+        if matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
+            && Self::pattern_reads_target(lvalue, rvalue)
+        {
+            let (saved, release) = self.capture_intra_rhs(lvalue, rvalue, rvalue.span);
+            self.exec_stmt_blocking_assign_body(stmt, lvalue, &saved);
+            if let Some(release) = release
+                && let StatementKind::Expr(e) = &release.kind
+                && let ExprKind::SystemCall { name, args } = &e.kind
+            {
+                self.exec_system_task(name, args);
+            }
             return;
         }
         // §7.6, §7.2: a whole multi-dimensional array of unpacked structs,
