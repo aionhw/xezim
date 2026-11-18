@@ -2876,19 +2876,19 @@ impl Simulator {
                     continue;
                 }
                 // Straight-line only: no branch targets to rebase, and no AST
-                // fallbacks (those would need per-member scope hints).
+                // fallbacks (those would need per-member scope hints). Every
+                // branch form counts, the fused compare-and-branch and the
+                // jump tables included: a member's targets are relative to
+                // its own first instruction, so a later member's branch would
+                // land in the first member's body (#1284: four inlined
+                // `if (k > N) k = N;` taps looped there for ever).
                 use super::bytecode::Insn as I;
                 if compiled.instructions.iter().any(|i| {
-                    matches!(
-                        i,
-                        I::Jump(..)
-                            | I::BranchIfFalse(..)
-                            | I::BranchUnlessZero(..)
-                            | I::BranchIfSignalFalse(..)
-                            | I::StmtFallback(..)
-                            | I::EvalExprFallback(..)
-                            | I::LoadDynElem(..)
-                    )
+                    i.is_branch()
+                        || matches!(
+                            i,
+                            I::StmtFallback(..) | I::EvalExprFallback(..) | I::LoadDynElem(..)
+                        )
                 }) {
                     continue;
                 }

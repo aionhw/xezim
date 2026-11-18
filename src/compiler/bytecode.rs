@@ -1223,6 +1223,25 @@ impl Insn {
                 | NbaAssignArrayRead(..)
         )
     }
+
+    /// Whether this instruction transfers control to a block-relative
+    /// instruction index: the plain and fused branch forms and the jump
+    /// tables. A pass that appends one block's instructions after another's
+    /// must relocate every such target or keep the block out.
+    pub fn is_branch(&self) -> bool {
+        use Insn::*;
+        matches!(
+            self,
+            Jump(..)
+                | BranchIfFalse(..)
+                | BranchUnlessZero(..)
+                | BranchIfSignalFalse(..)
+                | CmpBranch(..)
+                | CmpBranchConst(..)
+                | CaseJump(..)
+                | CaseMaskJump(..)
+        )
+    }
 }
 
 impl Insn {
