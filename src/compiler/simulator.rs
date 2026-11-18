@@ -382,7 +382,8 @@ fn method_boost_enabled() -> bool {
 // Refresh task frames after restoring private nested contextual caches.
 // Refresh cached AST bodies after boxing optional timing payloads.
 // Refresh cached AST bodies after compact declaration and name-cache storage.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3092;
+// Refresh cached AST bodies after boxing optional case-arm payloads.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3093;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never

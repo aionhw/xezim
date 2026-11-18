@@ -38,7 +38,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // 0x0e: procedural sequence/fork bodies use shared copy-on-write storage.
 // 0x0f: optional assignment delays and inferred assertion clocks are boxed.
 // 0x10: compact declaration payloads and cold module constructs.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x10";
+// 0x11: optional case-arm guards and patterns use boxed AST storage.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x11";
 
 #[derive(Default)]
 struct Session {
