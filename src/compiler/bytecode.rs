@@ -11750,6 +11750,47 @@ impl<'a> BytecodeCompiler<'a> {
         unreachable!("pattern index out of range")
     }
 
+    /// §11.4.13: the compiled membership test compares integral operands
+    /// as unsigned values sized to the widest of them, which is `==?` for
+    /// x/z-free members. A real operand needs `==` with each member
+    /// converted to real by its own sign and a fill member kept at one bit
+    /// (§11.4.5, §5.7.1), so an operand that may be real keeps the
+    /// interpreter. The operand's type is not always known here (an element,
+    /// a member, or a continuous assignment compiled without signal types),
+    /// so a member whose value differs between the two comparisons — a
+    /// negative signed constant or a fill — keeps the interpreter too.
+    fn inside_needs_numeric_eq(&self, e: &Expression, members: &[Value]) -> bool {
+        self.expr_may_be_real(e)
+            || self.expr_is_real_static(e)
+            || members
+                .iter()
+                .any(|v| v.is_fill || (v.is_signed && v.to_i64().is_some_and(|x| x < 0)))
+    }
+
+    /// §12.5.4: true when matching every item of a `case inside` by `===`
+    /// is the `inside` match: each item an x/z-free integral constant (no
+    /// range, no wildcard bit, no array) and a selector compared as an
+    /// integral (see `inside_needs_numeric_eq`).
+    fn case_inside_matches_by_case_eq(
+        &mut self,
+        sel: &Expression,
+        items: &[crate::ast::stmt::CaseItem],
+    ) -> bool {
+        let mut members: Vec<Value> = Vec::new();
+        for it in items.iter().filter(|it| !it.is_default) {
+            if it.pattern.is_some() || it.guard.is_some() {
+                return false;
+            }
+            for p in &it.patterns {
+                match self.inside_member_const(p) {
+                    Some(v) => members.push(v),
+                    None => return false,
+                }
+            }
+        }
+        !self.inside_needs_numeric_eq(sel, &members)
+    }
+
     /// A set-membership member as a compile-time CONSTANT with no x/z bits —
     /// the only shape `compile_inside` accepts (see there).
     fn inside_member_const(&mut self, m: &Expression) -> Option<Value> {
@@ -14770,6 +14811,19 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::Case {
                 kind, expr, items, ..
             } => {
+                // §12.5.4: `case inside` matches each item with the `inside`
+                // operator: a range by `>=`/`<=`, a value by `==?` (the
+                // item's x/z bits are wildcards) and a real by `==`
+                // (§11.4.13). The compare chain below matches by `===`, which
+                // agrees with that only for an integral selector and x/z-free
+                // integral constant items; anything else leaves the statement
+                // to the interpreter's matcher.
+                if matches!(kind, crate::ast::stmt::CaseKind::CaseInside)
+                    && !self.case_inside_matches_by_case_eq(expr, items)
+                {
+                    self.bail("Stmt_CaseInside");
+                    return self.emit_fallback(stmt);
+                }
                 // §12.5: the selector and the items are sized to the widest
                 // of them. An operation selector (`a8 + 8'd1`) narrower than
                 // an item is computed at that width, in the compare chain.
@@ -18750,6 +18804,12 @@ impl<'a> BytecodeCompiler<'a> {
                             break;
                         }
                     }
+                }
+                // §11.4.13, §11.4.5: a real operand is compared with `==`,
+                // converting each member to real, so the members must keep
+                // their own sign; the unsigned compare below is integral only.
+                if ok && self.inside_needs_numeric_eq(e, &members) {
+                    ok = false;
                 }
                 if !ok || members.is_empty() {
                     if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "Expr_Inside") {
