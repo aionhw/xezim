@@ -1102,7 +1102,10 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            let dv = if super::elaborate::is_type_real(&m.data_type) {
+            // §6.18: a typedef preserves the member's real type.
+            let is_real =
+                super::elaborate::is_type_real_resolved(&m.data_type, &self.module.typedef_types);
+            let dv = if is_real {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state_resolved(
                 &m.data_type,
@@ -1137,7 +1140,6 @@ impl Simulator {
                             &m.data_type,
                             &self.module.typedef_types,
                         );
-                        let is_real = super::elaborate::is_type_real(&m.data_type);
                         let signed = self.type_is_signed_concrete(&m.data_type);
                         Some(Self::fit_local_decl_init(
                             raw,
