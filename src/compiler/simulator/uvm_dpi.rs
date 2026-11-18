@@ -52,6 +52,10 @@ pub(super) struct PosixRe(Box<libc::regex_t>);
 impl PosixRe {
     /// `Err((code, text))` carries regcomp's error code and regerror's text.
     fn compile(pat: &str, flags: libc::c_int) -> Result<PosixRe, (i32, String)> {
+        // POSIX leaves an empty ERE undefined: glibc matches every string and
+        // BSD libc (macOS) rejects it with REG_EMPTY. `^` matches every string
+        // on both.
+        let pat = if pat.is_empty() { "^" } else { pat };
         let Ok(c_pat) = CString::new(pat) else {
             return Err((libc::REG_BADPAT, "pattern contains a NUL byte".to_string()));
         };
