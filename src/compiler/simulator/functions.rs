@@ -2074,6 +2074,34 @@ impl Simulator {
         put(&mut self.var_typedef_types, name, saved.typedef_type);
     }
 
+    /// §7.4.1/§13.5: a plain vector formal or return variable of a class
+    /// method binds without `register_formal_type_metadata`, so a range
+    /// other than `[w-1:0]` (`input logic [0:7] f`) was never recorded and
+    /// `f[0]` read and wrote bit 0, or another scope's range under the name
+    /// was used. Record the variable's own range, or drop that entry, behind
+    /// the method's metadata save (`meta_note`).
+    pub(super) fn note_plain_formal_range(&mut self, name: &str, dt: &DataType) {
+        let dims = match dt {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. }
+                if dimensions.len() == 1 =>
+            {
+                super::elaborate::packed_full_dims_of(dt, &self.module.parameters)
+            }
+            _ => None,
+        };
+        match dims {
+            Some(d) if self.module.packed_full_dims.get(name) != Some(&d) => {
+                self.meta_note(name);
+                self.module.packed_full_dims.insert(name.to_string(), d);
+            }
+            None if self.module.packed_full_dims.contains_key(name) => {
+                self.meta_note(name);
+                self.module.packed_full_dims.remove(name);
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn register_formal_type_metadata(
         &mut self,
         name: &str,

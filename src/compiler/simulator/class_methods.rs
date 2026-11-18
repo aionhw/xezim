@@ -2228,6 +2228,9 @@ impl Simulator {
                             }
                         }
                     }
+                    if plan.ports[i].plain_scalar {
+                        self.note_plain_formal_range(&port.name.name, &port.data_type);
+                    }
                     locals.insert(port.name.name.clone(), val);
                 }
                 if let Some(rn) = fn_ret_name {
@@ -2319,6 +2322,9 @@ impl Simulator {
                     }
                     if !locals.contains_key(rn) {
                         locals.insert(rn.to_string(), init);
+                    }
+                    if let ClassMethodKind::Function(f) = &method.kind {
+                        self.note_plain_formal_range(rn, &f.return_type);
                     }
                     // Register the return variable's class type so an
                     // implicit-return `funcname = new()` knows WHICH class to
