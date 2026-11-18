@@ -69,3 +69,5 @@ mod parked_waiter_index;
 mod queue_shift_counters;
 #[path = "perf/select_store_counters.rs"]
 mod select_store_counters;
+#[path = "perf/timing_check_conditions.rs"]
+mod timing_check_conditions;
