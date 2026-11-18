@@ -4103,8 +4103,12 @@ impl<'a> BytecodeCompiler<'a> {
                 let call_next = self.next_reg;
                 let mut ok = true;
                 let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
-                for a in args {
-                    match self.compile_expr(a, 0) {
+                for (i, a) in args.iter().enumerate() {
+                    // §13.5, §11.6.1: as `exec_function_call` binds the
+                    // actual, at its formal's width; the register reaches it
+                    // as a value, too late to widen the operands.
+                    let w = self.actual_ctx_width_of(&fd.ports, i, &name, false);
+                    match self.compile_expr(a, w) {
                         Some(r) => arg_values.push(r),
                         None => {
                             ok = false;
