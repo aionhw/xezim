@@ -5354,7 +5354,49 @@ impl Simulator {
                 // excluded here. Bit-selects are already correct in both
                 // directions; this closes the part-select WRITE gap.
                 let mut elem_ascending_dim: Option<(i64, i64)> = None;
-                let class_dim = self.class_prop_select_dim(expr);
+                // §7.4.1: a multidimensional packed class property, or an
+                // associative-array element of such a type, selects elements
+                // of its first dimension; neither has the signal tables the
+                // branches below read its geometry from.
+                let extra_dims = (!self.no_class_objects())
+                    .then(|| self.class_prop_receiver(expr))
+                    .flatten()
+                    .and_then(|(h, p)| self.class_prop_packed_dims(h, &p))
+                    .or_else(|| {
+                        let ExprKind::Index { expr: root, .. } = &expr.kind else {
+                            return None;
+                        };
+                        let ExprKind::Ident(h) = &root.kind else {
+                            return None;
+                        };
+                        let name = self.resolve_hier_name(h);
+                        self.is_associative_array(&name)
+                            .then(|| self.module.packed_full_dims.get(&*name).cloned())
+                            .flatten()
+                    })
+                    .filter(|d| d.len() > 1);
+                let physical = extra_dims.as_ref().map(|dims| {
+                    let (dl, dr) = dims[0];
+                    let stride: i64 = dims[1..].iter().map(|(l, r)| (l - r).abs() + 1).product();
+                    let (a, b) = match kind {
+                        RangeKind::Constant => (li, ri),
+                        RangeKind::IndexedUp => (li, li + ri - 1),
+                        RangeKind::IndexedDown => (li, li - ri + 1),
+                    };
+                    let bit = |i: i64| {
+                        if dl >= dr {
+                            (i - dr) * stride
+                        } else {
+                            (dr - i) * stride
+                        }
+                    };
+                    (bit(a).min(bit(b)), bit(a).max(bit(b)) + stride - 1)
+                });
+                let class_dim = if physical.is_none() {
+                    self.class_prop_select_dim(expr)
+                } else {
+                    None
+                };
                 if let Some((dl, dr)) = class_dim {
                     if dl < dr {
                         li = match kind {
@@ -5435,8 +5477,6 @@ impl Simulator {
                 // select. Kept for the partial-OOB case where the physical
                 // range is clamped: the loop needs the UNCLAMPED high end.
                 let mut asc_phys_hi: Option<i64> = None;
-                let l = li.max(0) as usize;
-                let r = ri.max(0) as usize;
                 let (mut msb, mut lsb) = (msb_i.max(0) as usize, lsb_i.max(0) as usize);
                 // §7.4.1 element-range WRITE on a packed multi-D base:
                 // `wv[2:1] = 16'hBEEF` / `wv[1 +: 2] = …` targets whole
@@ -5453,9 +5493,9 @@ impl Simulator {
                         .filter(|&&w| w > 1)
                     {
                         let (lab_a, lab_b): (i64, i64) = match kind {
-                            RangeKind::Constant => (l as i64, r as i64),
-                            RangeKind::IndexedUp => (l as i64, l as i64 + r as i64 - 1),
-                            RangeKind::IndexedDown => (l as i64, l as i64 - (r as i64 - 1)),
+                            RangeKind::Constant => (li, ri),
+                            RangeKind::IndexedUp => (li, li + ri - 1),
+                            RangeKind::IndexedDown => (li, li - (ri - 1)),
                         };
                         let dim = self
                             .module
@@ -5477,10 +5517,21 @@ impl Simulator {
                         };
                         let la = lsb_of(lab_a);
                         let lb = lsb_of(lab_b);
-                        lsb = la.min(lb).max(0) as usize;
-                        msb = (la.max(lb) + elem_w as i64 - 1).max(0) as usize;
+                        // §11.5.1: map signed labels before clipping, retaining
+                        // the source offset for partially out-of-range writes.
+                        src_base = la.min(lb);
+                        msb_i = la.max(lb) + elem_w as i64 - 1;
+                        lsb = src_base.max(0) as usize;
+                        msb = msb_i.max(0) as usize;
                         elem_scaled = true;
                     }
+                }
+                if let Some((lo, hi)) = physical {
+                    src_base = lo;
+                    msb_i = hi;
+                    lsb = lo.max(0) as usize;
+                    msb = hi.max(0) as usize;
+                    elem_scaled = true;
                 }
                 // Ascending packed vector part-write (`logic [0:7] pa; pa[0:3]=v`):
                 // labels index from the MSB end → internal [(W-1)-lsb : (W-1)-msb]
@@ -5903,13 +5954,31 @@ impl Simulator {
                             // property landed correctly. Resolved before the
                             // mutable borrow below.
                             let (msb, lsb) = match self.class_prop_packed_shape(handle, &fname) {
+                                // A multidimensional property's select was
+                                // mapped to physical bits above already.
                                 Some((_, total, left, right))
-                                    if class_dim.is_none() && left < right && total > 0 =>
+                                    if class_dim.is_none()
+                                        && physical.is_none()
+                                        && left < right
+                                        && total > 0 =>
                                 {
                                     let top = total as usize - 1;
                                     (top.saturating_sub(lsb), top.saturating_sub(msb))
                                 }
                                 _ => (msb, lsb),
+                            };
+                            // §11.5.1: elements below bit 0 are dropped with
+                            // the value bits they would have taken.
+                            let shifted;
+                            let val = if physical.is_some() && src_base < 0 {
+                                if msb_i < 0 {
+                                    return false;
+                                }
+                                shifted =
+                                    val.shift_right(&Value::from_u64(src_base.unsigned_abs(), 32));
+                                &shifted
+                            } else {
+                                val
                             };
                             if let Some(Some(inst)) = self.heap.get_mut(handle) {
                                 // The property takes the bits in place (§11.5.1); it is
