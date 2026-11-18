@@ -3112,6 +3112,17 @@ impl Simulator {
     /// instance method lands in the SAME shared store the static-method path
     /// (and any `ClassName::m[...]` spelling) uses.
     pub(super) fn spec_static_coll_key_in_class(&self, name: &str, ctx: &str) -> String {
+        self.spec_static_coll_key_in_class_with(name, ctx, None)
+    }
+
+    /// `spec_static_coll_key_in_class` under the specialization `spec`
+    /// (an object's own, §8.25) instead of the active one, when given.
+    pub(super) fn spec_static_coll_key_in_class_with(
+        &self,
+        name: &str,
+        ctx: &str,
+        spec: Option<&(String, String)>,
+    ) -> String {
         // Walk ctx's inheritance chain for a STATIC collection property.
         // Static collections are registered in `static_collections`
         // (name, is_assoc, width) — NOT queue_properties/assoc_properties,
@@ -3122,7 +3133,7 @@ impl Simulator {
                 if cd.static_properties.contains(name)
                     && cd.static_collections.iter().any(|(n, _, _)| n == name)
                 {
-                    if let Some(key) = self.static_prop_key(ctx, name) {
+                    if let Some(key) = self.static_prop_key_spec(ctx, name, spec) {
                         // Rewrite storage to the per-DECLARING-class key ONLY
                         // when the bare name collides across classes (§8.9) or
                         // the class is parameterized (`#spec`). A statically

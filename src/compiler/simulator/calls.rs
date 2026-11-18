@@ -2682,6 +2682,12 @@ impl Simulator {
                             | "reverse"
                             | "shuffle"
                             | "unique"
+                            // §7.9.4-§7.9.7: the traversal methods of an
+                            // associative array take the same receiver.
+                            | "first"
+                            | "last"
+                            | "next"
+                            | "prev"
                     )
                 {
                     let arr = hier.path[hier.path.len() - 2].name.name.clone();
@@ -2715,20 +2721,12 @@ impl Simulator {
                                 .and_then(|v| v.to_u64())
                                 .unwrap_or(0) as usize;
                         }
-                        if handle != 0 {
-                            let cn = self
-                                .heap
-                                .get(handle)
-                                .and_then(|x| x.as_ref())
-                                .map(|i| i.class_name.clone());
-                            if let Some(cn) = cn {
-                                if self.class_assoc_member(&cn, &arr) {
-                                    let scoped = format!("{}#{}", handle, arr);
-                                    if let Some(res) = self.eval_builtin_method(&scoped, m, args) {
-                                        return res;
-                                    }
-                                }
-                            }
+                        // §8.9: a static collection of the object's class
+                        // is the class's one store (`handle_collection_name`).
+                        if let Some(scoped) = self.handle_collection_name(handle, &arr)
+                            && let Some(res) = self.eval_builtin_method(&scoped, m, args)
+                        {
+                            return res;
                         }
                     }
                     // A collection reached through a hierarchical path —

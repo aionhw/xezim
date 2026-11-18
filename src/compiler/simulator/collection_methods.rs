@@ -2739,6 +2739,16 @@ impl Simulator {
                 }
                 n.into_owned()
             }
+            // §8.9, §8.23: `Cls::q` names the class's static queue or
+            // dynamic array.
+            ExprKind::Ident(h)
+                if h.path.len() == 2
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && self.module.classes.contains_key(&h.path[0].name.name)
+                    && self.member_is_static_coll(&h.path[0].name.name, &h.path[1].name.name) =>
+            {
+                self.class_scoped_static_coll(&h.path[0].name.name, &h.path[1].name.name)?
+            }
             // §13.5.2: a queue/dynamic-array member of ANOTHER object passed
             // as the actual — `cb.doit(comp.q)` / `cb.doit(this.q)`, or a
             // member chain of any depth (`a.b.c.q`, parsed as a flattened

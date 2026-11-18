@@ -2026,6 +2026,14 @@ impl Simulator {
                     .or_else(|| Some(n.into_owned()))
             }
         } else if h.path.iter().all(|s| s.selects.is_empty()) {
+            // §8.9, §8.23: `Cls::member` names the class's static collection.
+            if h.path.len() == 2
+                && self.module.classes.contains_key(&h.path[0].name.name)
+                && let Some(key) =
+                    self.class_scoped_static_coll(&h.path[0].name.name, &h.path[1].name.name)
+            {
+                return Some(key);
+            }
             // A flattened member chain `a.b.member` naming an unpacked-array
             // property. HEAD is the base object; middle segments are
             // handle-valued properties; the LAST names the collection, stored

@@ -155,6 +155,19 @@ impl Simulator {
         lvalue: &Expression,
         items: &[AssignmentPatternItem],
     ) -> bool {
+        // §8.9, §8.23: `Cls::q = '{...}` names the class's static
+        // collection without an object.
+        if let ExprKind::Ident(hi) = &lvalue.kind
+            && hi.path.len() == 2
+            && hi.path.iter().all(|s| s.selects.is_empty())
+            && self.module.classes.contains_key(&hi.path[0].name.name)
+        {
+            let (cls, member) = (&hi.path[0].name.name, &hi.path[1].name.name);
+            return match self.class_scoped_static_coll(cls, member) {
+                Some(key) => self.assign_static_collection_pattern(cls, member, &key, items),
+                None => false,
+            };
+        }
         // The lvalue is either `obj.q`/`this.q` (MemberAccess) or a two-
         // segment `c.q` (flattened Ident). Resolve the object handle + member
         // from both forms.
@@ -200,6 +213,14 @@ impl Simulator {
             return false;
         };
         let member = &member;
+        // §8.9: a STATIC collection reached through the object is the
+        // class's one store, the same one `obj.q[i]` and `Cls::q` use.
+        if self.collection_is_static_in(&cn, member) {
+            return match self.handle_collection_name(handle, member) {
+                Some(key) => self.assign_static_collection_pattern(&cn, member, &key, items),
+                None => false,
+            };
+        }
         let scoped = format!("{}#{}", handle, member);
         if items.is_empty() {
             // `'{}` leaves the queue or dynamic array with no elements.
@@ -236,6 +257,47 @@ impl Simulator {
             return true;
         }
         false
+    }
+
+    /// §8.9, §10.9: assign the pattern to the STATIC associative array,
+    /// queue or dynamic array `member` of `class`'s chain, stored at `key`
+    /// (see `handle_collection_name`). Keyed items replace an associative
+    /// array's contents; positional items are a queue's or dynamic array's
+    /// elements and set its size.
+    fn assign_static_collection_pattern(
+        &mut self,
+        class: &str,
+        member: &str,
+        key: &str,
+        items: &[AssignmentPatternItem],
+    ) -> bool {
+        let mut cur = Some(class);
+        let mut decl = None;
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            if let Some(&(_, is_assoc, w)) =
+                cd.static_collections.iter().find(|(n, ..)| n == member)
+            {
+                decl = Some((is_assoc, w));
+                break;
+            }
+            cur = cd.extends.as_deref();
+        }
+        let Some((is_assoc, w)) = decl else {
+            return false;
+        };
+        if is_assoc {
+            self.assign_class_assoc_pattern(key, w, items);
+            return true;
+        }
+        let exprs = self.pattern_ordered(items);
+        for (i, e) in exprs.iter().enumerate() {
+            self.pattern_leaf_at_elem_width(&format!("{}[{}]", key, i), e, w);
+        }
+        self.set_queue_size(key, exprs.len() as u64);
+        true
     }
 
     /// §7.9.11 / §10.9.2: assign the pattern `'{k: v, ..., default: d}` to

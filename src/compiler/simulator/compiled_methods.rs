@@ -2506,6 +2506,29 @@ impl Simulator {
                         static_members.remove(ip);
                         const_names.remove(ip);
                     }
+                    // §8.9, §7: a STATIC collection (associative array,
+                    // queue, dynamic or fixed-size array) has no scalar cell
+                    // for `LoadClassStatic` to read: its elements, methods
+                    // and whole-value reads keep their collection paths, and
+                    // any other spelling of it (`this.fa[i]`, `fa` passed
+                    // whole) stays on the interpreter.
+                    let mut cur = Some(cname.to_string());
+                    let mut guard = 0;
+                    while let Some(cn) = cur
+                        && guard < 64
+                    {
+                        guard += 1;
+                        let Some(cd) = self.module.classes.get(&cn) else {
+                            break;
+                        };
+                        let colls = cd.static_collections.iter().map(|(n, ..)| n);
+                        for n in colls.chain(cd.static_fixed_arrays.iter().map(|(n, ..)| n)) {
+                            if static_members.remove(n) {
+                                shadow_names.insert(n.clone());
+                            }
+                        }
+                        cur = cd.extends.clone();
+                    }
                     // A localparam lives in BOTH sets after the union
                     // walk; it is READ-ONLY — drop it from the writable
                     // set (stores to it stay AST).

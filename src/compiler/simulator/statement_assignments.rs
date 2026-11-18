@@ -3789,9 +3789,12 @@ impl Simulator {
             return;
         }
         // §10.10: `cfg.r = {…}` writes a queue member before the right side runs as a value.
+        // §8.9: so does a static queue reached through the object.
         if let ExprKind::MemberAccess { .. } = &lvalue.kind
             && let ExprKind::Concatenation(_) = &rvalue.kind
-            && let Some(n) = self.expr_assoc_name(lvalue).filter(|n| self.class_queue_prop(n))
+            && let Some(n) = self
+                .expr_assoc_name(lvalue)
+                .filter(|n| self.class_queue_prop(n) || self.module.arrays.contains_key(n))
             && self.assign_whole_coll(&n, None, rvalue)
         {
             self.settle_after_proc_write();
@@ -4346,10 +4349,16 @@ impl Simulator {
             if matches!(rvalue.kind, ExprKind::Concatenation(_))
                 && !self.module.arrays.contains_key(&*lname)
                 && let Some(n) = self.expr_assoc_name(lvalue)
-                && self.class_queue_prop(&n)
             {
-                lname = std::borrow::Cow::Owned(n);
-                class_dyn = true;
+                if self.class_queue_prop(&n) {
+                    lname = std::borrow::Cow::Owned(n);
+                    class_dyn = true;
+                } else if self.module.arrays.contains_key(&n) {
+                    // §8.9: a static queue or dynamic array reached
+                    // through an object (`h.sq = {h.sq, v}`) is the
+                    // class's store.
+                    lname = std::borrow::Cow::Owned(n);
+                }
             }
             if self.module.arrays.contains_key(&*lname) || class_dyn {
                 // Queue/array slice assignment: lq = rq[a:b]

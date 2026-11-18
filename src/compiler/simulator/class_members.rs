@@ -1199,27 +1199,35 @@ impl Simulator {
     /// `foreach (successors[s].m_predecessors[pred])` iterates
     /// `this.m_predecessors` instead of `successors[s].m_predecessors`, so
     /// the graph reads the wrong object's edges.
+    ///
+    /// This is the one answer to "which store is `obj.member`": every
+    /// receiver spelling (`obj.m`, `this.m`, `super.m`, `a.b.m`, `arr[i].m`,
+    /// `f().m`, `Cls::h.m`) resolves its object and asks here.
     pub(super) fn handle_collection_name(&self, handle: usize, member: &str) -> Option<String> {
         if handle == 0 {
             return None;
         }
-        let cn = self
-            .heap
-            .get(handle)
-            .and_then(|x| x.as_ref())
-            .map(|i| i.class_name.clone())?;
-        if self.class_assoc_member(&cn, member) || self.prop_bound_collection(handle, &cn, member) {
-            Some(format!("{}#{}", handle, member))
+        let inst = self.heap.get(handle).and_then(|x| x.as_ref())?;
+        let cn = inst.class_name.as_str();
+        if self.class_assoc_member(cn, member) || self.prop_bound_collection(handle, cn, member) {
+            Some(Self::handle_member_key(handle, member))
+        } else if self.collection_is_static_in(cn, member) {
+            // §8.9: a STATIC associative array, queue or dynamic array is
+            // one variable of the class, reached through an object "in the
+            // usual way": the store the class's own methods use for the bare
+            // name (`instance_assoc_member`), keyed by the specialization the
+            // object was built with (§8.25), not the caller's.
+            Some(self.spec_static_coll_key_in_class_with(member, cn, inst.spec.as_ref()))
         } else {
             // §8.9: a fixed-size static array member of the receiver's class
             // chain names the class-qualified shared store.
-            self.static_fixed_key_in(&cn, member)
+            self.static_fixed_key_in(cn, member)
         }
     }
 
     /// Storage key of `ClassName::q` for a static queue or dynamic array
     /// (§8.9): the store the class's own methods use.
-    fn class_scoped_static_coll(&self, class: &str, member: &str) -> Option<String> {
+    pub(super) fn class_scoped_static_coll(&self, class: &str, member: &str) -> Option<String> {
         self.member_is_static_coll(class, member)
             .then(|| self.spec_static_coll_key_in_class(member, class))
     }
@@ -1286,22 +1294,7 @@ impl Simulator {
             if handle == 0 {
                 return None;
             }
-            let cn = sim
-                .heap
-                .get(handle)
-                .and_then(|x| x.as_ref())
-                .map(|i| i.class_name.clone())?;
-            if sim.class_assoc_member(&cn, member) {
-                Some(Self::handle_member_key(handle, member))
-            } else if sim.prop_bound_collection(handle, &cn, member) {
-                // §6.20.3: `T data;` where THIS instance binds T to an
-                // array/queue typedef — a per-spec collection property.
-                Some(Self::handle_member_key(handle, member))
-            } else {
-                // §8.9: a fixed-size static array member names the
-                // class-qualified shared store.
-                sim.static_fixed_key_in(&cn, member)
-            }
+            sim.handle_collection_name(handle, member)
         };
         match &expr.kind {
             // Explicit `this.member` / `obj.member` MemberAccess forms — the
@@ -1580,17 +1573,7 @@ impl Simulator {
                 if handle == 0 {
                     return None;
                 }
-                let member = &h.path[n - 1].name.name;
-                let cn = self
-                    .heap
-                    .get(handle)
-                    .and_then(|x| x.as_ref())
-                    .map(|i| i.class_name.clone())?;
-                if self.class_assoc_member(&cn, member) {
-                    Some(format!("{}#{}", handle, member))
-                } else {
-                    None
-                }
+                self.handle_collection_name(handle, &h.path[n - 1].name.name)
             }
             // Flattened nested OBJECT handle: `a.mid.base` (path.len() >= 3).
             // The receiver is an object chain (`a.mid`), not a static handle.
@@ -1612,22 +1595,7 @@ impl Simulator {
                     Expression::new(ExprKind::Ident(recv), h.span)
                 };
                 let hh = self.eval_handle_expr(&recv_expr).unwrap_or(0);
-                if hh != 0 {
-                    if let Some(cn) = self
-                        .heap
-                        .get(hh)
-                        .and_then(|x| x.as_ref())
-                        .map(|i| i.class_name.clone())
-                    {
-                        if self.class_assoc_member(&cn, &member) {
-                            return Some(format!("{}#{}", hh, member));
-                        }
-                        if self.prop_bound_collection(hh, &cn, &member) {
-                            return Some(format!("{}#{}", hh, member));
-                        }
-                    }
-                }
-                None
+                self.handle_collection_name(hh, &member)
             }
             // Gated by name first: resolving evaluates the selects.
             ExprKind::Index { .. } if self.indexed_colls_live() => {
@@ -3376,7 +3344,19 @@ impl Simulator {
     /// §13.3: selected object receivers must enter the suspend-aware task
     /// path, not execute a blocking task through the synchronous fallback.
     pub(super) fn eval_live_object_receiver(&mut self, expr: &Expression) -> Option<usize> {
-        let handle = self.eval_expr(expr).to_u64()? as usize;
+        // §8.15: `super.m` names `m` through the current object, as `this.m`
+        // does; `super` has no value of its own to evaluate.
+        let handle = match &expr.kind {
+            ExprKind::This => self.this_stack.last().copied().flatten()?,
+            ExprKind::Ident(h)
+                if h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && h.path[0].name.name == "super" =>
+            {
+                self.this_stack.last().copied().flatten()?
+            }
+            _ => self.eval_expr(expr).to_u64()? as usize,
+        };
         (handle != 0
             && self.heap.get(handle).is_some_and(|o| o.is_some())
             && !self.mailboxes.contains_key(&handle)
