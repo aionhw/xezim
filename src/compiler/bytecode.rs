@@ -1242,6 +1242,34 @@ impl Insn {
                 | CaseMaskJump(..)
         )
     }
+
+    /// Shift every branch target of this instruction by `ib` (the index at
+    /// which its block now starts in a concatenated stream), leaving the
+    /// registers alone. Covers every form `is_branch` names.
+    pub fn offset_branch_targets(&mut self, ib: u32) {
+        use Insn::*;
+        match self {
+            Jump(t)
+            | BranchIfFalse(_, t)
+            | BranchUnlessZero(_, t)
+            | BranchIfSignalFalse(_, t, _)
+            | CmpBranch(_, _, _, _, t)
+            | CmpBranchConst(_, _, _, _, t) => *t += ib,
+            CaseJump(_, jump) => {
+                for t in &mut jump.table {
+                    *t += ib;
+                }
+                jump.default += ib;
+            }
+            CaseMaskJump(_, jump) => {
+                for t in &mut jump.table {
+                    *t += ib;
+                }
+                jump.xz_path += ib;
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Insn {
