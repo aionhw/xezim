@@ -2254,6 +2254,7 @@ impl Simulator {
                             .and_then(|o| o.as_ref())
                             .map(|i| i.class_name.clone());
                         let mut mtn: Option<String> = None;
+                        let mut decl_cn: Option<String> = None;
                         let mut cur = hcn;
                         while let Some(cn) = cur {
                             if let Some(cd) = self.module.classes.get(&cn) {
@@ -2263,6 +2264,7 @@ impl Simulator {
                                     .and_then(|s| s.type_name.clone())
                                 {
                                     mtn = Some(tn);
+                                    decl_cn = Some(cn);
                                     break;
                                 }
                                 cur = cd.extends.clone();
@@ -2309,8 +2311,31 @@ impl Simulator {
                                 _ => &[],
                             };
                             let (cn, spec) = mcls;
+                            // §8.8, §8.25: an element of `C #(args) arr[N]`
+                            // takes those args, read where they mean the
+                            // same as in the declaring class: through
+                            // `this`, or for a class without parameters.
+                            let type_args = decl_cn
+                                .as_deref()
+                                .filter(|d| {
+                                    spec.is_none()
+                                        && (this_recv
+                                            || self.this_stack.last().copied().flatten()
+                                                == Some(handle)
+                                            || !self.class_is_parameterized(d))
+                                })
+                                .and_then(|d| self.module.classes.get(d))
+                                .and_then(|d| d.property_type_args.get(&member_name))
+                                .filter(|ta| !ta.is_empty())
+                                .cloned();
                             if let Some(cd) = self.module.classes.get(&cn).cloned() {
-                                let v = if let Some((b, s)) = spec {
+                                let v = if let Some(ta) = type_args {
+                                    self.instantiate_class_with_type_args(
+                                        &cd,
+                                        ctor_args,
+                                        Some(ta.as_slice()),
+                                    )
+                                } else if let Some((b, s)) = spec {
                                     let saved = self.current_spec.take();
                                     self.current_spec = Some((b, s));
                                     let r = self.instantiate_class(&cd, ctor_args);

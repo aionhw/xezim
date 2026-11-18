@@ -1916,6 +1916,24 @@ impl Simulator {
     /// has no parameters (a parameterized owner's member specialization is
     /// `receiver_member_spec`'s).
     fn member_target_type_args(&self, lvalue: &Expression) -> Option<Vec<Expression>> {
+        let (owner, cn, prop) = self.member_target_decl(lvalue)?;
+        let cd = self.module.classes.get(&cn)?;
+        let is_this = self.this_stack.last().copied().flatten() == Some(owner);
+        if !is_this && self.class_is_parameterized(&cn) {
+            return None;
+        }
+        cd.property_type_args
+            .get(&prop)
+            .filter(|ta| !ta.is_empty())
+            .cloned()
+    }
+
+    /// For a `new` target naming a member through an object (`obj.m`,
+    /// `this.m`): the object, the class in its chain that declares the
+    /// member, and the member's name. `None` for any other target, a null
+    /// object, or a collection member (an element of one is constructed on
+    /// the element path of `exec_stmt_blocking_assign_body`).
+    fn member_target_decl(&self, lvalue: &Expression) -> Option<(usize, String, String)> {
         let (owner, prop) = match &lvalue.kind {
             ExprKind::MemberAccess { expr, member } => {
                 (self.eval_handle_expr(expr)?, member.name.as_str())
@@ -1933,20 +1951,19 @@ impl Simulator {
         if owner == 0 {
             return None;
         }
-        let is_this = self.this_stack.last().copied().flatten() == Some(owner);
         let mut cur = Some(self.heap.get(owner)?.as_ref()?.class_name.clone());
         for _ in 0..64 {
             let cn = cur?;
             let cd = self.module.classes.get(&cn)?;
             if cd.properties.contains_key(prop) {
-                if !is_this && self.class_is_parameterized(&cn) {
+                let coll = cd.array_properties.contains_key(prop)
+                    || cd.array_nd_properties.contains_key(prop)
+                    || cd.queue_properties.contains_key(prop)
+                    || cd.assoc_properties.contains_key(prop);
+                if coll {
                     return None;
                 }
-                return cd
-                    .property_type_args
-                    .get(prop)
-                    .filter(|ta| !ta.is_empty())
-                    .cloned();
+                return Some((owner, cn, prop.to_string()));
             }
             cur = cd.extends.clone();
         }
@@ -1969,6 +1986,15 @@ impl Simulator {
     /// `this`-instance inheritance chain so a base-class property (e.g.
     /// `uvm_component.event_pool`) resolves from a derived component.
     pub(super) fn this_member_typedef_spec(&self, lvalue: &Expression) -> Option<(String, String)> {
+        // §8.8: `obj.m = new` through another object (or an element of its
+        // member array) declares `m` in `obj`'s class, not in `this`'s.
+        if let Some((owner, cn, prop)) = self.member_target_decl(lvalue)
+            && self.this_stack.last().copied().flatten() != Some(owner)
+            && !self.class_is_parameterized(&cn)
+        {
+            let raw = self.module.classes.get(&cn)?.properties.get(&prop)?.type_name.as_ref()?;
+            return self.resolve_typedef_spec(raw);
+        }
         let leaf = match &lvalue.kind {
             ExprKind::Ident(h) => h.path.last()?.name.name.clone(),
             ExprKind::MemberAccess { member, .. } => member.name.clone(),
