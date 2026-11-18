@@ -120,7 +120,15 @@ impl Simulator {
         // constructor's `cg = new` after the base constructor's — leaves the
         // older instance unreachable. Drop it so it no longer counts in type
         // coverage (§19.11; the reference simulator does not count it).
-        if owner.is_some() {
+        // Only an embedded covergroup (`Class::cg`): an object may hold any
+        // number of instances of a covergroup type declared outside it
+        // (`cg_t a, b;`, `cg_t arr[4];`), and building one dropped the rest.
+        let embedded = cg_def
+            .name
+            .name
+            .rsplit_once("::")
+            .is_some_and(|(c, _)| self.module.classes.contains_key(c));
+        if owner.is_some() && embedded {
             for slot in self.cg_heap.iter_mut() {
                 if slot
                     .as_ref()
