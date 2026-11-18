@@ -391,3 +391,5 @@ mod stream_with_range_1197;
 mod stream_with_range_unpack;
 #[path = "collections/pattern_self_read.rs"]
 mod pattern_self_read;
+#[path = "collections/pattern_self_read_scopes.rs"]
+mod pattern_self_read_scopes;
