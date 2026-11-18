@@ -4951,7 +4951,7 @@ impl Simulator {
                     // including class members, before reading its elements;
                     // a `with [range]` / slice sub-range streams only the
                     // selected elements (§11.4.14.4), in stream order.
-                    let elem_list = self.stream_operand_elems(p);
+                    let elem_list = self.stream_operand_elems(p, false);
                     let piece = if let Some((names, ew)) = elem_list {
                         let mut acc = Value::zero(0);
                         for en in &names {

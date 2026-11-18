@@ -3282,26 +3282,8 @@ impl Simulator {
             };
             // Distribute `ordered` MSB-first to each target in source order.
             let total = ordered.width as usize;
-            // A `with [range]` / slice operand targets a sub-range of a
-            // collection (§11.4.14.4): only the selected elements are
-            // written, the rest of the array is unmodified. Resolve each
-            // RANGED operand's ordered element list once (the with-range
-            // bounds are evaluated a single time, per "the expression is
-            // evaluated immediately before its corresponding array is
-            // streamed"). A bare whole array has no such element list — it
-            // streams whole via the `assign_value` fast path below.
-            let operand_elems: Vec<Option<(Vec<String>, u32)>> = exprs
-                .iter()
-                .map(|e| {
-                    if Self::stream_operand_has_range(e) {
-                        self.stream_operand_elems(e)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            // Compute fixed-width targets; last target may be dynamic (remainder).
-            let mut fixed_ws: Vec<u32> = Vec::new();
+            // The last target may be a whole dynamic collection, which takes
+            // the remainder of the stream.
             let mut dyn_last: Option<String> = None;
             let mut dyn_last_elem_w: u32 = 8;
             for (i, e) in exprs.iter().enumerate() {
@@ -3324,25 +3306,27 @@ impl Simulator {
                             };
                             dyn_last = Some(n.to_string());
                             dyn_last_elem_w = ew;
-                            continue;
                         }
                     }
                 }
-                // A collection-with-range operand maps a whole number of
-                // elements: names.len() × element width.
-                fixed_ws.push(
-                    operand_elems[i]
-                        .as_ref()
-                        .map(|(ns, ew)| (ns.len() as u32) * ew)
-                        .unwrap_or_else(|| self.infer_lhs_width(e)),
-                );
             }
-            let fixed_total: u32 = fixed_ws.iter().sum();
             let mut msb = total; // bit position just above the MSB
             for (i, e) in exprs.iter().enumerate() {
                 let is_last = i == exprs.len() - 1;
+                // §11.4.14.4: a `with [range]` / slice operand targets a
+                // sub-range of a collection: only the selected elements are
+                // written, the rest of the array is unmodified. Its range
+                // "is evaluated immediately before its corresponding array
+                // is streamed", so it may read a target unpacked to its left
+                // by this same statement (`p.payload with [0 +: p.len]`).
+                let ranged = if Self::stream_operand_has_range(e) {
+                    self.stream_operand_elems(e, true)
+                } else {
+                    None
+                };
                 if is_last && dyn_last.is_some() {
-                    let remaining = (total as u32).saturating_sub(fixed_total);
+                    // Every earlier target took its width off the top.
+                    let remaining = msb as u32;
                     let elem_w = dyn_last_elem_w.max(1);
                     let n_elems = (remaining / elem_w) as usize;
                     let dname = dyn_last.clone().unwrap();
@@ -3372,7 +3356,7 @@ impl Simulator {
                             self.set_signal_value_by_name(&ename, slice_v);
                         }
                     }
-                } else if let Some((names, ew)) = operand_elems[i].as_ref() {
+                } else if let Some((names, ew)) = ranged.as_ref() {
                     // Collection-with-range target: unpack the operand's
                     // portion of the stream into the selected elements,
                     // MSB-first, leaving the array's other elements alone.

@@ -143,12 +143,17 @@ impl Simulator {
     /// that is a one-dimensional unpacked collection — a bare `arr`, or a
     /// `with [range]` / slice sub-range `arr[lo:hi]` / `arr[lo+:w]` /
     /// `arr[lo-:w]` / single `arr[i]` — together with each element's width.
-    /// The with-range bounds are evaluated once here, sharing the pack and
-    /// unpack paths (§11.4.14.4: "the expression is evaluated immediately
-    /// before its corresponding array is streamed"). `None` when `p` is not
-    /// such a collection operand (the caller streams the expression as a
-    /// value instead).
-    pub(super) fn stream_operand_elems(&mut self, p: &Expression) -> Option<(Vec<String>, u32)> {
+    /// The with-range bounds are evaluated here, when the operand is
+    /// streamed (§11.4.14.4: "the expression is evaluated immediately before
+    /// its corresponding array is streamed"); `unpack` selects the unpack
+    /// rules of `stream_ranged_elem_names`. `None` when `p` is not such a
+    /// collection operand (the caller streams the expression as a value
+    /// instead).
+    pub(super) fn stream_operand_elems(
+        &mut self,
+        p: &Expression,
+        unpack: bool,
+    ) -> Option<(Vec<String>, u32)> {
         use crate::ast::expr::RangeKind;
         let inner = match &p.kind {
             ExprKind::Paren(i) => i.as_ref(),
@@ -203,7 +208,7 @@ impl Simulator {
             Sel::All => self.stream_elem_order(&name),
             Sel::Single(idx) => {
                 let i = self.eval_expr(idx).to_i64()?;
-                self.stream_ranged_elem_names(&name, i, i)
+                self.stream_ranged_elem_names(&name, i, i, unpack)
             }
             Sel::Range { kind, left, right } => {
                 let l = self.eval_expr(left).to_i64()?;
@@ -218,7 +223,7 @@ impl Simulator {
                     RangeKind::IndexedUp => (l, l + r - 1),
                     RangeKind::IndexedDown => (l - r + 1, l),
                 };
-                self.stream_ranged_elem_names(&name, lo, hi)
+                self.stream_ranged_elem_names(&name, lo, hi, unpack)
             }
         }
     }
@@ -231,16 +236,24 @@ impl Simulator {
     /// copy of the array's entire element list. The §11.4.14.4 `with` clause
     /// applies to one-dimensional unpacked arrays, so a multi-dimensional
     /// collection (or a non-collection `name`) returns `None` here.
+    ///
+    /// §11.4.14.4: packing a range that reaches past the array streams the
+    /// whole array and then nonexistent entries (the caller reads a missing
+    /// element as its default). Unpacking resizes a dynamic array or queue
+    /// to accommodate the range, and writes only the part of the range that
+    /// lies within a fixed-size array.
     fn stream_ranged_elem_names(
         &mut self,
         name: &str,
         lo: i64,
         hi: i64,
+        unpack: bool,
     ) -> Option<(Vec<String>, u32)> {
         // Declared bounds and direction of the single dimension, in the same
         // form `stream_elem_order` uses (declared left/right; a descending
         // `[3:0]` decl stores (3,0) and streams high→low, left bound first).
-        let (dl, dh, descending): (i64, i64, bool) = if self.module.dynamic_arrays.contains(name) {
+        let dynamic = self.module.dynamic_arrays.contains(name);
+        let (dl, dh, descending): (i64, i64, bool) = if dynamic {
             (0, self.get_queue_size(name) as i64 - 1, false)
         } else if let Some(&(alo, ahi, _)) = self.module.arrays.get(name) {
             let (l0, r0) = match self.module.unpacked_decl_dims.get(name) {
@@ -253,11 +266,18 @@ impl Simulator {
             // Not a 1-D fixed array or dynamic/queue collection.
             return None;
         };
-        let lo = lo.max(dl);
-        let hi = hi.min(dh);
-        if lo > hi {
-            return None;
-        }
+        let (lo, hi) = if dynamic {
+            // Dynamic indices start at 0; an unpack grows the array to the
+            // range's upper bound.
+            if unpack && hi > dh {
+                self.set_queue_size(name, (hi + 1) as u64);
+            }
+            (lo.max(0), hi)
+        } else if unpack {
+            (lo.max(dl), hi.min(dh))
+        } else {
+            (lo, hi)
+        };
         let ew = self
             .lookup_signal_width(&format!("{name}[0]"))
             .or_else(|| self.module.arrays.get(name).map(|t| t.2))
@@ -265,6 +285,10 @@ impl Simulator {
             .max(1);
         // Stream order for a descending decl runs high→low (left bound
         // first), matching the whole-array traversal `stream_elem_order`.
+        if lo > hi {
+            // An empty selection streams nothing.
+            return Some((Vec::new(), ew));
+        }
         let idx: Vec<i64> = if descending {
             (lo..=hi).rev().collect()
         } else {
