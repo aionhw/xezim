@@ -1146,6 +1146,8 @@ mod class_param_formal_width_per_spec;
 mod class_param_typedef_chain;
 #[path = "classes/member_new_specialization.rs"]
 mod member_new_specialization;
+#[path = "classes/class_param_width_paths.rs"]
+mod class_param_width_paths;
 #[path = "classes/randc_wide_699.rs"]
 mod randc_wide_699;
 
