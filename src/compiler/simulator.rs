@@ -377,7 +377,8 @@ fn method_boost_enabled() -> bool {
 // Module helper fallbacks retain callee frames independently of tracing.
 // Refresh helper layouts after pending-only VHDL driver lowering.
 // Refresh generated process calls and selected VHDL activity tracking.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3087;
+// Refresh proven single-leaf pending driver layouts.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3088;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
