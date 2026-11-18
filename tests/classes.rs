@@ -894,6 +894,8 @@ mod vif_static_roundtrip;
 mod class_member_named_like_instance;
 #[path = "classes/covergroup_class_param_bins.rs"]
 mod covergroup_class_param_bins;
+#[path = "classes/covergroup_array_element_new.rs"]
+mod covergroup_array_element_new;
 #[path = "classes/class_method_scalar_formal_width.rs"]
 mod class_method_scalar_formal_width;
 #[path = "classes/typedef_packed_return_prototype.rs"]
