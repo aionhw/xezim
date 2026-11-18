@@ -1615,7 +1615,7 @@ impl Simulator {
                 return false;
             }
             let Some(names) = Self::member_chain(e) else {
-                return false;
+                return Self::rebase_selected_chain(e, t, hit);
             };
             let skip = usize::from(
                 t.recv
@@ -1672,6 +1672,48 @@ impl Simulator {
                 Self::rebase_expr(expr, t, hit)
                     && args.iter_mut().all(|a| Self::rebase_expr(a, t, hit))
             }
+            _ => false,
+        }
+    }
+
+    /// §18.5.9: `prop.g.item[1].key` — a path below `prop` that selects an
+    /// element on the way (an unrolled `foreach` over a member array of the
+    /// sub-object) — rebased like a plain chain, keeping its selects. Only
+    /// constant selects qualify: an index naming a variable of this object
+    /// could not be read in the sub-object's solve.
+    fn rebase_selected_chain(e: &mut Expression, t: &Rebase<'_>, hit: &mut bool) -> bool {
+        fn constant(x: &Expression) -> bool {
+            match &x.kind {
+                ExprKind::Number(_) => true,
+                ExprKind::Paren(i) | ExprKind::Unary { operand: i, .. } => constant(i),
+                ExprKind::Binary { left, right, .. } => constant(left) && constant(right),
+                _ => false,
+            }
+        }
+        match &mut e.kind {
+            ExprKind::Ident(h) => {
+                let skip = usize::from(t.recv.is_some_and(|r| {
+                    h.path.len() >= 3 && h.path[0].name.name == r && h.path[1].name.name == t.prop
+                }));
+                if h.root.is_some()
+                    || h.path.len() < skip + 2
+                    || h.path[skip].name.name != t.prop
+                    || h.path[..=skip].iter().any(|s| !s.selects.is_empty())
+                    || !h.path[skip + 1..]
+                        .iter()
+                        .all(|s| s.selects.iter().all(constant))
+                {
+                    return false;
+                }
+                h.path.drain(..=skip);
+                h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                h.cached_resolved_name = crate::ast::cache::NameCache::new();
+                *hit = true;
+                true
+            }
+            // `prop.g.item[1].key` parsed as a member access over an index:
+            // the index operand is rebased (a constant stays as it is).
+            ExprKind::MemberAccess { expr, .. } => Self::rebase_expr(expr, t, hit),
             _ => false,
         }
     }
