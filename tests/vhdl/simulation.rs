@@ -669,3 +669,10 @@ fn singleton_pending_scalar_parts() {
 fn initialization_batch_order() {
     check("initialization_batches");
 }
+
+/// §16.2.4: forwarding through signal formals preserves TIME'HIGH before
+/// the first event and the previous timestamp on equal-value transactions.
+#[test]
+fn last_event_through_signal_formals() {
+    check("last_event");
+}
