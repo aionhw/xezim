@@ -4376,11 +4376,37 @@ impl Simulator {
                 );
                 // Operands the width probe had to evaluate are kept and
                 // reused below instead of being evaluated again.
-                let has_shift = (is_arith_or_bitwise
+                let shift_scanned = is_arith_or_bitwise
                     || is_comparison
-                    || matches!(op, BinaryOp::Div | BinaryOp::Mod))
+                    || matches!(op, BinaryOp::Div | BinaryOp::Mod);
+                // An operand whose parent found it shift-free is, and so are
+                // its operands (see `shift_free_operand`).
+                let shift_free = std::mem::take(&mut self.shift_free_operand)
+                    == expr as *const Expression as usize;
+                let has_shift = shift_scanned
+                    && !shift_free
                     && (super::bytecode::has_context_shift(left)
                         || super::bytecode::has_context_shift(right));
+                // The operand of a shift-free scan that the scan recursed
+                // into, marked while it is evaluated.
+                let shift_free_mark = |e: &Expression| -> usize {
+                    match &e.kind {
+                        ExprKind::Binary {
+                            op:
+                                BinaryOp::Add
+                                | BinaryOp::Sub
+                                | BinaryOp::Mul
+                                | BinaryOp::Div
+                                | BinaryOp::Mod
+                                | BinaryOp::BitAnd
+                                | BinaryOp::BitOr
+                                | BinaryOp::BitXor
+                                | BinaryOp::BitXnor,
+                            ..
+                        } if shift_scanned && !has_shift => e as *const Expression as usize,
+                        _ => 0,
+                    }
+                };
                 let mut pre_l: Option<Value> = None;
                 let mut pre_r: Option<Value> = None;
                 let self_det_w = if is_arith_or_bitwise {
@@ -4575,7 +4601,12 @@ impl Simulator {
                         }
                         v
                     }
-                    None => self.eval_expr_typed(left, self_det_w, left_unsigned),
+                    None => {
+                        self.shift_free_operand = shift_free_mark(left);
+                        let v = self.eval_expr_typed(left, self_det_w, left_unsigned);
+                        self.shift_free_operand = 0;
+                        v
+                    }
                 };
                 // §11.4.8 zero-mask elision. `0 & anything` is 0 for EVERY
                 // value the other side can take — `0 & x` and `0 & z` are both
@@ -4622,7 +4653,10 @@ impl Simulator {
                     let rw = self.infer_width(right);
                     self.eval_expr_ctx(right, rw)
                 } else {
-                    self.eval_expr_typed(right, self_det_w, right_unsigned)
+                    self.shift_free_operand = shift_free_mark(right);
+                    let v = self.eval_expr_typed(right, self_det_w, right_unsigned);
+                    self.shift_free_operand = 0;
+                    v
                 };
                 // IEEE 1800-2023 §6.16 / Table 6-9: the `==`/`!=` operators
                 // are 2-STATE when applied to the `string` data type — they

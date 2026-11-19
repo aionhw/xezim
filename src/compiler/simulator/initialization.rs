@@ -4764,6 +4764,7 @@ impl Simulator {
             packed_named_signed,
             packed_named_signed_props,
             packed_named_sign_guard: 0,
+            shift_free_operand: 0,
             fn_decl_cache: HashMap::default(),
             free_fn_table: None,
             class_handle_member_types_cache: None,

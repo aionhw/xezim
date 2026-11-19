@@ -10405,6 +10405,13 @@ pub struct Simulator {
     /// address), so the re-entrant evaluation reads the slice itself.
     #[serde(skip)]
     packed_named_sign_guard: usize,
+    /// The arithmetic or bitwise operand (its address) being evaluated
+    /// whose parent operator found no context-determined shift in it
+    /// (`has_context_shift`), so its own operator does not scan its operands
+    /// again: each level of a chain `a ^ b ^ ...` scanned the whole chain
+    /// under it.
+    #[serde(skip)]
+    shift_free_operand: usize,
     /// `module.functions` holds each `FunctionDeclaration` by value, so the
     /// obvious `get(name).cloned()` deep-copies a whole function AST — body,
     /// statements and all — on EVERY call. On a design that calls a function
