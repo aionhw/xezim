@@ -1674,12 +1674,14 @@ impl Simulator {
                     } else {
                         let absent = ports
                             .iter()
-                            .all(|p| !self.vif_local_names.contains(&p.name.name));
+                            .map(|p| p.name.name.as_str())
+                            .chain(Self::body_decl_names(body))
+                            .all(|n| !self.vif_local_names.contains(n));
                         plan.vif_absent.set((vif_len0, absent));
                         absent
                     }
                 };
-                let vif_formals: Vec<(&str, Option<&Expression>)> = if vif_fast {
+                let mut vif_formals: Vec<(&str, Option<&Expression>)> = if vif_fast {
                     Vec::new()
                 } else {
                     ports
@@ -1700,6 +1702,11 @@ impl Simulator {
                         })
                         .collect()
                 };
+                // §13.5 / §25.9: the variables the body declares are the
+                // method's own, like its plain formals (see `vif_own_names`).
+                if !vif_fast && !self.vif_local_names.is_empty() {
+                    self.vif_own_names(ports, body, &mut vif_formals);
+                }
                 let vif_saved = if vif_fast {
                     Vec::new()
                 } else {

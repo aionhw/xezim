@@ -1911,7 +1911,11 @@ impl Simulator {
             for d in declarators {
                 let nm = d.name.name.as_str();
                 sv.declared_names.push(nm.to_string());
-                if d.dimensions.is_empty() && self.is_virtual_iface_type(data_type) {
+                // §13.5 / §25.9: a variable of any type hides a key left under
+                // its name by an enclosing or a caller's binding too.
+                if (d.dimensions.is_empty() && self.is_virtual_iface_type(data_type))
+                    || self.vif_local_names.contains(nm)
+                {
                     // §6.21 / §25.9: hiding a variable also hides its binding.
                     // Values alone cannot restore the enclosing vif after a
                     // nested block has rebound or cleared the same bare name.

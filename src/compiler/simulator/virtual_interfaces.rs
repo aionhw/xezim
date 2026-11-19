@@ -580,6 +580,47 @@ impl Simulator {
         )
     }
 
+    /// §13.5, §25.9: append to `formals`, with no actual, the names a
+    /// subroutine declares for itself under which a `__vif_local__` key may
+    /// already exist: its formals that cannot carry an interface and the
+    /// variables declared at the top level of its body. The keys are flat by
+    /// name, so a caller's virtual-interface formal or local `v` leaves one,
+    /// and inside a callee with an `int v` of its own that `v` read as the
+    /// caller's interface (`data = v;` stored a handle token). Entering with
+    /// no actual clears the key for the call; the exit puts it back.
+    pub(super) fn vif_own_names<'a>(
+        &self,
+        ports: &'a [crate::ast::decl::FunctionPort],
+        items: &'a [crate::ast::stmt::Statement],
+        formals: &mut Vec<(&'a str, Option<&'a Expression>)>,
+    ) {
+        let ports = ports
+            .iter()
+            .filter(|p| !Self::formal_may_carry_vif(&p.data_type))
+            .map(|p| p.name.name.as_str());
+        for name in ports.chain(Self::body_decl_names(items)) {
+            if self.vif_local_names.contains(name) && !formals.iter().any(|f| f.0 == name) {
+                formals.push((name, None));
+            }
+        }
+    }
+
+    /// The variables declared at the top level of a subroutine body.
+    pub(super) fn body_decl_names(
+        items: &[crate::ast::stmt::Statement],
+    ) -> impl Iterator<Item = &str> {
+        use crate::ast::stmt::StatementKind;
+        items
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => Some(declarators),
+                _ => None,
+            })
+            .flatten()
+            .map(|d| d.name.name.as_str())
+    }
+
     /// §25.9 `__vif_local__` keys on call entry: each formal takes its
     /// actual's interface binding, or none. The keys are flat by formal
     /// name, so the caller's values are returned for `vif_formals_exit` to

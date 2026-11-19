@@ -4282,6 +4282,18 @@ impl Simulator {
         {
             return true;
         }
+        // §13.5, §25.9: the running frame does not declare `name`, so it
+        // reads the enclosing scope (a module, interface or package
+        // variable). The key a CALLER's virtual-interface formal of that name
+        // made does not speak for it: no caller frame is visible here. The
+        // running subroutine's own formal (its alias frame is the last one,
+        // read from a nested scope such as an inline constraint) still is.
+        if let Some((own, callers)) = self.local_iface_aliases.split_last()
+            && !own.contains_key(name)
+            && callers.iter().any(|f| f.contains_key(name))
+        {
+            return false;
+        }
         let Some(th) = self.this_stack.last().copied().flatten() else {
             return true;
         };
