@@ -60,6 +60,72 @@ fn all_pass(src: &str, checks: usize) {
     }
 }
 
+const COMPILED_CALLERS: &str = r##"
+module top;
+  int errors = 0;
+  task automatic check(string what, logic [127:0] got, logic [127:0] want);
+    if (got === want) $display("PASS %s", what);
+    else begin errors++; $display("FAIL %s: got %h, expected %h", what, got, want); end
+  endtask
+
+  function automatic [7:0] rd_bit(input [7:0] v); reg [0:7] n; begin n = v; rd_bit = {7'b0, n[0]}; end endfunction
+  function automatic [7:0] rd_part(input [7:0] v); reg [0:7] n; begin n = v; rd_part = {4'b0, n[0:3]}; end endfunction
+  function automatic [7:0] rd_up(input [7:0] v); reg [0:7] n; begin n = v; rd_up = {5'b0, n[1 +: 3]}; end endfunction
+  function automatic [7:0] rd_off(input [7:0] v); reg [8:1] n; begin n = v; rd_off = {7'b0, n[1]}; end endfunction
+  function automatic [7:0] rd_var(input [7:0] v, input int k); reg [0:7] n; begin n = v; rd_var = {7'b0, n[k]}; end endfunction
+  function automatic [7:0] rd_formal(input [0:7] n); rd_formal = {4'b0, n[4:7]}; endfunction
+  function automatic [0:7] wr_ret(input [7:0] v); begin wr_ret = 0; wr_ret[0] = v[0]; wr_ret[6:7] = v[2:1]; end endfunction
+  function automatic [7:0] wr_local(input [7:0] v); reg [0:7] n; begin n = 0; n[0] = v[0]; n[4 +: 4] = v[7:4]; wr_local = n; end endfunction
+  function automatic [7:0] whole_only(input [0:7] n); whole_only = n ^ 8'h0f; endfunction
+
+  reg [7:0] x;
+  int k;
+  wire [7:0] a = rd_bit(x), b = rd_part(x), c = rd_up(x), d = rd_off(x), e = rd_var(x, k), f = rd_formal(x);
+  wire [7:0] g = wr_ret(x), h = wr_local(x), w = whole_only(x);
+  reg [7:0] z, y1, y2, y3;
+  always_comb z = rd_part(x) ^ rd_formal(x);
+  always @* begin : b1
+    reg [0:7] t;
+    t = x;
+    y1 = {7'b0, t[0]};
+    y2 = {4'b0, t[0:3]};
+  end
+  always @* begin : b2
+    reg [8:1] t;
+    t = 0;
+    t[1] = x[7];
+    t[8:5] = x[3:0];
+    y3 = t;
+  end
+  initial begin
+    x = 8'hb1; k = 7; #1;
+    check("bit read", a, 8'h01);
+    check("part read", b, 8'h0b);
+    check("indexed part read", c, 8'h03);
+    check("offset bit read", d, 8'h01);
+    check("variable index read", e, 8'h01);
+    check("formal part read", f, 8'h01);
+    check("return variable writes", g, 8'h80);
+    check("local writes", h, 8'h8b);
+    check("whole value", w, 8'hbe);
+    check("always_comb", z, 8'h0a);
+    check("block local bit read", y1, 8'h01);
+    check("block local part read", y2, 8'h0b);
+    check("offset block local writes", y3, 8'h11);
+    x = 8'h4e; k = 2; #1;
+    check("bit read, second value", a, 8'h00);
+    check("part read, second value", b, 8'h04);
+    check("variable index read, second value", e, 8'h00);
+    check("return variable writes, second value", g, 8'h03);
+    check("local writes, second value", h, 8'h04);
+    check("block local part read, second value", y2, 8'h04);
+    check("offset block local writes, second value", y3, 8'he0);
+    $display("DONE: %0d errors", errors);
+    $finish;
+  end
+endmodule
+"##;
+
 const DECLARED_RANGE: &str = r##"
 module top;
   int errors = 0;
@@ -419,4 +485,14 @@ fn declared_range_selects_neighbouring_shapes() {
 #[test]
 fn declared_range_selects_of_method_formals_and_nested_scopes() {
     all_pass(METHODS_AND_SCOPES, 14);
+}
+
+/// Reads and writes of such locals, formals and results in functions called
+/// from continuous assigns and an `always_comb`, and the static block locals
+/// of `always` blocks (read, and written with an offset range). A compiled caller inlined the function and took each
+/// label for a raw bit position (`n[0:3]` of `reg [0:7] n` read the low
+/// nibble); such a function now stays on the interpreter.
+#[test]
+fn declared_range_selects_in_compiled_callers() {
+    all_pass(COMPILED_CALLERS, 20);
 }
