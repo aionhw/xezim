@@ -335,6 +335,8 @@ mod packed_struct_member_idx_select;
 mod real_unpacked_concat_items;
 #[path = "collections/unpacked_case_compare.rs"]
 mod unpacked_case_compare;
+#[path = "collections/unpacked_concat_fixed_row.rs"]
+mod unpacked_concat_fixed_row;
 #[path = "collections/unpacked_row_pattern_store.rs"]
 mod unpacked_row_pattern_store;
 #[path = "collections/unpacked_row_pattern_followups.rs"]
