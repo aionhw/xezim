@@ -220,6 +220,92 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   tables: 2,000 calls writing a 64-bit local bit by bit take 23% fewer
   instructions, 34% fewer in a class method (§11.5.1, #1298).
 
+* A copy of a procedural statement shares the statement list of each
+  `begin`/`end` and `fork`/`join` block with the statement it was copied from,
+  and a root process whose body the final rewrite leaves unchanged keeps the
+  list it was parsed into; a block is copied only when a rewrite changes it
+  (§9.3, §9.2, #721, reported by amal-khailtash).
+
+* The optional parts of a declaration or statement that most designs leave out
+  (a nonblocking assignment's intra-assignment delay, a declarator's
+  initializer, net and continuous-assignment delays, a case item's pattern and
+  guard, an assertion's inferred clock, clocking skews) and the rare module
+  items (`for` generate, DPI import and export) are held out of line, so a
+  statement or module item without them is smaller (§10.4.2, §6.7.1, §10.3.3,
+  §12.6, #721, reported by amal-khailtash).
+
+* The parser hands over statement, declaration, port, argument and dimension
+  lists in buffers of their exact length, and the pages freed by parsing and
+  by the top module's elaboration are returned before the next phase allocates
+  (#721, reported by amal-khailtash).
+
+* The declaration-before-use check shares one table of module names between
+  the procedural scopes of a module instead of copying it for every function,
+  block and condition (§6.5, §6.21, #721, reported by amal-khailtash).
+
+* A leaf module with no instances, binds or generate constructs is inlined
+  without a second prepared copy of its items, and the check of inlined bodies
+  builds the table of names outside classes only when a class method needs it
+  (§23.3, §13.4, #721, reported by amal-khailtash).
+
+* A signal wider than 64 bits holds a previous-value copy for edge detection
+  only once it has been sampled; until then its all-x initial value is implied
+  (§9.4.2, #721, reported by amal-khailtash).
+
+* The declared types of a struct variable's members are read from an ordered
+  index of member names when a subroutine saves and restores a local, the
+  edge-block compilers share one index of qualified function names, and a
+  design without continuous assignments skips the buffer collapse pass (§7.2,
+  §13.4.2, §10.11, #721, reported by amal-khailtash).
+
+* Elaboration releases the prepared body of a parameter environment that no
+  second instance repeats. A body another instance asks for is kept for the
+  whole pass as before; of the bodies only one instance used, each definition
+  keeps its 16 most recent, and an environment that comes back after its body
+  was released is prepared once more and then kept. 512 instances of a module
+  generated under a distinct parameter value each peak at 136 MiB instead of
+  1,147 MiB; a design whose instances share their environments is unchanged
+  (#721, suggested by amal-khailtash).
+
+* The typed value parameters of one declaration share one copy of its declared
+  type across the instances of the module, instead of a copy of the type tree
+  per parameter per instance. Ranges written with parameters still resolve per
+  instance, and a type that names a typedef of the instance stays per
+  instance. 512 instances with 32 parameters of a 64-member packed struct peak
+  at 514 MiB instead of 1,393 MiB (§6.20.2, #721, suggested by
+  amal-khailtash).
+
+* The index that finds the parameters of an interface instance bound to an
+  interface port holds the path of each instance once, with the names of its
+  parameters beside it, instead of the full key of every parameter. 2,048
+  interface instances with 96 untyped parameters each peak at 631 MiB instead
+  of 704 MiB; an instance with a single parameter costs what it did (§25.10,
+  #721, suggested by amal-khailtash).
+
+* A class declared in a module holds its constraint blocks once for every
+  instance of the module, and a class specialization shares them with the
+  class it specializes; each elaborated copy of the class used to hold a deep
+  copy of every block. The blocks are shared where the class is copied, with
+  no comparison afterwards, so the compile gets faster as well: 1,024
+  instances of a module whose class has 128 constraint expressions peak at 44
+  MiB instead of 1,672 MiB and compile in 0.70 s instead of 2.68 s. A
+  `randomize()` call solves a working copy of its own, as before, and an
+  out-of-block constraint body is installed in the class it names (§8.3,
+  §18.5, #721, suggested by amal-khailtash).
+
+* The continuous assignments of an instance record one shared scope string for
+  code coverage instead of a copy of the instance path each, and the
+  assignments deferred during instance expansion are moved into a table
+  reserved once for all of them. 1,024 instances with 512 assignments each and
+  512-character instance names peak at 1,616 MiB instead of 2,066 MiB (§10.3,
+  #721, suggested by amal-khailtash).
+
+* The scope tree that upward hierarchical names are resolved against holds
+  each instance path and each definition name once, and a parent lists its
+  children by their paths instead of by a copy of the instance name and of the
+  definition name. 66,560 instances with 256-character names peak at 206 MiB
+  instead of 309 MiB (§23.8, #721, suggested by amal-khailtash).
+
 **Command line**
 
 * `$dumpvars` and `$fsdbDumpvars` accept indexed scope arguments: a
