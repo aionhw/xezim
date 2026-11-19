@@ -5674,3 +5674,29 @@ impl Simulator {
         self.check_edges_inner(None, false);
     }
 }
+
+#[cfg(test)]
+mod wide_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn untouched_wide_cells_share_an_implicit_initial_baseline() {
+        let mut sim = crate::simulate(
+            "module tb; logic [129:0] mem[0:127]; initial $finish; endmodule",
+            0,
+        )
+        .unwrap();
+        let id = *sim.signal_name_to_id.get("mem[3]").unwrap();
+        assert!(!sim.prev_wide.contains_key(&id));
+        assert_eq!(sim.preponed_value_of(id), Value::new(130));
+        sim.signal_table[id] = Value::new(130);
+        assert!(!sim.check_edge_id(id, EdgeKind::AnyEdge));
+        sim.signal_table[id].set_bit(129, LogicBit::Z);
+        assert!(sim.check_edge_id(id, EdgeKind::AnyEdge));
+        sim.edge_signal_ids.push(id);
+        sim.snapshot_edge_signals_full();
+        assert!(!sim.check_edge_id(id, EdgeKind::AnyEdge));
+        assert_eq!(sim.preponed_value_of(id).get_bit(129), LogicBit::Z);
+        assert!(!sim.prev_wide.contains_key(&(id + 1)));
+    }
+}
