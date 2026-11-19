@@ -803,3 +803,5 @@ mod review_pattern_type_keys_params;
 mod local_select_declared_range;
 #[path = "types/nettype_alias_1302.rs"]
 mod nettype_alias_1302;
+#[path = "types/pattern_type_key_last_match_1290.rs"]
+mod pattern_type_key_last_match_1290;
