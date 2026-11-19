@@ -3841,6 +3841,123 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// §7.4.1: is `dt` a vector whose packed range is not `[N-1:0]` (an
+    /// ascending range, or a low bound other than 0), directly or through a
+    /// typedef? A bound that does not fold counts as one.
+    fn decl_has_offset_range(&self, dt: &crate::ast::types::DataType) -> bool {
+        use crate::ast::types::{DataType, PackedDimension};
+        let offset = |dims: &[PackedDimension]| {
+            dims.iter().any(|d| match d {
+                PackedDimension::Range { left, right, .. } => {
+                    let c =
+                        |e| crate::compiler::elaborate::const_eval_i64_with_params(e, self.params);
+                    c(right) != Some(0) || c(left).is_some_and(|l| l < 0)
+                }
+                PackedDimension::Unsized(_) => false,
+            })
+        };
+        let mut cur = dt;
+        for _ in 0..16 {
+            match cur {
+                DataType::IntegerVector { dimensions, .. }
+                | DataType::Implicit { dimensions, .. } => {
+                    return offset(dimensions);
+                }
+                DataType::TypeReference {
+                    name, dimensions, ..
+                } => {
+                    if offset(dimensions) {
+                        return true;
+                    }
+                    match self.typedef_types.and_then(|t| t.get(&name.name.name)) {
+                        Some(next) => cur = next,
+                        None => return false,
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// §7.4.1, §11.5.1: does a subroutine select (`v[i]`, `v[7:4]`,
+    /// `v[i +: 2]`) one of its formals, locals or its result declared with a
+    /// packed range other than `[N-1:0]`? Such a select names the bits its
+    /// range labels, while an inlined body's select takes the label for a
+    /// raw bit position: `n[0]` of `reg [0:7] n` read bit 0. The body is not
+    /// inlined then; the interpreter places the label.
+    fn selects_offset_range_var(
+        &self,
+        ports: &[crate::ast::decl::FunctionPort],
+        ret: Option<(&str, &crate::ast::types::DataType)>,
+        body: &[Statement],
+    ) -> bool {
+        fn decls<'s>(s: &'s Statement, out: &mut Vec<(&'s str, &'s crate::ast::types::DataType)>) {
+            match &s.kind {
+                StatementKind::VarDecl {
+                    data_type,
+                    declarators,
+                    ..
+                } => out.extend(
+                    declarators
+                        .iter()
+                        .filter(|d| d.dimensions.is_empty())
+                        .map(|d| (d.name.name.as_str(), data_type)),
+                ),
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    stmts.iter().for_each(|s| decls(s, out))
+                }
+                StatementKind::If {
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => {
+                    decls(then_stmt, out);
+                    if let Some(e) = else_stmt {
+                        decls(e, out);
+                    }
+                }
+                StatementKind::Case { items, .. } => {
+                    items.iter().for_each(|it| decls(&it.stmt, out))
+                }
+                StatementKind::For { body, .. }
+                | StatementKind::Foreach { body, .. }
+                | StatementKind::While { body, .. }
+                | StatementKind::DoWhile { body, .. }
+                | StatementKind::Repeat { body, .. }
+                | StatementKind::Forever { body } => decls(body, out),
+                _ => {}
+            }
+        }
+        let mut vars: Vec<(&str, &crate::ast::types::DataType)> = ports
+            .iter()
+            .filter(|p| p.dimensions.is_empty())
+            .map(|p| (p.name.name.as_str(), &p.data_type))
+            .chain(ret)
+            .collect();
+        body.iter().for_each(|s| decls(s, &mut vars));
+        let names: Vec<&str> = vars
+            .into_iter()
+            .filter(|(_, dt)| self.decl_has_offset_range(dt))
+            .map(|(n, _)| n)
+            .collect();
+        if names.is_empty() {
+            return false;
+        }
+        let mut sc = super::fb_scan::FbScan::new(None);
+        for s in body {
+            sc.stmt(s);
+        }
+        // The body of an instantiated module's function names its own
+        // variables instance-qualified too (`u0.n`).
+        sc.names.iter().any(|(n, flags)| {
+            flags & super::fb_scan::SEL != 0
+                && names
+                    .iter()
+                    .any(|m| n == m || n.strip_suffix(m).is_some_and(|p| p.ends_with('.')))
+        })
+    }
+
     fn stmt_is_blocking(stmt: &Statement) -> bool {
         match &stmt.kind {
             StatementKind::TimingControl { .. } => true,
@@ -4304,6 +4421,14 @@ impl<'a> BytecodeCompiler<'a> {
         // Nothing that suspends, and no nested calls we cannot see through.
         if items.iter().any(Self::stmt_is_blocking) {
             self.bail("Expr_Call_blocking");
+            return None;
+        }
+        if self.selects_offset_range_var(
+            &fd.ports,
+            Some((fd.name.name.name.as_str(), &fd.return_type)),
+            &items,
+        ) {
+            self.bail("Expr_Call_offset_range_select");
             return None;
         }
         let ret_is_string = self.decl_is_string(&fd.return_type, Some(&name));
@@ -5164,6 +5289,9 @@ impl<'a> BytecodeCompiler<'a> {
         } else {
             return false;
         };
+        if self.selects_offset_range_var(&ports, None, &body) {
+            return false;
+        }
         // §13.3.1: a STATIC subroutine's variables — its locals and output
         // formals — keep their values between calls; an inline gives each
         // call fresh registers. That differs only for a variable whose value
@@ -5509,6 +5637,11 @@ impl<'a> BytecodeCompiler<'a> {
             other => other.to_vec(),
         };
         !items.iter().any(Self::stmt_is_blocking)
+            && !self.selects_offset_range_var(
+                &fd.ports,
+                Some((fd.name.name.name.as_str(), &fd.return_type)),
+                &items,
+            )
     }
 
     fn for_body_is_simple(&self, stmt: &Statement) -> bool {
@@ -14503,6 +14636,24 @@ impl<'a> BytecodeCompiler<'a> {
                 self.bail("VarDecl_shadows_signal");
                 return false;
             }
+        }
+        // §7.4.1, §11.5.1: a block local declared with a packed range other
+        // than `[N-1:0]` is selected by its labels, which a compiled select
+        // does not place (`t[0:3]` of `reg [0:7] t` read the low nibble).
+        // Failing without a fallback keeps the whole block on the
+        // interpreter, which runs the declaration. An inlined subroutine's
+        // locals were checked when it was admitted (`selects_offset_range_var`).
+        if self.inlining_stack.is_empty()
+            && let StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } = &stmt.kind
+            && declarators.iter().any(|d| d.dimensions.is_empty())
+            && self.decl_has_offset_range(data_type)
+        {
+            self.bail("VarDecl_offset_range");
+            return false;
         }
         let start = self.insns.len();
         let start_reg = self.next_reg;
