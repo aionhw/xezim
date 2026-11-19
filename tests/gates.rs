@@ -54,6 +54,8 @@ mod interrupt_fst_tail;
 mod multi_driver_contention;
 #[path = "gates/nameless_udp_instance.rs"]
 mod nameless_udp_instance;
+#[path = "gates/net_array_cell_drivers.rs"]
+mod net_array_cell_drivers;
 #[path = "gates/net_declaration_delay.rs"]
 mod net_declaration_delay;
 #[path = "gates/zero_rise_gate_net_delay.rs"]
