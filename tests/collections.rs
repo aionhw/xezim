@@ -54,6 +54,8 @@ mod dyn_array_of_mailboxes;
 mod fixed_array_member_initializer;
 #[path = "collections/fixed_array_member_pattern_forms.rs"]
 mod fixed_array_member_pattern_forms;
+#[path = "collections/fixed_array_row_copy_order.rs"]
+mod fixed_array_row_copy_order;
 #[path = "collections/foreach_assoc_key_types.rs"]
 mod foreach_assoc_key_types;
 #[path = "collections/foreach_blocking_resume.rs"]
