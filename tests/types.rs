@@ -801,3 +801,5 @@ mod negative_bound_packed_slice_write_1193;
 mod review_pattern_type_keys_params;
 #[path = "types/local_select_declared_range.rs"]
 mod local_select_declared_range;
+#[path = "types/pattern_type_key_last_match_1290.rs"]
+mod pattern_type_key_last_match_1290;
