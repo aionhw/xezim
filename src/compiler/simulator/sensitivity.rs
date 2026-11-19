@@ -768,6 +768,11 @@ impl Simulator {
         FRAME_SHADOW.with(|c| c.replace(outer_shadow));
         let callee_reads = CALLEE_READS.with(|c| c.replace(outer)).unwrap_or_default();
         body_reads.retain(|r| !frame.contains(r.as_str()) || keep.contains(r));
+        // §9.2.2.2.1: a variable the function also writes is not part of the
+        // caller's sensitivity. A continuous assignment whose function counts
+        // its calls in a module variable otherwise re-ran on its own write
+        // until the settle limit (§10.3).
+        body_reads.retain(|r| !scratch_writes.contains(r) || frame.contains(r.as_str()));
         // The reads that remain rooted at frame state: `s[3]` of a formal
         // `s`, `i` of a loop variable.
         let frame_local: Vec<String> = body_reads
