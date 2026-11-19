@@ -19,12 +19,17 @@ impl Simulator {
     /// §10.10/§11.4.12: the elements an unpacked-array concatenation's
     /// operands contribute, in order — a queue / array operand (bare, an
     /// object member, a struct member reached through any selects, an
-    /// associative element that is itself a collection) or a slice of one
-    /// contributes all of its elements; anything else is one element.
+    /// associative element that is itself a collection) or a slice contributes
+    /// its elements. Expand a fixed row only for a non-array element type.
     #[inline(never)]
-    pub(super) fn unpacked_concat_operand_values(&mut self, items: Vec<&Expression>) -> Vec<Value> {
+    pub(super) fn unpacked_concat_operand_values<'e>(
+        &mut self,
+        items: Vec<&'e Expression>,
+        expand_rows: bool,
+        mut first_row: Option<(&'e Expression, super::unpacked_slices::UnpackedLayout<'e>)>,
+    ) -> Vec<Value> {
         let mut all_vals: Vec<Value> = Vec::new();
-        for expr in items {
+        for (position, expr) in items.into_iter().enumerate() {
             // §10.10, §13.4.1: a call returning an unpacked array contributes
             // the elements it returns, in order (the call runs once).
             if matches!(expr.kind, ExprKind::Call { .. })
@@ -37,6 +42,24 @@ impl Simulator {
                         }
                     }
                 }
+                continue;
+            }
+            if expand_rows
+                && let Some(row) = if first_row
+                    .as_ref()
+                    .is_some_and(|(e, _)| std::ptr::eq(*e, expr))
+                {
+                    // A preceding operand can change an object's receiver.
+                    first_row
+                        .take()
+                        .filter(|(_, row)| position == 0 || !row.object_member())
+                        .map(|(_, row)| row)
+                        .or_else(|| self.fixed_row_concat_shape(expr))
+                } else {
+                    self.fixed_row_concat_shape(expr)
+                }
+            {
+                self.append_fixed_row_concat_values(row, &mut all_vals);
                 continue;
             }
             // A queue/array operand — bare (`q`), an instance-

@@ -2383,6 +2383,7 @@ impl Simulator {
         &mut self,
         pname: &str,
         dims: &[crate::ast::types::UnpackedDimension],
+        dims_from_type: bool,
         arg: &Expression,
         queue_data_type: &crate::ast::types::DataType,
         dir: PortDirection,
@@ -2396,7 +2397,14 @@ impl Simulator {
             return None;
         }
         if let Some(selected) = self.selected_aggregate_formal_rhs(queue_data_type, dims, arg) {
-            return self.bind_queue_param(pname, dims, &selected, queue_data_type, dir);
+            return self.bind_queue_param(
+                pname,
+                dims,
+                dims_from_type,
+                &selected,
+                queue_data_type,
+                dir,
+            );
         }
         // A queue literal / assignment pattern (`{"a", "b"}` or `'{...}`) passed
         // directly as the actual: bind each top-level element as one queue
@@ -2463,7 +2471,9 @@ impl Simulator {
                 if self.assign_struct_concat(&key, parts.clone()) {
                     return Some((key, String::new()));
                 }
-                let vals = self.unpacked_concat_operand_values(parts);
+                let expand_rows = dims.len() == 1
+                    && (dims_from_type || !self.concat_element_type_is_array(queue_data_type));
+                let vals = self.unpacked_concat_operand_values(parts, expand_rows, None);
                 let n = vals.len() as u64;
                 for (j, v) in vals.into_iter().enumerate() {
                     self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
