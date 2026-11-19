@@ -539,6 +539,89 @@ impl Simulator {
         Some(m)
     }
 
+    /// §8.5, §6.20.4: the parameters that size a type written inside a class
+    /// method: the active specialization's value parameters
+    /// (`class_spec_value_params`) plus the class-body constants the packed
+    /// dimensions of `dt` name (`localparam int W = 4;` ...
+    /// `$bits(logic [W-1:0])`), own or inherited. The design parameter map
+    /// holds a class constant only under its class-qualified name, so the
+    /// dimension was dropped and the type came out one bit wide (#1273).
+    pub(super) fn class_type_env(&mut self, dt: &DataType) -> Option<HashMap<String, Value>> {
+        let mut env = self.class_spec_value_params();
+        let Some(Some(ctx)) = self.class_context_stack.last().cloned() else {
+            return env;
+        };
+        let mut names: Vec<String> = Vec::new();
+        Self::type_dim_idents(dt, 0, &mut names);
+        for n in names {
+            if env.as_ref().is_some_and(|m| m.contains_key(&n)) || !self.class_body_const(&ctx, &n)
+            {
+                continue;
+            }
+            let v = self.eval_expr(&super::vpi_model::ident_expr(&n));
+            env.get_or_insert_with(HashMap::default).insert(n, v);
+        }
+        env
+    }
+
+    /// Whether `name` is a body constant (`parameter` / `localparam`, not a
+    /// header parameter) of class `cls` or of a class it extends.
+    fn class_body_const(&self, cls: &str, name: &str) -> bool {
+        let mut cur = self.module.classes.get(cls);
+        let mut depth = 0;
+        while let Some(cd) = cur {
+            if cd.param_defaults.iter().any(|(n, _)| n == name) {
+                return !cd.param_order.iter().any(|p| p == name);
+            }
+            depth += 1;
+            if depth > 64 {
+                break;
+            }
+            cur = cd.extends.as_ref().and_then(|e| self.module.classes.get(e));
+        }
+        false
+    }
+
+    /// The plain identifiers the packed dimensions of `dt` read.
+    fn type_dim_idents(dt: &DataType, depth: u32, out: &mut Vec<String>) {
+        use crate::ast::types::PackedDimension;
+        if depth > 8 {
+            return;
+        }
+        let dims = |dimensions: &[PackedDimension], out: &mut Vec<String>| {
+            for d in dimensions {
+                if let PackedDimension::Range { left, right, .. } = d {
+                    for e in [left, right] {
+                        Self::walk_operands(e, &mut |x| {
+                            if let ExprKind::Ident(h) = &x.kind
+                                && h.path.len() == 1
+                                && !out.contains(&h.path[0].name.name)
+                            {
+                                out.push(h.path[0].name.name.clone());
+                            }
+                        });
+                    }
+                }
+            }
+        };
+        match dt {
+            DataType::IntegerVector { dimensions, .. }
+            | DataType::Implicit { dimensions, .. }
+            | DataType::TypeReference { dimensions, .. } => dims(dimensions, out),
+            DataType::Struct(su) => {
+                for m in &su.members {
+                    Self::type_dim_idents(&m.data_type, depth + 1, out);
+                }
+            }
+            DataType::Enum(et) => {
+                if let Some(bt) = &et.base_type {
+                    Self::type_dim_idents(bt, depth + 1, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Resolve a value parameter `name` against the ACTIVE specialization,
     /// and if it is not declared there, against each ENCLOSING caller
     /// specialization on `spec_scope_stack` (`eval_call` pushes the caller's

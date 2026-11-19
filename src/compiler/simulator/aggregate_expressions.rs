@@ -3189,7 +3189,7 @@ impl Simulator {
                         // [W-1:0]`), which likewise sizes from W.
                         let resolved_dt = self.class_type_param_default(dt);
                         let target = resolved_dt.as_ref().unwrap_or(dt);
-                        let spec = self.class_spec_value_params();
+                        let spec = self.class_type_env(target);
                         let params = self.spec_param_env(&spec);
                         let w = super::elaborate::resolve_type_width_env(
                             target,

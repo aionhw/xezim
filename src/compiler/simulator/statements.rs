@@ -6571,11 +6571,16 @@ impl Simulator {
                 // resolve it — it was parsed and DISCARDED before, so a
                 // local `typedef struct packed {...} t; t v;` lost the
                 // member layout. Enum members become named constants.
-                let w = super::elaborate::resolve_type_width(
-                    &td.data_type,
-                    Some(&self.module.parameters),
-                    Some(&self.module.typedefs),
-                );
+                // §8.5: in a class method, by the class's own constants too.
+                let spec = self.class_type_env(&td.data_type);
+                let w = {
+                    let params = self.spec_param_env(&spec);
+                    super::elaborate::resolve_type_width_env(
+                        &td.data_type,
+                        Some(&params),
+                        Some(&self.module.typedefs),
+                    )
+                };
                 self.type_tables_gen += 1;
                 self.module.typedefs.insert(td.name.name.clone(), w);
                 self.module
