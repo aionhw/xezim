@@ -46,6 +46,8 @@ mod direct_ref_formal_calls;
 mod condition_waiter_gate;
 #[path = "perf/delay_loop_compiled.rs"]
 mod delay_loop_compiled;
+#[path = "perf/impure_call_delegated.rs"]
+mod impure_call_delegated;
 
 #[path = "perf/eqc_branch.rs"]
 mod eqc_branch;
