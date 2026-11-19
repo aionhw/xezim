@@ -41,7 +41,9 @@ use serde::ser::{SerializeSeq, Serializer};
 // §14.16.2: Simulator::clocking_select_due, the pending clocking select drives.
 // §9.4.2 / §9.3.2: Simulator::prev_wide holds a wide signal only once it is sampled; the
 // frame cache of a synchronous fork child is rebuilt, not carried (#721).
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x11";
+// §10.9.1, §26.3 / §9.4.2: named assignment pattern keys carry a bound type name; the guard
+// and value expressions of an event term are shared.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x12";
 
 #[derive(Default)]
 struct Session {

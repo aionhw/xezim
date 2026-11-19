@@ -390,7 +390,8 @@ fn method_boost_enabled() -> bool {
 // declared with an ascending or offset range does not inline.
 // §9.3, §13.3: block bodies in shared statement lists, a continuation tree per task call
 // site, and boxed optional delays, initializers and case item patterns (#721).
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308c;
+// §10.9.1, §26.3: a named assignment pattern key carries its lexically bound type name.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308d;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1805,7 +1806,8 @@ struct CombEntryCold {
 // §6.21, §13.4.2, §7.4.1: continuous assigns calling a static function whose local constant
 // selects write whole before a read compile; a call selecting an ascending or offset-range
 // variable of its callee stays interpreted.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB044";
+// §10.9.1, §26.3: a named assignment pattern key carries its lexically bound type name.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB045";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
