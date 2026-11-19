@@ -2366,18 +2366,15 @@ impl Simulator {
         arg: &Expression,
     ) -> Option<(String, String, i64, i64)> {
         use crate::ast::types::UnpackedDimension as UD;
-        if port.dimensions.is_empty() {
-            if let Some(dims) = self.fn_ret_coll_dims(&port.data_type)
-                && matches!(dims.first(), Some(UD::Range { .. } | UD::Expression { .. }))
-            {
-                let mut expanded = port.clone();
-                expanded.dimensions = dims;
-                return self.bind_array_arg(&expanded, arg);
-            }
-            return None;
-        }
+        let typedef_dims;
+        let declared_dims = if port.dimensions.is_empty() {
+            typedef_dims = self.fn_ret_coll_dims(&port.data_type)?;
+            &typedef_dims
+        } else {
+            &port.dimensions
+        };
         let dims = super::elaborate::normalize_unpacked_dims(
-            &port.dimensions,
+            declared_dims,
             &self.module.parameters,
             &self.module.typedef_types,
         );
@@ -2439,7 +2436,10 @@ impl Simulator {
             if self.assign_struct_concat(&param, parts.iter().collect()) {
                 return Some((param, String::new(), lo, hi));
             }
-            let vals = self.unpacked_concat_operand_values(parts.iter().collect());
+            let expand_rows =
+                port.dimensions.is_empty() || !self.concat_element_type_is_array(&port.data_type);
+            let vals =
+                self.unpacked_concat_operand_values(parts.iter().collect(), expand_rows, None);
             for (j, v) in vals.into_iter().take((hi - lo + 1) as usize).enumerate() {
                 let idx = if descending {
                     hi - j as i64

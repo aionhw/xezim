@@ -376,6 +376,7 @@ impl Simulator {
                 if let Some((store, caller)) = self.bind_queue_param(
                     &port.name.name,
                     &eff_dims,
+                    port.dimensions.is_empty(),
                     actual,
                     &port.data_type,
                     port.direction,
@@ -2697,6 +2698,7 @@ impl Simulator {
                 if let Some((store, caller)) = self.bind_queue_param(
                     &port.name.name,
                     &eff_dims,
+                    port.dimensions.is_empty(),
                     actual,
                     &port.data_type,
                     port.direction,
