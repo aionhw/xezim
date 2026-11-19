@@ -8,6 +8,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Performance:** Compile a free-running delay loop whose delay is not at its head, `always begin #(d); ... end` or `initial forever begin ...; #(d); end` with one or more delays and no event control, as a process FSM like `always #(d) ...`, instead of running it on the interpreter (§9.2.2.1, §9.4.1, #1327).
 - **Correctness:** Evaluate a continuous assignment delay that names a variable (`assign #(d) w = a;`, `wire #(di) w = a;`, `#(rise, fall)`, `buf #(di)`, a submodule `assign #(dv + PD)`) in the declaring scope each time the right-hand side changes, with transition selection and inertial filtering; it was folded to 0 (§10.3.3, #1289, reported by ds54e).
 
 - **Correctness:** Parse a real cast as a coverpoint expression (`coverpoint real'(x)`) in SV-2023 mode, where it was read as the coverpoint type modifier (§6.24.1, §19.5, #1473, reported by ds54e).
