@@ -2004,6 +2004,25 @@ impl Simulator {
                 return;
             }
         }
+        // §13.4.1: `f = d[i];` in the function `f` — the return variable of
+        // an unpacked-struct type is a set of leaves in the frame, so a whole
+        // element is spread over them.
+        if let ExprKind::Ident(h) = &lvalue.kind
+            && matches!(
+                rvalue.kind,
+                ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+            )
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && self
+                .func_call_stack
+                .last()
+                .is_some_and(|f| *f == h.path[0].name.name)
+            && self.ret_var_struct_assign(&h.path[0].name.name, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
         // §7.2.1: `b = a` between unpacked-struct VARS whose type has
         // a DYNAMIC member (queue/dynamic/assoc) — the pack/scatter
         // value path cannot carry variable-size members, so `b.d[]`

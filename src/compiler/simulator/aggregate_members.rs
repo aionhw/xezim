@@ -4837,6 +4837,121 @@ impl Simulator {
         out
     }
 
+    /// §13.4.1: the value of `return d[i];` (or `return d[i].inner;`) in a
+    /// function whose return type is an unpacked struct. The element of an
+    /// array formal, a local array or a module array has no container value:
+    /// its members are separate leaves, read here one by one. `None` when the
+    /// return type is not an unpacked struct or `e` is not such a reference.
+    pub(super) fn ret_struct_elem_value(&mut self, e: &Expression) -> Option<Value> {
+        let e = Self::peel_parens(e);
+        if !matches!(
+            e.kind,
+            ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+        ) {
+            return None;
+        }
+        let aggregate =
+            |dt: &DataType| matches!(dt, DataType::TypeReference { .. } | DataType::Struct(_));
+        let may = match self.fn_ret_frames.last()? {
+            ReturnPatternType::NotPacked => false,
+            ReturnPatternType::Func(dt) => aggregate(dt),
+            ReturnPatternType::Method(m) => match &m.kind {
+                crate::ast::decl::ClassMethodKind::Function(f) => aggregate(&f.return_type),
+                _ => false,
+            },
+        };
+        if !may {
+            return None;
+        }
+        if Self::is_struct_elem_ref(e) {
+            let su = self.unpacked_struct_of(&self.return_frame_type()?)?;
+            return Some(self.pack_struct_elem_ref(e, &su));
+        }
+        // An index that is not a plain expression (`d[$]`, `d[d.size() - 1]`,
+        // `d[i++]`) is evaluated once and held, so every leaf reads the same
+        // element.
+        if !Self::has_index_select(e) {
+            return None;
+        }
+        let su = self.unpacked_struct_of(&self.return_frame_type()?)?;
+        let held = self.hold_elem_ref_indices(e)?;
+        Self::is_struct_elem_ref(&held).then(|| self.pack_struct_elem_ref(&held, &su))
+    }
+
+    /// §13.4.1: `f = rvalue;` where `f` is the running function's return
+    /// variable of an unpacked-struct type and `rvalue` is a whole struct
+    /// element. Returns whether it wrote the leaves.
+    pub(super) fn ret_var_struct_assign(&mut self, ret_name: &str, rvalue: &Expression) -> bool {
+        // The return variable's `<name>.` marker: one lookup rejects every
+        // function that does not return an unpacked struct.
+        if !self.any_struct_formal_markers {
+            return false;
+        }
+        let mut marker = std::mem::take(&mut self.marker_key_scratch);
+        marker.clear();
+        marker.push_str(ret_name);
+        marker.push('.');
+        let has = self
+            .local_stack
+            .last()
+            .is_some_and(|l| l.contains_key(marker.as_str()));
+        self.marker_key_scratch = marker;
+        if !has {
+            return false;
+        }
+        let Some(su) = self
+            .return_frame_type()
+            .and_then(|dt| self.unpacked_struct_of(&dt))
+        else {
+            return false;
+        };
+        let v = self.ret_struct_elem_value(rvalue);
+        v.is_some_and(|v| self.spread_into_unpacked_struct(ret_name, &su, &v))
+    }
+
+    /// Whether the select chain of `e` holds an element select.
+    fn has_index_select(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Index { .. } => true,
+            ExprKind::MemberAccess { expr, .. } | ExprKind::Paren(expr) => {
+                Self::has_index_select(expr)
+            }
+            _ => false,
+        }
+    }
+
+    /// `e` (a chain of element and member selects on a plain name) with each
+    /// index replaced by the value it has now (§11.4.1: evaluated once).
+    /// `None`, with nothing evaluated, for any other root.
+    fn hold_elem_ref_indices(&mut self, e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                let base = self.hold_elem_ref_indices(expr)?;
+                let index = match index.kind {
+                    ExprKind::Number(_) | ExprKind::StringLiteral(_) => (**index).clone(),
+                    _ => self.capture_index_literal(index, &base),
+                };
+                Some(Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(base),
+                        index: Box::new(index),
+                    },
+                    e.span,
+                ))
+            }
+            ExprKind::MemberAccess { expr, member } => Some(Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.hold_elem_ref_indices(expr)?),
+                    member: member.clone(),
+                },
+                e.span,
+            )),
+            ExprKind::Paren(x) => self.hold_elem_ref_indices(x),
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => Some(e.clone()),
+            _ => None,
+        }
+    }
+
     /// `class_agg_member` for an already-split `<base>.<field>`.
     pub(super) fn class_agg_member_parts(
         &mut self,

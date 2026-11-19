@@ -5886,7 +5886,10 @@ impl Simulator {
                                 // like `f = e` (`return b + u` with a byte b
                                 // and 8-bit u in an int function is 9 bits).
                                 // §10.8: a pattern takes the return type.
-                                None => match self.ret_pattern_value(e) {
+                                None => match self
+                                    .ret_struct_elem_value(e)
+                                    .or_else(|| self.ret_pattern_value(e))
+                                {
                                     Some(v) => v,
                                     None => match self.fn_ret_ctx_stack.last() {
                                         Some(&w) if w > 0 => self.eval_expr_ctx(e, w),
