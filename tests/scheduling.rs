@@ -537,3 +537,5 @@ mod nettype_relay_chain_1239;
 mod time_literal_exact_1299;
 #[path = "scheduling/intra_delay_array_items.rs"]
 mod intra_delay_array_items;
+#[path = "scheduling/review_intra_delay_array_items.rs"]
+mod review_intra_delay_array_items;
