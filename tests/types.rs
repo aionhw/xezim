@@ -309,6 +309,7 @@ mod struct_copy_and_queue_ops;
 mod struct_member_array_of_structs_copy;
 #[path = "types/struct_member_typedef_element_dims.rs"]
 mod struct_member_typedef_element_dims;
+#[path = "types/typedef_unpacked_array_member.rs"] mod typedef_unpacked_array_member;
 #[path = "types/struct_named_patterns.rs"]
 mod struct_named_patterns;
 #[path = "types/struct_unpacked_array_member.rs"]
