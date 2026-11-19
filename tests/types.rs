@@ -811,3 +811,5 @@ mod pattern_type_key_real_realtime_1290;
 mod pattern_type_key_scoped_and_lexical_1290;
 #[path = "types/struct_element_return_1310.rs"]
 mod struct_element_return_1310;
+#[path = "types/review_pattern_type_keys_imports.rs"]
+mod review_pattern_type_keys_imports;
