@@ -3412,14 +3412,45 @@ impl Simulator {
             // handle, then walk the remaining segments as property reads.
             ExprKind::Ident(h) if h.path.len() >= 2 => {
                 let walk = |mut handle: usize, rest: &[HierPathSegment]| -> Option<usize> {
-                    for seg in rest {
+                    let mut i = 0;
+                    while i < rest.len() {
                         if handle == 0 {
                             return None;
                         }
-                        handle = self.member_handle(handle, &seg.name.name)?;
+                        // §7.2, §8.4: through a class-handle member of an
+                        // unpacked-struct property (`o.r.h`).
+                        if self.struct_prop_name_possible(&rest[i].name.name) {
+                            let names: Vec<&str> =
+                                rest[i..].iter().map(|s| s.name.name.as_str()).collect();
+                            if let Some((next, used)) = self.struct_prop_handle_walk(handle, &names)
+                            {
+                                handle = next;
+                                i += used;
+                                continue;
+                            }
+                        }
+                        handle = self.member_handle(handle, &rest[i].name.name)?;
+                        i += 1;
                     }
                     Some(handle)
                 };
+                // The same member reached with an implicit `this` (`r.h`).
+                if self.struct_prop_name_possible(&h.path[0].name.name)
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && let Some(this) = self.this_stack.last().copied().flatten()
+                    && !self
+                        .local_stack
+                        .last()
+                        .is_some_and(|l| l.contains_key(&h.path[0].name.name))
+                {
+                    let names: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+                    if let Some((mut handle, used)) = self.struct_prop_handle_walk(this, &names) {
+                        for seg in &h.path[used..] {
+                            handle = self.member_handle(handle, &seg.name.name)?;
+                        }
+                        return Some(handle);
+                    }
+                }
                 // §8.14: a member some class redeclares is the copy the
                 // declared class of the chain up to it sees.
                 if self.shadowed_prop_mask != 0
@@ -3485,6 +3516,15 @@ impl Simulator {
                             .map(|h| h as usize);
                     }
                 }
+                // §7.2, §8.4: a class-handle member of an unpacked-struct
+                // property (`r.h`, `this.r.h`, `o.r.in.h`): the struct is no
+                // handle, its member's cell is.
+                if !self.no_class_objects()
+                    && self.chain_may_name_struct_prop(expr)
+                    && let Some(h) = self.struct_member_chain_handle(expr)
+                {
+                    return Some(h);
+                }
                 let bh = self.eval_handle_expr(base)?;
                 if bh == 0 {
                     return None;
@@ -3526,6 +3566,72 @@ impl Simulator {
             },
             _ => None,
         }
+    }
+
+    /// The object a member chain ENDING at a class-handle member of an
+    /// unpacked-struct class property refers to: `r.h` and `this.r.h` in a
+    /// method, `o.r.h` / `o.sub.r.in.h` through handles. `None` for any other
+    /// chain or a null member.
+    fn struct_member_chain_handle(&self, expr: &Expression) -> Option<usize> {
+        let mut names: Vec<&str> = Vec::new();
+        let mut cur = expr;
+        let start = loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    names.push(member.name.as_str());
+                    cur = expr;
+                }
+                ExprKind::This => break self.this_stack.last().copied().flatten(),
+                ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                    names.extend(h.path.iter().rev().map(|s| s.name.name.as_str()));
+                    break None;
+                }
+                _ => return None,
+            }
+        };
+        names.reverse();
+        // `(object, first member)` candidates: an explicit `this`, an
+        // implicit one, then a handle variable at the head.
+        let mut starts: Vec<(usize, usize)> = Vec::new();
+        match start {
+            Some(this) => starts.push((this, 0)),
+            None => {
+                let head = *names.first()?;
+                let local = self
+                    .local_stack
+                    .last()
+                    .is_some_and(|l| l.contains_key(head));
+                if !local && let Some(this) = self.this_stack.last().copied().flatten() {
+                    starts.push((this, 0));
+                }
+                if let Some(h) = self.eval_ident_handle(head).filter(|&h| h != 0) {
+                    starts.push((h, 1));
+                }
+            }
+        }
+        'next: for (mut handle, mut i) in starts {
+            let mut stepped = false;
+            while i < names.len() {
+                if let Some((next, used)) = self.struct_prop_handle_walk(handle, &names[i..]) {
+                    handle = next;
+                    i += used;
+                    stepped = true;
+                    continue;
+                }
+                match self
+                    .member_handle(handle, names[i])
+                    .filter(|&h| h != 0 && self.heap.get(h).is_some_and(|o| o.is_some()))
+                {
+                    Some(h) => handle = h,
+                    None => continue 'next,
+                }
+                i += 1;
+            }
+            if stepped {
+                return Some(handle);
+            }
+        }
+        None
     }
 
     /// The handle held by element `index` of the collection stored as `coll`

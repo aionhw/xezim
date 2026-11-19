@@ -4310,6 +4310,27 @@ impl Simulator {
                 return self.write_class_agg(&r, val);
             }
         }
+        // §7.2, §8.4: a property of the object a class-handle member of an
+        // unpacked-struct class property refers to (`r.h.k = v`, `o.r.h.k =
+        // v`). The receiver is a struct leaf, not a handle variable, so no
+        // arm below resolved it and the write was dropped.
+        if matches!(lhs.kind, ExprKind::MemberAccess { .. } | ExprKind::Ident(_))
+            && !self.no_class_objects()
+            && self.chain_may_name_struct_prop(lhs)
+            && let Some((recv, member)) = Self::split_trailing_member(lhs)
+            && let Some(h) = self.struct_handle_chain_object(&recv)
+            && self
+                .heap
+                .get(h)
+                .and_then(|o| o.as_ref())
+                .is_some_and(|inst| inst.properties.contains_key(&member))
+        {
+            let fitted = self.fit_class_prop(h, &member, val);
+            if let Some(Some(inst)) = self.heap.get_mut(h) {
+                inst.properties.insert(member, fitted);
+                return true;
+            }
+        }
         // §8.9: assignment to a STATIC class property (`obj.static_prop = ...`,
         // `this.static_prop = ...`) writes the single shared cell, not per-
         // instance storage. A named reference resolves by its declared type

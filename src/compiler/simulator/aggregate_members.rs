@@ -2320,6 +2320,127 @@ impl Simulator {
         Some(steps)
     }
 
+    /// §7.2, §8.4: the class-handle member of an unpacked-struct class
+    /// property that `e` names (`r.h`, `o.r.h`, `r.in.h`, `r.hs[1]`): its
+    /// cell and the class its declaration names. `None` for any other
+    /// expression, a leaf of another type included.
+    pub(super) fn struct_handle_leaf(&mut self, e: &Expression) -> Option<(ClassAggRef, String)> {
+        if self.no_class_objects() || !self.chain_may_name_struct_prop(e) {
+            return None;
+        }
+        let r = self.class_unpacked_leaf(e)?;
+        let ClassAggRef::Unpacked { handle, key, .. } = &r else {
+            return None;
+        };
+        let cls = self.unpacked_leaf_class(*handle, key)?;
+        Some((r, cls))
+    }
+
+    /// The live object a class-handle member of an unpacked-struct class
+    /// property refers to (see `struct_handle_leaf`); `None` for a null
+    /// handle.
+    pub(super) fn struct_handle_leaf_object(&mut self, e: &Expression) -> Option<usize> {
+        let (r, _) = self.struct_handle_leaf(e)?;
+        let h = self.read_class_agg(&r).to_u64()? as usize;
+        (h != 0 && self.heap.get(h).is_some_and(|o| o.is_some())).then_some(h)
+    }
+
+    /// §7.2, §8.4: the value of `<leaf>.<member>` where `<leaf>` is a
+    /// class-handle member of an unpacked-struct class property and
+    /// `<member>` a property of the object it refers to (`o.r.h.k`).
+    pub(super) fn struct_handle_leaf_member(&mut self, e: &Expression) -> Option<Value> {
+        if self.no_class_objects() || !self.chain_may_name_struct_prop(e) {
+            return None;
+        }
+        let (recv, member) = Self::split_trailing_member(e)?;
+        let h = self.struct_handle_chain_object(&recv)?;
+        self.read_member_value(h, &member)
+    }
+
+    /// §7.2, §8.4: `segs` names an unpacked-struct property of `handle` and
+    /// then members down to a class-handle member (`r.h`, `r.in.h`, no
+    /// selects): the object that member refers to and how many segments
+    /// name it. `None` when `segs[0]` is no such property, the path ends
+    /// before a handle member, or the handle is null.
+    pub(super) fn struct_prop_handle_walk(
+        &self,
+        handle: usize,
+        segs: &[&str],
+    ) -> Option<(usize, usize)> {
+        let prop = *segs.first()?;
+        let su = self.class_prop_struct(handle, prop)?;
+        if !Self::spreads_member_wise(&su) {
+            return None;
+        }
+        let mut level = (*su).clone();
+        let mut key = prop.to_string();
+        for (j, seg) in segs.iter().enumerate().skip(1) {
+            let (dt, dims) = Self::struct_member_decl(&level, seg)?;
+            if !dims.is_empty() {
+                return None;
+            }
+            key.push('.');
+            key.push_str(seg);
+            if let Some(inner) = self.unpacked_struct_of(&dt) {
+                level = inner;
+                continue;
+            }
+            if !Self::dt_is_class_handle(&dt, &self.module) {
+                return None;
+            }
+            let h = self
+                .read_class_agg(&ClassAggRef::Unpacked { handle, key, w: 32 })
+                .to_u64()? as usize;
+            return (h != 0 && self.heap.get(h).is_some_and(|o| o.is_some())).then_some((h, j + 1));
+        }
+        None
+    }
+
+    /// The object the receiver chain `e` refers to when it passes through a
+    /// class-handle member of an unpacked-struct class property: the member
+    /// itself (`r.h`) or a handle property reached from it (`r.h.lf`,
+    /// `o.r.h.lf.next`).
+    pub(super) fn struct_handle_chain_object(&mut self, e: &Expression) -> Option<usize> {
+        if let Some(h) = self.struct_handle_leaf_object(e) {
+            return Some(h);
+        }
+        let (recv, member) = Self::split_trailing_member(e)?;
+        let h = self.struct_handle_chain_object(&recv)?;
+        let tn = self.class_prop_type_name(h, &member)?;
+        self.resolve_typeref_class_name_str(&tn)?;
+        self.member_handle(h, &member)
+            .filter(|&n| n != 0 && self.heap.get(n).is_some_and(|o| o.is_some()))
+    }
+
+    /// The declared class of the leaf cell `key` (`r.h`, `o.hs[1]`,
+    /// `ra[0].in.h`) of an unpacked-struct property of `handle`.
+    fn unpacked_leaf_class(&self, handle: usize, key: &str) -> Option<String> {
+        let (prop, suffix) = key.split_at(key.find(['.', '['])?);
+        let su = self.class_prop_struct(handle, prop)?;
+        let mut level = (*su).clone();
+        let mut dt: Option<DataType> = None;
+        for step in Self::member_suffix_steps(suffix)? {
+            match step {
+                MemberSel::Member(m) => {
+                    if let Some(d) = dt.take() {
+                        level = self.unpacked_struct_of(&d)?;
+                    }
+                    dt = Some(Self::struct_member_decl(&level, &m)?.0);
+                }
+                MemberSel::Index(_) => {}
+                MemberSel::Range { .. } => return None,
+            }
+        }
+        let dt = dt?;
+        if !Self::dt_is_class_handle(&dt, &self.module) {
+            return None;
+        }
+        match super::elaborate::resolve_typedef_chain(&dt, &self.module.typedef_types) {
+            DataType::TypeReference { name, .. } => Some(name.name.name.clone()),
+            _ => None,
+        }
+    }
+
     /// One candidate split: `base` names the property, `suffix` addresses a
     /// leaf beneath it. `None` when the property is not an unpacked struct or
     /// the suffix names no leaf of it — which is what lets the caller try

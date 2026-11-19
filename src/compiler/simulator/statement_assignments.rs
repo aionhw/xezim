@@ -3812,6 +3812,23 @@ impl Simulator {
         // `new src` is a distinct `ShallowCopy` node (LRM 8.8 fn 23) and
         // never reaches here — so a parenthesized `new(args)` is ALWAYS
         // a constructor call, even a single class-handle argument.
+        // §7.2, §8.4: a class-handle member of an unpacked-struct class
+        // property (`r.h = new();` with `struct { C h; } r;`). The property's
+        // type names a struct, not a class, so the lookups below found no
+        // class to construct and stored a handle to nothing.
+        let rv_is_new = match &rvalue.kind {
+            ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].name.name == "new",
+            ExprKind::Call { func, .. } => matches!(
+                &func.kind,
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new"
+            ),
+            _ => false,
+        };
+        let struct_member_cls = if rv_is_new {
+            self.struct_handle_leaf(lvalue).map(|(_, c)| c)
+        } else {
+            None
+        };
         let (is_new_call, ctor_args): (bool, &[Expression]) = match &rvalue.kind {
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new" => (true, &[]),
             ExprKind::Call { func, args }
@@ -3822,8 +3839,9 @@ impl Simulator {
                     // Non-empty args: only treat as class instantiation when
                     // the lvalue's type is a class AND it's NOT a single-arg
                     // class-handle (shallow copy).
-                    let is_class = self
-                        .get_expr_type_name(lvalue)
+                    let is_class = struct_member_cls
+                        .clone()
+                        .or_else(|| self.get_expr_type_name(lvalue))
                         .and_then(|tn| self.resolve_type_param_binding(&tn).or(Some(tn)))
                         .map(|tn| {
                             self.resolve_simple_typedef_class(&tn)
@@ -3871,7 +3889,7 @@ impl Simulator {
                 self.settle_after_proc_write();
                 return;
             }
-            let type_name = self.get_expr_type_name(lvalue);
+            let type_name = struct_member_cls.or_else(|| self.get_expr_type_name(lvalue));
             // §6.20.3 type-parameter construction: if the declared
             // type is a class type parameter (e.g. `T obj = new;`),
             // resolve it through the current instance's bindings to

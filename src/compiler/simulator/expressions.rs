@@ -2027,12 +2027,26 @@ impl Simulator {
             } else {
                 None
             };
-            for member in &segs[split..segs.len() - 1] {
-                handle = handle.and_then(|h| {
-                    let tn = self.class_prop_type_name(h, member)?;
-                    self.resolve_typeref_class_name_str(&tn)?;
-                    self.member_handle(h, member)
-                });
+            let mids = &segs[split..segs.len() - 1];
+            let mut i = 0;
+            while i < mids.len() {
+                let Some(h) = handle else {
+                    break;
+                };
+                // §7.2, §8.4: a class-handle member of an unpacked-struct
+                // property (`o.r.h.k`): the struct's members are cells of
+                // `o`, and the handle member's cell names the next object.
+                if let Some((next, used)) = self.struct_prop_handle_walk(h, &mids[i..]) {
+                    handle = Some(next);
+                    i += used;
+                    continue;
+                }
+                let member = mids[i];
+                handle = self
+                    .class_prop_type_name(h, member)
+                    .and_then(|tn| self.resolve_typeref_class_name_str(&tn))
+                    .and_then(|_| self.member_handle(h, member));
+                i += 1;
             }
             if let Some(h) =
                 handle.filter(|&h| h != 0 && self.heap.get(h).is_some_and(|o| o.is_some()))
@@ -2952,6 +2966,14 @@ impl Simulator {
                 if hier.path.len() >= 2 && !self.no_class_objects() {
                     if let Some(r) = self.class_agg_member(expr) {
                         return self.read_class_agg(&r);
+                    }
+                    // §7.2, §8.4: a property of the object a class-handle
+                    // member of an unpacked-struct property refers to
+                    // (`o.r.h.k`).
+                    if hier.path.len() >= 3
+                        && let Some(v) = self.struct_handle_leaf_member(expr)
+                    {
+                        return v;
                     }
                     // Whole unpacked-struct class-property read (`c.first`
                     // where `first` is a struct): assemble the member cells.
