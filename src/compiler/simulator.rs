@@ -2079,17 +2079,17 @@ struct SensitivityId {
     /// LRM §9.4.2.3 `iff` guard for this event term: the edge only counts
     /// when this expression is true at edge time. `None` for an unguarded
     /// term. Consulted by the procedural `@`-event wake path; the always-
-    /// block edge paths carry it but do not yet evaluate it. Boxed, like
-    /// `value_of`: almost every term has neither, and an inline
+    /// block edge paths carry it but do not yet evaluate it. Shared with
+    /// the other operands of this event expression. An inline
     /// `Option<Expression>` made each term hundreds of bytes (68 MB of edge
     /// sensitivity lists on a 64k-cell DRAM).
-    iff: Option<Box<Expression>>,
+    iff: Option<Rc<Expression>>,
     /// §9.4.2: for a NON-TRIVIAL event expression (`@(a + b)`), the term's
     /// full expression. Operand-signal edges only COUNT when this
     /// expression's value differs from its value at arm time (stored in
     /// `EventWaiter::guard_prev`) — `a=2;b=1` leaving `a+b` at 3 must not
     /// fire. `None` for plain signal/edge terms.
-    value_of: Option<Box<Expression>>,
+    value_of: Option<Rc<Expression>>,
     /// Scheduling depth of the NAME this term was written with (see
     /// `Simulator::sig_wake_rank`); orders same-pass waiter wakeups.
     wake_rank: u8,
@@ -2113,9 +2113,9 @@ struct Sensitivity {
     signal_name: String,
     edge: EdgeKind,
     /// See `SensitivityId::iff` — carried through name→id resolution.
-    iff: Option<Box<Expression>>,
+    iff: Option<Rc<Expression>>,
     /// See `SensitivityId::value_of` — carried through name→id resolution.
-    value_of: Option<Box<Expression>>,
+    value_of: Option<Rc<Expression>>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -8175,7 +8175,7 @@ pub struct Simulator {
     /// has sampled — the clocking event, and so its guard, occurs after the
     /// clockvars update. Each entry holds the waiter and the guard of the
     /// term that fired; see `resolve_deferred_clocking_guards`.
-    deferred_clocking_guarded: Vec<(EventWaiter, Box<Expression>)>,
+    deferred_clocking_guarded: Vec<(EventWaiter, Rc<Expression>)>,
     /// LRM §4.4 "reactive region" — drained AFTER the observed region
     /// has fired and BEFORE the postponed region runs. In a strict LRM
     /// implementation this hosts `program`-block procedural code so a
