@@ -196,6 +196,30 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   parameters; the reported case now runs in the same 277 M instructions with
   8,000 parameters as with none (§8.25, #1276, contributed by auty1395).
 
+* A static function whose local is written bit by bit through constant selects
+  before anything reads it (`n[0] = a[31]; ... n[31] = a[0]; f = n;`, the body
+  of a CRC or bit-reversal function) is inlined into compiled code, so the
+  continuous assigns that call it compile. The local was judged to carry its
+  value between calls, which made the function impure and left every such
+  continuous assign on the AST interpreter (a 32-bit bit reversal evaluated
+  100,000 times: 10.5 instead of 4.4 billion instructions). A select in a
+  branch or a loop, a non-constant index or range, or a read before every bit
+  is written still keeps the value between calls (§6.21, §13.4.2, #1296,
+  reported by git-hevangel).
+
+* An operator chain of selects (`d[3] ^ d[9] ^ ... ^ d[251]`, the shape of a
+  CRC or parity function) costs work in proportion to its length on the
+  interpreter: a select is sized from the select, not by evaluating it, so
+  each level of the chain no longer evaluates every select under it again, nor
+  scans it again for a shift. A function of 8 chains of 260 selects over a
+  256-bit local: 12.4 billion instructions before, 0.09 billion now (§11.5.1,
+  §11.6.1, #1295, reported by git-hevangel).
+
+* A select of a task or function local, formal or return variable reads and
+  writes the frame's value directly instead of first trying the design's name
+  tables: 2,000 calls writing a 64-bit local bit by bit take 23% fewer
+  instructions, 34% fewer in a class method (§11.5.1, #1298).
+
 **Command line**
 
 * `$dumpvars` and `$fsdbDumpvars` accept indexed scope arguments: a
@@ -828,6 +852,72 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * The elements of a package array parameter are left out of the waveform scope
   of a module that does not declare them (§21.7.2.3, §26.3, #1213, reported by
   ds54e).
+
+* A function or task reads its own plain formal or local when its caller has a
+  virtual-interface formal of the same name, and a callee's read of a module
+  or package variable of that name reads that variable: `v.put(x)` with
+  `function void put(int v); data = v; endfunction`, called from a method
+  whose virtual-interface formal is `v`, stored a handle token in `data`,
+  through an interface function or task, a modport import, a module function
+  or task, a class method, a fork and a recursive call (§13.5.1, §25.9, #1297,
+  reported by git-hevangel).
+
+* A real-valued initializer of a 64-bit integral variable converts to it:
+  `time t = 9200s;`, `longint l = 3000000000.0;` and `bit [63:0] b =
+  5000000000.0;` kept the double, so a shift read its IEEE 754 bits and `%0d`
+  printed its low 32 bits; the same for a typed parameter of a package
+  (§6.12.1, §5.8, #1299, reported by git-hevangel).
+
+* A time literal converts to the unit and precision of its scope by exact
+  powers of ten, in a value, a delay and a clocking skew: `9200s` under
+  `1ns/1fs` was 9199999999999.998 ns, so `t == 9200s` was false for `t =
+  9200000000000` and `#9200s` resumed 2048 fs early; `#9200s` in a 1 ps scope
+  of a 1 fs design resumed 9.2 us late, and a bare delay under `1us/1fs` was
+  scaled by 999999999.9999999 (§5.8, §3.14.1, #1299, reported by
+  git-hevangel).
+
+* A bit-, part- or indexed part-select of a task, function or method local,
+  formal or return variable declared with an ascending range or a low bound
+  other than 0 names the bits its range labels, as the same select of a module
+  variable does: `reg [0:7] n; n[0] = 1'b1;` sets bit 7 and `reg [8:1] n; n[1]
+  = 1'b1;` sets bit 0. Writes landed on the raw bit position of the value; so
+  did reads of a class method's formal, reads in a function inlined into a
+  compiled continuous assign or process, and selects of a compiled block's own
+  such local, and a local beside a design variable of its name wrote that
+  variable (§7.4.1, §11.5.1, §13.5, #1298, reported by git-hevangel).
+
+* A function local hides a design variable of its name when an expression's
+  width is found: with a module `reg [15:0] n`, a function's `reg [7:0] n`
+  made `{n + 8'h01}` 16 bits wide (§11.6.1, #1295, reported by git-hevangel).
+
+* A call in a compiled class method whose `output`, `inout` or `ref` actual is
+  a class member (a member scalar, a queue or array element) runs its callee
+  once. The call was emitted compiled and then run again by the interpreter
+  fallback, so counters, queue pushes and random draws happened twice; this
+  also held under `void'()`, for task enables and for static, `super.` and
+  other-handle calls (§13.5.2, #1293, contributed by auty1395).
+
+* A VPI deposit on a net whose package resolver reads its own return variable
+  holds until a driver changes, and a module variable named like the resolver
+  no longer restores the driver value. A deposit on a wire driven by a call
+  through a scope (`assign w = p::f(d)`, `$unit::f(d)`) holds as well: the
+  callee name is not an operand of the assignment (§13.4.1, §26.3, §38.34,
+  #1300, contributed by ds54e).
+
+* An assignment pattern with an intra-assignment delay or event control stores
+  the elements of an item that is an unpacked array (`wb = #1 '{wc, r}`,
+  `'{default: wc}`, rows of a multidimensional array, a class property
+  target), read when the statement runs; it stored zeros (§9.4.5, §10.9.1,
+  §10.10, #1291, contributed by chuanseng-ng).
+
+* Type keys in array assignment patterns apply at every dimension, after index
+  keys and before `default:`, for variables, continuous assignments,
+  resolved-nettype drivers, parameters, packed targets and slices, class
+  properties and array formals; a key naming a typedef, a package or class
+  type or a type parameter is a type key. `assign n = '{a:'{integer:x,
+  default:99}}` on a nettype structure member gave 99. A type key of an outer
+  level takes precedence over a `default:` row pattern, as the standard's
+  recursive descent gives (§10.9.1, §10.9.2, #1290, contributed by Thomasb81).
 
 ### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
 
