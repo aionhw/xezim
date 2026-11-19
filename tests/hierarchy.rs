@@ -115,6 +115,8 @@ mod inout_port_default;
 mod instance_var_init_signedness;
 #[path = "hierarchy/interface_array_element_ports.rs"]
 mod interface_array_element_ports;
+#[path = "hierarchy/interface_array_whole_ports.rs"]
+mod interface_array_whole_ports;
 #[path = "hierarchy/interface_default_clocking.rs"]
 mod interface_default_clocking;
 #[path = "hierarchy/ivtest_port_cluster.rs"]
