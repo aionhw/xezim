@@ -2114,6 +2114,98 @@ impl Simulator {
 
     /// Leaf identifier name of an expression, if it is a plain (possibly
     /// scoped/dotted) identifier.
+    /// §8.23, §8.25.1: the width of a typedef named through a class
+    /// specialization or a typedef of one, nested classes included —
+    /// `C#(6)::td`, `C#(.W(6))::Inner::td`, `alias_t::td`,
+    /// `alias_t::Inner::td`. None for any other member chain.
+    pub(super) fn spec_scoped_type_width(&mut self, e: &Expression) -> Option<u32> {
+        let mut links: Vec<&str> = Vec::new();
+        let mut root = e;
+        while let ExprKind::MemberAccess { expr, member } = &root.kind {
+            links.push(member.name.as_str());
+            root = expr;
+        }
+        links.reverse();
+        // `alias_t::td` also parses as one scoped identifier.
+        if let ExprKind::Ident(h) = &root.kind
+            && links.is_empty()
+            && h.path.len() >= 2
+            && h.root.is_none()
+            && h.path.iter().all(|s| s.selects.is_empty())
+            && self
+                .module
+                .typedef_types
+                .contains_key(h.path[0].name.name.as_str())
+            && !self
+                .signal_name_to_id
+                .contains_key(h.path[0].name.name.as_str())
+        {
+            let n = h.path.len();
+            let tn = crate::ast::types::TypeName {
+                scopes: h.path[..n - 1]
+                    .iter()
+                    .map(|s| crate::ast::types::TypeScope {
+                        name: s.name.clone(),
+                        type_args: Vec::new(),
+                    })
+                    .collect(),
+                name: h.path[n - 1].name.clone(),
+                span: crate::ast::Span::dummy(),
+                bound: Default::default(),
+            };
+            return super::elaborate::specialized_class_scope_width(&tn, &self.module);
+        }
+        let leaf = links.pop()?;
+        match &root.kind {
+            ExprKind::Specialization { .. } => {
+                let (base, sig) = self
+                    .resolve_call_spec_params(Self::extract_call_spec(root), &self.current_spec)?;
+                if !self.module.classes.contains_key(&base) {
+                    return None;
+                }
+                let saved = self.current_spec.replace((base.clone(), sig));
+                let bound = self.class_spec_value_params().unwrap_or_default();
+                self.current_spec = saved;
+                super::elaborate::class_scope_typedef_width(
+                    &base,
+                    &bound,
+                    &links,
+                    leaf,
+                    &self.module,
+                )
+            }
+            ExprKind::Ident(h)
+                if h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && self
+                        .module
+                        .typedef_types
+                        .contains_key(h.path[0].name.name.as_str()) =>
+            {
+                let ident = |n: &str| crate::ast::Identifier {
+                    name: n.to_string(),
+                    span: crate::ast::Span::dummy(),
+                };
+                let mut scopes = vec![crate::ast::types::TypeScope {
+                    name: h.path[0].name.clone(),
+                    type_args: Vec::new(),
+                }];
+                scopes.extend(links.iter().map(|l| crate::ast::types::TypeScope {
+                    name: ident(l),
+                    type_args: Vec::new(),
+                }));
+                let tn = crate::ast::types::TypeName {
+                    scopes,
+                    name: ident(leaf),
+                    span: crate::ast::Span::dummy(),
+                    bound: Default::default(),
+                };
+                super::elaborate::specialized_class_scope_width(&tn, &self.module)
+            }
+            _ => None,
+        }
+    }
+
     /// `std::randomize(targets) with {items}` through the joint solver
     /// (`rand_csp_solve_scope`): plain integral scalars and 1-D arrays (at
     /// their current size) are its variables. NotApplicable when a target
@@ -3205,6 +3297,13 @@ impl Simulator {
                     // FULL qualified key (no suffix fallback: `$bits(s.m)` on
                     // a real struct member must keep falling through to the
                     // member paths below).
+                    if matches!(
+                        &arg.kind,
+                        ExprKind::MemberAccess { .. } | ExprKind::Ident(_)
+                    ) && let Some(w) = self.spec_scoped_type_width(arg)
+                    {
+                        return Value::from_u64(w as u64, 32);
+                    }
                     if matches!(&arg.kind, ExprKind::MemberAccess { .. }) {
                         if let Some(key) = Self::expr_scoped_chain_key(arg) {
                             if let Some(&w) = self.module.typedefs.get(&key) {
