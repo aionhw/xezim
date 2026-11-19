@@ -1322,7 +1322,7 @@ impl Simulator {
                 .and_then(|n| n.rsplit_once('.').map(|(p, _)| p.to_string()))
                 .unwrap_or_default()
         } else {
-            scope
+            scope.to_string()
         };
         let paths = std::mem::take(&mut cov.inst_paths);
         let sc = Self::cov_instance_scope(module, cov, &paths, &scope);

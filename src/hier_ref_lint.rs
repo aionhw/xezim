@@ -969,7 +969,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             let mut refs = Vec::new();
             expr_refs(&ca.lhs, &mut refs);
             expr_refs(&ca.rhs, &mut refs);
-            add(Rc::new(refs), scope.clone(), None, None);
+            add(Rc::new(refs), scope.to_string(), None, None);
         }
     }
     let subroutines = elab
