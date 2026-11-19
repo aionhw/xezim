@@ -1242,7 +1242,8 @@ impl Simulator {
 
     /// `emit_severity_text` naming `scope` in the context line.
     pub(super) fn emit_severity_text_in(&mut self, severity: &str, body: &str, scope: &str) {
-        let time_s = self.format_time_parts(self.time_in_current_unit()).0;
+        let time = Value::from_f64(self.time_in_current_unit());
+        let time_s = self.format_time_parts(&time).0;
         let line = if body.is_empty() {
             format!("** {}", severity)
         } else {
@@ -2726,35 +2727,20 @@ impl Simulator {
                         }
                         't' | 'T' => {
                             if ai < args.len() {
-                                // The argument carries a time in the scope's
-                                // unit. §20.3: `$realtime` keeps sub-unit
-                                // precision, but `$time`/`$stime` are the time
-                                // ROUNDED to the module unit (an integer) — `%t`
-                                // must format that rounded value, not the raw
-                                // simulation time. Any other expression is read
-                                // as a scope-unit value directly.
+                                // Evaluate the time in scope units (§20.3),
+                                // then apply the display units and precision.
                                 let value = match &args[ai].kind {
                                     ExprKind::SystemCall { name, .. }
                                         if name.as_str() == "$realtime" =>
                                     {
-                                        self.time_in_current_unit()
+                                        Value::from_f64(self.time_in_current_unit())
                                     }
-                                    ExprKind::SystemCall { name, .. }
-                                        if matches!(name.as_str(), "$time" | "$stime") =>
-                                    {
-                                        let r = self.time_in_current_unit().round();
-                                        if name.as_str() == "$stime" {
-                                            ((r as u64) & 0xFFFF_FFFF) as f64
-                                        } else {
-                                            r
-                                        }
-                                    }
-                                    _ => self.eval_expr(&args[ai]).to_f64(),
+                                    _ => self.eval_expr(&args[ai]),
                                 };
                                 // $timeformat's min field width (default 20,
-                                // §21.3.5) governs a bare %t; an explicit
+                                // §20.4.3) governs a bare %t; an explicit
                                 // `%NNt` width overrides it, `%0t` is minimal.
-                                let (body, tf_width) = self.format_time_parts(value);
+                                let (body, tf_width) = self.format_time_parts(&value);
                                 result.push_str(&field(body, tf_width));
                                 ai += 1;
                             }
