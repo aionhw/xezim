@@ -838,3 +838,5 @@ mod struct_element_return_1310;
 mod review_pattern_type_keys_imports;
 #[path = "types/shortreal_storage_1463.rs"]
 mod shortreal_storage_1463;
+#[path = "types/real_to_integral_cast.rs"]
+mod real_to_integral_cast;
