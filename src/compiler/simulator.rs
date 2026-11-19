@@ -385,7 +385,10 @@ fn method_boost_enabled() -> bool {
 // inlined package callee its own, ahead of the design's same-named declarations.
 // §13.5.2: a call that declines its output or inout write-back leaves no compiled call
 // behind its interpreter fallback.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308a;
+// §6.21, §13.4.2, §7.4.1: a static local that constant selects write whole before a read
+// carries nothing between calls, so its subroutine inlines; a subroutine selecting a variable
+// declared with an ascending or offset range does not inline.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308b;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1797,7 +1800,10 @@ struct CombEntryCold {
 // read of an unnamed memory cell stays unresolved.
 // §13.4.1, §26.3: a scope-qualified function's return variable and the name of a callee
 // called through a package or `$unit` are not reads; its body's reads are.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB043";
+// §6.21, §13.4.2, §7.4.1: continuous assigns calling a static function whose local constant
+// selects write whole before a read compile; a call selecting an ascending or offset-range
+// variable of its callee stays interpreted.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB044";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
