@@ -72,8 +72,8 @@ impl Simulator {
 
     /// §9.4.5: the elements of the unpacked array named by `e` (a whole
     /// array or a row of one, not a call) read now, each with its leaf path
-    /// below `e` (`[1][0]`), in declared order. None when `e` names no
-    /// unpacked array or its elements are unpacked structs.
+    /// below `e` (`[1][0]`, or `[1].a` under an element that is an unpacked
+    /// struct), in declared order. None when `e` names no unpacked array.
     pub(super) fn array_item_elements(&mut self, e: &Expression) -> Option<Vec<(String, Value)>> {
         let e = Self::unparen(e);
         if !Self::may_be_array_item(e) || matches!(e.kind, ExprKind::Call { .. }) {
@@ -82,7 +82,7 @@ impl Simulator {
         let capture = self.pattern_nba_leaves.take();
         let out = self.array_item_elements_now(e);
         self.pattern_nba_leaves = capture;
-        out.filter(|v| !v.is_empty() && v.iter().all(|(s, _)| !s.contains('.')))
+        out.filter(|v| !v.is_empty() && v.iter().all(|(s, _)| s.starts_with('[')))
     }
 
     fn array_item_elements_now(&mut self, e: &Expression) -> Option<Vec<(String, Value)>> {

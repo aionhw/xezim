@@ -2708,16 +2708,25 @@ impl Simulator {
             _ => {
                 // §10.9.1: an array matched to a sub-array (`'{wc, wc}`)
                 // supplies its elements, read now.
-                if matches!(
+                // A target whose shape is not known here (a class property,
+                // a member path) takes an array item the same way: an
+                // unpacked array is only ever matched to a sub-array.
+                if !matches!(
                     shape,
-                    Some(super::intra_pattern_shape::ItemShape::Array { .. })
+                    Some(
+                        super::intra_pattern_shape::ItemShape::Leaf(_)
+                            | super::intra_pattern_shape::ItemShape::Struct(_)
+                    )
                 ) && let Some(elems) = self.array_item_elements(e)
                 {
+                    // `[1][0]` or, for an element that is an unpacked
+                    // struct, `[1].a`: one path step per dimension or member,
+                    // in declared order, so the steps nest positionally.
                     let rows = elems
                         .into_iter()
                         .map(|(suffix, v)| {
                             let path = suffix
-                                .split('[')
+                                .split(['[', '.'])
                                 .filter(|c| !c.is_empty())
                                 .map(|c| c.trim_end_matches(']').to_string())
                                 .collect();
