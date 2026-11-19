@@ -2323,8 +2323,7 @@ pub struct BytecodeCompiler<'a> {
     /// `typedef_types` key: such a type is not packed.
     typedef_unpacked_dims: Option<&'a HashMap<String, Vec<crate::ast::types::UnpackedDimension>>>,
     /// Declared types of explicitly typed value parameters.
-    param_decl_types:
-        Option<&'a xezim_core::shared_names::SharedNameMap<crate::ast::types::DataType>>,
+    param_decl_types: Option<&'a xezim_core::decl_types::ParamDeclTypeMap>,
     /// Ports collapsed onto the nets they connect, formal to actual.
     port_aliases: Option<&'a HashMap<String, String>>,
     /// Stack of pending `break` jump-target patches, one entry per enclosing
@@ -3496,10 +3495,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.port_aliases = Some(a);
     }
 
-    pub fn set_param_decl_types(
-        &mut self,
-        t: &'a xezim_core::shared_names::SharedNameMap<crate::ast::types::DataType>,
-    ) {
+    pub fn set_param_decl_types(&mut self, t: &'a xezim_core::decl_types::ParamDeclTypeMap) {
         self.param_decl_types = Some(t);
     }
 
