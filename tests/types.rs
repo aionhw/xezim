@@ -809,3 +809,5 @@ mod pattern_type_key_last_match_1290;
 mod pattern_type_key_real_realtime_1290;
 #[path = "types/pattern_type_key_scoped_and_lexical_1290.rs"]
 mod pattern_type_key_scoped_and_lexical_1290;
+#[path = "types/struct_element_return_1310.rs"]
+mod struct_element_return_1310;
