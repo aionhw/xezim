@@ -541,3 +541,5 @@ mod time_literal_exact_1299;
 mod intra_delay_array_items;
 #[path = "scheduling/review_intra_delay_array_items.rs"]
 mod review_intra_delay_array_items;
+#[path = "scheduling/sva_default_actuals_1309.rs"]
+mod sva_default_actuals_1309;
