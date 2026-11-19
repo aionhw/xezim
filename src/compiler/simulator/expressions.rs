@@ -2106,20 +2106,127 @@ impl Simulator {
             }
         }
         let ExprKind::Ident(h) = &root.kind else {
-            return false;
+            // §7.2, §7.4.1: a member written as a member access
+            // (`sa[1].m[1]`, `f().m[1]`, `h.st.m[1]`).
+            return matches!(&root.kind, ExprKind::MemberAccess { member, .. }
+                if self.packed_named_signed_members.contains(member.name.as_str()))
+                && self.lvalue_static_type(root).is_some_and(|dt| {
+                    super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
+                        == Some(selects)
+                });
         };
-        if h.root.is_some()
-            || h.path.iter().any(|s| !s.selects.is_empty())
-            || self.frame_bound_bare_name(h).is_some()
-        {
+        if h.root.is_some() {
             return false;
+        }
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            // A variable of an indexed scope (`g_loop[0].gv[1]`).
+            if h.path.last().is_some_and(|s| s.selects.is_empty()) {
+                let name = self.resolve_hier_name(h);
+                let name = name.as_ref();
+                if self.packed_named_signed.get(name) == Some(&selects)
+                    && !self.module.arrays.contains_key(name)
+                {
+                    return true;
+                }
+            }
+            // An element of a packed array of structures on the way
+            // (`sa[1].m` as one path): the member's declared type.
+            return h.path.len() >= 2
+                && h.path.last().is_some_and(|s| {
+                    s.selects.is_empty()
+                        && self
+                            .packed_named_signed_members
+                            .contains(s.name.name.as_str())
+                })
+                && self.lvalue_static_type(root).is_some_and(|dt| {
+                    super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
+                        == Some(selects)
+                });
+        }
+        // §7.4.1, §13.3: a formal or a local of the running subroutine or
+        // block. Its declaration is recorded under the bare name while the
+        // frame is live, so the element type comes from there; the table
+        // built at start-up only holds the design's own variables.
+        if let Some(n) = self.frame_bound_bare_name(h) {
+            return self.frame_named_signed_depth(n) == Some(selects);
         }
         let name = self.resolve_hier_name(h);
         let name = name.as_ref();
-        self.packed_named_signed.get(name) == Some(&selects)
-            && !self.module.arrays.contains_key(name)
-            && !self.module.arrays_2d.contains_key(name)
-            && !self.module.arrays_nd.contains_key(name)
+        let depth = match self.packed_named_signed.get(name) {
+            Some(&d) => Some(d),
+            // §6.21: a block variable is recorded when its declaration
+            // runs, after the table was built.
+            None => self.module.var_decl_types.get(name).and_then(|dt| {
+                super::bytecode::signed_named_packed_elem_depth(dt, &self.module.typedef_types)
+            }),
+        };
+        if depth == Some(selects) {
+            return !self.module.arrays.contains_key(name)
+                && !self.module.arrays_2d.contains_key(name)
+                && !self.module.arrays_nd.contains_key(name);
+        }
+        // §7.2, §7.4.1: a packed-array member reached through structure
+        // members, elements of a packed array of structures or an instance
+        // (`nst.i.m[1]`, `sa[1].m[1]`, `u.st.m[1]`) has its declared type.
+        depth.is_none()
+            && h.path.len() >= 2
+            && h.path.last().is_some_and(|s| {
+                self.packed_named_signed_members
+                    .contains(s.name.name.as_str())
+            })
+            && self.lvalue_static_type(root).is_some_and(|dt| {
+                super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
+                    == Some(selects)
+            })
+    }
+
+    /// §7.4.1: whether `dt` is a packed array of a named type, written with
+    /// its own dimensions (`lane_t [0:1]`) or carried by a typedef
+    /// (`typedef lane_t [0:1] arr_t;`).
+    pub(super) fn names_packed_array_of_named(&self, dt: &DataType) -> bool {
+        let mut cur = dt;
+        for _ in 0..16 {
+            let DataType::TypeReference {
+                name, dimensions, ..
+            } = cur
+            else {
+                return false;
+            };
+            if !dimensions.is_empty() {
+                return true;
+            }
+            match super::elaborate::lookup_scoped_type(name, &self.module.typedef_types) {
+                Some(next) => cur = next,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// §7.4.1: the select depth at which the formal or local `n` of the
+    /// running frame, a packed array, reaches a named signed element type.
+    /// None for any other variable, an unpacked array of such arrays
+    /// included: its first selects are unpacked, and its declaration here
+    /// is that of one element.
+    fn frame_named_signed_depth(&self, n: &str) -> Option<usize> {
+        let dt = self.module.var_decl_types.get(n)?;
+        let depth =
+            super::bytecode::signed_named_packed_elem_depth(dt, &self.module.typedef_types)?;
+        let frame = self.local_stack.last()?;
+        let whole = frame.get(n)?;
+        let width = super::elaborate::resolve_type_width(
+            dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        (whole.width == width
+            && !frame.contains_key(format!("\u{1}array_formal:{n}").as_str())
+            && !self.module.arrays.contains_key(n)
+            && !self.module.arrays_2d.contains_key(n)
+            && !self.module.arrays_nd.contains_key(n)
+            && !self.module.dynamic_arrays.contains(n)
+            && !self.module.queue_vars.contains(n))
+        .then_some(depth)
     }
 
     /// §7.4.1: the select depth at which the class property `e` names
@@ -2209,7 +2316,13 @@ impl Simulator {
                 let ExprKind::Ident(h) = &root.kind else {
                     return None;
                 };
-                if self.frame_bound_bare_name(h).is_some() {
+                if let Some(n) = self.frame_bound_bare_name(h) {
+                    // §7.4.1: an element of a named signed type.
+                    if self.packed_named_signed_types
+                        && self.frame_named_signed_depth(n) == Some(indices)
+                    {
+                        return Some(true);
+                    }
                     return self
                         .get_expr_type_name(expr)
                         .and_then(|name| self.concrete_type_signed(&name));
@@ -2429,7 +2542,9 @@ impl Simulator {
         // §7.4.1: an element of a packed array of a named signed type is
         // signed; the slice that reads it is not. One length test when no
         // variable is declared that way.
-        if (!self.packed_named_signed.is_empty() || !self.packed_named_signed_props.is_empty())
+        if (self.packed_named_signed_types
+            || !self.packed_named_signed.is_empty()
+            || !self.packed_named_signed_props.is_empty())
             && matches!(expr.kind, ExprKind::Index { .. })
             && self.packed_named_sign_guard != expr as *const Expression as usize
             && self.packed_named_select_signed(expr)

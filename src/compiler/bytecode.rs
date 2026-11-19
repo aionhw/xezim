@@ -3874,6 +3874,15 @@ impl<'a> BytecodeCompiler<'a> {
     /// typedef? A bound that does not fold counts as one.
     fn decl_has_offset_range(&self, dt: &crate::ast::types::DataType) -> bool {
         use crate::ast::types::{DataType, PackedDimension};
+        // §7.4.1: so is a packed array of a named signed type. A select of
+        // one of its elements is signed, which the interpreter reads from
+        // the declaration of the formal or local.
+        if self
+            .typedef_types
+            .is_some_and(|t| signed_named_packed_elem_depth(dt, t).is_some())
+        {
+            return true;
+        }
         let offset = |dims: &[PackedDimension]| {
             dims.iter().any(|d| match d {
                 PackedDimension::Range { left, right, .. } => {

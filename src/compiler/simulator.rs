@@ -10424,6 +10424,14 @@ pub struct Simulator {
     /// address), so the re-entrant evaluation reads the slice itself.
     #[serde(skip)]
     packed_named_sign_guard: usize,
+    /// §7.4.1: whether the design declares a signed integral type by name
+    /// at all. Only then can a subroutine or block variable be a packed
+    /// array whose elements are signed, so only then does an element select
+    /// of one consult its declaration.
+    packed_named_signed_types: bool,
+    /// §7.2, §7.4.1: names of structure members that are packed arrays of a
+    /// named signed type (see its construction).
+    packed_named_signed_members: HashSet<String>,
     /// The arithmetic or bitwise operand (its address) being evaluated
     /// whose parent operator found no context-determined shift in it
     /// (`has_context_shift`), so its own operator does not scan its operands

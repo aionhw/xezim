@@ -1750,7 +1750,13 @@ impl Simulator {
                         }
                         None => port,
                     };
-                    if !plain && matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_))
+                    // §7.4.1, §13.5: so does a formal that is a packed array
+                    // of a named type (`lane_t [0:1] v`, or a typedef of
+                    // one): its range labels its elements and their type
+                    // gives them their signing, as for a function's formal.
+                    if !plain
+                        && (matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_))
+                            || self.names_packed_array_of_named(&port.data_type))
                     {
                         self.register_formal_type_metadata(
                             &port.name.name,

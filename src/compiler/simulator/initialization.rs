@@ -3899,6 +3899,45 @@ impl Simulator {
                     .map(|depth| (p.clone(), depth))
             })
             .collect();
+        let packed_named_signed_types = module.typedef_types.values().any(|dt| {
+            matches!(
+                dt,
+                DataType::IntegerAtom { .. }
+                    | DataType::IntegerVector { .. }
+                    | DataType::Enum(_)
+                    | DataType::Struct(_)
+            ) && super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
+        });
+        // §7.2, §7.4.1: the names of structure members that are packed
+        // arrays of a named signed type, in any structure type the design
+        // declares. A select of a member path consults the member's declared
+        // type only when its last name is one of these.
+        let packed_named_signed_members: HashSet<String> = {
+            let types = &module.typedef_types;
+            let mut names: HashSet<String> = HashSet::default();
+            let class_props = module
+                .classes
+                .values()
+                .flat_map(|cd| cd.property_types.values());
+            for dt in types
+                .values()
+                .chain(module.var_decl_types.values())
+                .chain(class_props)
+            {
+                let DataType::Struct(su) = super::elaborate::resolve_typedef_chain(dt, types)
+                else {
+                    continue;
+                };
+                for member in &su.members {
+                    if super::bytecode::signed_named_packed_elem_depth(&member.data_type, types)
+                        .is_some()
+                    {
+                        names.extend(member.declarators.iter().map(|d| d.name.name.clone()));
+                    }
+                }
+            }
+            names
+        };
         let packed_named_signed: HashMap<String, usize> = {
             let types = &module.typedef_types;
             let mut m: HashMap<String, usize> = HashMap::default();
@@ -4761,6 +4800,8 @@ impl Simulator {
             cast_widths,
             packed_named_signed,
             packed_named_signed_props,
+            packed_named_signed_types,
+            packed_named_signed_members,
             packed_named_sign_guard: 0,
             shift_free_operand: 0,
             fn_decl_cache: HashMap::default(),
