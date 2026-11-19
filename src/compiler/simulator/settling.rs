@@ -2112,11 +2112,18 @@ impl Simulator {
                     // memory cells without element names) has no id to
                     // re-dirty: an out-of-range marker still makes the next
                     // full settle run, which seeds every unresolved entry.
-                    let reads = &entries[eidx].cold.read_signal_ids;
-                    self.defer_proc_reads(
-                        reads,
-                        entries[eidx].has_unresolved_reads && reads.is_empty(),
-                    );
+                    if self.comb_unresolved_idx.len() == num_entries {
+                        // A full settle already seeds every entry in this graph.
+                        // One wakeup suffices, even for a function reading
+                        // thousands of signals through the VHDL kernel.
+                        self.defer_proc_reads(&[], true);
+                    } else {
+                        let reads = &cold.read_signal_ids;
+                        self.defer_proc_reads(
+                            reads,
+                            entries[eidx].has_unresolved_reads && reads.is_empty(),
+                        );
+                    }
                     continue;
                 }
                 evaluated_any = true;

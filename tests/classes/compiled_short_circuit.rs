@@ -48,7 +48,7 @@ module top;
 endmodule
 "#;
 
-fn run(compile: &str) -> String {
+fn run(compile: &str, design: &str) -> String {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!(
         "xezim_short_circuit_{}_{}",
@@ -58,7 +58,7 @@ fn run(compile: &str) -> String {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temporary directory");
     let path = dir.join("design.sv");
-    std::fs::write(&path, DESIGN).expect("write design");
+    std::fs::write(&path, design).expect("write design");
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .args([
             "--simulate",
@@ -86,7 +86,7 @@ fn run(compile: &str) -> String {
 #[test]
 fn logical_and_conditional_operators_skip_the_unselected_operand() {
     for compile in ["0", "1"] {
-        let log = run(compile);
+        let log = run(compile, DESIGN);
         let lines: Vec<&str> = log.lines().filter(|l| l.starts_with("T|")).collect();
         assert_eq!(
             lines,
@@ -100,4 +100,42 @@ fn logical_and_conditional_operators_skip_the_unselected_operand() {
             "XEZIM_COMPILE_METHODS={compile}"
         );
     }
+}
+
+#[test]
+fn clocked_process_skips_decided_operands_and_evaluates_unknowns() {
+    let design = r#"
+module top;
+  bit tick;
+  logic [79:0] gate;
+  int calls;
+  logic a, b;
+  function automatic bit probe(bit result);
+    calls++;
+    return result;
+  endfunction
+  always @(posedge tick) begin
+    a = gate && probe(1);
+    b = gate || probe(0);
+  end
+  initial begin
+    gate = 0;
+    #1; tick = 1; #1;
+    $display("T|%b%b %0d", a, b, calls);
+    tick = 0; gate = 80'h80000000000000000000;
+    #1; tick = 1; #1;
+    $display("T|%b%b %0d", a, b, calls);
+    tick = 0; gate = 'z;
+    #1; tick = 1; #1;
+    $display("T|%b%b %0d", a, b, calls);
+    tick = 0; gate = 'x;
+    #1; tick = 1; #1;
+    $display("T|%b%b %0d", a, b, calls);
+    $finish;
+  end
+endmodule
+"#;
+    let log = run("1", design);
+    let lines: Vec<_> = log.lines().filter(|l| l.starts_with("T|")).collect();
+    assert_eq!(lines, ["T|00 1", "T|11 2", "T|xx 4", "T|xx 6"], "{log}");
 }

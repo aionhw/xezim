@@ -676,3 +676,10 @@ fn initialization_batch_order() {
 fn last_event_through_signal_formals() {
     check("last_event");
 }
+
+/// Both edge directions over every pair of STD_ULOGIC values, with the
+/// register enable held low and high.
+#[test]
+fn clock_enable_edges() {
+    check("clock_enable_edges");
+}

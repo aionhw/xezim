@@ -1,0 +1,2 @@
+clock_enable_edges.vhd:35:9:@324ns:(report note): PASS edge matrix
+simulation finished @324ns

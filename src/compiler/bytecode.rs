@@ -16661,8 +16661,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // §11.4.7: `&&` / `||` do not evaluate the right operand once
                 // the left decides the result. Matters when it has an effect
                 // (`h != null && h.f()` must not call through null).
-                if self.method_mode
-                    && matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr)
+                if matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr)
                     && Self::expr_has_effect(right)
                 {
                     return self.compile_short_circuit(*op, left, right);

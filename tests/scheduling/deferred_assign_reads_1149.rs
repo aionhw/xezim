@@ -173,3 +173,30 @@ endmodule
         "{stdout}"
     );
 }
+
+#[test]
+fn unresolved_assignment_with_signal_reads_runs_after_yield() {
+    let (stdout, _) = run(
+        "unresolved_reads",
+        r#"
+module top;
+  class cfg;
+    static int offset;
+  endclass
+  logic [7:0] a = 0, b = 0;
+  wire [7:0] sum = a + b + cfg::offset;
+  initial begin
+    #1;
+    a = 7;
+    b = 8;
+    $display("T|before yield %0d", sum);
+    #1;
+    $display("T|after yield %0d", sum);
+    $finish;
+  end
+endmodule
+"#,
+        &[],
+    );
+    assert_eq!(checks(&stdout), ["T|before yield 0", "T|after yield 15"]);
+}

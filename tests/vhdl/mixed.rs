@@ -137,3 +137,8 @@ fn mixed_generic_package_param() {
 fn mixed_inout_port() {
     check("mixed_inout_port");
 }
+
+#[test]
+fn mixed_wide_logic() {
+    check("mixed_wide_logic");
+}
