@@ -1577,7 +1577,7 @@ impl Simulator {
             return false;
         }
         self.module.var_decl_types.get(name).is_some_and(|dt| {
-            !super::elaborate::is_type_real(dt)
+            !self.dt_is_real(dt)
                 && super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types)
         })
     }
@@ -2536,7 +2536,7 @@ impl Simulator {
                     } else {
                         Self::real_into_slot(p, val.to_f64())
                     }
-                } else if elem_dt().is_some_and(|dt| super::elaborate::is_type_real(&dt)) {
+                } else if elem_dt().is_some_and(|dt| self.dt_is_real(&dt)) {
                     Value::from_f64(val.to_f64())
                 } else if let Some(p) = declared_slot() {
                     Self::real_into_slot(&p, val.to_f64())
@@ -6876,7 +6876,7 @@ impl Simulator {
                             if let Some(dt) = dt {
                                 let resolved =
                                     Self::resolve_type_ref(&dt, &self.module.typedef_types);
-                                if let Some(fields) = Self::struct_field_layout(&resolved) {
+                                if let Some(fields) = self.struct_field_layout(&resolved) {
                                     if let Some((_, off, w, _real)) = fields
                                         .iter()
                                         .find(|(m, _, _, _)| m == &member.name)

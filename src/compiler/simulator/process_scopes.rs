@@ -1300,7 +1300,10 @@ impl Simulator {
                     }
                 ) {
                     Expression::new(ExprKind::StringLiteral(String::new()), port.span)
-                } else if super::elaborate::is_type_real(&port.data_type) {
+                } else if super::elaborate::is_type_real_resolved(
+                    &port.data_type,
+                    &module.typedef_types,
+                ) {
                     Expression::new(
                         ExprKind::Number(crate::ast::expr::NumberLiteral::Real(0.0)),
                         port.span,

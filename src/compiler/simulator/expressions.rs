@@ -728,7 +728,7 @@ impl Simulator {
                     let mut m = std::collections::HashMap::new();
                     if let Some(dt) = dt_opt {
                         let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
-                        if let Some(fs) = Self::struct_field_layout(&resolved) {
+                        if let Some(fs) = self.struct_field_layout(&resolved) {
                             for (fn_, _, _, fr) in fs {
                                 m.insert(fn_, fr);
                             }
@@ -760,7 +760,7 @@ impl Simulator {
                                     &fd.return_type,
                                     &self.module.typedef_types,
                                 );
-                                Self::struct_field_layout(&resolved)
+                                self.struct_field_layout(&resolved)
                             } else {
                                 None
                             }
@@ -768,7 +768,7 @@ impl Simulator {
                             // Local variable/parameter with typedef type
                             let dt = self.module.typedef_types.get(type_name.as_str())?;
                             let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
-                            Self::struct_field_layout(&resolved)
+                            self.struct_field_layout(&resolved)
                         } else {
                             // Module-level signal with a typedef'd struct
                             // type: resolve via signal_name_to_id →
@@ -781,13 +781,13 @@ impl Simulator {
                                 let dt = self.module.typedef_types.get(tn.as_str())?;
                                 let resolved =
                                     Self::resolve_type_ref(dt, &self.module.typedef_types);
-                                Self::struct_field_layout(&resolved)
+                                self.struct_field_layout(&resolved)
                             } else {
                                 // Try resolving base_name as a typedef
                                 let dt = self.module.typedef_types.get(&*base_name)?;
                                 let resolved =
                                     Self::resolve_type_ref(dt, &self.module.typedef_types);
-                                Self::struct_field_layout(&resolved)
+                                self.struct_field_layout(&resolved)
                             }
                         }
                     })
@@ -1478,7 +1478,7 @@ impl Simulator {
             Some(tn) => {
                 if let Some(dt) = self.module.typedef_types.get(tn.as_str()) {
                     let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
-                    if Self::struct_field_layout(&resolved).is_some() {
+                    if self.struct_field_layout(&resolved).is_some() {
                         return None;
                     }
                 }
@@ -3888,7 +3888,7 @@ impl Simulator {
                             .and_then(|dt| {
                                 let resolved =
                                     Self::resolve_type_ref(dt, &self.module.typedef_types);
-                                Self::struct_field_layout(&resolved)
+                                self.struct_field_layout(&resolved)
                             })
                             .or_else(|| {
                                 // Signal-stored struct: resolve type via
@@ -3903,7 +3903,7 @@ impl Simulator {
                                     .and_then(|dt| {
                                         let resolved =
                                             Self::resolve_type_ref(dt, &self.module.typedef_types);
-                                        Self::struct_field_layout(&resolved)
+                                        self.struct_field_layout(&resolved)
                                     })
                             });
                         if let Some(fields) = layout {

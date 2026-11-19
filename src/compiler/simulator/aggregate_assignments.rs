@@ -3037,8 +3037,14 @@ impl Simulator {
                 "$__xz_type_cast" => matches!(
                     args.first().map(|a| &a.kind),
                     Some(ExprKind::TypeLiteral(dt))
-                        if crate::compiler::elaborate::is_type_real(dt)
+                        if self.dt_is_real(dt)
                 ),
+                // §6.24.1: `R'(i)` with `typedef real R` is a real operand.
+                "$__xz_named_cast" => args
+                    .first()
+                    .and_then(|a| self.named_cast_key(a))
+                    .and_then(|k| self.module.typedef_types.get(&k))
+                    .is_some_and(|dt| self.dt_is_real(dt)),
                 n => super::bytecode::system_function_is_real(n),
             },
             _ => false,
@@ -3058,12 +3064,7 @@ impl Simulator {
                 .module
                 .functions
                 .get(&h.path[0].name.name)
-                .is_some_and(|fd| {
-                    super::elaborate::is_type_real_resolved(
-                        &fd.return_type,
-                        &self.module.typedef_types,
-                    )
-                })
+                .is_some_and(|fd| self.dt_is_real(&fd.return_type))
     }
 
     /// A constant expression by its shape — literals, parameters, and

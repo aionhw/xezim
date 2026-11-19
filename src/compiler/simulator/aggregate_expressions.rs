@@ -4460,7 +4460,7 @@ impl Simulator {
                 ) {
                     return Self::sv_string_cast(&v);
                 }
-                if super::elaborate::is_type_real(&dt) {
+                if self.dt_is_real(&dt) {
                     return Value::from_f64(v.to_f64());
                 }
                 // §6.24.1: a type cast to an UNPACKED ARRAY / QUEUE target
@@ -4589,7 +4589,7 @@ impl Simulator {
                 if let Some(nm) = target {
                     // (a) Full typedef (carries signedness / real-ness).
                     if let Some(dt) = self.module.typedef_types.get(&nm).cloned() {
-                        if super::elaborate::is_type_real(&dt) {
+                        if self.dt_is_real(&dt) {
                             return Value::from_f64(inner_v.to_f64());
                         }
                         // §6.24.1 cast to an UNPACKED ARRAY / QUEUE typedef

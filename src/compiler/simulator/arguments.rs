@@ -1026,7 +1026,7 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            let is_real = super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type));
+            let is_real = self.dt_is_real(&m.data_type);
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
@@ -1103,8 +1103,7 @@ impl Simulator {
                 Some(&self.module.typedefs),
             );
             // §6.18: a typedef preserves the member's real type.
-            let is_real =
-                super::elaborate::is_type_real_resolved(&m.data_type, &self.module.typedef_types);
+            let is_real = self.dt_is_real(&m.data_type);
             let dv = if is_real {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state_resolved(
@@ -1883,7 +1882,7 @@ impl Simulator {
                         Some(&self.module.parameters),
                         Some(&self.module.typedefs),
                     );
-                    let r = super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type));
+                    let r = self.dt_is_real(&m.data_type);
                     for md in &m.declarators {
                         keys.push((format!("{}.{}", port_name, md.name.name), w, r));
                     }
@@ -2635,7 +2634,7 @@ impl Simulator {
         ) {
             return Some(Value::from_string(""));
         }
-        if super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types) {
+        if self.dt_is_real(dt) {
             return Some(Value::from_f64(0.0));
         }
         if super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types) {

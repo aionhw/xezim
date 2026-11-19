@@ -9081,6 +9081,38 @@ impl<'a> BytecodeCompiler<'a> {
         dt // A cyclic alias must not acquire a concrete local kind.
     }
 
+    /// §6.24.1: whether the named cast `T'(x)` (`pkg::T'(x)`) targets a
+    /// typedef of a real type, so the cast is a real operand of its context.
+    fn named_cast_is_real(&self, args: &[Expression]) -> bool {
+        let (scope, leaf) = match args.first().map(|a| &a.kind) {
+            Some(ExprKind::Ident(h)) if h.path.len() >= 2 => {
+                let n = h.path.len();
+                (
+                    Some(h.path[n - 2].name.name.as_str()),
+                    h.path[n - 1].name.name.as_str(),
+                )
+            }
+            Some(ExprKind::Ident(h)) if h.path.len() == 1 => (None, h.path[0].name.name.as_str()),
+            Some(ExprKind::MemberAccess { expr, member }) => match &expr.kind {
+                ExprKind::Ident(h) => (
+                    h.path.last().map(|s| s.name.name.as_str()),
+                    member.name.as_str(),
+                ),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        let get = |key: &str| {
+            self.local_typedef_types
+                .get(key)
+                .or_else(|| self.typedef_types.and_then(|t| t.get(key)))
+        };
+        scope
+            .and_then(|s| get(&format!("{s}::{leaf}")))
+            .or_else(|| get(leaf))
+            .is_some_and(|dt| self.decl_is_real(dt, None))
+    }
+
     fn decl_is_real(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> bool {
         crate::compiler::elaborate::is_type_real(self.resolved_decl_type(dt, scope))
     }
@@ -12178,9 +12210,9 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::SystemCall { name, args } => match name.as_str() {
                 "$__xz_type_cast" => matches!(
                     args.first().map(|a| &a.kind),
-                    Some(ExprKind::TypeLiteral(dt))
-                        if crate::compiler::elaborate::is_type_real(dt)
+                    Some(ExprKind::TypeLiteral(dt)) if self.decl_is_real(dt, None)
                 ),
+                "$__xz_named_cast" => self.named_cast_is_real(args),
                 n => system_function_is_real(n),
             },
             ExprKind::Call { func, .. } => self.call_returns_real(func),
@@ -12201,8 +12233,7 @@ impl<'a> BytecodeCompiler<'a> {
         let Some(name) = self.scoped_callee_name(h.path[0].name.name.clone()) else {
             return false;
         };
-        let real =
-            |fd: &FunctionDeclaration| crate::compiler::elaborate::is_type_real(&fd.return_type);
+        let real = |fd: &FunctionDeclaration| self.decl_is_real(&fd.return_type, Some(&name));
         self.functions.and_then(|f| f.get(&name)).is_some_and(real)
             || self
                 .dpi_import_fds
@@ -19048,7 +19079,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("type_cast_stream");
                         return None;
                     }
-                    let is_real = crate::compiler::elaborate::is_type_real(&dt);
+                    let is_real = self.decl_is_real(&dt, None);
                     let w = crate::compiler::elaborate::resolve_type_width(&dt, self.params, None)
                         .max(1);
                     // §6.24.1: an integral target is the operand's context

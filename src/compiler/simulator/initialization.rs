@@ -3868,7 +3868,7 @@ impl Simulator {
         let cast_widths: HashMap<String, (u32, bool)> = {
             let mut m: HashMap<String, (u32, bool)> = HashMap::default();
             for (name, dt) in &module.typedef_types {
-                if super::elaborate::is_type_real(dt) {
+                if super::elaborate::is_type_real_resolved(dt, &module.typedef_types) {
                     continue;
                 }
                 let w = super::elaborate::resolve_type_width(

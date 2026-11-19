@@ -31,7 +31,7 @@
 //! 0`) comes up in proportion to the solutions it leaves.
 use super::*;
 use crate::ast::decl::DistWeight;
-use crate::compiler::elaborate::{is_type_real, is_type_signed, resolve_type_width};
+use crate::compiler::elaborate::{is_type_signed, resolve_type_width};
 use rand::Rng;
 
 mod obj;
@@ -8664,7 +8664,7 @@ impl Simulator {
                     let ExprKind::TypeLiteral(dt) = &t.kind else {
                         return None;
                     };
-                    if is_type_real(dt) {
+                    if self.dt_is_real(dt) {
                         return None;
                     }
                     let w = resolve_type_width(
@@ -8684,7 +8684,7 @@ impl Simulator {
                     let nm = self.named_cast_key(t)?;
                     let nm = nm.as_str();
                     let (w, s) = if let Some(dt) = self.module.typedef_types.get(nm) {
-                        if is_type_real(dt) {
+                        if self.dt_is_real(dt) {
                             return None;
                         }
                         (self.cast_context_width(dt), Some(is_type_signed(dt)))

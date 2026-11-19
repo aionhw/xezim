@@ -4020,7 +4020,7 @@ impl Simulator {
                         .and_then(|tn| self.module.typedef_types.get(tn.as_str()))
                         .and_then(|dt| {
                             let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
-                            Self::struct_field_layout(&resolved)
+                            self.struct_field_layout(&resolved)
                         });
                     if let Some(members) = struct_members {
                         // Declaration order = reverse of struct_field_layout

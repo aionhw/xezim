@@ -94,7 +94,7 @@ impl Simulator {
         if matches!(fd.return_type, DataType::Void { .. }) {
             return None;
         }
-        if matches!(fd.return_type, DataType::Real { .. }) {
+        if self.dt_is_real(&fd.return_type) {
             return Some(64);
         }
         let w = super::elaborate::resolve_type_width(
@@ -190,7 +190,10 @@ impl Simulator {
         while let Some(cd) = self.module.classes.get(&cur) {
             if let Some(m) = cd.methods.get(mname) {
                 if let ClassMethodKind::Function(f) = &m.kind {
-                    if matches!(f.return_type, DataType::Real { .. }) {
+                    if super::elaborate::is_type_real_resolved(
+                        &f.return_type,
+                        &self.module.typedef_types,
+                    ) {
                         return Some(64);
                     }
                     if matches!(f.return_type, DataType::Void { .. }) {

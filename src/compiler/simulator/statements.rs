@@ -2330,7 +2330,7 @@ impl Simulator {
                 _ => false,
             };
         // §6.4: `real`/`shortreal` variables default to 0.0.
-        let is_real_type = super::elaborate::is_type_real(data_type);
+        let is_real_type = self.dt_is_real(data_type);
         // §6.11.3: the declared signedness every declarator's value and
         // later reads carry.
         let decl_signed = !plain_class
