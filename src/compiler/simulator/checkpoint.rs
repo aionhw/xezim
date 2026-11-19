@@ -39,7 +39,9 @@ use serde::ser::{SerializeSeq, Serializer};
 // §8.23 / §25.9: ClassMemberNames::vif_typedef_leaves.
 // §13.5.1: MethodAdmission::coll_formal_positions.
 // §14.16.2: Simulator::clocking_select_due, the pending clocking select drives.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x10";
+// §9.4.2 / §9.3.2: Simulator::prev_wide holds a wide signal only once it is sampled; the
+// frame cache of a synchronous fork child is rebuilt, not carried (#721).
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x11";
 
 #[derive(Default)]
 struct Session {
