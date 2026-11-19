@@ -544,11 +544,54 @@ impl Simulator {
         }
     }
 
+    /// §26.3: the `module.functions` key of a callee named through a scope:
+    /// a package function `p::f` (registered as `p::f`; the call names it
+    /// as a two-segment path or as a scope member access) or a
+    /// compilation-unit function `$unit::f` (registered as `f`).
+    fn scoped_function_key(func: &Expression, module: &ElaboratedModule) -> Option<String> {
+        let plain = |h: &HierarchicalIdentifier| {
+            h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty())
+        };
+        let (pkg, name) = match &func.kind {
+            ExprKind::Ident(h) if plain(h) && h.path.len() == 1 => {
+                let bare = crate::sv_parser::strip_unit_scope_name(&h.path[0].name.name)?;
+                return module
+                    .functions
+                    .contains_key(bare)
+                    .then(|| bare.to_string());
+            }
+            ExprKind::Ident(h) if plain(h) && h.path.len() == 2 => {
+                (h.path[0].name.name.as_str(), h.path[1].name.name.as_str())
+            }
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if plain(h) && h.path.len() == 1 => {
+                    (h.path[0].name.name.as_str(), member.name.as_str())
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if pkg == "$unit" {
+            return module
+                .functions
+                .contains_key(name)
+                .then(|| name.to_string());
+        }
+        if !module.packages.contains(pkg) {
+            return None;
+        }
+        let key = format!("{pkg}::{name}");
+        module.functions.contains_key(&key).then_some(key)
+    }
+
     /// Whether a call's `func` names a function with a body in the design
     /// (`module.functions`), as the call-site walk in `collect_expr_reads`
     /// looks it up: the scoped name, the bare name, or an instance's
     /// `<inst>.<name>` registration. A DPI import or a method is not one.
     fn names_user_function(func: &Expression, module: &ElaboratedModule) -> bool {
+        if Self::scoped_function_key(func, module).is_some() {
+            return true;
+        }
         let ExprKind::Ident(hier) = &func.kind else {
             return false;
         };
@@ -1374,7 +1417,10 @@ impl Simulator {
                 // only always_comb/always_latch descend into the body. The
                 // caller signals which mode applies via SKIP_FN_BODY_READS.
                 if !SKIP_FN_BODY_READS.with(|c| c.get()) {
-                    if let ExprKind::Ident(hier) = &func.kind {
+                    if let Some(key) = Self::scoped_function_key(func, module) {
+                        // §26.3: the body of `p::f` is registered as `p::f`.
+                        Self::collect_callee_reads(&key, module, reads);
+                    } else if let ExprKind::Ident(hier) = &func.kind {
                         if let Some(seg) = hier.path.last() {
                             // Prefer the fully-scoped registration: an inlined
                             // instance's call site resolves to `<inst>.<name>`, and
