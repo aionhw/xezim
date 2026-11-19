@@ -383,7 +383,9 @@ fn method_boost_enabled() -> bool {
 // §5.7.1, §7.4.1: unsized signed decimal widths with a sign bit; multidimensional packed range NBAs decline.
 // §26.3: package code reads its own package's parameters, variables and imports, and an
 // inlined package callee its own, ahead of the design's same-named declarations.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3089;
+// §13.5.2: a call that declines its output or inout write-back leaves no compiled call
+// behind its interpreter fallback.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308a;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1793,7 +1795,9 @@ struct CombEntryCold {
 // §10.3.2, §9.2.2.1: shared-read batches leave out members with fused branches or jump
 // tables, chain fusion relocates branches within one process class, and an instance's
 // read of an unnamed memory cell stays unresolved.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB042";
+// §13.4.1, §26.3: a scope-qualified function's return variable and the name of a callee
+// called through a package or `$unit` are not reads; its body's reads are.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB043";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
