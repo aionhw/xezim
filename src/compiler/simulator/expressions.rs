@@ -4171,6 +4171,35 @@ impl Simulator {
                         }
                     }
                 }
+                // #1311, §25.9, §11.4.5: an unpacked variable of an interface
+                // reached through a virtual interface (`vif.arr == w`) is
+                // compared as the bound instance's variable is. A literal on
+                // the other side leaves a scalar comparison.
+                if PatternCmpMode::of(*op).is_some() {
+                    let chain = |e: &Expression| match &e.kind {
+                        ExprKind::MemberAccess { .. } => true,
+                        ExprKind::Ident(h) => h.path.len() >= 2,
+                        _ => false,
+                    };
+                    let (pl, pr) = (Self::peel_parens(left), Self::peel_parens(right));
+                    if (chain(pl) && !Self::cmp_literal_like(pr))
+                        || (chain(pr) && !Self::cmp_literal_like(pl))
+                    {
+                        let cl = chain(pl).then(|| self.vif_aggregate_canon(pl)).flatten();
+                        let cr = chain(pr).then(|| self.vif_aggregate_canon(pr)).flatten();
+                        if cl.is_some() || cr.is_some() {
+                            let rebased = Expression::new(
+                                ExprKind::Binary {
+                                    op: *op,
+                                    left: Box::new(cl.unwrap_or_else(|| (**left).clone())),
+                                    right: Box::new(cr.unwrap_or_else(|| (**right).clone())),
+                                },
+                                expr.span,
+                            );
+                            return self.eval_expr_ctx(&rebased, ctx_width);
+                        }
+                    }
+                }
                 // §11.4.5 / §10.9: equality against an ASSIGNMENT PATTERN
                 // (`a == '{9, 5, 5, 5}`) compares element- / member-wise. A
                 // typed pattern of an unpacked type compares the same way;

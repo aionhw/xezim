@@ -8436,6 +8436,10 @@ pub struct Simulator {
     /// before `bind_static_vif` looks at an assignment.
     #[serde(skip)]
     vif_capable_statics: std::cell::OnceCell<HashSet<String>>,
+    /// The leaf names of the unpacked variables declared below a scope
+    /// (`arr` of `bus.arr`): the prefilter of `vif_aggregate_canon`.
+    #[serde(skip)]
+    scoped_unpacked_leaves: std::cell::OnceCell<HashSet<String>>,
     /// False once start-up found no such static (`vif_capable_statics`
     /// empty): the one-byte test every blocking assignment makes.
     may_bind_static_vif: bool,

@@ -4209,6 +4209,7 @@ impl Simulator {
             static_vif_bindings: HashMap::default(),
             static_vif_names: HashSet::default(),
             vif_capable_statics: std::cell::OnceCell::new(),
+            scoped_unpacked_leaves: std::cell::OnceCell::new(),
             may_bind_static_vif: true,
             static_vif_array_names: HashSet::default(),
             recv_call_memo: Vec::new(),

@@ -1630,6 +1630,23 @@ impl Simulator {
                 return;
             }
         }
+        // #1311, §25.9, §7.6: a whole unpacked variable of an interface
+        // reached through a virtual interface on either side
+        // (`vif.arr = w`, `w = cfg.vif.arr`) is the bound instance's variable.
+        if whole(lvalue) || whole(rvalue) {
+            let l = whole(lvalue)
+                .then(|| self.vif_aggregate_canon(lvalue))
+                .flatten();
+            let r = whole(rvalue)
+                .then(|| self.vif_aggregate_canon(rvalue))
+                .flatten();
+            if l.is_some() || r.is_some() {
+                let lvalue = l.as_ref().unwrap_or(lvalue);
+                let rvalue = r.as_ref().unwrap_or(rvalue);
+                self.exec_stmt_blocking_assign_body(stmt, lvalue, rvalue);
+                return;
+            }
+        }
         if let Some(pattern) = self.unpacked_typed_pattern(rvalue) {
             self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
             return;

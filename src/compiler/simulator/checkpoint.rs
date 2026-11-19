@@ -682,6 +682,7 @@ checkpoint_once_cells!(
     param_leaf_index_cell,
     var_decl_leaf_index_cell,
     vif_capable_statics,
+    scoped_unpacked_leaves,
     iface_instance_paths,
     iface_by_token,
     iface_path_parts,
