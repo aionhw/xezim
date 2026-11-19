@@ -2396,6 +2396,38 @@ impl Simulator {
         None
     }
 
+    /// §18.4: the live objects behind the `rand` class-handle members of the
+    /// unpacked-struct property `prop` of `handle`, as (`prop.member`,
+    /// object). Array members and members of nested structs are not listed.
+    pub(super) fn struct_rand_handle_members(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Vec<(String, usize)> {
+        let Some(su) = self.class_prop_struct(handle, prop) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for m in &su.members {
+            if m.rand_qualifier.is_none() || !Self::dt_is_class_handle(&m.data_type, &self.module) {
+                continue;
+            }
+            for d in m.declarators.iter().filter(|d| d.dimensions.is_empty()) {
+                let key = format!("{}.{}", prop, d.name.name);
+                let cell = ClassAggRef::Unpacked {
+                    handle,
+                    key: key.clone(),
+                    w: 32,
+                };
+                let h = self.read_class_agg(&cell).to_u64().unwrap_or(0) as usize;
+                if h != 0 && h != handle && self.heap.get(h).is_some_and(|o| o.is_some()) {
+                    out.push((key, h));
+                }
+            }
+        }
+        out
+    }
+
     /// The object the receiver chain `e` refers to when it passes through a
     /// class-handle member of an unpacked-struct class property: the member
     /// itself (`r.h`) or a handle property reached from it (`r.h.lf`,

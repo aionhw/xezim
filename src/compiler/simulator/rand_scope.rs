@@ -1617,14 +1617,21 @@ impl Simulator {
             let Some(names) = Self::member_chain(e) else {
                 return Self::rebase_selected_chain(e, t, hit);
             };
-            let skip = usize::from(
-                t.recv
-                    .is_some_and(|r| names.len() >= 3 && names[0] == r && names[1] == t.prop),
-            );
-            if names.len() < skip + 2 || names[skip] != t.prop {
+            // `prop` is one name, or `struct_prop.member` for a handle
+            // member of an unpacked-struct property (§18.4).
+            let n = t.prop.split('.').count();
+            let at = |from: usize| {
+                names.len() > from + n
+                    && t.prop
+                        .split('.')
+                        .zip(&names[from..])
+                        .all(|(p, name)| p == name.as_str())
+            };
+            let skip = usize::from(t.recv.is_some_and(|r| names[0] == r && at(1)));
+            if !at(skip) {
                 return false;
             }
-            *e = Self::chain_expr(&names[skip + 1..], e.span);
+            *e = Self::chain_expr(&names[skip + n..], e.span);
             *hit = true;
             return true;
         }
