@@ -2238,7 +2238,9 @@ impl Simulator {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
+            xezim_core::oom_trace::checkpoint("startup.edge_measure.begin", &[]);
             self.build_event_measure_state();
+            xezim_core::oom_trace::checkpoint("startup.edge_measure.complete", &[]);
             if event_skip {
                 chatter!(
                     "[EVENT-EDGE] SKIP mode ON (sim_time >= {}) — skipping gateable flop fires with no data-input change",

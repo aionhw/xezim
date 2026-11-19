@@ -1368,9 +1368,25 @@ impl Simulator {
         // Module tasks/functions reachable from the code above, matched the
         // way `stmt_calls_blocking_task` resolves a callee (scoped, as
         // written, scoped leaf) plus any `*.leaf` key, an over-approximation.
+        xezim_core::oom_trace::checkpoint(
+            "startup.writer_calls.begin",
+            &[
+                ("pending_calls", calls.len()),
+                ("functions", self.module.functions.len()),
+                ("tasks", self.module.tasks.len()),
+            ],
+        );
+        let mut qualified: HashMap<&str, Vec<&str>> = HashMap::default();
+        if !calls.is_empty() {
+            for key in self.module.tasks.keys().chain(self.module.functions.keys()) {
+                if let Some((_, leaf)) = key.rsplit_once('.') {
+                    qualified.entry(leaf).or_default().push(key.as_str());
+                }
+            }
+        }
         let mut walked: HashSet<String> = HashSet::default();
         while let Some((raw, scope)) = calls.pop() {
-            let leaf = raw.rsplit('.').next().unwrap_or(&raw).to_string();
+            let leaf = raw.rsplit('.').next().unwrap_or(&raw);
             let mut keys: Vec<String> = Vec::new();
             for cand in [
                 (!scope.is_empty()).then(|| format!("{}.{}", scope, raw)),
@@ -1386,15 +1402,11 @@ impl Simulator {
                     keys.push(cand);
                 }
             }
-            let dotted = format!(".{}", leaf);
-            keys.extend(
-                self.module
-                    .tasks
-                    .keys()
-                    .chain(self.module.functions.keys())
-                    .filter(|k| k.ends_with(dotted.as_str()))
-                    .map(|k| k.to_string()),
-            );
+            // The suffix match includes every scoped declaration with this
+            // leaf. Once visited, later calls only need their exact lookups.
+            if let Some(matches) = qualified.remove(leaf) {
+                keys.extend(matches.into_iter().map(str::to_owned));
+            }
             for key in keys {
                 if !walked.insert(key.clone()) {
                     continue;
@@ -1411,6 +1423,10 @@ impl Simulator {
                 }
             }
         }
+        xezim_core::oom_trace::checkpoint(
+            "startup.writer_calls.complete",
+            &[("walked", walked.len()), ("signals", out.0.len()), ("array_ranges", out.1.len())],
+        );
         if t0_prefix_skipped {
             self.edge_skip_t0_refresh = true;
         }
