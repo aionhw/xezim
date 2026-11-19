@@ -807,3 +807,5 @@ mod nettype_alias_1302;
 mod pattern_type_key_last_match_1290;
 #[path = "types/pattern_type_key_real_realtime_1290.rs"]
 mod pattern_type_key_real_realtime_1290;
+#[path = "types/pattern_type_key_scoped_and_lexical_1290.rs"]
+mod pattern_type_key_scoped_and_lexical_1290;
