@@ -182,3 +182,149 @@ fn called_declarations_materialize_independent_cached_bodies() {
     rvalue.cached_width.set(Some(64));
     assert_eq!(rvalue.cached_width.get(), Some(64));
 }
+
+#[test]
+fn deferred_module_state_callables_share_source_and_run_independently() {
+    let mut sim = crate::simulate(
+        "module leaf #(parameter int INIT = 0);
+           int state = INIT;
+           int out_v;
+           int unused_out;
+           function automatic int read_add(input int x);
+             return x + state;
+           endfunction
+           function automatic int shadow_add(input int state);
+             return state + 100;
+           endfunction
+           function automatic int rec_sum(input int n);
+             if (n <= 0) return state;
+             return n + rec_sum(n - 1);
+           endfunction
+           function int static_local_fn(input int x);
+             static int base = state;
+             base = base + x;
+             return base;
+           endfunction
+           task automatic bump(input int d);
+             state = state + d;
+             out_v = state;
+           endtask
+         endmodule
+         module top;
+           leaf #(10) a();
+           leaf #(20) b();
+           leaf #(99) u_unused();
+           int ra, rb, sa, rc, sl1, sl2, ta, tb;
+           logic [31:0] comb_out, cont_out, ff_out;
+           logic clk = 0;
+           assign cont_out = a.read_add(5);
+           always_comb comb_out = b.read_add(7);
+           always_ff @(posedge clk) ff_out <= a.read_add(1);
+           initial begin
+             a.bump(3);
+             b.bump(4);
+             ra = a.read_add(2);
+             rb = b.read_add(2);
+             sa = a.shadow_add(9);
+             rc = b.rec_sum(3);
+             sl1 = a.static_local_fn(5);
+             sl2 = a.static_local_fn(2);
+             ta = a.out_v;
+             tb = b.out_v;
+             #1; clk = 1; #1;
+             a.state = 40;
+             b.state = 50;
+             #1;
+             $finish;
+           end
+         endmodule",
+        20,
+    )
+    .expect("deferred module state callables");
+    assert!(sim.finished);
+    assert_eq!(sim.error_count, 0);
+
+    // Module-level declarations keep shared source bodies, and uncalled
+    // instances remain absent from the per-callable runtime caches.
+    assert!(Arc::ptr_eq(
+        sim.module.functions["a.read_add"].items.as_arc(),
+        sim.module.functions["u_unused.read_add"].items.as_arc(),
+    ));
+    assert!(Arc::ptr_eq(
+        sim.module.functions["b.shadow_add"].items.as_arc(),
+        sim.module.functions["u_unused.shadow_add"].items.as_arc(),
+    ));
+    assert!(Arc::ptr_eq(
+        sim.module.tasks["a.bump"].items.as_arc(),
+        sim.module.tasks["u_unused.bump"].items.as_arc(),
+    ));
+    assert!(!sim.fn_decl_cache.contains_key("u_unused.read_add"));
+    assert!(!sim.fn_decl_cache.contains_key("u_unused.shadow_add"));
+    assert!(!sim.task_decl_cache.contains_key("u_unused.bump"));
+
+    for (sig, expected) in [
+        ("ta", 13),
+        ("tb", 24),
+        ("ra", 15),
+        ("rb", 26),
+        ("sa", 109),
+        ("rc", 30),
+        ("sl1", 15),
+        ("sl2", 17),
+        ("ff_out", 14),
+        ("cont_out", 45),
+        ("comb_out", 57),
+    ] {
+        assert_eq!(
+            sim.get_signal(sig).and_then(Value::to_u64),
+            Some(expected),
+            "signal {sig}"
+        );
+    }
+
+    // Checkpoint save/restore clears callable caches and re-materializes cleanly.
+    let directory = std::env::temp_dir().join(format!(
+        "xezim_deferred_callable_ckpt_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(directory.clone());
+    let ckpt = directory.join("state.ckpt");
+    let ckpt = ckpt.to_str().unwrap();
+    sim.checkpoint_save(ckpt).expect("save deferred callable ckpt");
+    sim.checkpoint_restore(ckpt)
+        .expect("restore deferred callable ckpt");
+    assert!(sim.fn_decl_cache.is_empty());
+    assert!(sim.task_decl_cache.is_empty());
+    let ra_fd = sim.fn_decl_rc("a.read_add").unwrap();
+    let rb_fd = sim.fn_decl_rc("b.read_add").unwrap();
+    assert!(!Arc::ptr_eq(ra_fd.items.as_arc(), rb_fd.items.as_arc()));
+    fn rhs_name(fd: &FunctionDeclaration) -> String {
+        let StatementKind::Return(Some(expr)) = &fd.items[0].kind else {
+            panic!("return expected")
+        };
+        let ExprKind::Binary { right, .. } = &expr.kind else {
+            panic!("binary expected")
+        };
+        let ExprKind::Ident(h) = &right.kind else {
+            panic!("ident expected")
+        };
+        h.path
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+    assert_eq!(rhs_name(&ra_fd), "a.state");
+    assert_eq!(rhs_name(&rb_fd), "b.state");
+}
