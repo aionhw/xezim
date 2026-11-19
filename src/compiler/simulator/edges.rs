@@ -409,6 +409,7 @@ impl Simulator {
         let mut rank = 0u8;
         let mut moved = false;
         let mut deferred_ix = usize::MAX;
+        let mut last_check = None;
         let saved_hint = waiter
             .value_ctx
             .as_ref()
@@ -420,6 +421,13 @@ impl Simulator {
                 continue;
             }
             moved = true;
+            // §9.4.2: several changed leaves can name the same expression.
+            if let Some(e) = &sid.value_of {
+                if last_check == Some((e.span, sid.edge)) {
+                    continue;
+                }
+                last_check = Some((e.span, sid.edge));
+            }
             // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the
             // guard `g` holds at edge time. A false guard re-arms the
             // waiter (it stays in event_waiters for the next edge)
@@ -455,10 +463,8 @@ impl Simulator {
             // (`@(posedge v[3])`) is judged on that value's LSB.
             let value_ok = match (&sid.value_of, waiter.guard_prev.get(i)) {
                 (Some(e), Some(Some(prev))) => {
-                    let e = e.clone();
-                    let prev = prev.clone();
-                    let cur = self.eval_expr(&e);
-                    value_event_fires(sid.edge, &prev, &cur)
+                    let cur = self.eval_expr(e);
+                    value_event_fires(sid.edge, prev, &cur)
                 }
                 _ => true,
             };
@@ -578,15 +584,7 @@ impl Simulator {
             let Some(e) = w.resolved_sensitivities[i].value_of.as_ref() else {
                 continue;
             };
-            let v = match &last {
-                Some((sp, v)) if *sp == e.span => v.clone(),
-                _ => {
-                    let v = self.eval_expr(e);
-                    last = Some((e.span, v.clone()));
-                    v
-                }
-            };
-            w.guard_prev[i] = Some(v);
+            w.guard_prev[i] = Some(self.event_value_snapshot(e, &mut last));
         }
     }
 
