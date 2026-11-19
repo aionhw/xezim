@@ -191,7 +191,7 @@ fn design_cache_key(
     hash.bytes(XEZIM_BYTECODE_MAGIC);
     // Re-elaborate designs validated before duplicate package/typedef/interface
     // diagnostics (§3.13, §6.18, §25.3, §26.2) were added.
-    hash.text("qualified-package-array-storage-and-pr-validation-v3");
+    hash.text("qualified-package-array-storage-and-pr-validation-v4");
     hash.text(env!("CARGO_PKG_VERSION"));
     // VHDL lowering changes the generated driver activity logic before SV elaboration.
     hash.text("xezim-design-cache-vhd7");

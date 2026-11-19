@@ -17,6 +17,34 @@
 
 use xezim::simulate;
 
+/// #1169: GHDL names the parent output wire after the flattened child port.
+/// A redundant implied assignment would latch X onto the shared net.
+#[test]
+fn escaped_actual_matching_connected_output_tracks_driver() {
+    let src = r#"
+module child(input wire d, output wire q);
+  assign q = d;
+endmodule
+module top;
+  reg d;
+  wire \u.q ;
+  wire observed;
+  child u(.d(d), .q(\u.q ));
+  assign observed = \u.q ;
+  initial begin
+    d = 0; #1; $display("FIRST %b", observed);
+    d = 1; #1; $display("SECOND %b", observed);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("simulate escaped output connection");
+    let messages: Vec<_> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert!(
+        messages.contains(&"FIRST 0") && messages.contains(&"SECOND 1"),
+        "{messages:?}"
+    );
+}
+
 #[test]
 fn colliding_actual_resolves_to_parent_net() {
     let src = r#"

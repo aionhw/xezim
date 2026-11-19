@@ -22,6 +22,29 @@ GHDL's run options `--ieee-asserts=enable|disable|disable-at-0` (the
 assertions of the IEEE packages) and `--assert-level=note|warning|error|failure|none`
 (the severity that stops the simulation; default failure) are accepted.
 
+## Native JIT for synthesizable RTL
+
+For a VHDL-2008 RTL design driven through its top-level pins, the
+repository includes an opt-in netlist simulation command. Build xezim
+with `cargo build --release --features jit` and put a synthesis-capable
+GHDL on PATH (tested with GHDL 6). List the files of library `work` in
+dependency order. Pass xezim simulation options, including `--vpi-lib`
+for a testbench, after `--`.
+
+    XEZIM_JIT_VERBOSE=1 scripts/run-vhdl-rtl.py --xezim target/release/xezim \
+        --top counter counter_pkg.vhd counter.vhd -- --max-time 100ns
+
+GHDL synthesizes the design to a temporary Verilog netlist. xezim runs
+the netlist and Cranelift compiles eligible combinational and edge
+blocks to machine code. `XEZIM_JIT_VERBOSE=1` reports the compiled block
+counts. Unsupported blocks still run in xezim's interpreter.
+
+Use the regular VHDL command for source-level delta cycles, nine-value
+logic, delays, simulation-only assertions and access to the original
+design hierarchy. The netlist uses synthesis semantics and generated
+signal names. VPI clients should drive and sample simple top-level port
+names.
+
 ## How it works
 
 xezim-core parses VHDL with the parser of the rust_hdl project
