@@ -799,3 +799,5 @@ mod unsized_decimal_width_1120;
 mod negative_bound_packed_slice_write_1193;
 #[path = "types/review_pattern_type_keys_params.rs"]
 mod review_pattern_type_keys_params;
+#[path = "types/local_select_declared_range.rs"]
+mod local_select_declared_range;
