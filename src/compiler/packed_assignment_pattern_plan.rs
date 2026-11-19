@@ -171,9 +171,8 @@ pub(crate) fn has_pattern(e: &Expression) -> bool {
     }
 }
 
-/// The plan of `e`, a pattern (or a parenthesised or conditional expression
-/// with pattern operands) assigned to `ty`. None when `ty` is not a packed
-/// aggregate or the pattern cannot be laid out statically.
+/// `dt` with its `count` outermost packed dimensions removed: the type of
+/// `v[i]...` for a packed target `v` (§7.4.1). None when `dt` has fewer.
 pub(crate) fn peel_packed_dims(
     dt: &DataType,
     count: usize,
@@ -262,6 +261,9 @@ pub(crate) fn peel_packed_dims(
     Some(cur)
 }
 
+/// The plan of `e`, a pattern (or a parenthesised or conditional expression
+/// with pattern operands) assigned to `ty`. None when `ty` is not a packed
+/// aggregate or the pattern cannot be laid out statically.
 pub(crate) fn packed_plan<'a>(
     e: &'a Expression,
     ty: &DataType,
