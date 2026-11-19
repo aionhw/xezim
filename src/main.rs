@@ -1635,14 +1635,15 @@ fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<St
     let mut top_level_bind = false;
     // Open unit keywords, innermost last.
     let mut stack: Vec<&str> = Vec::new();
-    let mut prev: &str = "";
+    let mut prev_was_typedef = false;
     let mut i = 0usize;
     while i < toks.len() {
-        let t = &toks[i];
-        let text_s = t.text.as_str();
+        let t = toks[i];
+        let text_cow = toks.text(t);
+        let text_s = text_cow.as_ref();
         if matches!(t.kind, TK::Identifier | TK::EscapedIdentifier) {
             refs.insert(text_s.to_string());
-            prev = text_s;
+            prev_was_typedef = false;
             i += 1;
             continue;
         }
@@ -1661,10 +1662,10 @@ fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<St
             // interface scope for it, or the missing `endinterface` unbalances
             // everything that follows.
             let iface_class =
-                kind == "interface" && toks.get(i + 1).is_some_and(|n| n.text == "class");
+                kind == "interface" && toks.get(i + 1).is_some_and(|n| toks.text(n) == "class");
             // `typedef class C;` is a §6.18 forward declaration, not a
             // definition; the real one may live in another file entirely.
-            let fwd = kind == "class" && prev == "typedef";
+            let fwd = kind == "class" && prev_was_typedef;
             if !iface_class && !fwd {
                 let top_level = stack.iter().all(|s| *s == "package");
                 if top_level {
@@ -1672,13 +1673,13 @@ fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<St
                     // the name (`module automatic m`, `class static C`).
                     let mut j = i + 1;
                     while toks.get(j).is_some_and(|n| {
-                        matches!(n.text.as_str(), "static" | "automatic" | "virtual")
+                        matches!(toks.text(n).as_ref(), "static" | "automatic" | "virtual")
                     }) {
                         j += 1;
                     }
                     if let Some(n) = toks.get(j) {
                         if matches!(n.kind, TK::Identifier | TK::EscapedIdentifier) {
-                            declared.push(n.text.clone());
+                            declared.push(toks.text(n).into_owned());
                         }
                     }
                 }
@@ -1700,7 +1701,7 @@ fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<St
         } else if text_s == "bind" && stack.is_empty() {
             top_level_bind = true;
         }
-        prev = text_s;
+        prev_was_typedef = t.kind == TK::KwTypedef;
         i += 1;
     }
     (declared, refs, top_level_bind)
@@ -3990,6 +3991,7 @@ suppressed but the explicit SDF annotation still applies."
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
             let diags = parser.diagnostics().to_vec();
+            drop(parser);
             report_parse_diagnostics(&diags, source, line_maps[fi].as_ref(), label);
             total_desc += source_ast.descriptions.len();
             total_err += diags
@@ -4044,6 +4046,7 @@ suppressed but the explicit SDF annotation still applies."
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
             let diags = parser.diagnostics().to_vec();
+            drop(parser);
             report_parse_diagnostics(&diags, source, line_maps[fi].as_ref(), label);
             total_desc += source_ast.descriptions.len();
             total_err += diags

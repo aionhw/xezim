@@ -1037,6 +1037,7 @@ fn reinstall_ooc_constraint_bodies(
         let tokens = lexer::Lexer::new(&pre).tokenize();
         let mut parser = sv_parser::parse::Parser::new(tokens);
         let src_ast = parser.parse_source_text();
+        drop(parser);
         for d in &src_ast.descriptions {
             let ast::Description::OutOfClassConstraint {
                 class_name,
