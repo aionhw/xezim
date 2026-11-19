@@ -2034,11 +2034,16 @@ impl Simulator {
                 }
             }
         }
-        put(
-            self.module.var_decl_types.as_map_mut(),
-            name,
-            saved.declared_type,
-        );
+        match saved.declared_type {
+            Some(ty) => {
+                self.module
+                    .var_decl_types
+                    .insert_shared(name.to_string(), ty);
+            }
+            None => {
+                self.module.var_decl_types.remove(name);
+            }
+        }
         put(
             &mut self.module.packed_struct_fields,
             name,

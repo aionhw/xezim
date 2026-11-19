@@ -7901,7 +7901,8 @@ pub struct Simulator {
     prev_val: Vec<u64>,
     prev_xz: Vec<u64>,
     /// Fallback for signals wider than 64 bits where the inline u64 pair
-    /// above can't represent the full state.
+    /// above can't represent the full state. Until its first snapshot a wide
+    /// signal has its full-width all-X baseline implicitly.
     prev_wide: HashMap<usize, Value>,
     /// Snapshot generation counter: bumped every `snapshot_edge_signals`.
     /// (Previously read by `EventWaiter::registered_snap_gen` to guard

@@ -713,9 +713,7 @@ impl Simulator {
             prev_val[id] = v;
             prev_xz[id] = x;
             if signal_widths[id] > 64 {
-                if let Some(p) = prev_wide.get_mut(&id) {
-                    p.copy_from(&signal_table[id]);
-                }
+                Simulator::snapshot_wide(prev_wide, id, &signal_table[id]);
             }
         }
         let by_index = self.waiter_index_on && self.time != 0;
@@ -793,10 +791,8 @@ impl Simulator {
                 }
                 let cur = self.signal_table[id].raw_bits();
                 let wide_ok = self.signal_widths[id] <= 64
-                    || self
-                        .prev_wide
-                        .get(&id)
-                        .is_none_or(|p| *p == self.signal_table[id]);
+                    || *Self::wide_edge_baseline(&self.prev_wide, id, self.signal_widths[id])
+                        == self.signal_table[id];
                 if (self.prev_val[id], self.prev_xz[id]) != cur || !wide_ok {
                     panic!(
                         "XEZIM_WAITER_INDEX_SHADOW: at time {} the snapshot skipped '{}' \

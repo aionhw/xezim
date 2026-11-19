@@ -5264,6 +5264,32 @@ impl Simulator {
         }
     }
 
+    pub(super) fn snapshot_wide(
+        previous: &mut HashMap<usize, Value>,
+        id: usize,
+        current: &Value,
+    ) {
+        match previous.entry(id) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                slot.get_mut().copy_from(current);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(current.clone());
+            }
+        }
+    }
+
+    pub(super) fn wide_edge_baseline(
+        previous: &HashMap<usize, Value>,
+        id: usize,
+        width: u32,
+    ) -> std::borrow::Cow<'_, Value> {
+        match previous.get(&id) {
+            Some(value) => std::borrow::Cow::Borrowed(value),
+            None => std::borrow::Cow::Owned(Value::new(width)),
+        }
+    }
+
     /// Snapshot only edge-sensitive signals + event_waiter signals into
     /// the prev_val/prev_xz parallel arrays (A3 from the compression
     /// analysis). Wide signals (> 64 bits) also update `prev_wide`.
@@ -5299,9 +5325,7 @@ impl Simulator {
             prev_val[id] = v;
             prev_xz[id] = x;
             if signal_widths[id] > 64 {
-                if let Some(p) = prev_wide.get_mut(&id) {
-                    p.copy_from(&signal_table[id]);
-                }
+                Simulator::snapshot_wide(prev_wide, id, &signal_table[id]);
             }
         }
         // Hot loop: this runs over the WHOLE edge-signal set on every snapshot
@@ -5337,9 +5361,7 @@ impl Simulator {
                     pv[id] = v;
                     px[id] = x;
                     if widths[id] > 64 {
-                        if let Some(p) = pw.get_mut(&id) {
-                            p.copy_from(&st[id]);
-                        }
+                        Self::snapshot_wide(pw, id, &st[id]);
                     }
                     continue;
                 }
@@ -5351,9 +5373,7 @@ impl Simulator {
                     *px.get_unchecked_mut(id) = x;
                 }
                 if unsafe { *widths.get_unchecked(id) } > 64 {
-                    if let Some(p) = pw.get_mut(&id) {
-                        p.copy_from(sv);
-                    }
+                    Self::snapshot_wide(pw, id, sv);
                 }
             }
         }
@@ -5389,13 +5409,9 @@ impl Simulator {
     /// Check edge: compare signal_table[id] vs (prev_val[id], prev_xz[id]).
     #[inline]
     pub(super) fn check_edge_id(&self, id: usize, edge: EdgeKind) -> bool {
-        self.edge_fires_prev(
-            id,
-            edge,
-            self.prev_val[id],
-            self.prev_xz[id],
-            self.prev_wide.get(&id),
-        )
+        let wide = (self.signal_widths[id] > 64 && matches!(edge, EdgeKind::AnyEdge))
+            .then(|| Self::wide_edge_baseline(&self.prev_wide, id, self.signal_widths[id]));
+        self.edge_fires_prev(id, edge, self.prev_val[id], self.prev_xz[id], wide.as_deref())
     }
 
     /// Edge comparison against an EXPLICIT prev baseline (rather than the

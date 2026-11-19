@@ -280,13 +280,22 @@ impl Simulator {
             class: self.var_class_types.get(name).cloned(),
             container: self.var_container_types.get(name).cloned(),
             type_args: self.var_type_args.get(name).cloned(),
-            decl_types: pick(
-                m.var_decl_types.as_map(),
-                name,
-                &pfx,
-                members,
-                known.map(|k| &k.decl_types[..]),
-            ),
+            decl_types: if members && known.is_none() {
+                m.var_decl_types
+                    .get_key_value(name)
+                    .into_iter()
+                    .chain(m.var_decl_types.with_prefix(&pfx))
+                    .map(|(key, ty)| (key.clone(), ty.clone()))
+                    .collect()
+            } else {
+                pick(
+                    m.var_decl_types.as_map(),
+                    name,
+                    &pfx,
+                    members,
+                    known.map(|k| &k.decl_types[..]),
+                )
+            },
             struct_members: pick(
                 &m.struct_members,
                 name,
@@ -363,12 +372,13 @@ impl Simulator {
         flag(&mut self.real_signals, name, meta.real);
         flag(&mut self.string_signals, name, meta.string);
         let m = &mut self.module;
-        keyed(
-            m.var_decl_types.as_map_mut(),
-            name,
-            &out.decl_types,
-            &meta.decl_types,
-        );
+        m.var_decl_types.remove(name);
+        for (key, _) in &out.decl_types {
+            m.var_decl_types.remove(key);
+        }
+        for (key, ty) in &meta.decl_types {
+            m.var_decl_types.insert_shared(key.clone(), ty.clone());
+        }
         keyed(
             &mut m.struct_members,
             name,
