@@ -791,6 +791,24 @@ impl Simulator {
     /// None when it holds array stores or AST fallbacks whose targets are
     /// not visible here. NBA targets are included: a superset only keeps a
     /// snapshot that was not needed.
+    /// The system task a statement fallback runs, looking through the named
+    /// one-statement blocks that re-create its `%m` scope (§21.2.1.7: a
+    /// severity task or `%m` lifted out of an inlined function or a named
+    /// block is wrapped in those names). `None` for any other statement.
+    pub(super) fn fallback_system_task(stmt: &Statement) -> Option<&str> {
+        match &stmt.kind {
+            StatementKind::Expr(e) => match &e.kind {
+                ExprKind::SystemCall { name, .. } => Some(name.as_str()),
+                _ => None,
+            },
+            StatementKind::SeqBlock {
+                name: Some(_),
+                stmts,
+            } if stmts.len() == 1 => Self::fallback_system_task(&stmts[0]),
+            _ => None,
+        }
+    }
+
     pub(super) fn compiled_block_write_ids(
         cb: &super::bytecode::CompiledBlock,
     ) -> Option<Vec<u32>> {
@@ -812,33 +830,30 @@ impl Simulator {
                 Insn::StmtFallback(payload) => {
                     // Output-only system tasks (the fallbacks the FSM gate
                     // admits) write no signal; anything else is opaque.
-                    let out_only = match &payload.0.kind {
-                        StatementKind::Expr(e) => match &e.kind {
-                            ExprKind::SystemCall { name, .. } => matches!(
-                                name.as_str(),
-                                "$display"
-                                    | "$displayb"
-                                    | "$displayh"
-                                    | "$displayo"
-                                    | "$write"
-                                    | "$writeb"
-                                    | "$writeh"
-                                    | "$writeo"
-                                    | "$strobe"
-                                    | "$monitor"
-                                    | "$fdisplay"
-                                    | "$fwrite"
-                                    | "$fstrobe"
-                                    | "$finish"
-                                    | "$stop"
-                                    | "$info"
-                                    | "$warning"
-                                    | "$error"
-                                    | "$fatal"
-                            ),
-                            _ => false,
-                        },
-                        _ => false,
+                    let out_only = match Self::fallback_system_task(&payload.0) {
+                        Some(name) => matches!(
+                            name,
+                            "$display"
+                                | "$displayb"
+                                | "$displayh"
+                                | "$displayo"
+                                | "$write"
+                                | "$writeb"
+                                | "$writeh"
+                                | "$writeo"
+                                | "$strobe"
+                                | "$monitor"
+                                | "$fdisplay"
+                                | "$fwrite"
+                                | "$fstrobe"
+                                | "$finish"
+                                | "$stop"
+                                | "$info"
+                                | "$warning"
+                                | "$error"
+                                | "$fatal"
+                        ),
+                        None => false,
                     };
                     if !out_only {
                         return None;
@@ -848,6 +863,9 @@ impl Simulator {
                 | Insn::BlockingAssignArray(..)
                 | Insn::NbaAssignArrayRange(..)
                 | Insn::BlockingAssignArrayRange(..) => return None,
+                // A delegated function runs on the interpreter and may write
+                // any module variable (§13.4): the write set is unknown.
+                Insn::CallFreeFunction(..) => return None,
                 _ => {}
             }
         }

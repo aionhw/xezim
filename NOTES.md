@@ -8,6 +8,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Performance:** Keep a timed process compiled when it calls a function that writes module variables or calls a system task (a once-only warning, a lazily loaded table): the call runs the function on the interpreter from compiled code, as class methods already do, instead of putting the whole process on the interpreter (§13.4, #1328).
 - **Correctness:** Evaluate a continuous assignment delay that names a variable (`assign #(d) w = a;`, `wire #(di) w = a;`, `#(rise, fall)`, `buf #(di)`, a submodule `assign #(dv + PD)`) in the declaring scope each time the right-hand side changes, with transition selection and inertial filtering; it was folded to 0 (§10.3.3, #1289, reported by ds54e).
 
 - **Correctness:** Parse a real cast as a coverpoint expression (`coverpoint real'(x)`) in SV-2023 mode, where it was read as the coverpoint type modifier (§6.24.1, §19.5, #1473, reported by ds54e).

@@ -3316,7 +3316,15 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 )
             });
-            if self.method_mode
+            // §13.4: a process body (`allow_waits`) delegates too. A call there
+            // runs the function once per execution, as the interpreter would,
+            // so its writes to module variables and its system tasks need no
+            // purity; only the name must reach this instance's own copy (a
+            // dotted registration, or a bare one with no dotted twin). Edge
+            // and comb blocks keep inlining pure callees alone: their
+            // sensitivity follows the compiled reads.
+            let delegable = self.method_mode || (self.allow_waits && self.callee_ext_reads_ok(&name));
+            if delegable
                 && !scalarized
                 && input_only_scalar
                 && arity_le

@@ -2464,11 +2464,11 @@ impl Simulator {
         // Gate: fallback-free, at least one wait (else it belongs on the
         // comb/edge paths), and no process-local frame reads (the FSM has
         // no AST call frames).
+        // A system task from an inlined function body arrives wrapped in the
+        // function's name for `%m` and carries its formals with it; it is
+        // still only a system task.
         let non_systask_fallback = cb.instructions.iter().any(|i| match i {
-            Insn::StmtFallback(payload) => !matches!(
-                &payload.0.kind,
-                StatementKind::Expr(e) if matches!(&e.kind, ExprKind::SystemCall { .. })
-            ),
+            Insn::StmtFallback(payload) => Self::fallback_system_task(&payload.0).is_none(),
             _ => false,
         });
         if non_systask_fallback
