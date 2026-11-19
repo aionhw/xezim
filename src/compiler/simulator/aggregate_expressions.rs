@@ -3783,7 +3783,7 @@ impl Simulator {
                 v.is_signed = false;
                 v
             }
-            "$time" => Value::from_u64(self.time_in_current_unit().round() as u64, 64),
+            "$time" => Value::from_u64(self.rounded_time_in_current_unit(), 64),
             // §3.14.2.3: $time/$realtime from a body whose DECLARING
             // scope has its own timescale (CU/class/package subroutine
             // bodies are rewritten to this at elaboration; the literal
@@ -3793,23 +3793,19 @@ impl Simulator {
                     .first()
                     .map(|a| self.eval_expr(a).to_f64() as i32)
                     .unwrap_or(self.module.timeunit_exp);
+                if name == "$__xz_time_at" {
+                    return Value::from_u64(self.rounded_time_in_unit(ue), 64);
+                }
                 let diff = ue - Self::secs_to_exp(self.tick_s);
                 let t = if diff >= 0 {
                     self.time as f64 / 10f64.powi(diff)
                 } else {
                     self.time as f64 * 10f64.powi(-diff)
                 };
-                if name == "$__xz_realtime_at" {
-                    Value::from_f64(t)
-                } else {
-                    Value::from_u64(t.round() as u64, 64)
-                }
+                Value::from_f64(t)
             }
             "$realtime" => Value::from_f64(self.time_in_current_unit()),
-            "$stime" => Value::from_u64(
-                (self.time_in_current_unit().round() as u64) & 0xFFFF_FFFF,
-                32,
-            ),
+            "$stime" => Value::from_u64(self.rounded_time_in_current_unit(), 32),
             "$inferred_clock" | "$inferred_disable" if sv_parser::is_sv2023() => {
                 Value::from_u64(0, 1)
             }
