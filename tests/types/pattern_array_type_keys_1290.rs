@@ -4,8 +4,12 @@
 //! over nested `default:` patterns), typedefs, package-scoped types, and module
 //! / class type parameters (issue #1290).
 //!
-//! Verified byte-for-byte against reference simulators (and IEEE 1800-2023
-//! §10.9.1 constant evaluation for outer type keys above `default:` row patterns).
+//! The values match the reference simulator, except where a type key of an
+//! outer level sits above a `default:` row or structure pattern (`CA2`, `V2`,
+//! `SE`, `PARAM_U2`, `CLS_INIT`, `CLS_WHOLE`, `CLS_U2`). §10.9.1 descends into
+//! each sub-array or structure with the type and default keys, so the type
+//! key sets every element of its type; the reference simulator gives those
+//! elements the `default:` pattern's value instead.
 
 fn lines(src: &str) -> Vec<String> {
     let sim = xezim::simulate(src, 100_000).expect("simulate failed");
