@@ -663,6 +663,11 @@ fn singleton_pending_scalar_parts() {
     check("singleton_pending_parts");
 }
 
+#[test]
+fn record_driver_activity() {
+    check("record_driver_activity");
+}
+
 /// §14.7.5.2: a startup list crossing the batching boundary runs ordinary
 /// processes in order before the postponed initialization pass.
 #[test]
