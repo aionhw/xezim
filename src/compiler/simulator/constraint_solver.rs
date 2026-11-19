@@ -1001,7 +1001,13 @@ impl Simulator {
                         continue;
                     }
                     if seen_constraint_names.insert(con_name.clone()) {
-                        let mut con = con.clone();
+                        // A working copy of this call's own: the class's
+                        // block is shared between the copies of the class
+                        // (one per instance of its module, §8.3), while
+                        // `constraint_scopes` keys a block by where its
+                        // items are stored and the solver memoizes names
+                        // and widths in them.
+                        let mut con = ClassConstraint::clone(con);
                         // §18.5.9: an item that reads a rand variable of an
                         // enclosing object of this call through a handle
                         // back to it (`item.addr`) constrains that object's

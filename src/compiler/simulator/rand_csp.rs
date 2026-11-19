@@ -13487,7 +13487,7 @@ mod state_collection_tests {
         let constraints: Vec<_> = sim.module.classes[&class_name]
             .constraints
             .values()
-            .cloned()
+            .map(|c| ClassConstraint::clone(c))
             .collect();
         sim.this_stack.push(Some(handle));
         sim.class_context_stack.push(Some(class_name));

@@ -1059,6 +1059,9 @@ fn reinstall_ooc_constraint_bodies(
                 .map(std::sync::Arc::make_mut)
             {
                 if let Some(con) = cd.constraints.get_mut(constraint_name) {
+                    // The prototype may be shared with other copies of the
+                    // class; the body belongs to this one.
+                    let con = std::sync::Arc::make_mut(con);
                     con.items = items.clone();
                     con.has_body = true;
                 }

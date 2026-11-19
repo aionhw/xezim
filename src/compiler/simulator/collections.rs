@@ -5793,7 +5793,7 @@ impl Simulator {
                         continue;
                     }
                     if seen.insert(nm.clone()) {
-                        out.push(con.clone());
+                        out.push(ClassConstraint::clone(con));
                     }
                 }
                 cur = cd.extends.clone();
