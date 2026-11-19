@@ -1324,7 +1324,13 @@ impl PlanBuilder<'_> {
                     return Some(out);
                 }
                 DataType::Real { kind, .. } => {
-                    out.push_str(&format!("r{kind:?}"));
+                    use crate::ast::types::RealType;
+
+                    // IEEE 1800-2023 §6.12 treats real and realtime as synonyms.
+                    out.push_str(match kind {
+                        RealType::Real | RealType::RealTime => "rReal",
+                        RealType::ShortReal => "rShortReal",
+                    });
                     return Some(out);
                 }
                 DataType::Simple { kind, .. } => {
