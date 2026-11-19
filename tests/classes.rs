@@ -1345,3 +1345,5 @@ mod unpacked_struct_packed_member_1192;
 mod vif_formal_name_clash_1297;
 #[path = "classes/review_writeback_actual_forms.rs"]
 mod review_writeback_actual_forms;
+#[path = "classes/class_constraint_sharing_721.rs"]
+mod class_constraint_sharing_721;
