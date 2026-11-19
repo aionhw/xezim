@@ -2581,7 +2581,8 @@ impl Simulator {
             return None;
         }
         flatten(rhs, &mut items);
-        Some(self.unpacked_concat_operand_values(items))
+        let expand_rows = self.concat_has_non_array_elements(&dst);
+        Some(self.unpacked_concat_operand_values(items, expand_rows, None))
     }
 
     pub(super) fn saved_array_pattern(

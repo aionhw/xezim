@@ -4185,12 +4185,36 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
+        // §10.10: the element-wise store below reads a fixed row itself.
+        // A speculative packed evaluation would also execute its selectors.
+        let mut check_remaining_rows = true;
+        let first_row = match (&lvalue.kind, &rvalue.kind) {
+            (ExprKind::Ident(h), ExprKind::Concatenation(parts)) => {
+                let mut nested = false;
+                let first = parts.iter().find_map(|part| {
+                    nested |= matches!(part.kind, ExprKind::Concatenation(_));
+                    self.fixed_row_concat_shape(part).map(|row| (part, row))
+                });
+                check_remaining_rows = nested || first.is_some();
+                first.filter(|_| {
+                    !self.ident_shadowed_by_non_collection(h)
+                        && self.array_operand_name(lvalue).is_some_and(|dst| {
+                            (self.module.arrays.contains_key(&dst) || self.class_queue_prop(&dst))
+                                && !self.names_nd_subarray(&dst)
+                                && self.concat_has_non_array_elements(&dst)
+                        })
+                })
+            }
+            _ => None,
+        };
         // §8.8: `lhs = C::new(...)` builds a `C`, not the class `lhs` is
         // declared with (the `new` branch below), and the bare `C::new`
         // constructs too rather than reading a name.
         let typed_ctor = Self::typed_ctor_call(rvalue)
             .and_then(|(prefix, args)| self.construct_typed_ctor(prefix, args));
-        let val = if let Some(v) = typed_ctor {
+        let val = if first_row.is_some() {
+            Value::zero(w)
+        } else if let Some(v) = typed_ctor {
             v
         } else if let ExprKind::Call { func, args } = &rvalue.kind {
             if let ExprKind::Ident(hier) = &func.kind {
@@ -4880,7 +4904,8 @@ impl Simulator {
                             }
                         }
                     }
-                    let elem_is_scalar = self.foreach_dims(&lname).is_none_or(|d| d.len() == 1);
+                    let elem_is_scalar = !self.module.arrays_2d.contains_key(&*lname)
+                        && !self.module.arrays_nd.contains_key(&*lname);
                     let items: Vec<&Expression> = if elem_is_scalar {
                         let mut v = Vec::new();
                         flatten_unpacked_concat(exprs, &mut v);
@@ -4918,7 +4943,11 @@ impl Simulator {
                         return;
                     }
                     // Expand queue/array elements in concat (e.g. q = {q, 4})
-                    let all_vals = self.unpacked_concat_operand_values(items);
+                    let expand_rows = check_remaining_rows
+                        && elem_is_scalar
+                        && self.concat_has_non_array_elements(&lname);
+                    let all_vals =
+                        self.unpacked_concat_operand_values(items, expand_rows, first_row);
                     let is_dyn = class_dyn || self.module.dynamic_arrays.contains(&*lname);
                     let (lo, hi, _w) = self
                         .module
@@ -4927,11 +4956,17 @@ impl Simulator {
                         .copied()
                         .unwrap_or((0, -1, 32));
                     let n_vals = all_vals.len();
+                    // §7.6: the first value goes to the leftmost declared index.
+                    let descending = self.module.descending_arrays.contains(&*lname);
                     for (i, v) in all_vals.into_iter().enumerate() {
-                        let idx = lo + i as i64;
+                        let idx = if descending {
+                            hi - i as i64
+                        } else {
+                            lo + i as i64
+                        };
                         // Dynamic arrays/queues grow to fit; only fixed
                         // arrays are bounded by their declared range.
-                        if !is_dyn && idx > hi {
+                        if !is_dyn && (idx < lo || idx > hi) {
                             break;
                         }
                         // §10.10: each item is an element-typed value.

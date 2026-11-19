@@ -654,7 +654,8 @@ impl Simulator {
                         flat.splice(i..i, c);
                     }
                 }
-                let vals = self.unpacked_concat_operand_values(flat);
+                let expand_rows = self.concat_has_non_array_elements(name);
+                let vals = self.unpacked_concat_operand_values(flat, expand_rows, None);
                 self.set_queue_size(name, vals.len() as u64);
                 for (i, v) in vals.into_iter().enumerate() {
                     let v = self.fit_queue_push_elem(name, v);
@@ -4111,7 +4112,12 @@ impl Simulator {
                 }
                 // §10.10: an array operand contributes its elements in order.
                 ExprKind::Concatenation(parts) => {
-                    Some(self.unpacked_concat_operand_values(parts.iter().collect()))
+                    let expand_rows = self.concat_has_non_array_elements(elem);
+                    Some(self.unpacked_concat_operand_values(
+                        parts.iter().collect(),
+                        expand_rows,
+                        None,
+                    ))
                 }
                 _ => None,
             };
@@ -4161,7 +4167,12 @@ impl Simulator {
                     Some(items.iter().map(|e| self.eval_expr(e)).collect::<Vec<_>>())
                 }
                 ExprKind::Concatenation(parts) => {
-                    Some(self.unpacked_concat_operand_values(parts.iter().collect()))
+                    let expand_rows = self.concat_has_non_array_elements(elem);
+                    Some(self.unpacked_concat_operand_values(
+                        parts.iter().collect(),
+                        expand_rows,
+                        None,
+                    ))
                 }
                 _ => None,
             };

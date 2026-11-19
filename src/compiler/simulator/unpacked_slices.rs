@@ -9,6 +9,7 @@
 //! left-to-right order for all of them.
 
 use super::*;
+use crate::ast::types::SimpleType;
 
 /// The elements of an unpacked-array operand, left to right.
 pub(super) struct UnpackedElems {
@@ -31,6 +32,22 @@ pub(super) struct UnpackedElems {
 enum Step<'e> {
     Index(&'e Expression),
     Range(RangeKind, &'e Expression, &'e Expression),
+}
+
+pub(super) struct UnpackedLayout<'e> {
+    root: &'e Expression,
+    root_name: String,
+    dims: Vec<(i64, i64)>,
+    ew: u32,
+    steps: Vec<Step<'e>>,
+}
+
+impl UnpackedLayout<'_> {
+    pub(super) fn object_member(&self) -> bool {
+        self.root_name
+            .split_once('#')
+            .is_some_and(|(handle, _)| handle.parse::<usize>().is_ok())
+    }
 }
 
 impl Simulator {
@@ -183,12 +200,24 @@ impl Simulator {
     /// `c[0+:2]`), left to right (§7.4.6, §7.6). Element and range selects
     /// are evaluated now. `None` for anything else.
     pub(super) fn unpacked_operand_elems(&mut self, e: &Expression) -> Option<UnpackedElems> {
+        let layout = self.unpacked_operand_layout::<false>(e)?;
+        self.unpacked_elems_from_layout(layout, false)
+    }
+
+    fn unpacked_operand_layout<'e, const FIXED_ROW: bool>(
+        &mut self,
+        e: &'e Expression,
+    ) -> Option<UnpackedLayout<'e>> {
         let mut steps: Vec<Step> = Vec::new();
         let mut cur = e;
+        let mut selects = 0;
         loop {
             match &cur.kind {
                 ExprKind::Index { expr, index } => {
-                    steps.push(Step::Index(index));
+                    selects += 1;
+                    if !FIXED_ROW {
+                        steps.push(Step::Index(index));
+                    }
                     cur = expr;
                 }
                 ExprKind::RangeSelect {
@@ -196,7 +225,7 @@ impl Simulator {
                     kind,
                     left,
                     right,
-                } => {
+                } if !FIXED_ROW => {
                     steps.push(Step::Range(*kind, left, right));
                     cur = expr;
                 }
@@ -204,7 +233,25 @@ impl Simulator {
             }
         }
         steps.reverse();
-        let root_name = self.expr_assoc_name(cur).or_else(|| {
+        if FIXED_ROW {
+            match &cur.kind {
+                ExprKind::Ident(h) if h.path.iter().all(|seg| seg.selects.is_empty()) => {}
+                ExprKind::MemberAccess { expr, .. }
+                    if matches!(expr.kind, ExprKind::This)
+                        || Self::cond_expr_is_effect_free(cur, false) => {}
+                _ => return None,
+            }
+        }
+        let plain_row_root = FIXED_ROW
+            && matches!(&cur.kind, ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1)
+            && !self.this_stack.last().is_some_and(Option::is_some)
+            && !self.class_context_stack.last().is_some_and(Option::is_some);
+        let scoped = if plain_row_root {
+            None
+        } else {
+            self.expr_assoc_name(cur)
+        };
+        let root_name = scoped.or_else(|| {
             // A hierarchical aggregate has element storage but no scalar
             // signal of its own. Preserve its registered full path before
             // resolving a same-named local in the active subroutine.
@@ -226,12 +273,20 @@ impl Simulator {
             let local = (h.root.is_none() && h.path.len() == 1)
                 .then(|| self.dyn_name_lookup(bare))
                 .flatten();
-            Some(
-                local
-                    .map(str::to_string)
-                    .unwrap_or_else(|| self.resolve_hier_name(h).into_owned()),
-            )
+            let name = local
+                .map(std::borrow::Cow::Borrowed)
+                .unwrap_or_else(|| self.resolve_hier_name(h));
+            if FIXED_ROW
+                && (self.fixed_concat_rank(&name) != Some(selects + 1)
+                    || self.ident_shadowed_by_non_collection(h))
+            {
+                return None;
+            }
+            Some(name.into_owned())
         })?;
+        if FIXED_ROW && !plain_row_root && self.fixed_concat_rank(&root_name) != Some(selects + 1) {
+            return None;
+        }
         let (dims, ew) = self.unpacked_decl_shape(&root_name)?;
         // Every select must address an unpacked dimension, and only the last
         // one may be a range: a slice has no element select of its own.
@@ -244,6 +299,49 @@ impl Simulator {
         {
             return None;
         }
+        if FIXED_ROW
+            && (selects + 1 != dims.len()
+                || self.module.dynamic_arrays.contains(&root_name)
+                || self.module.queue_vars.contains(&root_name)
+                || self.coll_shape_at(&root_name).is_some_and(|(shape, depth)| {
+                    shape.dims.iter().skip(depth).any(|d| !matches!(d, Dim::Fixed(_)))
+                })
+                || self.concat_row_elem_type(&root_name).is_some_and(|dt| {
+                    matches!(self.resolve_dt_ref(&dt), DataType::Struct(su) if Self::spreads_member_wise(su))
+                }))
+        {
+            return None;
+        }
+        if FIXED_ROW {
+            let mut cur = e;
+            steps.reserve(selects);
+            while let ExprKind::Index { expr, index } = &cur.kind {
+                steps.push(Step::Index(index));
+                cur = expr;
+            }
+            steps.reverse();
+        }
+        Some(UnpackedLayout {
+            root: cur,
+            root_name,
+            dims,
+            ew,
+            steps,
+        })
+    }
+
+    fn unpacked_elems_from_layout(
+        &mut self,
+        layout: UnpackedLayout<'_>,
+        fixed_row: bool,
+    ) -> Option<UnpackedElems> {
+        let UnpackedLayout {
+            root,
+            root_name,
+            dims,
+            ew,
+            steps,
+        } = layout;
         let sliced = matches!(steps.last(), Some(Step::Range(..)));
         let selected = sliced || (!steps.is_empty() && steps.len() < dims.len());
         let mut names: Vec<Option<String>> = vec![Some(root_name.clone())];
@@ -253,10 +351,18 @@ impl Simulator {
             let idx: Vec<i64> = match step {
                 Step::Index(ix) => {
                     let v = self.eval_expr(ix);
-                    if v.has_xz() {
-                        return None;
+                    let i = v.to_index();
+                    if !fixed_row {
+                        vec![i?]
+                    } else if let Some(i) = i.filter(|&i| {
+                        (v.is_signed || i >= 0)
+                            && (v.width <= 64 || v.resize(64).resize(v.width) == v)
+                    }) {
+                        vec![i]
+                    } else {
+                        names.fill(None);
+                        continue;
                     }
-                    vec![v.to_i64()?]
                 }
                 Step::Range(kind, sl, sr) => self.slice_indices(*kind, sl, sr, l > r)?,
             };
@@ -277,7 +383,7 @@ impl Simulator {
             } else {
                 (r..=l).rev().collect()
             };
-            if names.len().saturating_mul(idx.len()) > 1 << 20 {
+            if !fixed_row && names.len().saturating_mul(idx.len()) > 1 << 20 {
                 return None;
             }
             names = names
@@ -289,13 +395,127 @@ impl Simulator {
                 .collect();
         }
         Some(UnpackedElems {
-            root: cur.clone(),
+            root: root.clone(),
             root_name,
             names,
             ew,
             sliced,
             selected,
         })
+    }
+
+    /// §10.10: admit an indexed fixed operand with one remaining dimension
+    /// before evaluating any selector.
+    pub(super) fn fixed_row_concat_shape<'e>(
+        &mut self,
+        e: &'e Expression,
+    ) -> Option<UnpackedLayout<'e>> {
+        let e = Self::unparen(e);
+        if !matches!(e.kind, ExprKind::Index { .. })
+            || (self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty())
+        {
+            return None;
+        }
+        self.unpacked_operand_layout::<true>(e)
+    }
+
+    /// Reject element selects before building a layout or allocating dimensions.
+    fn fixed_concat_rank(&self, name: &str) -> Option<usize> {
+        if self.module.arrays_2d.contains_key(name) {
+            return Some(2);
+        }
+        if let Some((dims, _)) = self.module.arrays_nd.get(name) {
+            return Some(dims.len());
+        }
+        let (handle, member) = name.split_once('#')?;
+        let class = self.class_prop_declarer(handle.parse().ok()?, member)?;
+        class
+            .array_nd_properties
+            .get(member)
+            .map(|(dims, _)| dims.len())
+    }
+
+    /// §10.10: an array-valued destination element takes a compatible row whole.
+    pub(super) fn concat_has_non_array_elements(&self, dst: &str) -> bool {
+        self.coll_shape_at(dst)
+            .is_none_or(|(shape, depth)| shape.dims.len() <= depth + 1)
+    }
+
+    pub(super) fn concat_element_type_is_array(&self, dt: &DataType) -> bool {
+        let DataType::TypeReference {
+            name, dimensions, ..
+        } = dt
+        else {
+            return false;
+        };
+        let class = self
+            .class_context_stack
+            .last()
+            .and_then(|c| c.as_deref())
+            .unwrap_or("");
+        dimensions.is_empty()
+            && (Self::typedef_dims_via_tables(&self.module, class, &name.name.name).is_some()
+                || (!name.scopes.is_empty()
+                    && Self::typedef_dims_via_tables(&self.module, class, &name.qualified())
+                        .is_some()))
+    }
+
+    fn concat_row_elem_type(&self, root: &str) -> Option<std::borrow::Cow<'_, DataType>> {
+        self.class_member_coll_type(root)
+            .map(std::borrow::Cow::Borrowed)
+            .or_else(|| self.p_elem_type_ref(root))
+    }
+
+    pub(super) fn append_fixed_row_concat_values(
+        &mut self,
+        layout: UnpackedLayout<'_>,
+        values: &mut Vec<Value>,
+    ) {
+        let Some(row) = self.unpacked_elems_from_layout(layout, true) else {
+            return;
+        };
+        let mut missing = None;
+        values.extend(row.names.iter().map(|name| {
+            self.read_unpacked_elem(name.as_deref()).unwrap_or_else(|| {
+                // §7.4.5 Table 7-1: an invalid fixed row has a default value in every cell.
+                missing
+                    .get_or_insert_with(|| {
+                        let dt = self.concat_row_elem_type(&row.root_name);
+                        match dt.as_deref().map(|dt| self.resolve_dt_ref(dt)) {
+                            Some(DataType::Simple {
+                                kind: SimpleType::String,
+                                ..
+                            }) => Value::from_string(""),
+                            Some(DataType::Simple {
+                                kind: SimpleType::Chandle | SimpleType::Event,
+                                ..
+                            }) => Value::zero(row.ew),
+                            Some(dt) if self.decl_is_virtual_iface(dt) => Value::zero(row.ew),
+                            Some(
+                                dt @ (DataType::IntegerAtom { .. }
+                                | DataType::IntegerVector { .. }
+                                | DataType::Struct(_)
+                                | DataType::Enum(_)),
+                            ) => {
+                                let types = &self.module.typedef_types;
+                                let mut value =
+                                    if super::elaborate::is_type_two_state_resolved(dt, types) {
+                                        Value::zero(row.ew)
+                                    } else {
+                                        Value::new(row.ew)
+                                    };
+                                value.is_signed =
+                                    super::elaborate::is_type_signed_resolved(dt, types);
+                                value
+                            }
+                            _ => self
+                                .coll_missing_elem_value(&row.root_name)
+                                .unwrap_or_else(|| Value::new(row.ew)),
+                        }
+                    })
+                    .clone()
+            })
+        }));
     }
 
     /// The elements of a selected part of an unpacked array, a slice or a
@@ -326,11 +546,14 @@ impl Simulator {
         el.names
             .iter()
             .map(|n| {
-                n.as_ref()
-                    .and_then(|n| self.get_signal_value_by_name(n))
+                self.read_unpacked_elem(n.as_deref())
                     .unwrap_or_else(|| Value::new(el.ew))
             })
             .collect()
+    }
+
+    fn read_unpacked_elem(&self, name: Option<&str>) -> Option<Value> {
+        name.and_then(|n| self.get_signal_value_by_name(n))
     }
 
     /// §7.6: `lhs = rhs` when either side is a slice of an unpacked array:
