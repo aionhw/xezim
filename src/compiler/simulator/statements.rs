@@ -6266,7 +6266,7 @@ impl Simulator {
                         ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
                             if let Some(name) = self.sva_named_key(&a.expr) =>
                         {
-                            if let Some(body) = self.module.property_decls.get(&name).cloned() {
+                            if let Some(body) = self.sva_body_with_defaults(&name) {
                                 body
                             } else {
                                 a.expr.clone()
@@ -6296,18 +6296,7 @@ impl Simulator {
                                 });
                             let resolved = pname.and_then(|n| {
                                 let body = self.module.property_decls.get(&n).cloned()?;
-                                let formals = self
-                                    .module
-                                    .property_params
-                                    .get(&n)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let mut map: HashMap<String, Expression> = HashMap::default();
-                                for (i, f) in formals.iter().enumerate() {
-                                    if let Some(actual) = args.get(i) {
-                                        map.insert(f.clone(), actual.clone());
-                                    }
-                                }
+                                let map = self.sva_bind_actuals(&n, args);
                                 Some(super::elaborate::rewrite_expr(
                                     &body,
                                     "",
