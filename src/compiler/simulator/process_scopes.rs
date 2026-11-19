@@ -1072,6 +1072,77 @@ impl Simulator {
         }
     }
 
+    pub(super) fn materialize_fn_fields(
+        functions: &mut super::elaborate::FuncTable,
+        deferred: &mut HashMap<String, std::rc::Rc<super::elaborate::CallableRewriteCtx>>,
+        packages: &HashSet<String>,
+        key: &str,
+    ) -> bool {
+        let Some(ctx) = deferred.remove(key) else {
+            return false;
+        };
+        let Some(mut fd) = functions.get(key).cloned() else {
+            return false;
+        };
+        fd.items = crate::ast::cache::without_scope_caches(|| {
+            let mut items = ctx.materialize_body(&fd.ports, &fd.items);
+            if !packages.is_empty() {
+                let pkgs: std::collections::HashSet<String> = packages.iter().cloned().collect();
+                items = items
+                    .iter()
+                    .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                    .collect();
+            }
+            items.into()
+        });
+        functions.insert(key.to_string(), fd);
+        true
+    }
+
+    pub(super) fn materialize_task_fields(
+        tasks: &mut HashMap<String, TaskDeclaration>,
+        deferred: &mut HashMap<String, std::rc::Rc<super::elaborate::CallableRewriteCtx>>,
+        packages: &HashSet<String>,
+        key: &str,
+    ) -> bool {
+        let Some(ctx) = deferred.remove(key) else {
+            return false;
+        };
+        let Some(td) = tasks.get_mut(key) else {
+            return false;
+        };
+        td.items = crate::ast::cache::without_scope_caches(|| {
+            let mut items = ctx.materialize_body(&td.ports, &td.items);
+            if !packages.is_empty() {
+                let pkgs: std::collections::HashSet<String> = packages.iter().cloned().collect();
+                items = items
+                    .iter()
+                    .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                    .collect();
+            }
+            items.into()
+        });
+        true
+    }
+
+    pub(super) fn materialize_deferred_fn_in_place(module: &mut ElaboratedModule, key: &str) {
+        Self::materialize_fn_fields(
+            &mut module.functions,
+            &mut module.deferred_function_bodies,
+            &module.packages,
+            key,
+        );
+    }
+
+    pub(super) fn materialize_deferred_task_in_place(module: &mut ElaboratedModule, key: &str) {
+        Self::materialize_task_fields(
+            &mut module.tasks,
+            &mut module.deferred_task_bodies,
+            &module.packages,
+            key,
+        );
+    }
+
     /// §6.21 / §13.3 / §13.4: module subroutine statics have one
     /// declaration-owned store, shared by recursion and allocated before
     /// time zero. Allocate all cells first, then evaluate their initializers.
@@ -1112,6 +1183,29 @@ impl Simulator {
                 | StatementKind::Wait { stmt: body, .. } => selected(body, nba_names),
                 _ => false,
             }
+        }
+        fn needs_prepare(
+            items: &[Statement],
+            routine: &str,
+            automatic: bool,
+            addressed: &HashSet<String>,
+            selected_memo: &mut HashMap<usize, bool>,
+            ptr: usize,
+        ) -> bool {
+            if !addressed.is_empty()
+                && items.iter().any(|stmt| {
+                    Simulator::has_addressed_statics(stmt, routine, automatic, addressed)
+                })
+            {
+                return true;
+            }
+            *selected_memo.entry(ptr).or_insert_with(|| {
+                let mut nba_names = HashSet::default();
+                for stmt in items.iter() {
+                    Simulator::collect_nba_roots(stmt, &mut nba_names);
+                }
+                items.iter().any(|s| selected(s, &nba_names))
+            })
         }
         fn collect(
             s: &Statement,
@@ -1341,6 +1435,7 @@ impl Simulator {
         let mut allocate = Vec::new();
         let mut initialize = Vec::new();
         let mut ordinal = 0usize;
+        let mut selected_memo: HashMap<usize, bool> = HashMap::default();
         let mut functions: Vec<_> = module.functions.keys().cloned().collect();
         functions.sort();
         let mut rewritten: HashMap<String, crate::ast::shared_vec::SharedVec<Statement>> =
@@ -1352,12 +1447,31 @@ impl Simulator {
             if !original.name.scopes.is_empty() {
                 continue;
             }
-            let mut fd = original.clone();
-            if let Some(items) = rewritten.get(&fd.name.name.name) {
+            if let Some(items) = rewritten.get(&original.name.name.name) {
+                let mut fd = original.clone();
                 fd.items = items.clone();
-            } else {
-                ordinal += 1;
-                if !prepare(
+                module.functions.insert(key, fd);
+                continue;
+            }
+            let ptr = std::sync::Arc::as_ptr(original.items.as_arc()) as usize;
+            let automatic = original.lifetime == Some(crate::ast::types::Lifetime::Automatic);
+            if !needs_prepare(
+                &original.items,
+                &original.name.name.name,
+                automatic,
+                addressed,
+                &mut selected_memo,
+                ptr,
+            ) {
+                continue;
+            }
+            Self::materialize_deferred_fn_in_place(module, &key);
+            let Some(mut fd) = module.functions.get(&key).cloned() else {
+                continue;
+            };
+            ordinal += 1;
+            let changed = crate::ast::cache::without_scope_caches(|| {
+                prepare(
                     module,
                     &mut fd.items,
                     &fd.ports,
@@ -1367,24 +1481,44 @@ impl Simulator {
                     &mut initialize,
                     &mut names,
                     addressed,
-                    fd.lifetime == Some(crate::ast::types::Lifetime::Automatic),
-                ) {
-                    continue;
-                }
-                routines.insert(fd.name.name.name.clone());
-                rewritten.insert(fd.name.name.name.clone(), fd.items.clone());
+                    automatic,
+                )
+            });
+            if !changed {
+                continue;
             }
+            routines.insert(fd.name.name.name.clone());
+            rewritten.insert(fd.name.name.name.clone(), fd.items.clone());
             module.functions.insert(key, fd);
         }
         let mut tasks: Vec<_> = module.tasks.keys().cloned().collect();
         tasks.sort();
         for key in tasks {
+            let Some(original) = module.tasks.get(&key) else {
+                continue;
+            };
+            if !original.name.scopes.is_empty() {
+                continue;
+            }
+            let ptr = std::sync::Arc::as_ptr(original.items.as_arc()) as usize;
+            let automatic = original.lifetime == Some(crate::ast::types::Lifetime::Automatic);
+            if !needs_prepare(
+                &original.items,
+                &original.name.name.name,
+                automatic,
+                addressed,
+                &mut selected_memo,
+                ptr,
+            ) {
+                continue;
+            }
+            Self::materialize_deferred_task_in_place(module, &key);
             let Some(mut td) = module.tasks.remove(&key) else {
                 continue;
             };
-            if td.name.scopes.is_empty() {
-                ordinal += 1;
-                if prepare(
+            ordinal += 1;
+            let changed = crate::ast::cache::without_scope_caches(|| {
+                prepare(
                     module,
                     &mut td.items,
                     &td.ports,
@@ -1394,10 +1528,11 @@ impl Simulator {
                     &mut initialize,
                     &mut names,
                     addressed,
-                    td.lifetime == Some(crate::ast::types::Lifetime::Automatic),
-                ) {
-                    routines.insert(td.name.name.name.clone());
-                }
+                    automatic,
+                )
+            });
+            if changed {
+                routines.insert(td.name.name.name.clone());
             }
             module.tasks.insert(key, td);
         }

@@ -1966,18 +1966,42 @@ impl Simulator {
                 let pkgs: std::collections::HashSet<String> =
                     module.packages.iter().cloned().collect();
                 let flat = |items: &[Statement]| -> Vec<Statement> {
-                    items
-                        .iter()
-                        .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
-                        .collect()
+                    crate::ast::cache::without_scope_caches(|| {
+                        items
+                            .iter()
+                            .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                            .collect()
+                    })
                 };
-                for td in module.tasks.values_mut() {
-                    td.items = flat(&td.items).into();
+                let mut flat_cache: HashMap<usize, crate::ast::shared_vec::SharedVec<Statement>> =
+                    HashMap::default();
+                for (key, td) in module.tasks.iter_mut() {
+                    if module.deferred_task_bodies.contains_key(key) {
+                        continue;
+                    }
+                    let ptr = std::sync::Arc::as_ptr(td.items.as_arc()) as usize;
+                    td.items = flat_cache
+                        .entry(ptr)
+                        .or_insert_with(|| flat(&td.items).into())
+                        .clone();
                 }
                 let fnames: Vec<String> = module.functions.keys().cloned().collect();
                 for n in fnames {
+                    if module.deferred_function_bodies.contains_key(&n) {
+                        continue;
+                    }
+                    let Some(ptr) = module
+                        .functions
+                        .get(&n)
+                        .map(|fd| std::sync::Arc::as_ptr(fd.items.as_arc()) as usize)
+                    else {
+                        continue;
+                    };
                     if let Some(mut fd) = module.functions.remove(&n) {
-                        fd.items = flat(&fd.items).into();
+                        fd.items = flat_cache
+                            .entry(ptr)
+                            .or_insert_with(|| flat(&fd.items).into())
+                            .clone();
                         module.functions.insert(n, fd);
                     }
                 }
@@ -2050,101 +2074,166 @@ impl Simulator {
                     );
                 }
                 drop(bodies);
-                let wrap = |items: &[Statement], span| Statement {
-                    kind: StatementKind::SeqBlock {
-                        name: None,
-                        stmts: items.to_vec().into(),
-                    },
-                    span,
+                fn body_has_typeref_decl(items: &[Statement]) -> bool {
+                    items.iter().any(|st| match &st.kind {
+                        StatementKind::VarDecl { data_type, .. } => {
+                            matches!(data_type, DataType::TypeReference { .. })
+                        }
+                        StatementKind::SeqBlock { stmts, .. }
+                        | StatementKind::ParBlock { stmts, .. } => body_has_typeref_decl(stmts),
+                        StatementKind::If {
+                            then_stmt,
+                            else_stmt,
+                            ..
+                        } => {
+                            body_has_typeref_decl(std::slice::from_ref(then_stmt.as_ref()))
+                                || else_stmt
+                                    .as_deref()
+                                    .is_some_and(|e| body_has_typeref_decl(std::slice::from_ref(e)))
+                        }
+                        StatementKind::Case { items, .. } => items
+                            .iter()
+                            .any(|it| body_has_typeref_decl(std::slice::from_ref(&it.stmt))),
+                        StatementKind::For { body, .. }
+                        | StatementKind::While { body, .. }
+                        | StatementKind::DoWhile { body, .. }
+                        | StatementKind::Repeat { body, .. }
+                        | StatementKind::Forever { body }
+                        | StatementKind::Foreach { body, .. }
+                        | StatementKind::TimingControl { stmt: body, .. }
+                        | StatementKind::Wait { stmt: body, .. } => {
+                            body_has_typeref_decl(std::slice::from_ref(body.as_ref()))
+                        }
+                        _ => false,
+                    })
+                }
+                let wrap = |items: &[Statement], span| {
+                    crate::ast::cache::without_scope_caches(|| Statement {
+                        kind: StatementKind::SeqBlock {
+                            name: None,
+                            stmts: items.to_vec().into(),
+                        },
+                        span,
+                    })
                 };
                 // §6.21: the variables of a static task or function keep
                 // their values between calls.
                 // (A class method, here when defined out of its class, is
                 // automatic, §8.6.)
-                for td in module.tasks.values_mut() {
-                    if td.lifetime != Some(crate::ast::types::Lifetime::Automatic)
-                        && td.name.scopes.is_empty()
-                    {
-                        Self::mark_static_locals(&mut td.items);
+                let mut static_mark_cache: HashMap<usize, (bool, bool)> = HashMap::default();
+                let mut needs_static_mark =
+                    |items: &crate::ast::shared_vec::SharedVec<Statement>,
+                     dctx: Option<&std::rc::Rc<super::elaborate::CallableRewriteCtx>>|
+                     -> bool {
+                        let ptr = std::sync::Arc::as_ptr(items.as_arc()) as usize;
+                        let (mark, has_typeref) =
+                            *static_mark_cache.entry(ptr).or_insert_with(|| {
+                                (
+                                    Self::static_locals_to_mark(items),
+                                    body_has_typeref_decl(items),
+                                )
+                            });
+                        mark || (has_typeref && dctx.is_some_and(|c| !c.ctx.type_binds.is_empty()))
+                    };
+                let tkeys: Vec<String> = module
+                    .tasks
+                    .iter()
+                    .filter(|(k, td)| {
+                        td.lifetime != Some(crate::ast::types::Lifetime::Automatic)
+                            && td.name.scopes.is_empty()
+                            && needs_static_mark(&td.items, module.deferred_task_bodies.get(*k))
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for key in tkeys {
+                    Self::materialize_task_fields(&mut module.tasks, &mut module.deferred_task_bodies, &module.packages, &key);
+                    if let Some(td) = module.tasks.get_mut(&key) {
+                        crate::ast::cache::without_scope_caches(|| {
+                            Self::mark_static_locals(&mut td.items)
+                        });
                     }
                 }
                 let fkeys: Vec<String> = module
                     .functions
                     .iter()
-                    .filter(|(_, fd)| {
+                    .filter(|(k, fd)| {
                         fd.lifetime != Some(crate::ast::types::Lifetime::Automatic)
                             && fd.name.scopes.is_empty()
-                            && Self::static_locals_to_mark(&fd.items)
+                            && needs_static_mark(&fd.items, module.deferred_function_bodies.get(*k))
                     })
                     .map(|(k, _)| k.clone())
                     .collect();
                 for key in fkeys {
+                    Self::materialize_fn_fields(&mut module.functions, &mut module.deferred_function_bodies, &module.packages, &key);
                     if let Some(fd) = module.functions.get(&key) {
                         let mut fd = fd.clone();
-                        Self::mark_static_locals(&mut fd.items);
+                        crate::ast::cache::without_scope_caches(|| {
+                            Self::mark_static_locals(&mut fd.items)
+                        });
                         module.functions.insert(key, fd);
                     }
                 }
-                let mut tdone = Vec::new();
-                for (key, td) in module.tasks.iter() {
-                    if !td
-                        .items
-                        .iter()
-                        .any(|s| Self::shadow_rename_possible(s, &claims))
-                    {
-                        continue;
-                    }
-                    let mut st = wrap(&td.items, td.span);
-                    if Self::rename_nested_shadowed(
-                        &mut st,
-                        &claims,
-                        &mut Vec::new(),
-                        &mut n,
-                        "b",
-                        1,
-                        key,
-                        &mut Vec::new(),
-                    ) {
-                        tdone.push((key.clone(), st));
-                    }
-                }
-                let mut fdone = Vec::new();
-                for (key, fd) in module.functions.iter() {
-                    if !fd
-                        .items
-                        .iter()
-                        .any(|s| Self::shadow_rename_possible(s, &claims))
-                    {
-                        continue;
-                    }
-                    let mut st = wrap(&fd.items, fd.span);
-                    if Self::rename_nested_shadowed(
-                        &mut st,
-                        &claims,
-                        &mut Vec::new(),
-                        &mut n,
-                        "b",
-                        1,
-                        key,
-                        &mut Vec::new(),
-                    ) {
-                        fdone.push((key.clone(), st));
+                let mut shadow_cache: HashMap<usize, bool> = HashMap::default();
+                let mut needs_shadow = |items: &crate::ast::shared_vec::SharedVec<Statement>| -> bool {
+                    let ptr = std::sync::Arc::as_ptr(items.as_arc()) as usize;
+                    *shadow_cache.entry(ptr).or_insert_with(|| {
+                        items.iter().any(|s| Self::shadow_rename_possible(s, &claims))
+                    })
+                };
+                let t_shadow_keys: Vec<String> = module
+                    .tasks
+                    .iter()
+                    .filter(|(_, td)| needs_shadow(&td.items))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for key in t_shadow_keys {
+                    Self::materialize_task_fields(&mut module.tasks, &mut module.deferred_task_bodies, &module.packages, &key);
+                    if let Some(td) = module.tasks.get_mut(&key) {
+                        let mut st = wrap(&td.items, td.span);
+                        let changed = crate::ast::cache::without_scope_caches(|| {
+                            Self::rename_nested_shadowed(
+                                &mut st,
+                                &claims,
+                                &mut Vec::new(),
+                                &mut n,
+                                "b",
+                                1,
+                                &key,
+                                &mut Vec::new(),
+                            )
+                        });
+                        if changed && let StatementKind::SeqBlock { stmts, .. } = st.kind {
+                            td.items = stmts.into();
+                        }
                     }
                 }
-                for (key, st) in tdone {
-                    if let (Some(td), StatementKind::SeqBlock { stmts, .. }) =
-                        (module.tasks.get_mut(&key), st.kind)
-                    {
-                        td.items = stmts.into();
-                    }
-                }
-                for (key, st) in fdone {
-                    if let (Some(fd), StatementKind::SeqBlock { stmts, .. }) =
-                        (module.functions.get(&key), st.kind)
-                    {
-                        let mut fd = fd.clone();
-                        fd.items = stmts.into();
-                        module.functions.insert(key, fd);
+                let f_shadow_keys: Vec<String> = module
+                    .functions
+                    .iter()
+                    .filter(|(_, fd)| needs_shadow(&fd.items))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for key in f_shadow_keys {
+                    Self::materialize_fn_fields(&mut module.functions, &mut module.deferred_function_bodies, &module.packages, &key);
+                    if let Some(fd) = module.functions.get(&key) {
+                        let mut st = wrap(&fd.items, fd.span);
+                        let changed = crate::ast::cache::without_scope_caches(|| {
+                            Self::rename_nested_shadowed(
+                                &mut st,
+                                &claims,
+                                &mut Vec::new(),
+                                &mut n,
+                                "b",
+                                1,
+                                &key,
+                                &mut Vec::new(),
+                            )
+                        });
+                        if changed && let StatementKind::SeqBlock { stmts, .. } = st.kind {
+                            let mut fd = fd.clone();
+                            fd.items = stmts.into();
+                            module.functions.insert(key, fd);
+                        }
                     }
                 }
             }

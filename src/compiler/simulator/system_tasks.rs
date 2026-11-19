@@ -26,11 +26,8 @@ impl Simulator {
                         .join(".")
                 });
                 let td = self
-                    .module
-                    .tasks
-                    .get(&*name)
-                    .or_else(|| raw.as_deref().and_then(|r| self.module.tasks.get(r)))
-                    .cloned();
+                    .task_decl_rc(&name)
+                    .or_else(|| raw.as_deref().and_then(|r| self.task_decl_rc(r)));
                 if let Some(td) = td {
                     // Execute a bare task-enable unless the body genuinely needs
                     // a suspendable process (event control, `wait`, `fork…join`,

@@ -3376,6 +3376,11 @@ impl Simulator {
                         }
                     }
                     compiler.set_dpi_import_fds(dpi_fds);
+                    compiler.set_deferred_callables(
+                        &self.module.deferred_function_bodies,
+                        &self.module.deferred_task_bodies,
+                        &self.module.packages,
+                    );
                     if method_trace_enabled() {
                         compiler.scope_hint = Some(format!("{}.{}", cname, method_name));
                     }
