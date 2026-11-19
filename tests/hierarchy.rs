@@ -515,3 +515,5 @@ mod rooted_packed_scope;
 mod nettype_input_port_actuals_1280;
 #[path = "hierarchy/prepared_body_release_721.rs"]
 mod prepared_body_release_721;
+#[path = "hierarchy/parameter_type_sharing_721.rs"]
+mod parameter_type_sharing_721;
