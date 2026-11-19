@@ -1405,10 +1405,10 @@ impl Simulator {
     }
 
     pub(super) fn preponed_value_of(&self, id: usize) -> Value {
-        if let Some(w) = self.prev_wide.get(&id) {
-            return w.clone();
+        let width = self.signal_widths.get(id).copied().unwrap_or(1);
+        if width > 64 {
+            return Self::wide_edge_baseline(&self.prev_wide, id, width).into_owned();
         }
-        let width = self.signal_widths.get(id).copied().unwrap_or(1).min(64);
         let mut v = Value::from_inline(self.prev_val[id], self.prev_xz[id], width);
         v.is_signed = self.signal_signed.get(id).copied().unwrap_or(false);
         v
@@ -1987,11 +1987,7 @@ impl Simulator {
                         )
                     };
                     let fires_any = if widths_t[sid] > 64 {
-                        prev_wide_t
-                            .get(&sid)
-                            .map_or(cur_v != prev_v || cur_x != prev_x, |p| {
-                                signal_table[sid] != *p
-                            })
+                        signal_table[sid] != *Self::wide_edge_baseline(prev_wide_t, sid, widths_t[sid])
                     } else {
                         cur_v != prev_v || cur_x != prev_x
                     };
@@ -2120,11 +2116,9 @@ impl Simulator {
                                 ((cur_v ^ prev_v) | (cur_x ^ prev_x)) & m != 0
                             }
                             Some(event_bits::EventMask::Wide(bits)) => {
-                                event_bits::wide_select_changed(
-                                    bits,
-                                    &signal_table[sid],
-                                    prev_wide_t.get(&sid),
-                                )
+                                let previous = (widths_t[sid] > 64)
+                                    .then(|| Self::wide_edge_baseline(prev_wide_t, sid, widths_t[sid]));
+                                event_bits::wide_select_changed(bits, &signal_table[sid], previous.as_deref())
                             }
                         };
                     if bitsel_ok
@@ -3128,9 +3122,7 @@ impl Simulator {
             self.prev_xz[sid] = x;
         }
         for (sid, val) in fired_wide.drain(..) {
-            if let Some(p) = self.prev_wide.get_mut(&sid) {
-                *p = val;
-            }
+            self.prev_wide.insert(sid, val);
         }
         self.edge_fired_snap = fired_snap;
         self.edge_fired_wide = fired_wide;

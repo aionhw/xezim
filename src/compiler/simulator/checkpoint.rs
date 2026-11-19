@@ -39,7 +39,9 @@ use serde::ser::{SerializeSeq, Serializer};
 // 0x0f: optional assignment delays and inferred assertion clocks are boxed.
 // 0x10: compact declaration payloads and cold module constructs.
 // 0x11: optional case-arm guards and patterns use boxed AST storage.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x11";
+// 0x12: an absent wide snapshot denotes its full-width initial X value.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x12";
+const DENSE_WIDE_SNAPSHOT_VERSION: u8 = 0x11;
 
 #[derive(Default)]
 struct Session {
@@ -910,7 +912,7 @@ impl Simulator {
         if &magic[..7] != &MAGIC[..7] {
             return Err("not a checkpoint".into());
         }
-        if magic[7] != MAGIC[7] {
+        if magic[7] != MAGIC[7] && magic[7] != DENSE_WIDE_SNAPSHOT_VERSION {
             return Err("written in another checkpoint format".into());
         }
         let mut z = zstd::stream::Decoder::new(f).map_err(|e| e.to_string())?;

@@ -3701,14 +3701,11 @@ impl Simulator {
         let phase_prev = std::time::Instant::now();
         let prev_val: Vec<u64> = vec![0u64; named_count];
         let mut prev_xz: Vec<u64> = vec![0u64; named_count];
-        let mut prev_wide: HashMap<usize, Value> = HashMap::default();
+        let prev_wide = HashMap::default();
         for id in 0..named_count {
             let w = signal_widths_vec[id];
             let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
             prev_xz[id] = mask;
-            if w > 64 {
-                prev_wide.insert(id, Value::new(w));
-            }
         }
         let prev_ms = phase_prev.elapsed().as_secs_f64() * 1000.0;
         crate::rss_trace("sim::new prev snapshot");
