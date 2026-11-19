@@ -777,7 +777,8 @@ impl Simulator {
         // block declares its locals for the whole body. A block among other
         // statements declares them for itself only, and a design variable
         // of the same name may be read outside it: its locals are nested.
-        let body: &[Statement] = match fdecl.items.as_slice() {
+        let resolved = module.resolved_function_items(name, fdecl);
+        let body: &[Statement] = match resolved.as_ref() {
             [
                 Statement {
                     kind: StatementKind::SeqBlock { stmts, .. },
@@ -801,7 +802,7 @@ impl Simulator {
             .chain(nested.iter().cloned())
             .collect();
         let outer_shadow = FRAME_SHADOW.with(|c| c.replace(Some(shadow)));
-        for item in &fdecl.items {
+        for item in resolved.as_ref() {
             Self::collect_stmt_reads(item, module, &mut body_reads, &mut scratch_writes);
         }
         FRAME_SHADOW.with(|c| c.replace(outer_shadow));

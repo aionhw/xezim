@@ -776,20 +776,22 @@ impl Simulator {
         let key = format!("f:{name}");
         self.ts_memo(key, |s| {
             if let Some(t) = s.module.tasks.get(name) {
+                let items = s.module.resolved_task_items(name, t);
                 let cx = TsCtx {
                     owner: None,
                     ports: &t.ports,
-                    body: &t.items,
+                    body: items.as_ref(),
                 };
-                return s.ts_stmts(&t.items, cx);
+                return s.ts_stmts(items.as_ref(), cx);
             }
             if let Some(f) = s.module.functions.get(name) {
+                let items = s.module.resolved_function_items(name, f);
                 let cx = TsCtx {
                     owner: None,
                     ports: &f.ports,
-                    body: &f.items,
+                    body: items.as_ref(),
                 };
-                return s.ts_stmts(&f.items, cx);
+                return s.ts_stmts(items.as_ref(), cx);
             }
             // §35.5: an imported DPI function cannot consume time; an
             // imported task can (through exported tasks). Anything else is

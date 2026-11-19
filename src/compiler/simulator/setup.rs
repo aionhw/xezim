@@ -1619,9 +1619,9 @@ impl Simulator {
             }
             for c in &cands {
                 if let Some(td) = self.module.tasks.get(c.as_str()) {
-                    return td.items.iter().any(|st| self.stmt_is_blocking(st))
-                        || td
-                            .items
+                    let items = self.module.resolved_task_items(c, td);
+                    return items.iter().any(|st| self.stmt_is_blocking(st))
+                        || items
                             .iter()
                             .any(|st| self.stmt_calls_blocking_task(st, scope, depth - 1));
                 }
@@ -2353,6 +2353,11 @@ impl Simulator {
         compiler.set_scope_hint(scope_hint);
         compiler.set_tasks(&self.module.tasks);
         compiler.set_functions(&self.module.functions);
+        compiler.set_deferred_callables(
+            &self.module.deferred_function_bodies,
+            &self.module.deferred_task_bodies,
+            &self.module.packages,
+        );
         compiler.set_params(&self.module.parameters);
         compiler.set_param_leaf_idx(self.param_leaf_index());
         compiler.set_cast_widths(&self.cast_widths);

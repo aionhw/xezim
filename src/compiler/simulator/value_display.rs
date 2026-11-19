@@ -592,7 +592,8 @@ impl Simulator {
         if let Some(p) = td.ports.iter().find(|p| p.name.name == name) {
             return Some(p.data_type.clone());
         }
-        for st in &td.items {
+        let items = self.module.resolved_task_items(task, td);
+        for st in items.iter() {
             if let StatementKind::VarDecl {
                 data_type,
                 declarators,

@@ -2214,6 +2214,11 @@ pub struct BytecodeCompiler<'a> {
     tasks: Option<&'a HashMap<String, TaskDeclaration>>,
     functions: Option<&'a HashMap<String, FunctionDeclaration>>,
     function_scope_index: Option<&'a FunctionScopeIndex<'a>>,
+    /// Deferred per-instance callable rewrite contexts (#193), materialized
+    /// on demand when bytecode inspects or inlines an instance subroutine.
+    deferred_functions: Option<&'a HashMap<String, std::rc::Rc<super::elaborate::CallableRewriteCtx>>>,
+    deferred_tasks: Option<&'a HashMap<String, std::rc::Rc<super::elaborate::CallableRewriteCtx>>>,
+    deferred_packages: Option<&'a HashSet<String>>,
     /// A scalarized stand-in for the next `compile_pure_call`'s callee (see
     /// `compile_struct_member_call`); taken at the function-table lookup.
     struct_call_fd: Option<FunctionDeclaration>,
@@ -2518,6 +2523,9 @@ impl<'a> BytecodeCompiler<'a> {
             tasks: None,
             functions: None,
             function_scope_index: None,
+            deferred_functions: None,
+            deferred_tasks: None,
+            deferred_packages: None,
             struct_call_fd: None,
             unpacked_structs: None,
             dpi_import_fds: None,
@@ -3783,6 +3791,57 @@ impl<'a> BytecodeCompiler<'a> {
         self.tasks = Some(tasks);
     }
 
+    pub fn set_deferred_callables(
+        &mut self,
+        functions: &'a HashMap<String, std::rc::Rc<super::elaborate::CallableRewriteCtx>>,
+        tasks: &'a HashMap<String, std::rc::Rc<super::elaborate::CallableRewriteCtx>>,
+        packages: &'a HashSet<String>,
+    ) {
+        self.deferred_functions = Some(functions);
+        self.deferred_tasks = Some(tasks);
+        self.deferred_packages = Some(packages);
+    }
+
+    fn flatten_deferred_items(
+        &self,
+        mut items: Vec<Statement>,
+    ) -> crate::ast::shared_vec::SharedVec<Statement> {
+        if let Some(packages) = self.deferred_packages
+            && !packages.is_empty()
+        {
+            let pkgs: std::collections::HashSet<String> = packages.iter().cloned().collect();
+            items = items
+                .iter()
+                .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                .collect();
+        }
+        items.into()
+    }
+
+    fn materialize_deferred_fn(
+        &self,
+        name: &str,
+        fd: &FunctionDeclaration,
+    ) -> Option<crate::ast::shared_vec::SharedVec<Statement>> {
+        let dctx = self.deferred_functions?.get(name)?;
+        Some(crate::ast::cache::without_scope_caches(|| {
+            let items = dctx.materialize_body(&fd.ports, &fd.items);
+            self.flatten_deferred_items(items)
+        }))
+    }
+
+    fn materialize_deferred_task(
+        &self,
+        name: &str,
+        td: &TaskDeclaration,
+    ) -> Option<crate::ast::shared_vec::SharedVec<Statement>> {
+        let dctx = self.deferred_tasks?.get(name)?;
+        Some(crate::ast::cache::without_scope_caches(|| {
+            let items = dctx.materialize_body(&td.ports, &td.items);
+            self.flatten_deferred_items(items)
+        }))
+    }
+
     /// Static-only heuristic: does this expression CLEARLY produce a string?
     /// Used to bail string-concat to the interpreter (which has byte-level
     /// concat semantics). We can only see syntactic clues at compile time —
@@ -4090,7 +4149,15 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         let name = self.scoped_callee_name(h.path[0].name.name.clone())?;
-        let fd = self.functions?.get(&name)?;
+        let fd_ref = self.functions?.get(&name)?;
+        let mut owned_fd;
+        let fd = if let Some(items) = self.materialize_deferred_fn(&name, fd_ref) {
+            owned_fd = fd_ref.clone();
+            owned_fd.items = items;
+            &owned_fd
+        } else {
+            fd_ref
+        };
         let scope = Some(name.as_str());
         let members = |dt: &DataType| -> Option<super::struct_sra::Members> {
             let DataType::Struct(su) = self.resolved_decl_type(dt, scope) else {
@@ -4265,7 +4332,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
         // A scalarized stand-in (`compile_struct_member_call`) is never
         // delegated: its formals are not the declared function's.
-        let (fd, scalarized) = match self.struct_call_fd.take() {
+        let (mut fd, scalarized) = match self.struct_call_fd.take() {
             Some(fd) => (fd, true),
             None => {
                 let Some(fd) = self.functions.and_then(|f| f.get(&name)).cloned() else {
@@ -4275,6 +4342,11 @@ impl<'a> BytecodeCompiler<'a> {
                 (fd, false)
             }
         };
+        if !scalarized
+            && let Some(items) = self.materialize_deferred_fn(&name, &fd)
+        {
+            fd.items = items;
+        }
         // §13.5.4 named actuals (`.re(expr)`) normalize to positional order
         // (with §13.5.3 defaults filled) so every path below — delegation and
         // inline — sees a plain positional actual list.
@@ -5473,12 +5545,18 @@ impl<'a> BytecodeCompiler<'a> {
             crate::ast::shared_vec::SharedVec<Statement>,
             Option<crate::ast::types::Lifetime>,
         ) = if let Some(td) = self.tasks.and_then(|t| t.get(task_name)) {
-            (td.ports.clone(), td.items.clone(), td.lifetime)
+            let body = self
+                .materialize_deferred_task(task_name, td)
+                .unwrap_or_else(|| td.items.clone());
+            (td.ports.clone(), body, td.lifetime)
         } else if let Some(fd) = self.functions.and_then(|f| f.get(task_name)) {
             if !matches!(fd.return_type, crate::ast::types::DataType::Void(_)) {
                 return false;
             }
-            (fd.ports.clone(), fd.items.clone(), fd.lifetime)
+            let body = self
+                .materialize_deferred_fn(task_name, fd)
+                .unwrap_or_else(|| fd.items.clone());
+            (fd.ports.clone(), body, fd.lifetime)
         } else {
             return false;
         };
@@ -5807,8 +5885,16 @@ impl<'a> BytecodeCompiler<'a> {
         if h.path.len() != 1 || !h.path[0].selects.is_empty() {
             return false;
         }
-        let Some(fd) = self.functions.and_then(|f| f.get(&h.path[0].name.name)) else {
+        let Some(fd_ref) = self.functions.and_then(|f| f.get(&h.path[0].name.name)) else {
             return false;
+        };
+        let mut owned_fd;
+        let fd = if let Some(items) = self.materialize_deferred_fn(&h.path[0].name.name, fd_ref) {
+            owned_fd = fd_ref.clone();
+            owned_fd.items = items;
+            &owned_fd
+        } else {
+            fd_ref
         };
         if fd.ports.len() != args.len()
             || fd.ports.iter().any(|p| {
@@ -9078,8 +9164,17 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => false,
             }
         }
+        let materialized = (!fd.name.name.name.is_empty())
+            .then(|| {
+                self.functions
+                    .and_then(|fs| fs.get(&fd.name.name.name))
+                    .filter(|raw| Arc::ptr_eq(fd.items.as_arc(), raw.items.as_arc()))
+                    .and_then(|raw| self.materialize_deferred_fn(&fd.name.name.name, raw))
+            })
+            .flatten();
+        let items = materialized.as_ref().unwrap_or(&fd.items);
         let mut scope = bound;
-        fd.items
+        items
             .iter()
             .all(|st| stmt_ok(st, &mut scope, self, allow_ext_reads))
     }
@@ -25001,6 +25096,9 @@ impl<'a> BytecodeCompiler<'a> {
             self.pkg_enum_consts.clear();
             self.functions = None;
             self.function_scope_index = None;
+            self.deferred_functions = None;
+            self.deferred_tasks = None;
+            self.deferred_packages = None;
             self.dpi_import_fds = None;
             self.method_class = None;
             self.handle_member_types = None;

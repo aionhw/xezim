@@ -972,17 +972,18 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             add(Rc::new(refs), scope.to_string(), None, None);
         }
     }
+    let mut subr_memo: HashMap<usize, Rc<Vec<Ref>>> = HashMap::new();
     let subroutines = elab
         .tasks
         .iter()
-        .map(|(k, t)| (k, &t.ports, &t.items))
+        .map(|(k, t)| (k, &t.ports, &t.items, elab.deferred_task_bodies.get(k)))
         .chain(
             elab.functions
                 .as_map()
                 .iter()
-                .map(|(k, f)| (k, &f.ports, &f.items)),
+                .map(|(k, f)| (k, &f.ports, &f.items, elab.deferred_function_bodies.get(k))),
         );
-    for (key, ports, items) in subroutines {
+    for (key, ports, items, dctx) in subroutines {
         // A package subroutine cannot name the design hierarchy (§26.2).
         if key.contains("::")
             || elab.pkg_subr_owner.contains_key(key)
@@ -990,14 +991,23 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
         {
             continue;
         }
-        let formals = ports.iter().map(|p| p.name.name.clone()).collect();
-        let stmts: Vec<&Statement> = items.iter().collect();
-        add(
-            body_refs(&stmts, formals),
-            parent(key).unwrap_or("").to_string(),
-            None,
-            None,
-        );
+        let scope = parent(key).unwrap_or("").to_string();
+        if let Some(dctx) = dctx {
+            let ptr = std::sync::Arc::as_ptr(items.as_arc()) as usize;
+            let refs = subr_memo
+                .entry(ptr)
+                .or_insert_with(|| {
+                    let formals = ports.iter().map(|p| p.name.name.clone()).collect();
+                    let stmts: Vec<&Statement> = items.iter().collect();
+                    body_refs(&stmts, formals)
+                })
+                .clone();
+            add(refs, scope, Some(dctx.ctx.owner.as_str()), Some(dctx.ctx.as_ref()));
+        } else {
+            let formals = ports.iter().map(|p| p.name.name.clone()).collect();
+            let stmts: Vec<&Statement> = items.iter().collect();
+            add(body_refs(&stmts, formals), scope, None, None);
+        }
     }
     for (key, body) in &elab.property_decls {
         let mut refs = Vec::new();

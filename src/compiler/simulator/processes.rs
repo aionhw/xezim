@@ -3062,6 +3062,11 @@ impl Simulator {
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
+            compiler.set_deferred_callables(
+                &self.module.deferred_function_bodies,
+                &self.module.deferred_task_bodies,
+                &self.module.packages,
+            );
             compiler.set_params(&self.module.parameters);
             compiler.set_param_leaf_idx(self.param_leaf_index());
             compiler.set_cast_widths(&self.cast_widths);
@@ -3305,6 +3310,11 @@ impl Simulator {
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
+            compiler.set_deferred_callables(
+                &self.module.deferred_function_bodies,
+                &self.module.deferred_task_bodies,
+                &self.module.packages,
+            );
             compiler.set_params(&self.module.parameters);
             compiler.set_param_leaf_idx(self.param_leaf_index());
             compiler.set_cast_widths(&self.cast_widths);
