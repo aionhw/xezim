@@ -39,6 +39,8 @@ mod c910_scoped_cont_assign;
 mod class_method_hier_subroutine_calls;
 #[path = "hierarchy/colliding_actual_child_body.rs"]
 mod colliding_actual_child_body;
+#[path = "hierarchy/default_nettype_inferred_ports.rs"]
+mod default_nettype_inferred_ports;
 #[path = "hierarchy/defparam_upward_paths.rs"]
 mod defparam_upward_paths;
 #[path = "hierarchy/disable_targets.rs"]
