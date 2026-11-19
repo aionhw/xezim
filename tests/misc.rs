@@ -151,6 +151,8 @@ mod init_reg_seed;
 mod inlined_call_caller_loop_constant;
 #[path = "misc/inspect_types.rs"]
 mod inspect_types;
+#[path = "misc/integral_time.rs"]
+mod integral_time;
 #[path = "misc/interconnect_and_var_ports.rs"]
 mod interconnect_and_var_ports;
 #[path = "misc/issue30_runner.rs"]
