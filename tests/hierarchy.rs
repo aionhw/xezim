@@ -517,3 +517,5 @@ mod nettype_input_port_actuals_1280;
 mod prepared_body_release_721;
 #[path = "hierarchy/parameter_type_sharing_721.rs"]
 mod parameter_type_sharing_721;
+#[path = "hierarchy/assignment_origin_sharing_721.rs"]
+mod assignment_origin_sharing_721;
