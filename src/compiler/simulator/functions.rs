@@ -43,7 +43,23 @@ impl Simulator {
         // §13.4/§23.6: only called declarations materialize a private body.
         // This cache has one lexical name, so memoized widths and resolved
         // signals can be enabled without contaminating shared elaboration ASTs.
-        fd.items = crate::ast::cache::with_fresh_scope_caches(|| fd.items.to_vec()).into();
+        fd.items = crate::ast::cache::with_fresh_scope_caches(|| {
+            let mut items = match self.module.materialize_function_body(name, &fd) {
+                Some(mat) => mat.into_vec(),
+                None => fd.items.to_vec(),
+            };
+            if self.module.deferred_function_bodies.contains_key(name)
+                && !self.module.packages.is_empty()
+            {
+                let pkgs: std::collections::HashSet<String> =
+                    self.module.packages.iter().cloned().collect();
+                items = items
+                    .iter()
+                    .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                    .collect();
+            }
+            items.into()
+        });
         let rc = std::rc::Rc::new(fd);
         self.fn_decl_cache.insert(name.to_string(), rc.clone());
         Some(rc)
@@ -79,7 +95,23 @@ impl Simulator {
             return Some(rc.clone());
         }
         let mut td = self.module.tasks.get(name)?.clone();
-        td.items = crate::ast::cache::with_fresh_scope_caches(|| td.items.to_vec()).into();
+        td.items = crate::ast::cache::with_fresh_scope_caches(|| {
+            let mut items = match self.module.materialize_task_body(name, &td) {
+                Some(mat) => mat.into_vec(),
+                None => td.items.to_vec(),
+            };
+            if self.module.deferred_task_bodies.contains_key(name)
+                && !self.module.packages.is_empty()
+            {
+                let pkgs: std::collections::HashSet<String> =
+                    self.module.packages.iter().cloned().collect();
+                items = items
+                    .iter()
+                    .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                    .collect();
+            }
+            items.into()
+        });
         let rc = std::rc::Rc::new(td);
         self.task_decl_cache.insert(name.to_string(), rc.clone());
         Some(rc)

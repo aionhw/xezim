@@ -1293,6 +1293,11 @@ impl Simulator {
                 // helpers) onto the slowest path. Every other compiler
                 // instantiation passes it; this one simply never did.
                 compiler.set_functions(&self.module.functions);
+                compiler.set_deferred_callables(
+                    &self.module.deferred_function_bodies,
+                    &self.module.deferred_task_bodies,
+                    &self.module.packages,
+                );
                 compiler.top_module_name = Some(self.module.name.clone());
                 if let Some(c) = cov_counter {
                     compiler.emit_cov_hit(c);
@@ -1383,6 +1388,11 @@ impl Simulator {
                 // (`assign {a,b} = ({N{hit}} & f(w)) | ...`) could never
                 // inline its calls and stayed on the AST interpreter.
                 compiler.set_functions(&self.module.functions);
+                compiler.set_deferred_callables(
+                    &self.module.deferred_function_bodies,
+                    &self.module.deferred_task_bodies,
+                    &self.module.packages,
+                );
                 compiler.top_module_name = Some(self.module.name.clone());
                 if let Some(c) = cov_counter {
                     compiler.emit_cov_hit(c);
@@ -2165,6 +2175,11 @@ impl Simulator {
                     compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_functions(&self.module.functions);
+                    compiler.set_deferred_callables(
+                        &self.module.deferred_function_bodies,
+                        &self.module.deferred_task_bodies,
+                        &self.module.packages,
+                    );
                     compiler.set_params(&self.module.parameters);
                     compiler.set_param_leaf_idx(self.param_leaf_index());
                     compiler.set_cast_widths(&self.cast_widths);

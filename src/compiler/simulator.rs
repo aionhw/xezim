@@ -1648,14 +1648,43 @@ mod edgesel_writers {
             {
                 proc_cont_targets(&b.stmt, &mut forced);
             }
-            for t in module.tasks.values() {
-                for x in &t.items {
-                    proc_cont_targets(x, &mut forced);
+            let mut routine_forced: HashMap<usize, Vec<String>> = HashMap::default();
+            for (k, t) in &module.tasks {
+                let ptr = std::sync::Arc::as_ptr(t.items.as_arc()) as usize;
+                let bases = routine_forced.entry(ptr).or_insert_with(|| {
+                    let mut f: Vec<&Expression> = Vec::new();
+                    for x in &t.items {
+                        proc_cont_targets(x, &mut f);
+                    }
+                    f.into_iter().filter_map(base_ident).collect()
+                });
+                let dctx = module.deferred_task_bodies.get(k);
+                for b in bases.iter() {
+                    ix.forced.insert(leaf(b).to_string());
+                    if let Some(dctx) = dctx
+                        && let Some(mb) = dctx.ctx.port_map.get(b).and_then(base_ident)
+                    {
+                        ix.forced.insert(leaf(&mb).to_string());
+                    }
                 }
             }
-            for f in module.functions.values() {
-                for x in &f.items {
-                    proc_cont_targets(x, &mut forced);
+            for (k, f) in module.functions.iter() {
+                let ptr = std::sync::Arc::as_ptr(f.items.as_arc()) as usize;
+                let bases = routine_forced.entry(ptr).or_insert_with(|| {
+                    let mut fv: Vec<&Expression> = Vec::new();
+                    for x in &f.items {
+                        proc_cont_targets(x, &mut fv);
+                    }
+                    fv.into_iter().filter_map(base_ident).collect()
+                });
+                let dctx = module.deferred_function_bodies.get(k);
+                for b in bases.iter() {
+                    ix.forced.insert(leaf(b).to_string());
+                    if let Some(dctx) = dctx
+                        && let Some(mb) = dctx.ctx.port_map.get(b).and_then(base_ident)
+                    {
+                        ix.forced.insert(leaf(&mb).to_string());
+                    }
                 }
             }
             for e in forced {
