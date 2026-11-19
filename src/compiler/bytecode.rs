@@ -5676,6 +5676,35 @@ impl<'a> BytecodeCompiler<'a> {
             )
     }
 
+    /// `q.pop_front()` / `q.pop_back()` on a plain (possibly dotted) name,
+    /// under any parentheses.
+    fn is_queue_pop_call(e: &Expression) -> bool {
+        let mut e = e;
+        while let ExprKind::Paren(inner) = &e.kind {
+            e = inner;
+        }
+        let ExprKind::Call { func, args } = &e.kind else {
+            return false;
+        };
+        if !args.is_empty() {
+            return false;
+        }
+        let plain = |h: &crate::ast::expr::HierarchicalIdentifier| {
+            h.path.iter().all(|s| s.selects.is_empty())
+        };
+        let (method, recv_ok) = match &func.kind {
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                (h.path.last().map(|s| s.name.name.as_str()), plain(h))
+            }
+            ExprKind::MemberAccess { expr, member } => (
+                Some(member.name.as_str()),
+                matches!(&expr.kind, ExprKind::Ident(h) if plain(h)),
+            ),
+            _ => (None, false),
+        };
+        recv_ok && matches!(method, Some("pop_front" | "pop_back"))
+    }
+
     fn for_body_is_simple(&self, stmt: &Statement) -> bool {
         let expr_simple = |e: &Expression| -> bool { self.expr_loop_simple(e) };
         let lv_simple = |e: &Expression| -> bool {
@@ -5847,7 +5876,13 @@ impl<'a> BytecodeCompiler<'a> {
                     _ => false,
                 };
                 let _ = expr_reads_name; // superseded by the form-aware audit
-                lv_simple(lvalue) && expr_simple(rvalue) && !self_read_skewed
+                // §7.10.2: `v[i] = q.pop_front();` — the pop is evaluated by
+                // the interpreter into a register (it names no loop
+                // variable), the loop and the store stay compiled. Such a
+                // drain loop used to run whole in the AST interpreter (#1210).
+                let queue_pop = matches!(stmt.kind, StatementKind::BlockingAssign { .. })
+                    && Self::is_queue_pop_call(rvalue);
+                lv_simple(lvalue) && (expr_simple(rvalue) || queue_pop) && !self_read_skewed
             }
             StatementKind::SeqBlock { stmts, .. } => {
                 stmts.iter().all(|st| self.for_body_is_simple(st))
