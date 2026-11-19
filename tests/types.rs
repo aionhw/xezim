@@ -827,3 +827,5 @@ mod pattern_type_key_scoped_and_lexical_1290;
 mod struct_element_return_1310;
 #[path = "types/review_pattern_type_keys_imports.rs"]
 mod review_pattern_type_keys_imports;
+#[path = "types/real_to_integral_cast.rs"]
+mod real_to_integral_cast;
