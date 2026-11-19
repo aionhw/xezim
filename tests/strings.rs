@@ -172,3 +172,5 @@ mod p_format_aggregates_566;
 mod format_backslash_literal;
 #[path = "strings/scan_zero_width.rs"]
 mod scan_zero_width;
+#[path = "strings/review_vpi_scoped_callee_deposit.rs"]
+mod review_vpi_scoped_callee_deposit;
