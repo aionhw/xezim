@@ -1121,45 +1121,60 @@ impl Simulator {
         self.assign_pattern_into_struct_with_types(base, su, items, &[]);
     }
 
-    fn assign_pattern_into_struct_with_types(
+    fn assign_pattern_into_struct_with_types<'a>(
         &mut self,
         base: &str,
         su: &crate::ast::types::StructUnionType,
-        items: &[AssignmentPatternItem],
-        outer_types: &[(DataType, Expression)],
+        items: &'a [AssignmentPatternItem],
+        outer_types: &[(DataType, &'a Expression)],
     ) {
-        let member_names: Vec<String> = su
-            .members
-            .iter()
-            .flat_map(|m| m.declarators.iter().map(|md| md.name.name.clone()))
-            .collect();
-        let mut combined_types: Vec<(DataType, Expression)> = items
-            .iter()
-            .filter_map(|item| {
-                if let AssignmentPatternItem::Named(id, _) = item
-                    && member_names.iter().any(|m| m == &id.name)
-                {
-                    return None;
+        let is_struct_member = |name: &str| {
+            su.members
+                .iter()
+                .any(|m| m.declarators.iter().any(|md| md.name.name == name))
+        };
+        let mut local_types: Vec<(DataType, &'a Expression)> = Vec::new();
+        for item in items {
+            match item {
+                AssignmentPatternItem::Ordered(_) | AssignmentPatternItem::Default(_) => {}
+                AssignmentPatternItem::Named(id, _) if is_struct_member(&id.name) => {}
+                _ => {
+                    if let Some((dt, e)) = self.array_pattern_type_key(item) {
+                        local_types.push((dt, e));
+                    }
                 }
-                self.array_pattern_type_key(item)
-                    .map(|(dt, e)| (dt, e.clone()))
-            })
-            .collect();
-        combined_types.extend(outer_types.iter().cloned());
+            }
+        }
+        let combined_owned: Vec<(DataType, &'a Expression)>;
+        let combined_types: &[(DataType, &'a Expression)] = if local_types.is_empty() {
+            outer_types
+        } else if outer_types.is_empty() {
+            local_types.as_slice()
+        } else {
+            local_types.extend_from_slice(outer_types);
+            combined_owned = local_types;
+            combined_owned.as_slice()
+        };
+
+        let mut target = String::with_capacity(base.len() + 16);
+        target.push_str(base);
+        target.push('.');
+        let prefix_len = target.len();
 
         for (mname, mdt, dims, e, explicit) in self.bind_struct_pattern_items(su, items) {
-            let target = format!("{}.{}", base, mname);
+            target.truncate(prefix_len);
+            target.push_str(&mname);
             let matched_outer = if !outer_types.is_empty() && dims.is_empty() {
                 outer_types
                     .iter()
                     .rev()
                     .find(|(kt, _)| self.pattern_type_matches(&mdt, kt))
-                    .map(|(_, v)| v.clone())
+                    .map(|(_, v)| *v)
             } else {
                 None
             };
             if let Some(ov) = matched_outer {
-                self.assign_pattern_or_leaf(&target, &mdt, &ov);
+                self.assign_pattern_or_leaf(&target, &mdt, ov);
                 continue;
             }
             if dims.is_empty() {
@@ -1167,22 +1182,31 @@ impl Simulator {
                     if let DataType::Struct(inner) = self.resolve_dt(&mdt)
                         && Self::spreads_member_wise(&inner)
                     {
-                        let sub = match e.map(|x| &self.unpacked_pattern(x).kind) {
-                            Some(ExprKind::AssignmentPattern(sub)) => sub.clone(),
-                            _ => e
-                                .map(|x| vec![AssignmentPatternItem::Default(x.clone())])
-                                .unwrap_or_default(),
+                        let synth_single;
+                        let sub: &[AssignmentPatternItem] = match e.map(|x| &self.unpacked_pattern(x).kind) {
+                            Some(ExprKind::AssignmentPattern(sub)) => sub.as_slice(),
+                            _ => match e {
+                                Some(x) => {
+                                    synth_single = [AssignmentPatternItem::Default(x.clone())];
+                                    &synth_single
+                                }
+                                None => &[],
+                            },
                         };
                         self.assign_pattern_into_struct_with_types(
                             &target,
                             &inner,
-                            &sub,
-                            &combined_types,
+                            sub,
+                            combined_types,
                         );
                         continue;
                     }
                     if let Some(e) = e
-                        && let Some(v) = self.eval_packed_with_outer_types(e, &mdt, &combined_types)
+                        && let Some(v) = self.eval_packed_with_outer_types(
+                            e,
+                            &mdt,
+                            combined_types.iter().map(|(kt, v)| (kt, *v)),
+                        )
                     {
                         self.write_pattern_leaf(&target, v);
                         continue;
@@ -1195,7 +1219,8 @@ impl Simulator {
                 // no other key sets.
                 if !explicit {
                     let capture = self.pattern_nba_leaves.take();
-                    let value = self.eval_default_in_packed_type(items, &mdt);
+                    let value =
+                        self.eval_default_in_packed_type(items, &mdt, &is_struct_member);
                     self.pattern_nba_leaves = capture;
                     if let Some(v) = value {
                         self.write_pattern_leaf(&target, v);
@@ -1226,7 +1251,7 @@ impl Simulator {
             let member_outer = if explicit {
                 outer_types
             } else {
-                combined_types.as_slice()
+                combined_types
             };
             if e.is_some() || !member_outer.is_empty() {
                 self.assign_pattern_over_dims_with_types(&target, &mdt, &lists, e, member_outer);
@@ -1238,11 +1263,11 @@ impl Simulator {
     /// with `outer_types` applied above `e` (so outer type keys win over items
     /// inside a `default:'{...}`). Never wraps a scalar for a simple bit vector
     /// (which would spread the scalar across individual bits).
-    pub(super) fn eval_packed_with_outer_types(
+    pub(super) fn eval_packed_with_outer_types<'a>(
         &mut self,
         e: &Expression,
         dt: &DataType,
-        outer_types: &[(DataType, Expression)],
+        outer_types: impl IntoIterator<Item = (&'a DataType, &'a Expression)>,
     ) -> Option<Value> {
         let is_pat = matches!(
             self.unpacked_pattern(e).kind,
@@ -1290,29 +1315,29 @@ impl Simulator {
         })
     }
 
-    fn leaf_elem_type(&self, dt: &DataType) -> DataType {
-        let mut cur = dt.clone();
+    fn leaf_elem_type<'a>(&self, dt: &'a DataType) -> std::borrow::Cow<'a, DataType> {
+        let mut cur: std::borrow::Cow<'a, DataType> = std::borrow::Cow::Borrowed(dt);
         for _ in 0..16 {
             let DataType::TypeReference {
                 name, dimensions, ..
-            } = &cur
+            } = cur.as_ref()
             else {
                 break;
             };
             if !dimensions.is_empty() {
                 break;
             }
-            let key_str = if name.has_scope() {
-                name.qualified()
+            let key_cow: std::borrow::Cow<'_, str> = if name.has_scope() {
+                std::borrow::Cow::Owned(name.qualified())
             } else {
-                name.name.name.clone()
+                std::borrow::Cow::Borrowed(name.name.name.as_str())
             };
             if self
-                .typedef_unpacked_dims_of(&key_str)
+                .typedef_unpacked_dims_of(key_cow.as_ref())
                 .is_some_and(|d| !d.is_empty())
-                && let Some(target) = self.lookup_typedef_target(&key_str)
+                && let Some(target) = self.lookup_typedef_target(key_cow.as_ref())
             {
-                cur = target;
+                cur = std::borrow::Cow::Owned(target);
                 continue;
             }
             break;
@@ -1320,43 +1345,52 @@ impl Simulator {
         cur
     }
 
-    fn assign_pattern_over_dims_with_types(
+    fn assign_pattern_over_dims_with_types<'a>(
         &mut self,
         target: &str,
         dt: &DataType,
         lists: &[Vec<i64>],
-        e: Option<&Expression>,
-        outer_types: &[(DataType, Expression)],
+        e: Option<&'a Expression>,
+        outer_types: &[(DataType, &'a Expression)],
     ) {
         let Some((first, rest)) = lists.split_first() else {
             let leaf_dt = self.leaf_elem_type(dt);
             for (key_dt, val) in outer_types.iter().rev() {
-                if self.pattern_type_matches(&leaf_dt, key_dt) {
-                    self.assign_pattern_or_leaf(target, &leaf_dt, val);
+                if self.pattern_type_matches(leaf_dt.as_ref(), key_dt) {
+                    self.assign_pattern_or_leaf(target, leaf_dt.as_ref(), val);
                     return;
                 }
             }
             if !outer_types.is_empty()
-                && let DataType::Struct(su) = self.resolve_dt(&leaf_dt)
+                && let DataType::Struct(su) = self.resolve_dt(leaf_dt.as_ref())
                 && Self::spreads_member_wise(&su)
             {
-                let sub = match e.map(|x| &self.unpacked_pattern(x).kind) {
-                    Some(ExprKind::AssignmentPattern(items)) => items.clone(),
-                    _ => e
-                        .map(|x| vec![AssignmentPatternItem::Default(x.clone())])
-                        .unwrap_or_default(),
+                let synth_single;
+                let sub: &[AssignmentPatternItem] = match e.map(|x| &self.unpacked_pattern(x).kind) {
+                    Some(ExprKind::AssignmentPattern(items)) => items.as_slice(),
+                    _ => match e {
+                        Some(x) => {
+                            synth_single = [AssignmentPatternItem::Default(x.clone())];
+                            &synth_single
+                        }
+                        None => &[],
+                    },
                 };
-                self.assign_pattern_into_struct_with_types(target, &su, &sub, outer_types);
+                self.assign_pattern_into_struct_with_types(target, &su, sub, outer_types);
                 return;
             }
             if let Some(e) = e {
                 if !outer_types.is_empty()
-                    && let Some(v) = self.eval_packed_with_outer_types(e, &leaf_dt, outer_types)
+                    && let Some(v) = self.eval_packed_with_outer_types(
+                        e,
+                        leaf_dt.as_ref(),
+                        outer_types.iter().map(|(kt, v)| (kt, *v)),
+                    )
                 {
                     self.write_pattern_leaf(target, v);
                     return;
                 }
-                self.assign_pattern_or_leaf(target, &leaf_dt, e);
+                self.assign_pattern_or_leaf(target, leaf_dt.as_ref(), e);
             }
             return;
         };
@@ -1379,14 +1413,14 @@ impl Simulator {
                 _ => {}
             }
         }
+        use std::fmt::Write;
+        let mut elem_target = String::with_capacity(target.len() + 8);
+        elem_target.push_str(target);
+        let base_len = elem_target.len();
         for idx in first {
-            self.assign_pattern_over_dims_with_types(
-                &format!("{}[{}]", target, idx),
-                dt,
-                rest,
-                e,
-                outer_types,
-            );
+            elem_target.truncate(base_len);
+            let _ = write!(&mut elem_target, "[{}]", idx);
+            self.assign_pattern_over_dims_with_types(&elem_target, dt, rest, e, outer_types);
         }
     }
 
@@ -1402,13 +1436,13 @@ impl Simulator {
         self.assign_pattern_items_over_dims_with_types(target, dt, lists, sub, &[]);
     }
 
-    fn assign_pattern_items_over_dims_with_types(
+    fn assign_pattern_items_over_dims_with_types<'a>(
         &mut self,
         target: &str,
         dt: &DataType,
         lists: &[Vec<i64>],
-        sub: &[AssignmentPatternItem],
-        outer_types: &[(DataType, Expression)],
+        sub: &'a [AssignmentPatternItem],
+        outer_types: &[(DataType, &'a Expression)],
     ) {
         let Some((first, rest)) = lists.split_first() else {
             return;
@@ -1422,9 +1456,15 @@ impl Simulator {
                 super::elaborate::struct_pattern_count_value(&self.eval_expr(count))
             })
         {
+            use std::fmt::Write;
+            let mut elem_target = String::with_capacity(target.len() + 8);
+            elem_target.push_str(target);
+            let base_len = elem_target.len();
             for (idx, v) in first.iter().zip(expanded) {
+                elem_target.truncate(base_len);
+                let _ = write!(&mut elem_target, "[{}]", idx);
                 self.assign_pattern_over_dims_with_types(
-                    &format!("{}[{}]", target, idx),
+                    &elem_target,
                     dt,
                     rest,
                     Some(v),
@@ -1433,9 +1473,9 @@ impl Simulator {
             }
             return;
         }
-        let mut per_elem: Vec<Option<&Expression>> = vec![None; first.len()];
-        let mut local_types: Vec<(DataType, Expression)> = Vec::new();
-        let mut dflt: Option<&Expression> = None;
+        let mut per_elem: Vec<Option<&'a Expression>> = vec![None; first.len()];
+        let mut local_types: Vec<(DataType, &'a Expression)> = Vec::new();
+        let mut dflt: Option<&'a Expression> = None;
         let mut pos = 0usize;
         for item in sub {
             match item {
@@ -1446,24 +1486,53 @@ impl Simulator {
                     pos += 1;
                 }
                 AssignmentPatternItem::Default(v) => dflt = Some(v),
-                _ => {
-                    if let Some((key_dt, v)) = self.array_pattern_type_key(item) {
-                        local_types.push((key_dt, v.clone()));
+                AssignmentPatternItem::Typed(key_dt, v) => {
+                    local_types.push((key_dt.clone(), v));
+                }
+                AssignmentPatternItem::Keyed(k, v) => {
+                    if matches!(k.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. })
+                        && let Some((key_dt, _)) = self.array_pattern_type_key(item)
+                    {
+                        local_types.push((key_dt, v));
                         continue;
                     }
-                    if let Some(k) = self.array_pattern_key(item)
-                        && let Some(key) = self.eval_expr(&k).to_i64()
+                    if let Some(key) = self.eval_expr(k).to_i64()
                         && let Some(p) = first.iter().position(|&i| i == key)
                     {
-                        per_elem[p] = Some(item.expr());
+                        per_elem[p] = Some(v);
+                    }
+                }
+                AssignmentPatternItem::Named(id, v) => {
+                    if let Some((key_dt, _)) = self.array_pattern_type_key(item) {
+                        local_types.push((key_dt, v));
+                        continue;
+                    }
+                    let key_expr = crate::compiler::packed_assignment_pattern_plan::ident_expr(id);
+                    if let Some(key) = self.eval_expr(&key_expr).to_i64()
+                        && let Some(p) = first.iter().position(|&i| i == key)
+                    {
+                        per_elem[p] = Some(v);
                     }
                 }
             }
         }
-        let mut combined_types = local_types;
-        combined_types.extend(outer_types.iter().cloned());
+        let combined_owned: Vec<(DataType, &'a Expression)>;
+        let combined_types: &[(DataType, &'a Expression)] = if local_types.is_empty() {
+            outer_types
+        } else if outer_types.is_empty() {
+            local_types.as_slice()
+        } else {
+            local_types.extend_from_slice(outer_types);
+            combined_owned = local_types;
+            combined_owned.as_slice()
+        };
+        use std::fmt::Write;
+        let mut elem_target = String::with_capacity(target.len() + 8);
+        elem_target.push_str(target);
+        let base_len = elem_target.len();
         for (p, idx) in first.iter().enumerate() {
-            let elem_target = format!("{}[{}]", target, idx);
+            elem_target.truncate(base_len);
+            let _ = write!(&mut elem_target, "[{}]", idx);
             if let Some(v) = per_elem[p] {
                 self.assign_pattern_over_dims_with_types(
                     &elem_target,
@@ -1479,9 +1548,9 @@ impl Simulator {
                     .iter()
                     .rev()
                     .find(|(kt, _)| self.pattern_subarray_matches(dt, rest, kt))
-                    .map(|(_, v)| v.clone())
+                    .map(|(_, v)| *v)
             {
-                self.assign_pattern_over_dims_with_types(&elem_target, dt, rest, Some(&matched), &[]);
+                self.assign_pattern_over_dims_with_types(&elem_target, dt, rest, Some(matched), &[]);
                 continue;
             }
             if dflt.is_some() || !combined_types.is_empty() {
@@ -1490,7 +1559,7 @@ impl Simulator {
                     dt,
                     rest,
                     dflt,
-                    &combined_types,
+                    combined_types,
                 );
             }
         }
@@ -4472,6 +4541,299 @@ impl Simulator {
             .map(|_| crate::compiler::packed_assignment_pattern_plan::type_ref(name))
     }
 
+    /// Resolve a `Class#(args)::td`, `pkg::Class#(args)::td`,
+    /// `Class#(args)::Inner::td`, or `alias::td` (where `alias` is a typedef of
+    /// a class specialization) expression to its concrete `DataType` (§8.25.1).
+    pub(super) fn resolve_specialized_class_typedef_expr(
+        &self,
+        expr: &Expression,
+    ) -> Option<DataType> {
+        let resolve_typedef_alias_spec = |head_name: &str| -> Option<(String, String)> {
+            let mut alias_name = head_name.to_string();
+            for _ in 0..16 {
+                let DataType::TypeReference {
+                    name: tn,
+                    type_args,
+                    dimensions,
+                    ..
+                } = self.lookup_typedef_target(&alias_name)?
+                else {
+                    return None;
+                };
+                if !dimensions.is_empty() {
+                    return None;
+                }
+                let target_cls = if tn.has_scope() {
+                    tn.qualified()
+                } else {
+                    tn.name.name.clone()
+                };
+                if !type_args.is_empty() && self.module.classes.contains_key(&target_cls) {
+                    let frags: Vec<String> = type_args
+                        .iter()
+                        .filter_map(|a| self.expr_to_spec_fragment(a))
+                        .collect();
+                    return Some((target_cls, frags.join(",")));
+                }
+                if tn.scopes.is_empty() && type_args.is_empty() {
+                    alias_name = tn.name.name;
+                    continue;
+                }
+                return None;
+            }
+            None
+        };
+
+        let (leaf, mut tail, spec_hit): (&str, Vec<&str>, Option<(String, String)>) =
+            match &expr.kind {
+                ExprKind::MemberAccess {
+                    expr: parent,
+                    member: leaf_id,
+                } => {
+                    let mut tail: Vec<&str> = Vec::new();
+                    let mut cur = parent.as_ref();
+                    let mut spec_hit: Option<(String, String)> = None;
+                    for _ in 0..16 {
+                        match &cur.kind {
+                            ExprKind::Specialization {
+                                base,
+                                type_args_text,
+                            } => {
+                                let base_name = match &base.kind {
+                                    ExprKind::Ident(h)
+                                        if h.root.is_none()
+                                            && h.path.len() == 1
+                                            && h.path[0].selects.is_empty() =>
+                                    {
+                                        h.path[0].name.name.clone()
+                                    }
+                                    _ => crate::compiler::packed_assignment_pattern_plan::scoped_name_key(
+                                        base,
+                                    )?,
+                                };
+                                spec_hit = Some((base_name, type_args_text.clone()));
+                                break;
+                            }
+                            ExprKind::MemberAccess { expr: inner, member } => {
+                                tail.push(member.name.as_str());
+                                cur = inner.as_ref();
+                            }
+                            ExprKind::Ident(h)
+                                if h.root.is_none()
+                                    && h.path.len() == 1
+                                    && h.path[0].selects.is_empty() =>
+                            {
+                                spec_hit = resolve_typedef_alias_spec(&h.path[0].name.name);
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                    (leaf_id.name.as_str(), tail, spec_hit)
+                }
+                ExprKind::Ident(h)
+                    if h.root.is_none()
+                        && h.path.len() >= 2
+                        && h.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    let leaf = h.path.last()?.name.name.as_str();
+                    let head = h.path[0].name.name.as_str();
+                    let tail: Vec<&str> = h.path[1..h.path.len() - 1]
+                        .iter()
+                        .rev()
+                        .map(|s| s.name.name.as_str())
+                        .collect();
+                    (leaf, tail, resolve_typedef_alias_spec(head))
+                }
+                _ => return None,
+            };
+        let (mut cls_name, raw_sig) = spec_hit?;
+        if !tail.is_empty() {
+            tail.reverse();
+            for seg in tail {
+                cls_name.push_str("::");
+                cls_name.push_str(seg);
+            }
+        }
+        let orig_cls_name = cls_name.clone();
+        if !self.module.classes.contains_key(&cls_name)
+            && let Some((_, rest)) = cls_name.split_once("::")
+            && self.module.classes.contains_key(rest)
+        {
+            cls_name = rest.to_string();
+        }
+        if !self.module.classes.contains_key(&cls_name) {
+            return None;
+        }
+        let canon_sig = self.canonicalize_spec_sig(&cls_name, &raw_sig);
+
+        // Walk `cls_name` and its `extends` chain to find `leaf` in `typedef_targets`.
+        let mut cur_cls = cls_name.clone();
+        for _ in 0..32 {
+            let cd = self.module.classes.get(&cur_cls)?;
+            let bare_cls = cur_cls.rsplit_once("::").map_or(cur_cls.as_str(), |(_, r)| r);
+            let target = cd
+                .typedef_targets
+                .get(leaf)
+                .or_else(|| cd.typedef_targets.get(&format!("{cur_cls}::{leaf}")))
+                .or_else(|| {
+                    (bare_cls != cur_cls)
+                        .then(|| cd.typedef_targets.get(&format!("{bare_cls}::{leaf}")))
+                        .flatten()
+                })
+                .or_else(|| {
+                    (cur_cls == cls_name && orig_cls_name != cls_name)
+                        .then(|| cd.typedef_targets.get(&format!("{orig_cls_name}::{leaf}")))
+                        .flatten()
+                });
+            if let Some(target) = target {
+                let cur_sig = self
+                    .ancestor_spec(&cls_name, &canon_sig, &cur_cls)
+                    .unwrap_or_else(|| canon_sig.clone());
+                let spec_args = Self::split_spec_args(&cur_sig);
+
+                // §8.25: `typedef T cw_t;` where `T` is a class type parameter.
+                if let DataType::TypeReference {
+                    name: tn,
+                    dimensions,
+                    type_args,
+                    ..
+                } = target
+                    && tn.scopes.is_empty()
+                    && type_args.is_empty()
+                    && cd.type_param_names.iter().any(|p| p == &tn.name.name)
+                    && let Some(pos) = cd.param_order.iter().position(|p| p == &tn.name.name)
+                    && let Some(arg) = spec_args.get(pos)
+                    && let Some(mut bound_dt) = self.resolve_type_binding_dt(arg)
+                {
+                    if !dimensions.is_empty() {
+                        match &mut bound_dt {
+                            DataType::IntegerVector {
+                                dimensions: bd, ..
+                            }
+                            | DataType::Implicit { dimensions: bd, .. }
+                            | DataType::TypeReference { dimensions: bd, .. } => {
+                                let mut merged = dimensions.clone();
+                                merged.extend(bd.drain(..));
+                                *bd = merged;
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Some(bound_dt);
+                }
+
+                // §8.25: `typedef logic [W-1:0] vec_t;` where packed dims
+                // reference a value parameter of the specialized class.
+                let has_value_params = cd
+                    .param_order
+                    .iter()
+                    .any(|p| !cd.type_param_names.iter().any(|tp| tp == p));
+                if has_value_params && Self::data_type_has_packed_dims(target) {
+                    let mut val_params: HashMap<String, Value> = HashMap::default();
+                    for (pn, init) in &cd.param_defaults {
+                        if let Some(init) = init
+                            && let Some(v) = super::elaborate::const_eval_i64_with_params(
+                                init,
+                                Some(&self.module.parameters),
+                            )
+                        {
+                            let mut val = Value::from_u64(v as u64, 32);
+                            val.is_signed = true;
+                            val_params.insert(pn.clone(), val);
+                        }
+                    }
+                    for (i, arg) in spec_args.iter().enumerate() {
+                        if let Some(pn) = cd.param_order.get(i)
+                            && !cd.type_param_names.iter().any(|tp| tp == pn)
+                            && let Ok(v) = arg.trim().parse::<i64>()
+                        {
+                            let mut val = Value::from_u64(v as u64, 32);
+                            val.is_signed = true;
+                            val_params.insert(pn.clone(), val);
+                        }
+                    }
+                    if !val_params.is_empty() {
+                        return Some(Self::fold_packed_dims_with_params(target, &val_params));
+                    }
+                }
+                return Some(target.clone());
+            }
+            let Some(next) = cd.extends.as_ref() else {
+                break;
+            };
+            cur_cls = next.clone();
+        }
+        None
+    }
+
+    fn data_type_has_packed_dims(dt: &DataType) -> bool {
+        match dt {
+            DataType::IntegerVector { dimensions, .. }
+            | DataType::Implicit { dimensions, .. }
+            | DataType::TypeReference { dimensions, .. } => !dimensions.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn fold_packed_dims_with_params(
+        dt: &DataType,
+        params: &HashMap<String, Value>,
+    ) -> DataType {
+        let fold_dims = |dims: &[crate::ast::types::PackedDimension]| {
+            dims.iter()
+                .map(|d| match d {
+                    crate::ast::types::PackedDimension::Range { left, right, span } => {
+                        let l = super::elaborate::const_eval_i64_with_params(left, Some(params))
+                            .map(|v| {
+                                Box::new(Expression::new(
+                                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                                        size: None,
+                                        signed: true,
+                                        base: crate::ast::expr::NumberBase::Decimal,
+                                        value: v.to_string(),
+                                        cached_val: Default::default(),
+                                    }),
+                                    left.span,
+                                ))
+                            })
+                            .unwrap_or_else(|| left.clone());
+                        let r = super::elaborate::const_eval_i64_with_params(right, Some(params))
+                            .map(|v| {
+                                Box::new(Expression::new(
+                                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                                        size: None,
+                                        signed: true,
+                                        base: crate::ast::expr::NumberBase::Decimal,
+                                        value: v.to_string(),
+                                        cached_val: Default::default(),
+                                    }),
+                                    right.span,
+                                ))
+                            })
+                            .unwrap_or_else(|| right.clone());
+                        crate::ast::types::PackedDimension::Range {
+                            left: l,
+                            right: r,
+                            span: *span,
+                        }
+                    }
+                    other => other.clone(),
+                })
+                .collect()
+        };
+        let mut out = dt.clone();
+        match &mut out {
+            DataType::IntegerVector { dimensions, .. }
+            | DataType::Implicit { dimensions, .. }
+            | DataType::TypeReference { dimensions, .. } => {
+                *dimensions = fold_dims(dimensions);
+            }
+            _ => {}
+        }
+        out
+    }
+
     pub(super) fn array_pattern_type_key<'a>(
         &self,
         item: &'a AssignmentPatternItem,
@@ -4479,9 +4841,18 @@ impl Simulator {
         match item {
             AssignmentPatternItem::Typed(dt, e) => Some((dt.clone(), e)),
             AssignmentPatternItem::Named(id, e) => {
+                if self.is_value_name_in_scope(&id.name) {
+                    return None;
+                }
+                if let Some(tk) = id.type_key.as_deref() {
+                    return self.resolve_type_key_name(tk).map(|dt| (dt, e));
+                }
                 self.resolve_type_key_name(&id.name).map(|dt| (dt, e))
             }
             AssignmentPatternItem::Keyed(k, e) => {
+                if !matches!(k.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. }) {
+                    return None;
+                }
                 if let ExprKind::Ident(h) = &k.kind
                     && h.path.len() == 1
                     && h.root.is_none()
@@ -4495,8 +4866,13 @@ impl Simulator {
                 }) {
                     return None;
                 }
-                let key = crate::compiler::packed_assignment_pattern_plan::scoped_name_key(k)?;
-                self.resolve_type_key_name(&key).map(|dt| (dt, e))
+                if let Some(key) = crate::compiler::packed_assignment_pattern_plan::scoped_name_key(k)
+                    && let Some(dt) = self.resolve_type_key_name(&key)
+                {
+                    return Some((dt, e));
+                }
+                self.resolve_specialized_class_typedef_expr(k)
+                    .map(|dt| (dt, e))
             }
             _ => None,
         }
@@ -4554,8 +4930,17 @@ impl Simulator {
                         pos += 1;
                     }
                 }
-                _ => {
-                    if let Some((key_dt, e)) = self.array_pattern_type_key(item) {
+                AssignmentPatternItem::Typed(key_dt, e) => {
+                    if let Some(edt) = elem_dt
+                        && self.pattern_type_matches(edt, key_dt)
+                    {
+                        typed = Some(e);
+                    }
+                }
+                AssignmentPatternItem::Keyed(k, e) => {
+                    if matches!(k.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. })
+                        && let Some((key_dt, _)) = self.array_pattern_type_key(item)
+                    {
                         if let Some(edt) = elem_dt
                             && self.pattern_type_matches(edt, &key_dt)
                         {
@@ -4563,12 +4948,24 @@ impl Simulator {
                         }
                         continue;
                     }
-                    let Some(k) = self.array_pattern_key(item) else {
-                        continue;
-                    };
-                    let ki = self.eval_expr(&k).to_i64().unwrap_or(0);
+                    let ki = self.eval_expr(k).to_i64().unwrap_or(0);
                     if let Some(p) = indices.iter().position(|&i| i == ki) {
-                        out[p] = Some(item.expr());
+                        out[p] = Some(e);
+                    }
+                }
+                AssignmentPatternItem::Named(id, e) => {
+                    if let Some((key_dt, _)) = self.array_pattern_type_key(item) {
+                        if let Some(edt) = elem_dt
+                            && self.pattern_type_matches(edt, &key_dt)
+                        {
+                            typed = Some(e);
+                        }
+                        continue;
+                    }
+                    let key_expr = crate::compiler::packed_assignment_pattern_plan::ident_expr(id);
+                    let ki = self.eval_expr(&key_expr).to_i64().unwrap_or(0);
+                    if let Some(p) = indices.iter().position(|&i| i == ki) {
+                        out[p] = Some(e);
                     }
                 }
             }
