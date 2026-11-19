@@ -3183,3 +3183,22 @@ impl Simulator {
         Self::raw_bits_slice(&self.signal_table[id], lo as u16, w as u16).0
     }
 }
+
+#[cfg(test)]
+mod writer_lookup_tests {
+    #[test]
+    fn qualified_call_counts_writers_with_same_leaf_in_other_scopes() {
+        let mut sim = crate::simulate(
+            "module a_mod; bit x; task touch; x = 1; endtask endmodule
+             module b_mod; bit y; function void touch(); y = 1; endfunction endmodule
+             module top; a_mod a(); b_mod b();
+               initial begin #1; a.touch(); #1; a.touch(); end
+             endmodule",
+            0,
+        )
+        .unwrap();
+        let (writers, _) = sim.foreign_procedural_writes("top.");
+        assert!(writers.contains(sim.signal_name_to_id.get("a.x").unwrap()));
+        assert!(writers.contains(sim.signal_name_to_id.get("b.y").unwrap()));
+    }
+}
