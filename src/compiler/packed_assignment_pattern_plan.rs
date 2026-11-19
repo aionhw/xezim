@@ -25,6 +25,11 @@ pub(crate) trait PatternTypeResolver {
     fn pattern_index(&mut self, e: &Expression, bounds: (i64, i64)) -> Option<i64>;
     /// Whether a bare `name:` key names a type (§10.9.2 type key).
     fn is_type_name(&mut self, name: &str) -> bool;
+    /// Resolve a `Keyed(k, v)` expression that names a parameterized class-scope
+    /// typedef (e.g. `PC#(integer)::cw_t` or `pkg::PC#(4)::vec_t`).
+    fn specialized_type_key(&mut self, _e: &Expression) -> Option<DataType> {
+        None
+    }
     /// The self-determined type of `e`, when known: a declared variable, a
     /// typed pattern, a cast or a call.
     fn expr_type(&mut self, e: &Expression) -> Option<DataType>;
@@ -328,18 +333,24 @@ pub(crate) fn default_plan<'a>(
     items: &'a [AssignmentPatternItem],
     ty: &DataType,
     r: &mut dyn PatternTypeResolver,
+    is_member: &dyn Fn(&str) -> bool,
 ) -> Option<PackedPlan<'a>> {
     let mut keys = Keys::default();
     for it in items {
         match it {
             AssignmentPatternItem::Default(e) => keys.default = Some(e),
             AssignmentPatternItem::Typed(t, e) => keys.types.push((t.clone(), e)),
-            AssignmentPatternItem::Named(id, e) if r.is_type_name(&id.name) => {
-                keys.types.push((type_ref(&id.name), e))
+            AssignmentPatternItem::Named(id, e) if !is_member(&id.name) => {
+                let tk = id.type_key_name();
+                if r.is_type_name(tk) {
+                    keys.types.push((scoped_type_ref(tk), e));
+                }
             }
             AssignmentPatternItem::Keyed(k, e) => {
                 if let Some(key) = keyed_type_name(k, &[], r) {
                     keys.types.push((scoped_type_ref(&key), e));
+                } else if let Some(dt) = r.specialized_type_key(k) {
+                    keys.types.push((dt, e));
                 }
             }
             _ => {}
@@ -1044,8 +1055,9 @@ impl PlanBuilder<'_> {
                 AssignmentPatternItem::Default(e) => keys.default = Some(e),
                 AssignmentPatternItem::Typed(t, e) => keys.types.push((t.clone(), e)),
                 AssignmentPatternItem::Named(id, e) => {
-                    if !members.contains(&id.name) && self.r.is_type_name(&id.name) {
-                        keys.types.push((type_ref(&id.name), e));
+                    let tk = id.type_key_name();
+                    if !members.contains(&id.name) && self.r.is_type_name(tk) {
+                        keys.types.push((scoped_type_ref(tk), e));
                     } else {
                         keys.keyed.push((Key::Name(id), e));
                     }
@@ -1053,6 +1065,8 @@ impl PlanBuilder<'_> {
                 AssignmentPatternItem::Keyed(k, e) => {
                     if let Some(key) = keyed_type_name(k, &members, self.r) {
                         keys.types.push((scoped_type_ref(&key), e));
+                    } else if let Some(dt) = self.r.specialized_type_key(k) {
+                        keys.types.push((dt, e));
                     } else {
                         keys.keyed.push((Key::Expr(k), e));
                     }
@@ -1272,70 +1286,91 @@ impl PlanBuilder<'_> {
         }
     }
 
-    fn signature(&mut self, dt: &DataType) -> Option<String> {
-        let mut out = String::new();
-        let mut cur = dt.clone();
+    fn signature(&mut self, dt: &DataType) -> Option<TypeSig> {
+        let mut dims: Vec<(i64, i64)> = Vec::new();
+        let mut owned: Option<DataType> = None;
         for _ in 0..64 {
+            let cur = owned.as_ref().unwrap_or(dt);
             match cur {
                 DataType::TypeReference {
-                    ref name,
-                    ref dimensions,
-                    ..
+                    name, dimensions, ..
                 } if dimensions.is_empty() => {
-                    cur = self.r.typedef_target(name)?;
+                    owned = Some(self.r.typedef_target(name)?);
                 }
                 DataType::IntegerVector {
                     kind,
                     signing,
-                    ref dimensions,
+                    dimensions,
                     ..
                 } if dimensions.len() <= 1 => {
-                    let state = if kind == IntegerVectorType::Bit { 2 } else { 4 };
-                    let signed = signing == Some(Signing::Signed);
-                    match dimensions.first() {
+                    let state = if *kind == IntegerVectorType::Bit { 2 } else { 4 };
+                    let signed = *signing == Some(Signing::Signed);
+                    let leaf = match dimensions.first() {
                         Some(d) => {
-                            let (l, r) = self.dim(d)?;
-                            out.push_str(&format!("v{state}{signed}[{l}:{r}]"));
+                            let (left, right) = self.dim(d)?;
+                            TypeSigLeaf::Vector {
+                                state,
+                                signed,
+                                left,
+                                right,
+                            }
                         }
-                        None => out.push_str(&format!("b{state}{signed}")),
-                    }
-                    return Some(out);
+                        None => TypeSigLeaf::Bit { state, signed },
+                    };
+                    return Some(TypeSig { dims, leaf });
                 }
                 DataType::Implicit {
                     signing,
                     dimensions,
-                    span,
-                } => {
-                    cur = DataType::IntegerVector {
-                        kind: IntegerVectorType::Logic,
-                        signing,
-                        dimensions,
-                        span,
+                    ..
+                } if dimensions.len() <= 1 => {
+                    let signed = *signing == Some(Signing::Signed);
+                    let leaf = match dimensions.first() {
+                        Some(d) => {
+                            let (left, right) = self.dim(d)?;
+                            TypeSigLeaf::Vector {
+                                state: 4,
+                                signed,
+                                left,
+                                right,
+                            }
+                        }
+                        None => TypeSigLeaf::Bit { state: 4, signed },
                     };
+                    return Some(TypeSig { dims, leaf });
                 }
                 DataType::IntegerAtom { kind, signing, .. } => {
-                    let (w, four_state) = atom_shape(kind);
+                    let (w, four_state) = atom_shape(*kind);
                     let signed = match signing {
-                        Some(s) => s == Signing::Signed,
-                        None => kind != IntegerAtomType::Time,
+                        Some(s) => *s == Signing::Signed,
+                        None => *kind != IntegerAtomType::Time,
                     };
                     let state = if four_state { 4 } else { 2 };
-                    out.push_str(&format!("v{state}{signed}[{}:0]", w - 1));
-                    return Some(out);
+                    return Some(TypeSig {
+                        dims,
+                        leaf: TypeSigLeaf::Vector {
+                            state,
+                            signed,
+                            left: i64::from(w) - 1,
+                            right: 0,
+                        },
+                    });
                 }
                 DataType::Real { kind, .. } => {
                     use crate::ast::types::RealType;
 
                     // IEEE 1800-2023 §6.12 treats real and realtime as synonyms.
-                    out.push_str(match kind {
-                        RealType::Real | RealType::RealTime => "rReal",
-                        RealType::ShortReal => "rShortReal",
-                    });
-                    return Some(out);
+                    let leaf = match kind {
+                        RealType::Real | RealType::RealTime => TypeSigLeaf::Real,
+                        RealType::ShortReal => TypeSigLeaf::ShortReal,
+                    };
+                    return Some(TypeSig { dims, leaf });
                 }
                 DataType::Simple { kind, .. } => {
-                    out.push_str(&format!("s{kind:?}"));
-                    return Some(out);
+                    return Some(TypeSig {
+                        dims,
+                        leaf: TypeSigLeaf::Simple(*kind),
+                    });
                 }
                 // A struct, union or enum matches only its own declaration,
                 // named by its span and members; a synthesized one has none.
@@ -1343,29 +1378,31 @@ impl PlanBuilder<'_> {
                     if su.span == crate::ast::Span::dummy() {
                         return None;
                     }
-                    out.push_str(&format!("u{}:{}", su.span.start, su.span.end));
-                    for m in &su.members {
-                        for d in &m.declarators {
-                            out.push_str(&format!(",{}", d.name.name));
-                        }
-                    }
-                    return Some(out);
+                    let members = su
+                        .members
+                        .iter()
+                        .flat_map(|m| m.declarators.iter().map(|d| d.name.name.clone()))
+                        .collect();
+                    return Some(TypeSig {
+                        dims,
+                        leaf: TypeSigLeaf::Struct(su.span.start, su.span.end, members),
+                    });
                 }
                 DataType::Enum(e) if e.dimensions.is_empty() => {
                     if e.span == crate::ast::Span::dummy() {
                         return None;
                     }
-                    out.push_str(&format!("e{}:{}", e.span.start, e.span.end));
-                    for m in &e.members {
-                        out.push_str(&format!(",{}", m.name.name));
-                    }
-                    return Some(out);
+                    let members = e.members.iter().map(|m| m.name.name.clone()).collect();
+                    return Some(TypeSig {
+                        dims,
+                        leaf: TypeSigLeaf::Enum(e.span.start, e.span.end, members),
+                    });
                 }
                 // A packed array: its outer dimension, then its element.
-                other => match self.view(&other)? {
+                other => match self.view(other)? {
                     Shape::Array { left, right, elem } => {
-                        out.push_str(&format!("[{left}:{right}]"));
-                        cur = elem;
+                        dims.push((left, right));
+                        owned = Some(elem);
                     }
                     _ => return None,
                 },
@@ -1428,6 +1465,31 @@ pub(crate) fn parse_type_name_str(name: &str) -> TypeName {
         span,
         bound: Default::default(),
     }
+}
+
+#[derive(PartialEq, Eq)]
+enum TypeSigLeaf {
+    Bit {
+        state: u8,
+        signed: bool,
+    },
+    Vector {
+        state: u8,
+        signed: bool,
+        left: i64,
+        right: i64,
+    },
+    Real,
+    ShortReal,
+    Simple(crate::ast::types::SimpleType),
+    Struct(usize, usize, Vec<String>),
+    Enum(usize, usize, Vec<String>),
+}
+
+#[derive(PartialEq, Eq)]
+struct TypeSig {
+    dims: Vec<(i64, i64)>,
+    leaf: TypeSigLeaf,
 }
 
 pub(crate) fn keyed_type_name(

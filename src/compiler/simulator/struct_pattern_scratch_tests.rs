@@ -39,8 +39,11 @@ endmodule
         };
         Expression::new(
             ExprKind::AssignmentPattern(vec![
-                AssignmentPatternItem::Named(name("node"), number(handle)),
-                AssignmentPatternItem::Named(name("count"), number(&Value::from_u64(count, 32))),
+                AssignmentPatternItem::Named(name("node").into(), number(handle)),
+                AssignmentPatternItem::Named(
+                    name("count").into(),
+                    number(&Value::from_u64(count, 32)),
+                ),
             ]),
             crate::ast::Span::dummy(),
         )

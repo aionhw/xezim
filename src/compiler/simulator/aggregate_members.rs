@@ -4407,16 +4407,16 @@ impl Simulator {
             }
             return;
         };
-        let member_names: Vec<String> = su
-            .members
-            .iter()
-            .flat_map(|m| m.declarators.iter().map(|md| md.name.name.clone()))
-            .collect();
+        let is_struct_member = |name: &str| {
+            su.members
+                .iter()
+                .any(|m| m.declarators.iter().any(|md| md.name.name == name))
+        };
         let mut combined_types: Vec<(DataType, Expression)> = its
             .iter()
             .filter_map(|item| {
                 if let AssignmentPatternItem::Named(id, _) = item
-                    && member_names.iter().any(|m| m == &id.name)
+                    && is_struct_member(&id.name)
                 {
                     return None;
                 }
@@ -4477,7 +4477,11 @@ impl Simulator {
             if let Some(inner) = self.unpacked_struct_of(&mdt) {
                 self.assign_class_unpacked_elem_with_types(&lhs_f, &rhs_f, &inner, rhs_outer);
             } else if !rhs_explicit && !rhs_outer.is_empty() {
-                if let Some(v) = self.eval_packed_with_outer_types(&rhs_f, &mdt, rhs_outer) {
+                if let Some(v) = self.eval_packed_with_outer_types(
+                    &rhs_f,
+                    &mdt,
+                    rhs_outer.iter().map(|(kt, v)| (kt, v)),
+                ) {
                     self.assign_value(&lhs_f, &v);
                 } else {
                     let v = self.eval_pattern_leaf_value(&mdt, &rhs_f, None);
@@ -4510,7 +4514,11 @@ impl Simulator {
             if let Some(inner) = self.unpacked_struct_of(elem_dt) {
                 self.assign_class_unpacked_elem_with_types(lhs, val, &inner, outer_types);
             } else if !outer_types.is_empty()
-                && let Some(v) = self.eval_packed_with_outer_types(val, elem_dt, outer_types)
+                && let Some(v) = self.eval_packed_with_outer_types(
+                    val,
+                    elem_dt,
+                    outer_types.iter().map(|(kt, v)| (kt, v)),
+                )
             {
                 self.assign_value(lhs, &v);
             } else {
