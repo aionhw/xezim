@@ -801,3 +801,5 @@ mod negative_bound_packed_slice_write_1193;
 mod review_pattern_type_keys_params;
 #[path = "types/local_select_declared_range.rs"]
 mod local_select_declared_range;
+#[path = "types/nettype_alias_1302.rs"]
+mod nettype_alias_1302;
