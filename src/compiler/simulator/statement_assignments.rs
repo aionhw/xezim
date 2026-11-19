@@ -70,14 +70,15 @@ impl Simulator {
             // `30000ps` under `timescale 1ns/1ps` must compare EQUAL to a
             // `$time` delta of 30, not 29.999999999999996 (the raw
             // secs/unit_s float residue). Computed as
-            // round(secs/prec) / 10^(unit−prec): both operands are integral
-            // f64s, so the division is exact for real timescale ratios.
+            // round(secs * 10^-prec) / 10^(unit−prec), each by an exact power
+            // of ten: a division by `10f64.powi(-15)` put `9200s` under
+            // `1ns/1fs` 2048 fs short (§3.14.1).
             // (Delay contexts route through eval_delay_ticks instead.)
             NumberLiteral::Time(s) => {
                 let (unit_exp, prec_exp) = self.current_timescale_exp();
-                let prec_s = 10f64.powi(prec_exp);
-                let ratio = 10f64.powi(unit_exp - prec_exp);
-                Value::from_f64((*s / prec_s).round() / ratio)
+                Value::from_f64(super::elaborate::time_literal_in_units(
+                    *s, unit_exp, prec_exp,
+                ))
             }
             // §5.7.1: unbased-unsized literal — a 1-bit FILL value; binary ops
             // and resize replicate it to the consuming context's width.

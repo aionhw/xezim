@@ -331,8 +331,10 @@ impl Simulator {
             // A `#1ns` skew is an ABSOLUTE time literal (stored in seconds);
             // convert against the global tick directly — eval_delay_ticks'
             // module-timescale context isn't established at compile time.
+            // §3.14.1: by an exact power of ten (`secs / 1e-15` is not).
             if let ExprKind::Number(crate::ast::expr::NumberLiteral::Time(secs)) = &e.kind {
-                return (secs / slf.tick_s).round() as u64;
+                let ticks = super::elaborate::scale_pow10(*secs, -Self::secs_to_exp(slf.tick_s));
+                return super::elaborate::round_time_units(ticks) as u64;
             }
             // §14.4: a plain number is in the time unit of the module or
             // interface declaring the block (unlike statement delays, the

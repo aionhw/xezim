@@ -1577,13 +1577,7 @@ impl Simulator {
         } else {
             v.to_u64().unwrap_or(0) as f64
         };
-        if precision_diff > 0 {
-            let q = 10f64.powi(precision_diff);
-            let x = (raw / q) * (1.0 + 1e-12);
-            (x.round() * q).round() as u64
-        } else {
-            raw.round() as u64
-        }
+        Self::quantize_delay_ticks(raw, precision_diff)
     }
 
     /// Roadmap step 13 (XEZIM_AOT=1): compile every process FSM body that
@@ -2437,12 +2431,23 @@ impl Simulator {
         // elaborator pre-scales by the module unit), so quantize to the
         // module-precision-per-tick grid. The grid ratio comes from EXPONENT
         // arithmetic (10^n is exact in f64 for small n; dividing seconds
-        // values is not), and a 1-ulp relative nudge keeps a half-grid delay
+        // values is not), and `round_time_units` keeps a half-grid delay
         // that arrived as x.49999999999996 from rounding the wrong way.
+        Self::quantize_delay_ticks(raw, precision_diff)
+    }
+
+    /// §3.14.1: `raw` global ticks rounded to the running scope's precision,
+    /// 10^`precision_diff` ticks. A count of 2^52 or more is a whole number
+    /// already: the relative nudge used before, `x * (1 + 1e-12)`, moved
+    /// `#9200s` under a 1 ps precision with a 1 fs tick by 9.2 ns.
+    #[inline]
+    pub(super) fn quantize_delay_ticks(raw: f64, precision_diff: i32) -> u64 {
+        use super::elaborate::{round_time_units, scale_pow10};
         if precision_diff > 0 {
-            let q = 10f64.powi(precision_diff);
-            let x = (raw / q) * (1.0 + 1e-12);
-            (x.round() * q).round() as u64
+            scale_pow10(
+                round_time_units(scale_pow10(raw, -precision_diff)),
+                precision_diff,
+            ) as u64
         } else {
             raw.round() as u64
         }
