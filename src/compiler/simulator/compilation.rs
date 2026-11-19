@@ -1548,6 +1548,7 @@ impl Simulator {
         // constant nets, and the reference fires them once at t0. Snapshotting
         // AFTER the settle erased that change and the blocks never ran.
         self.snapshot_edge_signals_full();
+        self.hold_time0_effect_entries();
         self.in_pre_process_settle = true;
         self.settle_combinatorial();
         self.fire_time0_input_port_blocks();

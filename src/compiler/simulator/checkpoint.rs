@@ -1250,6 +1250,7 @@ checkpoint_state!(
     comb_plan_abortn,
     comb_time0_deferred_done,
     comb_time0_fired,
+    comb_time0_held,
     compiled_class_method_ids,
     compiled_fast_calls,
     compiled_fast_static_calls,

@@ -615,6 +615,7 @@ impl Simulator {
                 // the slot (see the main loop's release).
                 if self.t0_starts_remaining > 0 {
                     self.t0_starts_remaining = 0;
+                    self.release_time0_held();
                     self.drain_deferred_proc_settle();
                     continue;
                 }

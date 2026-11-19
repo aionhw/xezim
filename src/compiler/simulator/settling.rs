@@ -29,6 +29,11 @@ impl Simulator {
         if self.finished {
             return;
         }
+        // §9.2.2.2: an entry held for the time-0 start batch does not stay
+        // held past time zero, whichever loop moved the time on.
+        if !self.comb_time0_held.is_empty() && self.time != 0 {
+            self.release_time0_held();
+        }
         if self.event_measure {
             self.event_phase += 1; // comb SETTLE phase (distinct from sample)
         }

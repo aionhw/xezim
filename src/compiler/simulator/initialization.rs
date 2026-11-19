@@ -4805,6 +4805,7 @@ impl Simulator {
             comb_time0_fired: false,
             comb_time0_deferred: Vec::new(),
             comb_time0_deferred_done: false,
+            comb_time0_held: Vec::new(),
             comb_dep_offsets: Vec::new(),
             ts_comb: Vec::new(),
             comb_plan: Vec::new(),

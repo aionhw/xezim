@@ -548,7 +548,10 @@ impl Simulator {
     /// a package function `p::f` (registered as `p::f`; the call names it
     /// as a two-segment path or as a scope member access) or a
     /// compilation-unit function `$unit::f` (registered as `f`).
-    fn scoped_function_key(func: &Expression, module: &ElaboratedModule) -> Option<String> {
+    pub(super) fn scoped_function_key(
+        func: &Expression,
+        module: &ElaboratedModule,
+    ) -> Option<String> {
         let plain = |h: &HierarchicalIdentifier| {
             h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty())
         };

@@ -1771,6 +1771,9 @@ struct CombEntryCold {
     /// compiled form counts with an `Insn::CovHit`). Never cached.
     #[serde(skip)]
     cov: Option<u32>,
+    /// §9.2.2.2: evaluating the entry is observable beyond its outputs
+    /// (see `time0_effects`); it waits for the time-0 start batch.
+    time0_effects: bool,
 }
 
 // §9.2.2.2.1 (#844): rebuild dependency tables made before packed-region
@@ -3178,6 +3181,7 @@ mod signal_commits;
 mod statement_assignments;
 mod statements;
 mod system_tasks;
+mod time0_effects;
 mod two_state;
 mod type_metadata;
 mod udp;
@@ -10577,6 +10581,10 @@ pub struct Simulator {
     comb_time0_deferred: Vec<CombEntry>,
     /// Latches once the deferred empty-sensitivity always_comb blocks fired.
     comb_time0_deferred_done: bool,
+    /// §9.2.2.2: the entries with time-0 effects and the items taken out of
+    /// them (a `Noop` stands in) until every process has started; see
+    /// `hold_time0_effect_entries`.
+    comb_time0_held: Vec<(usize, CombItem)>,
     /// Reverse index: signal_id → list of comb_entry indices that read
     /// this signal. CSR layout — `comb_dep_entries[comb_dep_offsets[id]
     /// .. comb_dep_offsets[id+1]]` gives the dependents of signal `id`.
