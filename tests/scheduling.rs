@@ -521,6 +521,8 @@ mod struct_array_actual_paths_1110;
 mod pattern_nba_1199;
 #[path = "scheduling/event_call_operands_1205.rs"]
 mod event_call_operands_1205;
+#[path = "scheduling/event_call_struct_arguments.rs"]
+mod event_call_struct_arguments;
 
 #[path = "scheduling/array_capture_1217.rs"]
 mod array_capture_1217;
