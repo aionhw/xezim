@@ -1834,6 +1834,7 @@ impl Simulator {
                 return false;
             }
             !Self::stmt_contains_event_control(&p.source)
+                && !Self::source_ends_in_delay_forever(&p.source)
                 && !Self::stmt_has_call_statement(&p.source)
         };
         let (deferred_pending, direct_pending): (Vec<_>, Vec<_>) =
@@ -1942,11 +1943,16 @@ impl Simulator {
                                 // per-statement waiter and UDP evaluation order
                                 // their pinned traces rely on. A labeled block is
                                 // a hierarchical scope (`disable lbl`, `lbl.v`)
-                                // the FSM does not model.
+                                // the FSM does not model. A delay-only
+                                // `forever` after untimed set-up is not such a
+                                // sequence but a free-running loop, the
+                                // `always` form that compiles by default
+                                // (§9.2.2.1).
                                 std::env::var_os("XEZIM_VALUE_TRACE").is_none()
                                     && block_label.is_none()
-                                    && stmts.iter().any(Self::stmt_contains_event_control)
-                                    && stmts.iter().all(|st| self.stmt_is_plain_stimulus(st))
+                                    && ((stmts.iter().any(Self::stmt_contains_event_control)
+                                        && stmts.iter().all(|st| self.stmt_is_plain_stimulus(st)))
+                                        || self.stmts_end_in_delay_loop(stmts))
                             }
                         };
                     if admit {

@@ -1465,6 +1465,47 @@ impl Simulator {
         }
     }
 
+    /// §9.2.2.1, §9.4.1: a free-running delay loop body: at least one wait,
+    /// every wait a delay control (no `@`; `wait` is not plain stimulus), and
+    /// plain-stimulus statements only. `always begin #(d); ... end` is the
+    /// same process as the delay-headed `always #(d) ...`, which becomes a
+    /// process FSM by default; so is an `initial forever` of this shape.
+    pub(super) fn stmt_is_delay_loop(&self, stmt: &Statement) -> bool {
+        Self::count_timing_controls(stmt) >= 1
+            && !Self::stmt_contains_event_control(stmt)
+            && self.stmt_is_plain_stimulus(stmt)
+    }
+
+    /// An initial body of untimed set-up followed by a delay-only `forever`
+    /// (§9.2.2.1: the `always` form of the same loop). A delay sequence that
+    /// ends (a reset script, an ordering probe) is not one and keeps the AST
+    /// path its pinned traces rely on.
+    pub(super) fn stmts_end_in_delay_loop(&self, stmts: &[Statement]) -> bool {
+        let Some((last, setup)) = stmts.split_last() else {
+            return false;
+        };
+        matches!(last.kind, StatementKind::Forever { .. })
+            && self.stmt_is_delay_loop(last)
+            && setup
+                .iter()
+                .all(|st| Self::count_timing_controls(st) == 0 && self.stmt_is_plain_stimulus(st))
+    }
+
+    /// The structural half of `stmts_end_in_delay_loop`, for a pending
+    /// initial whose names are not yet its instance's: it must be
+    /// materialized for the full check to see it.
+    pub(super) fn source_ends_in_delay_forever(stmt: &Statement) -> bool {
+        let last = match &stmt.kind {
+            StatementKind::SeqBlock { stmts, .. } => stmts.last(),
+            _ => Some(stmt),
+        };
+        last.is_some_and(|l| {
+            matches!(l.kind, StatementKind::Forever { .. })
+                && Self::count_timing_controls(l) >= 1
+                && !Self::stmt_contains_event_control(l)
+        })
+    }
+
     /// True when an identifier in `e` is a `virtual <iface>` variable: the
     /// compiled path stores through it as a plain signal, while §25.9 makes
     /// the assignment a name alias the interpreter tracks.
@@ -2290,7 +2331,11 @@ impl Simulator {
                 // becomes a bytecode FSM — resumes re-enter at a saved pc
                 // instead of re-walking the AST continuation chain.
                 {
-                    let fsm_on = self.proc_fsm_mode == 1;
+                    // By default (unset), a body whose only waits are delays
+                    // (`always begin #(d); ... end`) is admitted like the
+                    // delay-headed form above (§9.4.1).
+                    let fsm_on = self.proc_fsm_mode == 1
+                        || (self.proc_fsm_mode == 2 && self.stmt_is_delay_loop(&ab.stmt));
                     if fsm_on
                         && self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block")
                     {
