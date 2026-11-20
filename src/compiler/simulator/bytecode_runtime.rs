@@ -2415,7 +2415,7 @@ impl Simulator {
                 let n = *n_args as usize;
                 // Value-const actuals + row-2 write-back temps (the
                 // builtin arms read/eval them through the ordinary
-                // expression paths — §7.10.2.3 queue append, §15.5.5
+                // expression paths — §7.10.1 queue append, §15.5.5
                 // event keys, string keys — all carried).
                 let callee_class = self
                     .heap
@@ -2631,14 +2631,9 @@ impl Simulator {
                     let key = self.assoc_key_str(&an, &idx_val);
                     // class-perf: pre-sized manual renderer, as in `LoadCollElem`.
                     let elem_name = Self::name_with_key(&an, &key);
-                    // Keep the established queue-unpack growth behavior in
-                    // sync with the AST path.
                     let is_assoc = self.is_associative_array(&an);
-                    if !is_assoc {
-                        let kval = idx_val.to_i64().unwrap_or(0);
-                        if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
-                            self.set_queue_size(&an, kval as u64 + 1);
-                        }
+                    if !is_assoc && self.prepare_sequence_write(&an, &idx_val).is_none() {
+                        return 1;
                     }
                     // §10.7: fit to the DECLARED element width when one
                     // was recorded; otherwise store as-is.

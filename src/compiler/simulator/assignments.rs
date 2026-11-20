@@ -2202,7 +2202,12 @@ impl Simulator {
                         Some(i) if i == sz && dim == Dim::Queue => {
                             self.set_queue_size(&row, sz + 1)
                         }
-                        _ => return false,
+                        _ => {
+                            if dim == Dim::Queue {
+                                self.warn_invalid_queue_write(&row, iv.to_index(), sz);
+                            }
+                            return false;
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -2581,11 +2586,11 @@ impl Simulator {
         if let Some(row) = self.class_array_of_coll_key(expr) {
             if self.module.dynamic_arrays.contains(&row) {
                 self.dollar_bound.push(self.get_queue_size(&row) as i64 - 1);
-                let k = self.eval_expr(index).to_i64().unwrap_or(0);
+                let iv = self.eval_expr(index);
                 self.dollar_bound.pop();
-                if k >= 0 && k as u64 >= self.get_queue_size(&row) {
-                    self.set_queue_size(&row, k as u64 + 1);
-                }
+                let Some(k) = self.prepare_sequence_write(&row, &iv) else {
+                    return false;
+                };
                 let elem = format!("{}[{}]", row, k);
                 // §10.6/§5.7.1: the element takes the row's element width
                 // (a `'1` fill fills every bit of a struct element).
@@ -2611,17 +2616,11 @@ impl Simulator {
         if let Some(qn) = self.indexed_queue_base(expr) {
             // `$` is the last valid index of THIS queue.
             self.dollar_bound.push(self.get_queue_size(&qn) as i64 - 1);
-            let k = self.eval_expr(index).to_i64().unwrap_or(0);
+            let iv = self.eval_expr(index);
             self.dollar_bound.pop();
-            // §7.10.2.3 / §7.4: assigning `q[i]` with `i >= size`
-            // APPENDS to a queue (auto-grows), size becomes `i+1`.
-            // UVM's `uvm_unpack_queueN` fills an EMPTY queue exactly
-            // this way (`for i in 0..sz VAR[i] = …`), so without the
-            // growth the unpacked `.size()` stayed 0 and every
-            // subsequent field read desynced.
-            if k >= 0 && k as u64 >= self.get_queue_size(&qn) {
-                self.set_queue_size(&qn, k as u64 + 1);
-            }
+            let Some(k) = self.prepare_sequence_write(&qn, &iv) else {
+                return false;
+            };
             let elem = format!("{}[{}]", qn, k);
             // §6.12.2: a real rounds to the element type.
             let conv;
@@ -2916,21 +2915,13 @@ impl Simulator {
             let idx_val = self.eval_expr(index);
             let idx_str = self.assoc_key_str(&an, &idx_val);
             let elem_name = Self::name_with_key(&an, &idx_str);
-            // §7.10.2.3 / §7.4: for a QUEUE / dynamic array (NOT a
-            // true assoc array) `q[i] = v` with `i >= size` APPENDS —
-            // the size becomes `i+1`. UVM's `uvm_unpack_queueN` fills
-            // an EMPTY queue exactly this way
-            // (`for i in 0..sz VAR[i] = …`); without this growth the
-            // unpacked `.size()` stayed 0 and every later field read
-            // desynced (PCKSZ errors / X compare).
             let is_fixed_array = self.module.arrays.contains_key(&an)
                 && !self.module.dynamic_arrays.contains(&an)
                 && !self.module.queue_vars.contains(&an);
-            if !self.is_associative_array(&an) && !is_fixed_array {
-                let kval = idx_val.to_i64().unwrap_or(0);
-                if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
-                    self.set_queue_size(&an, kval as u64 + 1);
-                }
+            if !self.is_associative_array(&an) && !is_fixed_array
+                && self.prepare_sequence_write(&an, &idx_val).is_none()
+            {
+                return false;
             }
             // §10.7: fit to the DECLARED element width when one was
             // recorded; class-member collections often have none, in
@@ -4266,24 +4257,18 @@ impl Simulator {
             if !Self::expr_is_stream(base) {
                 let iv = self.eval_expr(index);
                 if iv.has_xz() && !iv.is_real {
+                    let store = self.expr_assoc_name(base).or_else(|| self.flat_member_name(base));
+                    if let Some(name) = store.filter(|n| self.is_queue_store(n)) {
+                        self.warn_invalid_queue_write(&name, None, self.get_queue_size(&name));
+                    }
                     return false;
                 }
-                // §7.10.1: a QUEUE write at index == size APPENDS (`q[0] = v`
-                // on an empty queue makes it '{v}). Bump the size shadow and
-                // let the normal element-write arms store the value. Gated on
-                // declared-queue vars so a dynamic array keeps its
-                // discard-out-of-range semantics.
                 if let ExprKind::Ident(h) = &base.kind {
                     let qn = self.resolve_hier_name(h);
                     if self.module.queue_vars.contains(&*qn) {
-                        let sz = self.get_queue_size(&qn);
-                        let within_max = self
-                            .module
-                            .queue_max_sizes
-                            .get(&*qn)
-                            .is_none_or(|&m| sz < m as u64);
-                        if within_max && iv.to_u64() == Some(sz) {
-                            self.set_queue_size(&qn, sz + 1);
+                        let name = qn.into_owned();
+                        if self.prepare_sequence_write(&name, &iv).is_none() {
+                            return false;
                         }
                     }
                 }
