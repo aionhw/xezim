@@ -829,3 +829,5 @@ mod struct_element_return_1310;
 mod review_pattern_type_keys_imports;
 #[path = "types/real_to_integral_cast.rs"]
 mod real_to_integral_cast;
+#[path = "types/real_into_integral_64.rs"]
+mod real_into_integral_64;
