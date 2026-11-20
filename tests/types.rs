@@ -317,6 +317,8 @@ mod tagged_union_matches;
 mod tagged_union_pattern_literal;
 #[path = "types/task_formal_param_width.rs"]
 mod task_formal_param_width;
+#[path = "types/task_input_context_width.rs"]
+mod task_input_context_width;
 #[path = "types/type_param_bound_to_specialization.rs"]
 mod type_param_bound_to_specialization;
 #[path = "types/type_param_static_property.rs"]
