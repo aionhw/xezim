@@ -1188,6 +1188,64 @@ impl Simulator {
                 }
             }
         }
+        // The packed-struct vector a member term names, and the member's bit
+        // offset and width in it: `a.clk` with `a` a packed struct (directly,
+        // or under the block's instance scope), or a nested member path.
+        // None for anything else, a name that is a signal of its own included.
+        fn packed_member(
+            module: &ElaboratedModule,
+            e: &Expression,
+            scope: &str,
+        ) -> Option<(String, i64, u32)> {
+            let mut e = e;
+            while let ExprKind::Paren(inner) = &e.kind {
+                e = inner;
+            }
+            let ExprKind::Ident(h) = &e.kind else {
+                return None;
+            };
+            if h.path.len() < 2 || h.path.iter().any(|s| !s.selects.is_empty()) {
+                return None;
+            }
+            let full = h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            let mut spellings: Vec<String> = if scope.is_empty() || h.root.is_some() {
+                vec![full]
+            } else {
+                vec![format!("{}.{}", scope, full), full]
+            };
+            // §23.6: `top.a.clk` names the top module's `a`, stored as `a`.
+            if let Some(rest) = spellings
+                .last()
+                .and_then(|f| f.strip_prefix(module.name.as_str()))
+                .and_then(|r| r.strip_prefix('.'))
+            {
+                spellings.push(rest.to_string());
+            }
+            spellings.iter().find_map(|name| {
+                if module.signals.contains_key(name.as_str()) {
+                    return None;
+                }
+                let mut cut = name.len();
+                while let Some(pos) = name[..cut].rfind('.') {
+                    let (base, field) = (&name[..pos], &name[pos + 1..]);
+                    if module.signals.contains_key(base) {
+                        let (_, off, w) = module
+                            .packed_struct_fields
+                            .get(base)?
+                            .iter()
+                            .find(|(m, _, _)| m == field)?;
+                        return (*w > 0).then(|| (base.to_string(), *off as i64, *w));
+                    }
+                    cut = pos;
+                }
+                None
+            })
+        }
         let mk_ident = |name: &str, span: crate::ast::Span| -> Expression {
             Expression::new(
                 ExprKind::Ident(HierarchicalIdentifier {
@@ -1213,7 +1271,7 @@ impl Simulator {
         let mut repl_cache: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
         let mut writer_index: Option<edgesel_writers::WriterIndex> = None;
         let mut new_assigns: Vec<super::elaborate::ContinuousAssignment> = Vec::new();
-        let mut new_signals: Vec<String> = Vec::new();
+        let mut new_signals: Vec<(String, u32)> = Vec::new();
         let dbg = std::env::var_os("XEZIM_DUMP_EDGE_SENS").is_some();
         // #7 keeps child always blocks PENDING (un-rewritten) until
         // classification — but the select-on-port shape this pass fixes is
@@ -1262,33 +1320,107 @@ impl Simulator {
                 }
             }));
         for (stmt, scope, mut patched) in headers {
-            let StatementKind::TimingControl {
-                control: TimingControl::Event(EventControl::EventExpr(exprs)),
-                ..
-            } = &mut stmt.kind
-            else {
-                if dbg {
-                    eprintln!(
-                        "[EDGESEL] block scope='{}' not a TimingControl/EventExpr: {:?}",
-                        scope,
-                        std::mem::discriminant(&stmt.kind)
-                    );
+            let discriminant = std::mem::discriminant(&stmt.kind);
+            // `always begin @(...); ... end` starts with its event control
+            // too (`extract_sensitivity`); only the member rewrite below
+            // applies to that shape.
+            let (exprs, wrapped) = match &mut stmt.kind {
+                StatementKind::TimingControl {
+                    control: TimingControl::Event(EventControl::EventExpr(exprs)),
+                    ..
+                } => (exprs, false),
+                StatementKind::SeqBlock { stmts, .. } => {
+                    match stmts.first_mut().map(|s| &mut s.kind) {
+                        Some(StatementKind::TimingControl {
+                            control: TimingControl::Event(EventControl::EventExpr(exprs)),
+                            ..
+                        }) => (exprs, true),
+                        _ => continue,
+                    }
                 }
-                continue;
+                _ => {
+                    if dbg {
+                        eprintln!(
+                            "[EDGESEL] block scope='{}' not a TimingControl/EventExpr: {:?}",
+                            scope, discriminant
+                        );
+                    }
+                    continue;
+                }
             };
             for (term, ee) in exprs.iter_mut().enumerate() {
                 // Port substitution leaves `@(dq[3])` as a select of the
                 // connection (`bus[15:8][3]`); spell such a term as the net
                 // bit it reads first (see `event_bits`).
-                if let Some(f) =
-                    event_bits::fold_event_term(module, &ee.expr, ee.edge.is_some(), &scope)
+                if !wrapped
+                    && let Some(f) =
+                        event_bits::fold_event_term(module, &ee.expr, ee.edge.is_some(), &scope)
                 {
                     ee.expr = f;
                     if let Some(p) = patched.as_mut() {
                         p.push(term);
                     }
                 }
-                if !matches!(ee.edge, Some(Edge::Posedge) | Some(Edge::Negedge)) {
+                // §7.2.1, §9.4.2: a term on a member of a packed struct
+                // (`@(posedge a.clk)`, also what `.clk(a.clk)` substitutes into
+                // a child's `@(posedge clk)`) is an event on that member: an
+                // edge on its LSB, a change of its bits. The struct is one
+                // vector, so the base-name fallback watched the vector's LSB,
+                // another member, and woke on every member's change. Watch an
+                // alias net driven by the member's bits instead.
+                if let Some((vector, off, width)) = packed_member(module, &ee.expr, &scope) {
+                    let span = ee.expr.span;
+                    let canon = format!("{}|member {}+{}", vector, off, width);
+                    let alias = aliases.entry(canon).or_insert_with(|| {
+                        let lit = |v: i64| {
+                            Box::new(Expression::new(
+                                ExprKind::Number(NumberLiteral::Integer {
+                                    size: None,
+                                    signed: false,
+                                    base: NumberBase::Decimal,
+                                    value: v.to_string(),
+                                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                                }),
+                                span,
+                            ))
+                        };
+                        let rhs = Expression::new(
+                            ExprKind::RangeSelect {
+                                expr: Box::new(mk_ident(&vector, span)),
+                                kind: RangeKind::Constant,
+                                left: lit(off + width as i64 - 1),
+                                right: lit(off),
+                            },
+                            span,
+                        );
+                        let alias = format!("__xz_edgesel{}", new_signals.len());
+                        new_signals.push((alias.clone(), width));
+                        new_assigns.push(super::elaborate::ContinuousAssignment {
+                            gate_delay_fall: None,
+                            delay_select: None,
+                            origin: None,
+                            lhs: mk_ident(&alias, span),
+                            rhs,
+                            delay: 0,
+                            rhs_parent_scoped: false,
+                            delay_fall: None,
+                            delay_off: None,
+                        });
+                        alias
+                    });
+                    if dbg {
+                        eprintln!(
+                            "[EDGESEL] scope='{}' member {}[{}+:{}] -> {}",
+                            scope, vector, off, width, alias
+                        );
+                    }
+                    ee.expr = mk_ident(alias, span);
+                    if let Some(p) = patched.as_mut() {
+                        p.push(term);
+                    }
+                    continue;
+                }
+                if wrapped || !matches!(ee.edge, Some(Edge::Posedge) | Some(Edge::Negedge)) {
                     continue;
                 }
                 let mut idxs: Vec<i64> = Vec::new();
@@ -1422,7 +1554,7 @@ impl Simulator {
                 }
                 let alias = aliases.entry(canon).or_insert_with(|| {
                     let alias = format!("__xz_edgesel{}", new_signals.len());
-                    new_signals.push(alias.clone());
+                    new_signals.push((alias.clone(), 1));
                     new_assigns.push(super::elaborate::ContinuousAssignment {
                         gate_delay_fall: None,
                         delay_select: None,
@@ -1448,17 +1580,17 @@ impl Simulator {
                 }
             }
         }
-        for name in new_signals {
+        for (name, width) in new_signals {
             module.signals.insert(
                 name.clone(),
                 Signal {
                     name: name.into(),
-                    width: 1,
+                    width,
                     is_signed: false,
                     is_real: false,
                     is_const: false,
                     direction: None,
-                    value: Value::new(1),
+                    value: Value::new(width),
                     type_name: None,
                 },
             );
