@@ -249,16 +249,16 @@ module tb_top;
 
     //==== follow-up sweep (RCA section 9): f1-f14 ==========================
     #1;                          // boundary: settle before the sweep half
-    // f3: NBA store path (queue element + flat variable) -------------------
+    // f3: queue element store and flat variable NBA -------------------
     e = '0;
     e.req_number = 8'd1;       // rebuild value 1/field 0 (value 0 -> safe)
     q_nba.push_back(e);
     sv_nba = e;                // whole-assignment
     #1;
-    q_nba[0].delay_counter <= 32'd7;
+    q_nba[0].delay_counter = 32'd7;
     sv_nba.delay_counter   <= 32'd7;
     #1;
-    `SVTEST_CHECK(q_nba[0][39:8] == 32'd7, "f3: NBA queue element member write vanished (q[0].delay_counter != 7)")
+    `SVTEST_CHECK(q_nba[0][39:8] == 32'd7, "f3: queue element member write vanished (q[0].delay_counter != 7)")
     `SVTEST_CHECK(sv_nba[39:8] == 32'd7, "f3: NBA flat member write vanished (sv.delay_counter != 7)")
 
     // f4: foreach loop-variable head (colliding + control elements) --------

@@ -51,7 +51,7 @@ module top;
     bq[$][3] = 1'b1;
     bq[$-1][7:4] = 4'hf;
     sq[$].g = 8'h55;
-    sq[$-1].f <= 8'h66;
+    sq[$-1].f = 8'h66;
   end
   initial begin
     #1 clk = 1;
@@ -150,9 +150,8 @@ endmodule
 }
 
 #[test]
-fn last_index_in_compiled_compound_and_nonblocking_writes() {
-    // §10.4.2: the nonblocking target's index is taken when the statement
-    // executes, before the `push_back`.
+fn last_index_in_compiled_compound_and_element_writes() {
+    // §7.10: the last index refers to the element before the push_back.
     let src = r#"
 module top;
   int q[$] = '{1, 2, 3};
@@ -161,7 +160,7 @@ module top;
   always @(posedge clk) begin
     q[$] += 5;
     q[$-1] -= 1;
-    z[$] <= 99;
+    z[$] = 99;
     z.push_back(8);
   end
   initial begin

@@ -26,10 +26,10 @@ class C;
   function string run();
     a = '{9, 5, 5, 5}; m = '{'{1, 2}, '{3, 4}}; d = '{1, 2, 3}; q = '{7, 8};
     sa = '{"a", "b"}; s = '{1, 2};
-    return $sformatf("%0d%0d%0d%0d%0d %0d%0d%0d%0d%0d%0d %0d%0d%0d%0d%0d", a == '{9, 5, 5, 5}, a != '{9, 5, 5, 6},
-      a === '{9, 5, 5, 5}, '{9, 5, 5, 5} == a, a != '{9, 5, 5, 5},
-      m == '{'{1, 2}, '{3, 4}}, m == '{'{1, 2}, '{3, 5}}, d == '{1, 2, 3}, d == '{1, 2, 4}, q == '{7, 8}, q != '{7, 8},
-      sa == '{"a", "b"}, sa == '{"a", "c"}, s == '{1, 2}, s == '{1, 3}, a == '{default: 5});
+    return $sformatf("%0d%0d%0d%0d%0d %0d%0d%0d%0d%0d%0d %0d%0d%0d%0d%0d", a == type(a)'{9, 5, 5, 5}, a != type(a)'{9, 5, 5, 6},
+      a === type(a)'{9, 5, 5, 5}, type(a)'{9, 5, 5, 5} == a, a != type(a)'{9, 5, 5, 5},
+      m == type(m)'{'{1, 2}, '{3, 4}}, m == type(m)'{'{1, 2}, '{3, 5}}, d == type(d)'{1, 2, 3}, d == type(d)'{1, 2, 4}, q == type(q)'{7, 8}, q != type(q)'{7, 8},
+      sa == type(sa)'{"a", "b"}, sa == type(sa)'{"a", "c"}, s == type(s)'{1, 2}, s == type(s)'{1, 3}, a == type(a)'{default: 5});
   endfunction
 endclass
 module top;
@@ -39,19 +39,19 @@ module top;
     C c;
     a = '{9, 5, 5, 5}; m = '{'{1, 2}, '{3, 4}}; d = '{1, 2, 3}; q = '{7, 8};
     sa = '{"a", "b"}; s = '{1, 2};
-    $display("T|m1 %0d%0d%0d%0d%0d %0d%0d%0d%0d%0d%0d %0d%0d%0d%0d%0d", a == '{9, 5, 5, 5}, a != '{9, 5, 5, 6},
-      a === '{9, 5, 5, 5}, '{9, 5, 5, 5} == a, a != '{9, 5, 5, 5},
-      m == '{'{1, 2}, '{3, 4}}, m == '{'{1, 2}, '{3, 5}}, d == '{1, 2, 3}, d == '{1, 2, 4}, q == '{7, 8}, q != '{7, 8},
-      sa == '{"a", "b"}, sa == '{"a", "c"}, s == '{1, 2}, s == '{1, 3}, a == '{default: 5});
-    if (a == '{9, 5, 5, 5}) $display("T|m2 if yes"); else $display("T|m2 if no");
-    k = 0; while (!(a == '{9, 5, 5, 5}) && k < 3) k++;
-    $display("T|m3 k=%0d tern=%0d slice=%0d", k, (a == '{9, 5, 5, 5}) ? 11 : 22, a[1:3] == '{5, 5, 5});
+    $display("T|m1 %0d%0d%0d%0d%0d %0d%0d%0d%0d%0d%0d %0d%0d%0d%0d%0d", a == type(a)'{9, 5, 5, 5}, a != type(a)'{9, 5, 5, 6},
+      a === type(a)'{9, 5, 5, 5}, type(a)'{9, 5, 5, 5} == a, a != type(a)'{9, 5, 5, 5},
+      m == type(m)'{'{1, 2}, '{3, 4}}, m == type(m)'{'{1, 2}, '{3, 5}}, d == type(d)'{1, 2, 3}, d == type(d)'{1, 2, 4}, q == type(q)'{7, 8}, q != type(q)'{7, 8},
+      sa == type(sa)'{"a", "b"}, sa == type(sa)'{"a", "c"}, s == type(s)'{1, 2}, s == type(s)'{1, 3}, a == type(a)'{default: 5});
+    if (a == type(a)'{9, 5, 5, 5}) $display("T|m2 if yes"); else $display("T|m2 if no");
+    k = 0; while (!(a == type(a)'{9, 5, 5, 5}) && k < 3) k++;
+    $display("T|m3 k=%0d tern=%0d slice=%0d", k, (a == type(a)'{9, 5, 5, 5}) ? 11 : 22, a[1:3] == type(a[1:3])'{5, 5, 5});
     ds = '{1, 2, 3}; stv = '{'{1, 2}, '{3, 4}}; lx = '{4'b1x01, 4'b0011}; by = '{1, 2, 255};
     m3 = '{'{'{1, 2}, '{3, 4}}, '{'{5, 6}, '{7, 8}}};
-    $display("T|m4 ds=%0d%0d stv=%0d%0d lx=%0d%0d%0d%0d", ds == '{1, 2, 3}, ds == '{3, 2, 1}, stv == '{'{1, 2}, '{3, 4}}, stv == '{'{1, 2}, '{3, 5}},
-      lx == '{4'b1x01, 4'b0011}, lx != '{4'b1x01, 4'b0011}, lx === '{4'b1x01, 4'b0011}, lx !== '{4'b1x01, 4'b0011});
-    $display("T|m5 key=%0d%0d by=%0d%0d m3=%0d%0d sn=%0d%0d%0d", a == '{0: 9, default: 5}, a == '{0: 5, default: 9}, by == '{1, 2, 255}, by == '{1, 2, -1},
-      m3 == '{'{'{1, 2}, '{3, 4}}, '{'{5, 6}, '{7, 8}}}, m3 == '{default: 1}, s == '{x: 1, y: 2}, s == '{y: 1, x: 2}, s == '{default: 1});
+    $display("T|m4 ds=%0d%0d stv=%0d%0d lx=%0d%0d%0d%0d", ds == type(ds)'{1, 2, 3}, ds == type(ds)'{3, 2, 1}, stv == type(stv)'{'{1, 2}, '{3, 4}}, stv == type(stv)'{'{1, 2}, '{3, 5}},
+      lx == type(lx)'{4'b1x01, 4'b0011}, lx != type(lx)'{4'b1x01, 4'b0011}, lx === type(lx)'{4'b1x01, 4'b0011}, lx !== type(lx)'{4'b1x01, 4'b0011});
+    $display("T|m5 key=%0d%0d by=%0d%0d m3=%0d%0d sn=%0d%0d%0d", a == type(a)'{0: 9, default: 5}, a == type(a)'{0: 5, default: 9}, by == type(by)'{1, 2, 255}, by == type(by)'{1, 2, -1},
+      m3 == type(m3)'{'{'{1, 2}, '{3, 4}}, '{'{5, 6}, '{7, 8}}}, m3 == type(m3)'{default: 1}, s == type(s)'{x: 1, y: 2}, s == type(s)'{y: 1, x: 2}, s == type(s)'{default: 1});
     c = new;
     repeat (3) $display("T|c1 %s", c.run());
   end
@@ -81,7 +81,7 @@ module top;
   logic [3:0] cc[2]; int cd[2];
   assign cc = '{4'd3, 4'd4};
   assign cd = '{5, 6};
-  initial #1 $display("T|ca %0d %0d %0d %0d %0d", cc[0], cc[1], cd[0], cd[1], cd == '{5, 6});
+  initial #1 $display("T|ca %0d %0d %0d %0d %0d", cc[0], cc[1], cd[0], cd[1], cd == type(cd)'{5, 6});
 endmodule
 "#;
 
@@ -110,7 +110,7 @@ module top;
   assign hh = '{'{1,2},'{3,4}};
   sub u(so);
   initial begin
-    #1 $display("T|ca %0d %0d %0d %0d %0d", cc[0], cc[1], cd[0], cd[1], cd == '{5, 6});
+    #1 $display("T|ca %0d %0d %0d %0d %0d", cc[0], cc[1], cd[0], cd[1], cd == type(cd)'{5, 6});
     $display("T|dd %0d %0d ee %0d %0d %0d ff %0d %0d", dd[1], dd[0], ee[0], ee[1], ee[2], ff[0], ff[2]);
     $display("T|gg %0d %0d %0d %0d kk %0d %0d %0d %0d pk %h", gg[0], gg[1], gg[2], gg[3], kk[0], kk[1], kk[2], kk[3], pk);
     $display("T|so %0d %0d hh %0d %0d %0d %0d", so[0], so[1], hh[0][0], hh[0][1], hh[1][0], hh[1][1]);

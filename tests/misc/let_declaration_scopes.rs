@@ -279,7 +279,7 @@ fn let_in_checker_program_clocking_and_fork() {
         r#"
 checker chk(logic a, event clk);
   let both(x) = x && a;
-  initial $display("T|chk both=%0d", both(1'b1));
+  initial assert (both(1'b1)) $display("T|chk both=%0d", both(1'b1));
 endchecker
 program prg;
   let pl(x) = x * 3;

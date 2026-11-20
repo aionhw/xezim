@@ -59,6 +59,7 @@ fn signed_keyed_locators() {
     let src = r#"module tb;
   int n[int];
   byte b[shortint];
+  shortint short_keys[$];
   int ik[$];
   int v[$];
   initial begin
@@ -67,8 +68,8 @@ fn signed_keyed_locators() {
     ik = n.find_index with (item > 5);        $display("N %p", ik);
     v = n.find with (item > 5);               $display("N %p", v);
     ik = n.find_index with (item.index < 0);  $display("N %p", ik);
-    $display("N %0d", (n.find_first_index with (item == 7))[0]);
-    ik = b.find_index with (item > 0);        $display("B %p", ik);
+    $display("N %0d", n.find_first_index with (item == 7)[0]);
+    short_keys = b.find_index with (item > 0); $display("B %p", short_keys);
   end
 endmodule
 "#;

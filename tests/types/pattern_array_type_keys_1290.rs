@@ -123,7 +123,7 @@ module top;
     v2       = '{m:'{integer:2, default:'{integer:1, default:4}}};
     v3       = '{m:'{byte:2, default:'{integer:1, default:4}}};
     v_flat.m = '{integer:2, 0:'{integer:1, default:3}, default:'{default:2}};
-    se       = '{integer:7, default:'{a:5, b:8'd6}};
+    se       = '{integer:7, byte:8'd6};
     plain2d  = '{integer:2, 0:'{integer:1, default:3}, default:'{default:2}};
     rm       = '{row_t:'{5, 6}, default:'{0, 0}};
     #1;

@@ -1,5 +1,6 @@
 // top: t16_12
 module t16_12;
+  initial $assertvacuousoff(0);
   bit clk, a, b, c;
   always #5 clk = ~clk;
   // a@15; b@25,35; c@45 -> until/s_until should pass at 45 (attempt started 15)

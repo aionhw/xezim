@@ -59,6 +59,7 @@ module followed_simultaneous #(bit REVERSE = 0);
 endmodule
 
 module top;
+  initial $assertvacuousoff(0);
   followed_case overlap_vacuous();
   followed_case #(0, 1, 0) overlap_strong();
   followed_case #(0, 0, 1) overlap_failure_then_pass();

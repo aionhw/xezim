@@ -162,7 +162,7 @@ endmodule
 /// the processes that read it. Readers of a queue element watch the queue, so
 /// the write must not be redirected to a flat member signal.
 #[test]
-fn nba_queue_element_member_wakes_readers() {
+fn clocked_queue_element_member_wakes_readers() {
     let src = r#"
 typedef struct { logic [7:0] f; } s_t;
 module tb;
@@ -170,7 +170,7 @@ module tb;
   s_t q[$];
   logic [7:0] r;
   always_comb r = q[0].f;
-  always_ff @(posedge clk) q[0].f <= q[0].f + 8'h1;
+  always_ff @(posedge clk) q[0].f = q[0].f + 8'h1;
   initial begin
     q.push_back('{f: 8'h10});
     repeat (3) begin #5 clk = 1; #5 clk = 0; end

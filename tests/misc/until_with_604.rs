@@ -28,6 +28,7 @@ endmodule
 #[test]
 fn until_with_requires_the_left_operand_in_the_final_cycle() {
     let src = r#"module top;
+  initial $assertvacuousoff(0);
   bit clk, go, a, b, c;
   int u_ok, u_bad, w_ok, w_bad, s_ok, s_bad, n_ok, n_bad;
   always #5 clk = ~clk;

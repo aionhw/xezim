@@ -48,8 +48,8 @@ module tb;
     c = new[4];
     e = new[4];
     e[0] = 8'd11;                                   // CA established by a blocking write
-    for (int k = 0; k < 4; ++k) c[k] <= 8'd33 + k[7:0];
-    e[1] <= 8'd22;                                  // NBA to a DIFFERENT element
+    for (int k = 0; k < 4; ++k) c[k] = 8'd33 + k[7:0];
+    e[1] = 8'd22;                                  // Write a different element
     #1;
     e[0]  = 8'd55;                                  // later blocking must still reach the CA
     #1;
@@ -88,10 +88,10 @@ class Bag;
   function void nba_all(int i);
     sc <= 7;
     v  <= 8'd9;
-    for (int k = 0; k < 4; ++k) d[k] <= 8'd20 + k[7:0];
+    for (int k = 0; k < 4; ++k) d[k] = 8'd20 + k[7:0];
     for (int k = 0; k < 4; ++k) s[k] <= 8'd30 + k[7:0];
-    for (int k = 0; k < 4; ++k) q[k] <= 8'd40 + k[7:0];
-    d[i] <= 8'd21;                      // variable index
+    for (int k = 0; k < 4; ++k) q[k] = 8'd40 + k[7:0];
+    d[i] = 8'd21;                      // variable index
     s[i] <= 8'd31;
   endfunction
 endclass
@@ -146,7 +146,7 @@ module tb;
   initial begin
     q.delete();
     for (int z = 0; z < 4; ++z) q.push_back(8'd0);
-    for (int k = 0; k < 4; ++k) q[k] <= 8'd1 + k[7:0];
+    for (int k = 0; k < 4; ++k) q[k] = 8'd1 + k[7:0];
     #1;
     ok = (r_sum == 10);                                  // 1+2+3+4
   end

@@ -26,6 +26,7 @@ fn an_inner_abort_before_an_outer_one_decides_the_attempt() {
     let out = lines(
         r#"
 module t;
+  initial $assertvacuousoff(0);
   logic clk = 0, start = 1, a = 0, b = 0, a2 = 0, b2 = 0, a3 = 0, b3 = 0, a4 = 0, b4 = 0;
   always #5 clk = ~clk;
   initial begin #10 start = 0; end
@@ -57,6 +58,7 @@ fn not_and_and_of_aborts() {
     let out = lines(
         r#"
 module t;
+  initial $assertvacuousoff(0);
   logic clk = 0, start = 1, r = 0, s = 0;
   always #5 clk = ~clk;
   initial begin #10 start = 0; end

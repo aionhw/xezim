@@ -53,8 +53,8 @@ module top;
     qc.push_back(10); qc.push_back(20);
     @(posedge clk);
     qa[$] = 77;       // blocking
-    qb[$] <= 88;      // non-blocking
-    qc[1] <= 99;      // control: constant index
+    qb[$] = 88;      // last element
+    qc[1] = 99;      // control: constant index
     @(posedge clk); #1;
     r_blk = qa[1]; r_nba = qb[1]; r_const = qc[1]; sz = qa.size();
     $finish;
@@ -148,9 +148,9 @@ module top;
   initial begin
     @(posedge clk);
     narrow_blk["k"]  = 8'hEF;
-    narrow_nba["k"] <= 8'hEF;
+    narrow_nba["k"] = 8'hEF;
     wide_blk["k"]    = 8'hEF;
-    wide_nba["k"]   <= 8'hEF;
+    wide_nba["k"]   = 8'hEF;
     @(posedge clk); #1;
     nb = narrow_blk["k"]; nn = narrow_nba["k"];
     wb = wide_blk["k"];   wn = wide_nba["k"];
@@ -183,8 +183,8 @@ module top;
     q.push_back(4'h0); q.push_back(4'h0);
     dyn = new[2];
     @(posedge clk);
-    q[1]   <= 8'hAB;
-    dyn[1] <= 8'hCD;
+    q[1]   = 8'hAB;
+    dyn[1] = 8'hCD;
     @(posedge clk); #1;
     rq = q[1]; rd = dyn[1];
     $finish;

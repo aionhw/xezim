@@ -2252,19 +2252,19 @@ impl Simulator {
         stat.kind = kind;
         if outcome {
             stat.pass_count += 1;
-            self.fire_sva_action(site_idx, true);
+            self.fire_sva_action(site_idx, true, false);
         } else if kind != 2 {
             stat.fail_count += 1;
-            self.fire_sva_action(site_idx, false);
+            self.fire_sva_action(site_idx, false, false);
         }
     }
 
-    pub(super) fn fire_sva_action(&mut self, site_idx: usize, passed: bool) {
+    pub(super) fn fire_sva_action(&mut self, site_idx: usize, passed: bool, vacuous: bool) {
         // §20.12 PassOff/FailOff, decided when the attempt finishes.
         if self.assert_ctl_on {
             let st = self.sva_site_ctl(site_idx);
             if !(if passed {
-                st.pass_action(false)
+                st.pass_action(vacuous)
             } else {
                 st.fail_action()
             }) {
@@ -3362,13 +3362,10 @@ impl Simulator {
                                 fail_count: 0,
                             });
                     stat.kind = site_kind;
-                    // §16.12.1: holds, but no pass action unless a
-                    // §20.12 PassOn enabled it for vacuous successes.
+                    // §20.11: an enabled vacuous pass action runs for assert and assume.
                     if site_kind != 2 {
                         stat.pass_count += 1;
-                        if self.assert_ctl_on && self.sva_site_ctl(i).pass_action(true) {
-                            self.fire_sva_action(i, true);
-                        }
+                        self.fire_sva_action(i, true, true);
                     }
                 }
             }

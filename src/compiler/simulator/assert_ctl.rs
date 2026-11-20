@@ -20,9 +20,8 @@
 //!   the attempt finishes or the deferred report matures.
 //! * Lock/Unlock: a locked assertion ignores every control except Unlock.
 //!
-//! Pinned against the reference simulator: the pass action of a vacuous
-//! success is off until PassOn (§20.12 lists the controls, the default is
-//! the reference's); levels count module instances only, so a generate or
+//! §20.11 enables pass actions on vacuous and nonvacuous successes by
+//! default. Levels count module instances only, so a generate or
 //! named block is part of its instance's level; levels with no list count
 //! from the top modules; `expect` statements ignore the controls, as in the
 //! reference. Unique/priority violation reports follow On/Off/Kill.
@@ -55,10 +54,15 @@ pub(super) const DT_ASSERT: u8 = 1;
 pub(super) const DT_COVER: u8 = 2;
 pub(super) const DT_ASSUME: u8 = 4;
 
-/// One assertion's control state; 0 is the default (enabled, unlocked,
-/// pass action on nonvacuous success only, fail action on).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+/// One assertion's control state. Initially all pass and fail actions are enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct CtlState(u8);
+
+impl Default for CtlState {
+    fn default() -> Self {
+        Self(Self::PASS_VAC_ON)
+    }
+}
 
 impl CtlState {
     const LOCKED: u8 = 1;
@@ -180,7 +184,7 @@ fn ctl_dims(ctl: u8) -> u8 {
 fn ctl_writes_default(ctl: u8) -> bool {
     matches!(
         ctl,
-        CTL_ON | CTL_FAIL_ON | CTL_NONVACUOUS_ON | CTL_VACUOUS_OFF | CTL_UNLOCK
+        CTL_ON | CTL_FAIL_ON | CTL_NONVACUOUS_ON | CTL_PASS_ON | CTL_UNLOCK
     )
 }
 

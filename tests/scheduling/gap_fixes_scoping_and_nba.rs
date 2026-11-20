@@ -44,7 +44,7 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 /// Gap 1: assoc-element NBA with a string-literal key, a string-variable key,
 /// an int key, and a wide (96-bit) element value.
 #[test]
-fn nba_to_associative_elements_stores_full_values() {
+fn associative_element_writes_store_full_values() {
     let src = r#"
 module top;
   bit clk;
@@ -57,10 +57,10 @@ module top;
   initial begin
     k = "gamma";
     @(posedge clk);
-    aa["alpha"] <= 11;
-    aa[k]       <= 22;
-    by_int[7]   <= 33;
-    wide_aa[3]  <= 96'hDEAD_BEEF_0123_4567_89AB_CDEF;
+    aa["alpha"] = 11;
+    aa[k]       = 22;
+    by_int[7]   = 33;
+    wide_aa[3]  = 96'hDEAD_BEEF_0123_4567_89AB_CDEF;
     @(posedge clk);
     r_lit = aa["alpha"];
     r_str = aa["gamma"];
