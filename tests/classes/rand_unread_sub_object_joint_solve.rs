@@ -37,17 +37,19 @@ class read_c;
   constraint k { x < 8'd100; leaf.v == x + 8'd1; }
   function new(); leaf = new(); endfunction
 endclass
+typedef class back_sub_c;
 class back_c;
   rand back_sub_c sub;
   rand bit [7:0] x;
   constraint k { x inside {[1:5]}; }
-  function new(); sub = new(); sub.p = this; endfunction
+  extern function new();
 endclass
 class back_sub_c;
   back_c p;
   rand bit [7:0] y;
   constraint s { y < p.x; }
 endclass
+function back_c::new(); sub = new(); sub.p = this; endfunction
 module t;
   initial begin
     cfg_c c = new();

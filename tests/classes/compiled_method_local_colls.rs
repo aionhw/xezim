@@ -120,7 +120,8 @@ class C;
       b0 = q.size();
     end
   endfunction
-  int r, t, p, d, n, last, lq, lmq, lqs, lmqs, dv, hn, heq, ht, b1, b0;
+  string last;
+  int r, t, p, d, n, lq, lmq, lqs, lmqs, dv, hn, heq, ht, b1, b0;
 endclass
 
 module top;
