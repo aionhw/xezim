@@ -2839,6 +2839,22 @@ impl Simulator {
                 .contains_key(format!("{}[{}]", base, lo).as_str())
     }
 
+    /// IEEE 1800-2023 §14.10–11: named and default clocking events use
+    /// the edge of the resolved clocking block.
+    fn clocking_sensitivity(&self, key: &str) -> Option<Sensitivity> {
+        let (clock, _) = self.clocking_meta.get(key)?;
+        Some(Sensitivity {
+            signal_name: clock.clone(),
+            edge: self
+                .clocking_edge
+                .get(key)
+                .copied()
+                .unwrap_or(EdgeKind::Posedge),
+            iff: None,
+            value_of: None,
+        })
+    }
+
     pub(super) fn event_to_sens(&self, event: &EventControl) -> Vec<Sensitivity> {
         // §13.5.2: inside a task, an event control on a `ref` formal waits
         // on the ACTUAL (see `ref_event_control`).
@@ -3134,17 +3150,9 @@ impl Simulator {
                             .resolve_clocking_key(&segs)
                             .unwrap_or_else(|| sig.to_string());
                         if ee.edge.is_none() {
-                            if let Some((clk, _)) = self.clocking_meta.get(&cb_key) {
-                                out.push(Sensitivity {
-                                    signal_name: clk.clone(),
-                                    edge: self
-                                        .clocking_edge
-                                        .get(&cb_key)
-                                        .copied()
-                                        .unwrap_or(EdgeKind::Posedge),
-                                    iff: ee.iff.clone().map(Box::new),
-                                    value_of: None,
-                                });
+                            if let Some(mut sensitivity) = self.clocking_sensitivity(&cb_key) {
+                                sensitivity.iff = ee.iff.clone().map(Box::new);
+                                out.push(sensitivity);
                                 continue;
                             }
                         }
@@ -3298,26 +3306,11 @@ impl Simulator {
                 out
             }
             EventControl::Identifier(id) => {
-                // LRM §14.3: `@(cb)` where `cb` names a clocking block
-                // synchronizes to that block's clock event (its declared
-                // `@(posedge clk)`), NOT a signal literally called `cb`. The
-                // old code built a sensitivity on a nonexistent signal `cb`,
-                // which never fired — so `@(cb)` returned at t=0 (a no-op) and
-                // any `@(cb); ...` sampling loop in a direct-SV testbench spun
-                // instead of stepping the clock. Substitute the block's clock
-                // signal with a posedge edge (the edge `tick_clocking_blocks`
-                // already assumes). Falls through to a plain named event when
-                // `id` is an ordinary `event`/signal, preserving prior behavior.
-                if let Some((clk, _)) = self
+                if let Some(sensitivity) = self
                     .resolve_clocking_key(&[id.name.as_str()])
-                    .and_then(|k| self.clocking_meta.get(&k))
+                    .and_then(|key| self.clocking_sensitivity(&key))
                 {
-                    vec![Sensitivity {
-                        signal_name: clk.clone(),
-                        edge: EdgeKind::Posedge,
-                        iff: None,
-                        value_of: None,
-                    }]
+                    vec![sensitivity]
                 } else {
                     vec![Sensitivity {
                         signal_name: {
@@ -3345,15 +3338,11 @@ impl Simulator {
                     // at t=0 instead of waiting for the block's clock edge.
                     // Every `@cb;` sampling loop then spun without advancing.
                     let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
-                    if let Some(cbk) = self.resolve_clocking_key(&segs) {
-                        if let Some((clk, _)) = self.clocking_meta.get(&cbk) {
-                            return vec![Sensitivity {
-                                signal_name: clk.clone(),
-                                edge: EdgeKind::Posedge,
-                                iff: None,
-                                value_of: None,
-                            }];
-                        }
+                    if let Some(sensitivity) = self
+                        .resolve_clocking_key(&segs)
+                        .and_then(|key| self.clocking_sensitivity(&key))
+                    {
+                        return vec![sensitivity];
                     }
                     vec![Sensitivity {
                         signal_name: self.resolve_hier_name(h).into_owned(),
