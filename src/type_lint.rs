@@ -947,6 +947,31 @@ impl<'a> Ck<'a> {
                 ModuleItem::ClassDeclaration(c) => {
                     self.top().types.remove(&c.name.name);
                 }
+                // §23.6, §23.9: an instance or a generate block is a scope of
+                // this one, so `p.s` is a hierarchical name through it even
+                // when a package is named `p` too; a package item is named
+                // with `::` (§26.3), never with a dot.
+                ModuleItem::ModuleInstantiation(mi) => {
+                    for hi in &mi.instances {
+                        let n = hi.name.name.split('[').next().unwrap_or_default();
+                        self.declare_scope_name(n);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => {
+                    if let Some(n) = &g.name {
+                        self.declare_scope_name(n);
+                    }
+                }
+                ModuleItem::GenerateIf(g) => {
+                    for n in g.branch_labels.iter().flatten() {
+                        self.declare_scope_name(n);
+                    }
+                }
+                ModuleItem::GenerateCase(g) => {
+                    for n in g.arms.iter().filter_map(|a| a.label.as_ref()) {
+                        self.declare_scope_name(n);
+                    }
+                }
                 _ => {}
             }
         }
@@ -2125,6 +2150,14 @@ impl<'a> Ck<'a> {
         let t = with_dims(self.resolve(dt), dims);
         self.declare_value(name, t.clone());
         t
+    }
+
+    /// The name of an instance or generate block: neither a constant nor a
+    /// variable (`u.x = 1` writes through it), of no type this pass models.
+    fn declare_scope_name(&mut self, name: &str) {
+        let top = self.top();
+        top.vars.insert(name.to_string(), Ty::Unknown);
+        top.unsure.insert(name.to_string());
     }
 
     /// A variable, net or port of type `t`.
