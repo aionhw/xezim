@@ -1,8 +1,5 @@
-//! Issues #143/#144/#145 — the delayed-write dimension of the #142 elision
-//! class: every compare that decides whether a delayed write is scheduled,
-//! merged, or elided must run against the PENDING delayed value when one
-//! exists, and the indexed part-select forms must convert base+width like
-//! everything else. All expectations reference-simulator verified.
+//! Delayed continuous and UDP drivers use inertial semantics. Procedural
+//! nonblocking assignments schedule each captured update (§4.9.4).
 
 use xezim::simulate;
 
@@ -81,18 +78,15 @@ endmodule
 }
 
 #[test]
-fn delayed_nba_of_current_value_is_elided_at_schedule() {
-    // #145: the reference elides `q <= #5 v` when v equals the CURRENT value
-    // at schedule time — a blocking write in the window makes it observable.
-    // The elision must NOT fire when a delayed NBA is already pending for
-    // the target (the pending entry, not the register, is the truth then).
+fn delayed_nba_of_current_value_lands_after_intervening_write() {
+    // IEEE 1800-2023 §4.9.4: capture at schedule time and update at maturity.
     let out = msgs(
         r#"
 module top;
   logic q, r;
   initial begin
     q = 0;
-    q <= #5 0;          // == current at schedule: never lands
+    q <= #5 0;          // capture 0 before the intervening write
     #1 q = 1;
     #5 $display("E_%b", q);
     r = 0;
@@ -103,6 +97,6 @@ module top;
 endmodule
 "#,
     );
-    assert!(out.contains(&"E_1".to_string()), "{out:?}");
+    assert!(out.contains(&"E_0".to_string()), "{out:?}");
     assert!(out.contains(&"F_0".to_string()), "{out:?}");
 }
