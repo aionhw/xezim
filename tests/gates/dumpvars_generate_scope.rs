@@ -672,6 +672,7 @@ fn dump_subinstance_from_another_top() {
     ] {
         let dir = tmp("cross_top", ext);
         fs::create_dir_all(&dir).unwrap();
+        let requested_ext = if ext == "fst" { "fsdb" } else { ext };
         let src = format!(
             r#"
 module leaf;
@@ -684,7 +685,7 @@ module tb_top;
 endmodule
 module dump_ctl;
   initial begin
-    {file_task}("out.{ext}");
+    {file_task}("out.{requested_ext}");
     {task}(0, tb_top.selected);
   end
 endmodule

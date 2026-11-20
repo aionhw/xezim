@@ -344,6 +344,8 @@ struct Env<'e> {
     pkg_members: &'e HashMap<String, Option<HashSet<String>>>,
 }
 
+use crate::should_fail_lint::{ConstScope, InstanceViews};
+
 struct Ck<'a> {
     env: Env<'a>,
     elab: &'a ElaboratedModule,
@@ -364,6 +366,7 @@ struct Ck<'a> {
     /// Inside a generate block, which may not be elaborated: counts that
     /// depend on a parameter are not judged there.
     gen_depth: u32,
+    generate_scopes: Vec<ConstScope<'a>>,
     errs: Vec<String>,
 }
 
@@ -385,6 +388,7 @@ impl<'a> Ck<'a> {
             seen: HashSet::default(),
             params_fixed: false,
             gen_depth: 0,
+            generate_scopes: Vec::new(),
             errs: Vec::new(),
         }
     }
@@ -2883,9 +2887,26 @@ impl<'a> Ck<'a> {
                 ModuleItem::ClassDeclaration(c) => self.walk_class(c),
                 ModuleItem::GenerateRegion(g) => self.walk_block(&g.items, None),
                 ModuleItem::GenerateIf(g) => {
-                    for (_, items) in &g.branches {
-                        self.walk_block(items, None);
+                    // §27.5: lint a block only for instances that can select it.
+                    // When a condition cannot be folded, retain both possibilities.
+                    let scopes = std::mem::take(&mut self.generate_scopes);
+                    let mut remaining = scopes.clone();
+                    for (condition, items) in &g.branches {
+                        self.generate_scopes.clear();
+                        remaining.retain(|scope| {
+                            let selected = condition
+                                .as_ref()
+                                .map_or(Some(true), |cond| scope.generate_condition(cond));
+                            if selected != Some(false) {
+                                self.generate_scopes.push(*scope);
+                            }
+                            selected != Some(true)
+                        });
+                        if !self.generate_scopes.is_empty() {
+                            self.walk_block(items, None);
+                        }
                     }
+                    self.generate_scopes = scopes;
                 }
                 ModuleItem::GenerateFor(g) => self.walk_block(&g.items, Some(&g.var)),
                 ModuleItem::GenerateCase(g) => {
@@ -3040,6 +3061,14 @@ fn dpi_name(d: &xezim_core::ast::decl::DPIImport) -> Option<String> {
 
 /// Run the checks over every definition; returns the error messages.
 pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String> {
+    check_with_views(defs, elab, &InstanceViews::build(elab))
+}
+
+pub(crate) fn check_with_views(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+    views: &InstanceViews,
+) -> Vec<String> {
     // Phase 0: class names (a name declared twice is ambiguous and ignored).
     let mut class_names: HashMap<String, usize> = HashMap::default();
     fn count_items(items: &[ModuleItem], out: &mut HashMap<String, usize>) {
@@ -3287,6 +3316,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 ck = Ck::new(env(), elab, &m.name.name);
                 ck.default_auto = m.lifetime == Some(Lifetime::Automatic);
                 ck.params_fixed = params_fixed_for(&m.name.name);
+                ck.generate_scopes = views.scopes(elab, &m.name.name);
                 ck.push();
                 for p in &m.params {
                     ck.declare_param(p);
@@ -3303,6 +3333,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 ck = Ck::new(env(), elab, &m.name.name);
                 ck.default_auto = m.lifetime == Some(Lifetime::Automatic);
                 ck.params_fixed = params_fixed_for(&m.name.name);
+                ck.generate_scopes = views.scopes(elab, &m.name.name);
                 ck.push();
                 for p in &m.params {
                     ck.declare_param(p);
@@ -3319,6 +3350,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 ck = Ck::new(env(), elab, &m.name.name);
                 ck.default_auto = m.lifetime == Some(Lifetime::Automatic);
                 ck.params_fixed = params_fixed_for(&m.name.name);
+                ck.generate_scopes = views.scopes(elab, &m.name.name);
                 ck.push();
                 for p in &m.params {
                     ck.declare_param(p);

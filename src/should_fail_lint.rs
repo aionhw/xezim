@@ -87,8 +87,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_unpacked_pattern_counts(&m.items, &mut errs);
                 check_stream_widths(&m.items, scope, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
-                check_instantiations(&m.items, &port_map, &mut errs);
-                check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                if scope.top || !views.of(&m.name.name).is_empty() {
+                    check_instantiations(&m.items, &port_map, &mut errs);
+                    check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                }
             }
             SourceDefinition::Interface(m) => {
                 let unit = Unit {
@@ -116,8 +118,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_monitor_automatic(&m.items, &mut errs);
                 check_unpacked_pattern_counts(&m.items, &mut errs);
-                check_instantiations(&m.items, &port_map, &mut errs);
-                check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                if scope.top || !views.of(&m.name.name).is_empty() {
+                    check_instantiations(&m.items, &port_map, &mut errs);
+                    check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                }
             }
             SourceDefinition::Program(m) => {
                 let unit = Unit {
@@ -146,8 +150,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_program_items(&m.items, &mut errs);
                 check_monitor_automatic(&m.items, &mut errs);
                 check_unpacked_pattern_counts(&m.items, &mut errs);
-                check_instantiations(&m.items, &port_map, &mut errs);
-                check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                if scope.top || !views.of(&m.name.name).is_empty() {
+                    check_instantiations(&m.items, &port_map, &mut errs);
+                    check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                }
             }
             SourceDefinition::Package(p) => {
                 use xezim_core::ast::decl::PackageItem;
@@ -177,7 +183,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     check_nettype_partial_drivers(defs, elab, &mut errs);
     check_named_block_refs(defs, &mut errs);
     if xezim_core::sv_parser::strict_checks() {
-        errs.extend(crate::type_lint::check(defs, elab));
+        errs.extend(crate::type_lint::check_with_views(defs, elab, &views));
         // §23.8: a hierarchical name that does not resolve is an error.
         errs.extend(crate::hier_ref_lint::check(defs, elab));
     }
@@ -679,7 +685,7 @@ impl Drop for ParamLeaves {
 /// Without an instance only literals and `pkg::N` (§26.3) fold; a bare name
 /// there may be its own.
 #[derive(Clone, Copy)]
-struct ConstScope<'a> {
+pub(crate) struct ConstScope<'a> {
     elab: &'a ElaboratedModule,
     top: bool,
     inst: Option<ParamEnv<'a>>,
@@ -695,13 +701,13 @@ struct ConstScope<'a> {
 /// A bare top-level key is NOT part of a child's view: the child's own `N`
 /// is registered as `u.N`, and a `$unit` or top-module `N` it could see is
 /// told apart from nothing by the flat table.
-struct InstanceViews {
+pub(crate) struct InstanceViews {
     by_def: HashMap<String, Vec<ParamMap>>,
     scoped: ParamMap,
 }
 
 impl InstanceViews {
-    fn build(elab: &ElaboratedModule) -> Self {
+    pub(crate) fn build(elab: &ElaboratedModule) -> Self {
         let mut by_def: HashMap<String, Vec<ParamMap>> = HashMap::default();
         if elab.instances.is_empty() {
             return InstanceViews {
@@ -737,6 +743,20 @@ impl InstanceViews {
             }
         }
         InstanceViews { by_def, scoped }
+    }
+
+    pub(crate) fn scopes<'a>(
+        &'a self,
+        elab: &'a ElaboratedModule,
+        name: &str,
+    ) -> Vec<ConstScope<'a>> {
+        if name == elab.name {
+            return vec![ConstScope::of(elab, name)];
+        }
+        self.of(name)
+            .iter()
+            .map(|view| ConstScope::instance(elab, view, &self.scoped))
+            .collect()
     }
 
     /// The own tables of the instances of `def`, empty when it is not
@@ -819,6 +839,13 @@ impl<'a> ConstScope<'a> {
             Folded::Value(v) => Some(v),
             _ => None,
         }
+    }
+
+    pub(crate) fn generate_condition(self, cond: &Expression) -> Option<bool> {
+        if !width_is_confident(cond, self) {
+            return None;
+        }
+        self.value(cond).map(|v| v != 0)
     }
 
     /// The width of `dt`, 0 when it is not known here.
