@@ -827,3 +827,6 @@ mod pattern_type_key_scoped_and_lexical_1290;
 mod struct_element_return_1310;
 #[path = "types/review_pattern_type_keys_imports.rs"]
 mod review_pattern_type_keys_imports;
+
+#[path = "types/class_scope_type_param_member_typedef.rs"]
+mod class_scope_type_param_member_typedef;
