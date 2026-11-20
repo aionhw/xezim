@@ -5816,32 +5816,11 @@ impl Simulator {
                     }
                     self.inherit_fork_child_context(pid_child);
                     self.inherit_fork_m_scope(pid_child, pid, block_name.as_ref());
-                    // §9.4.5: a child that IS an intra-assignment delay
-                    // (`fork lhs = #d rhs; join_none`) captures its RHS at the
-                    // fork point — a join_none parent keeps running and may
-                    // overwrite RHS operands before the child would start, so
-                    // deferring the capture to child start-up reads the
-                    // post-fork values. Evaluate now and schedule the
-                    // pre-computed assignment directly at t+d.
-                    if let StatementKind::BlockingAssign { lvalue, rvalue } = &s.kind {
-                        if let Some((d_expr, rhs)) = Self::intra_delay_marker(rvalue) {
-                            let (saved, release) = self.capture_intra_rhs(lvalue, rhs, rvalue.span);
-                            let delay = self.eval_delay_ticks(d_expr);
-                            let assign = Statement::new(
-                                StatementKind::BlockingAssign {
-                                    lvalue: lvalue.clone(),
-                                    rvalue: saved,
-                                },
-                                s.span,
-                            );
-                            let mut cont = vec![assign];
-                            cont.extend(release);
-                            self.event_queue
-                                .schedule(self.time + delay, pid_child, cont.into());
-                            child_pids.insert(pid_child);
-                            continue;
-                        }
-                    }
+                    // §9.3.2, §9.4.5: a child that is an intra-assignment
+                    // delay (`fork lhs = #d rhs; join_none`) evaluates its
+                    // right-hand side when it starts, like any other child:
+                    // after the parent blocks or finishes, so it reads what
+                    // the parent wrote after the fork.
                     // Schedule children to run at current time, sharing one
                     // cached Arc<[Statement]> per static fork branch node.
                     let frame = self.blocking_cont_frame(&pc.stmts, s, 5, std::slice::from_ref(s));
