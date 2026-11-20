@@ -849,3 +849,5 @@ mod union_real_member;
 mod local_struct_member_arrays;
 #[path = "types/struct_parameter_percent_p.rs"]
 mod struct_parameter_percent_p;
+#[path = "types/typename_typedef_packed_dims.rs"]
+mod typename_typedef_packed_dims;
