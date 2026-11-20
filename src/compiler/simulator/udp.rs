@@ -312,6 +312,7 @@ impl Simulator {
                             },
                         },
                         cold: Box::new(CombEntryCold {
+                            rhs_time_scope: None,
                             scope_hint: None,
                             read_signal_ids: read_ids,
                             write_signal_ids: write_ids,
@@ -369,6 +370,7 @@ impl Simulator {
             entries.push(CombEntry {
                 item: CombItem::Udp { idx },
                 cold: Box::new(CombEntryCold {
+                    rhs_time_scope: None,
                     scope_hint: None,
                     read_signal_ids: read_ids,
                     write_signal_ids: write_ids,
@@ -394,6 +396,7 @@ impl Simulator {
                     indices: indices.into_boxed_slice(),
                 },
                 cold: Box::new(CombEntryCold {
+                    rhs_time_scope: None,
                     scope_hint: None,
                     read_signal_ids: vec![event_ref.sig_id as usize],
                     write_signal_ids,
@@ -770,7 +773,10 @@ impl Simulator {
     #[inline(always)]
     pub(super) fn drive_udp_output(&mut self, idx: usize, new_code: u8) {
         let out_ref = self.udp_runtime[idx].out_ref;
-        let (rise, fall) = (self.udp_runtime[idx].delay, self.udp_runtime[idx].delay_fall);
+        let (rise, fall) = (
+            self.udp_runtime[idx].delay,
+            self.udp_runtime[idx].delay_fall,
+        );
         let is_seq = self.udp_runtime[idx].is_sequential;
         let id = out_ref.sig_id as usize;
         let bit = out_ref.bit as usize;

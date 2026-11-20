@@ -715,10 +715,19 @@ impl Simulator {
                 }
                 let w = self.infer_lhs_width(lhs);
                 // §10.8, §10.9: a pattern takes the net's declared type.
+                let saved_ts = self.timescale_scope_override.replace(
+                    entry
+                        .cold
+                        .rhs_time_scope
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
                 let val = match self.eval_pattern_for_lvalue(lhs, rhs) {
                     Some(v) => v.resize(w),
                     None => self.eval_expr_ctx(rhs, w).resize(w),
                 };
+                self.timescale_scope_override = saved_ts;
                 let delay = if *explicit_delay > 0 {
                     *explicit_delay
                 } else {
@@ -2520,7 +2529,14 @@ impl Simulator {
                                         let sc = entries[eidx].cold.scope_hint.clone();
                                         self.set_m_block_scope(sc.as_deref());
                                         *self.name_resolve_hint.borrow_mut() = sc.clone();
-                                        self.timescale_scope_override = sc;
+                                        self.timescale_scope_override = Some(
+                                            entries[eidx]
+                                                .cold
+                                                .rhs_time_scope
+                                                .as_deref()
+                                                .unwrap_or_default()
+                                                .to_owned(),
+                                        );
                                         Some((prev_hint, prev_ts))
                                     } else {
                                         None
@@ -2628,7 +2644,8 @@ impl Simulator {
                                     // re-enters the interpreter here.
                                     let saved_hint = if compiled.has_fallback {
                                         let prev = self.name_resolve_hint.borrow().clone();
-                                        *self.name_resolve_hint.borrow_mut() = entries[eidx].cold.scope_hint.clone();
+                                        *self.name_resolve_hint.borrow_mut() =
+                                            entries[eidx].cold.scope_hint.clone();
                                         Some(prev)
                                     } else {
                                         None
