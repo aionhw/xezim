@@ -163,6 +163,8 @@ mod null_ports_lib_defines_nowarn;
 mod package_scoped_vars_and_methods;
 #[path = "hierarchy/packed_port_formal_type.rs"]
 mod packed_port_formal_type;
+#[path = "hierarchy/packed_port_offset_select.rs"]
+mod packed_port_offset_select;
 #[path = "hierarchy/packed_record_output_chain.rs"]
 mod packed_record_output_chain;
 #[path = "hierarchy/param_typedef_instance_isolation.rs"]
