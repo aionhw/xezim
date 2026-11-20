@@ -15951,6 +15951,19 @@ impl<'a> BytecodeCompiler<'a> {
                 // integral constant items; anything else leaves the statement
                 // to the interpreter's matcher.
                 let inside_kind = matches!(kind, crate::ast::stmt::CaseKind::CaseInside);
+                // §12.5: a real selector or item compares numerically, not
+                // bit for bit (`case (r) 1:` matches `r = 1.0`); the
+                // interpreter's matcher does that.
+                if matches!(kind, crate::ast::stmt::CaseKind::Case)
+                    && (self.expr_is_real_static(expr)
+                        || items
+                            .iter()
+                            .flat_map(|it| it.patterns.iter())
+                            .any(|p| self.expr_is_real_static(p)))
+                {
+                    self.bail("Stmt_Case_real");
+                    return self.emit_fallback(stmt);
+                }
                 // The masked compare reads the selector at its own width, so an
                 // operation selector (sized with the items, below) keeps `===`.
                 let wild_sel_w = if inside_kind

@@ -165,6 +165,19 @@ impl Simulator {
         }
     }
 
+    /// §12.5: a `case` item matches its expression bit for bit (`===`),
+    /// which Table 11-1 does not define for a real operand. When either is
+    /// real the pair compares numerically, an integral one converted to real
+    /// (§11.8.2), so `case (r) 1:` matches `r = 1.0`, as `==` would.
+    #[inline]
+    pub(super) fn case_values_match(val: &Value, item: &Value) -> bool {
+        if val.is_real || item.is_real {
+            val.is_equal(item).is_true()
+        } else {
+            val.case_eq(item).is_true()
+        }
+    }
+
     /// IEEE 1800-2017 §12.5.4 `case (e) inside`: an item is a range, a value or
     /// an array, matched with the same rules as the `inside` OPERATOR — ranges
     /// are inclusive and x/z in an item are wildcards for integral operands.

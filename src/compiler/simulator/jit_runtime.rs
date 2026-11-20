@@ -1550,11 +1550,10 @@ impl Simulator {
         }
         let item = self.eval_expr_typed(pat, comparison.width, comparison.unsigned);
         match kind {
-            CaseKind::Casez => selector.casez_eq(&item),
-            CaseKind::Casex => selector.casex_eq(&item),
-            _ => selector.case_eq(&item),
+            CaseKind::Casez => selector.casez_eq(&item).is_true(),
+            CaseKind::Casex => selector.casex_eq(&item).is_true(),
+            _ => Self::case_values_match(selector, &item),
         }
-        .is_true()
     }
 
     /// Self-determined width of `expr`. Cached on the node when the answer
