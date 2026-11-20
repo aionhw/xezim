@@ -396,7 +396,8 @@ fn method_boost_enabled() -> bool {
 // and a subroutine or block selecting a packed array of a named signed type does not compile.
 // §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
 // §11.8.2: preserve integral arithmetic in constant operands of real comparisons.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308f;
+// §6.24.1: a signing conversion consumes an unsized fill literal.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3092;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1827,7 +1828,8 @@ struct CombEntryCold {
 // not a read of its caller.
 // §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
 // §9.2.2.2.1: parameterized instance vectors retain disjoint sensitivity regions.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB049";
+// §6.24.1: compiled sign conversions use the self-determined operand width.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB050";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

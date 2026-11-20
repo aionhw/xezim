@@ -6828,11 +6828,17 @@ impl Simulator {
                 // bits (256), not at the 8 bits of `a8`.
                 let jw = self.inside_joint_width(expr, ranges);
                 let val = match jw {
-                    Some(w) => self.eval_expr_ctx(expr, w),
+                    Some(w) => {
+                        let v = self.eval_expr_ctx(expr, w);
+                        if v.is_fill { v.resize(w) } else { v }
+                    }
                     None => self.eval_expr(expr),
                 };
                 let item = |me: &mut Self, e: &Expression| match jw {
-                    Some(w) => me.eval_expr_ctx(e, w),
+                    Some(w) => {
+                        let v = me.eval_expr_ctx(e, w);
+                        if v.is_fill { v.resize(w) } else { v }
+                    }
                     None => me.eval_expr(e),
                 };
                 for r in ranges {
