@@ -549,3 +549,7 @@ mod clocking_blocks_per_scope;
 mod scope_named_like_a_package;
 #[path = "hierarchy/generate_if_package_param_member.rs"]
 mod generate_if_package_param_member;
+#[path = "hierarchy/bind_target_order_194.rs"]
+mod bind_target_order_194;
+#[path = "hierarchy/deferred_callable_paths_193.rs"]
+mod deferred_callable_paths_193;
