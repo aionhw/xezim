@@ -325,14 +325,20 @@ class XIPW47Config ;
    constraint c_solving_order {
       solve __IPW50_sregs.IPW10_ds before total_IPW10_in_Gbits ;
       solve __IPW50_sregs.IPW18_en_ds before total_IPW10_in_Gbits ;
-      solve __IPW04_cfg.IPW04_r before total_IPW10_in_Gbits ;
+      solve __IPW04_cfg.IPW04_r.REG_IPW47_IPW56.NUM_IPW55S before total_IPW10_in_Gbits ;
       solve total_IPW10_in_Gbits before max_aIPW61ess ;
       solve IPW10_in_Gbits_perIPW50 before total_IPW10_in_Gbits ;
-      // §18.5: ordering directives are constraint block items. This
-      // fixture has two controllers, so the second one is at index 1.
-      solve full_access_IPW26_ids before __IPW15s_cfg[0].IPW15_r ;
-      solve __IPW04_cfg.IPW04_r before __IPW15s_cfg[0].IPW15_r ;
-      solve __IPW15s_cfg[0].IPW15_r before __IPW15s_cfg[1].IPW15_r ;
+      solve full_access_IPW26_ids[0], full_access_IPW26_ids[1],
+            full_access_IPW26_ids[2], full_access_IPW26_ids[3]
+            before __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_SEG_RIGHTS ;
+      solve __IPW04_cfg.IPW04_r.REG_IPW47_IPW56 before __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW56_DUP ;
+      // The fixture has two controllers. Order each corresponding field
+      // of controller 0 before controller 1 at constraint-block scope (§18.5).
+      solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW56_DUP before __IPW15s_cfg[1].IPW15_r.REG_IPW47_IPW56_DUP ;
+      solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_SEG_LIMIT before __IPW15s_cfg[1].IPW15_r.REG_IPW47_IPW60_SEG_LIMIT ;
+      solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_SEG_RELOC before __IPW15s_cfg[1].IPW15_r.REG_IPW47_IPW60_SEG_RELOC ;
+      solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_SEG_RIGHTS before __IPW15s_cfg[1].IPW15_r.REG_IPW47_IPW60_SEG_RIGHTS ;
+      solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_CLIENT_IPW29 before __IPW15s_cfg[1].IPW15_r.REG_IPW47_IPW60_CLIENT_IPW29 ;
    }
    constraint c_compute_total_IPW10 {
       IPW10_in_Gbits_perIPW50 == (__IPW50_sregs.IPW10_per_IPW55_per_die_per_x16[__IPW50_sregs.IPW10_ds]
