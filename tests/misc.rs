@@ -677,3 +677,6 @@ mod declaration_order_snapshots;
 mod shared_procedural_bodies;
 #[path = "misc/deferred_assertion_counts.rs"]
 mod deferred_assertion_counts;
+
+#[path = "misc/stringify_macro_chain.rs"]
+mod stringify_macro_chain;
