@@ -93,6 +93,8 @@ mod constructor_new_not_static;
 mod constructor_new_property_type;
 #[path = "types/constructor_typedef_dispatch.rs"]
 mod constructor_typedef_dispatch;
+#[path = "types/continuous_aggregate_pattern_defaults.rs"]
+mod continuous_aggregate_pattern_defaults;
 #[path = "types/continuous_nested_array_leaves.rs"]
 mod continuous_nested_array_leaves;
 #[path = "types/copy_constructor_decl_init.rs"]
