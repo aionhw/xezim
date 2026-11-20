@@ -736,6 +736,19 @@ fn nospecify() -> bool {
     NOSPECIFY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `--writemem-every-address`: `$writemem*` writes `@<address> <word>` on
+/// every line, as xezim did before it wrote addresses only where needed.
+static WRITEMEM_EVERY_ADDRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_writemem_every_address(v: bool) {
+    WRITEMEM_EVERY_ADDRESS.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn writemem_every_address() -> bool {
+    WRITEMEM_EVERY_ADDRESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Structural-delay mode (commercial-simulator GLS convention): 0 = normal (specify/SDF path
 /// delays apply), 1 = `+delay_mode_zero` (all structural delays forced to 0 —
 /// fast functional GLS), 2 = `+delay_mode_unit` (every nonzero structural delay
