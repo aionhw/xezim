@@ -1,29 +1,6 @@
-//! §6.20 — a parameter may reference one declared LATER in the same module.
-//!
-//! Parameters were evaluated where they appeared, so
-//!
-//!     localparam int L = $clog2(SIZE) - 6;
-//!     localparam int SIZE = 4096;
-//!
-//! saw nothing for `SIZE`, fell back to 0, and produced -6. Read back as
-//! unsigned that is 4294967290, so `logic [L-1:0] bus;` became a
-//! `[4294967289:0]` packed range, tripped the sane-width cap, and collapsed
-//! the whole bus to ONE BIT. The design then simulated wrongly with only a
-//! width warning to show for it — this was seen on a real customer run where
-//! a write-buffer bus silently became 1 bit wide.
-//!
-//! Parameters are now resolved to a fixpoint BEFORE the item walk, so
-//! declarations sized from them are correct regardless of declaration order.
-//!
-//! The pre-pass is deliberately conservative — it seeds a parameter only when
-//! every name its initializer reads is already resolved, and never touches:
-//!   * package/class-scoped references (`pkg::X`), which are not bound until
-//!     the walk reaches the import,
-//!   * real-valued parameters, and
-//!   * unbased-unsized literals (`'1`), which are self-determined per §6.20.2.
-//! Each of those has its own handling in the walk, and seeding them would
-//! replace a correct value with a wrong one. Every case below is checked
-//! against a reference simulator.
+//! IEEE 1800-2023 §6.5 and §6.20: declare parameter dependencies before
+//! using them to size a packed range. The relaxed CLI fixture separately
+//! covers the parameter fixpoint used for legacy forward references.
 
 use xezim::simulate;
 
@@ -57,8 +34,8 @@ module tb;
   localparam int L4 = $clog2(`MACRO_SIZE) - 6;       // macro
   localparam int L5 = log2_fn(LOCAL_SIZE) - 6;       // user sizing function
   localparam int L6 = $clog2(LOCAL_SIZE/64);
-  localparam int L7 = $clog2(LATER_SIZE) - 6;        // FORWARD ref
-  localparam int LATER_SIZE = 4096;
+  localparam int IMPORTED_SIZE = PKG_SIZE;
+  localparam int L7 = $clog2(IMPORTED_SIZE) - 6;
   localparam int MID = LOCAL_SIZE / 64;
   localparam int L8  = $clog2(MID);
 
@@ -78,41 +55,60 @@ endmodule
 "#;
 
 #[test]
-fn parameter_may_reference_one_declared_later() {
+fn parameter_values_and_dependent_widths() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     // Every form evaluates to 6 ...
     for n in ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8"] {
         assert_eq!(get(&sim, n) as u32, 6, "{} should be 6", n);
     }
-    // ... and every dependent declaration is 6 bits wide. `v7`/`b7` are the
-    // forward reference: before the fix they were -6 (4294967290) and 8.
+    // ... and every dependent declaration is 6 bits wide.
     for n in ["b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8"] {
         assert_eq!(get(&sim, n) as u32, 6, "{} should be 6 bits", n);
     }
 }
 
-/// A chain of forward references has to resolve one link per fixpoint pass.
-const CHAIN: &str = r#"
+/// In relaxed mode, resolve a forward chain before sizing its users. The
+/// subtraction used to underflow when the size was provisionally zero.
+#[test]
+fn relaxed_forward_references_resolve_before_sizing() {
+    const CHAIN: &str = r#"
 module tb;
+  localparam int W = $clog2(SIZE) - 6;
+  localparam int SIZE = 1 << B;
   localparam int A = B + 1;
   localparam int B = C + 1;
   localparam int C = D + 1;
   localparam int D = 10;
-  logic [A-1:0] bus;
-  int va, vb, vc, vd, wbits;
-  initial begin
-    #1;
-    va = A; vb = B; vc = C; vd = D; wbits = $bits(bus);
-  end
+  logic [W-1:0] bus;
+  logic [A-1:0] chain_bus;
+  initial $display("P|%0d %0d %0d %0d %0d %0d %0d %0d",
+                   D, C, B, A, SIZE, W, $bits(bus), $bits(chain_bus));
 endmodule
 "#;
-
-#[test]
-fn a_chain_of_forward_references_resolves() {
-    let sim = simulate(CHAIN, 100).expect("simulate failed");
-    assert_eq!(get(&sim, "vd") as u32, 10);
-    assert_eq!(get(&sim, "vc") as u32, 11);
-    assert_eq!(get(&sim, "vb") as u32, 12);
-    assert_eq!(get(&sim, "va") as u32, 13);
-    assert_eq!(get(&sim, "wbits") as u32, 13);
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("relaxed_forward_params");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("forward_params.sv");
+    std::fs::write(&path, CHAIN).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args([
+            "--simulate",
+            "--no-cache",
+            "--relax-use-before-decl",
+            "-s",
+            "tb",
+        ])
+        .arg(path)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|line| line == "P|10 11 12 13 4096 6 6 13"),
+        "{stdout}"
+    );
 }
