@@ -67,6 +67,8 @@ mod flat_actual_struct_port;
 mod foreach_in_inlined_child;
 #[path = "hierarchy/foreach_over_submodule_array.rs"]
 mod foreach_over_submodule_array;
+#[path = "hierarchy/gated_clk_cell_by_body.rs"]
+mod gated_clk_cell_by_body;
 #[path = "hierarchy/genblk_dotted_ref_nettype_none.rs"]
 mod genblk_dotted_ref_nettype_none;
 #[path = "hierarchy/genblk_cont_assign.rs"]
