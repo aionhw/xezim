@@ -920,6 +920,10 @@ fn dpi_trampoline_cc_command(
     cmd
 }
 
+pub(crate) fn foreign_libraries_configured() -> bool {
+    !configured_dpi_libs().is_empty() || !configured_vpi_libs().is_empty()
+}
+
 fn configured_dpi_libs() -> Vec<String> {
     dpi_lib_paths()
         .lock()
