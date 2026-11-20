@@ -28030,7 +28030,9 @@ pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
         | "$coverage_get"
         | "$coverage_merge"
         | "$coverage_save" => (32, true),
-        "$urandom" | "$urandom_range" | "$stime" | "$shortrealtobits" => (32, false),
+        "$urandom" | "$urandom_range" | "$stime" | "$__xz_stime_at" | "$shortrealtobits" => {
+            (32, false)
+        }
         "$onehot" | "$onehot0" | "$isunknown" | "$isunbounded" | "$rose" | "$fell" | "$stable"
         | "$changed" => (1, false),
         "$time" | "$realtobits" => (64, false),

@@ -3919,14 +3919,17 @@ impl Simulator {
             // §3.14.2.3: $time/$realtime from a body whose DECLARING
             // scope has its own timescale (CU/class/package subroutine
             // bodies are rewritten to this at elaboration; the literal
-            // argument is the scope's unit exponent).
-            "$__xz_time_at" | "$__xz_realtime_at" => {
+            // argument is the scope's unit exponent). §20.3.2: `$stime`
+            // keeps the low 32 bits there too.
+            "$__xz_time_at" | "$__xz_stime_at" | "$__xz_realtime_at" => {
                 let ue = args
                     .first()
                     .map(|a| self.eval_expr(a).to_f64() as i32)
                     .unwrap_or(self.module.timeunit_exp);
-                if name == "$__xz_time_at" {
-                    return Value::from_u64(self.rounded_time_in_unit(ue), 64);
+                match name.as_str() {
+                    "$__xz_time_at" => return Value::from_u64(self.rounded_time_in_unit(ue), 64),
+                    "$__xz_stime_at" => return Value::from_u64(self.rounded_time_in_unit(ue), 32),
+                    _ => {}
                 }
                 let diff = ue - Self::secs_to_exp(self.tick_s);
                 let t = if diff >= 0 {
