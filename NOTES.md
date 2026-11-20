@@ -56,6 +56,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
+- Inline literal default inputs on positional function calls and compile process locals overwritten by a function output before their first read (#1453).
+
 * Module bodies containing only declarations and continuous assignments reuse
   their prepared syntax across value-parameter overrides, avoiding repeated
   cloning and content comparison. Each instance still resolves its own

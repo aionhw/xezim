@@ -4275,6 +4275,24 @@ impl<'a> BytecodeCompiler<'a> {
             };
             owned_args = v;
             &owned_args
+        } else if args.len() < fd.ports.len()
+            && fd.ports[args.len()..].iter().all(|p| {
+                matches!(p.direction, PortDirection::Input)
+                    && p.default
+                        .as_ref()
+                        .is_some_and(|d| matches!(d.kind, ExprKind::Number(_)))
+            })
+        {
+            // §13.5.3: a literal default has the same meaning in the caller
+            // and callee scopes. Bind it using the usual formal conversion.
+            let mut full_args = args.to_vec();
+            full_args.extend(
+                fd.ports[args.len()..]
+                    .iter()
+                    .filter_map(|p| p.default.clone()),
+            );
+            owned_args = full_args;
+            &owned_args
         } else {
             args
         };
@@ -14347,12 +14365,12 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => false,
             }
         }
-        Self::block_has_carried_static(stmts) || stmts.iter().any(nested)
+        Self::block_has_carried_static(stmts, None) || stmts.iter().any(nested)
     }
 
     /// §6.21: does a process block declare a static local whose value can
     /// carry from one activation to the next (see `static_local_carries`)?
-    fn block_has_carried_static(stmts: &[Statement]) -> bool {
+    fn block_has_carried_static(stmts: &[Statement], caller: Option<&Self>) -> bool {
         stmts.iter().enumerate().any(|(i, s)| match &s.kind {
             StatementKind::VarDecl {
                 lifetime,
@@ -14365,12 +14383,63 @@ impl<'a> BytecodeCompiler<'a> {
                 declarators.iter().any(|d| match &d.init {
                     Some(_) => explicit,
                     None => {
-                        Self::static_local_carries(&d.name.name, Some(data_type), &stmts[i + 1..])
+                        let rest = &stmts[i + 1..];
+                        !caller.is_some_and(|c| c.first_call_copies_output(&d.name.name, rest))
+                            && Self::static_local_carries(&d.name.name, Some(data_type), rest)
                     }
                 })
             }
             _ => false,
         })
+    }
+
+    /// §13.5.1: a function copies its output back before the next statement.
+    /// A whole local used solely as that output cannot carry an old value
+    /// into the rest of the block. Only simple positional actuals prove it.
+    fn first_call_copies_output(&self, local: &str, rest: &[Statement]) -> bool {
+        let Some(Statement {
+            kind: StatementKind::Expr(call),
+            ..
+        }) = rest.first()
+        else {
+            return false;
+        };
+        let ExprKind::Call { func, args } = &call.kind else {
+            return false;
+        };
+        let ExprKind::Ident(h) = &func.kind else {
+            return false;
+        };
+        if h.root.is_some() || h.path.iter().any(|seg| !seg.selects.is_empty()) {
+            return false;
+        }
+        let name = Self::hier_raw_name(h);
+        let Some(fd) = self.functions.and_then(|f| f.get(&name)) else {
+            return false;
+        };
+        if fd.ports.len() != args.len()
+            || !matches!(fd.return_type, crate::ast::types::DataType::Void(_))
+        {
+            return false;
+        }
+        let mut written = false;
+        for (port, actual) in fd.ports.iter().zip(args) {
+            match &actual.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                {
+                    if h.path[0].name.name == local {
+                        if port.direction != PortDirection::Output {
+                            return false;
+                        }
+                        written = true;
+                    }
+                }
+                ExprKind::Number(_) => {}
+                _ => return false,
+            }
+        }
+        written
     }
 
     /// §6.21: does a subroutine body declare, at any depth, a static
@@ -15671,7 +15740,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // when such a local can be observed doing so.
                 if !self.method_mode
                     && self.inlining_stack.is_empty()
-                    && Self::block_has_carried_static(stmts)
+                    && Self::block_has_carried_static(stmts, Some(self))
                 {
                     self.bail("static_block_local");
                     return false;
