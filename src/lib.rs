@@ -1628,9 +1628,12 @@ fn simulate_multi_inner(
     sim.simulate();
     rss_trace("simulated");
     if std::env::var_os("XEZIM_MEM_CENSUS").is_some() {
+        let named = sim.signals.map_entries().count();
         eprintln!(
-            "[MEM-CENSUS] end of run: runtime name->value map {} entries; {}",
+            "[MEM-CENSUS] end of run: runtime name->value map {} entries ({} named, {} dense); {}",
             sim.signals.len(),
+            named,
+            sim.signals.len() - named,
             sim.class_heap_census()
         );
     }

@@ -398,7 +398,8 @@ fn method_boost_enabled() -> bool {
 // §20.8.1, §7.4.1: `$clog2` of a constant folds; unfolded select bounds map labels.
 // §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3093;
+// §6.21, §13.5.3: output-before-read locals and literal default actuals compile.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3095;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1827,7 +1828,7 @@ struct CombEntryCold {
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
 // process, not as a combinational entry.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB051";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB053";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -7086,19 +7087,18 @@ impl SignalMap {
             if let Some(name) = k.strip_suffix(".size") {
                 let name = name.to_string();
                 let prev = self.map.insert(k, v);
-                self.note_sized(&name);
+                self.register_element_run(&name, true);
                 return prev;
             }
         }
         self.map.insert(k, v)
     }
 
-    /// `name.size` was stored: `name` is a queue or dynamic array, so its
-    /// elements are kept in a run from now on. Elements the map already
-    /// holds move into it (the contiguous ones, from the lowest index).
-    fn note_sized(&mut self, name: &str) {
+    /// Store contiguous elements in a run. Only a queue or dynamic array
+    /// with a `.size` key keeps its run after the last element is removed.
+    fn register_element_run(&mut self, name: &str, sized: bool) {
         if let Some(run) = self.runs.get_mut(name) {
-            run.sized = true;
+            run.sized |= sized;
             return;
         }
         let outer = Self::outer_of(name);
@@ -7115,7 +7115,7 @@ impl SignalMap {
         };
         held.sort_unstable();
         let mut run = ElemRun {
-            sized: true,
+            sized,
             strays: held.len() as u32,
             ..ElemRun::default()
         };
