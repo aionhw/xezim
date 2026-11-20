@@ -7086,19 +7086,18 @@ impl SignalMap {
             if let Some(name) = k.strip_suffix(".size") {
                 let name = name.to_string();
                 let prev = self.map.insert(k, v);
-                self.note_sized(&name);
+                self.register_element_run(&name, true);
                 return prev;
             }
         }
         self.map.insert(k, v)
     }
 
-    /// `name.size` was stored: `name` is a queue or dynamic array, so its
-    /// elements are kept in a run from now on. Elements the map already
-    /// holds move into it (the contiguous ones, from the lowest index).
-    fn note_sized(&mut self, name: &str) {
+    /// Store contiguous elements in a run. Only a queue or dynamic array
+    /// with a `.size` key keeps its run after the last element is removed.
+    fn register_element_run(&mut self, name: &str, sized: bool) {
         if let Some(run) = self.runs.get_mut(name) {
-            run.sized = true;
+            run.sized |= sized;
             return;
         }
         let outer = Self::outer_of(name);
@@ -7115,7 +7114,7 @@ impl SignalMap {
         };
         held.sort_unstable();
         let mut run = ElemRun {
-            sized: true,
+            sized,
             strays: held.len() as u32,
             ..ElemRun::default()
         };

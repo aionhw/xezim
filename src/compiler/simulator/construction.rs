@@ -3063,6 +3063,12 @@ impl Simulator {
                 // An unpacked-struct element keeps its member cells in the
                 // instance (`sta[1].f`), where member reads and writes go.
                 let (fill, elem_su) = self.class_array_elem_fill(cdef, prop, width);
+                // Consecutive scalar elements share the same key prefix.
+                // Keep their Values in the existing dense run while preserving
+                // every indexed cell, its declared width and its typed default.
+                if elem_su.is_none() && lo < hi && (0..1_000_000_000).contains(&lo) {
+                    self.signals.register_element_run(&scoped, false);
+                }
                 for i in lo..=hi {
                     let elem = format!("{}[{}]", scoped, i);
                     if let Some(su) = &elem_su {
