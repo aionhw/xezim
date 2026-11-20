@@ -311,6 +311,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   definition name. 66,560 instances with 256-character names peak at 206 MiB
   instead of 309 MiB (§23.8, #721, suggested by amal-khailtash).
 
+* Join alias groups and the ports that reach them with an index union-find, in
+  one pass instead of one pass per level of ports (§10.11, #1302, contributed
+  by Thomasb81).
+
+* Classify each key of an array pattern once and build nested element names in
+  place: a loop of keyed patterns on the interpreted store takes 5.5 % fewer
+  instructions (#1290, contributed by Thomasb81).
+
+* A `for` loop that stores `q.pop_front()` or `q.pop_back()` into a variable
+  or array element is compiled; it used to run whole in the AST interpreter.
+  The reporter's stream collector runs in 83.4 G instead of 108.7 G
+  instructions (§7.10.2, §12.7.1, #1210, reported by Ganesh-TNL).
+
 **Command line**
 
 * `$dumpvars` and `$fsdbDumpvars` accept indexed scope arguments: a
@@ -1009,6 +1022,142 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   default:99}}` on a nettype structure member gave 99. A type key of an outer
   level takes precedence over a `default:` row pattern, as the standard's
   recursive descent gives (§10.9.1, §10.9.2, #1290, contributed by Thomasb81).
+
+* Wake an event control whose expression calls a function with a whole
+  unpacked structure, a fixed array of structures or one of its elements when
+  a member write changes the result, with the edge and `iff` terms judged once
+  per waiter (§9.4.2, §9.4.2.3, #1317, contributed by ds54e).
+
+* Match every string with an empty UVM regex on a BSD libc host, as on glibc,
+  so `uvm_config_db::set(null, "", ...)` under UVM 1.1d and 1.2 is found on
+  macOS (#1306, contributed by auty1395).
+
+* Resolve aliased nets of a user-defined nettype as one net with all their
+  drivers, through `alias` lists, chained `alias` statements, `inout` ports,
+  nettype arrays and generate blocks, and count the single driver of an
+  unresolved nettype over the aliased names (§10.11, §6.6.7, #1302,
+  contributed by Thomasb81).
+
+* Match `real` and `realtime` type keys of an assignment pattern as one type
+  (§6.12, §10.9.1, #1290, contributed by ds54e).
+
+* Resolve assignment pattern type keys that name a typedef of a parameterized
+  class scope, of a generate block or of a package imported at that point of
+  the module, and keep a member name of the structure from also acting as a
+  type key (§10.9.1, §10.9.2, §8.25.1, §26.3, #1290, contributed by
+  Thomasb81).
+
+* Return a whole unpacked-struct element of an array argument, a local array
+  or a design array from a function (`return d[0];`, `f = d[i];`), with the
+  index evaluated once, instead of zeros; a nettype resolver that returns one
+  of its drivers now resolves (§13.4.1, §13.5.1, §11.4.1, #1310, reported by
+  ds54e).
+
+* A typedef'd `real` member of an unpacked struct (`typedef real t_real;
+  struct { t_real m[2]; }`) keeps real values: the member cells of a function
+  local, a nettype resolver's result and a class struct property were created
+  as integers and rounded every write (§6.18, §7.2, #1304, contributed by
+  ds54e).
+
+* A typedef that names `real`, `shortreal` or `realtime` declares real objects
+  everywhere a type is classified: block, function and task variables, class
+  properties (also of an alias the class declares, or of a type parameter
+  bound to `real`), function return variables, task and method formals, typed
+  parameters and localparams, and casts to the alias (`r_t'(i) / 2` is a real
+  division). Before, `typedef real r_t; r_t v; v = 3.14;` stored 3. A
+  class-method formal declared `real` now also converts an integral actual
+  (§6.18, §6.12.1, §8.25, #1313, reported by Dragon-Git; #1304, reported by
+  ds54e).
+
+* A constant element select of a packed array of packed structures or unions
+  reads the element its index labels: the left bound of the range is the most
+  significant element, so `S[0]` of `localparam s_t [0:2] S` is the first one
+  (it read the last). Ranges that do not start at 0 (`s_t [1:3]`, `[3:1]`), a
+  second packed dimension (`M[0][1]`), dimensions carried by a typedef and the
+  package form `p::ENC[fmt].field` in a package function are right too
+  (§7.4.1, xezim-core #248, reported by auty1395).
+
+* The delays of a UDP instance count the time unit of the module that holds
+  the instance: `udp #(4) u(q, a);` under `` `timescale 1ns/1ps `` waits 4 ns
+  instead of 4 ps. Real and time-literal values, `#(rise, fall)` pairs, and
+  expressions over package, class and instance parameters are scaled as a
+  whole (§3.14.2, §28.16, §29.8, #1308, reported by ds54e).
+
+* An element of a packed array of a named signed type is signed in every
+  declaration context, so a widening cast, assignment or arithmetic use of
+  `lanes[1]` sign-extends: non-ANSI ports (`input lane_t [0:1] p;`), ports
+  whose packed dimensions come from a typedef, subroutine and class-method
+  formals and locals, block variables, and packed-array members reached
+  through nested structures, packed arrays of structures, class properties and
+  instance names. Before, -1887 read as 129185 (§7.4.1, §11.8.1, #1312,
+  reported by Ganesh-TNL).
+
+* An `always_comb` procedure or a continuous assignment whose evaluation is
+  observable beyond its outputs now waits for the time-0 processes: it is left
+  out of the settle that runs before they start and is evaluated once when
+  every `initial` and `always` procedure has started. This covers a body or
+  right-hand side that calls an output, control, file or random system task or
+  function, contains an immediate assertion, calls a class method or a DPI
+  import that is not `pure`, reads a property through a class handle, steps a
+  variable it never plainly assigns (`n++`), or calls a function or task that
+  does any of these or writes a variable outside its own frame. Before, such
+  an entry was also evaluated on the declaration-time state: an assertion
+  failed on the type defaults, a method ran on a null handle, `always_comb c =
+  h.v;` ended the run with a null dereference, and counters counted an
+  evaluation too many. Entries that only compute their outputs still settle
+  before the processes start (§9.2.2.2, §4.9.1, §10.3, #1314, reported by
+  Ganesh-TNL).
+
+* A variable that a called function writes is no longer part of its caller's
+  sensitivity. A continuous assignment or `always_comb` whose function counts
+  its calls in a module variable it also reads re-ran on its own write until
+  the settle limit (§9.2.2.2.1, §10.3, #1314, reported by Ganesh-TNL).
+
+* A formal argument of a named sequence or property takes its default actual
+  argument when an instance leaves it out: `p()`, `p(a)`, `p` without an
+  argument list. The defaults were dropped by the parser, so the formal stayed
+  unbound in the expanded body. Arguments bound by name (`p(.y(b))`) and empty
+  positional arguments (`p(, b)`), which were not bound either, are bound too;
+  a default may name an earlier formal; a default of a declaration in an
+  instantiated module or interface names that instance's variables; and the
+  default of an untyped formal is cast to its self-determined type before it
+  is substituted (§16.8, §16.12, #1309, reported by ds54e).
+
+* A whole unpacked variable of an interface (an array, a structure, a queue, a
+  dynamic or associative array, an unpacked member of a structure) is copied,
+  read and compared through a virtual interface as it is through a
+  hierarchical name. With the handle in a class property, a static property, a
+  package variable, an array element, a subroutine formal or a function local,
+  or used from a class method, `vif.arr = w;` and `w = vif.arr;` did nothing,
+  `vif.arr == w` was 0 or x, and the array passed as a subroutine actual
+  arrived empty; element, slice and packed accesses were not affected (§25.9,
+  §7.6, §11.4.5, #1311, reported by rharikrishna25).
+
+* A class-handle member of an unpacked-struct class property is a handle like
+  any other: `r.h = new();` constructs the member's class, and the object's
+  properties are read and written through the member in a method and from
+  outside the class (`o.r.h.k`), also through a nested struct, an array of
+  handles and an array of structs. The constructor did not run and a write
+  through the member was dropped (§7.2, §8.4, §8.7, #1192, reported by
+  Ganesh-TNL).
+
+* The object behind a `rand` class-handle member of a rand unpacked struct is
+  randomized with the object that holds the struct, under its own constraints
+  and the holder's constraints that read only its members (`r.h.k == 5`);
+  `randomize()` returned 0 for such a constraint (§18.4, §18.5.9, #1192,
+  reported by Ganesh-TNL).
+
+* A type written inside a class method is sized in the class scope:
+  `$bits(logic [W-1:0])` and a method-local `typedef logic [W-1:0] lt;` see
+  the class's own and inherited body constants and the parameters of the
+  active specialization, instead of coming out one bit wide (§8.5, §6.20.4,
+  #1273, reported by Ganesh-TNL).
+
+* `$bits` of a typedef named through a class specialization follows that
+  specialization's parameters through a nested class and through a typedef of
+  the specialization or of the nested class (`box #(6)::pay::wide_t`,
+  `p6_t::wide_t`, `b9_t::pay::wide_t`), with named arguments bound by name
+  (§8.23, §8.25.1, §20.6.2, #1273, reported by Ganesh-TNL).
 
 ### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
 
