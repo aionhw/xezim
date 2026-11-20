@@ -3413,6 +3413,13 @@ impl Simulator {
                                 return self.eval_call_inner(expr, &[]);
                             }
                         }
+                        // §5.13, §6.19.5: any other receiver (a class
+                        // property, a struct member, an element) takes the
+                        // methods from its declared type, as the call does.
+                        let recv = self.method_receiver_expr(hier, hier.path.len() - 1);
+                        if let Some(v) = self.enum_method_on_receiver(&recv, &mname, &[]) {
+                            return v;
+                        }
                     }
                 }
                 if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
@@ -6958,6 +6965,10 @@ impl Simulator {
                         if is_enum {
                             return self.eval_call_inner(expr, &[]);
                         }
+                    }
+                    // §6.19.5: a property, member or element receiver.
+                    if let Some(v) = self.enum_method_on_receiver(recv, &member.name, &[]) {
+                        return v;
                     }
                 }
                 // §13.5.5, the same shape for a PACKAGE function: inside a
