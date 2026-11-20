@@ -2737,9 +2737,26 @@ impl Simulator {
                                     // time in any scope's unit; format it
                                     // from the tick counter.
                                     ExprKind::SystemCall { name, .. }
-                                        if name.as_str() == "$realtime" =>
+                                        if matches!(
+                                            name.as_str(),
+                                            "$realtime" | "$__xz_realtime_at"
+                                        ) =>
                                     {
                                         self.format_current_time_parts()
+                                    }
+                                    // §3.14.2.3: a read in a package, class
+                                    // or compilation-unit subroutine is in
+                                    // the declaring scope's unit, which the
+                                    // display then scales from.
+                                    ExprKind::SystemCall { name, args: unit }
+                                        if matches!(
+                                            name.as_str(),
+                                            "$__xz_time_at" | "$__xz_stime_at"
+                                        ) && unit.len() == 1 =>
+                                    {
+                                        let unit_exp = self.eval_expr(&unit[0]).to_f64() as i32;
+                                        let value = self.eval_expr(&args[ai]);
+                                        self.format_time_parts_in(&value, unit_exp)
                                     }
                                     _ => {
                                         let value = self.eval_expr(&args[ai]);

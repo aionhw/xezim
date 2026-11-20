@@ -4341,7 +4341,17 @@ impl Simulator {
     /// Scale a scope-unit value to the `$timeformat` unit and return the
     /// unpadded %t body and minimum field width (§20.4.3, §21.2.1).
     pub(super) fn format_time_parts(&self, value: &Value) -> (String, usize) {
-        let (scope_unit_exp, _) = self.current_timescale_exp();
+        self.format_time_parts_in(value, self.current_timescale_exp().0)
+    }
+
+    /// `format_time_parts` for a value in the unit 10^`scope_unit_exp` s: a
+    /// time read rewritten to its declaring scope's unit (§3.14.2.3) is
+    /// displayed from that unit, not the caller's.
+    pub(super) fn format_time_parts_in(
+        &self,
+        value: &Value,
+        scope_unit_exp: i32,
+    ) -> (String, usize) {
         let (tf_units, tf_prec, tf_suffix, tf_width) = self
             .time_format
             .clone()
