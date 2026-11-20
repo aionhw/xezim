@@ -36,6 +36,7 @@ endinterface
 module mon(input aclk, input aresetn, input valid, input ready);
 endmodule
 module top;
+  initial $assertvacuousoff(0);
   bit aclk; bit aresetn; logic valid; logic ready;
   always #10 aclk = ~aclk;
   initial begin

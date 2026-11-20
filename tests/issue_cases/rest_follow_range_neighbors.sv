@@ -1,5 +1,6 @@
 // §16.12.9: one successful match suffices after another candidate fails.
 module top;
+  initial $assertvacuousoff(0);
  bit clk=0,a=1,b=0,c=0;int hits=0,fails=0;
  always #1 clk=~clk;
  p:assert property(@(posedge clk) a |-> ((1'b1 ##[1:2] b) #-# c)) hits++;else fails++;

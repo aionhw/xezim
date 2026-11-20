@@ -1,5 +1,6 @@
 // top: c16_seq
 module c16_seq;
+  initial $assertvacuousoff(0);
   bit clk; bit a, b, c, d, rst;
   int cyc;
   always #5 clk = ~clk;

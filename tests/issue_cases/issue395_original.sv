@@ -7,6 +7,7 @@
 // edge 2. At edge 1, c is 0, so (c |-> ...) succeeds vacuously and the attempt
 // succeeds there, vacuously. Every other attempt fails (a is 0).
 module top;
+  initial $assertvacuousoff(0);
   logic clk = 0, a = 0, b = 0, c = 0, d = 0;
   int pass_times[$], fails1 = 0, fails2 = 0, hits = 0;
   always #5 clk = ~clk;
