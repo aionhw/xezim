@@ -94,7 +94,10 @@ impl Simulator {
         let mut path = String::new();
         let mut selected = false;
         append(expr, &self.module, &mut path, &mut selected)?;
-        if !selected {
+        // An ordinary array element keeps its unpacked and packed selectors:
+        // its declaration supplies packed lane widths, bounds and pattern types.
+        // Only an indexed scope in the path hides the stored leaf from them.
+        if !selected || !path.rsplit_once('.').is_some_and(|(scope, _)| scope.contains(']')) {
             return None;
         }
         let rooted = path.strip_prefix("$root.");
