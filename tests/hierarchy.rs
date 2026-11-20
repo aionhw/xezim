@@ -533,3 +533,5 @@ mod assignment_origin_sharing_721;
 mod upward_scope_sharing_721;
 #[path = "hierarchy/vif_whole_unpacked_1311.rs"]
 mod vif_whole_unpacked_1311;
+#[path = "hierarchy/generate_if_package_param_member.rs"]
+mod generate_if_package_param_member;
