@@ -293,6 +293,8 @@ mod shift_context_width;
 mod shift_width_and_scope_hint;
 #[path = "types/compiled_member_operand_width.rs"]
 mod compiled_member_operand_width;
+#[path = "types/shortreal_binary32.rs"]
+mod shortreal_binary32;
 #[path = "types/signedness_and_power_context.rs"]
 mod signedness_and_power_context;
 #[path = "types/size_cast_context_and_fn_return_default.rs"]
