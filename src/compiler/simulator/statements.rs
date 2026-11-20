@@ -3598,6 +3598,9 @@ impl Simulator {
                     None
                 };
                 if let Some(shape) = nd_shape {
+                    if let Some(bounds) = self.declared_fixed_dims(&dims) {
+                        self.module.unpacked_decl_dims.insert(name.clone(), bounds);
+                    }
                     self.module.arrays.remove(&name);
                     if shape.len() == 2 {
                         self.module
