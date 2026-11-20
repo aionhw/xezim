@@ -1572,12 +1572,11 @@ impl Simulator {
     /// the register-value half of `delay_value_to_ticks`, without the
     /// pathological-real diagnostics (no source expression at hand).
     pub(super) fn fsm_delay_ticks(&self, v: &Value, precision_diff: i32) -> u64 {
-        let raw = if v.is_real {
-            let f = v.to_f64();
-            if f.is_finite() && f > 0.0 { f } else { 0.0 }
-        } else {
-            v.to_u64().unwrap_or(0) as f64
-        };
+        if !v.is_real {
+            return Self::quantize_integral_delay_ticks(v.to_u64().unwrap_or(0), precision_diff);
+        }
+        let f = v.to_f64();
+        let raw = if f.is_finite() && f > 0.0 { f } else { 0.0 };
         Self::quantize_delay_ticks(raw, precision_diff)
     }
 
@@ -2424,7 +2423,7 @@ impl Simulator {
             }
             if f.is_finite() && f > 0.0 { f } else { 0.0 }
         } else {
-            v.to_u64().unwrap_or(0) as f64
+            return Self::quantize_integral_delay_ticks(v.to_u64().unwrap_or(0), precision_diff);
         };
         // §3.14.3: a delay rounds to the CURRENT MODULE's time precision, not
         // the (finer) global tick — `#1.55` in a 1ns/100ps module is 1.6ns,
@@ -2451,6 +2450,26 @@ impl Simulator {
             ) as u64
         } else {
             raw.round() as u64
+        }
+    }
+
+    /// §3.14.1, §9.4.1: an integral tick count rounded to the running scope's
+    /// precision, 10^`precision_diff` ticks, ties away from zero, in integer
+    /// arithmetic. Converting the count to binary64 first lost its low bits
+    /// above 2^53 ticks (`#(64'd9007199254740993)` under 1 fs woke at
+    /// ...992).
+    #[inline]
+    pub(super) fn quantize_integral_delay_ticks(raw: u64, precision_diff: i32) -> u64 {
+        if precision_diff <= 0 {
+            return raw;
+        }
+        match 10u64.checked_pow(precision_diff as u32) {
+            Some(grid) => {
+                let rem = raw % grid;
+                (raw / grid + u64::from(rem >= grid - rem)).saturating_mul(grid)
+            }
+            // Half a grid step is more than any count: every count rounds to 0.
+            None => 0,
         }
     }
 
