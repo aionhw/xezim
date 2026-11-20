@@ -390,7 +390,8 @@ fn method_boost_enabled() -> bool {
 // declared with an ascending or offset range does not inline.
 // §9.3, §13.3: block bodies in shared statement lists, a continuation tree per task call
 // site, and boxed optional delays, initializers and case item patterns (#721).
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308c;
+// §12.5: an unsigned item makes the entire case comparison unsigned.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308d;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never

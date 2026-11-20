@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Use all case items to determine signedness for `case`, `casez`, and `casex` comparisons (§12.5, #1355).
+
 - **Correctness:** Schedule delayed nonblocking updates even when the target already holds the captured value (§4.9.4, #1354).
 
 - **Correctness:** Compare strings by unsigned character values so `compare()` agrees with the relational operators (§6.16.6, #1361).
