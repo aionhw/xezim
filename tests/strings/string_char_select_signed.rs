@@ -1,10 +1,8 @@
 //! IEEE 1800-2017 §6.16.3: a character select `s[i]` (and `s.getc(i)`) of a
 //! string is a `byte` — signed 8-bit. It read as an unsigned byte, so
 //! `s[0] + s[1]` of "ab" was 195 instead of -61 and `"\xff"[0]` was 255, and a
-//! character select compared as text (`s[0] < 0` was 0). §6.16.6: `compare()`
-//! takes signed character differences, `icompare()` unsigned ones, and the
-//! relational operators order by unsigned bytes. Expected values are the
-//! reference simulator's.
+//! character select compared as text (`s[0] < 0` was 0).
+//! IEEE 1800-2023 §6.16.6 and Table 6-9 order strings by unsigned bytes.
 
 use xezim::simulate;
 
@@ -45,9 +43,9 @@ module top;
     t = c.g("ab", 1);
     t = c.g("\xffz", 0);
     s = "\x80"; t = "\x7f";
-    $display("T|cmp=%0d icmp=%0d lt=%0d gt=%0d", s.compare(t), s.icompare(t), s < t, s > t);
+    $display("T|cmp_positive=%0d icmp=%0d lt=%0d gt=%0d", s.compare(t) > 0, s.icompare(t), s < t, s > t);
     s = "\xff"; t = "a";
-    $display("T|cmp=%0d icmp=%0d lt=%0d gt=%0d", s.compare(t), s.icompare(t), s < t, s > t);
+    $display("T|cmp_positive=%0d icmp=%0d lt=%0d gt=%0d", s.compare(t) > 0, s.icompare(t), s < t, s > t);
   end
 endmodule
 "#;
@@ -65,8 +63,8 @@ fn string_character_selects_are_signed_bytes() {
         "T|c getc=97 cast=97 ucast=97 mul=194 neg=-97 shr=48 sk=98 sz=8",
         "T|g k=1 b=98 lt0=0 sum=-61",
         "T|g k=0 b=-1 lt0=1 sum=121",
-        "T|cmp=-255 icmp=1 lt=0 gt=1",
-        "T|cmp=-98 icmp=158 lt=0 gt=1",
+        "T|cmp_positive=1 icmp=1 lt=0 gt=1",
+        "T|cmp_positive=1 icmp=158 lt=0 gt=1",
     ];
     assert_eq!(t_lines(SRC), want);
 }
