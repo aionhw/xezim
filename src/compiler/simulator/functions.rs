@@ -434,7 +434,7 @@ impl Simulator {
                 // already dropped.
                 let value = match self.formal_pattern_value(port, &args[i]) {
                     Some(v) => v,
-                    None => match self.actual_context_width(port) {
+                    None => match self.free_actual_context_width(port) {
                         Some(w) => self.eval_expr_ctx(&args[i], w),
                         None => self.eval_expr(&args[i]),
                     },
@@ -2831,9 +2831,16 @@ impl Simulator {
                         // §13.5, §11.6.1: as a function's (`exec_function_call`),
                         // a task's input actual is context-determined by its
                         // formal; `t(x + y)` over 8-bit operands lost the carry.
+                        // A module- or package-scope task's formal sized by a
+                        // parameter (`input [W-1:0] v`) gives its width too.
+                        let width = if method_ctx.is_none() {
+                            self.free_actual_context_width(port)
+                        } else {
+                            self.actual_context_width(port)
+                        };
                         let value = match self.formal_pattern_value(port, &args[i]) {
                             Some(v) => v,
-                            None => match self.actual_context_width(port) {
+                            None => match width {
                                 Some(w) => self.eval_expr_ctx(&args[i], w),
                                 None => self.eval_expr(&args[i]),
                             },

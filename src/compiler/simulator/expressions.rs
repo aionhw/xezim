@@ -4234,8 +4234,12 @@ impl Simulator {
                     return c.value(want_eq);
                 }
                 // Short-circuit evaluation for logical operators (IEEE §11.3.5)
+                // §11.6.1 Table 11-21: the operands of `&&`, `||`, `->` and
+                // `<->` are self-determined, so the surrounding width does
+                // not reach them: `(a << 1) || 1'b0` for `logic [7:0] a =
+                // 8'h80` shifts at 8 bits and is 0 in a 32-bit context too.
                 if matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) {
-                    let l = self.eval_expr_ctx(left, ctx_width);
+                    let l = self.eval_expr(left);
                     match op {
                         BinaryOp::LogAnd => {
                             // §11.3.5: `&&` short-circuits only when the left is a
@@ -4246,14 +4250,14 @@ impl Simulator {
                             if !l.has_xz() && l.to_u64() == Some(0) {
                                 return Value::from_u64(0, 1);
                             }
-                            let r = self.eval_expr_ctx(right, ctx_width);
+                            let r = self.eval_expr(right);
                             return l.logic_and(&r);
                         }
                         BinaryOp::LogOr => {
                             if l.to_u64().is_some_and(|v| v != 0) {
                                 return Value::from_u64(1, 1);
                             }
-                            let r = self.eval_expr_ctx(right, ctx_width);
+                            let r = self.eval_expr(right);
                             return l.logic_or(&r);
                         }
                         _ => unreachable!(),
@@ -4266,8 +4270,8 @@ impl Simulator {
                     op,
                     BinaryOp::LogImplies | BinaryOp::LogEquiv | BinaryOp::Iff
                 ) {
-                    let l = self.eval_expr_ctx(left, ctx_width);
-                    let r = self.eval_expr_ctx(right, ctx_width);
+                    let l = self.eval_expr(left);
+                    let r = self.eval_expr(right);
                     return match op {
                         BinaryOp::LogImplies => l.logic_impl(&r),
                         BinaryOp::LogEquiv => l.logic_equiv(&r),
