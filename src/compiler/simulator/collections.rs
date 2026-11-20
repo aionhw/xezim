@@ -3279,7 +3279,11 @@ impl Simulator {
             }
             let w = self.signal_widths[id];
             let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
-            let mut resized = if is_str { val } else { val.resize(w) };
+            let mut resized = if is_str {
+                val
+            } else {
+                self.cell_real_fit(id, val).resize(w)
+            };
             if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
                 resized = resized.to_two_state();
             }
@@ -3388,6 +3392,23 @@ impl Simulator {
     /// Store `val` in table cell `id` as a by-name write of the cell's name
     /// does: fitted to the cell's width, value set and signedness, and marked
     /// dirty when it changed. Returns whether it changed.
+    /// §6.12.1, §10.7: a value written into table cell `id` takes the cell's
+    /// real or integral type before its width: a real into an integral cell
+    /// rounds (`Resize` to 64 bits would keep the real), and an integral or
+    /// unbased unsized value into a real cell converts at its own width
+    /// (§5.7.1: `'1` is one bit there, not 2**64-1).
+    #[inline]
+    fn cell_real_fit(&self, id: usize, val: Value) -> Value {
+        let cell_real = self.signal_real.get(id).copied().unwrap_or(false);
+        if val.is_real == cell_real {
+            val
+        } else if cell_real {
+            Value::from_f64(val.to_f64())
+        } else {
+            Self::real_to_int(val.to_f64(), self.signal_widths[id].max(1))
+        }
+    }
+
     pub(super) fn store_named_cell(&mut self, id: usize, val: Value) -> bool {
         let w = self.signal_widths[id];
         // A width-0 signal (e.g. an untracked module-scope class handle)
@@ -3399,7 +3420,11 @@ impl Simulator {
         // it a `string q[$]` element was still clamped to 128 characters
         // after scalar strings had been fixed.
         let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
-        let mut resized = if w == 0 || is_str { val } else { val.resize(w) };
+        let mut resized = if w == 0 || is_str {
+            val
+        } else {
+            self.cell_real_fit(id, val).resize(w)
+        };
         // §6.11.1: a 2-state destination drops x/z.
         if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
             resized = resized.to_two_state();
