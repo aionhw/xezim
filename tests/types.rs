@@ -843,3 +843,5 @@ mod local_struct_signed_members;
 mod struct_array_member_defaults;
 #[path = "types/union_real_member.rs"]
 mod union_real_member;
+#[path = "types/local_struct_member_arrays.rs"]
+mod local_struct_member_arrays;
