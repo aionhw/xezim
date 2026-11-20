@@ -3,6 +3,14 @@
 use super::*;
 
 impl Simulator {
+    pub(super) fn method_typedef_widths(&self) -> &super::elaborate::TypedefTable {
+        self.declaration_typedefs.as_ref().map_or(&self.module.typedefs, |t| &t.0)
+    }
+
+    pub(super) fn method_typedef_types(&self) -> &super::elaborate::SharedMap<DataType> {
+        self.declaration_typedefs.as_ref().map_or(&self.module.typedef_types, |t| &t.1)
+    }
+
     /// Declared return width of the function `func` names, without calling it.
     /// `None` when the callee is not a plain module-scope function (a method,
     /// a class constructor, an array builtin), where the caller falls back to
@@ -199,7 +207,7 @@ impl Simulator {
                     let w = super::elaborate::resolve_type_width(
                         &f.return_type,
                         Some(&self.module.parameters),
-                        Some(&self.module.typedefs),
+                        Some(self.method_typedef_widths()),
                     );
                     return (w > 0).then_some(w);
                 }

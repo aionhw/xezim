@@ -9939,6 +9939,9 @@ pub struct Simulator {
     meta_pending: usize,
     /// Call plans by `Arc<ClassMethod>` address (see `MethodCallPlan`).
     method_plans: std::cell::RefCell<HashMap<usize, std::rc::Rc<MethodCallPlan>>>,
+    /// Declaration-scope typedefs before a procedural typedef shadows a name.
+    /// The tables share storage until a write (§6.18, §23.9).
+    declaration_typedefs: Option<(super::elaborate::TypedefTable, super::elaborate::SharedMap<DataType>)>,
     /// Moves whenever a procedural `typedef` or an inline-enum local edits the
     /// type tables at run time (see `MethodCallPlan`).
     type_tables_gen: u64,

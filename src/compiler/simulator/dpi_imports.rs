@@ -106,10 +106,19 @@ impl Simulator {
     /// formals keep the caller value untouched (mirrors the direct integral
     /// formal handling that a raw `TypeReference` port bypassed).
     pub(super) fn scalar_formal_integral(&self, dt: &DataType) -> Option<(u32, bool)> {
+        self.scalar_integral_in(dt, &self.module.typedef_types, &self.module.typedefs)
+    }
+
+    pub(super) fn scalar_integral_in(
+        &self,
+        dt: &DataType,
+        types: &HashMap<String, DataType>,
+        widths: &super::elaborate::TypedefTable,
+    ) -> Option<(u32, bool)> {
         use crate::ast::types::DataType as DT;
         // Enum and real stay out: enum formals were never width-adapted and a
         // real typedef must round (not resize) — keep the prior behavior.
-        let resolved = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+        let resolved = super::elaborate::resolve_typedef_chain(dt, types);
         let is_resolved_int =
             matches!(&resolved, DT::IntegerVector { .. } | DT::IntegerAtom { .. })
                 || matches!(
@@ -123,19 +132,19 @@ impl Simulator {
         // on every alias in the chain, not just its terminal element type.
         let named_width = matches!(dt, DT::TypeReference { name, dimensions, .. }
             if !dimensions.is_empty()
-                || super::elaborate::lookup_scoped_type(name, &self.module.typedefs)
+                || super::elaborate::lookup_scoped_type(name, widths)
                     .is_some_and(|width| *width > 0));
         let width_type = if named_width { dt } else { resolved };
         let pw = super::elaborate::resolve_type_width(
             width_type,
             Some(&self.module.parameters),
-            Some(&self.module.typedefs),
+            Some(widths),
         );
         if pw == 0 {
             return None;
         }
         let signed =
-            super::elaborate::is_type_signed_resolved(&resolved, &self.module.typedef_types);
+            super::elaborate::is_type_signed_resolved(&resolved, types);
         Some((pw, signed))
     }
 
