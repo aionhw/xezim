@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Schedule delayed nonblocking updates even when the target already holds the captured value (§4.9.4, #1354).
+
 - **Correctness:** Compare strings by unsigned character values so `compare()` agrees with the relational operators (§6.16.6, #1361).
 - **Correctness:** Reject duplicate package definitions (§3.13, §26.2).
 - **Correctness:** Reject differing duplicate typedef definitions and warn on identical cross-file typedefs (§3.13, §6.18).
