@@ -2494,20 +2494,37 @@ impl Simulator {
         if self.clocking_meta.is_empty() {
             return None;
         }
-        let segs = Self::clocking_term_segs(e)?;
-        let refs: Vec<&str> = segs.iter().map(String::as_str).collect();
-        // The block is the last segment, or the one before a clockvar.
+        // The block is the last segment, or the one before a clockvar. This
+        // is checked on the names as written, before the path is copied: it
+        // runs for every member read of an element (`s[0].i.x`).
+        fn tail_name(e: &Expression) -> Option<&str> {
+            match &e.kind {
+                ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                ExprKind::Index { expr, .. } => tail_name(expr),
+                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+                _ => None,
+            }
+        }
+        let (last, prev) = match &e.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (Some(member.name.as_str()), tail_name(expr))
+            }
+            ExprKind::Ident(h) if h.path.len() > 1 => (
+                h.path.last().map(|s| s.name.name.as_str()),
+                Some(h.path[h.path.len() - 2].name.name.as_str()),
+            ),
+            _ => return None,
+        };
         let block = |s: &str| {
             self.clocking_meta
                 .keys()
                 .any(|k| k == s || k.strip_suffix(s).is_some_and(|p| p.ends_with('.')))
         };
-        if !refs[refs.len().saturating_sub(2)..]
-            .iter()
-            .any(|s| block(s))
-        {
+        if !last.is_some_and(block) && !prev.is_some_and(block) {
             return None;
         }
+        let segs = Self::clocking_term_segs(e)?;
+        let refs: Vec<&str> = segs.iter().map(String::as_str).collect();
         if self.resolve_clocking_key(&refs).is_none()
             && self.resolve_clocking_key(&refs[..refs.len() - 1]).is_none()
         {
