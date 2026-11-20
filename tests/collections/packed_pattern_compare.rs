@@ -17,19 +17,20 @@ fn packed_array_equals_typed_pattern() {
 module top;
   typedef logic [2:0] u3_t;
   typedef u3_t des_t [1:0];
-  u3_t [0:3] a;
+  typedef u3_t [0:3] packed_words_t;
+  packed_words_t a;
   des_t des;
   initial begin
     a = '{2,2,2,2};
     des[1] = 2; des[0] = 2;
-    $display("A1_%b", a == type(a)'{2,2,2,2});
-    $display("A2_%b", a != type(a)'{2,2,2,2});
-    $display("A3_%b", a === type(a)'{2,2,2,2});
-    $display("A4_%b", a !== type(a)'{2,2,2,2});
-    $display("A5_%b", a == type(a)'{2,2,2,3});
-    $display("A6_%b", a != type(a)'{2,2,2,3});
-    $display("D1_%b", des == type(des)'{2,2});
-    $display("D2_%b", des == type(des)'{2,3});
+    $display("A1_%b", a == packed_words_t'{2,2,2,2});
+    $display("A2_%b", a != packed_words_t'{2,2,2,2});
+    $display("A3_%b", a === packed_words_t'{2,2,2,2});
+    $display("A4_%b", a !== packed_words_t'{2,2,2,2});
+    $display("A5_%b", a == packed_words_t'{2,2,2,3});
+    $display("A6_%b", a != packed_words_t'{2,2,2,3});
+    $display("D1_%b", des == des_t'{2,2});
+    $display("D2_%b", des == des_t'{2,3});
   end
 endmodule
 "#);
@@ -48,12 +49,13 @@ endmodule
 fn packed_multi_dim_array_vs_nested_pattern() {
     let msgs = run(r#"
 module top;
-  logic [1:0][0:3][2:0] d2d;
+  typedef logic [1:0][0:3][2:0] matrix_t;
+  matrix_t d2d;
   initial begin
     d2d = '{'{1,2,3,4},'{5,6,7,8}};
-    $display("M1_%b", d2d == type(d2d)'{'{1,2,3,4},'{5,6,7,8}});
-    $display("M2_%b", d2d == type(d2d)'{'{1,2,3,4},'{5,6,7,9}});
-    $display("M3_%b", d2d === type(d2d)'{'{1,2,3,4},'{5,6,7,8}});
+    $display("M1_%b", d2d == matrix_t'{'{1,2,3,4},'{5,6,7,8}});
+    $display("M2_%b", d2d == matrix_t'{'{1,2,3,4},'{5,6,7,9}});
+    $display("M3_%b", d2d === matrix_t'{'{1,2,3,4},'{5,6,7,8}});
   end
 endmodule
 "#);
@@ -74,10 +76,10 @@ module top;
   ps_t ps;
   initial begin
     ps = '{12'h34, 8'h56};
-    $display("S1_%b", ps == type(ps)'{12'h34, 8'h56});
-    $display("S2_%b", ps == type(ps)'{12'h35, 8'h56});
-    $display("S3_%b", ps === type(ps)'{12'h34, 8'h56});
-    $display("S4_%b", ps == type(ps)'{y:8'h56, x:12'h34});
+    $display("S1_%b", ps == ps_t'{12'h34, 8'h56});
+    $display("S2_%b", ps == ps_t'{12'h35, 8'h56});
+    $display("S3_%b", ps === ps_t'{12'h34, 8'h56});
+    $display("S4_%b", ps == ps_t'{y:8'h56, x:12'h34});
   end
 endmodule
 "#);
@@ -90,7 +92,7 @@ endmodule
 
 #[test]
 fn wildcard_ops_on_packed_aggregate_vs_pattern() {
-    // §11.4.6 `==?`/`!=?` on a packed aggregate vs a bare pattern: these were
+    // §11.4.6 `==?`/`!=?` on a packed aggregate vs a typed pattern: these were
     // not dispatched through the pattern comparator (bug cousin of J) and so
     // reported unequal — a no-wildcard pattern must compare like `==`. An x/z
     // in the pattern item is a don't-care; an x/z in the element at a
@@ -106,12 +108,12 @@ module top;
   initial begin
     a = '{1,2,3,4};
     ps = '{8'h34, 4'hC};
-    $display("W1_%b", a ==? type(a)'{1,2,3,4});
-    $display("W2_%b", a !=? type(a)'{1,2,3,4});
-    $display("W3_%b", a ==? type(a)'{1,2,3,5});
-    $display("W4_%b", a ==? type(a)'{1,2,'x,4});  // 'x item is a don't-care
-    $display("W5_%b", ps ==? type(ps)'{8'h34, 4'hC});
-    $display("W6_%b", ps ==? type(ps)'{8'h34, 4'hD});
+    $display("W1_%b", a ==? st_t'{1,2,3,4});
+    $display("W2_%b", a !=? st_t'{1,2,3,4});
+    $display("W3_%b", a ==? st_t'{1,2,3,5});
+    $display("W4_%b", a ==? st_t'{1,2,'x,4});  // 'x item is a don't-care
+    $display("W5_%b", ps ==? ps_t'{8'h34, 4'hC});
+    $display("W6_%b", ps ==? ps_t'{8'h34, 4'hD});
   end
 endmodule
 "#);
@@ -127,19 +129,20 @@ endmodule
 #[test]
 fn packed_slice_vs_typed_pattern() {
     // A packed sub-array slice (`d2[0]`, an Index expression into a packed
-    // array) compared against a bare pattern must compare its rows element-
+    // array) compared against a typed pattern must compare its rows element-
     // wise like the whole array. This was a separate latent gap (fallback to
     // the packed-scalar compare always returned 0). Reference-verified.
     let msgs = run(r#"
 module top;
-  logic [0:3][3:0][2:0] d2;
+  typedef logic [3:0][2:0] row_t;
+  row_t [0:3] d2;
   initial begin
     d2 = '{'{1,2,3,4},'{5,6,7,8},'{9,10,11,12},'{13,14,15,16}};
-    $display("Z1_%b", d2[0] == type(d2[0])'{1,2,3,4});
-    $display("Z2_%b", d2[0] == type(d2[0])'{1,2,3,5});
-    $display("Z3_%b", d2[0] != type(d2[0])'{1,2,3,4});
-    $display("Z4_%b", d2[0] === type(d2[0])'{1,2,3,4});
-    $display("Z5_%b", d2[2] == type(d2[2])'{9,10,11,12});
+    $display("Z1_%b", d2[0] == row_t'{1,2,3,4});
+    $display("Z2_%b", d2[0] == row_t'{1,2,3,5});
+    $display("Z3_%b", d2[0] != row_t'{1,2,3,4});
+    $display("Z4_%b", d2[0] === row_t'{1,2,3,4});
+    $display("Z5_%b", d2[2] == row_t'{9,10,11,12});
   end
 endmodule
 "#);
