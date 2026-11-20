@@ -22,8 +22,7 @@ fn parked_waiter_reads_pre_edge_block_value() {
     // right after `@(posedge)`. The check must see the data, not the blast.
     let sim = simulate(
         r#"
-module dut (input clk, input en, output [7:0] q);
-  reg [7:0] q;
+module dut (input clk, input en, output reg [7:0] q);
   reg en_r;
   always @(posedge clk) begin
     en_r = en;

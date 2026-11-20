@@ -597,9 +597,9 @@ module top; dut u(); endmodule
 fn a_top_level_checker_names_its_blocks_in_each_instance() {
     let got = lines(
         r#"checker chk(input logic c);
-  if (1) begin function int f(); return 11; endfunction initial $display("%m %0d", f()); end
-  if (1) begin task t(); $display("%m t"); endtask initial t(); end
-  if (0) ; else begin logic [7:0] v = 8'd42; initial $display("%m v=%0d", v); end
+  if (1) begin function int f(); return 11; endfunction initial assert (1) $display("%m %0d", f()); end
+  if (1) begin function int t(); return 2; endfunction initial assert (t() == 2) $display("%m t"); end
+  if (0) ; else begin logic [7:0] v = 8'd42; initial assert (1) $display("%m v=%0d", v); end
 endchecker
 module top;
   logic clk = 0;
@@ -612,10 +612,10 @@ endmodule
         got,
         [
             "top.k.genblk1 11",
-            "top.k.genblk2.t t",
+            "top.k.genblk2 t",
             "top.k.genblk3 v=42",
             "top.k2.genblk1 11",
-            "top.k2.genblk2.t t",
+            "top.k2.genblk2 t",
             "top.k2.genblk3 v=42",
         ]
     );
@@ -627,9 +627,9 @@ endmodule
 fn a_top_level_checkers_blocks_keep_their_subroutines_apart() {
     let got = lines(
         r#"checker chk(input logic c);
-  if (1) begin function int f(); return 1; endfunction initial $display("a %0d", f()); end
-  if (1) begin function int f(); return 2; endfunction initial $display("b %0d", f()); end
-  if (1) if (1) begin : d function int f(); return 3; endfunction initial $display("%m %0d", f()); end
+  if (1) begin function int f(); return 1; endfunction initial assert (1) $display("a %0d", f()); end
+  if (1) begin function int f(); return 2; endfunction initial assert (1) $display("b %0d", f()); end
+  if (1) if (1) begin : d function int f(); return 3; endfunction initial assert (1) $display("%m %0d", f()); end
 endchecker
 module top;
   logic clk = 0;
