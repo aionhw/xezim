@@ -2582,6 +2582,24 @@ impl Simulator {
                     let rewritten = Expression::new(ExprKind::Ident(abs), expr.span);
                     return self.eval_expr_ctx_inner(&rewritten, ctx_width, unsigned_context);
                 }
+                if h.path.len() >= 4 && h.path[0].name.name == "$root" {
+                    for i in 2..h.path.len() - 1 {
+                        if h.path[i].selects.is_empty() {
+                            continue;
+                        }
+                        let mut prefix = h.clone();
+                        prefix.path.truncate(i + 1);
+                        prefix.path[i].selects.clear();
+                        prefix.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                        prefix.cached_resolved_name = crate::ast::cache::NameCache::new();
+                        prefix.bound = crate::ast::binding::Bound::UNSET;
+                        let name = self.resolve_hier_name(&prefix);
+                        if self.module.dynamic_arrays.contains(name.as_ref()) {
+                            let selected = Self::hier_select_chain_from(h, expr.span, i);
+                            return self.eval_expr_ctx_inner(&selected, ctx_width, unsigned_context);
+                        }
+                    }
+                }
                 if h.path.len() >= 2
                     && !self.local_stack.is_empty()
                     && let Some(v) = self.frame_handle_path_read(expr)

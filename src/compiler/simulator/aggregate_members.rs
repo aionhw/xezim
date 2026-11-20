@@ -3879,27 +3879,33 @@ impl Simulator {
         h: &crate::ast::expr::HierarchicalIdentifier,
         span: crate::ast::Span,
     ) -> Expression {
-        let mut cur: Option<Expression> = None;
-        for seg in &h.path {
-            let mut e = match cur.take() {
-                None => {
-                    let mut root = h.clone();
-                    root.path = vec![crate::ast::expr::HierPathSegment {
-                        name: seg.name.clone(),
-                        selects: Vec::new(),
-                    }];
-                    root.cached_signal_id = crate::ast::cache::SignalCache::new(None);
-                    root.cached_resolved_name = crate::ast::cache::NameCache::new();
-                    Expression::new(ExprKind::Ident(root), span)
-                }
-                Some(b) => Expression::new(
+        Self::hier_select_chain_from(h, span, 0)
+    }
+
+    /// Preserve the hierarchy through the storage name. Only the remaining
+    /// selects and members are operations on the value (§23.6, §7.10).
+    pub(super) fn hier_select_chain_from(
+        h: &crate::ast::expr::HierarchicalIdentifier,
+        span: crate::ast::Span,
+        storage: usize,
+    ) -> Expression {
+        let mut root = h.clone();
+        root.path.truncate(storage + 1);
+        root.path[storage].selects.clear();
+        root.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+        root.cached_resolved_name = crate::ast::cache::NameCache::new();
+        root.bound = crate::ast::binding::Bound::UNSET;
+        let mut e = Expression::new(ExprKind::Ident(root), span);
+        for (i, seg) in h.path.iter().enumerate().skip(storage) {
+            if i != storage {
+                e = Expression::new(
                     ExprKind::MemberAccess {
-                        expr: Box::new(b),
+                        expr: Box::new(e),
                         member: seg.name.clone(),
                     },
                     span,
-                ),
-            };
+                );
+            }
             for sel in &seg.selects {
                 e = Expression::new(
                     ExprKind::Index {
@@ -3909,9 +3915,8 @@ impl Simulator {
                     span,
                 );
             }
-            cur = Some(e);
         }
-        cur.expect("non-empty hierarchical path")
+        e
     }
 
     /// §7.8.6: a write through a dynamic member of an associative-array
