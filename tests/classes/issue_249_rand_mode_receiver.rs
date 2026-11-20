@@ -55,11 +55,11 @@ module top;
     $display("T after id=%0d len=%0d", i.id, i.len);
     i.sub = p;
     i.sub_off();
-    $display("T sub_off sub=%0d p.a=%0d o=%0d", i.sub.rand_mode(), p.a.rand_mode(), o.rand_mode());
+    $display("T sub_off sub=%0d p.a=%0d o=%0d", i.sub.rand_mode(), p.a.rand_mode(), o.a.rand_mode());
     i.cons_off();
     $display("T constraint c_len=%0d", i.c_len.constraint_mode());
     i.arg_off(o);
-    $display("T argument o=%0d", o.rand_mode());
+    $display("T argument o=%0d", o.a.rand_mode());
   end
 endmodule
 "#,
@@ -103,7 +103,7 @@ module top;
     i.freeze();
     d.freeze();
     $display("T i.id=%0d i.tp=%0d d.id=%0d o=%0d",
-             i.id.rand_mode(), i.tp.rand_mode(), d.id.rand_mode(), o.rand_mode());
+             i.id.rand_mode(), i.tp.rand_mode(), d.id.rand_mode(), o.a.rand_mode());
   end
 endmodule
 "#,
