@@ -123,6 +123,8 @@ mod system_task_gaps;
 mod uvm_dpi_driver_linkage;
 #[path = "strings/uvm_dpi_user_library_wins.rs"]
 mod uvm_dpi_user_library_wins;
+#[path = "strings/vpi_array_elem_range.rs"]
+mod vpi_array_elem_range;
 #[path = "strings/vpi_array_ports.rs"]
 mod vpi_array_ports;
 #[path = "strings/vpi_assertion_controls.rs"]
