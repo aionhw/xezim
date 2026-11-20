@@ -265,6 +265,8 @@ mod waiter_edge_ordering;
 mod xtrace_conformance;
 #[path = "scheduling/zero_delay_inactive_region.rs"]
 mod zero_delay_inactive_region;
+#[path = "scheduling/zero_delay_task_recursion.rs"]
+mod zero_delay_task_recursion;
 
 #[path = "scheduling/compiled_for_loops.rs"]
 mod compiled_for_loops;

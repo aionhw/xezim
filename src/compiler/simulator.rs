@@ -10863,6 +10863,11 @@ pub struct Simulator {
     /// While this is non-zero, procedural comb entries triggered mid-process
     /// are parked in `deferred_comb` and run at the process's exit instead.
     proc_depth: u32,
+    /// Nesting of `run_process_stmts` activations on the native stack. A
+    /// process that calls a task which can wait but does not resumes the
+    /// caller from inside the callee's activation, so a call chain that never
+    /// waits nests one level per call (see `process_nesting_exceeded`).
+    stmts_depth: u32,
     /// (comb entry index, outputs it produced) for procedural entries that ran
     /// while a process was mid-flight. Checked for clobbering at process exit.
     deferred_comb: Vec<(usize, Vec<(usize, Value)>)>,

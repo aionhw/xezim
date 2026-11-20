@@ -4936,6 +4936,7 @@ impl Simulator {
             edge_exec_wrote: Vec::new(),
             edge_exec_seen: Vec::new(),
             proc_depth: 0,
+            stmts_depth: 0,
             deferred_comb: Vec::new(),
             in_edge_rescan: false,
             edge_rescan_block_hits: HashMap::default(),
