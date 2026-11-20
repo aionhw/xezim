@@ -163,6 +163,8 @@ mod intra_assignment_delay;
 mod intra_assignment_event_identifier;
 #[path = "scheduling/intra_delay_assignment_pattern.rs"]
 mod intra_delay_assignment_pattern;
+#[path = "scheduling/intra_delay_unpacked_array_shapes.rs"]
+mod intra_delay_unpacked_array_shapes;
 #[path = "scheduling/issue_237_mixed_clock_configs.rs"]
 mod issue_237_mixed_clock_configs;
 #[path = "scheduling/ivtest_always_cluster.rs"]
