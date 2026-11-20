@@ -1,7 +1,6 @@
 // §16.12.9 / §16.14.8: settle at the first successful consequent tick,
 // preserving vacuity and preferring simultaneous nonvacuous successes.
 module followed_case #(bit SHIFT = 0, bit STRONG = 0, bit FAIL_FIRST = 0);
-  initial $assertvacuousoff(0);
   logic clk = 0, a = 0, b = 0, c = 0, d = 0;
   int passes = 0, hits = 0, failures = 0;
   always #5 clk = ~clk;
@@ -39,7 +38,6 @@ module followed_case #(bit SHIFT = 0, bit STRONG = 0, bit FAIL_FIRST = 0);
 endmodule
 
 module followed_simultaneous #(bit REVERSE = 0);
-  initial $assertvacuousoff(0);
   logic clk = 0, a = 0, d = 1;
   int passes = 0, hits = 0, failures = 0;
   always #5 clk = ~clk;

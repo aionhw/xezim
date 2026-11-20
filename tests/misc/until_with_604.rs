@@ -9,7 +9,6 @@ fn reported_property_parses() {
     assert!(
         simulate(
             r#"module top;
-  initial $assertvacuousoff(0);
   bit clk, a, b;
   property hold_until_done;
     @(posedge clk) a |-> (!a until_with b);

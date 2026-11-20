@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Concurrent assertions run their pass action on vacuous success by default. Assertion control tasks can disable it (§20.11, #1339).
+
 - **Correctness:** Resolve an unadorned parameterized class name in a typedef type argument to its default specialization (§8.25, #1357).
 
 - **Correctness:** Schedule delayed nonblocking updates even when the target already holds the captured value (§4.9.4, #1354).
