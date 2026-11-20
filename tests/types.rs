@@ -831,3 +831,5 @@ mod review_pattern_type_keys_imports;
 mod real_to_integral_cast;
 #[path = "types/real_into_integral_64.rs"]
 mod real_into_integral_64;
+#[path = "types/real_case_items.rs"]
+mod real_case_items;
