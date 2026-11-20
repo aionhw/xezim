@@ -69,8 +69,8 @@ module tb;
       int a[5] = '{4, 1, 3, 5, 2};
       int q[$], idx[$];
       `CK("sum", a.sum() == 15)
-      `CK("min", a.min() == '{1})
-      `CK("max", a.max() == '{5})
+      `CK("min", a.min() == type(a.min())'{1})
+      `CK("max", a.max() == type(a.max())'{5})
       q = a.find with (item > 2);
       `CK("find", q.size() == 3)
       idx = a.find_first_index with (item == 3);

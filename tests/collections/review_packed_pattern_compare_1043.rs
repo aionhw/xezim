@@ -44,13 +44,13 @@ module top;
   class C;
     u3_t [0:3] cp;
     ps_t cs;
-    function bit eq_this(); return cp == '{2,2,2,2}; endfunction
-    function bit eq_cs(); return cs == '{lo:1, hi:2}; endfunction
+    function bit eq_this(); return cp == type(cp)'{2,2,2,2}; endfunction
+    function bit eq_cs(); return cs == type(cs)'{lo:1, hi:2}; endfunction
   endclass
   C c;
   function automatic u3_t [0:3] f_ret(); return '{2,2,2,2}; endfunction
   function automatic ps_t f_ps(); return '{lo:1, hi:2}; endfunction
-  function automatic bit f_formal(u3_t [0:3] x); return x == '{2,2,2,2}; endfunction
+  function automatic bit f_formal(u3_t [0:3] x); return x == type(x)'{2,2,2,2}; endfunction
   int n;
   initial begin
     pa = '{2,2,2,2}; px = '{2,2,'x,2};
@@ -63,21 +63,21 @@ module top;
     plain = 8'b1010_0101;
     b2 = '{1,2,3,0};
     c = new; c.cp = '{2,2,2,2}; c.cs = '{lo:1, hi:2};
-    $display("X1 %b %b %b %b", pa == '{2,2,'x,2}, pa != '{2,2,'x,2}, pa === '{2,2,'x,2}, pa !== '{2,2,'x,2});
-    $display("X2 %b %b %b %b", px == '{2,2,2,2}, px != '{2,2,2,2}, px === '{2,2,'x,2}, px == '{3,2,2,2});
-    $display("X3 %b %b %b", psx == '{1,2}, psx != '{1,3}, psx === '{'x,2});
-    $display("S1 %b %b %b", f_ret() == '{2,2,2,2}, f_ps() == '{lo:1, hi:2}, f_formal(pa));
-    $display("S2 %b %b %b %b", c.cp == '{2,2,2,2}, c.cs == '{1,2}, c.eq_this(), c.eq_cs());
-    $display("S3 %b %b", aps[1] == '{lo:3, hi:4}, aps == '{'{1,2},'{3,4}});
-    $display("S4 %b %b", uaps[1] == '{lo:3, hi:4}, uaps == '{'{1,2},'{3,4}});
-    $display("S5 %b %b", upe[0] == '{2,2,2,2}, upe == '{'{2,2,2,2}, '{2,2,2,2}});
-    $display("S6 %b %b", plain == '{1,0,1,0,0,1,0,1}, plain == '{default:1});
-    $display("S7 %b %b", b2 == '{1,2,3,0}, b2 == '{3:1, default:0});
-    $display("S8 %b %b", ps == '{u3_t:2}, ps == '{lo:1, default:2});
-    $display("S9 %b %b %b", (pa) == ('{2,2,2,2}), m2 == '{2{2}}, m2 == '{default:2});
-    $display("S10 %b %b", nst == '{a:'{lo:2,hi:2}, b:'{lo:2,hi:2}}, pa ==? '{2,'x,2,2});
+    $display("X1 %b %b %b %b", pa == type(pa)'{2,2,'x,2}, pa != type(pa)'{2,2,'x,2}, pa === type(pa)'{2,2,'x,2}, pa !== type(pa)'{2,2,'x,2});
+    $display("X2 %b %b %b %b", px == type(px)'{2,2,2,2}, px != type(px)'{2,2,2,2}, px === type(px)'{2,2,'x,2}, px == type(px)'{3,2,2,2});
+    $display("X3 %b %b %b", psx == type(psx)'{1,2}, psx != type(psx)'{1,3}, psx === type(psx)'{'x,2});
+    $display("S1 %b %b %b", f_ret() == type(f_ret())'{2,2,2,2}, f_ps() == type(f_ps())'{lo:1, hi:2}, f_formal(pa));
+    $display("S2 %b %b %b %b", c.cp == type(c.cp)'{2,2,2,2}, c.cs == type(c.cs)'{1,2}, c.eq_this(), c.eq_cs());
+    $display("S3 %b %b", aps[1] == type(aps[1])'{lo:3, hi:4}, aps == type(aps)'{'{1,2},'{3,4}});
+    $display("S4 %b %b", uaps[1] == type(uaps[1])'{lo:3, hi:4}, uaps == type(uaps)'{'{1,2},'{3,4}});
+    $display("S5 %b %b", upe[0] == type(upe[0])'{2,2,2,2}, upe == type(upe)'{'{2,2,2,2}, '{2,2,2,2}});
+    $display("S6 %b %b", plain == type(plain)'{1,0,1,0,0,1,0,1}, plain == type(plain)'{default:1});
+    $display("S7 %b %b", b2 == type(b2)'{1,2,3,0}, b2 == type(b2)'{3:1, default:0});
+    $display("S8 %b %b", ps == type(ps)'{u3_t:2}, ps == type(ps)'{lo:1, default:2});
+    $display("S9 %b %b %b", (pa) == ('{2,2,2,2}), m2 == type(m2)'{2{2}}, m2 == type(m2)'{default:2});
+    $display("S10 %b %b", nst == type(nst)'{a:'{lo:2,hi:2}, b:'{lo:2,hi:2}}, pa ==? type(pa)'{2,'x,2,2});
     n = 0;
-    foreach (upe[i]) if (upe[i] == '{2,2,2,2}) n++;
+    foreach (upe[i]) if (upe[i] == type(upe[i])'{2,2,2,2}) n++;
     $display("S11 %0d", n);
   end
 endmodule
@@ -114,10 +114,10 @@ module top;
   u3_t ua [0:3];
   logic clk = 0, w1, w2;
   int nf = 0, np = 0;
-  assign w1 = (v == '{2,2,2,2});
-  assign w2 = (ua == '{2,2,2,2});
-  a_cmp: assert property (@(posedge clk) (v == '{2,2,2,2})) np++; else nf++;
-  a_un: assert property (@(posedge clk) (ua == '{2,2,2,2})) np++; else nf++;
+  assign w1 = (v == type(v)'{2,2,2,2});
+  assign w2 = (ua == type(ua)'{2,2,2,2});
+  a_cmp: assert property (@(posedge clk) (v == type(v)'{2,2,2,2})) np++; else nf++;
+  a_un: assert property (@(posedge clk) (ua == type(ua)'{2,2,2,2})) np++; else nf++;
   always #1 clk = ~clk;
   initial begin
     v = '{2,2,2,2}; ua = '{2,2,2,2};
