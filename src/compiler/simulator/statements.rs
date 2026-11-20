@@ -4796,24 +4796,9 @@ impl Simulator {
                     // §4.9.4: matures in the target slot's NBA REGION — the
                     // separate queue commits inside apply_nba, so Active
                     // reads at the same time still see the old value.
-                    //
-                    // Reference-parity (#145): a delayed NBA whose captured
-                    // value equals the CURRENT value is elided at SCHEDULE
-                    // time (`q = 0; q <= #5 0; #1 q = 1;` leaves q at 1 —
-                    // the reference never lands the update). Elide only when
-                    // no delayed NBA is already pending for the id: a
-                    // pending entry, not the register, is the truth then
-                    // (the #142 rule).
                     let mut v = val.resize_for_assign(w);
-                    // Normalize signedness to the TARGET before comparing —
-                    // the apply site does the same at maturity, and without
-                    // it the elision compare saw identical bits as unequal
-                    // Values and always pushed.
                     v.is_signed = self.signal_signed[id];
-                    let pending_here = self.delayed_nba.iter().any(|(_, sid, _)| *sid == id);
-                    if pending_here || self.signal_table[id] != v {
-                        self.delayed_nba.push((self.time + d, id, v));
-                    }
+                    self.delayed_nba.push((self.time + d, id, v));
                 } else {
                     let frozen = self.freeze_lvalue_indices(lvalue);
                     let qval = if self.nba_target_is_assoc_elem(lvalue) {

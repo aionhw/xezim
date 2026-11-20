@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Schedule delayed nonblocking updates even when the target already holds the captured value (§4.9.4, #1354).
+
 - **Correctness:** Reject duplicate package definitions (§3.13, §26.2).
 - **Correctness:** Reject differing duplicate typedef definitions and warn on identical cross-file typedefs (§3.13, §6.18).
 - **Correctness:** Warn on redefined interfaces, programs and primitives (§3.13, §25.3).
