@@ -383,6 +383,8 @@ mod dyn_array_of_dyn_array_rows;
 
 #[path = "collections/pattern_array_items.rs"]
 mod pattern_array_items;
+#[path = "collections/pattern_replication_evaluated_once.rs"]
+mod pattern_replication_evaluated_once;
 #[path = "collections/pattern_struct_array_and_slice_items.rs"]
 mod pattern_struct_array_and_slice_items;
 #[path = "collections/pattern_struct_element_items.rs"]
