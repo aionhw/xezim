@@ -102,6 +102,8 @@ mod wave_suppress;
 mod udp_unnamed_after_delay_579;
 #[path = "gates/udp_delay_forms.rs"]
 mod udp_delay_forms;
+#[path = "gates/udp_instance_delay_units.rs"]
+mod udp_instance_delay_units;
 
 #[path = "gates/udp_adjacent_symbols_841.rs"]
 mod udp_adjacent_symbols_841;
