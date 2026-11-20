@@ -522,6 +522,8 @@ mod type_id_create_applies_override;
 mod typedef_chain_local_namespace;
 #[path = "types/typedef_real_struct_members.rs"]
 mod typedef_real_struct_members;
+#[path = "types/typedef_real_alias.rs"]
+mod typedef_real_alias;
 #[path = "types/unpacked_elem_compare_width.rs"]
 mod unpacked_elem_compare_width;
 #[path = "types/vector_type_arg_spec.rs"]
