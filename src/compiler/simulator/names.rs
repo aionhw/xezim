@@ -728,6 +728,36 @@ mod tests {
         assert_eq!(all, 6);
     }
 
+    /// A subroutine call's own storage key (`@q#17`) is not kept in the
+    /// interface-alias cache, which would otherwise grow by one entry per
+    /// call for the whole run; every other answer still is, and the lookups
+    /// return the same ids either way.
+    #[test]
+    fn call_storage_keys_stay_out_of_the_interface_cache() {
+        let mut m = NameMap::default();
+        m.insert(Arc::from("u_if.d"), 0);
+        m.insert(Arc::from("@q#7"), 1);
+        m.insert(Arc::from("@q#8[0]"), 2);
+        let mut aliases = HashMap::default();
+        aliases.insert("u.p".to_string(), "u_if".to_string());
+        m.set_interface_aliases("top".to_string(), aliases);
+        assert_eq!(m.get("u.p.d"), Some(&0), "an aliased name resolves");
+        assert_eq!(m.get("other"), None);
+        for k in 9..200 {
+            assert_eq!(m.get(&format!("@q#{k}")), None);
+            assert_eq!(m.get(&format!("@q#{k}[2]")), None);
+        }
+        assert_eq!(m.get("@q#7"), Some(&1));
+        assert_eq!(m.get("@q#8[0]"), Some(&2));
+        let cache = m.interface_cache.read().unwrap();
+        assert!(cache.contains_key("u.p.d") && cache.contains_key("other"));
+        assert!(
+            cache.keys().all(|k| !k.starts_with('@')),
+            "call storage keys were cached: {:?}",
+            cache.keys().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn id_names_keep_ids_aligned_across_gaps() {
         let mut n = IdNames::default();
