@@ -222,6 +222,9 @@ impl Simulator {
     /// name is looked up.
     pub(super) fn declare_enum_constant(&mut self, name: &str, v: Value) {
         self.module.parameters.insert(name.to_string(), v.clone());
+        // The instance overlays and the overlaid table are built from the
+        // parameter table; build them again with the new constant.
+        *self.decl_param_scope_cache.get_mut() = Default::default();
         self.set_signal_value_by_name(name, v);
     }
 
