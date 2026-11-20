@@ -333,6 +333,8 @@ mod assoc_packed_elem;
 mod packed_struct_member_idx_select;
 #[path = "collections/real_unpacked_concat_items.rs"]
 mod real_unpacked_concat_items;
+#[path = "collections/review_unpacked_concat_1322.rs"]
+mod review_unpacked_concat_1322;
 #[path = "collections/unpacked_case_compare.rs"]
 mod unpacked_case_compare;
 #[path = "collections/unpacked_concat_fixed_row.rs"]
