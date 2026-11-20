@@ -1251,6 +1251,20 @@ impl Simulator {
             }
             return Some("re-arming via #0 delay".to_string());
         }
+        // A process FSM parks with an EMPTY continuation: its state is the
+        // frame's resume pc, so there is no AST above to classify. The
+        // instruction before that pc is the wait it suspended on; a delay
+        // wait that re-arms at this same timestamp was a zero delay (an
+        // edge wait is parked as an event waiter, classified below).
+        if let Some(f) = self.proc_fsm.get(&pid) {
+            let waited_on_delay = (f.pc as usize)
+                .checked_sub(1)
+                .and_then(|i| f.compiled.instructions.get(i))
+                .is_some_and(|i| matches!(i, super::bytecode::Insn::WaitDelayReg(_)));
+            if waited_on_delay {
+                return Some("re-arming via #0 delay".to_string());
+            }
+        }
         // Blocked on @(...) — if it is also a top spinner, something keeps
         // re-triggering it at this timestamp.
         if let Some(w) = self.event_waiters.first_of_pid(pid) {
