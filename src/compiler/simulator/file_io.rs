@@ -1318,7 +1318,7 @@ impl Simulator {
         // §21.4: with no start address, loading begins at the memory's left
         // bound; an associative array has none and begins at address 0.
         let first = if assoc { key_order(0, bias) } else { lo };
-        let mut addr = match args.get(2) {
+        let start = match args.get(2) {
             Some(a) => self
                 .memory_task_address(a)
                 .map(|a| key_order(a, bias))
@@ -1332,7 +1332,7 @@ impl Simulator {
                 .unwrap_or(hi),
             None => hi,
         };
-        let step: i128 = if addr <= end_addr { 1 } else { -1 };
+        let step: i128 = if start <= end_addr { 1 } else { -1 };
         let min_idx = lo.min(hi);
         let max_idx = lo.max(hi);
         let content = match std::fs::read_to_string(&path) {
@@ -1351,35 +1351,36 @@ impl Simulator {
             }
         };
         let mut loaded = 0usize;
+        let mut next_addr = Some(start);
         let dense_array = if assoc {
             None
         } else {
             self.array_first_id.get(mem_name.as_str()).copied()
         };
         let mut assoc_changed = false;
-        'lines: for raw_line in content.lines() {
+        for raw_line in content.lines() {
             let line = raw_line.split("//").next().unwrap_or("").trim();
             if line.is_empty() {
                 continue;
             }
             for raw_tok in line.split_whitespace() {
-                if step > 0 {
-                    if addr > end_addr {
-                        break 'lines;
-                    }
-                } else if addr < end_addr {
-                    break 'lines;
-                }
                 if let Some(rest) = raw_tok.strip_prefix('@') {
                     let addr_hex = rest.trim_start_matches("0x").trim_start_matches("0X");
                     if let Some(a) = Self::memory_file_address(addr_hex, key) {
-                        addr = key_order(a, bias);
+                        next_addr = Some(key_order(a, bias));
                     }
                     continue;
                 }
                 let Some((radix, digits)) = Self::parse_mem_token(raw_tok, default_radix) else {
                     continue;
                 };
+                // An explicit address can restart a sparse image after the
+                // previous run reached its finish or the index type's limit.
+                let Some(addr) = next_addr else { continue };
+                if (step > 0 && addr > end_addr) || (step < 0 && addr < end_addr) {
+                    continue;
+                }
+                next_addr = addr.checked_add(step);
                 if addr >= min_idx && addr <= max_idx {
                     let val = Value::from_str_radix(&digits, radix, width);
                     if assoc {
@@ -1392,10 +1393,6 @@ impl Simulator {
                             if is_packed_id(id) {
                                 self.cell_write(id, &val);
                                 loaded += 1;
-                                let Some(next) = addr.checked_add(step) else {
-                                    break 'lines;
-                                };
-                                addr = next;
                                 continue;
                             }
                             let width = self.signal_widths[id];
@@ -1423,12 +1420,6 @@ impl Simulator {
                     }
                     loaded += 1;
                 }
-                // The last address a wide index type holds ends the load
-                // rather than wrap to the other end of the range.
-                let Some(next) = addr.checked_add(step) else {
-                    break 'lines;
-                };
-                addr = next;
             }
         }
         if assoc_changed {
@@ -1538,24 +1529,26 @@ impl Simulator {
         let max_idx = lo.max(hi);
         let dense_array = self.array_first_id.get(mem_name.as_str()).copied();
         let mut out = String::new();
-        let mut addr = start;
-        while (step > 0 && addr <= end) || (step < 0 && addr >= end) {
-            if addr >= min_idx && addr <= max_idx {
-                let val = if let Some((first_id, arr_lo, _)) = dense_array {
-                    let id = first_id + (addr - i128::from(arr_lo)) as usize;
-                    if is_packed_id(id) {
-                        self.packed.read(id)
-                    } else {
-                        self.signal_table
-                            .get(id)
-                            .cloned()
-                            .unwrap_or_else(|| Value::zero(width))
-                    }
+        let (mut addr, last) = if step > 0 {
+            (start.max(min_idx), end.min(max_idx))
+        } else {
+            (start.min(max_idx), end.max(min_idx))
+        };
+        while (step > 0 && addr <= last) || (step < 0 && addr >= last) {
+            let val = if let Some((first_id, arr_lo, _)) = dense_array {
+                let id = first_id + (addr - i128::from(arr_lo)) as usize;
+                if is_packed_id(id) {
+                    self.packed.read(id)
                 } else {
-                    Value::zero(width)
-                };
-                Self::push_memory_word(&mut out, addr, &val, radix, false);
-            }
+                    self.signal_table
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| Value::zero(width))
+                }
+            } else {
+                Value::zero(width)
+            };
+            Self::push_memory_word(&mut out, addr, &val, radix, false);
             addr += step;
         }
         let _ = std::fs::write(&path, out);
@@ -1722,7 +1715,7 @@ impl Simulator {
             return Value::zero(32);
         }
         let (lo, hi) = mem.addr_range();
-        let mut addr = match args.get(2) {
+        let start = match args.get(2) {
             Some(a) => self.eval_expr(a).to_i64().unwrap_or(lo),
             None => lo,
         };
@@ -1730,7 +1723,7 @@ impl Simulator {
             Some(a) => self.eval_expr(a).to_i64().unwrap_or(hi),
             None => hi,
         };
-        let step: i64 = if addr <= end_addr { 1 } else { -1 };
+        let step: i64 = if start <= end_addr { 1 } else { -1 };
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
@@ -1744,24 +1737,29 @@ impl Simulator {
             }
         };
         let mut loaded = 0usize;
-        'lines: for raw_line in content.lines() {
+        let mut next_addr = Some(start);
+        for raw_line in content.lines() {
             let line = raw_line.split("//").next().unwrap_or("").trim();
             for raw_tok in line.split_whitespace() {
-                if (step > 0 && addr > end_addr) || (step < 0 && addr < end_addr) {
-                    break 'lines;
-                }
                 if let Some(rest) = raw_tok.strip_prefix('@') {
                     let addr_hex = rest.trim_start_matches("0x").trim_start_matches("0X");
                     // A negative address is written as its 64-bit two's
                     // complement (`{:x}` of an `i64`).
                     if let Ok(a) = u64::from_str_radix(addr_hex, 16) {
-                        addr = a as i64;
+                        next_addr = Some(a as i64);
                     }
                     continue;
                 }
                 let Some((radix, digits)) = Self::parse_mem_token(raw_tok, default_radix) else {
                     continue;
                 };
+                // An explicit address can restart a sparse image after the
+                // previous run reached its finish or the index type's limit.
+                let Some(addr) = next_addr else { continue };
+                if (step > 0 && addr > end_addr) || (step < 0 && addr < end_addr) {
+                    continue;
+                }
+                next_addr = addr.checked_add(step);
                 if addr >= lo && addr <= hi {
                     let idx = mem.indices(addr);
                     let val = Value::from_str_radix(&digits, radix, mem.width);
@@ -1788,7 +1786,6 @@ impl Simulator {
                     }
                     loaded += 1;
                 }
-                addr += step;
             }
         }
         sim_dbg_eprintln!(

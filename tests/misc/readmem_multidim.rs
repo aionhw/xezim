@@ -400,3 +400,25 @@ endmodule
         ]
     );
 }
+
+#[test]
+fn sparse_memory_can_restart_after_the_range_endpoint() {
+    let dir = scratch("restart");
+    let hex = dir.join("mem.hex");
+    std::fs::write(&hex, "@3 aa ee @0 bb\n").unwrap();
+    let src = r#"
+module t;
+  bit [7:0] m[2][2], a[int], fixed_mem[4];
+  initial begin
+    $readmemh("@HEX@", m, 0, 3);
+    $readmemh("@HEX@", a, 0, 3);
+    $readmemh("@HEX@", fixed_mem, 0, 3);
+    $display("T|%h %h %h %h %h %h", m[1][1], m[0][0], a[3], a[0], fixed_mem[3], fixed_mem[0]);
+  end
+endmodule
+"#
+    .replace("@HEX@", &hex.display().to_string());
+    let got = t_lines(&src);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(got, ["T|aa bb aa bb aa bb"]);
+}

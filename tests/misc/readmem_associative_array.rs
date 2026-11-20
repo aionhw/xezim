@@ -344,7 +344,7 @@ fn readmem_writemem_unsigned_128_bit_index() {
     let f = |n: &str| dir.join(n).display().to_string();
     std::fs::write(
         dir.join("h.hex"),
-        "@ffffffffffffffffffffffffffffffff\naa bb\n",
+        "@ffffffffffffffffffffffffffffffff\naa bb\n@2 cc\n",
     )
     .unwrap();
     std::fs::write(dir.join("b.hex"), "aa bb\n").unwrap();
@@ -377,7 +377,7 @@ module t;
     $readmemh("@RG@", rg);
     $display("T|range num=%0d %h %h", rg.num(), rg[TOP], rg[MAX]);
     $readmemh("@H@", uh);
-    $display("T|top num=%0d %h", uh.num(), uh[MAX]);
+    $display("T|top num=%0d %h %h", uh.num(), uh[MAX], uh[2]);
     $readmemh("@B@", us, TOP - 1);
     $display("T|start num=%0d %h %h", us.num(), us[TOP - 1], us[TOP]);
     $readmemh("@M@", uf);
@@ -404,7 +404,7 @@ endmodule
             "T|one num=1 5a",
             "T|all num=3 11 22 33",
             "T|range num=2 22 33",
-            "T|top num=1 aa",
+            "T|top num=2 aa cc",
             "T|start num=2 aa bb",
             "T|file num=1 cc",
         ]
