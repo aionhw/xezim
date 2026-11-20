@@ -199,6 +199,8 @@ mod nested_packed_typedefs;
 mod nonzero_based_vector_reads;
 #[path = "types/nonzero_based_vector_writes.rs"]
 mod nonzero_based_vector_writes;
+#[path = "types/one_bit_operator_condition_width.rs"]
+mod one_bit_operator_condition_width;
 #[path = "types/package_base_constraint_inherited.rs"]
 mod package_base_constraint_inherited;
 #[path = "types/package_scope_resolution.rs"]
