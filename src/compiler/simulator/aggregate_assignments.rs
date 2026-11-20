@@ -417,8 +417,15 @@ impl Simulator {
             // member values survived an assignment that should overwrite
             // everything. Re-enter the spread with a synthetic default item.
             if Self::spreads_member_wise(&su) {
-                let synthetic = [AssignmentPatternItem::Default(e.clone())];
                 self.pattern_nba_leaves = capture;
+                // §7.2, §10.9.2: a whole struct of this type (a variable, an
+                // element of an array of them) is the element's value: its
+                // members are copied one by one, read now. Spread as a
+                // default, each member received the whole struct.
+                if self.assign_whole_struct_item(target, &su, e) {
+                    return;
+                }
+                let synthetic = [AssignmentPatternItem::Default(e.clone())];
                 self.assign_pattern_into_struct(target, &su, &synthetic);
                 return;
             }
@@ -432,6 +439,50 @@ impl Simulator {
         } else {
             self.write_pattern_leaf(target, value);
         }
+    }
+
+    /// Copy the whole unpacked struct `e` (of type `su`, with leaves of its
+    /// own: a design or frame variable, an element of an array of them) to
+    /// the struct element `target`, every member read before any is
+    /// written. False, with nothing read, when `e` is no such struct.
+    fn assign_whole_struct_item(
+        &mut self,
+        target: &str,
+        su: &crate::ast::types::StructUnionType,
+        e: &Expression,
+    ) -> bool {
+        let e = Self::unparen(e);
+        if !matches!(
+            e.kind,
+            ExprKind::Ident(_) | ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+        ) || !Self::cond_expr_is_effect_free(e, false)
+        {
+            return false;
+        }
+        let capture = self.pattern_nba_leaves.take();
+        let src = self
+            .flat_member_name(e)
+            .filter(|flat| self.struct_storage_exists(flat, su));
+        let Some(src) = src else {
+            self.pattern_nba_leaves = capture;
+            return false;
+        };
+        let mut leaves = Vec::new();
+        self.unpacked_struct_leaves(target, e, su, 0, &mut leaves);
+        let values: Vec<(String, Option<Value>)> = leaves
+            .into_iter()
+            .map(|(key, _, _, _)| {
+                let v = self.get_signal_value_by_name(&format!("{src}{}", &key[target.len()..]));
+                (key, v)
+            })
+            .collect();
+        self.pattern_nba_leaves = capture;
+        for (key, v) in values {
+            if let Some(v) = v {
+                self.write_pattern_leaf(&key, v);
+            }
+        }
+        true
     }
 
     /// §10.4.2: collect target writes only; RHS function side effects remain

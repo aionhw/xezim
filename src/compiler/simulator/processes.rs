@@ -2780,6 +2780,45 @@ impl Simulator {
                     let rows = Self::leaf_rows(elems);
                     return self.kept_element_pattern(rows, e.span, slots);
                 }
+                // §7.2, §10.9.2: a whole unpacked struct matched to a struct
+                // element (`'{sa[1], sa[0]}`) has no value of its own, only
+                // member leaves: each is read now, nested like the members.
+                // Captured as one value, it filled every member with it. A
+                // class property's target has no known shape; an element of
+                // its struct array (`'{ks[1], ks[0]}`) is recognized by itself.
+                let elem_su = match shape {
+                    Some(super::intra_pattern_shape::ItemShape::Struct(su)) => Some(su.clone()),
+                    None if matches!(e.kind, ExprKind::Index { .. }) => self.struct_elem_type(e),
+                    _ => None,
+                };
+                if let Some(su) = elem_su
+                    && matches!(
+                        e.kind,
+                        ExprKind::Ident(_) | ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+                    )
+                    && Self::cond_expr_is_effect_free(e, false)
+                    && !su.members.iter().any(|m| {
+                        m.declarators.iter().any(|d| {
+                            d.dimensions.iter().any(|dim| {
+                                !matches!(
+                                    dim,
+                                    crate::ast::types::UnpackedDimension::Range { .. }
+                                        | crate::ast::types::UnpackedDimension::Expression { .. }
+                                )
+                            })
+                        })
+                    })
+                {
+                    let mut leaves = Vec::new();
+                    self.unpacked_struct_leaves("", e, &su, 0, &mut leaves);
+                    if !leaves.is_empty() {
+                        let values = leaves
+                            .into_iter()
+                            .map(|(key, leaf, _, _)| (key, self.eval_expr(&leaf)))
+                            .collect();
+                        return self.kept_element_pattern(Self::leaf_rows(values), e.span, slots);
+                    }
+                }
                 let val = self.intra_item_value(shape, e);
                 self.kept_item(val, e.span, slots)
             }
