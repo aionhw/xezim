@@ -331,6 +331,8 @@ mod task_input_context_width;
 mod type_param_bound_to_specialization;
 #[path = "types/type_param_static_property.rs"]
 mod type_param_static_property;
+#[path = "types/type_param_block_local_dims.rs"]
+mod type_param_block_local_dims;
 #[path = "types/type_param_struct_per_instance.rs"]
 mod type_param_struct_per_instance;
 #[path = "types/typed_parameter_value_context.rs"]
