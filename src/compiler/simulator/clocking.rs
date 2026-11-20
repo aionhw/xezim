@@ -95,42 +95,62 @@ impl Simulator {
                 Self::select_chain_base(l).and_then(Self::member_path_head) == base
             })
         };
-        let picked: Vec<(usize, Expression)> = if skew == 0 {
+        // Indices only: the targets stay in the queue and are lent to
+        // `queued_select_range` (a drive runs this on every clock edge).
+        let picked: Vec<usize> = if skew == 0 {
             self.nba_queue
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| same_base(e))
-                .filter_map(|(i, e)| e.lhs.clone().map(|l| (i, l)))
+                .map(|(i, _)| i)
                 .collect()
         } else {
             self.delayed_nba_queue
                 .iter()
                 .enumerate()
                 .filter(|(_, (t, e))| *t == when && same_base(e))
-                .filter_map(|(i, (_, e))| e.lhs.clone().map(|l| (i, l)))
+                .map(|(i, _)| i)
                 .collect()
         };
-        let Some((last, last_lhs)) = picked.last() else {
+        let Some((&last, earlier)) = picked.split_last() else {
             return;
         };
-        if self.delayed_lhs_select_range(last_lhs) != Some(range) {
+        if earlier.is_empty() || self.queued_select_range(last, skew > 0) != Some(range) {
             return;
         }
         let value = if skew == 0 {
-            self.nba_queue[*last].value.clone()
+            self.nba_queue[last].value.clone()
         } else {
-            self.delayed_nba_queue[*last].1.value.clone()
+            self.delayed_nba_queue[last].1.value.clone()
         };
-        for (i, lhs) in &picked[..picked.len() - 1] {
-            if self.delayed_lhs_select_range(lhs) != Some(range) {
+        for &i in earlier {
+            if self.queued_select_range(i, skew > 0) != Some(range) {
                 continue;
             }
             if skew == 0 {
-                self.nba_queue[*i].value = value.clone();
+                self.nba_queue[i].value = value.clone();
             } else {
-                self.delayed_nba_queue[*i].1.value = value.clone();
+                self.delayed_nba_queue[i].1.value = value.clone();
             }
         }
+    }
+
+    /// `delayed_lhs_select_range` of the target of queued update `i` (of
+    /// `delayed_nba_queue` when `delayed`), read in place: the target is
+    /// taken out of the entry for the call and put back.
+    fn queued_select_range(&mut self, i: usize, delayed: bool) -> Option<(usize, u32, u32)> {
+        let lhs = if delayed {
+            self.delayed_nba_queue[i].1.lhs.take()
+        } else {
+            self.nba_queue[i].lhs.take()
+        };
+        let range = lhs.as_ref().and_then(|l| self.delayed_lhs_select_range(l));
+        if delayed {
+            self.delayed_nba_queue[i].1.lhs = lhs;
+        } else {
+            self.nba_queue[i].lhs = lhs;
+        }
+        range
     }
 
     /// §14.3: the element signals (`net[i]`, with `i`) of clockvar net `net`
