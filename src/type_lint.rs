@@ -62,6 +62,8 @@ use xezim_core::ast::types::{
 };
 use xezim_core::elaborate::ElaboratedModule;
 
+use crate::should_fail_lint::{GenReach, GenerateSelection};
+
 #[derive(Clone, Debug, PartialEq)]
 enum Ty {
     Unknown,
@@ -364,6 +366,16 @@ struct Ck<'a> {
     /// Inside a generate block, which may not be elaborated: counts that
     /// depend on a parameter are not judged there.
     gen_depth: u32,
+    /// The conditional generate branches the elaborated design selects
+    /// (§27.5); a branch no instance selects is not checked.
+    gen_sel: Option<&'a GenerateSelection<'a>>,
+    /// The instances that elaborate the generate branch being walked (see
+    /// `GenReach`); a nested construct is decided for those only.
+    gen_reach: GenReach,
+    /// Stack depth of the definition's own scope: a name declared above it
+    /// is local to a generate block (or a genvar), which the elaborated
+    /// parameter tables do not key by its bare name.
+    body_depth: usize,
     errs: Vec<String>,
 }
 
@@ -385,6 +397,9 @@ impl<'a> Ck<'a> {
             seen: HashSet::default(),
             params_fixed: false,
             gen_depth: 0,
+            gen_sel: None,
+            gen_reach: None,
+            body_depth: usize::MAX,
             errs: Vec::new(),
         }
     }
@@ -2883,19 +2898,70 @@ impl<'a> Ck<'a> {
                 ModuleItem::ClassDeclaration(c) => self.walk_class(c),
                 ModuleItem::GenerateRegion(g) => self.walk_block(&g.items, None),
                 ModuleItem::GenerateIf(g) => {
-                    for (_, items) in &g.branches {
-                        self.walk_block(items, None);
+                    let conds: Vec<Option<&Expression>> =
+                        g.branches.iter().map(|(c, _)| c.as_ref()).collect();
+                    let reach = match self.gen_sel {
+                        Some(sel) if !conds.iter().flatten().any(|c| self.names_gen_local(c)) => {
+                            sel.if_branches(&self.owner, &conds, &self.gen_reach)
+                        }
+                        _ => vec![self.gen_reach.clone(); conds.len()],
+                    };
+                    for ((_, items), reach) in g.branches.iter().zip(reach) {
+                        self.walk_branch(items, reach);
                     }
                 }
                 ModuleItem::GenerateFor(g) => self.walk_block(&g.items, Some(&g.var)),
                 ModuleItem::GenerateCase(g) => {
-                    for arm in &g.arms {
-                        self.walk_block(&arm.items, None);
+                    let arms: Vec<&[Expression]> =
+                        g.arms.iter().map(|a| a.values.as_slice()).collect();
+                    let reach = match self.gen_sel {
+                        Some(sel)
+                            if !self.names_gen_local(&g.selector)
+                                && !arms
+                                    .iter()
+                                    .flat_map(|a| a.iter())
+                                    .any(|v| self.names_gen_local(v)) =>
+                        {
+                            sel.case_arms(&self.owner, &g.selector, &arms, &self.gen_reach)
+                        }
+                        _ => vec![self.gen_reach.clone(); arms.len()],
+                    };
+                    for (arm, reach) in g.arms.iter().zip(reach) {
+                        self.walk_branch(&arm.items, reach);
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// A conditional generate branch, walked only when some instance in
+    /// `reach` elaborates it (§27.5), with its constructs decided for those.
+    fn walk_branch(&mut self, items: &[ModuleItem], reach: GenReach) {
+        if reach.as_ref().is_some_and(|r| r.is_empty()) {
+            return;
+        }
+        let outer = std::mem::replace(&mut self.gen_reach, reach);
+        self.walk_block(items, None);
+        self.gen_reach = outer;
+    }
+
+    /// Whether `e` reads a name declared inside a generate block or a genvar,
+    /// whose value the elaborated tables do not hold under its bare name.
+    fn names_gen_local(&self, e: &Expression) -> bool {
+        let mut local = false;
+        visit_expr(e, &mut |x| {
+            if let ExprKind::Ident(h) = &x.kind
+                && let Some(seg) = h.path.first()
+            {
+                let n = seg.name.name.as_str();
+                local |= self.stack.iter().skip(self.body_depth).any(|l| {
+                    let s = l.get();
+                    s.vars.contains_key(n) || s.types.contains_key(n) || s.unsure.contains(n)
+                });
+            }
+        });
+        local
     }
 
     fn walk_block(&mut self, items: &[ModuleItem], genvar: Option<&str>) {
@@ -3039,7 +3105,11 @@ fn dpi_name(d: &xezim_core::ast::decl::DPIImport) -> Option<String> {
 }
 
 /// Run the checks over every definition; returns the error messages.
-pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String> {
+pub fn check(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+    gen_sel: &GenerateSelection<'_>,
+) -> Vec<String> {
     // Phase 0: class names (a name declared twice is ambiguous and ignored).
     let mut class_names: HashMap<String, usize> = HashMap::default();
     fn count_items(items: &[ModuleItem], out: &mut HashMap<String, usize>) {
@@ -3297,6 +3367,8 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 for p in &m.params {
                     ck.check_param_values(p);
                 }
+                ck.gen_sel = Some(gen_sel);
+                ck.body_depth = ck.stack.len();
                 ck.walk_items(&m.items);
             }
             SourceDefinition::Interface(m) => {
@@ -3313,6 +3385,8 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 for p in &m.params {
                     ck.check_param_values(p);
                 }
+                ck.gen_sel = Some(gen_sel);
+                ck.body_depth = ck.stack.len();
                 ck.walk_items(&m.items);
             }
             SourceDefinition::Program(m) => {
@@ -3329,6 +3403,8 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 for p in &m.params {
                     ck.check_param_values(p);
                 }
+                ck.gen_sel = Some(gen_sel);
+                ck.body_depth = ck.stack.len();
                 ck.walk_items(&m.items);
             }
             SourceDefinition::Package(p) => {
