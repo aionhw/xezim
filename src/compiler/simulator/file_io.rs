@@ -376,25 +376,23 @@ impl Simulator {
                             si2 += 1;
                         }
                         let dstart = si2;
-                        while si2 < s.len()
-                            && (s[si2].is_digit(radix) || s[si2] == '_')
-                            && si2 - dstart < w
-                        {
+                        let is_four_state = |c| matches!(c, 'x' | 'X' | 'z' | 'Z' | '?');
+                        // §21.3.4.3: decimal accepts a single whole-value x/z,
+                        // while based conversions accept four-state digits anywhere.
+                        if signed && s.get(si2).copied().is_some_and(is_four_state) {
                             si2 += 1;
-                        }
-                        if si2 == dstart {
-                            break;
+                        } else {
+                            while si2 < s.len()
+                                && si2 - start < w
+                                && (s[si2].is_digit(radix)
+                                    || s[si2] == '_'
+                                    || (!signed && is_four_state(s[si2])))
+                            {
+                                si2 += 1;
+                            }
                         }
                         let text: String = s[dstart..si2].iter().filter(|c| **c != '_').collect();
-                        // The scan above admits `char::is_digit`, which is
-                        // Unicode-aware, so a non-ASCII digit can land here.
-                        // `from_str_radix` would answer X; `$sscanf` has to
-                        // report a failed conversion and stop, the way the old
-                        // `i64::from_str_radix` returning `Err` did.
-                        if text
-                            .bytes()
-                            .any(|b| !b.is_ascii() || (b as char).to_digit(radix).is_none())
-                        {
+                        if text.is_empty() || si2 - start > w {
                             break;
                         }
                         si = si2;
