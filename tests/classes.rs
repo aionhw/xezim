@@ -1357,3 +1357,5 @@ mod class_struct_array_member_patterns;
 mod multidim_property_pattern_init;
 #[path = "classes/static_string_queue_percent_p.rs"]
 mod static_string_queue_percent_p;
+#[path = "classes/typename_specialized_property.rs"]
+mod typename_specialized_property;
