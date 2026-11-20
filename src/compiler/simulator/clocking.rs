@@ -1190,7 +1190,15 @@ impl Simulator {
     /// `$time`, `$stime`, `$realtime` change every step (LRM §21.2.3).
     pub(super) fn is_monitor_time_arg(e: &Expression) -> bool {
         matches!(&e.kind, ExprKind::SystemCall { name, .. }
-            if matches!(name.as_str(), "$time" | "$stime" | "$realtime"))
+        if matches!(
+            name.as_str(),
+            "$time"
+                | "$stime"
+                | "$realtime"
+                | "$__xz_time_at"
+                | "$__xz_stime_at"
+                | "$__xz_realtime_at"
+        ))
     }
 
     /// The design root is the synthetic multi-top wrapper (§23.3.3): its
