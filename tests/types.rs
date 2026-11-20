@@ -311,6 +311,8 @@ mod struct_member_array_of_structs_copy;
 mod struct_member_typedef_element_dims;
 #[path = "types/struct_named_patterns.rs"]
 mod struct_named_patterns;
+#[path = "types/struct_return_variable_whole_struct.rs"]
+mod struct_return_variable_whole_struct;
 #[path = "types/struct_unpacked_array_member.rs"]
 mod struct_unpacked_array_member;
 #[path = "types/submodule_packed_struct_member_contassign.rs"]
