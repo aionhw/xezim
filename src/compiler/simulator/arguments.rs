@@ -1135,7 +1135,7 @@ impl Simulator {
             );
             // §6.18: a typedef preserves the member's real type.
             let is_real = self.dt_is_real(&m.data_type);
-            let dv = if is_real {
+            let mut dv = if is_real {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state_resolved(
                 &m.data_type,
@@ -1147,6 +1147,12 @@ impl Simulator {
             } else {
                 Value::new(mw)
             };
+            // §6.11.3: the leaf carries its member's signedness, which a
+            // store into it keeps (a real rounds into it, §6.12.1: `-1.5`
+            // into an `int` member reads -2, not 4294967294).
+            if !is_real && self.type_is_signed_concrete(&m.data_type) {
+                dv.is_signed = true;
+            }
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);

@@ -3235,7 +3235,12 @@ impl Simulator {
             {
                 let fitted = match self.frame_get(name) {
                     Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
-                    Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
+                    // §6.11.3: the leaf keeps its member's signedness.
+                    Some(p) if !p.is_real && !val.is_real && p.width > 0 => {
+                        let mut v = val.resize(p.width);
+                        v.is_signed = p.is_signed;
+                        v
+                    }
                     // §6.12.2: a real into an integral leaf rounds.
                     Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                     _ => val,

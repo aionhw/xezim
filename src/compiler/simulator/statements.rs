@@ -2635,6 +2635,11 @@ impl Simulator {
                         for (k, dv, mdt) in leaves {
                             self.register_packed_leaf_layout(&k, &mdt);
                             self.widths.insert(k.clone(), dv.width);
+                            // §6.11.3: a signed member (`int`, `byte`) reads
+                            // signed, as a module-scope leaf does.
+                            if dv.is_signed {
+                                self.signed_signals.insert(k.clone());
+                            }
                             self.signals.insert(k, dv);
                         }
                         if self.struct_colls_possible() {
@@ -3661,6 +3666,11 @@ impl Simulator {
                         for (k, dv, mdt) in leaves {
                             self.register_packed_leaf_layout(&k, &mdt);
                             self.widths.insert(k.clone(), dv.width);
+                            // §6.11.3: a signed member (`int`, `byte`) reads
+                            // signed, as a module-scope leaf does.
+                            if dv.is_signed {
+                                self.signed_signals.insert(k.clone());
+                            }
                             self.signals.insert(k, dv);
                         }
                         continue;
