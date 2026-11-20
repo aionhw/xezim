@@ -117,3 +117,75 @@ fn generate_block_parameters_shadow_and_restore_the_module_parameter() {
         assert!(msgs.iter().any(|m| m == w), "missing {w:?} in {msgs:?}");
     }
 }
+
+/// More hierarchies with different outermost scopes than the overlaid
+/// tables kept: six of them round robin, twice, so a table is reused for
+/// another hierarchy and earlier ones are revisited, then nested selects
+/// whose indices read the next hierarchy, so four tables are held when a
+/// fifth and a sixth are asked for. `other` is sized by the compilation-unit
+/// `N` that every leaf's own `N` shadows. Each leaf's array is ascending, so
+/// an element lands on other bits under another `N`. Expected values agree
+/// with Verilator 5.046.
+const TABLES: &str = "localparam int N = 3;
+typedef struct packed { logic a; logic [3:0] d; logic u; } s_t;
+
+module leaf #(parameter int N = 2) ();
+  s_t [0:N-1] par;
+endmodule
+
+module other ();
+  // Sized by the compilation-unit N (3), which every leaf's N shadows.
+  s_t [0:N-1] q;
+endmodule
+
+module top;
+  leaf #(.N(2)) t1 ();
+  leaf #(.N(4)) t2 ();
+  leaf #(.N(5)) t3 ();
+  leaf #(.N(6)) t4 ();
+  leaf #(.N(7)) t5 ();
+  other o ();
+  initial begin
+    t1.par = '0; t2.par = '0; t3.par = '0; t4.par = '0; t5.par = '0; o.q = '0;
+    // Six hierarchies with different outermost scopes, round robin, twice:
+    // more than the tables kept, so earlier ones are reused and revisited.
+    for (int k = 0; k < 2; k++) begin
+      t1.par[0].d = 4'(k + 1);
+      t2.par[0].d = 4'(k + 1);
+      t3.par[1].d = 4'(k);
+      t4.par[1].d = 4'(k + 1);
+      t5.par[0].d = 4'(k + 1);
+      o.q[2].d = 4'(k + 7);
+      t1.par[1].a = 1'b1;
+      t5.par[6].u = 1'b1;
+      o.q[0].a = 1'b1;
+      t3.par[4].u = 1'b1;
+    end
+    $display(\"p t1=%h t2=%h t3=%h\", t1.par, t2.par, t3.par);
+    $display(\"p t4=%h t5=%h o=%h\", t4.par, t5.par, o.q);
+    t5.par[0].d = 4'd1; t4.par[1].d = 4'd2; t3.par[2].d = 4'd3; t2.par[3].d = 4'd1;
+    // Each select holds its hierarchy's table while its index reads the
+    // next one, so four are held when the fifth and sixth are asked for.
+    t1.par[t2.par[t3.par[t4.par[t5.par[0].d].d].d].d].d = 4'hc;
+    o.q[t2.par[t3.par[t4.par[t5.par[0].d].d].d].d].d = 4'h9;
+    $display(\"n t1=%h o=%h\", t1.par, o.q);
+    $display(\"r %h %h %h %h\", t1.par[1].d, o.q[1].d, t5.par[6].u, t3.par[4].u);
+    $finish;
+  end
+endmodule
+";
+
+#[test]
+fn reused_and_held_overlay_tables_keep_their_parameters() {
+    let sim = simulate(TABLES, 1_000).expect("simulate failed");
+    let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    let want = [
+        "p t1=120 t2=100000 t3=00080001",
+        "p t4=004000000 t5=04000000001 o=20010",
+        "n t1=138 o=20490",
+        "r c 9 1 1",
+    ];
+    for w in want {
+        assert!(msgs.iter().any(|m| m == w), "missing {w:?} in {msgs:?}");
+    }
+}
