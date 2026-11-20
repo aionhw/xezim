@@ -39,6 +39,8 @@ mod c910_scoped_cont_assign;
 mod class_method_hier_subroutine_calls;
 #[path = "hierarchy/colliding_actual_child_body.rs"]
 mod colliding_actual_child_body;
+#[path = "hierarchy/default_nettype_inferred_ports.rs"]
+mod default_nettype_inferred_ports;
 #[path = "hierarchy/defparam_upward_paths.rs"]
 mod defparam_upward_paths;
 #[path = "hierarchy/disable_targets.rs"]
@@ -115,6 +117,8 @@ mod inout_port_default;
 mod instance_var_init_signedness;
 #[path = "hierarchy/interface_array_element_ports.rs"]
 mod interface_array_element_ports;
+#[path = "hierarchy/interface_array_whole_ports.rs"]
+mod interface_array_whole_ports;
 #[path = "hierarchy/interface_default_clocking.rs"]
 mod interface_default_clocking;
 #[path = "hierarchy/ivtest_port_cluster.rs"]
