@@ -68,3 +68,66 @@ endmodule
         );
     }
 }
+
+/// §20.6.2, §11.7: `$bits` of an instance parameter, `$signed` of an
+/// 8-bit `8'hff` (-1, not 255), `$unsigned`, a cast and a nested `$clog2`
+/// in the locals of a function and a loop block, per instance; and the
+/// locals of an interface function and a class method of the instance.
+/// Expected values are the reference simulator's.
+#[test]
+fn sized_system_functions_and_other_scopes_of_the_instance() {
+    let out = lines(
+        r#"
+interface ifc #(parameter int P = 4);
+  function automatic int f();
+    logic [$clog2(P)-1:0] a;
+    return $bits(a);
+  endfunction
+endinterface
+module m #(parameter int P = 4, parameter logic [7:0] Q = 8'hff);
+  ifc #(.P(P*2)) i();
+  class C;
+    function int g();
+      logic [$clog2(P)-1:0] a;
+      return $bits(a);
+    endfunction
+  endclass
+  function automatic int f();
+    logic [$clog2(P)-1:0] a;
+    logic [int'(P)-1:0] c;
+    logic [$unsigned(P)-1:0] d;
+    logic [($signed(Q) < 0 ? 3 : 5)-1:0] e;
+    logic [$clog2(P*2)-1:0] g;
+    return $bits(a) * 1000000 + $bits(c) * 1000 + $bits(d) + $bits(e) * 100000000 + $bits(g)*10000;
+  endfunction
+  initial begin
+    C c = new;
+    #1;
+    for (int i = 0; i < 1; i++) begin
+      logic [$clog2(P)-1:0] a;
+      logic [$signed(P)-1:0] b;
+      logic [$bits(P)-1:0] h;
+      bit [$clog2(P):0] k [$clog2(P)];
+      $display("P=%0d proc a=%0d b=%0d h=%0d k=%0d/%0d f=%0d", P, $bits(a), $bits(b), $bits(h), $bits(k[0]), $size(k), f());
+    end
+    $display("P=%0d ifc f=%0d class g=%0d", P, i.f(), c.g());
+  end
+endmodule
+module top;
+  m #(.P(256)) u256();
+  m #(.P(16), .Q(8'h7f)) u16();
+endmodule
+"#,
+    );
+    for want in [
+        "P=256 proc a=8 b=256 h=32 k=9/8 f=308346256",
+        "P=16 proc a=4 b=16 h=32 k=5/4 f=504066016",
+        "P=256 ifc f=9 class g=8",
+        "P=16 ifc f=5 class g=4",
+    ] {
+        assert!(
+            out.iter().any(|m| m == want),
+            "missing {want:?}; got {out:?}"
+        );
+    }
+}
