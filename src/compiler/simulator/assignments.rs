@@ -588,12 +588,10 @@ impl Simulator {
                 // reads the driven value in the statement after `release`.
                 if !self.settling && !self.in_edge_block {
                     let drivers: Vec<CombEntry> = self
-                        .comb_entries
-                        .iter()
-                        .filter(|e| {
-                            e.cold.write_signal_ids.contains(&id)
-                                && !e.cold.read_signal_ids.is_empty()
-                        })
+                        .comb_writers_of(id)
+                        .into_iter()
+                        .map(|eidx| &self.comb_entries[eidx])
+                        .filter(|e| !e.cold.read_signal_ids.is_empty())
                         .cloned()
                         .collect();
                     for entry in &drivers {
@@ -827,10 +825,9 @@ impl Simulator {
         self.forced_signals.remove(&id);
         if !self.settling && !self.in_edge_block {
             let drivers: Vec<CombEntry> = self
-                .comb_entries
-                .iter()
-                .filter(|e| e.cold.write_signal_ids.contains(&id))
-                .cloned()
+                .comb_writers_of(id)
+                .into_iter()
+                .map(|eidx| self.comb_entries[eidx].clone())
                 .collect();
             for entry in &drivers {
                 self.eval_comb_entry_full(entry);

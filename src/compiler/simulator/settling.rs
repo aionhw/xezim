@@ -111,16 +111,49 @@ impl Simulator {
         self.mark_release_sources_dirty(id);
     }
 
+    /// The indices of the comb entries that write signal `id`, in table
+    /// order (§10.6.2). A release re-drives the net from them; looking them
+    /// up in `comb_writer_index` replaces a scan of every entry, which a
+    /// testbench releasing a signal each clock repeated every cycle. Empty
+    /// while a settle pass has the table taken out, as the scan was.
+    pub(super) fn comb_writers_of(&mut self, id: usize) -> Vec<usize> {
+        let n = self.comb_entries.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        if self
+            .comb_writer_index
+            .as_ref()
+            .is_none_or(|(len, _)| *len != n)
+        {
+            let mut index: HashMap<usize, Vec<u32>> = HashMap::default();
+            for (eidx, entry) in self.comb_entries.iter().enumerate() {
+                for &w in &entry.cold.write_signal_ids {
+                    let writers = index.entry(w).or_default();
+                    // An entry that lists a signal twice is one writer.
+                    if writers.last() != Some(&(eidx as u32)) {
+                        writers.push(eidx as u32);
+                    }
+                }
+            }
+            self.comb_writer_index = Some((n, index));
+        }
+        self.comb_writer_index
+            .as_ref()
+            .and_then(|(_, index)| index.get(&id))
+            .map(|writers| writers.iter().map(|&e| e as usize).collect())
+            .unwrap_or_default()
+    }
+
     pub(super) fn mark_release_sources_dirty(&mut self, id: usize) {
         let mut sources: Vec<usize> = Vec::new();
         let mut constant_drivers: Vec<CombEntry> = Vec::new();
-        for entry in self.comb_entries.iter() {
-            if entry.cold.write_signal_ids.contains(&id) {
-                if entry.cold.read_signal_ids.is_empty() {
-                    constant_drivers.push(entry.clone());
-                } else {
-                    sources.extend(entry.cold.read_signal_ids.iter().copied());
-                }
+        for eidx in self.comb_writers_of(id) {
+            let entry = &self.comb_entries[eidx];
+            if entry.cold.read_signal_ids.is_empty() {
+                constant_drivers.push(entry.clone());
+            } else {
+                sources.extend(entry.cold.read_signal_ids.iter().copied());
             }
         }
         for src_id in sources {

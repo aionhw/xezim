@@ -539,6 +539,7 @@ impl Simulator {
                 return false;
             }
         }
+        self.comb_writer_index = None;
         self.comb_entries = cache.entries;
         self.ts_comb.clear();
         self.comb_dep_offsets = cache.dep_offsets;
@@ -5517,6 +5518,7 @@ impl Simulator {
                     .sum::<usize>()
             );
         }
+        self.comb_writer_index = None;
         self.comb_entries = entries;
         self.write_prepared_comb_cache();
         // Drop AST storage for items we've consumed into comb_entries.
