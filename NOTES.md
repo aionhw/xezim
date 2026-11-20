@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Use the declared clocking edge for bare clocking block waits and default clocking cycle delays (§14.10–11, #1332).
+
 - **Correctness:** A trailing whitespace directive in `$fscanf` sets EOF when it reads to the end of the file (§21.3.4.3, #1376).
 
 - **Correctness:** Queue element writes append at the current size and warn when an invalid index is ignored (§7.10.1, #1353).
