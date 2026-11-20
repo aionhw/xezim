@@ -19923,7 +19923,11 @@ impl<'a> BytecodeCompiler<'a> {
                     // (width, signedness): a SIZE cast (`8'(x)`, `N'(x)`)
                     // keeps the operand's signedness (§6.24.1), a type
                     // cast takes the type's.
-                    let known = literal_w.map(|w| (w, None)).or_else(|| {
+                    // A struct-parameter field names no type, so its leaf
+                    // must not be looked up as one below.
+                    let member_w = args.first().and_then(|a| self.member_cast_size(a));
+                    let target = if member_w.is_some() { None } else { target };
+                    let known = literal_w.or(member_w).map(|w| (w, None)).or_else(|| {
                         target.as_ref().and_then(|nm| {
                             self.cast_widths
                                 .and_then(|m| m.get(nm).copied())
@@ -24318,6 +24322,9 @@ impl<'a> BytecodeCompiler<'a> {
                     .map(|n| n.max(1))
             }),
             "$__xz_named_cast" => literal.or_else(|| {
+                if let Some(w) = self.member_cast_size(args.first()?) {
+                    return Some(w);
+                }
                 let key = self.named_cast_key(args.first()?)?;
                 self.cast_widths
                     .and_then(|m| m.get(&key).map(|&(w, _)| w.max(1)))
@@ -24330,6 +24337,36 @@ impl<'a> BytecodeCompiler<'a> {
             }),
             _ => None,
         }
+    }
+
+    /// §6.24.1: a cast whose casting type is a constant primary is a SIZE
+    /// cast. A field of a struct parameter (`pt.DEPTH'(x)`, also written
+    /// `(pt.DEPTH)'(x)`) parses like a scoped type name, so it reaches the
+    /// named-cast arm; it names a value, never a type. Its folded value, or
+    /// None when the target is not such a field.
+    fn member_cast_size(&self, target: &Expression) -> Option<u32> {
+        let v = match &target.kind {
+            ExprKind::Paren(inner) => return self.member_cast_size(inner),
+            // An instance's names arrive rewritten to their full path and
+            // rooted (`$root.u.pt.DEPTH`); without the root that path is the
+            // parameter's own key.
+            ExprKind::Ident(h) if h.path.len() >= 2 && h.root.as_deref() == Some("$root") => {
+                let mut flat = h.clone();
+                flat.root = None;
+                self.const_param_member_path(&flat)?
+            }
+            ExprKind::Ident(h) if h.path.len() >= 2 => self.const_param_member_path(h)?,
+            ExprKind::MemberAccess { expr, member } => {
+                self.const_param_member(expr, &member.name)?
+            }
+            _ => return None,
+        };
+        if v.has_xz() || v.is_real {
+            return None;
+        }
+        v.to_u64()
+            .filter(|&n| n > 0)
+            .and_then(|n| u32::try_from(n).ok())
     }
 
     /// Value of a cast-size literal (`9` in `9'(x)`), not the literal's

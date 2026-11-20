@@ -512,6 +512,49 @@ impl Simulator {
         None
     }
 
+    /// §6.24.1: a cast whose casting type is a constant primary is a SIZE
+    /// cast. A field of a struct parameter (`pt.DEPTH'(x)`, also written
+    /// `(pt.DEPTH)'(x)`) parses like a scoped type name and arrives as a
+    /// named cast, but it names a value: its root is a parameter in scope.
+    /// The field's value, or None for any other target.
+    pub(super) fn member_cast_size(&mut self, target: &Expression) -> Option<u32> {
+        // Walk to the root identifier; a bare `N'(x)` is not a field and
+        // keeps the parameter arm of the caller.
+        let mut root = target;
+        let mut field = false;
+        let h = loop {
+            match &root.kind {
+                ExprKind::Paren(inner) => root = inner,
+                ExprKind::MemberAccess { expr, .. } => {
+                    field = true;
+                    root = expr;
+                }
+                ExprKind::Ident(h) => break h,
+                _ => return None,
+            }
+        };
+        // An instance's names arrive rewritten to their full path and rooted
+        // (`$root.u.pt.DEPTH`); that path is the parameter's own key.
+        let is_param = match h.root.as_deref() {
+            None => self.scoped_param_value(&h.path[0].name.name).is_some(),
+            Some("$root") => self
+                .module
+                .parameters
+                .contains_key(h.path[0].name.name.as_str()),
+            Some(_) => false,
+        };
+        if (!field && h.path.len() < 2) || !is_param {
+            return None;
+        }
+        let v = self.eval_expr(target);
+        if v.has_xz() || v.is_real {
+            return None;
+        }
+        v.to_u64()
+            .filter(|&n| n > 0)
+            .and_then(|n| u32::try_from(n).ok())
+    }
+
     /// The table key of a parser-lowered named cast's target (`T'(v)`,
     /// `pkg::T'(v)`, `pkg::cls::T'(v)`). A scoped name prefers its
     /// qualified registration (`pkg::T`, `pkg::cls::T`), so a same-named
