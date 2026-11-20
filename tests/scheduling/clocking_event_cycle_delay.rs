@@ -218,3 +218,35 @@ endmodule
         out
     );
 }
+
+/// IEEE 1800-2023 §14.10–11: all three forms count the declared clocking event.
+#[test]
+fn named_and_default_waits_follow_the_declared_edge() {
+    for (edge, second) in [("posedge", 15), ("negedge", 20), ("edge", 10)] {
+        let src = format!(
+            r#"
+`timescale 1ns/1ns
+interface bus(input logic clk);
+  clocking cb @({edge} clk); endclocking
+  task automatic wait_two(); repeat (2) @cb; endtask
+endinterface
+module top;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  bus b(clk);
+  default clocking cb @({edge} clk); endclocking
+  initial begin repeat (2) @cb; $display("bare=%0d", $time); end
+  initial begin repeat (2) @(cb); $display("paren=%0d", $time); end
+  initial begin ##2; $display("cycles=%0d", $time); end
+  initial begin b.wait_two(); $display("task=%0d", $time); end
+  initial #30 $finish;
+endmodule
+"#
+        );
+        let out = output_of(&simulate(&src, 100).expect("simulate"));
+        for form in ["bare", "paren", "cycles", "task"] {
+            let expected = format!("{form}={second}");
+            assert!(out.lines().any(|line| line == expected), "{edge}: {out}");
+        }
+    }
+}
