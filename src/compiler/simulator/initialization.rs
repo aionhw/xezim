@@ -3237,6 +3237,15 @@ impl Simulator {
             // ("aq[0]") while var_decl_types is keyed by the declaration name
             // ("aq") — strip index suffixes until the declaration is found,
             // or `int aq[2][$]` elements read back unsigned.
+            if module.nets.contains(base.as_str()) {
+                use xezim_core::elaborate::ResolvedNetKind;
+                let initial = match module.resolved_net_kinds.get(base.as_str()) {
+                    Some(ResolvedNetKind::Tri0) => Value::zero(w),
+                    Some(ResolvedNetKind::Tri1) => Value::ones(w),
+                    _ => Value::all_z(w),
+                };
+                signal_table[first_id..].fill(initial);
+            }
             if let Some(dt) = elem_dt {
                 if super::elaborate::is_type_signed_resolved(dt, &module.typedef_types) {
                     for id in first_id..signal_table.len() {
