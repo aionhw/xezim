@@ -4655,8 +4655,7 @@ impl Simulator {
     /// positional order), or a typedef for a specialization. None for a
     /// plain class or an unresolvable type. Used to seed `current_spec`
     /// when a static method is dispatched through a null receiver whose
-    /// declared type is specialized, so the method body's bare
-    /// self-references denote the current specialization.
+    /// declared type is specialized, so the method sees its type parameters.
     pub(super) fn spec_from_declared_type(&self, decl: &str) -> Option<(String, String)> {
         let cand = self
             .positional_spec_text(decl)

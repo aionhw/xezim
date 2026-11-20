@@ -182,7 +182,7 @@ class cb_iter #(type T = item_c, type CB = item_c);
     m_obj = obj;
   endfunction
   function CB set_and_get(CB cb);
-    REQ t;
+    CB t;
     m_cb = cb;
     t = m_cb;
     return t;
@@ -193,7 +193,8 @@ module top;
   initial begin
     sqr_c#(item_c) sqr = new();
     fifo_c#(item_c) fifo = new();
-    cb_iter#(item_c, item_c) iter = new(new(100));
+    item_c seed = new(100);
+    cb_iter#(item_c, item_c) iter = new(seed);
     item_c it1, it2, it3, out_it;
     bit ok;
     int loop_cnt = 0;

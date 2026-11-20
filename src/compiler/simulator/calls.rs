@@ -1972,10 +1972,8 @@ impl Simulator {
                 if self.is_static_method(&base_cls, &member.name) {
                     // §8.25: same as the flattened `req::get_type()` arm — a
                     // static method through a null receiver declared with a
-                    // SPECIALIZATION runs in that specialization's context
-                    // (the body's bare self-references denote the current
-                    // specialization). Seed `current_spec` from the declared
-                    // type; the live-object recovery inside
+                    // specialization uses its bound type parameters. Seed
+                    // `current_spec` from the declared type because
                     // `exec_static_method_via_object` cannot see a null handle.
                     let saved_spec = if handle == 0 {
                         // A variable receiver's declaration names its
@@ -3364,12 +3362,8 @@ impl Simulator {
                             // receiver whose declared type is a SPECIALIZATION
                             // (`req::get_type()` where req is declared
                             // `C#(T)` — `uvm_create_on`'s shape) runs in that
-                            // specialization's context: the body's bare
-                            // self-references (the `C` type argument of a
-                            // member typedef like
-                            // `uvm_object_registry#(C,"C") type_id`, written by
-                            // `uvm_object_utils(C)`) denote the CURRENT
-                            // specialization, not the default. The live-object
+                            // specialization's context for explicit type
+                            // arguments such as C#(T). The live-object
                             // spec recovery in `exec_static_method_via_object`
                             // cannot see a null handle, so seed `current_spec`
                             // from the DECLARED type here.

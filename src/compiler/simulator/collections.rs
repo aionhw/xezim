@@ -2127,28 +2127,6 @@ impl Simulator {
                     Some(f) => f,
                     None => self.fold_enclosing_param_expr(e)?,
                 };
-                // §8.25: a bare SELF-REFERENCE — the argument names the
-                // class whose specialization context we are resolving in
-                // (`uvm_object_registry#(C,"C") type_id`, written by
-                // `uvm_object_utils(C)`) — denotes the CURRENT
-                // specialization `C#(sig)`, not the default. Without
-                // this, a static method entered through a specialization
-                // (`C#(T2)::get_type()`, or `v.get_type()` on a null `v`
-                // declared `C#(T2)`) keyed the registry on the default
-                // `C`, so the factory created default-specialized objects
-                // and the `$cast` in `uvm_create_on` correctly rejected
-                // them.
-                //
-                // Only inside that class's own declaration (or a derived
-                // one): elsewhere the bare name IS the default
-                // specialization — a non-parameterized class whose typedef
-                // names `C` must not read `C#(sig)` just because its method
-                // happens to run under an active `C#(sig)` context.
-                if let Some((b, s)) = &self.current_spec {
-                    if frag == *b && self.inside_class_decl_of(b) {
-                        return Some(format!("{}#({})", b, s));
-                    }
-                }
                 // Resolve bare type-param names (e.g. `T`, `this_type`)
                 // through the active specialization so the typedef's
                 // specialization carries concrete values.

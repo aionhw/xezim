@@ -59,6 +59,7 @@ class base_obj;
   endfunction
 endclass
 class child_obj extends base_obj;
+  function new(string name); super.new(name); endfunction
   function string child_describe();
     return m_leaf_name;
   endfunction
@@ -111,6 +112,7 @@ class base_obj;
   endfunction
 endclass
 class child_obj extends base_obj;
+  function new(string name); super.new(name); endfunction
   function string get_name();
     return m_leaf_name;
   endfunction
