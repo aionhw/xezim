@@ -627,6 +627,8 @@ mod inlined_typedef_packed_array_dims;
 mod struct_param_member_select_bounds;
 #[path = "types/instance_local_typedef_struct_array.rs"]
 mod instance_local_typedef_struct_array;
+#[path = "types/instance_local_syscall_dims.rs"]
+mod instance_local_syscall_dims;
 
 #[path = "types/scoped_typed_assignment_pattern.rs"]
 mod scoped_typed_assignment_pattern;
