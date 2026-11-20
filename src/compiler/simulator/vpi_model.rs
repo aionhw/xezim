@@ -5110,6 +5110,32 @@ pub(super) fn handle(
                                 let ts = m.typespec_obj(td);
                                 out(Some(plain_obj_handle(m, ts)))
                             }
+                            // §38.11: the left and right range of an element
+                            // or sub-array are those of its own type, the
+                            // packed range of a vector element (`[31:0]` of
+                            // `logic [31:0] a [4]`) or the next unpacked
+                            // dimension of a sub-array. cocotb reads them for
+                            // every element it makes a handle for; a NULL here
+                            // made it read a value through a null handle.
+                            c::LEFT_RANGE | c::RIGHT_RANGE => {
+                                let Some(mut td) = obj_td(m, o) else {
+                                    return out(None);
+                                };
+                                for _ in 0..ix.len() {
+                                    if !td_is_array(m, td) {
+                                        // A bit has no range.
+                                        return out(None);
+                                    }
+                                    td = m.elem_td(td);
+                                }
+                                let w = (h.kind == VpiKind::Signal)
+                                    .then(|| sim.signal_widths.get(h.signal_id).copied())
+                                    .flatten();
+                                let r = range_ends(m, td, w);
+                                out(r.map(|(l, rr)| {
+                                    int_const(if rel == c::LEFT_RANGE { l } else { rr })
+                                }))
+                            }
                             _ => None,
                         };
                     }

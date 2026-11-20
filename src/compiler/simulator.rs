@@ -13439,7 +13439,11 @@ pub extern "C" fn vpi_chk_error(error_info_p: *mut s_vpi_error_info) -> libc::c_
         info.message = vpi_err_scratch(&msg);
         info.product = b"xezim\0".as_ptr() as *mut libc::c_char;
         info.code = b"\0".as_ptr() as *mut libc::c_char;
-        info.file = std::ptr::null_mut();
+        // §38.3: every string field points at a string. An error has no
+        // source file, so `file` is empty rather than NULL: cocotb logs
+        // `file` and `product` as C strings, and a NULL `file` crashed it
+        // on the first error it checked.
+        info.file = b"\0".as_ptr() as *mut libc::c_char;
         info.line = 0;
     }
     level
