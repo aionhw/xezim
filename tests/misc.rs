@@ -153,6 +153,8 @@ mod inlined_call_caller_loop_constant;
 mod inspect_types;
 #[path = "misc/integral_time.rs"]
 mod integral_time;
+#[path = "misc/review_exact_time_reads.rs"]
+mod review_exact_time_reads;
 #[path = "misc/interconnect_and_var_ports.rs"]
 mod interconnect_and_var_ports;
 #[path = "misc/issue30_runner.rs"]
