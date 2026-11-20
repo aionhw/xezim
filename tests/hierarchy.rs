@@ -531,3 +531,5 @@ mod assignment_origin_sharing_721;
 mod upward_scope_sharing_721;
 #[path = "hierarchy/vif_whole_unpacked_1311.rs"]
 mod vif_whole_unpacked_1311;
+#[path = "hierarchy/clocking_blocks_per_scope.rs"]
+mod clocking_blocks_per_scope;
