@@ -1235,39 +1235,125 @@ impl Simulator {
         name: &str,
     ) -> Option<std::rc::Rc<HashMap<String, Value>>> {
         let (prefix, _) = name.rsplit_once('.')?;
-        if let Some((cached, scope)) = self.decl_param_scope_cache.borrow().as_ref()
-            && cached == prefix
+        let mut cache = self.decl_param_scope_cache.borrow_mut();
+        let cache = &mut *cache;
+        if let Some((last, owns)) = &cache.last
+            && last == prefix
         {
-            return scope.clone();
+            return if *owns {
+                cache.tables.last().map(|t| t.table.clone())
+            } else {
+                None
+            };
         }
         // Every enclosing scope of the prefix, outermost first: `u.g.par`
         // sees `u.N` as `N` and a generate-block constant `u.g.L` as `L`.
+        // Their groups go on in that order, so the innermost binding of a
+        // name wins over an outer same-named one.
         let scopes: Vec<&str> = prefix
             .match_indices('.')
             .map(|(i, _)| &prefix[..i])
             .chain(std::iter::once(prefix))
             .collect();
-        let mut overlay: Vec<(usize, &str, &Value)> = Vec::new();
-        for (k, v) in &self.module.parameters {
-            for (depth, scope) in scopes.iter().enumerate() {
-                if let Some(rest) = k.strip_prefix(scope).and_then(|r| r.strip_prefix('.')) {
-                    overlay.push((depth, rest, v));
+        let mut groups = Vec::with_capacity(scopes.len());
+        for scope in &scopes {
+            let group = match cache.groups.get(*scope) {
+                Some(group) => group.clone(),
+                None => {
+                    let group = self.decl_param_group(scope);
+                    cache.groups.insert(scope.to_string(), group.clone());
+                    group
+                }
+            };
+            groups.push(group);
+        }
+        if groups.iter().all(|g| g.is_empty()) {
+            cache.last = Some((prefix.to_string(), false));
+            return None;
+        }
+        // An overlaid table is moved between prefixes: the groups of the
+        // scopes the old and new prefix share stay on, the old prefix's
+        // other groups come off and the new prefix's go on. Of the tables
+        // nothing else holds, the one sharing the most outer scopes with the
+        // new prefix is moved; a prefix that shares none with any of them
+        // gets a fresh copy while there is room, else the least recently
+        // used one. A caller that still holds a table (a select whose index
+        // reads another instance's signal) keeps it untouched.
+        let shared = |t: &DeclParamTable| {
+            t.applied
+                .iter()
+                .zip(&scopes)
+                .take_while(|((applied, _), scope)| applied == *scope)
+                .count()
+        };
+        let unshared = |t: &DeclParamTable| std::rc::Rc::strong_count(&t.table) == 1;
+        let best = cache
+            .tables
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| unshared(t))
+            .map(|(i, t)| (shared(t), i))
+            .filter(|&(keep, _)| keep > 0)
+            .max_by_key(|&(keep, i)| (keep, i));
+        let fresh = || DeclParamTable {
+            table: std::rc::Rc::new(self.module.parameters.clone()),
+            applied: Vec::new(),
+            undo: Vec::new(),
+        };
+        let pick = if let Some((_, i)) = best {
+            i
+        } else if cache.tables.len() < DECL_PARAM_TABLES {
+            cache.tables.push(fresh());
+            cache.tables.len() - 1
+        } else if let Some(i) = cache.tables.iter().position(|t| unshared(t)) {
+            i
+        } else {
+            // Every table is held by a caller: replace the least recently
+            // used one; its holder keeps its own copy.
+            cache.tables[0] = fresh();
+            0
+        };
+        let mut t = cache.tables.remove(pick);
+        let keep = shared(&t);
+        // Nothing else holds `t.table` here, so this never copies it.
+        let table = std::rc::Rc::make_mut(&mut t.table);
+        if let Some(&(_, mark)) = t.applied.get(keep) {
+            for (k, prev) in t.undo.drain(mark..).rev() {
+                match prev {
+                    Some(v) => {
+                        table.insert(k, v);
+                    }
+                    None => {
+                        table.remove(&k);
+                    }
                 }
             }
+            t.applied.truncate(keep);
         }
-        let scope = if overlay.is_empty() {
-            None
-        } else {
-            // Innermost last, so its binding wins over an outer same-named one.
-            overlay.sort_by_key(|(depth, ..)| *depth);
-            let mut params = self.module.parameters.clone();
-            for (_, bare, v) in overlay {
-                params.insert(bare.to_string(), v.clone());
+        for (scope, group) in scopes[keep..].iter().zip(&groups[keep..]) {
+            t.applied.push((scope.to_string(), t.undo.len()));
+            for (rest, v) in group.iter() {
+                let prev = table.insert(rest.clone(), v.clone());
+                t.undo.push((rest.clone(), prev));
             }
-            Some(std::rc::Rc::new(params))
-        };
-        *self.decl_param_scope_cache.borrow_mut() = Some((prefix.to_string(), scope.clone()));
-        scope
+        }
+        let handed = t.table.clone();
+        cache.tables.push(t);
+        cache.last = Some((prefix.to_string(), true));
+        Some(handed)
+    }
+
+    /// The parameters named `<scope>.<rest>` in the design-wide table, as
+    /// `(rest, value)` in table order.
+    fn decl_param_group(&self, scope: &str) -> std::rc::Rc<[(String, Value)]> {
+        self.module
+            .parameters
+            .iter()
+            .filter_map(|(k, v)| {
+                let rest = k.strip_prefix(scope)?.strip_prefix('.')?;
+                Some((rest.to_string(), v.clone()))
+            })
+            .collect()
     }
 
     pub(super) fn declared_packed_type_in(

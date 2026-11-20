@@ -5330,6 +5330,38 @@ struct DeclShadow {
     meta: FormalMetadataSnapshot,
 }
 
+/// `Simulator::decl_param_scope`'s state (§23.10).
+#[derive(Default)]
+struct DeclParamScopeCache {
+    /// The prefix asked for last, and whether it owns parameters (when it
+    /// does, the last of `tables` holds its overlay).
+    last: Option<(String, bool)>,
+    /// Per scope: the parameters declared in it or below it, by their name
+    /// relative to the scope (`u.g.L` is `g.L` for `u`), in table order.
+    groups: HashMap<String, std::rc::Rc<[(String, Value)]>>,
+    /// Overlaid copies of the design-wide table, least recently used first,
+    /// at most `DECL_PARAM_TABLES`. Lookups that alternate between hierarchies
+    /// with different outermost scopes (a testbench component and the design
+    /// under test) each keep a copy, instead of taking one hierarchy's groups
+    /// off a single copy and putting the other's on at every move.
+    tables: Vec<DeclParamTable>,
+}
+
+/// How many overlaid parameter tables `decl_param_scope` keeps.
+const DECL_PARAM_TABLES: usize = 4;
+
+/// One overlaid copy of the design-wide parameter table (§23.10).
+struct DeclParamTable {
+    /// The design-wide parameter table with the groups of `applied` on it.
+    table: std::rc::Rc<HashMap<String, Value>>,
+    /// The scopes whose groups `table` holds, outermost first, each with the
+    /// length `undo` had before its group went on.
+    applied: Vec<(String, usize)>,
+    /// What each group write replaced in `table`, in write order, so a group
+    /// comes off again in reverse.
+    undo: Vec<(String, Option<Value>)>,
+}
+
 /// One selected region of a declared packed value (§7.4.1 / §11.5.1).
 struct DeclaredPackedAccess {
     storage: String,
@@ -9780,12 +9812,13 @@ pub struct Simulator {
     method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
     /// Reused buffer for the `<hint>.<name>` probe in `get_signal_value_by_name` (a `&self` path).
     hint_key_scratch: std::cell::RefCell<String>,
-    /// One-entry cache of `decl_param_scope`: the instance prefix last asked
-    /// for and its overlaid parameter table (`None` when the prefix owns no
-    /// parameters). A select loop over one instance's signal rebuilds nothing.
+    /// `decl_param_scope`'s state: the parameters under each scope, and the
+    /// overlaid parameter tables it hands out. A select loop over one
+    /// instance's signal rebuilds nothing, and a move to another instance
+    /// changes only the scopes the two do not share instead of copying the
+    /// table.
     #[serde(skip)]
-    decl_param_scope_cache:
-        std::cell::RefCell<Option<(String, Option<std::rc::Rc<HashMap<String, Value>>>)>>,
+    decl_param_scope_cache: std::cell::RefCell<DeclParamScopeCache>,
     /// Reused buffer for the `__vif_local__` key probes (`&self` paths).
     vif_key_scratch: std::cell::RefCell<String>,
     /// §8.25: specialization-argument texts already folded to their value
