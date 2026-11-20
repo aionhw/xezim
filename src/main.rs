@@ -4280,11 +4280,17 @@ suppressed but the explicit SDF annotation still applies."
 }
 
 /// §20.10: translate end-of-run severity state into a process exit status.
-/// `$fatal` must never exit 0 — its finish_number is a diagnostics level, not
+/// A run that a signal stopped exits 128 + the signal number. `$fatal` must
+/// never exit 0 — its finish_number is a diagnostics level, not
 /// a success code, so any `$fatal` fails the run. `$error` only fails when the
 /// user opts in with `--error-exit` (matching the "promote errors" switch other
 /// simulators provide), so existing flows that tolerate errors keep working.
 fn exit_status_for_severities(sim: &xezim::compiler::Simulator, error_exit: bool) -> i32 {
+    // A run that SIGINT or SIGTERM stopped exits 128 + the signal (130,
+    // 143), after the dumps are finalized: it did not run to its end.
+    if let Some(code) = xezim::compiler::interrupted_exit_status() {
+        return code;
+    }
     if sim.saw_fatal {
         return 1;
     }
