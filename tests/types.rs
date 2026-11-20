@@ -841,3 +841,5 @@ mod real_fill_literal_stores;
 mod local_struct_signed_members;
 #[path = "types/struct_array_member_defaults.rs"]
 mod struct_array_member_defaults;
+#[path = "types/union_real_member.rs"]
+mod union_real_member;
