@@ -1178,7 +1178,7 @@ impl Simulator {
     /// §14.10, §9.4.2: an event control naming clocking block `cb`, as
     /// `@(cb)` or `@cb`, waits for the block's clocking event: its clock
     /// signal on the edge the block declares.
-    fn clocking_event_sens(&self, cb: &str, iff: Option<Box<Expression>>) -> Option<Sensitivity> {
+    fn clocking_event_sens(&self, cb: &str, iff: Option<Rc<Expression>>) -> Option<Sensitivity> {
         let (clk, _) = self.clocking_meta.get(cb)?;
         Some(Sensitivity {
             signal_name: clk.clone(),
