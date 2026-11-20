@@ -241,8 +241,14 @@ impl NameMap {
         // Only alias-determined answers are kept: the canonical spelling (its
         // id is looked up again on every hit) or "no alias applies". A miss of
         // an aliased name is not, since a later `insert` /
-        // `add_virtual_array` can add the canonical name.
-        let stored = if ans.is_some() {
+        // `add_virtual_array` can add the canonical name. Nor is the answer
+        // for a subroutine call's own storage (`@q#17`, `@q#17[3]`): its key
+        // is new on every call and not asked for again once the call returns,
+        // so keeping it only grew the cache, by one entry per call and
+        // element, for the whole run.
+        let stored = if name.starts_with('@') {
+            None
+        } else if ans.is_some() {
             Some(Some(canonical.into_owned()))
         } else if canonical == name {
             Some(None)
