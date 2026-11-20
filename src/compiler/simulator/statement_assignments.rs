@@ -1728,6 +1728,22 @@ impl Simulator {
         }
         // §15.5.5: a class-member event takes the other event's object.
         self.bind_instance_event_assign(lvalue, rvalue);
+        // §13.4.1, §7.2: `f = t;` in the function `f`, with `t` a whole
+        // unpacked struct, spreads `t` over the return variable's leaves.
+        // The plain copy below stored it as one value nobody reads.
+        if let ExprKind::Ident(h) = &lvalue.kind
+            && let ExprKind::Ident(_) = &rvalue.kind
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && self
+                .func_call_stack
+                .last()
+                .is_some_and(|f| *f == h.path[0].name.name)
+            && self.ret_var_struct_assign(&h.path[0].name.name, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
         if self.simple_blocking_assign(lvalue, rvalue) || self.member_target_assign(lvalue, rvalue)
         {
             return;

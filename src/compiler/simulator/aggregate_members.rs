@@ -5063,8 +5063,30 @@ impl Simulator {
         else {
             return false;
         };
-        let v = self.ret_struct_elem_value(rvalue);
+        let v = match &rvalue.kind {
+            ExprKind::Ident(_) => self.whole_struct_ident_value(rvalue, &su),
+            _ => self.ret_struct_elem_value(rvalue),
+        };
         v.is_some_and(|v| self.spread_into_unpacked_struct(ret_name, &su, &v))
+    }
+
+    /// §13.4.1, §7.2: the packed value of the whole unpacked struct `e`
+    /// names, a local, a formal or a static or design variable of type `su`,
+    /// assembled from its leaves as `return e;` assembles it. None when `e`
+    /// names no such struct.
+    fn whole_struct_ident_value(
+        &mut self,
+        e: &Expression,
+        su: &crate::ast::types::StructUnionType,
+    ) -> Option<Value> {
+        if let Some((name, own)) = self.frame_struct_local(e) {
+            return self.pack_unpacked_struct(&name, &own);
+        }
+        let flat = self.flat_member_name(e)?;
+        if !self.struct_storage_exists(&flat, su) {
+            return None;
+        }
+        self.pack_unpacked_struct(&flat, su)
     }
 
     /// Whether the select chain of `e` holds an element select.
