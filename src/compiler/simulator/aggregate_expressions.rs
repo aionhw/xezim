@@ -1887,7 +1887,9 @@ impl Simulator {
     }
 
     pub(super) fn read_declared_packed_access(&mut self, expr: &Expression) -> Option<Value> {
-        let access = self.declared_packed_access(expr)?;
+        let Some(access) = self.declared_packed_access(expr) else {
+            return self.read_partial_packed_range(expr);
+        };
         if access.unpacked != 0 || access.width == 0 {
             return None;
         }
@@ -1910,17 +1912,32 @@ impl Simulator {
         expr: &Expression,
         value: &Value,
     ) -> Option<bool> {
-        let access = self.declared_packed_access(expr)?;
-        if access.unpacked != 0 || access.width == 0 {
+        // Each piece is (bit in the stored vector, bit in the fitted value,
+        // width); a select inside its dimension is one piece.
+        let (access, fit_w, partial) = match self.declared_packed_access(expr) {
+            Some(access) => {
+                let w = access.width;
+                (access, w, None)
+            }
+            None => {
+                let (access, w, pieces) = self.partial_packed_range_pieces(expr)?;
+                (access, w, Some(pieces))
+            }
+        };
+        if access.unpacked != 0 || fit_w == 0 {
             return None;
         }
+        let single = [(access.offset, 0, access.width)];
+        let pieces: &[(u32, u32, u32)] = partial.as_deref().unwrap_or(&single);
         let mut stored = if let Some((class, spec, member)) = &access.static_target {
             self.static_read_in(class, spec.clone(), member)?
         } else {
             self.packed_local_value(&access.storage)?
         };
-        if access.offset.checked_add(access.width)? > stored.width {
-            return None;
+        for &(dst, _, w) in pieces {
+            if dst.checked_add(w)? > stored.width {
+                return None;
+            }
         }
         let before = stored.clone();
         if access.static_target.is_none() && self.forced_names.contains(&access.storage) {
@@ -1931,12 +1948,14 @@ impl Simulator {
                 &access.element_type,
                 &self.module.typedef_types,
             ) {
-            value.to_two_state().resize_for_assign(access.width)
+            value.to_two_state().resize_for_assign(fit_w)
         } else {
-            value.resize_for_assign(access.width)
+            value.resize_for_assign(fit_w)
         };
-        for bit in 0..access.width {
-            stored.set_bit((access.offset + bit) as usize, fitted.get_bit(bit as usize));
+        for &(dst, src, w) in pieces {
+            for bit in 0..w {
+                stored.set_bit((dst + bit) as usize, fitted.get_bit((src + bit) as usize));
+            }
         }
         let changed = stored != before;
         if let Some((class, spec, member)) = access.static_target {
@@ -1948,6 +1967,122 @@ impl Simulator {
             self.set_local_or_signal(&access.storage, stored);
         }
         Some(changed)
+    }
+
+    /// §11.5.1: a part-select after an index or member that runs partly (or
+    /// wholly) past its dimension reads x for its elements outside it; the
+    /// generic read placed it as bits (`a[0][k +: 2]` with `k = 5` read 0).
+    fn read_partial_packed_range(&mut self, expr: &Expression) -> Option<Value> {
+        let (access, fit_w, pieces) = self.partial_packed_range_pieces(expr)?;
+        if fit_w == 0 {
+            return None;
+        }
+        let stored = if let Some((class, spec, member)) = &access.static_target {
+            self.static_read_in(class, spec.clone(), member)?
+        } else {
+            self.packed_local_value(&access.storage)?
+        };
+        let mut out = Value::new(fit_w);
+        for (src, dst, w) in pieces {
+            if src.checked_add(w)? > stored.width {
+                return None;
+            }
+            for bit in 0..w {
+                out.set_bit((dst + bit) as usize, stored.get_bit((src + bit) as usize));
+            }
+        }
+        // A two-state element reads its missing bits as 0 (§7.4.6).
+        if super::elaborate::is_type_two_state_resolved(
+            &access.element_type,
+            &self.module.typedef_types,
+        ) {
+            out = out.to_two_state();
+        }
+        Some(out)
+    }
+
+    /// §11.5.1: a part-select after an index or member that runs partly (or
+    /// wholly) past its dimension writes only its elements inside it. The
+    /// declaration walk declines such a select, and the generic store then
+    /// placed it wrongly: `a[0][k +: 2] = 16'hbbaa` on
+    /// `logic [3:0][5:0][7:0] a` with `k = 5` wrote nothing, and
+    /// `a[1][k -: 2]` with `k = 0` wrote one bit. Returns the access of the
+    /// select's base, the width of the value the select stands for, and the
+    /// pieces of it that land inside the dimension.
+    #[allow(clippy::type_complexity)]
+    fn partial_packed_range_pieces(
+        &mut self,
+        expr: &Expression,
+    ) -> Option<(DeclaredPackedAccess, u32, Vec<(u32, u32, u32)>)> {
+        let ExprKind::RangeSelect {
+            expr: base,
+            left,
+            right,
+            kind,
+        } = &expr.kind
+        else {
+            return None;
+        };
+        if !matches!(
+            base.kind,
+            ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+        ) || !Self::cond_expr_is_effect_free(left, false)
+            || !Self::cond_expr_is_effect_free(right, false)
+        {
+            return None;
+        }
+        let access = self.declared_packed_access(base)?;
+        if access.unpacked != 0 {
+            return None;
+        }
+        let &(dl, dr) = access.dimensions.first()?;
+        let a = self.eval_expr(left).to_index()?;
+        let b = self.eval_expr(right).to_index()?;
+        let (l, r) = match kind {
+            RangeKind::Constant => (a, b),
+            RangeKind::IndexedUp if b > 0 => {
+                if dl >= dr {
+                    (a.checked_add(b - 1)?, a)
+                } else {
+                    (a, a.checked_add(b - 1)?)
+                }
+            }
+            RangeKind::IndexedDown if b > 0 => {
+                if dl >= dr {
+                    (a, a.checked_sub(b - 1)?)
+                } else {
+                    (a.checked_sub(b - 1)?, a)
+                }
+            }
+            _ => return None,
+        };
+        if l != r && (l > r) != (dl > dr) {
+            return None;
+        }
+        let count = u32::try_from(dl.abs_diff(dr) + 1).ok()?;
+        if access.width % count != 0 {
+            return None;
+        }
+        let stride = access.width / count;
+        let n = u32::try_from(l.abs_diff(r) + 1).ok()?;
+        let fit_w = n.checked_mul(stride)?;
+        // Element `k` of the value (from its least significant end) has
+        // label `r + k*step`.
+        let step: i64 = if l >= r { 1 } else { -1 };
+        let (lo, hi) = (dl.min(dr), dl.max(dr));
+        let mut pieces = Vec::new();
+        for k in 0..n {
+            let label = r + i64::from(k) * step;
+            if label < lo || label > hi {
+                continue;
+            }
+            let slot = if dl >= dr { label - dr } else { dr - label };
+            let dst = access
+                .offset
+                .checked_add(u32::try_from(slot).ok()?.checked_mul(stride)?)?;
+            pieces.push((dst, k * stride, stride));
+        }
+        Some((access, fit_w, pieces))
     }
 
     pub(super) fn select_base_elem_dim(&self, base: &Expression) -> Option<(i64, i64)> {
