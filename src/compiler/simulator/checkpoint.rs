@@ -45,7 +45,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // §10.9.1, §26.3 / §9.4.2: named assignment pattern keys carry a bound type name; the guard
 // and value expressions of an event term are shared.
 // §9.2.2.2: Simulator::comb_time0_held, CombEntryCold::time0_effects.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x13";
+// §16.4.2: DeferredReport::stat_key, ::stat_kind and ::stat_loc, counted when the report matures.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x14";
 
 #[derive(Default)]
 struct Session {

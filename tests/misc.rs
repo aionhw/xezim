@@ -671,3 +671,5 @@ mod declaration_order_snapshots;
 
 #[path = "misc/shared_procedural_bodies.rs"]
 mod shared_procedural_bodies;
+#[path = "misc/deferred_assertion_counts.rs"]
+mod deferred_assertion_counts;

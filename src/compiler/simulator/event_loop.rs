@@ -3710,13 +3710,9 @@ impl Simulator {
         // §16.12.2: strong properties still pending fail at the end of
         // simulation, before the summary counts them.
         self.sva_end_of_sim();
-        // Assertion + coverage summary (always when any data was recorded;
-        // dump the JSON database iff XEZIM_COV_DB=<path> is set, else default
-        // path xezim_cov.json when at least one stat exists). A run with code
-        // coverage writes it after the `final` blocks, which count too.
-        if self.code_cov.is_none() {
-            self.emit_coverage_summary();
-        }
+        // The assertion + coverage summary (and the JSON database) is written
+        // by `run` after the last slot's deferred reports mature and the
+        // `final` blocks run, which both count.
         if self.edge_block_stats_enabled {
             self.print_edge_block_stats();
         }

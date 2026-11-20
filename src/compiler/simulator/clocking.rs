@@ -875,9 +875,12 @@ impl Simulator {
         }
     }
 
-    /// §16.4: record a deferred assertion's outcome; its action block runs
+    /// §16.4: queue a deferred assertion's report; its action block runs
     /// when the report matures. Arguments of a subroutine-call action are
-    /// evaluated now, as §16.4 requires.
+    /// evaluated now, as §16.4 requires. The outcome is counted only when
+    /// the report matures (`mature_deferred_asserts`): a report flushed
+    /// because its process resumed in the same time slot (§16.4.2), or
+    /// superseded by a re-execution of its `always_comb`, is no attempt.
     pub(super) fn queue_deferred_assert(
         &mut self,
         a: &crate::ast::stmt::AssertionStatement,
@@ -893,26 +896,14 @@ impl Simulator {
         let src = self.current_src_file();
         let stat_key = Self::assert_stat_key(a.span.start, src);
         self.note_assert_label(stat_key, label);
-        let entry = self
-            .assertion_stats
-            .entry(stat_key)
-            .or_insert(AssertionStat {
-                kind: kind_tag,
-                loc: Some((src, a.span.start)),
-                pass_count: 0,
-                fail_count: 0,
-            });
-        if passed {
-            entry.pass_count += 1;
-        } else {
-            entry.fail_count += 1;
-        }
         // An `always_comb` / `always @*` the settle runs as a comb entry is
         // not the process that happens to be current (whose resumption, a
         // §16.4.2 flush point, would drop the report): its reports belong to
-        // no process, keyed by the block's scope instead.
+        // no process, keyed by the scope `%m` names instead. The copies of a
+        // generate loop share the statement, and can share the settle's
+        // name hint, but each has its own `%m` path.
         let (pid, comb_scope) = if self.settling || self.comb_direct_eval {
-            (usize::MAX, self.name_resolve_hint.borrow().clone())
+            (usize::MAX, Some(self.m_path()))
         } else {
             (self.current_pid, None)
         };
@@ -926,9 +917,7 @@ impl Simulator {
         // has no failure action).
         let default_error_scope =
             (action.is_none() && !passed && kind_tag != 2).then(|| self.m_path());
-        if action.is_none() && default_error_scope.is_none() {
-            return;
-        }
+        // A report with no action still matures, to be counted then.
         let ctl = self.imm_assert_ident(a);
         self.deferred_asserts.push(DeferredReport {
             pid,
@@ -941,6 +930,9 @@ impl Simulator {
             this_handle: self.this_stack.last().copied().flatten(),
             class_context: self.class_context_stack.last().cloned().flatten(),
             ctl,
+            stat_key,
+            stat_kind: kind_tag,
+            stat_loc: (src, a.span.start),
         });
     }
 
@@ -996,9 +988,49 @@ impl Simulator {
     pub(super) fn mature_deferred_asserts(&mut self) {
         let mut pending = std::mem::take(&mut self.deferred_asserts);
         pending.sort_by_key(|d| d.kind == crate::ast::stmt::DeferredAssertion::Final);
-        for d in pending {
+        // §16.4: the `#0` reports mature together in the Observed region and
+        // the `final` ones in the Postponed region, before any of their
+        // actions run, so each group is counted on reaching its region and a
+        // `$finish` in one report's action leaves the others counted. A
+        // region a `$finish` kept the slot from reaching matures nothing.
+        let at = pending
+            .iter()
+            .position(|d| d.kind == crate::ast::stmt::DeferredAssertion::Final)
+            .unwrap_or(pending.len());
+        let finals = pending.split_off(at);
+        for group in [pending, finals] {
+            if !self.finished {
+                for d in &group {
+                    self.count_deferred_report(d);
+                }
+            }
+            self.run_deferred_actions(group);
+        }
+    }
+
+    /// Count one matured deferred report in its statement's `assertion_stats`
+    /// entry (§16.4.2).
+    fn count_deferred_report(&mut self, d: &DeferredReport) {
+        let entry = self.assertion_stats.entry(d.stat_key).or_insert(AssertionStat {
+            kind: d.stat_kind,
+            loc: Some(d.stat_loc),
+            pass_count: 0,
+            fail_count: 0,
+        });
+        if d.passed {
+            entry.pass_count += 1;
+        } else {
+            entry.fail_count += 1;
+        }
+    }
+
+    /// The actions of matured deferred reports (see `mature_deferred_asserts`).
+    fn run_deferred_actions(&mut self, group: Vec<DeferredReport>) {
+        for d in group {
             if self.finished {
-                if !d.passed {
+                // Only a report with a failure action left to run is noted:
+                // a cover that did not match has none (§16.14.3).
+                if !d.passed && (d.action.is_some() || d.default_error_scope.is_some()) {
                     let loc = self
                         .span_file_line_in(d.span, None)
                         .unwrap_or_else(|| "?".to_string());

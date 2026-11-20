@@ -340,9 +340,13 @@ impl Simulator {
         if self.vpi_cb_mask != 0 {
             self.vpi_end_of_simulation();
         }
-        if self.code_cov.is_some() {
-            self.emit_coverage_summary();
-        }
+        // Assertion + coverage summary (always when any data was recorded;
+        // the JSON database goes to XEZIM_COV_DB, else to xezim_cov.json when
+        // at least one stat exists). It follows the `final` blocks and the
+        // last slot's deferred reports, which mature above (§16.4): a run
+        // without code coverage wrote it at the end of the event loop,
+        // before those were counted.
+        self.emit_coverage_summary();
         // Flush any `--warn-x` reports captured during the final region.
         self.drain_warn_x();
         self.drain_value_trace();
