@@ -4011,6 +4011,7 @@ impl Simulator {
             has_coll_rows: false,
             partial_forces: HashMap::default(),
             pending_release_ids: Vec::new(),
+            comb_writer_index: None,
             prop_raw_ty_cache: std::cell::RefCell::new(HashMap::default()),
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
