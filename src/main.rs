@@ -4082,6 +4082,10 @@ suppressed but the explicit SDF annotation still applies."
                 *t = rewritten;
             }
         }
+        // A saved image can be loaded later with a VPI or DPI library (§38.34).
+        xezim_core::elaborate::set_vpi_net_drivers(
+            _output_file.is_some() || !vpi_libs.is_empty() || !dpi_libs.is_empty(),
+        );
         match xezim_core::parse_and_elaborate_multi_preprocessed(
             &sources,
             top_module.as_deref(),

@@ -129,3 +129,30 @@ endmodule
         false,
     );
 }
+#[test]
+fn absolute_queue_element_member_reads() {
+    check(
+        r#"class C;
+  int v;
+  function new(int n); v = n; endfunction
+endclass
+typedef struct packed { logic [7:0] a, b; } pair_t;
+module top;
+  C objs[$], c;
+  pair_t qs[$];
+  int i;
+  initial begin
+    c = new(10); objs.push_back(c);
+    c = new(20); objs.push_back(c);
+    qs.push_back('{8'h11,8'h22});
+    qs.push_back('{8'h33,8'h44});
+    i = 1;
+    #1;
+    $display("T|class %0d %0d", objs[i].v, $root.top.objs[i].v);
+    $display("T|struct %h %h", qs[i].a, $root.top.qs[i].a);
+  end
+endmodule"#,
+        &["T|class 20 20", "T|struct 33 33"],
+        false,
+    );
+}

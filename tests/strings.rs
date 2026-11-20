@@ -129,6 +129,8 @@ mod vpi_array_ports;
 mod vpi_assertion_controls;
 #[path = "strings/vpi_callbacks.rs"]
 mod vpi_callbacks;
+#[path = "strings/vpi_deposit_unchanged_driver.rs"]
+mod vpi_deposit_unchanged_driver;
 #[path = "strings/vpi_mcd_and_time_queries.rs"]
 mod vpi_mcd_and_time_queries;
 #[path = "strings/vpi_net_kinds.rs"]
