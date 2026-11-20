@@ -1350,6 +1350,9 @@ impl Simulator {
                 // helpers) onto the slowest path. Every other compiler
                 // instantiation passes it; this one simply never did.
                 compiler.set_functions(&self.module.functions);
+                // §6.12.1: which operands are real decides the conversions
+                // (an integral net driven by a real rounds it).
+                compiler.set_signal_real(&self.signal_real);
                 compiler.top_module_name = Some(self.module.name.clone());
                 if let Some(c) = cov_counter {
                     compiler.emit_cov_hit(c);
@@ -1440,6 +1443,7 @@ impl Simulator {
                 // (`assign {a,b} = ({N{hit}} & f(w)) | ...`) could never
                 // inline its calls and stayed on the AST interpreter.
                 compiler.set_functions(&self.module.functions);
+                compiler.set_signal_real(&self.signal_real);
                 compiler.top_module_name = Some(self.module.name.clone());
                 if let Some(c) = cov_counter {
                     compiler.emit_cov_hit(c);

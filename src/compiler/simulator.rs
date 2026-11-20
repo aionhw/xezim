@@ -15456,6 +15456,16 @@ fn drop_xz(r: &mut Value) {
     }
 }
 
+/// `Insn::RealToInt`: §6.12.1 — a real rounds to a 64-bit integer, ties
+/// away from zero (a target narrower than 64 bits wraps it at the `Resize`
+/// that follows); any other value is left as it is.
+#[inline]
+fn real_to_int_reg(r: &mut Value) {
+    if r.is_real {
+        *r = Value::from_real_wrapped(r.to_f64(), 64);
+    }
+}
+
 /// The last `.`-separated segment of a hierarchical name and that segment
 /// cut at its first `[` — what `rsplit('.')` / `split('[')` give, in one
 /// pass over the bytes.

@@ -763,6 +763,7 @@ impl Simulator {
                     vm_regs[*reg as usize].is_signed = false;
                 }
                 Insn::DropXz(reg) => drop_xz(&mut vm_regs[*reg as usize]),
+                Insn::RealToInt(reg) => real_to_int_reg(&mut vm_regs[*reg as usize]),
                 Insn::Pow(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].power(&vm_regs[*r as usize]);
                 }
@@ -1310,6 +1311,7 @@ impl Simulator {
                     vm_regs[*reg as usize].is_signed = false;
                 }
                 Insn::DropXz(reg) => drop_xz(&mut vm_regs[*reg as usize]),
+                Insn::RealToInt(reg) => real_to_int_reg(&mut vm_regs[*reg as usize]),
                 Insn::Pow(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].power(&vm_regs[*r as usize]);
                 }
@@ -4824,6 +4826,7 @@ impl Simulator {
                     self.vm_regs[*reg as usize].is_signed = false;
                 }
                 Insn::DropXz(reg) => drop_xz(&mut self.vm_regs[*reg as usize]),
+                Insn::RealToInt(reg) => real_to_int_reg(&mut self.vm_regs[*reg as usize]),
                 Insn::Pow(d, l, r) => {
                     self.vm_regs[*d as usize] =
                         self.vm_regs[*l as usize].power(&self.vm_regs[*r as usize]);

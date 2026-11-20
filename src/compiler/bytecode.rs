@@ -640,6 +640,12 @@ pub enum Insn {
     /// its X/Z bits to 0. Emitted only after a store to a register-backed
     /// local of a 2-state type (see `emit_local_fit`).
     DropXz(RegId),
+    /// §6.12.1/§6.24.1: a real in the register is rounded to a 64-bit
+    /// integer (ties away from zero); any other value is left as it is.
+    /// Emitted before the `Resize` that fits a value which may be real to
+    /// a 64-bit integral type: real storage is 64 bits wide, so that
+    /// `Resize` alone would keep the real and its IEEE 754 bits.
+    RealToInt(RegId),
     /// §11.4.3 `**` with a non-constant base: left operand pre-resized to the
     /// operation width by the compiler; result width = left's width.
     Pow(RegId, RegId, RegId),
@@ -1346,6 +1352,7 @@ impl Insn {
             | SetSigned(a)
             | ClearSigned(a)
             | DropXz(a)
+            | RealToInt(a)
             | LoadSignal(a, _)
             | LoadSignalSigned(a, _)
             | LoadSignalRange(a, _, _, _)
@@ -1570,6 +1577,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::Move(..) => "Move",
         Insn::SetSigned(..) => "SetSigned",
         Insn::DropXz(..) => "DropXz",
+        Insn::RealToInt(..) => "RealToInt",
         Insn::ClearSigned(..) => "ClearSigned",
         Insn::Pow(..) => "Pow",
         Insn::LoadClassMember(..) => "LoadCls",
@@ -4693,6 +4701,10 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 let v = self.compile_expr(a, w)?;
                 self.emit(Insn::Move(slot, v));
+                // §13.5, §6.12.1: a real actual of an integral formal rounds.
+                if !formal_is_real && !formal_is_string {
+                    self.emit_real_to_int_fit(slot, a, w);
+                }
             }
             if w > 0 && !formal_is_real {
                 self.emit(Insn::Resize(slot, w));
@@ -5233,6 +5245,10 @@ impl<'a> BytecodeCompiler<'a> {
                     return false;
                 };
                 self.emit(Insn::Move(slot, value));
+                // §6.8, §6.12.1: `longint t = r;` rounds a real initializer.
+                if matches!(kind, Some(LocalKind::Int { .. })) {
+                    self.emit_real_to_int_fit(slot, expr, width);
+                }
             }
             None => {
                 let value = if is_real {
@@ -5316,12 +5332,17 @@ impl<'a> BytecodeCompiler<'a> {
             self.decl_width(data_type)
         };
         let slot = self.alloc_reg();
+        let kind = self.local_kind_of(data_type, None);
         match &d.init {
             Some(e) => {
                 let Some(v) = self.compile_expr(e, w) else {
                     return false;
                 };
                 self.emit(Insn::Move(slot, v));
+                // §6.8, §6.12.1: `longint t = r;` rounds a real initializer.
+                if matches!(kind, Some(LocalKind::Int { .. })) {
+                    self.emit_real_to_int_fit(slot, e, w);
+                }
             }
             None => {
                 let init = self.type_default_value(data_type, w);
@@ -5346,7 +5367,7 @@ impl<'a> BytecodeCompiler<'a> {
                 self.local_var_elem.insert(d.name.name.clone(), ew);
             }
         }
-        if let Some(k) = self.local_kind_of(data_type, None) {
+        if let Some(k) = kind {
             self.local_kinds.insert(slot, k);
             self.emit_local_fit(slot);
         }
@@ -11527,6 +11548,7 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::SetSigned(..)
             | Insn::ClearSigned(..)
             | Insn::DropXz(..)
+            | Insn::RealToInt(..)
             | Insn::Add(..)
             | Insn::Sub(..)
             | Insn::Mul(..)
@@ -12707,25 +12729,6 @@ impl<'a> BytecodeCompiler<'a> {
         Some(dest)
     }
 
-    /// `expr_may_be_real`, also counting real casts and any subroutine call
-    /// (whose return type is not tracked here).
-    fn ret_expr_may_be_real(&self, e: &Expression) -> bool {
-        fn has_call(e: &Expression) -> bool {
-            match &e.kind {
-                ExprKind::Call { .. } => true,
-                ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => has_call(x),
-                ExprKind::Binary { left, right, .. } => has_call(left) || has_call(right),
-                ExprKind::Conditional {
-                    then_expr,
-                    else_expr,
-                    ..
-                } => has_call(then_expr) || has_call(else_expr),
-                _ => false,
-            }
-        }
-        self.expr_is_real_static(e) || self.expr_may_be_real(e) || has_call(e)
-    }
-
     /// Conservative: true when `e` may evaluate to a real — a real literal,
     /// a real signal or local, or a real-valued system function.
     fn expr_may_be_real(&self, e: &Expression) -> bool {
@@ -12765,6 +12768,268 @@ impl<'a> BytecodeCompiler<'a> {
             } => self.expr_may_be_real(then_expr) || self.expr_may_be_real(else_expr),
             ExprKind::Call { func, .. } => self.call_returns_real(func),
             _ => false,
+        }
+    }
+
+    /// Conservative the other way from `expr_may_be_real`: false only when
+    /// `e` provably evaluates to a value that is not real (an integral,
+    /// string or handle value), true for a real and for any shape not
+    /// understood here. Decides whether a value fitted to a 64-bit integral
+    /// type needs `RealToInt`, and (applied to an assignment target) whether
+    /// that target is integral.
+    fn value_may_be_real(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(n) => matches!(n, NumberLiteral::Real(_) | NumberLiteral::Time(_)),
+            ExprKind::StringLiteral(_) => false,
+            ExprKind::Paren(x) => self.value_may_be_real(x),
+            ExprKind::Ident(h) => self.ident_may_be_real(h),
+            // §11.5.1: a part-select is integral (a real has none).
+            ExprKind::RangeSelect { .. } => false,
+            ExprKind::Index { expr: base, .. } => match &base.kind {
+                ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                    let raw = Self::hier_raw_name(h);
+                    if let Some(ab) = self.local_var_array.get(&raw) {
+                        return ab.is_real;
+                    }
+                    if let Some(name) = self.lookup_array_name(h) {
+                        // §7.4: the element type of an unpacked array.
+                        let lo = self.arrays.get(&name).map_or(0, |&(lo, _, _)| lo);
+                        return self
+                            .lookup_signal_id_by_name(&format!("{name}[{lo}]"))
+                            .is_none_or(|id| self.signal_is_real(id));
+                    }
+                    if self.is_assoc_target(h)
+                        || self.is_dynamic_collection(&raw)
+                        || self.arrays.contains_key(&raw)
+                        || self
+                            .multi_dim_arrays
+                            .is_some_and(|m| m.contains(raw.as_str()))
+                    {
+                        return true;
+                    }
+                    // A select of a packed vector or structure (§7.4.1).
+                    !(self.local_var_reg_of(h).is_some_and(|(r, _)| {
+                        matches!(self.local_kinds.get(&r), Some(LocalKind::Int { .. }))
+                    }) || self.lookup_signal_id(h).is_some_and(|id| {
+                        self.signal_real.is_some()
+                            && !self.signal_is_real(id)
+                            && self.signal_widths.get(id).is_some_and(|&w| w > 0)
+                    }))
+                }
+                // An element of a two-dimensional unpacked array.
+                ExprKind::Index { expr: root, .. } => match &root.kind {
+                    ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => self
+                        .arrays_2d_entry(h)
+                        .is_none_or(|(key, ((a, b), (c, d), _))| {
+                            self.lookup_signal_id_by_name(&format!(
+                                "{key}[{}][{}]",
+                                a.min(b),
+                                c.min(d)
+                            ))
+                            .is_none_or(|id| self.signal_is_real(id))
+                        }),
+                    _ => true,
+                },
+                _ => true,
+            },
+            ExprKind::MemberAccess { expr: base, member } => match &base.kind {
+                ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                    let mut h = h.clone();
+                    h.path.push(HierPathSegment {
+                        name: member.clone(),
+                        selects: Vec::new(),
+                    });
+                    self.ident_may_be_real(&h)
+                }
+                _ => true,
+            },
+            ExprKind::Unary { op, operand } => match op {
+                UnaryOp::Plus
+                | UnaryOp::Minus
+                | UnaryOp::PreIncr
+                | UnaryOp::PreDecr
+                | UnaryOp::PostIncr
+                | UnaryOp::PostDecr => self.value_may_be_real(operand),
+                // Logical, bitwise and reduction operators are integral.
+                UnaryOp::LogNot
+                | UnaryOp::BitNot
+                | UnaryOp::BitAnd
+                | UnaryOp::BitNand
+                | UnaryOp::BitOr
+                | UnaryOp::BitNor
+                | UnaryOp::BitXor
+                | UnaryOp::BitXnor => false,
+                _ => true,
+            },
+            ExprKind::Binary { op, left, right } => match op {
+                // §11.3.1: arithmetic is real when an operand is.
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::Power => self.value_may_be_real(left) || self.value_may_be_real(right),
+                // Relational, equality, logical, bitwise and shift operators
+                // give an integral result (§11.4.4-§11.4.10).
+                BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::CaseEq
+                | BinaryOp::CaseNeq
+                | BinaryOp::WildcardEq
+                | BinaryOp::WildcardNeq
+                | BinaryOp::LogAnd
+                | BinaryOp::LogOr
+                | BinaryOp::LogImplies
+                | BinaryOp::LogEquiv
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::BitXnor
+                | BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight
+                | BinaryOp::ArithShiftLeft
+                | BinaryOp::ArithShiftRight => false,
+                _ => true,
+            },
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => self.value_may_be_real(then_expr) || self.value_may_be_real(else_expr),
+            // §11.4.12, §11.4.13: concatenations and `inside` are integral.
+            ExprKind::Concatenation(_)
+            | ExprKind::Replication { .. }
+            | ExprKind::Inside { .. }
+            | ExprKind::StreamOp { .. } => false,
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$__xz_type_cast" => match args.first().map(|a| &a.kind) {
+                    Some(ExprKind::TypeLiteral(dt)) => self.decl_is_real(dt, None),
+                    _ => true,
+                },
+                "$__xz_named_cast" => {
+                    self.named_cast_is_real(args)
+                        || !(self.cast_arg_targets_string(args)
+                            || matches!(args.first().map(|a| &a.kind), Some(ExprKind::Number(_)))
+                            || args.first().is_some_and(|a| {
+                                let leaf = match &a.kind {
+                                    ExprKind::Ident(h) => h.path.last().map(|s| &s.name.name),
+                                    ExprKind::MemberAccess { member, .. } => Some(&member.name),
+                                    _ => None,
+                                };
+                                leaf.is_some_and(|n| {
+                                    self.cast_widths.is_some_and(|m| m.contains_key(n))
+                                        || self.params.is_some_and(|p| p.contains_key(n))
+                                })
+                            }))
+                }
+                "$__xz_size_cast" => false,
+                "$signed" | "$unsigned" | "$sampled" | "$past" => {
+                    args.first().is_none_or(|a| self.value_may_be_real(a))
+                }
+                "$time"
+                | "$stime"
+                | "$random"
+                | "$urandom"
+                | "$urandom_range"
+                | "$clog2"
+                | "$bits"
+                | "$countones"
+                | "$countbits"
+                | "$onehot"
+                | "$onehot0"
+                | "$isunknown"
+                | "$size"
+                | "$high"
+                | "$low"
+                | "$left"
+                | "$right"
+                | "$increment"
+                | "$dimensions"
+                | "$unpacked_dimensions"
+                | "$rtoi"
+                | "$realtobits"
+                | "$shortrealtobits"
+                | "$rose"
+                | "$fell"
+                | "$stable"
+                | "$changed"
+                | "$test$plusargs"
+                | "$fopen"
+                | "$feof"
+                | "$fgetc" => false,
+                _ => true,
+            },
+            ExprKind::Call { func, .. } => {
+                let ExprKind::Ident(h) = &func.kind else {
+                    return true;
+                };
+                if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    return true;
+                }
+                let Some(name) = self.scoped_callee_name(h.path[0].name.name.clone()) else {
+                    return true;
+                };
+                // §13.4.1: a call has its declared return type.
+                let fd = self
+                    .functions
+                    .and_then(|f| f.get(&name))
+                    .or_else(|| self.dpi_import_fds.as_deref().and_then(|m| m.get(&name)));
+                fd.is_none_or(|fd| self.decl_is_real(&fd.return_type, Some(&name)))
+            }
+            _ => true,
+        }
+    }
+
+    /// `value_may_be_real` for a name.
+    fn ident_may_be_real(&self, h: &HierarchicalIdentifier) -> bool {
+        let simple = h.path.iter().all(|s| s.selects.is_empty());
+        if h.root.is_none() && h.path.len() == 1 && simple {
+            if let Some(v) = self.local_const_vars.get(&h.path[0].name.name) {
+                return v.is_real;
+            }
+        }
+        let raw = Self::hier_raw_name(h);
+        if self.local_var_is_real.contains(&raw) {
+            return true;
+        }
+        if let Some((r, _)) = self.local_var_reg_of(h) {
+            return !matches!(
+                self.local_kinds.get(&r),
+                Some(LocalKind::Int { .. } | LocalKind::Str | LocalKind::Handle)
+            );
+        }
+        if !simple {
+            return true;
+        }
+        if let Some(v) = self.lookup_param_value(h) {
+            return v.is_real;
+        }
+        if self.signal_real.is_none() {
+            return true;
+        }
+        if let Some(id) = self.lookup_signal_id(h) {
+            return self.signal_is_real(id);
+        }
+        // §7.2.1: a member of a packed structure is integral.
+        self.packed_struct_member_target(h).is_none()
+    }
+
+    fn signal_is_real(&self, id: usize) -> bool {
+        self.signal_real
+            .is_none_or(|r| r.get(id).copied().unwrap_or(true))
+    }
+
+    /// §6.12.1, §6.24.1: `reg` holds the value of `e`, about to be fitted to a
+    /// `width`-bit integral type. `Resize` rounds a real to every width but
+    /// 64, where it keeps the real (real storage is 64 bits wide), so a value
+    /// that may be real at that width is rounded first.
+    fn emit_real_to_int_fit(&mut self, reg: RegId, e: &Expression, width: u32) {
+        if width == 64 && self.value_may_be_real(e) {
+            self.emit(Insn::RealToInt(reg));
         }
     }
 
@@ -15372,6 +15637,10 @@ impl<'a> BytecodeCompiler<'a> {
                     };
                     self.emit(Insn::Move(rv, v));
                     if w > 0 {
+                        // §13.4.1, §6.12.1: an integral result rounds a real.
+                        if matches!(self.local_kinds.get(&rv), Some(LocalKind::Int { .. })) {
+                            self.emit_real_to_int_fit(rv, e, w);
+                        }
                         self.emit(Insn::Resize(rv, w));
                         self.emit_local_fit(rv);
                     }
@@ -15398,9 +15667,8 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::Move(slot, v));
                     // §13.4.1: the returned value converts to the declared
                     // type. A real return converts an integral value; an
-                    // integral return rounds a real, which `Resize` does for
-                    // every width but 64 (where it keeps the real as is), so
-                    // a 64-bit one goes through 65 bits first.
+                    // integral return rounds a real (`emit_real_to_int_fit`
+                    // for the 64-bit width `Resize` keeps a real at).
                     if self.inline_ret_real {
                         if w > 0 {
                             self.emit(Insn::Resize(slot, w));
@@ -15409,9 +15677,7 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit_to_real(slot);
                         }
                     } else if w > 0 {
-                        if w == 64 && self.ret_expr_may_be_real(e) {
-                            self.emit(Insn::Resize(slot, 65));
-                        }
+                        self.emit_real_to_int_fit(slot, e, w);
                         self.emit(Insn::Resize(slot, w));
                         self.emit_local_fit(slot);
                     }
@@ -15603,6 +15869,11 @@ impl<'a> BytecodeCompiler<'a> {
                         return true;
                     }
                     if width > 0 && !via_new && !self.expr_is_string_static(rvalue) {
+                        // §10.7, §6.12.1: a real stored into an integral
+                        // variable is rounded (`l = r;` with `longint l`).
+                        if !self.value_may_be_real(lvalue) {
+                            self.emit_real_to_int_fit(val_reg, rvalue, width);
+                        }
                         self.emit(Insn::Resize(val_reg, width));
                     }
                     // class-perf P2: STRING member store (`m_leaf_name = name`)
@@ -16397,6 +16668,11 @@ impl<'a> BytecodeCompiler<'a> {
                                 return false;
                             };
                             self.emit(Insn::Move(slot, v));
+                            // §6.12.1: an integral loop variable rounds a
+                            // real initial value.
+                            if !self.decl_is_real(data_type, None) {
+                                self.emit_real_to_int_fit(slot, init, w);
+                            }
                             if w > 0 {
                                 self.emit(Insn::Resize(slot, w));
                             }
@@ -16458,6 +16734,11 @@ impl<'a> BytecodeCompiler<'a> {
                                 return false;
                             };
                             self.emit(Insn::Move(slot, v));
+                            // §6.12.1: an integral loop variable rounds a
+                            // real initial value.
+                            if !self.decl_is_real(data_type, None) {
+                                self.emit_real_to_int_fit(slot, init, w);
+                            }
                             if w > 0 {
                                 self.emit(Insn::Resize(slot, w));
                             }
@@ -19400,6 +19681,8 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit_to_real(r);
                         return Some(r);
                     }
+                    // §6.24.1, §6.12.1: `longint'(r)` rounds a real operand.
+                    self.emit_real_to_int_fit(r, inner, w);
                     self.emit(Insn::Resize(r, w));
                     // §6.24.1: the cast value is what a variable of the
                     // target type holds, so a 2-state target (`int'`,
@@ -19519,6 +19802,11 @@ impl<'a> BytecodeCompiler<'a> {
                         // the loop exactly this way.
                         let r = self.alloc_reg();
                         self.emit(Insn::Move(r, src));
+                        // §6.24.1, §6.12.1: a cast to a 64-bit integral type
+                        // (`xlen_t'(r)`) rounds a real operand.
+                        if signed.is_some() && !self.named_cast_is_real(args) {
+                            self.emit_real_to_int_fit(r, &args[1], w);
+                        }
                         self.emit(Insn::Resize(r, w));
                         // §6.24.1: a named two-state type also converts X/Z.
                         if let Some(types) = self.typedef_types {
@@ -23311,6 +23599,11 @@ impl<'a> BytecodeCompiler<'a> {
                 self.bail("bytecode_register_limit");
                 return false;
             }
+            // §10.3.2, §6.12.1: an integral net or variable driven by a real
+            // takes the real rounded (`wire [63:0] w = r;`).
+            if self.signal_real.is_some() && !self.signal_is_real(dst_id) {
+                self.emit_real_to_int_fit(val_reg, rhs, width);
+            }
             self.emit(Insn::Resize(val_reg, width));
             self.emit(Insn::BlockingAssign(as_sig_id(dst_id), val_reg, width));
             true
@@ -23337,6 +23630,9 @@ impl<'a> BytecodeCompiler<'a> {
             if self.register_overflow {
                 self.bail("bytecode_register_limit");
                 return false;
+            }
+            if !self.value_may_be_real(lhs) {
+                self.emit_real_to_int_fit(val_reg, rhs, lhs_width);
             }
             self.emit(Insn::Resize(val_reg, lhs_width));
             self.compile_blocking_target(lhs, val_reg, lhs_width)
@@ -24787,7 +25083,8 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::Resize(a, _)
             | Insn::SetSigned(a)
             | Insn::ClearSigned(a)
-            | Insn::DropXz(a) => f(*a),
+            | Insn::DropXz(a)
+            | Insn::RealToInt(a) => f(*a),
             // Class-member access: Load reads the handle; Store reads the
             // handle AND the stored value register.
             Insn::LoadClassMember(_, h, _) => f(*h),
@@ -25332,9 +25629,11 @@ impl<'a> BytecodeCompiler<'a> {
     /// The register an instruction modifies IN PLACE (read and written).
     pub(crate) fn in_place_reg(insn: &Insn) -> Option<RegId> {
         match insn {
-            Insn::Resize(a, _) | Insn::SetSigned(a) | Insn::ClearSigned(a) | Insn::DropXz(a) => {
-                Some(*a)
-            }
+            Insn::Resize(a, _)
+            | Insn::SetSigned(a)
+            | Insn::ClearSigned(a)
+            | Insn::DropXz(a)
+            | Insn::RealToInt(a) => Some(*a),
             _ => None,
         }
     }
@@ -26186,6 +26485,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::SetSigned(d)
                 | Insn::ClearSigned(d)
                 | Insn::DropXz(d)
+                | Insn::RealToInt(d)
                 | Insn::LoadSignalRange(d, _, _, _)
                 | Insn::LoadSignalBit(d, _, _)
                 | Insn::BinOpConst(d, _, _, _) => Some(Some(*d)),
@@ -26976,6 +27276,9 @@ impl<'a> BytecodeCompiler<'a> {
 
                 // Stamp/clear `is_signed`; storage and width are untouched.
                 Insn::SetSigned(_) | Insn::ClearSigned(_) | Insn::DropXz(_) => {}
+                // A real becomes a 64-bit integer (its width already); any
+                // other value is untouched, so the fact still holds.
+                Insn::RealToInt(_) => {}
 
                 // Result width is the (runtime) left operand's width — not
                 // statically tracked here.
@@ -27249,8 +27552,9 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 }
                 Insn::SetSigned(r) => set_to = Some((*r, false)),
-                // X/Z to 0 keeps the flag.
-                Insn::DropXz(_) => {}
+                // X/Z to 0 keeps the flag; a real rounds to an unsigned
+                // integer, anything else is untouched.
+                Insn::DropXz(_) | Insn::RealToInt(_) => {}
                 // -- no register writes: state flows through --
                 Insn::Jump(_)
                 | Insn::BranchIfFalse(_, _)
