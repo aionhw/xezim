@@ -8,6 +8,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Bind whole interface-array ports by position, fold header array parameters in the declaring instance, honor inferred pull net types, and size fill literals through comparisons (#1402, #1404, #1400, #1399).
+- **Correctness:** Drive nested unpacked leaves at their declared widths, copy fixed rows in declaration order, resolve drivers per wire-array element and delay whole unpacked structures (#1403, #1398, #1395, #1393).
+- **Correctness:** Resolve named fork activations in their declaring scope, describe types in declared dimension order, and apply packed assignment-pattern defaults recursively (#1396, #1348, #1343).
+
 - **Correctness:** A trailing whitespace directive in `$fscanf` sets EOF when it reads to the end of the file (§21.3.4.3, #1376).
 
 - **Correctness:** Queue element writes append at the current size and warn when an invalid index is ignored (§7.10.1, #1353).
