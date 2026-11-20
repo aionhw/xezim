@@ -1646,6 +1646,17 @@ struct LocalArrayBind {
     elem_signed: Option<bool>,
 }
 
+/// A fixed unpacked local addressed by constant numeric index.
+#[derive(Clone, Copy)]
+struct LocalArrayBank {
+    base: RegId,
+    width: u32,
+    len: usize,
+    lo: i64,
+    descending: bool,
+    element: Option<LocalKind>,
+}
+
 /// A member of a packed-struct formal that an inlined body reads as a slice
 /// of the formal's register.
 #[derive(Clone)]
@@ -2243,11 +2254,10 @@ pub struct BytecodeCompiler<'a> {
     /// carries it (`fb_carry`); absent when the type is not carryable.
     local_const_kinds: HashMap<String, LocalKind>,
     /// Register-bank locals: a small fixed-size local unpacked array whose
-    /// elements live in consecutive VM registers. name -> (base reg, element
-    /// width, length, declared lo index). Only CONSTANT indexes can address a
+    /// elements live in consecutive VM registers. Only CONSTANT indexes address a
     /// bank — the registers have no runtime indexing — so any dynamic access
     /// fails the enclosing compile, which rolls back to the AST path.
-    local_array_regs: HashMap<String, (RegId, u32, usize, i64)>,
+    local_array_regs: HashMap<String, LocalArrayBank>,
     /// class-perf row 3: bare names of LOCAL queue / dynamic-array
     /// declarations compiled in this method body (delegated to the
     /// interpreter via a StmtFallback of the declaration, so the per-call
@@ -4410,8 +4420,62 @@ impl<'a> BytecodeCompiler<'a> {
                 [crate::ast::types::UnpackedDimension::Unsized(_)]
             ) && matches!(p.direction, PortDirection::Input)
         };
+        let mut array_output = |p: &crate::ast::decl::FunctionPort, a: &Expression| {
+            use crate::ast::types::{Lifetime, UnpackedDimension};
+            if p.direction != PortDirection::Output || fd.lifetime != Some(Lifetime::Automatic) {
+                return None;
+            }
+            let ExprKind::Ident(h) = &a.kind else {
+                return None;
+            };
+            if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                return None;
+            }
+            let bank = *self.local_array_regs.get(&h.path[0].name.name)?;
+            let number = |e: &Expression| {
+                if let ExprKind::Number(n) = &e.kind {
+                    self.eval_number_static(n)?.to_u64()
+                } else {
+                    None
+                }
+            };
+            let (left, right) = match p.dimensions.as_slice() {
+                [UnpackedDimension::Range { left, right, .. }] => (number(left)?, number(right)?),
+                [UnpackedDimension::Expression { expr, .. }] => (0, number(expr)?.checked_sub(1)?),
+                _ => return None,
+            };
+            let element = self.local_kind_of(&p.data_type, Some(&name))?;
+            if !matches!(element, LocalKind::Int { .. })
+                || bank.element != Some(element)
+                || left.max(right) > i32::MAX as u64
+                || left.abs_diff(right).checked_add(1)? != bank.len as u64
+            {
+                return None;
+            }
+            Some((
+                bank,
+                i64::try_from(left.min(right)).ok()?,
+                left > right,
+                element,
+            ))
+        };
+        let output_bank = fd
+            .ports
+            .iter()
+            .position(|p| p.direction == PortDirection::Output && !p.dimensions.is_empty())
+            .and_then(|index| {
+                if fd
+                    .ports
+                    .iter()
+                    .enumerate()
+                    .any(|(i, p)| i != index && p.direction != PortDirection::Input)
+                {
+                    return None;
+                }
+                Some((index, array_output(&fd.ports[index], args.get(index)?)?))
+            });
         if fd.ports.len() != args.len()
-            || fd.ports.iter().zip(args).any(|(p, a)| {
+            || fd.ports.iter().zip(args).enumerate().any(|(i, (p, a))| {
                 // §13.5.2 output formals ride the existing ref-writeback
                 // machinery: the body sees a register, the caller's actual
                 // is written on return. AES-style helpers
@@ -4421,6 +4485,7 @@ impl<'a> BytecodeCompiler<'a> {
                     PortDirection::Input | PortDirection::Ref | PortDirection::Output
                 ) || !p.dimensions.is_empty())
                     && !(is_unsized_dim(p) && dyn_array_formal(p, a))
+                    && output_bank.is_none_or(|(index, _)| index != i)
             })
         {
             self.bail("Expr_Call_ports");
@@ -4505,7 +4570,42 @@ impl<'a> BytecodeCompiler<'a> {
         let mut real_formal_names: Vec<String> = Vec::new();
         let mut array_binds: Vec<(String, LocalArrayBind)> = Vec::new();
         let mut struct_binds: Vec<(String, (RegId, Vec<(String, FormalMember)>))> = Vec::new();
+        let mut output_elements = Vec::new();
         for (i, (p, a)) in fd.ports.iter().zip(args).enumerate() {
+            if let Some((_, (bank, lo, descending, element))) =
+                output_bank.filter(|(index, _)| *index == i)
+            {
+                // §13.5.3: initialize a private formal array and copy it back in
+                // declaration order, including on an early return.
+                let init = self.type_default_value_in(&p.data_type, bank.width, Some(&name));
+                let mut regs = Vec::with_capacity(bank.len);
+                for offset in 0..bank.len {
+                    let slot = self.alloc_reg();
+                    self.emit(Insn::LoadConst(slot, Box::new(init.clone())));
+                    self.local_kinds.insert(slot, element);
+                    let out = if descending == bank.descending {
+                        offset
+                    } else {
+                        bank.len - 1 - offset
+                    };
+                    output_elements.push((bank.base + out as RegId, slot));
+                    regs.push(slot);
+                }
+                let LocalKind::Int { signed, .. } = element else {
+                    unreachable!()
+                };
+                array_binds.push((
+                    p.name.name.clone(),
+                    LocalArrayBind {
+                        regs,
+                        lo,
+                        elem_w: bank.width,
+                        is_real: false,
+                        elem_signed: Some(signed),
+                    },
+                ));
+                continue;
+            }
             if is_unsized_dim(p) {
                 // Dynamic-array formal from a fixed assignment pattern: one
                 // register per element, evaluated in the CALLER's scope. The
@@ -4779,6 +4879,9 @@ impl<'a> BytecodeCompiler<'a> {
         // §13.5.3: copy-out assigns the caller's lvalues after return. Restore
         // its locals and loop constants first, including for indexed targets.
         if ok {
+            for (target, value) in output_elements {
+                self.emit(Insn::Move(target, value));
+            }
             for (target, value, width) in &ref_writes {
                 if !self.compile_blocking_target(target, *value, *width) {
                     ok = false;
@@ -4957,7 +5060,7 @@ impl<'a> BytecodeCompiler<'a> {
                         match (l, r) {
                             (Some(l), Some(r)) => {
                                 let (lo, hi) = (l.min(r) as i64, l.max(r) as i64);
-                                Some((lo, (hi - lo + 1) as usize))
+                                Some((lo, (hi - lo + 1) as usize, l > r))
                             }
                             _ => None,
                         }
@@ -4966,13 +5069,13 @@ impl<'a> BytecodeCompiler<'a> {
                         .fold_const(expr)
                         .and_then(|v| v.to_u64())
                         .filter(|&n| n > 0)
-                        .map(|n| (0i64, n as usize)),
+                        .map(|n| (0i64, n as usize, false)),
                     _ => None,
                 }
             } else {
                 None
             };
-            let Some((lo, len)) = bounds.filter(|&(_, n)| n <= 64) else {
+            let Some((lo, len, descending)) = bounds.filter(|&(_, n, _)| n <= 64) else {
                 self.bail("VarDecl_array");
                 return false;
             };
@@ -4991,8 +5094,18 @@ impl<'a> BytecodeCompiler<'a> {
                 self.bail("VarDecl_array");
                 return false;
             };
-            self.local_array_regs
-                .insert(decl.name.name.clone(), (base, ew, len, lo));
+            let element = self.local_kind_of(data_type, None);
+            self.local_array_regs.insert(
+                decl.name.name.clone(),
+                LocalArrayBank {
+                    base,
+                    width: ew,
+                    len,
+                    lo,
+                    descending,
+                    element,
+                },
+            );
             return true;
         }
         // §6.16 string local: no declared width — bind at width
@@ -8277,6 +8390,15 @@ impl<'a> BytecodeCompiler<'a> {
             self.emit_to_real(v);
         } else {
             self.emit(Insn::Resize(v, ab.elem_w));
+            if let Some(kind) = ab
+                .regs
+                .first()
+                .and_then(|r| self.local_kinds.get(r))
+                .copied()
+            {
+                self.local_kinds.insert(v, kind);
+                self.emit_local_fit(v);
+            }
         }
         if let Some(k) = self.eval_const_expr(idx) {
             let i = (k as i64).checked_sub(ab.lo)?;
@@ -9382,7 +9504,9 @@ impl<'a> BytecodeCompiler<'a> {
                     local.lo + local.regs.len() as i64 - 1,
                     local.elem_w,
                 ))
-            } else if let Some(&(_, width, len, lo)) = self.local_array_regs.get(&name) {
+            } else if let Some(&LocalArrayBank { width, len, lo, .. }) =
+                self.local_array_regs.get(&name)
+            {
                 Some((lo, lo + len as i64 - 1, width))
             } else {
                 scope
@@ -10591,7 +10715,7 @@ impl<'a> BytecodeCompiler<'a> {
         if self.local_array_regs.is_empty() {
             return false;
         }
-        fn expr_hits(e: &Expression, banks: &HashMap<String, (RegId, u32, usize, i64)>) -> bool {
+        fn expr_hits(e: &Expression, banks: &HashMap<String, LocalArrayBank>) -> bool {
             match &e.kind {
                 ExprKind::Ident(h) => h.path.len() == 1 && banks.contains_key(&h.path[0].name.name),
                 ExprKind::Index { expr, index } => {
@@ -10624,7 +10748,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         let banks = &self.local_array_regs;
-        fn walk(st: &Statement, banks: &HashMap<String, (RegId, u32, usize, i64)>) -> bool {
+        fn walk(st: &Statement, banks: &HashMap<String, LocalArrayBank>) -> bool {
             match &st.kind {
                 StatementKind::BlockingAssign { lvalue, rvalue }
                 | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
@@ -18203,8 +18327,13 @@ impl<'a> BytecodeCompiler<'a> {
                 // through an unrolled loop var) index: a plain register move.
                 if let ExprKind::Ident(h) = &expr.kind {
                     if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() {
-                        if let Some(&(base, ew, len, lo)) =
-                            self.local_array_regs.get(&h.path[0].name.name)
+                        if let Some(&LocalArrayBank {
+                            base,
+                            width: ew,
+                            len,
+                            lo,
+                            ..
+                        }) = self.local_array_regs.get(&h.path[0].name.name)
                         {
                             let Some(iv) = self.fold_const(index).and_then(|v| v.to_u64()) else {
                                 // Dynamic index into registers is impossible.
@@ -21865,8 +21994,13 @@ impl<'a> BytecodeCompiler<'a> {
         if let ExprKind::Index { expr, index } = &lhs.kind {
             if let ExprKind::Ident(h) = &expr.kind {
                 if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() {
-                    if let Some(&(base, ew, len, lo)) =
-                        self.local_array_regs.get(&h.path[0].name.name)
+                    if let Some(&LocalArrayBank {
+                        base,
+                        width: ew,
+                        len,
+                        lo,
+                        ..
+                    }) = self.local_array_regs.get(&h.path[0].name.name)
                     {
                         let Some(iv) = self.fold_const(index).and_then(|v| v.to_u64()) else {
                             self.bail("local_array_dyn_index");
@@ -22692,7 +22826,7 @@ impl<'a> BytecodeCompiler<'a> {
                     // width. Missing this returned the 1-bit default and a
                     // bank store truncated every value to its LSB.
                     if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
-                        if let Some(&(_, ew, _, _)) =
+                        if let Some(&LocalArrayBank { width: ew, .. }) =
                             self.local_array_regs.get(&hier.path[0].name.name)
                         {
                             return ew;

@@ -94,3 +94,56 @@ endmodule
         sim.output
     );
 }
+
+/// §7.4 and §13.5.3: copy-out maps unpacked elements in declaration
+/// order. Every activation starts with the output type's default, also
+/// when the function returns before assigning every element.
+#[test]
+fn fixed_array_output_compiles_and_copies_in_declaration_order() {
+    let dir = std::env::temp_dir().join(format!("xezim_array_out_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("test.sv");
+    std::fs::write(
+        &path,
+        r#"
+module top;
+  bit clk;
+  int calls, sum;
+  function automatic void fill(input int step, output int row[2:4]);
+    row[2] = -step;
+    if (step == 2) return;
+    row[3] = 8;
+    row[4] = 11;
+  endfunction
+  always @(posedge clk) begin
+    int vals[9:7];
+    fill(calls, vals);
+    sum += 3 * vals[9] + 2 * vals[8] + vals[7];
+    calls++;
+  end
+  initial begin
+    repeat (3) begin #1 clk = 1; #1 clk = 0; end
+    $display("sum=%0d", sum);
+    $finish;
+  end
+endmodule
+"#,
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(["--no-cache", "--profile", "-s", "top"])
+        .arg(path)
+        .env("XEZIM_FALLBACK_SITES", "1")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.lines().any(|l| l == "sum=45"), "{text}");
+    assert!(!text.contains("reason=fb_local_array"), "{text}");
+    assert!(!text.contains("reason=static_block_local"), "{text}");
+}
