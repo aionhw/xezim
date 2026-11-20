@@ -281,6 +281,8 @@ mod simulation_version_banner;
 mod spec_static_and_pkg_queue;
 #[path = "misc/struct_members_and_constant_targets.rs"]
 mod struct_members_and_constant_targets;
+#[path = "misc/subroutine_body_port_packed_user_type.rs"]
+mod subroutine_body_port_packed_user_type;
 #[path = "misc/subroutine_port_redeclaration.rs"]
 mod subroutine_port_redeclaration;
 #[path = "misc/subroutine_port_type.rs"]
