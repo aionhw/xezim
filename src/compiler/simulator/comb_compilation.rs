@@ -55,7 +55,8 @@ impl Simulator {
         ) -> Option<()> {
             use std::fmt::Write;
             let index = |name: &mut String, sel: &Expression| {
-                let i = super::elaborate::const_eval_i64_with_params(sel, Some(&module.parameters))?;
+                let i =
+                    super::elaborate::const_eval_i64_with_params(sel, Some(&module.parameters))?;
                 write!(name, "[{i}]").ok()
             };
             match &e.kind {
@@ -66,7 +67,9 @@ impl Simulator {
                         return None;
                     }
                     for (i, seg) in h.path.iter().enumerate() {
-                        if i != 0 { name.push('.'); }
+                        if i != 0 {
+                            name.push('.');
+                        }
                         name.push_str(&seg.name.name);
                         for sel in &seg.selects {
                             index(name, sel)?;
@@ -91,14 +94,18 @@ impl Simulator {
         let mut path = String::new();
         let mut selected = false;
         append(expr, &self.module, &mut path, &mut selected)?;
-        if !selected { return None; }
+        if !selected {
+            return None;
+        }
         let rooted = path.strip_prefix("$root.");
         let name = rooted.unwrap_or(&path);
         if rooted.is_none() && self.signal_name_to_id.contains_key(name) {
             return Some(path);
         }
         let short = name.strip_prefix(&self.module.name)?.strip_prefix('.')?;
-        self.signal_name_to_id.contains_key(short).then(|| short.to_string())
+        self.signal_name_to_id
+            .contains_key(short)
+            .then(|| short.to_string())
     }
 
     /// An `Ident` whose single segment is already the fully-qualified stored
