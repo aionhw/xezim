@@ -1341,6 +1341,10 @@ mod subroutine_actual_width_1256;
 mod packed_member_foreach_1192;
 #[path = "classes/unpacked_struct_packed_member_1192.rs"]
 mod unpacked_struct_packed_member_1192;
+#[path = "classes/class_scope_type_widths_1273.rs"]
+mod class_scope_type_widths_1273;
+#[path = "classes/struct_handle_member_1192.rs"]
+mod struct_handle_member_1192;
 #[path = "classes/vif_formal_name_clash_1297.rs"]
 mod vif_formal_name_clash_1297;
 #[path = "classes/review_writeback_actual_forms.rs"]

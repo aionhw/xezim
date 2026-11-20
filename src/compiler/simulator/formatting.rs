@@ -1278,10 +1278,7 @@ impl Simulator {
                     && let Some(b) = self.obj_type_param(handle, cn, &name.name.name)
                 {
                     let b = b.trim();
-                    return matches!(b, "real" | "shortreal" | "realtime")
-                        || self.module.typedef_types.get(b).is_some_and(|t| {
-                            super::elaborate::is_type_real_resolved(t, &self.module.typedef_types)
-                        });
+                    return self.concrete_type_real(b);
                 }
                 // §8.25: the state domain of a type parameter belongs to
                 // this object, including when another specialization calls it.

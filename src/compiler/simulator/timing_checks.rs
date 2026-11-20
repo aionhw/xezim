@@ -510,6 +510,7 @@ impl Simulator {
                     write_signal_ids: Vec::new(),
                     span: crate::ast::Span::dummy(),
                     cov: None,
+                    time0_effects: false,
                 }),
                 has_unresolved_reads: false,
                 defer_at_time0: false,

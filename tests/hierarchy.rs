@@ -521,3 +521,5 @@ mod parameter_type_sharing_721;
 mod assignment_origin_sharing_721;
 #[path = "hierarchy/upward_scope_sharing_721.rs"]
 mod upward_scope_sharing_721;
+#[path = "hierarchy/vif_whole_unpacked_1311.rs"]
+mod vif_whole_unpacked_1311;

@@ -194,7 +194,7 @@ impl Simulator {
             {
                 value = value.to_two_state();
             }
-        } else if super::elaborate::is_type_real(dt) && !value.is_real {
+        } else if self.dt_is_real(dt) && !value.is_real {
             value = Value::from_f64(value.to_f64());
         }
         value
@@ -217,7 +217,7 @@ impl Simulator {
             let mut by_w: HashMap<u32, Vec<Vec<(String, u32, u32, bool)>>> = HashMap::default();
             for td in self.module.typedef_types.values() {
                 let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
-                if let Some(fields) = Self::struct_field_layout(&resolved) {
+                if let Some(fields) = self.struct_field_layout(&resolved) {
                     let total: u32 = fields.iter().map(|f| f.2).sum();
                     by_w.entry(total).or_default().push(fields);
                 }
@@ -236,7 +236,10 @@ impl Simulator {
             })
     }
 
-    pub(super) fn struct_field_layout(dt: &DataType) -> Option<Vec<(String, u32, u32, bool)>> {
+    pub(super) fn struct_field_layout(
+        &self,
+        dt: &DataType,
+    ) -> Option<Vec<(String, u32, u32, bool)>> {
         let su = match dt {
             DataType::Struct(su) if !su.packed => su,
             _ => return None,
@@ -245,7 +248,7 @@ impl Simulator {
         let mut offset: u32 = 0;
         for m in su.members.iter().rev() {
             let fw = resolve_type_width(&m.data_type, None, None);
-            let fr = super::elaborate::is_type_real(&m.data_type);
+            let fr = self.dt_is_real(&m.data_type);
             for d in &m.declarators {
                 fields.push((d.name.name.clone(), offset, fw, fr));
                 offset += fw;

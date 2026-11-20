@@ -26,6 +26,10 @@ impl PatternTypeResolver for Simulator {
         self.resolve_type_key_name(name).is_some()
     }
 
+    fn specialized_type_key(&mut self, e: &Expression) -> Option<DataType> {
+        self.resolve_specialized_class_typedef_expr(e)
+    }
+
     fn expr_type(&mut self, e: &Expression) -> Option<DataType> {
         if let Some(t) = packed_assignment_pattern_plan::named_type_of(e) {
             return Some(t);
@@ -129,8 +133,9 @@ impl Simulator {
         &mut self,
         items: &[AssignmentPatternItem],
         dt: &DataType,
+        is_member: &dyn Fn(&str) -> bool,
     ) -> Option<Value> {
-        let plan = packed_assignment_pattern_plan::default_plan(items, dt, self)?;
+        let plan = packed_assignment_pattern_plan::default_plan(items, dt, self, is_member)?;
         Some(self.exec_packed_assignment_pattern_plan(&plan))
     }
 

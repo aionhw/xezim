@@ -391,7 +391,11 @@ fn method_boost_enabled() -> bool {
 // §9.3, §13.3: block bodies in shared statement lists, a continuation tree per task call
 // site, and boxed optional delays, initializers and case item patterns (#721).
 // §12.5: an unsigned item makes the entire case comparison unsigned.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308d;
+// §10.9.1, §26.3: a named assignment pattern key carries its lexically bound type name.
+// §6.18, §7.4.1: a cast to a typedef of real and a function returning one are real operands,
+// and a subroutine or block selecting a packed array of a named signed type does not compile.
+// §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308e;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1771,6 +1775,9 @@ struct CombEntryCold {
     /// compiled form counts with an `Insn::CovHit`). Never cached.
     #[serde(skip)]
     cov: Option<u32>,
+    /// §9.2.2.2: evaluating the entry is observable beyond its outputs
+    /// (see `time0_effects`); it waits for the time-0 start batch.
+    time0_effects: bool,
 }
 
 // §9.2.2.2.1 (#844): rebuild dependency tables made before packed-region
@@ -1806,7 +1813,12 @@ struct CombEntryCold {
 // §6.21, §13.4.2, §7.4.1: continuous assigns calling a static function whose local constant
 // selects write whole before a read compile; a call selecting an ascending or offset-range
 // variable of its callee stays interpreted.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB044";
+// §10.9.1, §26.3: a named assignment pattern key carries its lexically bound type name.
+// §6.18, §6.24.1: a cast to a typedef of real is a real operand of a continuous assignment.
+// §9.2.2.2, §10.3: CombEntryCold::time0_effects; a variable a called function writes is
+// not a read of its caller.
+// §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB045";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -2080,17 +2092,17 @@ struct SensitivityId {
     /// LRM §9.4.2.3 `iff` guard for this event term: the edge only counts
     /// when this expression is true at edge time. `None` for an unguarded
     /// term. Consulted by the procedural `@`-event wake path; the always-
-    /// block edge paths carry it but do not yet evaluate it. Boxed, like
-    /// `value_of`: almost every term has neither, and an inline
+    /// block edge paths carry it but do not yet evaluate it. Shared with
+    /// the other operands of this event expression. An inline
     /// `Option<Expression>` made each term hundreds of bytes (68 MB of edge
     /// sensitivity lists on a 64k-cell DRAM).
-    iff: Option<Box<Expression>>,
+    iff: Option<Rc<Expression>>,
     /// §9.4.2: for a NON-TRIVIAL event expression (`@(a + b)`), the term's
     /// full expression. Operand-signal edges only COUNT when this
     /// expression's value differs from its value at arm time (stored in
     /// `EventWaiter::guard_prev`) — `a=2;b=1` leaving `a+b` at 3 must not
     /// fire. `None` for plain signal/edge terms.
-    value_of: Option<Box<Expression>>,
+    value_of: Option<Rc<Expression>>,
     /// Scheduling depth of the NAME this term was written with (see
     /// `Simulator::sig_wake_rank`); orders same-pass waiter wakeups.
     wake_rank: u8,
@@ -2114,9 +2126,9 @@ struct Sensitivity {
     signal_name: String,
     edge: EdgeKind,
     /// See `SensitivityId::iff` — carried through name→id resolution.
-    iff: Option<Box<Expression>>,
+    iff: Option<Rc<Expression>>,
     /// See `SensitivityId::value_of` — carried through name→id resolution.
-    value_of: Option<Box<Expression>>,
+    value_of: Option<Rc<Expression>>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -3177,6 +3189,7 @@ mod signal_commits;
 mod statement_assignments;
 mod statements;
 mod system_tasks;
+mod time0_effects;
 mod two_state;
 mod type_metadata;
 mod udp;
@@ -8176,7 +8189,7 @@ pub struct Simulator {
     /// has sampled — the clocking event, and so its guard, occurs after the
     /// clockvars update. Each entry holds the waiter and the guard of the
     /// term that fired; see `resolve_deferred_clocking_guards`.
-    deferred_clocking_guarded: Vec<(EventWaiter, Box<Expression>)>,
+    deferred_clocking_guarded: Vec<(EventWaiter, Rc<Expression>)>,
     /// LRM §4.4 "reactive region" — drained AFTER the observed region
     /// has fired and BEFORE the postponed region runs. In a strict LRM
     /// implementation this hosts `program`-block procedural code so a
@@ -8431,6 +8444,10 @@ pub struct Simulator {
     /// before `bind_static_vif` looks at an assignment.
     #[serde(skip)]
     vif_capable_statics: std::cell::OnceCell<HashSet<String>>,
+    /// The leaf names of the unpacked variables declared below a scope
+    /// (`arr` of `bus.arr`): the prefilter of `vif_aggregate_canon`.
+    #[serde(skip)]
+    scoped_unpacked_leaves: std::cell::OnceCell<HashSet<String>>,
     /// False once start-up found no such static (`vif_capable_statics`
     /// empty): the one-byte test every blocking assignment makes.
     may_bind_static_vif: bool,
@@ -10421,6 +10438,14 @@ pub struct Simulator {
     /// address), so the re-entrant evaluation reads the slice itself.
     #[serde(skip)]
     packed_named_sign_guard: usize,
+    /// §7.4.1: whether the design declares a signed integral type by name
+    /// at all. Only then can a subroutine or block variable be a packed
+    /// array whose elements are signed, so only then does an element select
+    /// of one consult its declaration.
+    packed_named_signed_types: bool,
+    /// §7.2, §7.4.1: names of structure members that are packed arrays of a
+    /// named signed type (see its construction).
+    packed_named_signed_members: HashSet<String>,
     /// The arithmetic or bitwise operand (its address) being evaluated
     /// whose parent operator found no context-determined shift in it
     /// (`has_context_shift`), so its own operator does not scan its operands
@@ -10582,6 +10607,10 @@ pub struct Simulator {
     comb_time0_deferred: Vec<CombEntry>,
     /// Latches once the deferred empty-sensitivity always_comb blocks fired.
     comb_time0_deferred_done: bool,
+    /// §9.2.2.2: the entries with time-0 effects and the items taken out of
+    /// them (a `Noop` stands in) until every process has started; see
+    /// `hold_time0_effect_entries`.
+    comb_time0_held: Vec<(usize, CombItem)>,
     /// Reverse index: signal_id → list of comb_entry indices that read
     /// this signal. CSR layout — `comb_dep_entries[comb_dep_offsets[id]
     /// .. comb_dep_offsets[id+1]]` gives the dependents of signal `id`.
@@ -11441,6 +11470,10 @@ pub struct Simulator {
     edge_forced_fire: Vec<usize>,
     /// True while the compile-time (pre-process) time-0 settle runs.
     in_pre_process_settle: bool,
+    /// A combinational entry is being evaluated outside the settle
+    /// (`release_time0_held`): its deferred assertion reports are the
+    /// block's, as in the settle (`queue_deferred_assert`).
+    comb_direct_eval: bool,
     /// Call-site (expression span start) → per activation scope (see
     /// `sampled_scope`) → index into `sampled_watches`. Every instance of a
     /// child module shares the call's span, so the scope tells them apart.

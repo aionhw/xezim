@@ -3614,6 +3614,131 @@ impl Simulator {
         self.vif_rebase_chain(e)
     }
 
+    /// The last name of every unpacked variable (array, queue, dynamic or
+    /// associative array, unpacked structure) declared below a scope.
+    fn scoped_unpacked_leaves(&self) -> &HashSet<String> {
+        self.scoped_unpacked_leaves.get_or_init(|| {
+            let mut set: HashSet<String> = HashSet::default();
+            let mut add = |name: &str| {
+                if let Some((_, leaf)) = name.rsplit_once('.') {
+                    let leaf = leaf.split('[').next().unwrap_or(leaf);
+                    if !set.contains(leaf) {
+                        set.insert(leaf.to_string());
+                    }
+                }
+            };
+            let m = &self.module;
+            m.arrays.keys().for_each(|n| add(n));
+            m.arrays_2d.keys().for_each(|n| add(n));
+            m.arrays_nd.keys().for_each(|n| add(n));
+            m.dynamic_arrays.iter().for_each(|n| add(n));
+            m.queue_vars.iter().for_each(|n| add(n));
+            m.associative_arrays.keys().for_each(|n| add(n));
+            for (name, dt) in m.var_decl_types.as_map() {
+                if name.contains('.') && self.unpacked_struct_of(dt).is_some() {
+                    add(name);
+                }
+            }
+            set
+        })
+    }
+
+    /// §25.9, §7.6: the bound instance's variable for a member chain through
+    /// a virtual interface that names an unpacked aggregate (an array, a
+    /// queue, a dynamic or associative array, an unpacked structure), so the
+    /// whole-aggregate copy, read and comparison paths, which resolve their
+    /// operands by name, take the same variable a hierarchical reference
+    /// does. `None` for any other expression, a scalar member included.
+    pub(super) fn vif_aggregate_canon(&mut self, e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() >= 2 => {}
+            ExprKind::MemberAccess { .. } => {}
+            _ => return None,
+        }
+        // No virtual interface is bound (the gate of `vif_rebase_expr`), or
+        // no name in the chain is an unpacked variable of any scope: the
+        // common scalar access (`vif.valid = 1`) stops here.
+        if !self.iface_alias_possible()
+            && self.virtual_iface_bindings.is_empty()
+            && self.static_vif_bindings.is_empty()
+            && !self.vif_tokens_stored
+            && self.recv_call_memo.is_empty()
+        {
+            return None;
+        }
+        let leaves = self.scoped_unpacked_leaves();
+        let mut cur = e;
+        let mut possible = false;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    possible |= leaves.contains(member.name.as_str());
+                    cur = expr;
+                }
+                ExprKind::Index { expr, .. } | ExprKind::Paren(expr) => cur = expr,
+                ExprKind::Ident(h) => {
+                    possible |= h.path[1..]
+                        .iter()
+                        .any(|s| leaves.contains(s.name.name.as_str()));
+                    break;
+                }
+                _ => break,
+            }
+            if possible {
+                break;
+            }
+        }
+        if !possible {
+            return None;
+        }
+        // §26.3: a handle held in a package (`pkg::vh.arr`) is stored under
+        // its own name, as `vif_recv_target` reads it.
+        let unqualified = if self.module.packages.is_empty() {
+            None
+        } else {
+            self.strip_package_lvalue(e).or_else(|| match &e.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    let recv = self.strip_package_lvalue(expr)?;
+                    Some(Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(recv),
+                            member: member.clone(),
+                        },
+                        e.span,
+                    ))
+                }
+                _ => None,
+            })
+        };
+        let rebased = self.vif_rebase_expr(unqualified.as_ref().unwrap_or(e))?;
+        // An array or collection of the instance under its stored name, one
+        // flat identifier: the whole-array paths look their operand up by
+        // it, and a one-segment name is not rebound through a property
+        // again. (An associative array is none of the shapes
+        // `is_unpacked_aggregate_operand` probes.)
+        if let ExprKind::Ident(h) = &rebased.kind
+            && h.path.iter().all(|s| s.selects.is_empty())
+        {
+            let flat = h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if self.module.associative_arrays.contains_key(&flat)
+                || self.module.dynamic_arrays.contains(&flat)
+                || self.module.queue_vars.contains(&flat)
+                || self.module.arrays.contains_key(&flat)
+                || self.module.arrays_2d.contains_key(&flat)
+                || self.module.arrays_nd.contains_key(&flat)
+            {
+                return Some(Self::flat_name_ident(flat, rebased.span));
+            }
+        }
+        self.is_unpacked_aggregate_operand(&rebased)
+            .then_some(rebased)
+    }
+
     /// A flattened path: the first prefix `path[..=i]` (with at least one
     /// segment after it) that is a bound vif is replaced by the bound
     /// instance's path.

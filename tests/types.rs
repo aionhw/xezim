@@ -18,6 +18,8 @@ mod constant_expression_contexts;
 mod constant_real_math_1089;
 #[path = "types/deferred_type_contexts_721.rs"]
 mod deferred_type_contexts_721;
+#[path = "types/signed_packed_elem_select_contexts.rs"]
+mod signed_packed_elem_select_contexts;
 #[path = "types/struct_array_continuous_sensitivity_1090.rs"]
 mod struct_array_continuous_sensitivity_1090;
 
@@ -520,6 +522,10 @@ mod two_state_loop_blocks;
 mod type_id_create_applies_override;
 #[path = "types/typedef_chain_local_namespace.rs"]
 mod typedef_chain_local_namespace;
+#[path = "types/typedef_real_alias.rs"]
+mod typedef_real_alias;
+#[path = "types/typedef_real_struct_members.rs"]
+mod typedef_real_struct_members;
 #[path = "types/unpacked_elem_compare_width.rs"]
 mod unpacked_elem_compare_width;
 #[path = "types/vector_type_arg_spec.rs"]
@@ -801,3 +807,15 @@ mod negative_bound_packed_slice_write_1193;
 mod review_pattern_type_keys_params;
 #[path = "types/local_select_declared_range.rs"]
 mod local_select_declared_range;
+#[path = "types/nettype_alias_1302.rs"]
+mod nettype_alias_1302;
+#[path = "types/pattern_type_key_last_match_1290.rs"]
+mod pattern_type_key_last_match_1290;
+#[path = "types/pattern_type_key_real_realtime_1290.rs"]
+mod pattern_type_key_real_realtime_1290;
+#[path = "types/pattern_type_key_scoped_and_lexical_1290.rs"]
+mod pattern_type_key_scoped_and_lexical_1290;
+#[path = "types/struct_element_return_1310.rs"]
+mod struct_element_return_1310;
+#[path = "types/review_pattern_type_keys_imports.rs"]
+mod review_pattern_type_keys_imports;

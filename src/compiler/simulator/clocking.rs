@@ -911,7 +911,7 @@ impl Simulator {
         // not the process that happens to be current (whose resumption, a
         // §16.4.2 flush point, would drop the report): its reports belong to
         // no process, keyed by the block's scope instead.
-        let (pid, comb_scope) = if self.settling {
+        let (pid, comb_scope) = if self.settling || self.comb_direct_eval {
             (usize::MAX, self.name_resolve_hint.borrow().clone())
         } else {
             (self.current_pid, None)

@@ -572,7 +572,7 @@ impl Simulator {
         // initial value is the type default: x for a 4-state type, 0 for a
         // 2-state one. An empty `function integer y(); endfunction` returns
         // 'bx (ivtest br_gh337); seeding zero unconditionally masked that.
-        let mut ret_init = if super::elaborate::is_type_real(&fd.return_type) {
+        let mut ret_init = if self.dt_is_real(&fd.return_type) {
             Value::from_f64(0.0)
         } else if match &ret_tp {
             Some((_, c)) => self.concrete_type_two_state(c),
