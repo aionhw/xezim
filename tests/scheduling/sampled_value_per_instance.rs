@@ -102,7 +102,8 @@ endmodule"#;
     );
 }
 
-/// The first tick of a clock that starts late reads the declaration value.
+/// §16.5.1, §16.9.3: a child input net has its own default sampled
+/// value, even when its driver is a declaration-initialized variable.
 #[test]
 fn first_tick_compares_with_the_default_value() {
     const SRC: &str = r#"
@@ -133,9 +134,9 @@ endmodule"#;
     assert_eq!(
         t_lines(&sim),
         [
-            "T|40 tb.c1 rose=1 fell=0 st=0 ch=1 past=0 past2=0 v=5",
-            "T|60 tb.c2 rose=0 fell=0 st=0 ch=1 past=0 past2=0 v=1",
-            "T|80 tb.c2 rose=0 fell=0 st=0 ch=1 past=3 past2=0 v=2",
+            "T|40 tb.c1 rose=1 fell=0 st=0 ch=1 past=x past2=x v=5",
+            "T|60 tb.c2 rose=0 fell=1 st=0 ch=1 past=x past2=x v=1",
+            "T|80 tb.c2 rose=0 fell=0 st=0 ch=1 past=3 past2=x v=2",
         ],
     );
 }
