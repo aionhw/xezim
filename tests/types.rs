@@ -857,3 +857,6 @@ mod struct_parameter_percent_p;
 mod typename_typedef_packed_dims;
 #[path = "types/imported_constant_dimension_type_collision.rs"]
 mod imported_constant_dimension_type_collision;
+
+#[path = "types/class_scope_type_param_member_typedef.rs"]
+mod class_scope_type_param_member_typedef;
