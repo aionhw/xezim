@@ -151,6 +151,8 @@ mod function_return_width;
 mod generate_scope_struct_metadata;
 #[path = "types/generate_with_array_queries.rs"]
 mod generate_with_array_queries;
+#[path = "types/header_array_parameter_elements.rs"]
+mod header_array_parameter_elements;
 #[path = "types/header_parameter_declared_signedness.rs"]
 mod header_parameter_declared_signedness;
 #[path = "types/hierarchy_and_type_overrides.rs"]
