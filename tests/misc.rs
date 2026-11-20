@@ -420,6 +420,8 @@ mod void_cast_operand;
 mod warm_cache_diag_replay;
 #[path = "misc/wildcard_import_conflict.rs"]
 mod wildcard_import_conflict;
+#[path = "misc/writemem_address_lines.rs"]
+mod writemem_address_lines;
 #[path = "misc/x_warn_switch.rs"]
 mod x_warn_switch;
 #[path = "misc/xselect_and_concat_flatten.rs"]
