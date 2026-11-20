@@ -151,7 +151,7 @@ module tb;
   int cyc = 0;
   always #1 clk = ~clk;
   initial for (int i = 0; i < 65536; i++) mem[i] = i;
-  always_ff @(posedge clk) begin
+  always @(posedge clk) begin
     idx      <= (idx * 5 + 1) & 32'h0000_ffff;
     mem[idx] <= mem[idx] + idx;
     acc      <= acc ^ mem[idx];

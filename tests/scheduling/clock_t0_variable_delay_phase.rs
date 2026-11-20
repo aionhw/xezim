@@ -322,8 +322,7 @@ endmodule
 fn shared_clock_port_fanout_delivers_every_child_edge() {
     const SRC: &str = r#"
 `timescale 1ps/1ps
-module capture(output logic q, input logic clk);
-  initial q = 0;
+module capture(output logic q = 0, input logic clk);
   always_ff @(posedge clk) q <= 1;
 endmodule
 module top;

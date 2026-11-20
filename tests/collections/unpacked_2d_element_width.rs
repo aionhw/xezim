@@ -422,11 +422,10 @@ fn an_element_with_packed_dimensions() {
         r#"module tb;
   logic clk = 0; always #5 clk = ~clk;
   logic [1:0][39:0] whole [1:0][1:0];
-  logic [1:0][39:0] part [1:0][1:0];
+  logic [1:0][39:0] part [1:0][1:0] = '{default: '{default: '0}};
   logic [79:0] e1, e2, e3;
   logic [39:0] hi1, lo1, hi2, hi3;
   int i = 1;
-  initial begin part[0][0] = 80'h0; part[0][1] = 80'h0; end
   always_ff @(posedge clk) begin
     whole[0][0] <= {40'hEF_0000_0003, 40'h11_0000_0004};
     part[0][0][1] <= 40'hAB_0000_0001;
