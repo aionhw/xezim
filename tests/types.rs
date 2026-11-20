@@ -839,3 +839,5 @@ mod real_items_integral_aggregates;
 mod real_fill_literal_stores;
 #[path = "types/local_struct_signed_members.rs"]
 mod local_struct_signed_members;
+#[path = "types/struct_array_member_defaults.rs"]
+mod struct_array_member_defaults;
