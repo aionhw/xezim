@@ -1240,7 +1240,11 @@ impl Simulator {
         if let Some((last, owns)) = &cache.last
             && last == prefix
         {
-            return if *owns { cache.table.clone() } else { None };
+            return if *owns {
+                cache.tables.last().map(|t| t.table.clone())
+            } else {
+                None
+            };
         }
         // Every enclosing scope of the prefix, outermost first: `u.g.par`
         // sees `u.N` as `N` and a generate-block constant `u.g.L` as `L`.
@@ -1267,25 +1271,54 @@ impl Simulator {
             cache.last = Some((prefix.to_string(), false));
             return None;
         }
-        // One overlaid table is kept and moved between prefixes: the groups
-        // of the scopes the old and new prefix share stay on, the old
-        // prefix's other groups come off and the new prefix's go on. A
-        // caller that still holds the table (a select whose index reads
-        // another instance's signal) keeps it; start a fresh copy then.
-        if cache.table.as_mut().and_then(std::rc::Rc::get_mut).is_none() {
-            cache.table = Some(std::rc::Rc::new(self.module.parameters.clone()));
-            cache.applied.clear();
-            cache.undo.clear();
-        }
-        let table = std::rc::Rc::get_mut(cache.table.as_mut()?)?;
-        let keep = cache
-            .applied
+        // An overlaid table is moved between prefixes: the groups of the
+        // scopes the old and new prefix share stay on, the old prefix's
+        // other groups come off and the new prefix's go on. Of the tables
+        // nothing else holds, the one sharing the most outer scopes with the
+        // new prefix is moved; a prefix that shares none with any of them
+        // gets a fresh copy while there is room, else the least recently
+        // used one. A caller that still holds a table (a select whose index
+        // reads another instance's signal) keeps it untouched.
+        let shared = |t: &DeclParamTable| {
+            t.applied
+                .iter()
+                .zip(&scopes)
+                .take_while(|((applied, _), scope)| applied == *scope)
+                .count()
+        };
+        let unshared = |t: &DeclParamTable| std::rc::Rc::strong_count(&t.table) == 1;
+        let best = cache
+            .tables
             .iter()
-            .zip(&scopes)
-            .take_while(|((applied, _), scope)| applied == *scope)
-            .count();
-        if let Some(&(_, mark)) = cache.applied.get(keep) {
-            for (k, prev) in cache.undo.drain(mark..).rev() {
+            .enumerate()
+            .filter(|(_, t)| unshared(t))
+            .map(|(i, t)| (shared(t), i))
+            .filter(|&(keep, _)| keep > 0)
+            .max_by_key(|&(keep, i)| (keep, i));
+        let fresh = || DeclParamTable {
+            table: std::rc::Rc::new(self.module.parameters.clone()),
+            applied: Vec::new(),
+            undo: Vec::new(),
+        };
+        let pick = if let Some((_, i)) = best {
+            i
+        } else if cache.tables.len() < DECL_PARAM_TABLES {
+            cache.tables.push(fresh());
+            cache.tables.len() - 1
+        } else if let Some(i) = cache.tables.iter().position(|t| unshared(t)) {
+            i
+        } else {
+            // Every table is held by a caller: replace the least recently
+            // used one; its holder keeps its own copy.
+            cache.tables[0] = fresh();
+            0
+        };
+        let mut t = cache.tables.remove(pick);
+        let keep = shared(&t);
+        // Nothing else holds `t.table` here, so this never copies it.
+        let table = std::rc::Rc::make_mut(&mut t.table);
+        if let Some(&(_, mark)) = t.applied.get(keep) {
+            for (k, prev) in t.undo.drain(mark..).rev() {
                 match prev {
                     Some(v) => {
                         table.insert(k, v);
@@ -1295,17 +1328,19 @@ impl Simulator {
                     }
                 }
             }
-            cache.applied.truncate(keep);
+            t.applied.truncate(keep);
         }
         for (scope, group) in scopes[keep..].iter().zip(&groups[keep..]) {
-            cache.applied.push((scope.to_string(), cache.undo.len()));
+            t.applied.push((scope.to_string(), t.undo.len()));
             for (rest, v) in group.iter() {
                 let prev = table.insert(rest.clone(), v.clone());
-                cache.undo.push((rest.clone(), prev));
+                t.undo.push((rest.clone(), prev));
             }
         }
+        let handed = t.table.clone();
+        cache.tables.push(t);
         cache.last = Some((prefix.to_string(), true));
-        cache.table.clone()
+        Some(handed)
     }
 
     /// The parameters named `<scope>.<rest>` in the design-wide table, as
