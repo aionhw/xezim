@@ -7,8 +7,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 # What's new in 0.11
 
 ### Unreleased
-- **Correctness:** Resolve class method return widths in declaration scope when callers shadow a typedef (§6.18, §23.9, #1366).
 
+- **Correctness:** Resolve class method return widths in declaration scope when callers shadow a typedef (§6.18, §23.9, #1366).
 - **Correctness:** Resolve an unadorned parameterized class name in a typedef type argument to its default specialization (§8.25, #1357).
 - **Correctness:** Use all case items to determine signedness for `case`, `casez`, and `casex` comparisons (§12.5, #1355).
 
