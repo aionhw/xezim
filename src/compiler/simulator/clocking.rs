@@ -37,6 +37,7 @@ impl Simulator {
         // the current time), so it moves into the nonblocking queue ahead of
         // this drive. This drive is recorded so a whole drive issued after
         // it queues behind it (`schedule_clocking_update`).
+        let mut again = false;
         if let Some(id) = self.clocking_select_signal(target) {
             let when = self.time.saturating_add(skew);
             for value in self.take_clocking_whole_drives(id, when) {
@@ -44,6 +45,7 @@ impl Simulator {
             }
             let now = self.time;
             self.clocking_select_due.retain(|&(t, _)| t >= now);
+            again = self.clocking_select_due.contains(&(when, id));
             self.clocking_select_due.push((when, id));
         }
         let rvalue = self.make_intra_saved_expr(val, span);
@@ -67,6 +69,68 @@ impl Simulator {
             },
             span,
         ));
+        if again {
+            self.supersede_clocking_selects(target, skew);
+        }
+    }
+
+    /// §14.16.2: when synchronous drives of one output mature in the same
+    /// time step, "the last value is the only value driven". Each select
+    /// drive is a nonblocking update of its bits, so two drives of the same
+    /// bits (`cb.e[0] <= 1; cb.e[0] <= 0;`) changed them twice in that step
+    /// and woke `@(e)` with the value unchanged. The earlier updates of the
+    /// same bits that mature with this one (the last one queued) take its
+    /// value, so the bits change at most once. Only reached when another
+    /// select drive of the output is due at the same time.
+    fn supersede_clocking_selects(&mut self, target: &Expression, skew: u64) {
+        let Some(range) = self.delayed_lhs_select_range(target) else {
+            return;
+        };
+        let when = self.time.saturating_add(skew);
+        let base = Self::select_chain_base(target).and_then(Self::member_path_head);
+        // The queued updates of this time whose target has the same base
+        // name: a cheap filter before the select ranges are evaluated.
+        let same_base = |e: &NbaEntry| {
+            e.lhs.as_ref().is_some_and(|l| {
+                Self::select_chain_base(l).and_then(Self::member_path_head) == base
+            })
+        };
+        let picked: Vec<(usize, Expression)> = if skew == 0 {
+            self.nba_queue
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| same_base(e))
+                .filter_map(|(i, e)| e.lhs.clone().map(|l| (i, l)))
+                .collect()
+        } else {
+            self.delayed_nba_queue
+                .iter()
+                .enumerate()
+                .filter(|(_, (t, e))| *t == when && same_base(e))
+                .filter_map(|(i, (_, e))| e.lhs.clone().map(|l| (i, l)))
+                .collect()
+        };
+        let Some((last, last_lhs)) = picked.last() else {
+            return;
+        };
+        if self.delayed_lhs_select_range(last_lhs) != Some(range) {
+            return;
+        }
+        let value = if skew == 0 {
+            self.nba_queue[*last].value.clone()
+        } else {
+            self.delayed_nba_queue[*last].1.value.clone()
+        };
+        for (i, lhs) in &picked[..picked.len() - 1] {
+            if self.delayed_lhs_select_range(lhs) != Some(range) {
+                continue;
+            }
+            if skew == 0 {
+                self.nba_queue[*i].value = value.clone();
+            } else {
+                self.delayed_nba_queue[*i].1.value = value.clone();
+            }
+        }
     }
 
     /// §14.3: the element signals (`net[i]`, with `i`) of clockvar net `net`
