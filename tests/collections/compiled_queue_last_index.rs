@@ -150,9 +150,8 @@ endmodule
 }
 
 #[test]
-fn last_index_in_compiled_compound_and_nonblocking_writes() {
-    // §10.4.2: the nonblocking target's index is taken when the statement
-    // executes, before the `push_back`.
+fn last_index_in_compiled_compound_and_element_writes() {
+    // §7.10: the last index refers to the element before the push_back.
     let src = r#"
 module top;
   int q[$] = '{1, 2, 3};

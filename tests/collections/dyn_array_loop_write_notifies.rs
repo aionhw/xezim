@@ -130,7 +130,7 @@ endmodule
 "#;
 
 /// §10.4.2: dynamic elements use blocking writes; the fixed array is the NBA control.
-const NBA_TO_DYNAMIC_ELEMENT: &str = r#"
+const ELEMENT_WRITE_NOTIFICATION: &str = r#"
 module tb;
   logic [7:0] n1 [];
   logic [7:0] q1 [$];
@@ -204,7 +204,7 @@ fn dynamic_array_sibling_shapes_and_non_comb_readers_notify() {
 #[test]
 fn dynamic_array_or_queue_element_write_notifies_readers() {
     assert_eq!(
-        ok_flag(NBA_TO_DYNAMIC_ELEMENT),
+        ok_flag(ELEMENT_WRITE_NOTIFICATION),
         1,
         "a write to a dynamic array or queue element did not reach its reader"
     );
