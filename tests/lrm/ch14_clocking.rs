@@ -294,6 +294,21 @@ fn c14_16_2_clocking_last_wins_no_glitch() {
     );
 }
 
+// §14.16.2: of two select drives of the same bits maturing together, only
+// the last reaches the output, so a 1-then-0 pair never wakes the output's
+// waiters; the same value twice changes the bits once.
+#[test]
+fn c14_16_2_clocking_select_last_wins_no_glitch() {
+    check(
+        "c14_select_lastwins_glitch",
+        include_str!("sv/c14_select_lastwins_glitch.sv"),
+        "c14slg",
+        Order::Exact,
+        &["T|g|t=7000 g=0100", "T|end e=0000 f=0000 g=0100 h=0"],
+        &[],
+    );
+}
+
 // §14.16.2: a whole drive replaces a select of the same output issued
 // before it in the same cycle, at the clocking event, between events, and
 // from a class task.
