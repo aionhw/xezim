@@ -257,6 +257,8 @@ mod part_select_negative_bound_compiled;
 mod placeholder_parameter_replication;
 #[path = "misc/port_width_mismatch_explains.rs"]
 mod port_width_mismatch_explains;
+#[path = "misc/readmem_associative_array.rs"]
+mod readmem_associative_array;
 #[path = "misc/readmem_hierarchical_target.rs"]
 mod readmem_hierarchical_target;
 #[path = "misc/real_call_bytecode.rs"]
