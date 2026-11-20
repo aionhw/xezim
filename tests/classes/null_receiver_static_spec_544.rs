@@ -1,6 +1,6 @@
 //! IEEE 1800 §8.25: a static method entered through a NULL receiver whose
 //! declared type is a SPECIALIZATION runs in that specialization's context —
-//! the body's bare self-references (the `C#(T)` argument of a member typedef,
+//! the body's explicit specializations (the `C#(T)` argument of a member typedef,
 //! `uvm_object_param_utils`'s `type_id`) denote the CURRENT specialization,
 //! not the default. This is `uvm_create_on`'s shape: `req.get_type()` where
 //! `req` is declared `C#(T)` and is null at the call, so the factory must
