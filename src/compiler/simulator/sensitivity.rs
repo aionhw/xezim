@@ -1206,6 +1206,23 @@ impl Simulator {
         format!("{}{}.{}", CB_SAMPLE_PREFIX, cb, sig.unwrap_or(leaf))
     }
 
+    /// §14.10, §9.4.2: an event control naming clocking block `cb`, as
+    /// `@(cb)` or `@cb`, waits for the block's clocking event: its clock
+    /// signal on the edge the block declares.
+    fn clocking_event_sens(&self, cb: &str, iff: Option<Rc<Expression>>) -> Option<Sensitivity> {
+        let (clk, _) = self.clocking_meta.get(cb)?;
+        Some(Sensitivity {
+            signal_name: clk.clone(),
+            edge: self
+                .clocking_edge
+                .get(cb)
+                .copied()
+                .unwrap_or(EdgeKind::Posedge),
+            iff,
+            value_of: None,
+        })
+    }
+
     pub(super) fn collect_expr_reads(
         expr: &Expression,
         module: &ElaboratedModule,
@@ -3438,17 +3455,8 @@ impl Simulator {
                             .resolve_clocking_key(&segs)
                             .unwrap_or_else(|| sig.to_string());
                         if ee.edge.is_none() {
-                            if let Some((clk, _)) = self.clocking_meta.get(&cb_key) {
-                                out.push(Sensitivity {
-                                    signal_name: clk.clone(),
-                                    edge: self
-                                        .clocking_edge
-                                        .get(&cb_key)
-                                        .copied()
-                                        .unwrap_or(EdgeKind::Posedge),
-                                    iff: iff.clone(),
-                                    value_of: None,
-                                });
+                            if let Some(s) = self.clocking_event_sens(&cb_key, iff.clone()) {
+                                out.push(s);
                                 continue;
                             }
                         }
@@ -3617,20 +3625,14 @@ impl Simulator {
                 // old code built a sensitivity on a nonexistent signal `cb`,
                 // which never fired — so `@(cb)` returned at t=0 (a no-op) and
                 // any `@(cb); ...` sampling loop in a direct-SV testbench spun
-                // instead of stepping the clock. Substitute the block's clock
-                // signal with a posedge edge (the edge `tick_clocking_blocks`
-                // already assumes). Falls through to a plain named event when
+                // instead of stepping the clock. Substitute the block's
+                // clocking event. Falls through to a plain named event when
                 // `id` is an ordinary `event`/signal, preserving prior behavior.
-                if let Some((clk, _)) = self
+                if let Some(s) = self
                     .resolve_clocking_key(&[id.name.as_str()])
-                    .and_then(|k| self.clocking_meta.get(&k))
+                    .and_then(|k| self.clocking_event_sens(&k, None))
                 {
-                    vec![Sensitivity {
-                        signal_name: clk.clone(),
-                        edge: EdgeKind::Posedge,
-                        iff: None,
-                        value_of: None,
-                    }]
+                    vec![s]
                 } else {
                     vec![Sensitivity {
                         signal_name: {
@@ -3658,15 +3660,11 @@ impl Simulator {
                     // at t=0 instead of waiting for the block's clock edge.
                     // Every `@cb;` sampling loop then spun without advancing.
                     let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
-                    if let Some(cbk) = self.resolve_clocking_key(&segs) {
-                        if let Some((clk, _)) = self.clocking_meta.get(&cbk) {
-                            return vec![Sensitivity {
-                                signal_name: clk.clone(),
-                                edge: EdgeKind::Posedge,
-                                iff: None,
-                                value_of: None,
-                            }];
-                        }
+                    if let Some(s) = self
+                        .resolve_clocking_key(&segs)
+                        .and_then(|k| self.clocking_event_sens(&k, None))
+                    {
+                        return vec![s];
                     }
                     vec![Sensitivity {
                         signal_name: self.resolve_hier_name(h).into_owned(),

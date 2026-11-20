@@ -85,3 +85,45 @@ endmodule",
         "selects of a class array element: {msgs:?}"
     );
 }
+
+/// Fixed arrays retain individually addressable, typed cells even when only
+/// a part-select of a previously untouched element is written (#1053).
+#[test]
+fn fixed_class_array_uses_dense_typed_cells() {
+    let sim = simulate(
+        r#"
+class bank;
+  byte data[8:1];
+  logic [7:0] flags[1:8];
+endclass
+module tb;
+  bank b;
+  initial begin
+    b = new;
+    b.data[8][7:4] = 4'hf;
+    b.flags[1][3:0] <= 4'h5;
+    #1;
+    $display("data=%0d zero=%0d flags=%b untouched=%b",
+             $signed(b.data[8]), b.data[1], b.flags[1], b.flags[8]);
+  end
+endmodule
+"#,
+        10,
+    )
+    .expect("simulate failed");
+    assert!(
+        sim.output
+            .iter()
+            .any(|line| { line.message == "data=-16 zero=0 flags=xxxx0101 untouched=xxxxxxxx" }),
+        "{:?}",
+        sim.output
+    );
+    for property in ["#data", "#flags"] {
+        assert!(
+            sim.signals.elem_runs().any(|(name, first, values)| {
+                name.ends_with(property) && first == 1 && values.len() == 8
+            }),
+            "no run for {property}"
+        );
+    }
+}

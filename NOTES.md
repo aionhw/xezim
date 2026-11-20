@@ -16,6 +16,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 - **Correctness:** Bind whole interface-array ports by position, fold header array parameters in the declaring instance, honor inferred pull net types, and size fill literals through comparisons (#1402, #1404, #1400, #1399).
 - **Correctness:** Drive nested unpacked leaves at their declared widths, copy fixed rows in declaration order, resolve drivers per wire-array element and delay whole unpacked structures (#1403, #1398, #1395, #1393).
 - **Correctness:** Resolve named fork activations in their declaring scope, describe types in declared dimension order, and apply packed assignment-pattern defaults recursively (#1396, #1348, #1343).
+- **Correctness:** Use the declared clocking edge for bare clocking block waits and default clocking cycle delays (§14.10–11, #1332).
+- Store contiguous fixed class-array elements in dense runs while retaining their declared widths and typed values (#1053).
 
 - **Correctness:** A trailing whitespace directive in `$fscanf` sets EOF when it reads to the end of the file (§21.3.4.3, #1376).
 
@@ -63,6 +65,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 - **Correctness:** Preserve input-port indices around UDP instances, schedule fixed-array and record assignment-pattern leaves in the NBA region, and combine root and descendant waveform scopes with independent depth limits (#1201, #1199, #1195).
 
 **Performance**
+
+- Inline literal default inputs on positional function calls and compile process locals overwritten by a function output before their first read (#1453).
 
 * Module bodies containing only declarations and continuous assignments reuse
   their prepared syntax across value-parameter overrides, avoiding repeated
