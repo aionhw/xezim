@@ -43,6 +43,7 @@ use serde::ser::{SerializeSeq, Serializer};
 // frame cache of a synchronous fork child is rebuilt, not carried (#721).
 // §10.9.1, §26.3 / §9.4.2: named assignment pattern keys carry a bound type name; the guard
 // and value expressions of an event term are shared.
+// §9.2.2.2: Simulator::comb_time0_held, CombEntryCold::time0_effects.
 const MAGIC: &[u8; 8] = b"XZCKPT\x00\x12";
 
 #[derive(Default)]

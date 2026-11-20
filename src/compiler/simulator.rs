@@ -391,6 +391,9 @@ fn method_boost_enabled() -> bool {
 // §9.3, §13.3: block bodies in shared statement lists, a continuation tree per task call
 // site, and boxed optional delays, initializers and case item patterns (#721).
 // §10.9.1, §26.3: a named assignment pattern key carries its lexically bound type name.
+// §6.18, §7.4.1: a cast to a typedef of real and a function returning one are real operands,
+// and a subroutine or block selecting a packed array of a named signed type does not compile.
+// §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
 const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308d;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
@@ -1810,6 +1813,10 @@ struct CombEntryCold {
 // selects write whole before a read compile; a call selecting an ascending or offset-range
 // variable of its callee stays interpreted.
 // §10.9.1, §26.3: a named assignment pattern key carries its lexically bound type name.
+// §6.18, §6.24.1: a cast to a typedef of real is a real operand of a continuous assignment.
+// §9.2.2.2, §10.3: CombEntryCold::time0_effects; a variable a called function writes is
+// not a read of its caller.
+// §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
 const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB045";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
