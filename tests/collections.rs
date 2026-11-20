@@ -331,6 +331,8 @@ mod assoc_elem_select_read;
 mod assoc_packed_elem;
 #[path = "collections/packed_struct_member_idx_select.rs"]
 mod packed_struct_member_idx_select;
+#[path = "collections/real_unpacked_concat_items.rs"]
+mod real_unpacked_concat_items;
 #[path = "collections/unpacked_case_compare.rs"]
 mod unpacked_case_compare;
 #[path = "collections/unpacked_row_pattern_store.rs"]
