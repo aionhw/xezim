@@ -33,6 +33,8 @@ mod dpi_export_task_waits;
 mod dpi_export_types;
 #[path = "strings/dpi_integration_tests.rs"]
 mod dpi_integration_tests;
+#[path = "strings/dpi_libc_import.rs"]
+mod dpi_libc_import;
 #[path = "strings/dpi_library_loading.rs"]
 mod dpi_library_loading;
 #[path = "strings/dpi_real_int_conversion.rs"]
