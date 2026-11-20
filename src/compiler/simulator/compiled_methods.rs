@@ -2070,7 +2070,7 @@ impl Simulator {
                 // Collection return: the VALUE leaves via the side channel;
                 // the result register is never consumed by the caller.
                 (0u32, false)
-            } else if let Some(pair) = self.scalar_formal_integral(&_f.return_type) {
+            } else if let Some(pair) = self.scalar_integral_in(&_f.return_type, self.method_typedef_types(), self.method_typedef_widths()) {
                 pair
             } else if let Some(pair) = self.enum_type_info(&_f.return_type) {
                 // Step 6: an enum RETURN is integral — width of the enum's base
@@ -2254,7 +2254,7 @@ impl Simulator {
                 resolve_type_width(
                     &pre.return_type,
                     Some(&self.module.parameters),
-                    Some(&self.module.typedefs),
+                    Some(self.method_typedef_widths()),
                 )
             } else {
                 let values: HashMap<String, Value> =
@@ -2263,7 +2263,7 @@ impl Simulator {
                 super::elaborate::resolve_type_width_env(
                     &pre.return_type,
                     Some(&scope),
-                    Some(&self.module.typedefs),
+                    Some(self.method_typedef_widths()),
                 )
             };
             if w > 0 { w } else { pre.static_result_width }
