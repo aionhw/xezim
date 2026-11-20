@@ -5796,7 +5796,7 @@ impl Simulator {
     /// Declared (left, right) bounds of each unpacked dimension of the array
     /// stored at `name`: a module or local array's, or a class member's
     /// (`<handle>#prop`). A dynamic dimension may be listed or left out.
-    fn unpacked_decl_dims_of(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+    pub(super) fn unpacked_decl_dims_of(&self, name: &str) -> Option<Vec<(i64, i64)>> {
         if let Some(d) = self.module.unpacked_decl_dims.get(name) {
             return Some(d.clone());
         }

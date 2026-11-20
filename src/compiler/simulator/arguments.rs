@@ -2514,19 +2514,18 @@ impl Simulator {
                 return None;
             }
             let param = self.array_formal_key(port);
-            let suffixes =
-                if let Some(&((a0, a1), (b0, b1), w)) = self.module.arrays_2d.get(&*caller) {
-                    self.module
-                        .arrays_2d
-                        .insert(param.clone(), ((a0, a1), (b0, b1), w));
-                    Self::nd_elem_suffixes(&[(a0, a1), (b0, b1)])
-                } else {
-                    let (shape, w) = self.module.arrays_nd.get(&*caller).cloned()?;
-                    self.module
-                        .arrays_nd
-                        .insert(param.clone(), (shape.clone(), w));
-                    Self::nd_elem_suffixes(&shape)
-                };
+            let callers = self.nd_formal_suffixes(&caller)?;
+            let declared = self.declared_fixed_dims(&dims)?;
+            let numeric: Vec<_> = declared.iter().map(|&(l,r)| (l.min(r),l.max(r))).collect();
+            let suffixes = Self::nd_elem_suffixes(&declared);
+            let w = self.module.arrays_2d.get(&*caller).map(|s|s.2)
+                .or_else(||self.module.arrays_nd.get(&*caller).map(|s|s.1))?;
+            if numeric.len() == 2 {
+                self.module.arrays_2d.insert(param.clone(),(numeric[0],numeric[1],w));
+            } else {
+                self.module.arrays_nd.insert(param.clone(),(numeric,w));
+            }
+            self.module.unpacked_decl_dims.insert(param.clone(), declared);
             self.multi_dim_array_names.insert(param.clone());
             if param != caller {
                 let w = match self.module.arrays_2d.get(&param) {
@@ -2540,7 +2539,7 @@ impl Simulator {
                     .p_elem_type(&caller)
                     .or_else(|| self.p_elem_type(&param))
                     .and_then(|dt| self.unpacked_struct_of(&dt));
-                for sfx in &suffixes {
+                for (sfx, src) in suffixes.iter().zip(&callers) {
                     if let Some(su) = &elem_su {
                         let d = format!("{}{}", param, sfx);
                         if out_default.is_some() {
@@ -2550,14 +2549,14 @@ impl Simulator {
                                 self.signals.insert(k, dv);
                             }
                         } else {
-                            let s = format!("{}{}", caller, sfx);
+                            let s = format!("{}{}", caller, src);
                             self.copy_unpacked_struct(&d, &s, &su.clone());
                         }
                         continue;
                     }
                     let v = match &out_default {
                         Some(d) => Some(d.clone()),
-                        None => self.get_signal_value_by_name(&format!("{}{}", caller, sfx)),
+                        None => self.get_signal_value_by_name(&format!("{}{}", caller, src)),
                     };
                     if let Some(v) = v {
                         self.signals.insert(format!("{}{}", param, sfx), v);
@@ -2653,7 +2652,8 @@ impl Simulator {
             let (lo, hi) = (d0.min(d1), d0.max(d1));
             let mut next = Vec::with_capacity(out.len() * ((hi - lo + 1).max(0) as usize));
             for prefix in &out {
-                for i in lo..=hi {
+                for offset in 0..=(hi - lo) {
+                    let i = if d0 > d1 { d0 - offset } else { d0 + offset };
                     next.push(format!("{}[{}]", prefix, i));
                 }
             }
@@ -2662,13 +2662,32 @@ impl Simulator {
         out
     }
 
+    /// §7.6: storage bounds are normalized; positional operations start at the
+    /// declared left bound of each remaining dimension.
+    pub(super) fn nd_ordered_suffixes(&self, name: &str, shape: &[(i64, i64)], skip: usize) -> Vec<String> {
+        let declared = self.unpacked_decl_dims_of(name);
+        let ordered = declared.as_deref().filter(|dims| dims.len() == shape.len())
+            .unwrap_or(shape);
+        Self::nd_elem_suffixes(&ordered[skip..])
+    }
+
+    pub(super) fn declared_fixed_dims(&self, dims: &[crate::ast::types::UnpackedDimension]) -> Option<Vec<(i64, i64)>> {
+        use crate::ast::types::UnpackedDimension as D;
+        let bound = |e: &Expression| super::elaborate::const_eval_i64_with_params(e, Some(&self.module.parameters));
+        dims.iter().map(|dim| match dim {
+            D::Range {left, right, ..} => Some((bound(left)?, bound(right)?)),
+            D::Expression {expr, ..} => Some((0, bound(expr)?-1)),
+            _ => None,
+        }).collect()
+    }
+
     /// Element suffixes of a name registered as a multi-dimensional array.
     pub(super) fn nd_formal_suffixes(&self, name: &str) -> Option<Vec<String>> {
         if let Some(&(a, b, _)) = self.module.arrays_2d.get(name) {
-            return Some(Self::nd_elem_suffixes(&[a, b]));
+            return Some(self.nd_ordered_suffixes(name, &[a, b], 0));
         }
         if let Some((shape, _)) = self.module.arrays_nd.get(name) {
-            return Some(Self::nd_elem_suffixes(shape));
+            return Some(self.nd_ordered_suffixes(name, shape, 0));
         }
         None
     }
@@ -2700,6 +2719,7 @@ impl Simulator {
         if self.module.arrays_2d.remove(param).is_some()
             | self.module.arrays_nd.remove(param).is_some()
         {
+            self.module.unpacked_decl_dims.remove(param);
             self.multi_dim_array_names.remove(param);
         }
     }
@@ -2766,20 +2786,20 @@ impl Simulator {
                     _ => return None,
                 };
                 let rest: Vec<(i64, i64)> =
-                    if let Some(&(_, b, _)) = self.module.arrays_2d.get(&*name) {
-                        vec![b]
+                    if let Some(&(a, b, _)) = self.module.arrays_2d.get(&*name) {
+                        vec![a,b]
                     } else if let Some((shape, _)) = self.module.arrays_nd.get(&*name) {
                         if shape.len() < 2 {
                             return None;
                         }
-                        shape[1..].to_vec()
+                        shape.clone()
                     } else {
                         return None;
                     };
                 let i = self.eval_expr(index).to_i64()?;
                 Some((
                     format!("{}[{}]", name, i),
-                    Self::nd_elem_suffixes(&rest),
+                    self.nd_ordered_suffixes(&name, &rest, 1),
                     true,
                 ))
             }
@@ -2884,6 +2904,9 @@ impl Simulator {
             if let Some(shape) = self.module.arrays_nd.get(param).cloned() {
                 self.module.arrays_nd.insert(tmp.clone(), shape);
             }
+            if let Some(bounds) = self.module.unpacked_decl_dims.get(param).cloned() {
+                self.module.unpacked_decl_dims.insert(tmp.clone(), bounds);
+            }
             if self.multi_dim_array_names.contains(param) {
                 self.multi_dim_array_names.insert(tmp.clone());
             }
@@ -2903,16 +2926,17 @@ impl Simulator {
                         .p_elem_type(param)
                         .or_else(|| self.p_elem_type(caller))
                         .and_then(|dt| self.unpacked_struct_of(&dt));
-                    for sfx in sfxs {
+                    let Some(destinations) = self.nd_formal_suffixes(caller) else { continue; };
+                    for (sfx, dst) in sfxs.iter().zip(destinations) {
                         if let Some(su) = &elem_su {
                             let (d, s) =
-                                (format!("{}{}", caller, sfx), format!("{}{}", param, sfx));
+                                (format!("{}{}", caller, dst), format!("{}{}", param, sfx));
                             self.copy_unpacked_struct(&d, &s, &su.clone());
                             continue;
                         }
                         if let Some(v) = self.get_signal_value_by_name(&format!("{}{}", param, sfx))
                         {
-                            self.set_signal_value_by_name(&format!("{}{}", caller, sfx), v);
+                            self.set_signal_value_by_name(&format!("{}{}", caller, dst), v);
                         }
                     }
                 }
