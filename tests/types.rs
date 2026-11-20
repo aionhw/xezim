@@ -65,6 +65,8 @@ mod call_result_member_element_select;
 mod callback_typedef_static;
 #[path = "types/callee_local_keeps_caller_type.rs"]
 mod callee_local_keeps_caller_type;
+#[path = "types/case_inside_tolerance.rs"]
+mod case_inside_tolerance;
 #[path = "types/cast_class_member_enum_range.rs"]
 mod cast_class_member_enum_range;
 #[path = "types/cast_operand_context.rs"]
