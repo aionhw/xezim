@@ -4205,6 +4205,12 @@ struct DeferredReport {
     class_context: Option<String>,
     /// §20.12: what an assertion control selects the assertion by.
     ctl: CtlIdent,
+    /// §16.4.2: the `assertion_stats` entry the outcome is counted in when
+    /// the report matures, with its kind tag (0 assert, 1 assume, 2 cover)
+    /// and location. A flushed or superseded report is no attempt.
+    stat_key: usize,
+    stat_kind: u8,
+    stat_loc: (Option<u32>, usize),
 }
 
 /// LRM §4.4 / §16 observed-region probe entry. A concurrent property's
