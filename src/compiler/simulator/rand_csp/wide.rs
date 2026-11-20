@@ -976,7 +976,7 @@ impl Simulator {
         let Some(dt) = self.csp_prop_decl_type(csp.handle, root) else {
             return false;
         };
-        matches!(super::elaborate::resolve_typedef_chain(&dt,&self.module.typedef_types),DataType::Struct(su) if su.packed)
+        matches!(crate::compiler::elaborate::resolve_typedef_chain(&dt,&self.module.typedef_types),DataType::Struct(su) if su.packed)
     }
 
     fn csp_wide_named(csp: &Csp, read: &HashSet<String>, opaque: bool) -> bool {
