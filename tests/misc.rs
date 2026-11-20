@@ -255,6 +255,8 @@ mod part_select_constant_bounds;
 mod part_select_negative_bound_compiled;
 #[path = "misc/placeholder_parameter_replication.rs"]
 mod placeholder_parameter_replication;
+#[path = "misc/port_conn_width_after_index.rs"]
+mod port_conn_width_after_index;
 #[path = "misc/port_width_mismatch_explains.rs"]
 mod port_width_mismatch_explains;
 #[path = "misc/readmem_hierarchical_target.rs"]
