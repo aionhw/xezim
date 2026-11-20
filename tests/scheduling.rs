@@ -249,6 +249,8 @@ mod static_local_nba_per_instance;
 mod struct_member_read_sensitivity;
 #[path = "scheduling/suspending_loop_depth_and_continue.rs"]
 mod suspending_loop_depth_and_continue;
+#[path = "scheduling/sva_delay_operand_forms.rs"]
+mod sva_delay_operand_forms;
 #[path = "scheduling/sva_multiclock_delay_then_clock.rs"]
 mod sva_multiclock_delay_then_clock;
 #[path = "scheduling/sva_time0_default_samples.rs"]
