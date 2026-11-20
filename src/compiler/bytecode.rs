@@ -12293,18 +12293,8 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
-    /// §11.8.2 operators with a REAL operand. Neither operand real: None, and
-    /// the integral rules apply. Otherwise:
-    /// - an arithmetic operator's result is real, so each integral operand is
-    ///   evaluated SELF-determined and then converted. The surrounding context
-    ///   width never reaches it — `(u - 2) * 1.0` with `int unsigned u = 1`
-    ///   converts the 32-bit 4294967295, not a 64-bit all-ones;
-    /// - a relational or equality operator's operands take real type from
-    ///   each other, so the real type propagates ONE operator into the
-    ///   integral side, whose own operands are then self-determined (see
-    ///   `compile_in_real_context`): `3.5 == 7/2` compares 3.5 with 3.5. As
-    ///   in the reference simulator, this happens only for a constant
-    ///   integral side; a run-time one is converted whole.
+    /// §11.8.2: integral operands of real arithmetic and comparisons are
+    /// self-determined before conversion, including constant expressions.
     fn compile_real_operator(
         &mut self,
         op: BinaryOp,
@@ -12332,26 +12322,10 @@ impl<'a> BytecodeCompiler<'a> {
         if !lr && !rr {
             return None;
         }
-        // The reference simulator propagates into a comparison only when the
-        // integral side is itself CONSTANT (`3.5 == 7/2` divides as reals);
-        // a run-time integral side is converted from its self-determined
-        // value (`x == a/b` divides as integers).
-        let lp = cmp && !lr && self.expr_is_constant(left);
-        let rp = cmp && !rr && self.expr_is_constant(right);
-        let l = if lp {
-            self.compile_in_real_context(left)
-        } else {
-            self.compile_real_operand(left, lr)
-        };
-        let Some(l) = l else {
+        let Some(l) = self.compile_real_operand(left, lr) else {
             return Some(None);
         };
-        let r = if rp {
-            self.compile_in_real_context(right)
-        } else {
-            self.compile_real_operand(right, rr)
-        };
-        let Some(r) = r else {
+        let Some(r) = self.compile_real_operand(right, rr) else {
             return Some(None);
         };
         Some(Some(self.emit_real_binop(op, l, r)))

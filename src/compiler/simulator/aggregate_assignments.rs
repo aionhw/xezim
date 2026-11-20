@@ -3137,32 +3137,13 @@ impl Simulator {
         ) {
             return None;
         }
-        let cmp = matches!(
-            op,
-            BinaryOp::Eq
-                | BinaryOp::Neq
-                | BinaryOp::Lt
-                | BinaryOp::Leq
-                | BinaryOp::Gt
-                | BinaryOp::Geq
-        );
         let lr = self.expr_is_real_static(left);
         let rr = self.expr_is_real_static(right);
         if !lr && !rr {
             return None;
         }
-        // Only a CONSTANT integral side takes the real type in a comparison,
-        // as in the reference simulator (see the bytecode compiler).
-        let l = if cmp && !lr && self.expr_is_constant(left) {
-            self.eval_in_real_context(left)
-        } else {
-            self.real_operand(left)
-        };
-        let r = if cmp && !rr && self.expr_is_constant(right) {
-            self.eval_in_real_context(right)
-        } else {
-            self.real_operand(right)
-        };
+        let l = self.real_operand(left);
+        let r = self.real_operand(right);
         Some(Self::real_binop(op, &l, &r))
     }
 
