@@ -264,7 +264,7 @@ impl Simulator {
             ExprKind::Ident(hier) => {
                 // A package- or `$unit`-qualified root is not a signal-table
                 // path; `$root` is a marker the table's names do not carry.
-                if hier.root.is_some() {
+                if hier.root.as_deref().is_some_and(|root| root != "$root") {
                     return None;
                 }
                 let skip_root =

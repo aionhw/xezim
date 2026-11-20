@@ -906,7 +906,9 @@ impl Simulator {
                     // `$dumpvars` renderer for that spelling.
                     let name = match &a.kind {
                         ExprKind::Ident(hier)
-                            if hier.path.iter().all(|seg| seg.selects.is_empty()) =>
+                            if hier.root.as_deref() != Some("$root")
+                                && hier.path.len() == 1
+                                && hier.path[0].selects.is_empty() =>
                         {
                             let s = self.resolve_hier_name(hier);
                             (!s.is_empty()).then(|| s.to_string())
