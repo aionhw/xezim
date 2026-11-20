@@ -4506,6 +4506,25 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
+        // §7.6: a subarray the copies above do not name (`v[1][0]` of a
+        // three-dimensional array, a row into a queue or dynamic array, a
+        // row of a class property) is read element by element and stored as
+        // the pattern of those values. It was read as one scalar. Only a
+        // design with multidimensional storage has one.
+        if r_dyn.is_none()
+            && (!self.module.arrays_2d.is_empty() || !self.module.arrays_nd.is_empty())
+            && matches!(
+                rvalue.kind,
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+            )
+            && let Some((pattern, release)) = self.unpacked_array_snapshot(rvalue, rvalue.span)
+        {
+            self.exec_stmt_blocking_assign_body(stmt, lvalue, &pattern);
+            if let Some(release) = release {
+                self.exec_statement(&release);
+            }
+            return;
+        }
         if let (Some((dst, lo, hi)), Some(src)) = (l_fix, r_dyn.clone()) {
             let desc = self.module.descending_arrays.contains(&dst);
             let cap = (hi - lo + 1) as u64;
