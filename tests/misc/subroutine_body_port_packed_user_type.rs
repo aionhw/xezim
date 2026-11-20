@@ -73,3 +73,59 @@ endmodule
         assert!(lines.contains(&want), "missing {want}: {lines:?}");
     }
 }
+
+/// §5.6.1: an escaped identifier is an identifier, so `input s_t \in1 ;` in a
+/// subroutine body and `input s_t \pi ;` in a module's port declarations name
+/// the ports `in1` and `pi`, with or without packed dimensions on the type.
+/// The type lookahead only accepted a plain name after the type, so `s_t`
+/// became the port and the escaped name was a parse error or a statement.
+#[test]
+fn escaped_port_name_after_a_user_type() {
+    let src = r#"
+typedef struct packed { logic a; logic b; } s_t;
+module m (\pi , \pk , y);
+  input s_t \pi ;
+  input s_t [1:0] \pk ;
+  output logic y;
+  assign y = \pi .b ^ \pk [1].a;
+endmodule
+module top;
+  function automatic logic f1;
+    input s_t \in1 ;
+    logic r;
+    begin
+      r = \in1 .b;
+      f1 = r;
+    end
+  endfunction
+  function automatic logic [1:0] f2;
+    input s_t [1:0] \in2 ;
+    logic [1:0] r;
+    begin
+      r = {\in2 [1].a, \in2 [0].b};
+      f2 = r;
+    end
+  endfunction
+  task automatic tk;
+    output s_t \o1 , \o2 ;
+    begin
+      \o1 = 2'b01;
+      \o2 = 2'b10;
+    end
+  endtask
+  logic y0, y1;
+  m u0 (.\pi (2'b01), .\pk (4'b0000), .y(y0));
+  m u1 (.\pi (2'b01), .\pk (4'b1000), .y(y1));
+  initial begin
+    s_t a, b;
+    tk(a, b);
+    #1;
+    $display("f1=%b f2=%b tk=%b%b y=%b%b", f1(2'b01), f2(4'b1001), a, b, y0, y1);
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("escaped port names after a user type are legal");
+    let lines: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert!(lines.contains(&"f1=1 f2=11 tk=0110 y=10"), "{lines:?}");
+}
