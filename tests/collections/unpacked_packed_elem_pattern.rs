@@ -35,7 +35,7 @@ endmodule",
     );
     assert_line(
         &msgs,
-        "m=00000000000000000000 di=beef,beef pi=0102,0304,0506,0708",
+        "m=00000000000000000000 di=efef,efef pi=0102,0304,0506,0708",
     );
 }
 
@@ -63,7 +63,7 @@ endmodule",
     );
     assert_line(
         &msgs,
-        "n=00000000000000000000 a2=1234,1234 a6=1111,1111,2222 a7=7777,7777",
+        "n=00000000000000000000 a2=3434,3434 a6=1111,1111,2222 a7=7777,7777",
     );
     assert_line(
         &msgs,
@@ -91,7 +91,7 @@ endmodule",
     );
     assert_line(
         &msgs,
-        "a4=0102030405060708,0102030405060708 a5=4321,4321 sel=05060708",
+        "a4=0808080808080808,0808080808080808 a5=2121,2121 sel=08080808",
     );
     assert_line(&msgs, "asc=0102,0304,0506,0708");
 }
@@ -111,7 +111,7 @@ fn typedef_and_packed_struct_array_elements() {
   end
 endmodule",
     );
-    assert_line(&msgs, "td=d00d,d00d sp=01020304,01020304");
+    assert_line(&msgs, "td=0d0d,0d0d sp=04040404,04040404");
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn nonblocking_always_comb_and_variable_default() {
   end
 endmodule",
     );
-    assert_line(&msgs, "nb=f00d,f00d ac=1357,0001,1357 vr=1357");
+    assert_line(&msgs, "nb=0d0d,0d0d ac=1357,0001,1357 vr=1357");
 }
 
 // Guards: shapes that already stored every element.
@@ -158,6 +158,6 @@ endmodule",
     );
     assert_line(
         &msgs,
-        "c1=00000000000000000005 c2=00000000000000000006 st=5a5a,5a5a ca=cafe,cafe pk=1234",
+        "c1=00000000000000000005 c2=00000000060000000006 st=5a5a,5a5a ca=fefe,fefe pk=1234",
     );
 }

@@ -1254,7 +1254,7 @@ impl Simulator {
                 combined_types
             };
             if e.is_some() || !member_outer.is_empty() {
-                self.assign_pattern_over_dims_with_types(&target, &mdt, &lists, e, member_outer);
+                self.assign_pattern_over_dims_with_types(&target, &mdt, &lists, e, !explicit, member_outer);
             }
         }
     }
@@ -1351,6 +1351,7 @@ impl Simulator {
         dt: &DataType,
         lists: &[Vec<i64>],
         e: Option<&'a Expression>,
+        from_default: bool,
         outer_types: &[(DataType, &'a Expression)],
     ) {
         let Some((first, rest)) = lists.split_first() else {
@@ -1390,6 +1391,20 @@ impl Simulator {
                     self.write_pattern_leaf(target, v);
                     return;
                 }
+                // §10.9.1: an inherited default can descend further into the
+                // packed element; a value of matching type is stored whole.
+                if from_default && !matches!(e.kind, ExprKind::AssignmentPattern(_))
+                    && crate::compiler::packed_assignment_pattern_plan::is_packed_aggregate(leaf_dt.as_ref(), self)
+                {
+                    let items = [AssignmentPatternItem::Default(e.clone())];
+                    let capture = self.pattern_nba_leaves.take();
+                    let v = self.eval_default_in_packed_type(&items, leaf_dt.as_ref(), &|_| false);
+                    self.pattern_nba_leaves = capture;
+                    if let Some(v) = v {
+                        self.write_pattern_leaf(target, v);
+                        return;
+                    }
+                }
                 self.assign_pattern_or_leaf(target, leaf_dt.as_ref(), e);
             }
             return;
@@ -1420,7 +1435,7 @@ impl Simulator {
         for idx in first {
             elem_target.truncate(base_len);
             let _ = write!(&mut elem_target, "[{}]", idx);
-            self.assign_pattern_over_dims_with_types(&elem_target, dt, rest, e, outer_types);
+            self.assign_pattern_over_dims_with_types(&elem_target, dt, rest, e, from_default, outer_types);
         }
     }
 
@@ -1468,6 +1483,7 @@ impl Simulator {
                     dt,
                     rest,
                     Some(v),
+                    false,
                     outer_types,
                 );
             }
@@ -1539,6 +1555,7 @@ impl Simulator {
                     dt,
                     rest,
                     Some(v),
+                    false,
                     outer_types,
                 );
                 continue;
@@ -1550,7 +1567,7 @@ impl Simulator {
                     .find(|(kt, _)| self.pattern_subarray_matches(dt, rest, kt))
                     .map(|(_, v)| *v)
             {
-                self.assign_pattern_over_dims_with_types(&elem_target, dt, rest, Some(matched), &[]);
+                self.assign_pattern_over_dims_with_types(&elem_target, dt, rest, Some(matched), false, &[]);
                 continue;
             }
             if dflt.is_some() || !combined_types.is_empty() {
@@ -1559,6 +1576,7 @@ impl Simulator {
                     dt,
                     rest,
                     dflt,
+                    true,
                     combined_types,
                 );
             }
