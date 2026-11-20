@@ -245,6 +245,8 @@ mod undeclared_names_by_binding;
 mod undefined_call_in_instance;
 #[path = "hierarchy/undriven_implicit_output_is_z.rs"]
 mod undriven_implicit_output_is_z;
+#[path = "hierarchy/unpacked_port_param_slice.rs"]
+mod unpacked_port_param_slice;
 #[path = "hierarchy/unpacked_struct_port.rs"]
 mod unpacked_struct_port;
 #[path = "hierarchy/unresolved_hier_refs.rs"]
