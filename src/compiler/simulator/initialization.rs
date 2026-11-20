@@ -4617,7 +4617,7 @@ impl Simulator {
             cg_type_options: HashMap::default(),
             method_receiver_cache: HashMap::default(),
             hint_key_scratch: std::cell::RefCell::new(String::new()),
-            decl_param_scope_cache: std::cell::RefCell::new(None),
+            decl_param_scope_cache: std::cell::RefCell::default(),
             vif_key_scratch: std::cell::RefCell::new(String::new()),
             spec_frag_fold_cache: RefCell::new(HashMap::default()),
             param_leaf_names: std::cell::OnceCell::new(),

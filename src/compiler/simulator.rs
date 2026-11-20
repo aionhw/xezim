@@ -5330,6 +5330,25 @@ struct DeclShadow {
     meta: FormalMetadataSnapshot,
 }
 
+/// `Simulator::decl_param_scope`'s state (§23.10).
+#[derive(Default)]
+struct DeclParamScopeCache {
+    /// The prefix asked for last, and whether it owns parameters (when it
+    /// does, `table` holds its overlay).
+    last: Option<(String, bool)>,
+    /// Per scope: the parameters declared in it or below it, by their name
+    /// relative to the scope (`u.g.L` is `g.L` for `u`), in table order.
+    groups: HashMap<String, std::rc::Rc<[(String, Value)]>>,
+    /// The design-wide parameter table with the groups of `applied` on it.
+    table: Option<std::rc::Rc<HashMap<String, Value>>>,
+    /// The scopes whose groups `table` holds, outermost first, each with the
+    /// length `undo` had before its group went on.
+    applied: Vec<(String, usize)>,
+    /// What each group write replaced in `table`, in write order, so a group
+    /// comes off again in reverse.
+    undo: Vec<(String, Option<Value>)>,
+}
+
 /// One selected region of a declared packed value (§7.4.1 / §11.5.1).
 struct DeclaredPackedAccess {
     storage: String,
@@ -9780,12 +9799,13 @@ pub struct Simulator {
     method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
     /// Reused buffer for the `<hint>.<name>` probe in `get_signal_value_by_name` (a `&self` path).
     hint_key_scratch: std::cell::RefCell<String>,
-    /// One-entry cache of `decl_param_scope`: the instance prefix last asked
-    /// for and its overlaid parameter table (`None` when the prefix owns no
-    /// parameters). A select loop over one instance's signal rebuilds nothing.
+    /// `decl_param_scope`'s state: the parameters under each scope, and the
+    /// one overlaid parameter table it hands out. A select loop over one
+    /// instance's signal rebuilds nothing, and a move to another instance
+    /// changes only the scopes the two do not share instead of copying the
+    /// table.
     #[serde(skip)]
-    decl_param_scope_cache:
-        std::cell::RefCell<Option<(String, Option<std::rc::Rc<HashMap<String, Value>>>)>>,
+    decl_param_scope_cache: std::cell::RefCell<DeclParamScopeCache>,
     /// Reused buffer for the `__vif_local__` key probes (`&self` paths).
     vif_key_scratch: std::cell::RefCell<String>,
     /// §8.25: specialization-argument texts already folded to their value
