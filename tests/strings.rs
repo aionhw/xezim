@@ -49,6 +49,8 @@ mod format_lrm_compliance;
 mod format_real_integral_889;
 #[path = "strings/format_sibling_fixes.rs"]
 mod format_sibling_fixes;
+#[path = "strings/fscanf_whitespace_directive_eof.rs"]
+mod fscanf_whitespace_directive_eof;
 #[path = "strings/fwrite_buffered_flush_points.rs"]
 mod fwrite_buffered_flush_points;
 #[path = "strings/fwrite_mcd_fd.rs"]
