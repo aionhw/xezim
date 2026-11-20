@@ -5257,10 +5257,11 @@ impl Simulator {
                 two_state,
                 ..
             } => {
-                let val = &if *two_state && val.has_xz() {
-                    val.to_two_state()
+                let fitted = val.resize_for_assign(*w);
+                let val = &if *two_state && fitted.has_xz() {
+                    fitted.to_two_state()
                 } else {
-                    val.clone()
+                    fitted
                 };
                 // A property stored at its full width takes the member's
                 // bits in place (§7.4.1): reading the whole value out,
@@ -5295,7 +5296,7 @@ impl Simulator {
                 changed
             }
             ClassAggRef::Unpacked { handle, key, w } => {
-                let nv = val.resize((*w).max(1));
+                let nv = val.resize_for_assign((*w).max(1));
                 if let Some(Some(inst)) = self.heap.get_mut(*handle) {
                     let changed = inst.properties.get(key) != Some(&nv);
                     inst.properties.insert(key.clone(), nv);
@@ -5310,6 +5311,13 @@ impl Simulator {
                 w,
                 cell_w,
             } => {
+                let fitted;
+                let val = if val.width < *w {
+                    fitted = val.resize_for_assign(*w);
+                    &fitted
+                } else {
+                    val
+                };
                 // Read-modify-write the one cell: the packed-array member (or
                 // the part-selected element) is a bit field of it. A cell
                 // already at its width is edited in place.

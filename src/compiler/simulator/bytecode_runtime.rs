@@ -92,7 +92,7 @@ impl Simulator {
                 Insn::Resize(reg, width) => {
                     let r = *reg as usize;
                     if vm_regs[r].width != *width {
-                        let resized = vm_regs[r].resize(*width);
+                        let resized = vm_regs[r].resize_for_assign(*width);
                         vm_regs[r] = resized;
                     }
                 }
@@ -720,7 +720,7 @@ impl Simulator {
                     // value's `is_fill` verbatim).
                     let sv = &vm_regs[*s as usize];
                     vm_regs[*d as usize] = if sv.width != *w {
-                        sv.resize(*w)
+                        sv.resize_for_assign(*w)
                     } else {
                         sv.clone()
                     };
@@ -901,7 +901,7 @@ impl Simulator {
                 Insn::Resize(reg, width) => {
                     let r = *reg as usize;
                     if vm_regs[r].width != *width {
-                        let resized = vm_regs[r].resize(*width);
+                        let resized = vm_regs[r].resize_for_assign(*width);
                         vm_regs[r] = resized;
                     }
                 }
@@ -1267,7 +1267,7 @@ impl Simulator {
                     // value's `is_fill` verbatim).
                     let sv = &vm_regs[*s as usize];
                     vm_regs[*d as usize] = if sv.width != *w {
-                        sv.resize(*w)
+                        sv.resize_for_assign(*w)
                     } else {
                         sv.clone()
                     };
@@ -3157,13 +3157,22 @@ impl Simulator {
                         } else {
                             vr.inline_bits()
                         };
-                        match bits.and_then(|(v, x)| vm_resize_bits(v, x, cw, sg, w)) {
+                        // §11.8.3: widening a signed four-state value copies
+                        // its sign on both planes, including an x or z MSB.
+                        let resized = bits.and_then(|(v, x)| {
+                            if sg && w > cw && cw > 0 && x & (1u64 << (cw - 1)) != 0 {
+                                None
+                            } else {
+                                vm_resize_bits(v, x, cw, sg, w)
+                            }
+                        });
+                        match resized {
                             Some((nv, nx)) => {
                                 vr.set_inline_bits(nv, nx);
                                 vr.width = w;
                             }
                             None => {
-                                let resized = self.vm_regs[r].resize(w);
+                                let resized = self.vm_regs[r].resize_for_assign(w);
                                 self.vm_regs[r] = resized;
                             }
                         }
@@ -3605,7 +3614,7 @@ impl Simulator {
                     // skip preserves `is_fill` verbatim).
                     let sv = &self.vm_regs[*s as usize];
                     let nv = if sv.width != *w {
-                        sv.resize(*w)
+                        sv.resize_for_assign(*w)
                     } else {
                         sv.clone()
                     };
