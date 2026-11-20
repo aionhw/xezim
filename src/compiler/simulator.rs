@@ -3128,8 +3128,12 @@ pub struct Simulator {
     /// `class_prop_signed_of`: a class property's packed-dimension / signed
     /// status is a per-object invariant, but the helpers walk the class
     /// hierarchy per call (per foreach element) with identical arguments.
+    /// The key carries the minimum-dimension count the caller asked for
+    /// (`class_prop_packed_dims` vs `class_prop_packed_dims_min1`): a walk
+    /// that finds nothing at two dimensions may still find one.
     #[serde(skip)]
-    class_prop_dims_memo: std::cell::RefCell<HashMap<(usize, String), Option<Vec<(i64, i64)>>>>,
+    class_prop_dims_memo:
+        std::cell::RefCell<HashMap<(usize, String, usize), Option<Vec<(i64, i64)>>>>,
     #[serde(skip)]
     class_prop_signed_memo: std::cell::RefCell<HashMap<(usize, String), bool>>,
     /// Per-randomize cache of resolved `dist` geometries in foreach fast

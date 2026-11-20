@@ -32,11 +32,207 @@ impl Simulator {
         handle: usize,
         prop: &str,
     ) -> Option<Vec<(i64, i64)>> {
-        let key = (handle, prop.to_string());
+        self.class_prop_packed_dims_cached(handle, prop, 2)
+    }
+
+    /// §12.7.3: the same walk as [`class_prop_packed_dims`], but a property
+    /// with a LONE packed dimension (`bit [15:0] row`) reports it too. A
+    /// procedural `foreach (row[i])` over such a member iterates that
+    /// dimension's declared range; the two-dimension minimum of
+    /// [`class_prop_packed_dims`] serves element selects (`d[0][0]`), which a
+    /// lone dimension never needs — the value paths already bit-select the
+    /// whole property value.
+    pub(super) fn class_prop_packed_dims_min1(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Option<Vec<(i64, i64)>> {
+        self.class_prop_packed_dims_cached(handle, prop, 1)
+    }
+
+    /// §12.7.3: the PACKED dimensions of an UNPACKED-array property's ELEMENT
+    /// (`bit [7:0] row [4]` → `[7:0]`; `bit [3:0][7:0] row [4]` →
+    /// `[[3:0], [7:0]]`) — the dimensions the loop variables of a
+    /// multi-variable `foreach (row[i, j])` walk after the member's unpacked
+    /// ones. Unlike [`class_prop_packed_dims_min1`] this does not decline
+    /// unpacked members (their index selects the element whose packed
+    /// dimensions are asked for here) nor skip the type-query fallback for
+    /// queue/associative ones (a `bit [7:0] row [$]` element is still a
+    /// packed vector). Uncached: the memo is keyed by the minimum-dimension
+    /// count, and this walk's answers for `min_dims == 1` differ from
+    /// [`class_prop_packed_dims_min1`]'s.
+    pub(super) fn class_prop_elem_packed_dims(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Option<Vec<(i64, i64)>> {
+        let cn = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let mut cur = Some(cn);
+        while let Some(c) = cur {
+            let cd = self.module.classes.get(&c)?;
+            if let Some(dt) = cd.property_types.get(prop) {
+                let bound = self.bind_type_params_in(dt, &|n| self.obj_type_param(handle, &c, n));
+                let bdt = bound.as_ref().unwrap_or(dt);
+                if let Some(dims) = super::elaborate::packed_full_dims_chained(
+                    bdt,
+                    &self.module.parameters,
+                    &self.module.typedef_types,
+                ) {
+                    return Some(dims);
+                }
+                let q = super::elaborate::type_query_dims_of(
+                    bdt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                    Some(&self.module.typedef_types),
+                );
+                if !q.dims.is_empty() {
+                    return Some(q.dims);
+                }
+                // #1331: the element's packed range may be written with a
+                // class VALUE parameter (`class c #(int W = 8); bit [W-1:0]
+                // row [4]`), which the module table cannot resolve. Retry with
+                // the object's class parameters overlaid — both walks above
+                // already failed, so this only answers members whose bounds
+                // were previously unresolvable.
+                if let Some(ext) = self.class_param_extended(handle, &c) {
+                    if let Some(dims) = super::elaborate::packed_full_dims_chained(
+                        bdt,
+                        &ext,
+                        &self.module.typedef_types,
+                    ) {
+                        return Some(dims);
+                    }
+                    let q = super::elaborate::type_query_dims_of(
+                        bdt,
+                        Some(&ext),
+                        Some(&self.module.typedefs),
+                        Some(&self.module.typedef_types),
+                    );
+                    if !q.dims.is_empty() {
+                        return Some(q.dims);
+                    }
+                }
+                // §7.4.1: a packed ARRAY of packed structs element
+                // (`cand_t [0:2] rows [4]`): the array dimensions alone.
+                let su = self.packed_struct_with_dims(bdt)?;
+                if !su.packed || su.dimensions.is_empty() {
+                    return None;
+                }
+                return Self::packed_range_bounds(&su.dimensions, &self.module.parameters);
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// §12.7.3 / #1331: the module parameter table EXTENDED with
+    /// the class VALUE parameters in scope for `class` as seen from
+    /// `handle`'s object. `class row_param #(int W = 16); bit [W-1:0] row;`
+    /// declares `W` on the CLASS, and the packed-range walkers hand
+    /// `const_eval_i64_with_params` the MODULE table, so the bound never
+    /// resolves, the walk reports no dimensions, and a `foreach (row[i])`
+    /// over the member ran exactly one iteration — while the same `foreach`
+    /// over a literal `[15:0]` member, and a counted `for` over this one,
+    /// were both fine. The specialization is the INSTANCE's
+    /// (`ClassInstance::spec`): the object decides whether `W` is 16 or 8,
+    /// not the lexical context, so an `#(8)` object is not sized from the
+    /// `#(16)` default. The executing method's lexical spec is the fallback
+    /// for objects constructed without a captured spec. Same
+    /// argument-then-default walk as `class_parameter_value`, keyed by the
+    /// object instead of the lexical scope.
+    fn class_param_extended(&self, handle: usize, class: &str) -> Option<HashMap<String, Value>> {
+        let inst = self.heap.get(handle)?.as_ref()?;
+        let leaf = inst.class_name.clone();
+        let spec = inst.spec.clone().or_else(|| {
+            let lex = self.lexical_value_spec()?;
+            (lex.0 == leaf).then_some(lex)
+        });
+        let (base, sig) = spec.unwrap_or_else(|| (leaf.clone(), String::new()));
+        let arg_value = |arg: &str| -> Option<Value> {
+            let (negative, body) = match arg.trim().strip_prefix('-') {
+                Some(body) => (true, body),
+                None => (false, arg.trim()),
+            };
+            let mut value = self.eval_number(&Self::parse_spec_number(body)?);
+            if negative {
+                value.is_signed = true;
+                value = value.negate();
+            }
+            Some(value)
+        };
+        let mut params = self.module.parameters.clone();
+        let mut scopes = self.class_parameter_scopes(class);
+        scopes.reverse();
+        for scope in scopes {
+            let def = self.module.classes.get(scope)?;
+            let scope_sig = if scope == base {
+                sig.clone()
+            } else {
+                self.ancestor_spec(&base, &sig, scope).unwrap_or_default()
+            };
+            let args = Self::split_spec_args(&scope_sig);
+            // A class parameter SHADOWS a same-named module constant rather
+            // than inheriting it, so drop both kinds of name from the table
+            // before recomputing this scope's own bindings.
+            for tp in def.type_param_names.iter() {
+                params.remove(tp);
+            }
+            for (name, _) in def.param_defaults.iter() {
+                params.remove(name);
+            }
+            let mut supplied: Vec<&str> = Vec::new();
+            for (index, name) in def.param_order.iter().enumerate() {
+                if let Some(arg) = args.get(index).filter(|a| !a.trim().is_empty()) {
+                    supplied.push(name.as_str());
+                    if let Some(value) = arg_value(arg) {
+                        params.insert(name.clone(), value);
+                    }
+                }
+            }
+            // A default may reference a SIBLING parameter (`#(int W, int H =
+            // W * 2)`), so walk the defaults to a fixed point.
+            for _ in 0..def.param_defaults.len() {
+                let mut changed = false;
+                for (name, initializer) in def.param_defaults.iter() {
+                    if supplied.contains(&name.as_str()) || params.contains_key(name) {
+                        continue;
+                    }
+                    let Some(initializer) = initializer else {
+                        continue;
+                    };
+                    if let Some(value) =
+                        super::elaborate::const_eval_i64_with_params(initializer, Some(&params))
+                    {
+                        let mut value = Value::from_u64(value as u64, 64);
+                        value.is_signed = true;
+                        params.insert(name.clone(), value);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        Some(params)
+    }
+
+    fn class_prop_packed_dims_cached(
+        &self,
+        handle: usize,
+        prop: &str,
+        min_dims: usize,
+    ) -> Option<Vec<(i64, i64)>> {
+        let key = (handle, prop.to_string(), min_dims);
         if let Some(cached) = self.class_prop_dims_memo.borrow().get(&key) {
             return cached.clone();
         }
-        let r = self.class_prop_packed_dims_uncached(handle, prop);
+        let r = self.class_prop_packed_dims_uncached(handle, prop, min_dims);
         let mut memo = self.class_prop_dims_memo.borrow_mut();
         // Keyed per object: a long run allocates objects without bound.
         if memo.len() >= CLASS_PROP_MEMO_CAP {
@@ -50,6 +246,7 @@ impl Simulator {
         &self,
         handle: usize,
         prop: &str,
+        min_dims: usize,
     ) -> Option<Vec<(i64, i64)>> {
         let cn = self
             .heap
@@ -76,7 +273,69 @@ impl Simulator {
                     &self.module.parameters,
                     &self.module.typedef_types,
                 ) {
-                    return if dims.len() >= 2 { Some(dims) } else { None };
+                    return if dims.len() >= min_dims {
+                        Some(dims)
+                    } else {
+                        None
+                    };
+                }
+                // §12.7.3: `packed_full_dims_chained` reports None for a
+                // LONE packed dimension (an ordinary vector, per the
+                // bit-range convention in its own comment), but a
+                // procedural `foreach (row[i])` over `bit [15:0] row`
+                // iterates that dimension's declared range. The §20.7
+                // type-query walk reports a lone dimension — and an atom's
+                // implicit one (`int`, `byte`) — without that convention,
+                // so take whatever it finds when it meets the caller's
+                // minimum. A property with an UNPACKED dimension never
+                // gets this fallback: its single-variable `foreach`
+                // iterates the COLLECTION (queue, dynamic, associative),
+                // which the collection arms own; `array_properties` and
+                // `array_nd_properties` already returned above.
+                if !cd.queue_properties.contains_key(prop)
+                    && !cd.assoc_properties.contains_key(prop)
+                {
+                    let q = super::elaborate::type_query_dims_of(
+                        bdt,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                        Some(&self.module.typedef_types),
+                    );
+                    if q.dims.len() >= min_dims {
+                        return Some(q.dims);
+                    }
+                }
+                // #1331: the range may be written with a class VALUE
+                // parameter (`class row_param #(int W = 16); bit [W-1:0]
+                // row;`), which the module table alone cannot resolve — both
+                // walks above came back empty for such a member, and the
+                // `foreach (row[i])` that asks this question then fell back to
+                // a single iteration. Retry with the object's own class
+                // parameters overlaid, so `#(8)` and `#(16)` objects of one
+                // class each get their declared width.
+                if let Some(ext) = self.class_param_extended(handle, &c) {
+                    if let Some(dims) = super::elaborate::packed_full_dims_chained(
+                        bdt,
+                        &ext,
+                        &self.module.typedef_types,
+                    ) {
+                        if dims.len() >= min_dims {
+                            return Some(dims);
+                        }
+                    }
+                    if !cd.queue_properties.contains_key(prop)
+                        && !cd.assoc_properties.contains_key(prop)
+                    {
+                        let q = super::elaborate::type_query_dims_of(
+                            bdt,
+                            Some(&ext),
+                            Some(&self.module.typedefs),
+                            Some(&self.module.typedef_types),
+                        );
+                        if q.dims.len() >= min_dims {
+                            return Some(q.dims);
+                        }
+                    }
                 }
                 // §7.4.1: a packed ARRAY of packed structs (`cand_t [0:2] a`):
                 // the array dimensions alone — the struct is the element, so

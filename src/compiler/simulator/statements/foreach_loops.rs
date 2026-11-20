@@ -146,6 +146,18 @@ impl Simulator {
         let mut name = h.path[0].name.name.clone();
         if let Some(local) = self.dyn_name_lookup(&name) {
             name = local.to_string();
+        } else {
+            // A bare CLASS-MEMBER base (`foreach (rows[1][i])` inside a
+            // method) resolves through the running instance — the same lift
+            // the plain-Ident arm below applies — else the member arm would
+            // iterate the array's ELEMENTS instead of the selected one's
+            // packed bits (#1331).
+            let spec_key = self.spec_static_coll_key(&name);
+            if let std::borrow::Cow::Owned(k) = spec_key {
+                name = k;
+            } else if let Some(scoped) = self.instance_assoc_member(&name) {
+                name = scoped;
+            }
         }
         if self.foreach_dims(&name).is_none()
             && let Some(scoped) = self.hint_scoped(&name)
@@ -204,6 +216,136 @@ impl Simulator {
         rest.truncate(nvars);
         descs.truncate(nvars);
         Some((rest, descs))
+    }
+
+    /// The iteration keys of an associative (or key-addressed) member store
+    /// `an`: its stored element keys' first segment, sorted per §7.8.4
+    /// (numeric order for integral keys, lexicographic for string keys),
+    /// with whether the keys are strings. Shared by the single-variable key
+    /// scan and the multi-variable member arm's associative nesting.
+    fn foreach_member_keys(&self, an: &str) -> (Vec<String>, bool) {
+        let prefix = format!("{}[", an);
+        // An assoc-of-collections member (e.g. `bq_t all[int]`) stores
+        // elements as `all[5][0]` etc. — extract the key up to the FIRST
+        // `]` and dedup so multiple sub-elements don't each produce a
+        // phantom key.
+        let mut ks: Vec<String> = self
+            .signals
+            .elem_keys_with_prefix(&prefix)
+            .filter_map(|k| {
+                let rest = k.strip_prefix(prefix.as_str())?;
+                Self::assoc_first_key_seg(rest).map(|s| s.to_string())
+            })
+            .collect();
+        Self::sort_name_keys(&mut ks);
+        ks.dedup();
+        let is_str = self
+            .module
+            .associative_arrays
+            .get(an)
+            .copied()
+            .unwrap_or(false)
+            || self.is_string_keyed_array(an);
+        // Integer-keyed members iterate in NUMERIC order; lexicographic
+        // sort would visit "10" before "2". Use i64 so negative (signed)
+        // keys keep order.
+        if is_str {
+            Self::sort_name_keys(&mut ks);
+        } else {
+            // §7.9: int keys traverse in NUMERIC order including NEGATIVE
+            // keys — u64 parsing mangled "-7" to 0.
+            let wide = self.assoc_index_width_for(an).is_some_and(|(w, _)| w > 64);
+            Self::sort_int_keys(&mut ks, wide);
+        }
+        (ks, is_str)
+    }
+
+    /// §12.7.3: the PACKED dimensions of instance member `an`
+    /// (`"<handle>#prop"`)'s ELEMENT type — the dimensions the loop
+    /// variables of a multi-variable `foreach` walk after the member's
+    /// unpacked ones.
+    fn member_elem_packed_dims(&self, an: &str) -> Option<Vec<(i64, i64)>> {
+        let (h, prop) = an.split_once('#')?;
+        let handle = h.parse::<usize>().ok()?;
+        self.class_prop_elem_packed_dims(handle, prop)
+    }
+
+    /// §12.7.3: a multi-variable `foreach (row[i, j])` over an ASSOCIATIVE
+    /// member of packed elements (`bit [7:0] row [int]`): `vars[0]` walks
+    /// the keys in §7.8.4 order (the same materialization the
+    /// single-variable key scan uses), the remaining variables the
+    /// element's packed dimensions.
+    fn foreach_member_assoc_packed(
+        &mut self,
+        an: &str,
+        pdims: &[(i64, i64)],
+        vars: &[Option<crate::ast::Identifier>],
+        body: &Statement,
+        iterations: &mut u64,
+    ) {
+        let (keys, is_str) = self.foreach_member_keys(an);
+        let Some(var) = vars[0].as_ref() else {
+            return;
+        };
+        self.widths.insert(var.name.clone(), 32);
+        // §7.8.2: the loop variable takes the AA's index type (width +
+        // signedness) so a signed/narrowed key (e.g. shortint -3) keeps
+        // its value instead of a failed u64 parse clobbering it to 0.
+        let (kw, ks_sign) = self.assoc_index_width_for(an).unwrap_or((32, false));
+        self.widths.insert(var.name.clone(), kw);
+        let var_scope = (!an.contains('#'))
+            .then(|| an.rsplit_once('.').map(|(scope, _)| scope.to_string()))
+            .flatten();
+        let n = vars.len() - 1;
+        // `exec_foreach_nested_dir` takes NORMALIZED (lo,hi) pairs plus a
+        // per-dimension `desc` flag: a packed `[7:0]` is (0,7) with
+        // desc=true so the variable still visits 7 down to 0. Passing
+        // the declared (7,0) raw hit the `hi < lo` empty-range guard
+        // and ran zero iterations.
+        let pd_norm: Vec<(i64, i64)> = pdims
+            .iter()
+            .take(n)
+            .map(|&(l, r)| (l.min(r), l.max(r)))
+            .collect();
+        let descs: Vec<bool> = pdims.iter().take(n).map(|&(l, r)| l > r).collect();
+        for key in keys {
+            if self.finished {
+                break;
+            }
+            let kv = if is_str {
+                Self::name_key_value(&key)
+            } else if kw > 64 {
+                // Wide numeric keys are keyed by hex digits.
+                Value::from_str_radix(&key, 16, kw)
+            } else if ks_sign {
+                let mut v = Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
+                v.is_signed = true;
+                v
+            } else {
+                // §7.9 + §7.8.2: SIGNED parse (negative keys must not
+                // collapse to 0) at the DECLARED index width/signedness.
+                let mut v = Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
+                v.is_signed = ks_sign;
+                v
+            };
+            self.set_loop_var_aliased(var_scope.as_deref(), &var.name, kv);
+            self.continue_flag = false;
+            self.exec_foreach_nested_dir(
+                &pd_norm,
+                &vars[1..],
+                body,
+                var_scope.as_deref(),
+                Some(&descs),
+                iterations,
+            );
+            // `continue` is per-iteration (clear it); a `break`/`return`
+            // (both set break_flag) exits the loop and propagates — do
+            // NOT clear it.
+            if self.break_flag {
+                break;
+            }
+            self.continue_flag = false;
+        }
     }
 
     pub(in crate::compiler::simulator) fn exec_stmt_foreach_inner(
@@ -625,22 +767,93 @@ impl Simulator {
                 // single-var key-scan below would leave the inner
                 // index X and mis-parse `i][j` composite keys.
                 if vars.len() >= 2 {
-                    if let Some(mut dims) = self.foreach_dims(&an) {
-                        // A dynamic outer dimension (`T a[][N]`) iterates
-                        // its current size, not the 64-slot buffer.
-                        if self.module.dynamic_arrays.contains(&an) {
-                            dims[0] = (0, self.get_queue_size(&an) as i64 - 1);
+                    // §12.7.3: the loop variables map onto the member's
+                    // dimensions left to right — its UNPACKED dimensions
+                    // first, then the element type's PACKED ones — the
+                    // same nesting the module-scope arm below applies.
+                    // `bit [7:0] row [4]` with `foreach (row[i, j])`
+                    // iterates i over the four elements and j over each
+                    // element's eight bits; the arms below bind only
+                    // `vars[0]`, so `j` stayed X and writes landed
+                    // nowhere (#1331). A member whose remaining dimensions
+                    // are themselves collections (a declared CollShape:
+                    // `int d[][]`, `T all[k][$]`) keeps its own arms below.
+                    let mut dims: Vec<(i64, i64)> = match self.foreach_dims(&an) {
+                        // An ASSOCIATIVE member's one dimension is its
+                        // (sparse) KEY SET, not a dense range: a stray
+                        // `.size` cell or dynamic-table entry must not
+                        // size a rectangle that then runs zero
+                        // iterations. Leave `dims` empty so the key
+                        // walk below fires.
+                        Some(d) if !self.is_associative_array(&an) => d,
+                        _ => {
+                            // A QUEUE or DYNAMIC member iterates its live
+                            // size; an ASSOCIATIVE one its keys (below).
+                            if !self.is_associative_array(&an)
+                                && (self.module.dynamic_arrays.contains(&an)
+                                    || self.signals.contains_key(&format!("{}.size", an)))
+                            {
+                                vec![(0, self.get_queue_size(&an) as i64 - 1)]
+                            } else {
+                                Vec::new()
+                            }
                         }
-                        if dims.len() >= vars.len() {
-                            self.exec_foreach_nested(
+                    };
+                    // A dynamic outer dimension (`T a[][N]`) iterates
+                    // its current size, not the 64-slot buffer.
+                    if self.module.dynamic_arrays.contains(&an) && !dims.is_empty() {
+                        dims[0] = (0, self.get_queue_size(&an) as i64 - 1);
+                    }
+                    if dims.len() >= vars.len() {
+                        self.exec_foreach_nested(&dims[..vars.len()], vars, body, None, iterations);
+                        self.auto_loop_vars.truncate(fe_auto_len);
+                        self.restore_loop_vars(&fe_saved);
+                        return;
+                    }
+                    if self.coll_shape_at(&an).is_none()
+                        && let Some(pdims) = self.member_elem_packed_dims(&an)
+                    {
+                        if dims.is_empty() {
+                            // An ASSOCIATIVE member (`bit [7:0] row [int]`
+                            // with `foreach (row[i, j])`): `vars[0]` walks
+                            // the keys, the rest the element's packed
+                            // dimensions.
+                            if 1 + pdims.len() >= vars.len() {
+                                self.foreach_member_assoc_packed(
+                                    &an, &pdims, vars, body, iterations,
+                                );
+                                self.auto_loop_vars.truncate(fe_auto_len);
+                                self.restore_loop_vars(&fe_saved);
+                                if !self.return_flag && self.disable_target.is_none() {
+                                    self.break_flag = false;
+                                }
+                                return;
+                            }
+                        } else if dims.len() + pdims.len() >= vars.len() {
+                            let mut descs = self.foreach_unpacked_descs(&an, dims.len());
+                            if dims.len() == 1 && self.module.descending_arrays.contains(&an) {
+                                descs[0] = true;
+                            }
+                            for &(l, r) in &pdims {
+                                if dims.len() >= vars.len() {
+                                    break;
+                                }
+                                dims.push((l.min(r), l.max(r)));
+                                descs.push(l > r);
+                            }
+                            self.exec_foreach_nested_dir(
                                 &dims[..vars.len()],
                                 vars,
                                 body,
                                 None,
+                                Some(&descs[..vars.len()]),
                                 iterations,
                             );
                             self.auto_loop_vars.truncate(fe_auto_len);
                             self.restore_loop_vars(&fe_saved);
+                            if !self.return_flag && self.disable_target.is_none() {
+                                self.break_flag = false;
+                            }
                             return;
                         }
                     }
@@ -795,42 +1008,14 @@ impl Simulator {
                         keys = (0..sz).map(|i| i.to_string()).collect();
                         is_str = false;
                     } else {
-                        let prefix = format!("{}[", an);
-                        // An assoc-of-collections member (e.g.
-                        // `bq_t all[int]`) stores elements as
-                        // `all[5][0]` etc. — extract the key up to
-                        // the FIRST `]` and dedup so multiple
-                        // sub-elements don't each produce a phantom key.
-                        let mut ks: Vec<String> = self
-                            .signals
-                            .elem_keys_with_prefix(&prefix)
-                            .filter_map(|k| {
-                                let rest = k.strip_prefix(prefix.as_str())?;
-                                Self::assoc_first_key_seg(rest).map(|s| s.to_string())
-                            })
-                            .collect();
-                        Self::sort_name_keys(&mut ks);
-                        ks.dedup();
-                        is_str = self
-                            .module
-                            .associative_arrays
-                            .get(&an)
-                            .copied()
-                            .unwrap_or(false)
-                            || self.is_string_keyed_array(&an);
-                        // Integer-keyed members iterate in NUMERIC order;
-                        // lexicographic sort would visit "10" before "2".
-                        // Use i64 so negative (signed) keys keep order.
-                        if is_str {
-                            Self::sort_name_keys(&mut ks);
-                        } else {
-                            // §7.9: int keys traverse in NUMERIC order
-                            // including NEGATIVE keys — u64 parsing
-                            // mangled "-7" to 0.
-                            let wide = self.assoc_index_width_for(&an).is_some_and(|(w, _)| w > 64);
-                            Self::sort_int_keys(&mut ks, wide);
-                        }
+                        // An assoc-of-collections member (e.g. `bq_t all[int]`)
+                        // stores elements as `all[5][0]` etc. — the helper
+                        // extracts the key up to the FIRST `]` and dedups so
+                        // multiple sub-elements don't each produce a phantom
+                        // key.
+                        let (ks, str_keys) = self.foreach_member_keys(&an);
                         keys = ks;
+                        is_str = str_keys;
                     }
                     self.widths.insert(var.name.clone(), 32);
                     // §7.8.2: the loop variable takes the AA's index
@@ -980,7 +1165,7 @@ impl Simulator {
                         || self.module.arrays_nd.contains_key(&scoped)
                     {
                         name = std::borrow::Cow::Owned(scoped);
-                    } else if let Some(pd) = self.class_prop_packed_dims(
+                    } else if let Some(pd) = self.class_prop_packed_dims_min1(
                         h,
                         hier.path.last().map(|s| s.name.name.as_str()).unwrap_or(""),
                     ) {
@@ -1005,7 +1190,11 @@ impl Simulator {
                     .flatten()
                     .filter(|&h| h != 0)
                 {
-                    if let Some(pd) = self.class_prop_packed_dims(h, &hier.path[0].name.name) {
+                    // §12.7.3: a LONE packed dimension counts too (`bit [15:0]
+                    // row; foreach (row[i])` iterates 16 times) — the width
+                    // fallback below would otherwise size the loop from a
+                    // same-named module/package variable, or to 1.
+                    if let Some(pd) = self.class_prop_packed_dims_min1(h, &hier.path[0].name.name) {
                         if pd.len() >= vars.len() {
                             prop_packed_dims = Some(pd);
                         }

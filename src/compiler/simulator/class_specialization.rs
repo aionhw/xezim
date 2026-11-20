@@ -2092,7 +2092,7 @@ impl Simulator {
             })
     }
 
-    fn class_parameter_scopes<'a>(&'a self, context: &'a str) -> Vec<&'a str> {
+    pub(super) fn class_parameter_scopes<'a>(&'a self, context: &'a str) -> Vec<&'a str> {
         let mut pending = vec![(context, true)];
         let mut seen = Vec::new();
         let mut scopes = Vec::new();

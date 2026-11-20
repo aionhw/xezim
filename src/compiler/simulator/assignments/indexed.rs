@@ -848,7 +848,10 @@ impl Simulator {
                 // `m[i][j]` is a signal of its own and `[k]` a bit of it (a
                 // slice, for a multi-D packed element). No arm took that
                 // shape, so the write was silently dropped, procedurally and
-                // as a continuous assign alike.
+                // as a continuous assign alike. A 2-D class-member element
+                // has no compact id (it lives only in the by-name store),
+                // so the id lookup alone dropped `row[i][j][k] = 1` inside a
+                // method (#1331) — fall back to a by-name RMW bit write.
                 if rev_idxs.len() >= 3 {
                     let depth = match self.module.arrays_nd.get(&*base_name) {
                         Some((shape, _)) => shape.len(),
@@ -869,6 +872,44 @@ impl Simulator {
                                 self.store_unpacked_elem_select(&base_name, &elem, id, index, val)
                             {
                                 return changed;
+                            }
+                        } else if !self.module.dynamic_arrays.contains(&elem)
+                            && !self.is_associative_array(&elem)
+                            && !self.signals.contains_key(&format!("{}.size", elem))
+                        {
+                            // 2-D MEMBER element: RMW the bit through the
+                            // canonical by-name accessors, defaulting a
+                            // never-written element to zero at its declared
+                            // width.
+                            let ew = match self.module.arrays_2d.get(&*base_name) {
+                                Some(&(_, _, w)) => w as u32,
+                                None => self
+                                    .module
+                                    .arrays_nd
+                                    .get(&*base_name)
+                                    .map(|(_, w)| *w as u32)
+                                    .unwrap_or(0),
+                            };
+                            if let Some(cur) = self
+                                .get_signal_value_by_name(&elem)
+                                .or_else(|| (ew > 0).then(|| Value::from_u64(0, ew)))
+                            {
+                                let bv = self.eval_expr(index);
+                                if let Some(b) = bv.to_i64().filter(|_| !bv.has_xz()) {
+                                    if b >= 0 && (b as u32) < cur.width {
+                                        let mut nv = cur.clone();
+                                        let nb = val.get_bit(0);
+                                        let changed = nv.get_bit(b as usize) != nb;
+                                        if changed {
+                                            nv.set_bit(b as usize, nb);
+                                            self.set_signal_value_by_name(&elem, nv);
+                                            self.mark_dirty(&elem);
+                                        }
+                                        return changed;
+                                    }
+                                    // Out-of-range bit write: no-op.
+                                    return false;
+                                }
                             }
                         }
                     }
