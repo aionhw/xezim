@@ -1503,6 +1503,30 @@ impl Simulator {
                 if self.is_associative_array(&name) {
                     return None;
                 }
+                // §7.2.1, §7.4.3: a packed struct member spelled as one
+                // hierarchical name (`s.m`) has no declaration of its own;
+                // walk it as the member access it is, so a slice below an
+                // index into it (`s.m[1][2:1]`) selects whole elements. It
+                // fell to the generic select, which read the labels as bits.
+                if h.path.len() >= 2 && !self.module.var_decl_types.contains_key(&name) {
+                    let mut head = h.clone();
+                    head.path.truncate(1);
+                    head.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                    head.cached_resolved_name = crate::ast::cache::NameCache::new();
+                    let mut chain = Expression::new(ExprKind::Ident(head), expr.span);
+                    for seg in &h.path[1..] {
+                        chain = Expression::new(
+                            ExprKind::MemberAccess {
+                                expr: Box::new(chain),
+                                member: seg.name.clone(),
+                            },
+                            expr.span,
+                        );
+                    }
+                    if let Some(access) = self.declared_packed_access(&chain) {
+                        return Some(access);
+                    }
+                }
                 let recorded_type;
                 let dt = match self.module.var_decl_types.get(&name) {
                     Some(dt) => dt,
