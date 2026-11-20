@@ -6199,6 +6199,25 @@ impl Simulator {
         }
     }
 
+    /// §8.9: the element type of a static queue or dynamic array stored
+    /// under its bare name, as a statically unique static collection is (see
+    /// `spec_static_coll_key_in_class_with`). No variable declares it, so its
+    /// string elements printed as numbers.
+    fn bare_static_coll_elem_type(&self, name: &str) -> Option<DataType> {
+        if name.contains(['[', '.', ':', '#']) {
+            return None;
+        }
+        self.module.classes.values().find_map(|cd| {
+            (cd.static_properties.contains(name)
+                && cd
+                    .static_collections
+                    .iter()
+                    .any(|(n, is_assoc, _)| n == name && !*is_assoc))
+            .then(|| self.class_prop_elem_type(cd, name).cloned())
+            .flatten()
+        })
+    }
+
     pub(super) fn render_p_var(&mut self, name: &str) -> Option<String> {
         if let Some(s) = self.render_p_shaped(name) {
             return Some(s);
@@ -6239,7 +6258,9 @@ impl Simulator {
                     Some(dt.clone())
                 }
                 Some(_) => None,
-                None => self.p_elem_type(name),
+                None => self
+                    .p_elem_type(name)
+                    .or_else(|| self.bare_static_coll_elem_type(name)),
             };
             let parts: Vec<String> = match elem_dt {
                 Some(dt) => (0..sz)
