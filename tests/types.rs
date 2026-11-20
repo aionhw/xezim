@@ -837,3 +837,5 @@ mod real_case_items;
 mod real_items_integral_aggregates;
 #[path = "types/real_fill_literal_stores.rs"]
 mod real_fill_literal_stores;
+#[path = "types/local_struct_signed_members.rs"]
+mod local_struct_signed_members;
