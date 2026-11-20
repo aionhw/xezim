@@ -1497,6 +1497,10 @@ impl Simulator {
                 module.functions.insert(key, fd);
                 continue;
             }
+            // `psub<ordinal>_` names the cells of every routine's statics:
+            // count each routine, prepared or not, so the names do not depend
+            // on which bodies are still deferred.
+            ordinal += 1;
             let ptr = std::sync::Arc::as_ptr(original.items.as_arc()) as usize;
             let automatic = original.lifetime == Some(crate::ast::types::Lifetime::Automatic);
             if !needs_prepare(
@@ -1513,7 +1517,6 @@ impl Simulator {
             let Some(mut fd) = module.functions.get(&key).cloned() else {
                 continue;
             };
-            ordinal += 1;
             let changed = crate::ast::cache::without_scope_caches(|| {
                 prepare(
                     module,
@@ -1544,6 +1547,7 @@ impl Simulator {
             if !original.name.scopes.is_empty() {
                 continue;
             }
+            ordinal += 1;
             let ptr = std::sync::Arc::as_ptr(original.items.as_arc()) as usize;
             let automatic = original.lifetime == Some(crate::ast::types::Lifetime::Automatic);
             if !needs_prepare(
@@ -1560,7 +1564,6 @@ impl Simulator {
             let Some(mut td) = module.tasks.remove(&key) else {
                 continue;
             };
-            ordinal += 1;
             let changed = crate::ast::cache::without_scope_caches(|| {
                 prepare(
                     module,
