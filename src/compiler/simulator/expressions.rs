@@ -231,6 +231,18 @@ impl Simulator {
                 return v;
             }
         }
+        // §27.6: through an indexed scope, `gen[1].cb.a` reads the block of
+        // copy 1 (`u[0].cb.a`, of an instance-array element).
+        if matches!(expr.kind, ExprKind::MemberAccess { .. })
+            && let Some(flat) = self.clocking_indexed_term_as_ident(expr)
+            && let ExprKind::Ident(h) = &flat.kind
+        {
+            let mut refs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+            refs.push(member.name.as_str());
+            if let Some(v) = self.try_clocking_signal_read(&refs) {
+                return v;
+            }
+        }
         // §25.10: member access through an indexed plain virtual-
         // interface array (`vifs[i].data`). Resolve the element alias
         // before generic flattened aggregate handling creates/reads a
@@ -3356,7 +3368,9 @@ impl Simulator {
                     }
                 }
                 if hier.path.len() >= 2 {
-                    let segs: Vec<&str> = hier.path.iter().map(|s| s.name.name.as_str()).collect();
+                    // §27.6: `gen[1].cb.a` names the block of copy 1.
+                    let scoped = Self::clocking_scoped_segs(hier);
+                    let segs = Self::clocking_segs(hier, &scoped);
                     if let Some(v) = self.try_clocking_signal_read(&segs) {
                         return v;
                     }

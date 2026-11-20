@@ -2422,6 +2422,128 @@ impl Simulator {
         ))
     }
 
+    /// §14.3, §27.6: the segments of `h` as a clocking key spells them. A
+    /// constant select of a segment before the last names a generate copy or
+    /// an instance-array element, so it is part of the scope's name
+    /// (`gen[1].cb`), as it is in signal keys. `None` when no such segment
+    /// has a select, or one is not constant (no scope is named then).
+    pub(super) fn clocking_scoped_segs(h: &HierarchicalIdentifier) -> Option<Vec<String>> {
+        let n = h.path.len();
+        if n < 2 || h.path[..n - 1].iter().all(|s| s.selects.is_empty()) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n);
+        for (i, s) in h.path.iter().enumerate() {
+            let mut name = s.name.name.clone();
+            if i + 1 < n {
+                for sel in &s.selects {
+                    use std::fmt::Write as _;
+                    let _ = write!(name, "[{}]", Self::try_const_u64(sel)?);
+                }
+            }
+            out.push(name);
+        }
+        Some(out)
+    }
+
+    /// `clocking_scoped_segs` of a path in any of its shapes: the parser
+    /// writes `gen[1].cb` as a member access of an element select.
+    pub(super) fn clocking_term_segs(e: &Expression) -> Option<Vec<String>> {
+        // Only a chain that selects before its last segment names an indexed
+        // scope; any other chain is left before a segment is copied.
+        fn selects_a_scope(e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::MemberAccess { expr, .. } => match &expr.kind {
+                    ExprKind::Index { .. } => true,
+                    _ => selects_a_scope(expr),
+                },
+                ExprKind::Index { expr, .. } => selects_a_scope(expr),
+                ExprKind::Ident(h) => {
+                    h.path.len() > 1
+                        && h.path[..h.path.len() - 1]
+                            .iter()
+                            .any(|s| !s.selects.is_empty())
+                }
+                _ => false,
+            }
+        }
+        if !matches!(e.kind, ExprKind::MemberAccess { .. } | ExprKind::Ident(_))
+            || !selects_a_scope(e)
+        {
+            return None;
+        }
+        let mut path = Vec::new();
+        if !Self::fold_hier_path_segments(e, &mut path) {
+            return None;
+        }
+        Self::clocking_scoped_segs(&HierarchicalIdentifier {
+            root: None,
+            path,
+            span: e.span,
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
+        })
+    }
+
+    /// §14.3, §27.6: a clocking block, or a clockvar of one, named through
+    /// an indexed scope (`@(gen[2].cb)`, `gen[1].cb.a`, `u[0].cb`), as the
+    /// flat identifier the clocking arms resolve: its segments spell the
+    /// index (`gen[2]`). `None` for any other expression.
+    pub(super) fn clocking_indexed_term_as_ident(&self, e: &Expression) -> Option<Expression> {
+        if self.clocking_meta.is_empty() {
+            return None;
+        }
+        let segs = Self::clocking_term_segs(e)?;
+        let refs: Vec<&str> = segs.iter().map(String::as_str).collect();
+        // The block is the last segment, or the one before a clockvar.
+        let block = |s: &str| {
+            self.clocking_meta
+                .keys()
+                .any(|k| k == s || k.strip_suffix(s).is_some_and(|p| p.ends_with('.')))
+        };
+        if !refs[refs.len().saturating_sub(2)..]
+            .iter()
+            .any(|s| block(s))
+        {
+            return None;
+        }
+        if self.resolve_clocking_key(&refs).is_none()
+            && self.resolve_clocking_key(&refs[..refs.len() - 1]).is_none()
+        {
+            return None;
+        }
+        Some(Expression::new(
+            ExprKind::Ident(HierarchicalIdentifier {
+                root: None,
+                path: segs
+                    .into_iter()
+                    .map(|name| crate::ast::expr::HierPathSegment {
+                        name: crate::ast::Identifier { name, span: e.span },
+                        selects: Vec::new(),
+                    })
+                    .collect(),
+                span: e.span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            }),
+            e.span,
+        ))
+    }
+
+    /// `h`'s path as clocking-key segments: `scoped` (from
+    /// `clocking_scoped_segs`) when it has one, else the plain names.
+    pub(super) fn clocking_segs<'h>(
+        h: &'h HierarchicalIdentifier,
+        scoped: &'h Option<Vec<String>>,
+    ) -> Vec<&'h str> {
+        match scoped {
+            Some(v) => v.iter().map(String::as_str).collect(),
+            None => h.path.iter().map(|s| s.name.name.as_str()).collect(),
+        }
+    }
+
     pub(super) fn resolve_clocking_key(&self, segs: &[&str]) -> Option<String> {
         if segs.is_empty() || self.clocking_meta.is_empty() {
             return None;
