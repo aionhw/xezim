@@ -1951,6 +1951,29 @@ impl Simulator {
     }
 
     pub(super) fn select_base_elem_dim(&self, base: &Expression) -> Option<(i64, i64)> {
+        let (dims, level) = self.select_base_elem_level(base)?;
+        dims.get(level).copied()
+    }
+
+    /// §7.4.3, §11.5.1: width in bits of one element of the dimension a
+    /// part-select on the index chain `base` addresses, when it is not the
+    /// last one — `a[0][5:0]` on `logic [3:0][5:0][7:0] a` counts six 8-bit
+    /// elements. None for a select of bits.
+    pub(super) fn select_base_elem_stride(&self, base: &Expression) -> Option<u32> {
+        let (dims, level) = self.select_base_elem_level(base)?;
+        if level + 1 >= dims.len() {
+            return None;
+        }
+        let stride: u64 = dims[level + 1..]
+            .iter()
+            .map(|&(l, r)| (l - r).unsigned_abs() + 1)
+            .product();
+        u32::try_from(stride).ok().filter(|&w| w > 1)
+    }
+
+    /// The packed dimensions of the element an index chain `base` lands in,
+    /// and which of them a select on `base` addresses.
+    fn select_base_elem_level(&self, base: &Expression) -> Option<(&Vec<(i64, i64)>, usize)> {
         let mut cur = base;
         let mut layers = 0usize;
         while let ExprKind::Index { expr: inner, .. } = &cur.kind {
@@ -1999,7 +2022,7 @@ impl Simulator {
             // An unpacked SLICE (a row of a 2-D array), not a packed element.
             return None;
         }
-        dims.get(layers - udepth).copied()
+        Some((dims, layers - udepth))
     }
 
     /// `[N-1:0]` maps idx→(idx-lo)·w, an ASCENDING `[0:N-1]` mirrors the slot
