@@ -1491,7 +1491,11 @@ impl Simulator {
         expr: &Expression,
         items: &[crate::ast::stmt::CaseItem],
     ) -> Value {
-        if !matches!(
+        let fill_item = matches!(kind, CaseKind::CaseInside)
+            && items.iter().flat_map(|it| &it.patterns).any(|p|
+                matches!(Self::unparen(p).kind, ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(_)))
+            );
+        if !fill_item && !matches!(
             Self::unparen(expr).kind,
             ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
         ) {
@@ -1506,6 +1510,7 @@ impl Simulator {
             .map(|p| (p, inside))
             .collect();
         match self.inside_joint_width_of(expr, &bounds) {
+            Some(w) if fill_item => self.eval_expr_ctx(expr, w).resize_for_assign(w),
             Some(w) => self.eval_expr_ctx(expr, w),
             None => self.eval_expr(expr),
         }

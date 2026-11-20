@@ -3871,6 +3871,7 @@ impl Simulator {
                     .first()
                     .map(|a| self.eval_expr(a))
                     .unwrap_or(Value::zero(32));
+                v.is_fill = false;
                 v.is_signed = true;
                 v
             }
@@ -3879,6 +3880,7 @@ impl Simulator {
                     .first()
                     .map(|a| self.eval_expr(a))
                     .unwrap_or(Value::zero(32));
+                v.is_fill = false;
                 v.is_signed = false;
                 v
             }

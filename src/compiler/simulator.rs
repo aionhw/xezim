@@ -394,7 +394,7 @@ fn method_boost_enabled() -> bool {
 // §6.18, §7.4.1: a cast to a typedef of real and a function returning one are real operands,
 // and a subroutine or block selecting a packed array of a named signed type does not compile.
 // §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308d;
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3091;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1817,7 +1817,7 @@ struct CombEntryCold {
 // §9.2.2.2, §10.3: CombEntryCold::time0_effects; a variable a called function writes is
 // not a read of its caller.
 // §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB045";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB049";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

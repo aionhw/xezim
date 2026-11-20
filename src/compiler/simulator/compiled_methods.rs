@@ -3810,7 +3810,7 @@ impl Simulator {
         if result.is_real && !pre.is_class_result && !pre.is_void_result {
             result = Self::compiled_ret_from_real(&result, result_width);
         }
-        if result_width > 0 && result.width != result_width {
+        if result_width > 0 && (result.width != result_width || result.is_fill) {
             result = result.resize_for_assign(result_width);
         }
         if !pre.is_class_result && !pre.is_void_result && !result.is_real {

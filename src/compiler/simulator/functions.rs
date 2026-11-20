@@ -932,8 +932,8 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            if w > 0 && w != result.width {
-                result = result.resize(w);
+            if w > 0 && (w != result.width || result.is_fill) {
+                result = result.resize_for_assign(w);
             }
             // §13.4.1, §6.18: the result has the return type's sign, through
             // a typedef too.

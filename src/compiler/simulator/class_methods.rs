@@ -2878,7 +2878,7 @@ impl Simulator {
                     && matches!(&f.return_type, DataType::TypeReference { .. })
                     && let Some(w) = self.method_formal_param_width(handle, &cname, &f.return_type)
                 {
-                    if w != ret.width {
+                    if w != ret.width || ret.is_fill {
                         ret = ret.resize_for_assign(w);
                     }
                     if let DataType::TypeReference { name, .. } = &f.return_type
@@ -2906,7 +2906,7 @@ impl Simulator {
                                 )
                             }
                         };
-                        if w > 0 && w != ret.width {
+                        if w > 0 && (w != ret.width || ret.is_fill) {
                             ret = ret.resize_for_assign(w);
                         }
                     }
@@ -2948,8 +2948,8 @@ impl Simulator {
                                 Some(&self.module.typedefs),
                             ),
                         };
-                        if w > 0 && w != ret.width {
-                            ret = ret.resize(w);
+                        if w > 0 && (w != ret.width || ret.is_fill) {
+                            ret = ret.resize_for_assign(w);
                         }
                         ret.is_signed = plan.ret.as_ref().map_or_else(
                             || super::elaborate::is_type_signed(&f.return_type),

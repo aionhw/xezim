@@ -764,6 +764,13 @@ impl Simulator {
     }
 
     pub(super) fn dpi_value_to_logic_words(v: &Value, width: u32) -> (Vec<u32>, Vec<u32>) {
+        let fitted;
+        let v = if v.width < width || v.is_fill {
+            fitted = v.resize_for_assign(width);
+            &fitted
+        } else {
+            v
+        };
         let nwords = width.div_ceil(32).max(1) as usize;
         let mut aval = vec![0u32; nwords];
         let mut bval = vec![0u32; nwords];

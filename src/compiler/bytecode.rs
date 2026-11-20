@@ -18983,19 +18983,24 @@ impl<'a> BytecodeCompiler<'a> {
                     ));
                     Some(dst)
                 }
-                "$signed" => {
-                    let r = self.compile_expr(args.first()?, 0)?;
-                    self.emit(Insn::SetSigned(r));
-                    Some(r)
-                }
-                "$unsigned" => {
-                    // §6.24.1: reinterpret as unsigned. This was a NO-OP,
-                    // so the operand kept its runtime signed flag and the
-                    // context Resize SIGN-extended — `unsigned'(sa)` in a
-                    // 32-bit context read fffffff4 instead of 000000f4
-                    // (the $display path was already correct).
-                    let r = self.compile_expr(args.first()?, 0)?;
-                    self.emit(Insn::ClearSigned(r));
+                "$signed" | "$unsigned" => {
+                    // §6.24.1: the sign conversion consumes a literal's fill.
+                    let arg = args.first()?;
+                    let signed = name == "$signed";
+                    let mut operand = arg;
+                    while let ExprKind::Paren(inner) = &operand.kind {
+                        operand = inner;
+                    }
+                    if let ExprKind::Number(n) = &operand.kind {
+                        let mut v = self.eval_number_static(n)?;
+                        v.is_fill = false;
+                        v.is_signed = signed;
+                        let dst = self.alloc_reg();
+                        self.emit(Insn::LoadConst(dst, Box::new(v)));
+                        return Some(dst);
+                    }
+                    let r = self.compile_expr(arg, 0)?;
+                    self.emit(if signed { Insn::SetSigned(r) } else { Insn::ClearSigned(r) });
                     Some(r)
                 }
                 "$__xz_size_cast" => {
