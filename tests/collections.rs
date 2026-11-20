@@ -385,6 +385,8 @@ mod dyn_array_of_dyn_array_rows;
 mod pattern_array_items;
 #[path = "collections/pattern_struct_array_and_slice_items.rs"]
 mod pattern_struct_array_and_slice_items;
+#[path = "collections/pattern_struct_element_items.rs"]
+mod pattern_struct_element_items;
 #[path = "collections/struct_concat_forms.rs"]
 mod struct_concat_forms;
 #[path = "collections/queue_front_shift.rs"]
