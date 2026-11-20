@@ -870,5 +870,7 @@ mod imported_constant_dimension_type_collision;
 
 #[path = "types/class_scope_type_param_member_typedef.rs"]
 mod class_scope_type_param_member_typedef;
+#[path = "types/review_packed_slice_partial_range.rs"]
+mod review_packed_slice_partial_range;
 #[path = "types/review_struct_param_cast_in_instance.rs"]
 mod review_struct_param_cast_in_instance;
