@@ -35,6 +35,7 @@ module tb;
   string wp0, wp1;
 
   initial begin
+    C h;
     q.push_back('{3, "three", '{30}});
     q.push_back('{1, "one",   '{10}});
     q.push_back('{2, "two",   '{20}});
@@ -62,8 +63,10 @@ module tb;
     $display("INT=%p", iq);
 
     // Class-handle elements: `item.prop` goes through the heap, as before.
-    cq.push_back(new(3));
-    cq.push_back(new(1));
+    h = new(3);
+    cq.push_back(h);
+    h = new(1);
+    cq.push_back(h);
     cq.sort() with (item.v);
     c0 = cq[0].v;
     c1 = cq[1].v;
