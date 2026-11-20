@@ -2486,6 +2486,46 @@ impl Simulator {
         })
     }
 
+    /// Whether `s` is the name of a clocking block (the last segment of a
+    /// key in `clocking_meta`). A key whose last byte differs is passed over
+    /// before any comparison: this runs for every member read of an element
+    /// in a design that has a clocking block.
+    pub(super) fn names_clocking_block(&self, s: &str) -> bool {
+        let s = s.as_bytes();
+        let Some(&end) = s.last() else {
+            return false;
+        };
+        self.clocking_meta.keys().any(|k| {
+            let k = k.as_bytes();
+            k.last() == Some(&end)
+                && (k.len() == s.len() || (k.len() > s.len() && k[k.len() - s.len() - 1] == b'.'))
+                && k.ends_with(s)
+        })
+    }
+
+    /// The clocking-key segments of a hierarchical name read as a clockvar
+    /// (`gen[1].cb.a`, `cb.a`): `clocking_scoped_segs` when a select names a
+    /// scope and the last or the second-last segment names a clocking
+    /// block, else `None` (the plain names). The names are checked before
+    /// the path is copied: a read of a member of an element (`s[0].i.x`)
+    /// comes here on every evaluation.
+    pub(super) fn clocking_scoped_read_segs(
+        &self,
+        h: &HierarchicalIdentifier,
+    ) -> Option<Vec<String>> {
+        let n = h.path.len();
+        if n < 2
+            || self.clocking_meta.is_empty()
+            || h.path[..n - 1].iter().all(|s| s.selects.is_empty())
+            || !h.path[n - 2..]
+                .iter()
+                .any(|s| self.names_clocking_block(&s.name.name))
+        {
+            return None;
+        }
+        Self::clocking_scoped_segs(h)
+    }
+
     /// §14.3, §27.6: a clocking block, or a clockvar of one, named through
     /// an indexed scope (`@(gen[2].cb)`, `gen[1].cb.a`, `u[0].cb`), as the
     /// flat identifier the clocking arms resolve: its segments spell the
@@ -2515,11 +2555,7 @@ impl Simulator {
             ),
             _ => return None,
         };
-        let block = |s: &str| {
-            self.clocking_meta
-                .keys()
-                .any(|k| k == s || k.strip_suffix(s).is_some_and(|p| p.ends_with('.')))
-        };
+        let block = |s: &str| self.names_clocking_block(s);
         if !last.is_some_and(block) && !prev.is_some_and(block) {
             return None;
         }

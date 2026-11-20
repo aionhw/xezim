@@ -3369,7 +3369,7 @@ impl Simulator {
                 }
                 if hier.path.len() >= 2 {
                     // §27.6: `gen[1].cb.a` names the block of copy 1.
-                    let scoped = Self::clocking_scoped_segs(hier);
+                    let scoped = self.clocking_scoped_read_segs(hier);
                     let segs = Self::clocking_segs(hier, &scoped);
                     if let Some(v) = self.try_clocking_signal_read(&segs) {
                         return v;
