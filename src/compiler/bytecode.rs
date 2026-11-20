@@ -14871,25 +14871,31 @@ impl<'a> BytecodeCompiler<'a> {
         let dst = map.get(&dst)?;
         // §7.2 / §13.5: project an automatic scalar-member constructor to
         // registers, then scatter. The destination may also be an actual.
-        if nb_delay.is_none() && let ExprKind::Call { func, args } = &rvalue.kind {
+        if nb_delay.is_none()
+            && let ExprKind::Call { func, args } = &rvalue.kind
+        {
             let ExprKind::Ident(h) = &func.kind else { return Some(false); };
             let [segment] = h.path.as_slice() else { return Some(false); };
-            let name = self.scoped_callee_name(segment.name.name.clone())?;
-            let fd = self.functions?.get(&name)?;
-            if !super::struct_sra::projectable_constructor(fd, args) { return Some(false); }
-            let leaves = dst.iter().map(|(member, leaf)| {
+            let constructor = self.scoped_callee_name(segment.name.name.clone())
+                .and_then(|name| self.functions?.get(&name));
+            if !constructor.is_some_and(|f| super::struct_sra::projectable_constructor(f, args)) {
+                return Some(false);
+            }
+            let leaves: Option<Vec<_>> = dst.iter().map(|(member, leaf)| {
                 let id = self.signal_name_to_id.get(leaf.as_str()).copied()?;
-                Some((member.clone(), id))
-            }).collect::<Option<Vec<_>>>()?;
+                Some((member.clone(), id, *self.signal_widths.get(id)?))
+            }).collect();
+            let Some(leaves) = leaves else { return Some(false); };
             let mut writes = Vec::with_capacity(leaves.len());
-            for (member, id) in leaves {
+            for (member, id, width) in leaves {
                 let Some(value) = self.compile_struct_member_call(func, args, &member) else {
                     return Some(false);
                 };
-                let width = self.signal_widths.get(id).copied().unwrap_or(1);
                 writes.push(Insn::BlockingAssign(as_sig_id(id), value, width));
             }
-            for insn in writes { self.emit(insn); }
+            for insn in writes {
+                self.emit(insn);
+            }
             return Some(true);
         }
         let Some(src) = id_of(rvalue).flatten().and_then(|id| map.get(&id)) else {
