@@ -612,6 +612,8 @@ mod artifact_with_sources_738;
 mod checkpoint_save_restore;
 #[path = "misc/checkpoint_forked_process_bodies.rs"]
 mod checkpoint_forked_process_bodies;
+#[path = "misc/checkpoint_jit_display.rs"]
+mod checkpoint_jit_display;
 
 #[path = "misc/block_local_array_for_loop.rs"]
 mod block_local_array_for_loop;
