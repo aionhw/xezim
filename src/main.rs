@@ -2009,6 +2009,8 @@ fn append_adopted_libs_to_merged(
             how,
             mods.join(", ")
         ));
+        // Each adopted library starts its own directive context (§22.2).
+        extra.push_str("`default_nettype wire\n");
         extra.push_str(&text);
         if !extra.ends_with('\n') {
             extra.push('\n');
