@@ -1355,3 +1355,5 @@ mod class_constraint_sharing_721;
 mod class_struct_array_member_patterns;
 #[path = "classes/multidim_property_pattern_init.rs"]
 mod multidim_property_pattern_init;
+#[path = "classes/static_string_queue_percent_p.rs"]
+mod static_string_queue_percent_p;
