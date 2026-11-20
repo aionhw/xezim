@@ -1659,8 +1659,8 @@ impl Simulator {
 /// in that order from the low index of the leftmost dimension, and the
 /// start and finish arguments and the file's `@` entries are such addresses.
 /// The LRM text has `@` entries and the address arguments name words of the
-/// leftmost dimension instead, but Verilator, Icarus and the reference
-/// simulator all linearize the array, and real images depend on it: a
+/// leftmost dimension instead, but Verilator and Icarus both linearize the
+/// array, and real images depend on it: a
 /// byte-wide `ram [DEPTH][NB]` is loaded from a byte-addressed hex file with
 /// finish address `DEPTH*NB-1`.
 pub(super) struct NdMemory {
