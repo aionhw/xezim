@@ -105,15 +105,22 @@ endmodule
     assert_has(&got, "s2: sub $bits(x)=128 x.a=0000000000000000000000123");
 }
 
-/// A type parameter used as a class scope, bound per instance.
+/// A type parameter used as a class scope, bound per instance. §6.18
+/// allows such a prefix only in a typedef declaration (`C::hw_t h;` is
+/// illegal), so the scope is named by module and block typedefs.
 #[test]
 fn type_parameter_as_a_class_scope() {
     let got = lines(&format!(
         "{CLASSES}{}",
         r#"
 module wrap #(parameter type C = cfg_t) ();
-  C::hw_t h;
-  initial #1 $display("s3: %m $bits=%0d", $bits(h));
+  typedef C::hw_t h_t;
+  h_t h;
+  initial begin
+    typedef C::hw_t l_t;
+    l_t l;
+    #1 $display("s3: %m $bits=%0d local=%0d", $bits(h), $bits(l));
+  end
 endmodule
 module top;
   wrap w ();
@@ -121,8 +128,8 @@ module top;
 endmodule
 "#
     ));
-    assert_has(&got, "s3: top.w $bits=128");
-    assert_has(&got, "s3: top.w2 $bits=16");
+    assert_has(&got, "s3: top.w $bits=128 local=128");
+    assert_has(&got, "s3: top.w2 $bits=16 local=16");
 }
 
 /// A type parameter whose default names an earlier one, a typedef of a
@@ -153,6 +160,27 @@ endmodule
 "#
     ));
     assert_has(&got, "s4: d1=16 d2=128 a1=16 n1=8 n2=8");
+}
+
+/// §8.25.1: the argument is itself a specialization of a class with a
+/// value parameter, written in place (`extractor#(cfgw#(8))::hw_t`).
+/// Expected value is the reference simulator's.
+#[test]
+fn specialization_argument_written_in_place() {
+    let got = lines(&format!(
+        "{CLASSES}{}",
+        r#"
+class cfgw #(int W = 4);
+  typedef logic [W-1:0] hw_t;
+endclass
+module top;
+  extractor#(cfgw#(8))::hw_t n1;
+  extractor#(cfgw#(.W(6)))::hw_t n2;
+  initial $display("s6: n1=%0d n2=%0d", $bits(n1), $bits(n2));
+endmodule
+"#
+    ));
+    assert_has(&got, "s6: n1=8 n2=6");
 }
 
 /// A typedef of a value-parameterized specialization used as a scope
