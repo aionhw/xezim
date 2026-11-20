@@ -851,3 +851,5 @@ mod local_struct_member_arrays;
 mod struct_parameter_percent_p;
 #[path = "types/typename_typedef_packed_dims.rs"]
 mod typename_typedef_packed_dims;
+#[path = "types/imported_constant_dimension_type_collision.rs"]
+mod imported_constant_dimension_type_collision;
