@@ -52,3 +52,45 @@ endmodule
     assert!(!text.contains("reason=static_block_local"), "{text}");
     assert!(!text.contains("reason=Expr_Call_ports"), "{text}");
 }
+
+/// §13.5: a value also passed as an input, or through inout, can still
+/// carry across activations.
+#[test]
+fn input_uses_still_observe_the_previous_activation() {
+    let sim = xezim::simulate(
+        r#"
+module top;
+  bit clk;
+  int left, right;
+  function automatic void add(input int prev, output int dst);
+    dst = prev + 1;
+  endfunction
+  function automatic void bump(inout int dst);
+    dst += 2;
+  endfunction
+  always @(posedge clk) begin
+    int a;
+    add(a, a);
+    left = a;
+  end
+  always @(posedge clk) begin
+    int b;
+    bump(b);
+    right = b;
+  end
+  initial begin
+    repeat (3) begin #1 clk = 1; #1 clk = 0; end
+    $display("sum=%0d,%0d", left, right);
+    $finish;
+  end
+endmodule
+"#,
+        100,
+    )
+    .unwrap();
+    assert!(
+        sim.output.iter().any(|e| e.message.trim_end() == "sum=3,6"),
+        "{:?}",
+        sim.output
+    );
+}
