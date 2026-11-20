@@ -44,7 +44,7 @@ module top;
   logic [3:0] a_ini [string];
   int v_blk, v_nba, v_ini, e_blk, e_nba, e_ini;
   always_ff @(posedge clk) a_blk["k"]  = 4'hD;
-  always_ff @(posedge clk) a_nba["k"] <= 4'hC;
+  always_ff @(posedge clk) a_nba["k"] = 4'hC;
   initial begin
     @(posedge clk);
     a_ini["k"] = 4'hE;

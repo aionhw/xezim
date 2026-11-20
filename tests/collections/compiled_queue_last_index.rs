@@ -51,7 +51,7 @@ module top;
     bq[$][3] = 1'b1;
     bq[$-1][7:4] = 4'hf;
     sq[$].g = 8'h55;
-    sq[$-1].f <= 8'h66;
+    sq[$-1].f = 8'h66;
   end
   initial begin
     #1 clk = 1;
@@ -161,7 +161,7 @@ module top;
   always @(posedge clk) begin
     q[$] += 5;
     q[$-1] -= 1;
-    z[$] <= 99;
+    z[$] = 99;
     z.push_back(8);
   end
   initial begin

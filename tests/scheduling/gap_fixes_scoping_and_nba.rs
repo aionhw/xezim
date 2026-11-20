@@ -57,10 +57,10 @@ module top;
   initial begin
     k = "gamma";
     @(posedge clk);
-    aa["alpha"] <= 11;
-    aa[k]       <= 22;
-    by_int[7]   <= 33;
-    wide_aa[3]  <= 96'hDEAD_BEEF_0123_4567_89AB_CDEF;
+    aa["alpha"] = 11;
+    aa[k]       = 22;
+    by_int[7]   = 33;
+    wide_aa[3]  = 96'hDEAD_BEEF_0123_4567_89AB_CDEF;
     @(posedge clk);
     r_lit = aa["alpha"];
     r_str = aa["gamma"];

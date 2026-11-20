@@ -255,7 +255,7 @@ module tb_top;
     q_nba.push_back(e);
     sv_nba = e;                // whole-assignment
     #1;
-    q_nba[0].delay_counter <= 32'd7;
+    q_nba[0].delay_counter = 32'd7;
     sv_nba.delay_counter   <= 32'd7;
     #1;
     `SVTEST_CHECK(q_nba[0][39:8] == 32'd7, "f3: NBA queue element member write vanished (q[0].delay_counter != 7)")
