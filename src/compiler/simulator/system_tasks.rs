@@ -1242,8 +1242,8 @@ impl Simulator {
 
     /// `emit_severity_text` naming `scope` in the context line.
     pub(super) fn emit_severity_text_in(&mut self, severity: &str, body: &str, scope: &str) {
-        let time = Value::from_f64(self.time_in_current_unit());
-        let time_s = self.format_time_parts(&time).0;
+        // §20.10, §20.4.3: the current time, scaled from the tick counter.
+        let time_s = self.format_current_time_parts().0;
         let line = if body.is_empty() {
             format!("** {}", severity)
         } else {
@@ -2729,18 +2729,23 @@ impl Simulator {
                             if ai < args.len() {
                                 // Evaluate the time in scope units (§20.3),
                                 // then apply the display units and precision.
-                                let value = match &args[ai].kind {
-                                    ExprKind::SystemCall { name, .. }
-                                        if name.as_str() == "$realtime" =>
-                                    {
-                                        Value::from_f64(self.time_in_current_unit())
-                                    }
-                                    _ => self.eval_expr(&args[ai]),
-                                };
                                 // $timeformat's min field width (default 20,
                                 // §20.4.3) governs a bare %t; an explicit
                                 // `%NNt` width overrides it, `%0t` is minimal.
-                                let (body, tf_width) = self.format_time_parts(&value);
+                                let (body, tf_width) = match &args[ai].kind {
+                                    // §20.3.3: `$realtime` is the current
+                                    // time in any scope's unit; format it
+                                    // from the tick counter.
+                                    ExprKind::SystemCall { name, .. }
+                                        if name.as_str() == "$realtime" =>
+                                    {
+                                        self.format_current_time_parts()
+                                    }
+                                    _ => {
+                                        let value = self.eval_expr(&args[ai]);
+                                        self.format_time_parts(&value)
+                                    }
+                                };
                                 result.push_str(&field(body, tf_width));
                                 ai += 1;
                             }

@@ -4363,6 +4363,26 @@ impl Simulator {
         (body, tf_width)
     }
 
+    /// The %t body and field width of the current simulation time, as for
+    /// `$realtime` (§20.3.3, §20.4.3). The tick counter is the time in the
+    /// global precision's unit, so it is scaled from that unit exactly; a
+    /// real in a coarser scope unit lost the low ticks above 2^53. An exact
+    /// display tie keeps the formatter's real rounding.
+    pub(super) fn format_current_time_parts(&self) -> (String, usize) {
+        let tick_exp = Self::secs_to_exp(self.tick_s);
+        let (tf_units, tf_prec, tf_suffix, tf_width) = self
+            .time_format
+            .clone()
+            .unwrap_or_else(|| (tick_exp, 0, String::new(), 20));
+        let shift = tick_exp - tf_units;
+        if (-19..=19).contains(&shift)
+            && let Some(body) = Self::format_integral_time(self.time, shift, tf_prec, &tf_suffix)
+        {
+            return (body, tf_width);
+        }
+        self.format_time_parts(&Value::from_f64(self.time_in_current_unit()))
+    }
+
     /// Work in decimal so scaling and printing cannot lose low time bits.
     fn format_integral_time(
         value: u64,
