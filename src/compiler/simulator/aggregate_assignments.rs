@@ -3639,9 +3639,26 @@ impl Simulator {
     pub(super) fn populate_queue_from_init(&mut self, scoped_q: &str, init: &Expression) {
         // §7.10.1: both the pattern form `'{1,2,3}` and the queue
         // concatenation form `{1,2,3}` initialize element-wise.
-        let elems: Vec<&Expression> = match &self.unpacked_pattern(init).kind {
-            ExprKind::AssignmentPattern(items) => items.iter().map(|it| it.expr()).collect(),
-            ExprKind::Concatenation(parts) => parts.iter().collect(),
+        let vals: Vec<Value> = match &self.unpacked_pattern(init).kind {
+            ExprKind::AssignmentPattern(items) => {
+                items.iter().map(|it| self.eval_expr(it.expr())).collect()
+            }
+            // §10.10: an array operand of the concatenation (`{w, 5}`, a
+            // row `m[1]`, a slice `a[0 +: 2]`) contributes all its elements,
+            // and a nested concatenation splices its own.
+            ExprKind::Concatenation(parts) => {
+                let mut flat: Vec<&Expression> = parts.iter().collect();
+                while let Some(i) = flat
+                    .iter()
+                    .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
+                {
+                    if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
+                        flat.splice(i..i, c);
+                    }
+                }
+                let expand_rows = self.concat_has_non_array_elements(scoped_q);
+                self.unpacked_concat_operand_values(flat, expand_rows, None)
+            }
             _ => return,
         };
         let (_lo, _hi, w) = self
@@ -3650,8 +3667,8 @@ impl Simulator {
             .get(scoped_q)
             .copied()
             .unwrap_or((0, 63, 32));
-        for (i, item) in elems.iter().enumerate() {
-            let mut v = self.eval_expr(item);
+        let n = vals.len();
+        for (i, mut v) in vals.into_iter().enumerate() {
             // §5.7.1: an unsized fill element takes the element width.
             if v.is_fill && !v.is_real {
                 v = v.resize(w.max(1));
@@ -3659,7 +3676,7 @@ impl Simulator {
             self.set_signal_value_by_name(&format!("{}[{}]", scoped_q, i), v);
             self.widths.insert(format!("{}[{}]", scoped_q, i), w);
         }
-        self.set_queue_size(scoped_q, elems.len() as u64);
+        self.set_queue_size(scoped_q, n as u64);
     }
 
     /// Relative leaf paths of an unpacked struct (`a`, `inner.b`, `arr[0]`).
