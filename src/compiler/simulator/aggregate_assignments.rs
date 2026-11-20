@@ -1633,6 +1633,10 @@ impl Simulator {
                 };
                 for e in elems {
                     self.zero_two_state_members(&e, &su);
+                    // §7.2.2: each element starts with its members' declared
+                    // defaults, as a scalar variable of the type does (the
+                    // elaborator writes those as initial assignments).
+                    self.apply_struct_member_defaults(&e, &su, 0);
                 }
                 continue;
             }
@@ -1847,6 +1851,61 @@ impl Simulator {
                         ..
                     } => {
                         out.insert(leaf);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// §7.2.2: write each declared member default of the unpacked struct
+    /// `su` (`real a = 1.5;`) into the leaves under `base`, converted to the
+    /// member's type; nested unpacked struct members recurse. Members with
+    /// unpacked dimensions keep their defaults.
+    pub(super) fn apply_struct_member_defaults(
+        &mut self,
+        base: &str,
+        su: &crate::ast::types::StructUnionType,
+        depth: u32,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        for m in &su.members {
+            let resolved = self.resolve_dt(&m.data_type);
+            for md in &m.declarators {
+                if !md.dimensions.is_empty() {
+                    continue;
+                }
+                let leaf = format!("{}.{}", base, md.name.name);
+                match (&resolved, &md.init) {
+                    (DataType::Struct(inner), None) if Self::spreads_member_wise(inner) => {
+                        let inner = inner.clone();
+                        self.apply_struct_member_defaults(&leaf, &inner, depth + 1);
+                    }
+                    (_, Some(init)) if self.signal_name_to_id.contains_key(leaf.as_str()) => {
+                        let w = super::elaborate::resolve_type_width(
+                            &m.data_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        )
+                        .max(1);
+                        let raw = self.eval_expr_ctx(init, w);
+                        let two_state = super::elaborate::is_type_two_state_resolved(
+                            &m.data_type,
+                            &self.module.typedef_types,
+                        );
+                        let is_real = self.dt_is_real(&m.data_type);
+                        let signed = self.type_is_signed_concrete(&m.data_type);
+                        let v = Self::fit_local_decl_init(
+                            raw,
+                            w,
+                            &m.data_type,
+                            two_state,
+                            is_real,
+                            signed,
+                        );
+                        self.set_signal_value_by_name(&leaf, v);
                     }
                     _ => {}
                 }
