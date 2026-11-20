@@ -24794,15 +24794,20 @@ impl<'a> BytecodeCompiler<'a> {
     fn member_cast_size(&self, target: &Expression) -> Option<u32> {
         let v = match &target.kind {
             ExprKind::Paren(inner) => return self.member_cast_size(inner),
-            // An instance's names arrive rewritten to their full path and
-            // rooted (`$root.u.pt.DEPTH`); without the root that path is the
-            // parameter's own key.
-            ExprKind::Ident(h) if h.path.len() >= 2 && h.root.as_deref() == Some("$root") => {
+            // An instance's names arrive with the instance folded into the
+            // first segment (`u.pt` . `DEPTH`), or rooted and spelled out
+            // (`$root.u.pt.DEPTH`). Elaboration keys each member of a struct
+            // parameter by that whole path. The instance's own parameter
+            // (`u.pt`) has no layout entry, so the layout walk below found
+            // one only through a same-named top-level parameter, whose type
+            // may differ.
+            ExprKind::Ident(h) if h.path.len() >= 2 && matches!(h.root.as_deref(), None | Some("$root")) => {
                 let mut flat = h.clone();
                 flat.root = None;
-                self.const_param_member_path(&flat)?
+                self.params
+                    .and_then(|p| p.get(Self::hier_raw_name(&flat).as_str()).cloned())
+                    .or_else(|| self.const_param_member_path(&flat))?
             }
-            ExprKind::Ident(h) if h.path.len() >= 2 => self.const_param_member_path(h)?,
             ExprKind::MemberAccess { expr, member } => {
                 self.const_param_member(expr, &member.name)?
             }

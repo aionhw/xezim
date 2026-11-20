@@ -533,20 +533,42 @@ impl Simulator {
                 _ => return None,
             }
         };
-        // An instance's names arrive rewritten to their full path and rooted
-        // (`$root.u.pt.DEPTH`); that path is the parameter's own key.
-        let is_param = match h.root.as_deref() {
-            None => self.scoped_param_value(&h.path[0].name.name).is_some(),
-            Some("$root") => self
-                .module
-                .parameters
-                .contains_key(h.path[0].name.name.as_str()),
-            Some(_) => false,
-        };
-        if (!field && h.path.len() < 2) || !is_param {
+        // Shape first: every named cast comes through here, and a bare
+        // `T'(x)` must not pay for the scoped parameter lookup.
+        if !field && h.path.len() < 2 {
             return None;
         }
-        let v = self.eval_expr(target);
+        // The parameter is a prefix of the path. An instance's names arrive
+        // with the instance folded into the first segment (`u.pt` . `DEPTH`),
+        // which no scoped lookup of a bare name finds, and a `$root`-rooted
+        // path spells the instance out (`$root.u.pt.DEPTH`).
+        let mut key = String::new();
+        let mut is_param = match h.root.as_deref() {
+            None => self.scoped_param_value(&h.path[0].name.name).is_some(),
+            Some("$root") => false,
+            Some(_) => return None,
+        };
+        let prefixes = if field { h.path.len() } else { h.path.len() - 1 };
+        for seg in &h.path[..prefixes] {
+            if !key.is_empty() {
+                key.push('.');
+            }
+            key.push_str(&seg.name.name);
+            is_param = is_param || self.module.parameters.contains_key(key.as_str());
+        }
+        if !is_param {
+            return None;
+        }
+        // Elaboration also keys each member of a struct parameter by its
+        // whole path (`u.pt.DEPTH`); take that value when there is one.
+        let member_value = (!field)
+            .then(|| {
+                key.push('.');
+                key.push_str(&h.path.last()?.name.name);
+                self.module.parameters.get(key.as_str()).cloned()
+            })
+            .flatten();
+        let v = member_value.unwrap_or_else(|| self.eval_expr(target));
         if v.has_xz() || v.is_real {
             return None;
         }
