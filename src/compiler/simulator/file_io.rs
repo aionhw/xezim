@@ -375,10 +375,26 @@ impl Simulator {
                             neg = s[si2] == '-';
                             si2 += 1;
                         }
+                        // §21.3.4.3: the %b, %o and %h digit sets include
+                        // the 4-state x, X, z, Z and ?, each digit setting
+                        // its 1, 3 or 4 bits to x or z (`?` is z); %d takes
+                        // a single one of them for the whole value. Stopping
+                        // at the first x read "xx01" as a failed conversion.
+                        let four_state = |c: char| matches!(c, 'x' | 'X' | 'z' | 'Z' | '?');
                         let dstart = si2;
                         while si2 < s.len()
-                            && (s[si2].is_digit(radix) || s[si2] == '_')
+                            && (s[si2].is_digit(radix)
+                                || s[si2] == '_'
+                                || (radix != 10 && four_state(s[si2])))
                             && si2 - dstart < w
+                        {
+                            si2 += 1;
+                        }
+                        if si2 == dstart
+                            && radix == 10
+                            && w > 0
+                            && si2 < s.len()
+                            && four_state(s[si2])
                         {
                             si2 += 1;
                         }
@@ -391,10 +407,10 @@ impl Simulator {
                         // `from_str_radix` would answer X; `$sscanf` has to
                         // report a failed conversion and stop, the way the old
                         // `i64::from_str_radix` returning `Err` did.
-                        if text
-                            .bytes()
-                            .any(|b| !b.is_ascii() || (b as char).to_digit(radix).is_none())
-                        {
+                        if text.bytes().any(|b| {
+                            !b.is_ascii()
+                                || ((b as char).to_digit(radix).is_none() && !four_state(b as char))
+                        }) {
                             break;
                         }
                         si = si2;
