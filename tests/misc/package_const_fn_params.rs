@@ -313,18 +313,16 @@ endmodule
 
 #[test]
 fn package_param_fixpoint_heals_declarations_not_just_values() {
-    // A package parameter that references one the hoist has not reached yet
-    // (forward reference here; the same shape arises for a bare cross-package
-    // reference to a package that sorts later). Each hoist pass used to
-    // restart with no bare names visible, so the reference missed on EVERY
-    // pass, const-eval defaulted it to 0, and `X - 6` froze at -6. The
-    // parameter VALUE healed later, but any declaration sized during the bad
-    // window kept a 1-bit clamped width — value right, storage wrong, which
-    // is exactly how this hides in a large design.
+    // The source package is declared first (§6.5, §26.3) but sorts after
+    // cfg in the package hoist. Both the value and its dependent signal
+    // width must see the imported parameter after the hoist converges.
     let src = r#"
-package cfg;
-  parameter integer LOG_64B = LOG_SIZE - 6;
+package sizes;
   parameter integer LOG_SIZE = 12;
+endpackage
+package cfg;
+  import sizes::LOG_SIZE;
+  parameter integer LOG_64B = LOG_SIZE - 6;
 endpackage
 module tb;
   logic [cfg::LOG_64B:0] c;

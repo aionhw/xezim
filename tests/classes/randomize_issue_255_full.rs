@@ -1,8 +1,8 @@
 //! #255 (reported by rharikrishna25): a configuration object with rand
 //! sub-objects in an object array, packed-struct rand members up to ~3800
 //! bits wide constrained field by field from the parent, `solve ... before`
-//! on sub-object fields and 40-bit arithmetic. The reference simulator
-//! prints TEST_PASS; the second test restates every constraint procedurally
+//! on sub-object properties and 40-bit arithmetic. The first test checks
+//! TEST_PASS; the second test restates every constraint procedurally
 //! and checks the solution of each randomize() call (§18.6.1: never 1 with a
 //! constraint violated).
 
@@ -239,7 +239,7 @@ class XIPW47ClientCtrlConfig ;
    }
 endclass : XIPW47ClientCtrlConfig
 
-// ----- IPW02.sv:733 IPW47Config (StartCfgForDUT), constraints verbatim -----
+// ----- IPW02.sv:733 IPW47Config (StartCfgForDUT) -----
 class XIPW47Config ;
    rand XIPW47IPW55CtrlConfig __IPW15s_cfg [`NUM_IPW50] ;
    rand XIPW47ClientCtrlConfig __IPW04_cfg ;
@@ -260,7 +260,6 @@ class XIPW47Config ;
    bit disable_post_rand_printout ;
    bit perf_diag ;
    bit disable_IPW60 ;
-   bit [`NUM_IPW50-1:1] IPW55_iterator ;
    bit [15:1] IPW26s_iterator ;
    bit [0:(`NUM_IPW60_IPW29S-1)] IPW29s_iterator ;
    bit [`NUM_TOTAL_IPW06-1:0] IPW06_iterator ;
@@ -329,17 +328,17 @@ class XIPW47Config ;
       solve __IPW04_cfg.IPW04_r.REG_IPW47_IPW56.NUM_IPW55S before total_IPW10_in_Gbits ;
       solve total_IPW10_in_Gbits before max_aIPW61ess ;
       solve IPW10_in_Gbits_perIPW50 before total_IPW10_in_Gbits ;
-      foreach (full_access_IPW26_ids[i]) {
-         solve full_access_IPW26_ids[i] before __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_SEG_RIGHTS ;
-      }
+      solve full_access_IPW26_ids[0], full_access_IPW26_ids[1],
+            full_access_IPW26_ids[2], full_access_IPW26_ids[3]
+            before __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_SEG_RIGHTS ;
       solve __IPW04_cfg.IPW04_r.REG_IPW47_IPW56 before __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW56_DUP ;
-      foreach (IPW55_iterator[i]) {
-         solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW56_DUP before __IPW15s_cfg[i].IPW15_r.REG_IPW47_IPW56_DUP ;
-         solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_SEG_LIMIT before __IPW15s_cfg[i].IPW15_r.REG_IPW47_IPW60_SEG_LIMIT ;
-         solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_SEG_RELOC before __IPW15s_cfg[i].IPW15_r.REG_IPW47_IPW60_SEG_RELOC ;
-         solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_SEG_RIGHTS before __IPW15s_cfg[i].IPW15_r.REG_IPW47_IPW60_SEG_RIGHTS ;
-         solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_CLIENT_IPW29 before __IPW15s_cfg[i].IPW15_r.REG_IPW47_IPW60_CLIENT_IPW29 ;
-      }
+      // The fixture has two controllers. Order each corresponding field
+      // of controller 0 before controller 1 at constraint-block scope (§18.5).
+      solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW56_DUP before __IPW15s_cfg[1].IPW15_r.REG_IPW47_IPW56_DUP ;
+      solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_SEG_LIMIT before __IPW15s_cfg[1].IPW15_r.REG_IPW47_IPW60_SEG_LIMIT ;
+      solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_SEG_RELOC before __IPW15s_cfg[1].IPW15_r.REG_IPW47_IPW60_SEG_RELOC ;
+      solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_SEG_RIGHTS before __IPW15s_cfg[1].IPW15_r.REG_IPW47_IPW60_SEG_RIGHTS ;
+      solve __IPW15s_cfg[0].IPW15_r.REG_IPW47_IPW60_CLIENT_IPW29 before __IPW15s_cfg[1].IPW15_r.REG_IPW47_IPW60_CLIENT_IPW29 ;
    }
    constraint c_compute_total_IPW10 {
       IPW10_in_Gbits_perIPW50 == (__IPW50_sregs.IPW10_per_IPW55_per_die_per_x16[__IPW50_sregs.IPW10_ds]

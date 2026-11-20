@@ -142,7 +142,7 @@ fn defparam_multiple_assignments_last_wins() {
     // comma-separated + duplicate target (last write wins).
     assert!(passes(
         r#"
-module m(output [W-1:0] Z, input [W-1:0] A); parameter W=1; parameter INV=0;
+module m #(parameter W=1, INV=0) (output [W-1:0] Z, input [W-1:0] A);
   assign Z = INV ? ~A : A;
 endmodule
 module top;
