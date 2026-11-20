@@ -925,13 +925,37 @@ impl Simulator {
     }
 
     pub(super) fn resolve_array_name_from_expr(&self, expr: &Expression) -> Option<String> {
+        self.resolve_memory_name(expr, MemKind::OneDim)
+            .map(|(n, _)| n)
+    }
+
+    /// The storage name of the fixed unpacked array `expr` names, of the
+    /// `kind` asked for: one-dimensional (`module.arrays`), multidimensional
+    /// (`arrays_2d` / `arrays_nd`), or either, with whether it is
+    /// multidimensional. Each step of the lookup tries every kind asked for,
+    /// so with [`MemKind::Either`] the first array the name reaches wins: a
+    /// one-dimensional class property `mem` named in a method is not a
+    /// module's two-dimensional `mem`.
+    fn resolve_memory_name(&self, expr: &Expression, kind: MemKind) -> Option<(String, bool)> {
+        let is_mem = |n: &str| -> Option<bool> {
+            let one = kind != MemKind::MultiDim && self.module.arrays.contains_key(n);
+            let multi = kind != MemKind::OneDim
+                && (self.module.arrays_2d.contains_key(n) || self.module.arrays_nd.contains_key(n));
+            if one {
+                Some(false)
+            } else if multi {
+                Some(true)
+            } else {
+                None
+            }
+        };
         // §8.5: fixed arrays declared as class properties live in the
         // per-object store.  Memory tasks accept those arrays just as they do
         // module arrays, both through `obj.member` and a bare member inside a
         // method.
         if let Some(name) = self.handle_member_array_name(expr) {
-            if self.module.arrays.contains_key(&name) {
-                return Some(name);
+            if let Some(m) = is_mem(&name) {
+                return Some((name, m));
             }
         }
         // §23.6 / §21.4: a hierarchical memory name inside a subroutine body
@@ -941,7 +965,7 @@ impl Simulator {
         // `$readmemh("f", r.mem)` in a task loaded nothing.
         if matches!(expr.kind, ExprKind::MemberAccess { .. }) {
             if let Some(flat) = self.member_chain_ident(expr) {
-                return self.resolve_array_name_from_expr(&flat);
+                return self.resolve_memory_name(&flat, kind);
             }
         }
         let (resolved, raw) = match &expr.kind {
@@ -958,8 +982,8 @@ impl Simulator {
             _ => return None,
         };
         if let Some(name) = self.instance_assoc_member(&raw) {
-            if self.module.arrays.contains_key(&name) {
-                return Some(name);
+            if let Some(m) = is_mem(&name) {
+                return Some((name, m));
             }
         }
         let ExprKind::Ident(hier) = &expr.kind else {
@@ -984,7 +1008,7 @@ impl Simulator {
         }
         let bare = hier.path.len() == 1 && hier.path[0].selects.is_empty();
         if bare
-            && !(resolved.as_ref() != raw && self.module.arrays.contains_key(resolved.as_ref()))
+            && !(resolved.as_ref() != raw && is_mem(resolved.as_ref()).is_some())
             && self.scalar_hides_module_coll(hier.path[0].name.name.as_str())
         {
             return None;
@@ -993,8 +1017,7 @@ impl Simulator {
         // here, so it is tried before the spelled path.
         [resolved.as_ref(), raw.as_str()]
             .into_iter()
-            .find(|n| self.module.arrays.contains_key(*n))
-            .map(str::to_string)
+            .find_map(|n| is_mem(n).map(|m| (n.to_string(), m)))
     }
 
     /// The memory a `$readmem*` / `$writemem*` call names, with its
@@ -1158,6 +1181,10 @@ impl Simulator {
             sim_dbg_eprintln!("[DEBUG] $readmem*: missing arguments");
             return Value::zero(32);
         }
+        // §21.4.3: a multidimensional array, or a partially indexed one.
+        if let Some(mem) = self.nd_memory_target(&args[1]) {
+            return self.read_nd_memory_file(args, default_radix, mem);
+        }
         let path = self.system_string_arg(&args[0]);
         if path.is_empty() {
             sim_dbg_eprintln!("[DEBUG] $readmem*: empty path");
@@ -1280,6 +1307,11 @@ impl Simulator {
         if args.len() < 2 {
             return Value::zero(32);
         }
+        // §21.4.3 / §21.5: a multidimensional array, or a partially indexed
+        // one.
+        if let Some(mem) = self.nd_memory_target(&args[1]) {
+            return self.write_nd_memory_file(args, tn, mem);
+        }
         let path = self.system_string_arg(&args[0]);
         if path.is_empty() {
             return Value::zero(32);
@@ -1356,4 +1388,323 @@ impl Simulator {
             _ => None,
         }
     }
+
+    /// The memory of a `$readmem*` / `$writemem*` call when it is a
+    /// multidimensional fixed unpacked array, or one partially indexed down
+    /// to a lesser-dimensioned subarray (`ram`, `ram[1]` of
+    /// `ram [4][2][3:0]`; §21.4.3). `None` for anything else, which the
+    /// one-dimensional path then takes or reports.
+    fn nd_memory_target(&mut self, arg: &Expression) -> Option<NdMemory> {
+        if self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty() {
+            return None;
+        }
+        // The subarray selects, outermost first. `ram[1]` is an index
+        // expression on `ram`; an index followed by another lands in the
+        // identifier's last segment (`r3[0][1]` is `[1]` on `r3` with
+        // select `[0]`).
+        let mut selects: Vec<&Expression> = Vec::new();
+        let mut cur = arg;
+        while let ExprKind::Index { expr, index } = &cur.kind {
+            selects.push(index);
+            cur = expr;
+        }
+        selects.reverse();
+        if let ExprKind::Ident(h) = &cur.kind
+            && h.path.last().is_some_and(|s| !s.selects.is_empty())
+        {
+            let mut path = h.path.clone();
+            let outer = std::mem::take(&mut path.last_mut()?.selects);
+            let stripped = Expression::new(
+                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                    root: h.root.clone(),
+                    path,
+                    span: h.span,
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
+                }),
+                cur.span,
+            );
+            let all: Vec<&Expression> = outer.iter().chain(selects).collect();
+            return self.nd_memory_from(&stripped, &all);
+        }
+        self.nd_memory_from(cur, &selects)
+    }
+
+    /// [`nd_memory_target`] for the array `base_expr` names, indexed by
+    /// `selects`.
+    fn nd_memory_from(
+        &mut self,
+        base_expr: &Expression,
+        selects: &[&Expression],
+    ) -> Option<NdMemory> {
+        // The array the name reaches first, of either kind: one that is a
+        // one-dimensional memory stays on that path.
+        let (base, multi) = self.resolve_memory_name(base_expr, MemKind::Either)?;
+        if !multi {
+            return None;
+        }
+        let dims = self.multi_dim_memory_dims(&base)?;
+        let width = match self.module.arrays_2d.get(&base) {
+            Some(&(_, _, w)) => w,
+            None => self.module.arrays_nd.get(&base)?.1,
+        };
+        if selects.len() >= dims.len() {
+            return None;
+        }
+        let mut prefix = Vec::with_capacity(selects.len());
+        for (sel, &(l, r)) in selects.iter().zip(&dims) {
+            let i = self.eval_expr(sel).to_i64()?;
+            if i < l.min(r) || i > l.max(r) {
+                return None;
+            }
+            prefix.push(i);
+        }
+        let dims = dims[prefix.len()..]
+            .iter()
+            .map(|&(l, r)| (l.min(r), l.max(r)))
+            .collect();
+        Some(NdMemory {
+            base,
+            prefix,
+            dims,
+            width,
+        })
+    }
+
+    /// Declared bounds of the multidimensional array `name`, outermost
+    /// first, when it can be a memory: a fixed unpacked array whose element
+    /// is a vector, a packed struct among them (§21.4.1), and not an
+    /// unpacked struct.
+    fn multi_dim_memory_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+        if self.module.dynamic_arrays.contains(name) || self.is_associative_array(name) {
+            return None;
+        }
+        if let Some(dt) = self.module.var_decl_types.get(name)
+            && matches!(self.resolve_dt(dt), DataType::Struct(su) if !su.packed)
+        {
+            return None;
+        }
+        if let Some(&(r0, r1, _)) = self.module.arrays_2d.get(name) {
+            return Some(match self.module.unpacked_decl_dims.get(name) {
+                Some(d) if d.len() == 2 => d.clone(),
+                _ => vec![r0, r1],
+            });
+        }
+        let (shape, _) = self.module.arrays_nd.get(name)?;
+        Some(match self.module.unpacked_decl_dims.get(name) {
+            Some(d) if d.len() == shape.len() => d.clone(),
+            _ => shape.clone(),
+        })
+    }
+
+    /// `$readmemb` / `$readmemh` / `$readmemd` into a multidimensional
+    /// array: [`read_memory_file`] with one address per element, in the
+    /// order [`NdMemory`] describes.
+    fn read_nd_memory_file(
+        &mut self,
+        args: &[Expression],
+        default_radix: u32,
+        mem: NdMemory,
+    ) -> Value {
+        let task = match default_radix {
+            2 => "$readmemb",
+            10 => "$readmemd",
+            _ => "$readmemh",
+        };
+        let path = self.system_string_arg(&args[0]);
+        if path.is_empty() {
+            return Value::zero(32);
+        }
+        let (lo, hi) = mem.addr_range();
+        let mut addr = match args.get(2) {
+            Some(a) => self.eval_expr(a).to_i64().unwrap_or(lo),
+            None => lo,
+        };
+        let end_addr = match args.get(3) {
+            Some(a) => self.eval_expr(a).to_i64().unwrap_or(hi),
+            None => hi,
+        };
+        let step: i64 = if addr <= end_addr { 1 } else { -1 };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                let m = format!(
+                    "[xezim][warning] {}: cannot open file \"{}\": {}",
+                    task, path, e
+                );
+                self.record_output(m.clone());
+                self.stdout_writeln(&m);
+                return Value::zero(32);
+            }
+        };
+        let mut loaded = 0usize;
+        'lines: for raw_line in content.lines() {
+            let line = raw_line.split("//").next().unwrap_or("").trim();
+            for raw_tok in line.split_whitespace() {
+                if (step > 0 && addr > end_addr) || (step < 0 && addr < end_addr) {
+                    break 'lines;
+                }
+                if let Some(rest) = raw_tok.strip_prefix('@') {
+                    let addr_hex = rest.trim_start_matches("0x").trim_start_matches("0X");
+                    // A negative address is written as its 64-bit two's
+                    // complement (`{:x}` of an `i64`).
+                    if let Ok(a) = u64::from_str_radix(addr_hex, 16) {
+                        addr = a as i64;
+                    }
+                    continue;
+                }
+                let Some((radix, digits)) = Self::parse_mem_token(raw_tok, default_radix) else {
+                    continue;
+                };
+                if addr >= lo && addr <= hi {
+                    let idx = mem.indices(addr);
+                    let val = Value::from_str_radix(&digits, radix, mem.width);
+                    match self.elem_cell(&mem.base, &idx) {
+                        Some(id) => {
+                            self.fast_signal_write_id(id, &val);
+                        }
+                        // A class property's elements have no cell; they
+                        // are stored by name, and a 2-state property drops
+                        // X/Z as any write to it does (§6.11.1).
+                        None => {
+                            let val = match mem.base.split_once('#') {
+                                Some((h, prop))
+                                    if val.has_xz()
+                                        && h.parse::<usize>()
+                                            .is_ok_and(|h| self.class_prop_two_state(h, prop)) =>
+                                {
+                                    val.to_two_state()
+                                }
+                                _ => val,
+                            };
+                            self.fast_signal_write(&Self::elem_name(&mem.base, &idx), val);
+                        }
+                    }
+                    loaded += 1;
+                }
+                addr += step;
+            }
+        }
+        sim_dbg_eprintln!(
+            "[DEBUG] $readmem*: loaded {} words into '{}' from '{}'",
+            loaded,
+            mem.base,
+            path
+        );
+        Value::zero(32)
+    }
+
+    /// `$writememb` / `$writememh` / `$writememd` of a multidimensional
+    /// array (§21.5): [`write_memory_file`] with one address per element, in
+    /// the order [`NdMemory`] describes, so `$readmem*` reads it back.
+    fn write_nd_memory_file(&mut self, args: &[Expression], tn: &str, mem: NdMemory) -> Value {
+        let path = self.system_string_arg(&args[0]);
+        if path.is_empty() {
+            return Value::zero(32);
+        }
+        let (lo, hi) = mem.addr_range();
+        let start = match args.get(2) {
+            Some(a) => self.eval_expr(a).to_i64().unwrap_or(lo),
+            None => lo,
+        };
+        let end = match args.get(3) {
+            Some(a) => self.eval_expr(a).to_i64().unwrap_or(hi),
+            None => hi,
+        };
+        let radix: u32 = if tn.ends_with('b') {
+            2
+        } else if tn.ends_with('h') {
+            16
+        } else {
+            10
+        };
+        // The addresses between start and finish that the array holds, in
+        // the direction start to finish.
+        let addrs: Box<dyn Iterator<Item = i64>> = if start <= end {
+            Box::new(start.max(lo)..=end.min(hi))
+        } else {
+            Box::new((end.max(lo)..=start.min(hi)).rev())
+        };
+        let mut out = String::new();
+        for addr in addrs {
+            let idx = mem.indices(addr);
+            let val = match self.elem_cell(&mem.base, &idx) {
+                Some(id) => self.cell_read(id),
+                // A class property's elements are stored by name.
+                None => self
+                    .lookup_signal_value(&Self::elem_name(&mem.base, &idx))
+                    .unwrap_or_else(|| Value::zero(mem.width)),
+            };
+            out.push_str(&format!("@{:x} ", addr));
+            let s = match radix {
+                2 => val.to_bin_string(),
+                16 => val.to_hex_string(),
+                _ => val.to_dec_string(),
+            };
+            out.push_str(&s);
+            out.push('\n');
+        }
+        let _ = std::fs::write(&path, out);
+        Value::zero(32)
+    }
+}
+
+/// A multidimensional fixed unpacked array, or a partially indexed one, as
+/// the memory of a `$readmem*` / `$writemem*` call.
+///
+/// §21.4.3 lays its words out in row-major order: the rightmost dimension
+/// varies fastest, and every dimension runs from its low index to its high
+/// one whichever way it is declared. Each element has one address, counted
+/// in that order from the low index of the leftmost dimension, and the
+/// start and finish arguments and the file's `@` entries are such addresses.
+/// The LRM text has `@` entries and the address arguments name words of the
+/// leftmost dimension instead, but Verilator, Icarus and the reference
+/// simulator all linearize the array, and real images depend on it: a
+/// byte-wide `ram [DEPTH][NB]` is loaded from a byte-addressed hex file with
+/// finish address `DEPTH*NB-1`.
+pub(super) struct NdMemory {
+    /// Storage name of the whole array.
+    base: String,
+    /// The indices that select the subarray, outermost first.
+    prefix: Vec<i64>,
+    /// `(lo, hi)` of each remaining dimension, outermost first.
+    dims: Vec<(i64, i64)>,
+    /// Element width.
+    width: u32,
+}
+
+impl NdMemory {
+    /// The first and last address: the low index of the leftmost remaining
+    /// dimension, and that plus the element count less one.
+    fn addr_range(&self) -> (i64, i64) {
+        let count = self
+            .dims
+            .iter()
+            .fold(1i64, |n, &(lo, hi)| n.saturating_mul(hi - lo + 1));
+        (self.dims[0].0, self.dims[0].0.saturating_add(count - 1))
+    }
+
+    /// The full index list of the element at `addr`, which lies in
+    /// [`addr_range`](Self::addr_range).
+    fn indices(&self, addr: i64) -> Vec<i64> {
+        let mut k = addr - self.dims[0].0;
+        let mut tail = vec![0i64; self.dims.len()];
+        for (slot, &(lo, hi)) in tail.iter_mut().zip(&self.dims).rev() {
+            let size = hi - lo + 1;
+            *slot = lo + k % size;
+            k /= size;
+        }
+        let mut idx = self.prefix.clone();
+        idx.extend(tail);
+        idx
+    }
+}
+
+/// Which fixed unpacked arrays [`Simulator::resolve_memory_name`] looks for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemKind {
+    OneDim,
+    MultiDim,
+    Either,
 }
