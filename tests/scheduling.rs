@@ -521,6 +521,8 @@ mod struct_array_actual_paths_1110;
 mod pattern_nba_1199;
 #[path = "scheduling/event_call_operands_1205.rs"]
 mod event_call_operands_1205;
+#[path = "scheduling/event_call_struct_arguments.rs"]
+mod event_call_struct_arguments;
 
 #[path = "scheduling/array_capture_1217.rs"]
 mod array_capture_1217;
@@ -539,3 +541,7 @@ mod time_literal_exact_1299;
 mod intra_delay_array_items;
 #[path = "scheduling/review_intra_delay_array_items.rs"]
 mod review_intra_delay_array_items;
+#[path = "scheduling/time0_effect_entries_1314.rs"]
+mod time0_effect_entries_1314;
+#[path = "scheduling/sva_default_actuals_1309.rs"]
+mod sva_default_actuals_1309;

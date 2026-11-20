@@ -42,7 +42,10 @@ use serde::ser::{SerializeSeq, Serializer};
 // §9.4.2 / §9.3.2: Simulator::prev_wide holds a wide signal only once it is sampled; the
 // frame cache of a synchronous fork child is rebuilt, not carried (#721).
 // Preserve declaration-scope typedefs across procedural shadowing (§6.18).
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x12";
+// §10.9.1, §26.3 / §9.4.2: named assignment pattern keys carry a bound type name; the guard
+// and value expressions of an event term are shared.
+// §9.2.2.2: Simulator::comb_time0_held, CombEntryCold::time0_effects.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x13";
 
 #[derive(Default)]
 struct Session {
@@ -681,6 +684,7 @@ checkpoint_once_cells!(
     param_leaf_index_cell,
     var_decl_leaf_index_cell,
     vif_capable_statics,
+    scoped_unpacked_leaves,
     iface_instance_paths,
     iface_by_token,
     iface_path_parts,
@@ -1249,6 +1253,7 @@ checkpoint_state!(
     comb_plan_abortn,
     comb_time0_deferred_done,
     comb_time0_fired,
+    comb_time0_held,
     compiled_class_method_ids,
     compiled_fast_calls,
     compiled_fast_static_calls,

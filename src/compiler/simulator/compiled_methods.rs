@@ -3894,7 +3894,7 @@ impl Simulator {
                     continue;
                 }
                 let copy_in = matches!(port.direction, PortDirection::Ref | PortDirection::Inout);
-                let real = matches!(port.data_type, crate::ast::types::DataType::Real { .. });
+                let real = self.dt_is_real(&port.data_type);
                 if !copy_in || real || !scalar.contains(&i) {
                     never(self);
                     return None;
@@ -4017,7 +4017,7 @@ impl Simulator {
                 Some(&self.module.typedefs),
             )
             .max(1);
-            if super::elaborate::is_type_real(&pre.return_type) {
+            if self.dt_is_real(&pre.return_type) {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state(&pre.return_type) {
                 Value::zero(rw)
@@ -4242,7 +4242,7 @@ impl Simulator {
                 Some(&self.module.typedefs),
             )
             .max(1);
-            if super::elaborate::is_type_real(&pre.return_type) {
+            if self.dt_is_real(&pre.return_type) {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state(&pre.return_type) {
                 Value::zero(rw)

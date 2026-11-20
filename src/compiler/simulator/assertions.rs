@@ -228,6 +228,76 @@ impl Simulator {
         }
     }
 
+    /// §16.8, §16.12: the actual argument of each formal of the named
+    /// sequence or property `key` in an instance with the arguments `args`:
+    /// bound by position or by name (`.x(a)`), and the declaration's default
+    /// actual argument for a formal the instance leaves out. A default may
+    /// name an earlier formal, which takes that formal's actual.
+    pub(super) fn sva_bind_actuals(
+        &self,
+        key: &str,
+        args: &[Expression],
+    ) -> HashMap<String, Expression> {
+        let formals: &[String] = self
+            .module
+            .property_params
+            .get(key)
+            .map_or(&[], |v| v.as_slice());
+        let mut map: HashMap<String, Expression> = HashMap::default();
+        for (i, a) in args.iter().enumerate() {
+            match &a.kind {
+                ExprKind::NamedArg { name, expr } => {
+                    if let Some(e) = expr
+                        && !matches!(e.kind, ExprKind::Empty)
+                    {
+                        map.insert(name.name.clone(), (**e).clone());
+                    }
+                }
+                ExprKind::Empty => {}
+                _ => {
+                    if let Some(f) = formals.get(i) {
+                        map.insert(f.clone(), a.clone());
+                    }
+                }
+            }
+        }
+        if let Some(defaults) = self.module.property_param_defaults.get(key) {
+            for (f, d) in formals.iter().zip(defaults) {
+                if let Some(d) = d
+                    && !map.contains_key(f)
+                {
+                    let d = super::elaborate::rewrite_expr(
+                        d,
+                        "",
+                        &map,
+                        &std::collections::HashSet::new(),
+                        &HashMap::default(),
+                    );
+                    map.insert(f.clone(), d);
+                }
+            }
+        }
+        map
+    }
+
+    /// §16.8: the body of the named sequence or property `key` for an
+    /// instance written without an argument list: each formal with a default
+    /// actual argument replaced by it.
+    pub(super) fn sva_body_with_defaults(&self, key: &str) -> Option<Expression> {
+        let body = self.module.property_decls.get(key)?;
+        if !self.module.property_param_defaults.contains_key(key) {
+            return Some(body.clone());
+        }
+        let map = self.sva_bind_actuals(key, &[]);
+        Some(super::elaborate::rewrite_expr(
+            body,
+            "",
+            &map,
+            &std::collections::HashSet::new(),
+            &HashMap::default(),
+        ))
+    }
+
     pub(super) fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {
         if depth > 16 {
             return e.clone();
@@ -249,6 +319,15 @@ impl Simulator {
                         return self.sva_expand_named(&inner, depth + 1);
                     }
                 }
+                // §16.8: an instance without an argument list takes every
+                // default actual argument.
+                if self.module.sequences.contains(name)
+                    && self.module.property_param_defaults.contains_key(name)
+                    && let Some(body) = self.sva_body_with_defaults(name)
+                {
+                    let inner = Self::sva_unclocked(&body);
+                    return self.sva_expand_named(&inner, depth + 1);
+                }
                 e.clone()
             }
             // `s(x, y)`: a named sequence / property with formals — the
@@ -257,18 +336,7 @@ impl Simulator {
                 let name = self.sva_named_key(func);
                 if let Some(name) = name {
                     if let Some(body) = self.module.property_decls.get(&name).cloned() {
-                        let formals = self
-                            .module
-                            .property_params
-                            .get(&name)
-                            .cloned()
-                            .unwrap_or_default();
-                        let mut map: HashMap<String, Expression> = HashMap::default();
-                        for (i, f) in formals.iter().enumerate() {
-                            if let Some(actual) = args.get(i) {
-                                map.insert(f.clone(), actual.clone());
-                            }
-                        }
+                        let map = self.sva_bind_actuals(&name, args);
                         let body = super::elaborate::rewrite_expr(
                             &body,
                             "",

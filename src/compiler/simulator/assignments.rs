@@ -1577,7 +1577,7 @@ impl Simulator {
             return false;
         }
         self.module.var_decl_types.get(name).is_some_and(|dt| {
-            !super::elaborate::is_type_real(dt)
+            !self.dt_is_real(dt)
                 && super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types)
         })
     }
@@ -2541,7 +2541,7 @@ impl Simulator {
                     } else {
                         Self::real_into_slot(p, val.to_f64())
                     }
-                } else if elem_dt().is_some_and(|dt| super::elaborate::is_type_real(&dt)) {
+                } else if elem_dt().is_some_and(|dt| self.dt_is_real(&dt)) {
                     Value::from_f64(val.to_f64())
                 } else if let Some(p) = declared_slot() {
                     Self::real_into_slot(&p, val.to_f64())
@@ -4293,6 +4293,27 @@ impl Simulator {
         ) {
             if let Some(r) = self.class_agg_member(lhs) {
                 return self.write_class_agg(&r, val);
+            }
+        }
+        // §7.2, §8.4: a property of the object a class-handle member of an
+        // unpacked-struct class property refers to (`r.h.k = v`, `o.r.h.k =
+        // v`). The receiver is a struct leaf, not a handle variable, so no
+        // arm below resolved it and the write was dropped.
+        if matches!(lhs.kind, ExprKind::MemberAccess { .. } | ExprKind::Ident(_))
+            && !self.no_class_objects()
+            && self.chain_may_name_struct_prop(lhs)
+            && let Some((recv, member)) = Self::split_trailing_member(lhs)
+            && let Some(h) = self.struct_handle_chain_object(&recv)
+            && self
+                .heap
+                .get(h)
+                .and_then(|o| o.as_ref())
+                .is_some_and(|inst| inst.properties.contains_key(&member))
+        {
+            let fitted = self.fit_class_prop(h, &member, val);
+            if let Some(Some(inst)) = self.heap.get_mut(h) {
+                inst.properties.insert(member, fitted);
+                return true;
             }
         }
         // §8.9: assignment to a STATIC class property (`obj.static_prop = ...`,
@@ -6840,7 +6861,7 @@ impl Simulator {
                             if let Some(dt) = dt {
                                 let resolved =
                                     Self::resolve_type_ref(&dt, &self.module.typedef_types);
-                                if let Some(fields) = Self::struct_field_layout(&resolved) {
+                                if let Some(fields) = self.struct_field_layout(&resolved) {
                                     if let Some((_, off, w, _real)) = fields
                                         .iter()
                                         .find(|(m, _, _, _)| m == &member.name)

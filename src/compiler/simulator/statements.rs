@@ -2330,7 +2330,7 @@ impl Simulator {
                 _ => false,
             };
         // §6.4: `real`/`shortreal` variables default to 0.0.
-        let is_real_type = super::elaborate::is_type_real(data_type);
+        let is_real_type = self.dt_is_real(data_type);
         // §6.11.3: the declared signedness every declarator's value and
         // later reads carry.
         let decl_signed = !plain_class
@@ -5856,7 +5856,10 @@ impl Simulator {
                                 // like `f = e` (`return b + u` with a byte b
                                 // and 8-bit u in an int function is 9 bits).
                                 // §10.8: a pattern takes the return type.
-                                None => match self.ret_pattern_value(e) {
+                                None => match self
+                                    .ret_struct_elem_value(e)
+                                    .or_else(|| self.ret_pattern_value(e))
+                                {
                                     Some(v) => v,
                                     None => match self.fn_ret_ctx_stack.last() {
                                         Some(&w) if w > 0 => self.eval_expr_ctx(e, w),
@@ -6233,7 +6236,7 @@ impl Simulator {
                         ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
                             if let Some(name) = self.sva_named_key(&a.expr) =>
                         {
-                            if let Some(body) = self.module.property_decls.get(&name).cloned() {
+                            if let Some(body) = self.sva_body_with_defaults(&name) {
                                 body
                             } else {
                                 a.expr.clone()
@@ -6263,18 +6266,7 @@ impl Simulator {
                                 });
                             let resolved = pname.and_then(|n| {
                                 let body = self.module.property_decls.get(&n).cloned()?;
-                                let formals = self
-                                    .module
-                                    .property_params
-                                    .get(&n)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let mut map: HashMap<String, Expression> = HashMap::default();
-                                for (i, f) in formals.iter().enumerate() {
-                                    if let Some(actual) = args.get(i) {
-                                        map.insert(f.clone(), actual.clone());
-                                    }
-                                }
+                                let map = self.sva_bind_actuals(&n, args);
                                 Some(super::elaborate::rewrite_expr(
                                     &body,
                                     "",
@@ -6549,11 +6541,16 @@ impl Simulator {
                 // resolve it — it was parsed and DISCARDED before, so a
                 // local `typedef struct packed {...} t; t v;` lost the
                 // member layout. Enum members become named constants.
-                let w = super::elaborate::resolve_type_width(
-                    &td.data_type,
-                    Some(&self.module.parameters),
-                    Some(&self.module.typedefs),
-                );
+                // §8.5: in a class method, by the class's own constants too.
+                let spec = self.class_type_env(&td.data_type);
+                let w = {
+                    let params = self.spec_param_env(&spec);
+                    super::elaborate::resolve_type_width_env(
+                        &td.data_type,
+                        Some(&params),
+                        Some(&self.module.typedefs),
+                    )
+                };
                 self.type_tables_gen += 1;
                 self.declaration_typedefs.get_or_insert_with(|| {
                     (

@@ -1630,6 +1630,23 @@ impl Simulator {
                 return;
             }
         }
+        // #1311, §25.9, §7.6: a whole unpacked variable of an interface
+        // reached through a virtual interface on either side
+        // (`vif.arr = w`, `w = cfg.vif.arr`) is the bound instance's variable.
+        if whole(lvalue) || whole(rvalue) {
+            let l = whole(lvalue)
+                .then(|| self.vif_aggregate_canon(lvalue))
+                .flatten();
+            let r = whole(rvalue)
+                .then(|| self.vif_aggregate_canon(rvalue))
+                .flatten();
+            if l.is_some() || r.is_some() {
+                let lvalue = l.as_ref().unwrap_or(lvalue);
+                let rvalue = r.as_ref().unwrap_or(rvalue);
+                self.exec_stmt_blocking_assign_body(stmt, lvalue, rvalue);
+                return;
+            }
+        }
         if let Some(pattern) = self.unpacked_typed_pattern(rvalue) {
             self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
             return;
@@ -2003,6 +2020,25 @@ impl Simulator {
                 self.settle_after_proc_write();
                 return;
             }
+        }
+        // §13.4.1: `f = d[i];` in the function `f` — the return variable of
+        // an unpacked-struct type is a set of leaves in the frame, so a whole
+        // element is spread over them.
+        if let ExprKind::Ident(h) = &lvalue.kind
+            && matches!(
+                rvalue.kind,
+                ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+            )
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && self
+                .func_call_stack
+                .last()
+                .is_some_and(|f| *f == h.path[0].name.name)
+            && self.ret_var_struct_assign(&h.path[0].name.name, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
         }
         // §7.2.1: `b = a` between unpacked-struct VARS whose type has
         // a DYNAMIC member (queue/dynamic/assoc) — the pack/scatter
@@ -3776,6 +3812,23 @@ impl Simulator {
         // `new src` is a distinct `ShallowCopy` node (LRM 8.8 fn 23) and
         // never reaches here — so a parenthesized `new(args)` is ALWAYS
         // a constructor call, even a single class-handle argument.
+        // §7.2, §8.4: a class-handle member of an unpacked-struct class
+        // property (`r.h = new();` with `struct { C h; } r;`). The property's
+        // type names a struct, not a class, so the lookups below found no
+        // class to construct and stored a handle to nothing.
+        let rv_is_new = match &rvalue.kind {
+            ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].name.name == "new",
+            ExprKind::Call { func, .. } => matches!(
+                &func.kind,
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new"
+            ),
+            _ => false,
+        };
+        let struct_member_cls = if rv_is_new {
+            self.struct_handle_leaf(lvalue).map(|(_, c)| c)
+        } else {
+            None
+        };
         let (is_new_call, ctor_args): (bool, &[Expression]) = match &rvalue.kind {
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new" => (true, &[]),
             ExprKind::Call { func, args }
@@ -3786,8 +3839,9 @@ impl Simulator {
                     // Non-empty args: only treat as class instantiation when
                     // the lvalue's type is a class AND it's NOT a single-arg
                     // class-handle (shallow copy).
-                    let is_class = self
-                        .get_expr_type_name(lvalue)
+                    let is_class = struct_member_cls
+                        .clone()
+                        .or_else(|| self.get_expr_type_name(lvalue))
                         .and_then(|tn| self.resolve_type_param_binding(&tn).or(Some(tn)))
                         .map(|tn| {
                             self.resolve_simple_typedef_class(&tn)
@@ -3835,7 +3889,7 @@ impl Simulator {
                 self.settle_after_proc_write();
                 return;
             }
-            let type_name = self.get_expr_type_name(lvalue);
+            let type_name = struct_member_cls.or_else(|| self.get_expr_type_name(lvalue));
             // §6.20.3 type-parameter construction: if the declared
             // type is a class type parameter (e.g. `T obj = new;`),
             // resolve it through the current instance's bindings to
@@ -3966,7 +4020,7 @@ impl Simulator {
                         .and_then(|tn| self.module.typedef_types.get(tn.as_str()))
                         .and_then(|dt| {
                             let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
-                            Self::struct_field_layout(&resolved)
+                            self.struct_field_layout(&resolved)
                         });
                     if let Some(members) = struct_members {
                         // Declaration order = reverse of struct_field_layout

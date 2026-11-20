@@ -3874,6 +3874,15 @@ impl<'a> BytecodeCompiler<'a> {
     /// typedef? A bound that does not fold counts as one.
     fn decl_has_offset_range(&self, dt: &crate::ast::types::DataType) -> bool {
         use crate::ast::types::{DataType, PackedDimension};
+        // §7.4.1: so is a packed array of a named signed type. A select of
+        // one of its elements is signed, which the interpreter reads from
+        // the declaration of the formal or local.
+        if self
+            .typedef_types
+            .is_some_and(|t| signed_named_packed_elem_depth(dt, t).is_some())
+        {
+            return true;
+        }
         let offset = |dims: &[PackedDimension]| {
             dims.iter().any(|d| match d {
                 PackedDimension::Range { left, right, .. } => {
@@ -5676,6 +5685,35 @@ impl<'a> BytecodeCompiler<'a> {
             )
     }
 
+    /// `q.pop_front()` / `q.pop_back()` on a plain (possibly dotted) name,
+    /// under any parentheses.
+    fn is_queue_pop_call(e: &Expression) -> bool {
+        let mut e = e;
+        while let ExprKind::Paren(inner) = &e.kind {
+            e = inner;
+        }
+        let ExprKind::Call { func, args } = &e.kind else {
+            return false;
+        };
+        if !args.is_empty() {
+            return false;
+        }
+        let plain = |h: &crate::ast::expr::HierarchicalIdentifier| {
+            h.path.iter().all(|s| s.selects.is_empty())
+        };
+        let (method, recv_ok) = match &func.kind {
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                (h.path.last().map(|s| s.name.name.as_str()), plain(h))
+            }
+            ExprKind::MemberAccess { expr, member } => (
+                Some(member.name.as_str()),
+                matches!(&expr.kind, ExprKind::Ident(h) if plain(h)),
+            ),
+            _ => (None, false),
+        };
+        recv_ok && matches!(method, Some("pop_front" | "pop_back"))
+    }
+
     fn for_body_is_simple(&self, stmt: &Statement) -> bool {
         let expr_simple = |e: &Expression| -> bool { self.expr_loop_simple(e) };
         let lv_simple = |e: &Expression| -> bool {
@@ -5847,7 +5885,13 @@ impl<'a> BytecodeCompiler<'a> {
                     _ => false,
                 };
                 let _ = expr_reads_name; // superseded by the form-aware audit
-                lv_simple(lvalue) && expr_simple(rvalue) && !self_read_skewed
+                // §7.10.2: `v[i] = q.pop_front();` — the pop is evaluated by
+                // the interpreter into a register (it names no loop
+                // variable), the loop and the store stay compiled. Such a
+                // drain loop used to run whole in the AST interpreter (#1210).
+                let queue_pop = matches!(stmt.kind, StatementKind::BlockingAssign { .. })
+                    && Self::is_queue_pop_call(rvalue);
+                lv_simple(lvalue) && (expr_simple(rvalue) || queue_pop) && !self_read_skewed
             }
             StatementKind::SeqBlock { stmts, .. } => {
                 stmts.iter().all(|st| self.for_body_is_simple(st))
@@ -9046,6 +9090,38 @@ impl<'a> BytecodeCompiler<'a> {
         dt // A cyclic alias must not acquire a concrete local kind.
     }
 
+    /// §6.24.1: whether the named cast `T'(x)` (`pkg::T'(x)`) targets a
+    /// typedef of a real type, so the cast is a real operand of its context.
+    fn named_cast_is_real(&self, args: &[Expression]) -> bool {
+        let (scope, leaf) = match args.first().map(|a| &a.kind) {
+            Some(ExprKind::Ident(h)) if h.path.len() >= 2 => {
+                let n = h.path.len();
+                (
+                    Some(h.path[n - 2].name.name.as_str()),
+                    h.path[n - 1].name.name.as_str(),
+                )
+            }
+            Some(ExprKind::Ident(h)) if h.path.len() == 1 => (None, h.path[0].name.name.as_str()),
+            Some(ExprKind::MemberAccess { expr, member }) => match &expr.kind {
+                ExprKind::Ident(h) => (
+                    h.path.last().map(|s| s.name.name.as_str()),
+                    member.name.as_str(),
+                ),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        let get = |key: &str| {
+            self.local_typedef_types
+                .get(key)
+                .or_else(|| self.typedef_types.and_then(|t| t.get(key)))
+        };
+        scope
+            .and_then(|s| get(&format!("{s}::{leaf}")))
+            .or_else(|| get(leaf))
+            .is_some_and(|dt| self.decl_is_real(dt, None))
+    }
+
     fn decl_is_real(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> bool {
         crate::compiler::elaborate::is_type_real(self.resolved_decl_type(dt, scope))
     }
@@ -12143,9 +12219,9 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::SystemCall { name, args } => match name.as_str() {
                 "$__xz_type_cast" => matches!(
                     args.first().map(|a| &a.kind),
-                    Some(ExprKind::TypeLiteral(dt))
-                        if crate::compiler::elaborate::is_type_real(dt)
+                    Some(ExprKind::TypeLiteral(dt)) if self.decl_is_real(dt, None)
                 ),
+                "$__xz_named_cast" => self.named_cast_is_real(args),
                 n => system_function_is_real(n),
             },
             ExprKind::Call { func, .. } => self.call_returns_real(func),
@@ -12166,8 +12242,7 @@ impl<'a> BytecodeCompiler<'a> {
         let Some(name) = self.scoped_callee_name(h.path[0].name.name.clone()) else {
             return false;
         };
-        let real =
-            |fd: &FunctionDeclaration| crate::compiler::elaborate::is_type_real(&fd.return_type);
+        let real = |fd: &FunctionDeclaration| self.decl_is_real(&fd.return_type, Some(&name));
         self.functions.and_then(|f| f.get(&name)).is_some_and(real)
             || self
                 .dpi_import_fds
@@ -19031,7 +19106,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("type_cast_stream");
                         return None;
                     }
-                    let is_real = crate::compiler::elaborate::is_type_real(&dt);
+                    let is_real = self.decl_is_real(&dt, None);
                     let w = crate::compiler::elaborate::resolve_type_width(&dt, self.params, None)
                         .max(1);
                     // §6.24.1: an integral target is the operand's context

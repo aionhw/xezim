@@ -1026,7 +1026,7 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            let is_real = super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type));
+            let is_real = self.dt_is_real(&m.data_type);
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
@@ -1102,7 +1102,9 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            let dv = if super::elaborate::is_type_real(&m.data_type) {
+            // §6.18: a typedef preserves the member's real type.
+            let is_real = self.dt_is_real(&m.data_type);
+            let dv = if is_real {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state_resolved(
                 &m.data_type,
@@ -1137,7 +1139,6 @@ impl Simulator {
                             &m.data_type,
                             &self.module.typedef_types,
                         );
-                        let is_real = super::elaborate::is_type_real(&m.data_type);
                         let signed = self.type_is_signed_concrete(&m.data_type);
                         Some(Self::fit_local_decl_init(
                             raw,
@@ -1881,7 +1882,7 @@ impl Simulator {
                         Some(&self.module.parameters),
                         Some(&self.module.typedefs),
                     );
-                    let r = super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type));
+                    let r = self.dt_is_real(&m.data_type);
                     for md in &m.declarators {
                         keys.push((format!("{}.{}", port_name, md.name.name), w, r));
                     }
@@ -2368,8 +2369,12 @@ impl Simulator {
             return self.bind_array_arg(port, &selected);
         }
         let arg = self.unpacked_pattern(arg);
-        // #1108: an array member of an instance-array element.
-        let folded = self.inst_array_member_canon(arg);
+        // #1108: an array member of an instance-array element; #1311: an
+        // array of an interface through a virtual interface (§25.9).
+        let folded = match self.inst_array_member_canon(arg) {
+            Some(f) => Some(f),
+            None => self.vif_aggregate_canon(arg),
+        };
         let arg = folded.as_ref().unwrap_or(arg);
         let params = Some(&self.module.parameters);
         let (lo, hi) = match dims.first()? {
@@ -2629,7 +2634,7 @@ impl Simulator {
         ) {
             return Some(Value::from_string(""));
         }
-        if super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types) {
+        if self.dt_is_real(dt) {
             return Some(Value::from_f64(0.0));
         }
         if super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types) {

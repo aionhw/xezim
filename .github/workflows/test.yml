@@ -86,7 +86,8 @@ jobs:
         run: cargo test --test strings --no-fail-fast -- dpi_export_task_waits dpi_semantics dpi_export_types
 
   # The DPI groups on macOS arm64: the fibers there are aarch64 and the
-  # trampoline links for Mach-O (#290). Only the DPI tests, not the suite.
+  # trampoline links for Mach-O (#290), and the UVM regex builtins call BSD
+  # libc's regcomp. Only the DPI tests, not the suite.
   dpi-macos:
     runs-on: macos-latest
     steps:
@@ -114,3 +115,7 @@ jobs:
         env:
           XEZIM_DPI_FIBERS: "0"
         run: cargo test --test strings --no-fail-fast -- dpi_export_task_waits dpi_semantics dpi_export_types
+
+      - name: UVM DPI builtins
+        if: always()
+        run: cargo test --test misc --no-fail-fast -- uvm_dpi_builtins

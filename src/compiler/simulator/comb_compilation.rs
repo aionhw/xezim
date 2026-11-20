@@ -682,6 +682,7 @@ impl Simulator {
         // (63K on c906, 501K on c910). Clear() preserves the bucket array.
         let mut reads: HashSet<String> = HashSet::default();
         let mut writes: HashSet<String> = HashSet::default();
+        let mut t0_effects = super::time0_effects::Time0Effects::default();
         let mut ca_compile_fail: HashMap<&'static str, usize> = HashMap::default();
         let mut ca_compile_fail_samples = 0usize;
         let cont_loop_t0 = std::time::Instant::now();
@@ -840,6 +841,13 @@ impl Simulator {
             let explicit_delay = ca.delay;
             // Captured before `ca.lhs` may be moved into the CombItem below.
             let ca_span = ca.lhs.span;
+            // §10.3.2, §4.9.1: an assignment whose evaluation is observable
+            // waits for the time-0 start batch (see `time0_effects`).
+            let ca_time0_effects = {
+                let frame = super::time0_effects::T0Frame::expr();
+                self.t0_expr_has_effects(&ca.rhs, None, &frame, &mut t0_effects)
+                    || self.t0_expr_has_effects(&ca.lhs, None, &frame, &mut t0_effects)
+            };
             // Statement coverage counts this assignment's evaluations: keep it
             // on a form that runs a counter (compiled, or interpreted).
             let cov_counter = if self.code_cov.is_some() {
@@ -1857,6 +1865,7 @@ impl Simulator {
                     write_signal_ids: wids,
                     span: ca_span,
                     cov,
+                    time0_effects: ca_time0_effects,
                 }),
                 has_unresolved_reads,
                 defer_at_time0: false,
@@ -2208,6 +2217,14 @@ impl Simulator {
                     }
                 };
                 let _is_pure_observer = wids.is_empty();
+                // §9.2.2.2: see `time0_effects`.
+                let ab_time0_effects = is_always_comb
+                    && self.t0_stmt_has_effects(
+                        &ab.stmt,
+                        scope_hint.as_deref(),
+                        &super::time0_effects::T0Frame::block(&ab.stmt),
+                        &mut t0_effects,
+                    );
                 entries.push(CombEntry {
                     item,
                     cold: Box::new(CombEntryCold {
@@ -2216,6 +2233,7 @@ impl Simulator {
                         write_signal_ids: wids,
                         span: ab.stmt.span,
                         cov: None,
+                        time0_effects: ab_time0_effects,
                     }),
                     has_unresolved_reads,
                     // §9.2.2.1: a level-only `always @(sensitivity)` block
