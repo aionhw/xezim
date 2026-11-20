@@ -715,6 +715,27 @@ impl Simulator {
         let params_snapshot = self.module.parameters.clone();
         let descending_snapshot = self.module.descending_arrays.clone();
         let decl_dims_snapshot = self.module.unpacked_decl_dims.clone();
+        // §10.10: the arrays an unpacked concatenation item cannot be spread
+        // from element by element (`concat_array_assign_parts`).
+        let arrays_nd_snapshot = self.module.arrays_nd.clone();
+        let other_arrays_snapshot: HashSet<String> = self
+            .module
+            .dynamic_arrays
+            .iter()
+            .chain(&self.module.queue_vars)
+            .chain(self.module.associative_arrays.keys())
+            .cloned()
+            .collect();
+        let is_other_array = |n: &str| other_arrays_snapshot.contains(n);
+        let concat_tables = crate::compiler::elaborate::UnpackedArrayTables {
+            arrays: &arrays_snapshot,
+            arrays_2d: &arrays_2d_snapshot,
+            arrays_nd: &arrays_nd_snapshot,
+            descending: &descending_snapshot,
+            decl_dims: &decl_dims_snapshot,
+            params: &params_snapshot,
+            other_array: &is_other_array,
+        };
         // §23.9/§6.10: a HIERARCHICAL continuous assign can target a
         // sub-instance INPUT PORT (`assign uut.mid.core.i_clk = tb_clk;`
         // with the port chain above unconnected). Identity port connects
@@ -781,6 +802,14 @@ impl Simulator {
                 })
                 .or_else(|| {
                     Self::row_pattern_assign_parts(&self.module, &ca, &decl_dims_snapshot, &params_snapshot)
+                })
+                .or_else(|| {
+                    crate::compiler::elaborate::concat_array_assign_parts(
+                        &ca.lhs,
+                        &ca.rhs,
+                        ca.delay,
+                        &concat_tables,
+                    )
                 })
                 .unwrap_or_else(|| vec![ca])
             })
