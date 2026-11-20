@@ -42,7 +42,11 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     // segments of the parameter keys and the classes every unit sees.
     let _leaves = ParamLeaves::install(elab);
     let global = global_classes(defs);
-    let views = InstanceViews::build(elab);
+    // One set of per-instance views, shared with the type lint's generate
+    // selection (a large design has many instances and parameters).
+    let gen_sel = GenerateSelection::new(elab);
+    let views = &gen_sel.views;
+    let elaborated = elaborated_definitions(defs, elab);
     for def in defs {
         match def {
             SourceDefinition::Class(c) => check_class(c, &mut errs),
@@ -66,6 +70,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     params: &m.params,
                     ports: &m.ports,
                     items: &m.items,
+                    elaborated: elaborated.as_ref().is_none_or(|e| e.contains(&m.name.name)),
                 };
                 check_unit(
                     &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
@@ -78,7 +83,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     &m.name.name,
                     &m.items,
                     scope,
-                    &views,
+                    views,
                     &local_types,
                     &mut errs,
                 );
@@ -87,7 +92,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_unpacked_pattern_counts(&m.items, &mut errs);
                 check_stream_widths(&m.items, scope, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
-                if scope.top || !views.of(&m.name.name).is_empty() {
+                if unit.elaborated {
                     check_instantiations(&m.items, &port_map, &mut errs);
                     check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
                 }
@@ -98,6 +103,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     params: &m.params,
                     ports: &m.ports,
                     items: &m.items,
+                    elaborated: elaborated.as_ref().is_none_or(|e| e.contains(&m.name.name)),
                 };
                 check_unit(
                     &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
@@ -110,7 +116,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     &m.name.name,
                     &m.items,
                     scope,
-                    &views,
+                    views,
                     &local_types,
                     &mut errs,
                 );
@@ -118,7 +124,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_monitor_automatic(&m.items, &mut errs);
                 check_unpacked_pattern_counts(&m.items, &mut errs);
-                if scope.top || !views.of(&m.name.name).is_empty() {
+                if unit.elaborated {
                     check_instantiations(&m.items, &port_map, &mut errs);
                     check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
                 }
@@ -129,6 +135,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     params: &m.params,
                     ports: &m.ports,
                     items: &m.items,
+                    elaborated: elaborated.as_ref().is_none_or(|e| e.contains(&m.name.name)),
                 };
                 check_unit(
                     &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
@@ -141,7 +148,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     &m.name.name,
                     &m.items,
                     scope,
-                    &views,
+                    views,
                     &local_types,
                     &mut errs,
                 );
@@ -150,7 +157,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_program_items(&m.items, &mut errs);
                 check_monitor_automatic(&m.items, &mut errs);
                 check_unpacked_pattern_counts(&m.items, &mut errs);
-                if scope.top || !views.of(&m.name.name).is_empty() {
+                if unit.elaborated {
                     check_instantiations(&m.items, &port_map, &mut errs);
                     check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
                 }
@@ -183,7 +190,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     check_nettype_partial_drivers(defs, elab, &mut errs);
     check_named_block_refs(defs, &mut errs);
     if xezim_core::sv_parser::strict_checks() {
-        errs.extend(crate::type_lint::check_with_views(defs, elab, &views));
+        errs.extend(crate::type_lint::check(defs, elab, &gen_sel));
         // §23.8: a hierarchical name that does not resolve is an error.
         errs.extend(crate::hier_ref_lint::check(defs, elab));
     }
@@ -196,6 +203,9 @@ struct Unit<'a> {
     params: &'a [xezim_core::ast::decl::ParameterDeclaration],
     ports: &'a PortList,
     items: &'a [ModuleItem],
+    /// Some instance of the definition may be elaborated (see
+    /// `elaborated_definitions`); its instantiations are judged only then.
+    elaborated: bool,
 }
 
 /// The declaration and reference checks shared by modules, interfaces and
@@ -215,7 +225,9 @@ fn check_unit<'a>(
     check_pattern_counts(defs, u.items, elab, is_top, errs);
     check_foreach_dims(u.items, errs);
     check_select_depth(u.items, errs);
-    check_port_actuals(defs, u.items, errs);
+    if u.elaborated {
+        check_port_actuals(defs, u.items, errs);
+    }
     check_generate_block_names(u.items, errs);
     check_system_task_values(u.items, errs);
     check_wildcard_import_conflicts(u.ports, u.params, u.items, pkg_decls, errs);
@@ -685,7 +697,7 @@ impl Drop for ParamLeaves {
 /// Without an instance only literals and `pkg::N` (§26.3) fold; a bare name
 /// there may be its own.
 #[derive(Clone, Copy)]
-pub(crate) struct ConstScope<'a> {
+struct ConstScope<'a> {
     elab: &'a ElaboratedModule,
     top: bool,
     inst: Option<ParamEnv<'a>>,
@@ -701,13 +713,13 @@ pub(crate) struct ConstScope<'a> {
 /// A bare top-level key is NOT part of a child's view: the child's own `N`
 /// is registered as `u.N`, and a `$unit` or top-module `N` it could see is
 /// told apart from nothing by the flat table.
-pub(crate) struct InstanceViews {
+struct InstanceViews {
     by_def: HashMap<String, Vec<ParamMap>>,
     scoped: ParamMap,
 }
 
 impl InstanceViews {
-    pub(crate) fn build(elab: &ElaboratedModule) -> Self {
+    fn build(elab: &ElaboratedModule) -> Self {
         let mut by_def: HashMap<String, Vec<ParamMap>> = HashMap::default();
         if elab.instances.is_empty() {
             return InstanceViews {
@@ -745,26 +757,145 @@ impl InstanceViews {
         InstanceViews { by_def, scoped }
     }
 
-    pub(crate) fn scopes<'a>(
-        &'a self,
-        elab: &'a ElaboratedModule,
-        name: &str,
-    ) -> Vec<ConstScope<'a>> {
-        if name == elab.name {
-            return vec![ConstScope::of(elab, name)];
-        }
-        self.of(name)
-            .iter()
-            .map(|view| ConstScope::instance(elab, view, &self.scoped))
-            .collect()
-    }
-
     /// The own tables of the instances of `def`, empty when it is not
     /// instantiated.
     fn of(&self, def: &str) -> &[ParamMap] {
         self.by_def.get(def).map_or(&[], Vec::as_slice)
     }
 }
+
+/// §27.5: which branches of a definition's conditional generate constructs
+/// the elaborated design holds. Only the branch a construct's constant
+/// selects is elaborated, so a check of the definition's source must not
+/// judge a branch no instance selects: `if (Full) assign o = r.missing;`
+/// is legal while every instance has `Full = 0`.
+pub(crate) struct GenerateSelection<'a> {
+    elab: &'a ElaboratedModule,
+    views: InstanceViews,
+}
+
+impl<'a> GenerateSelection<'a> {
+    pub(crate) fn new(elab: &'a ElaboratedModule) -> Self {
+        GenerateSelection {
+            elab,
+            views: InstanceViews::build(elab),
+        }
+    }
+
+    /// The scope of the top, or of each elaborated instance of `def`; empty
+    /// when nothing elaborates `def`.
+    fn scopes(&self, def: &str) -> Vec<ConstScope<'_>> {
+        let top = ConstScope::of(self.elab, def);
+        if top.top {
+            return vec![top];
+        }
+        self.views
+            .of(def)
+            .iter()
+            .map(|v| ConstScope::instance(self.elab, v, &self.views.scoped))
+            .collect()
+    }
+
+    /// The value of a condition in `scope`, when it is certain there.
+    fn known(scope: ConstScope, e: &Expression) -> Option<i64> {
+        if width_is_confident(e, scope) {
+            scope.value(e)
+        } else {
+            None
+        }
+    }
+
+    /// For each branch of a generate `if` of `def` (`None` is the final
+    /// `else`), the instances that elaborate it, out of `reach`, the ones
+    /// that elaborate the enclosing branch (None: every instance, or not
+    /// known). A branch no instance in `reach` selects gets an empty set.
+    /// Every branch keeps `reach` when one instance's choice is not certain,
+    /// and gets None when nothing elaborates `def`.
+    pub(crate) fn if_branches(
+        &self,
+        def: &str,
+        conds: &[Option<&Expression>],
+        reach: &GenReach,
+    ) -> Vec<GenReach> {
+        self.select(def, conds.len(), reach, |scope| {
+            for (i, c) in conds.iter().enumerate() {
+                match c.map(|c| Self::known(scope, c)) {
+                    None => return Some(Some(i)),
+                    Some(Some(0)) => {}
+                    Some(Some(_)) => return Some(Some(i)),
+                    Some(None) => return None,
+                }
+            }
+            Some(None)
+        })
+    }
+
+    /// For each arm of a generate `case` of `def` (an empty list of values
+    /// is the `default`), the instances that elaborate it, as for
+    /// [`Self::if_branches`].
+    pub(crate) fn case_arms(
+        &self,
+        def: &str,
+        selector: &Expression,
+        arms: &[&[Expression]],
+        reach: &GenReach,
+    ) -> Vec<GenReach> {
+        self.select(def, arms.len(), reach, |scope| {
+            let sel = Self::known(scope, selector)?;
+            for (i, vals) in arms.iter().enumerate() {
+                let mut hit = false;
+                for v in vals.iter() {
+                    hit |= Self::known(scope, v)? == sel;
+                }
+                if hit {
+                    return Some(Some(i));
+                }
+            }
+            Some(arms.iter().position(|vals| vals.is_empty()))
+        })
+    }
+
+    /// Splits `reach` among `n` branches by `choose`, which gives the branch
+    /// one instance elaborates (`Some(None)`: none of them), or None when it
+    /// is not certain.
+    fn select(
+        &self,
+        def: &str,
+        n: usize,
+        reach: &GenReach,
+        choose: impl Fn(ConstScope) -> Option<Option<usize>>,
+    ) -> Vec<GenReach> {
+        let scopes = self.scopes(def);
+        if scopes.is_empty() {
+            return vec![None; n];
+        }
+        let mut out: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let all: Vec<usize>;
+        let members = match reach {
+            Some(r) => r.as_slice(),
+            None => {
+                all = (0..scopes.len()).collect();
+                &all
+            }
+        };
+        for &k in members {
+            let Some(&scope) = scopes.get(k) else {
+                return vec![reach.clone(); n];
+            };
+            match choose(scope) {
+                Some(Some(i)) => out[i].push(k),
+                Some(None) => {}
+                None => return vec![reach.clone(); n],
+            }
+        }
+        out.into_iter().map(Some).collect()
+    }
+}
+
+/// The instances of a definition (indices of its scopes in
+/// `GenerateSelection`) that elaborate a generate branch; None for every
+/// instance, or when that is not known.
+pub(crate) type GenReach = Option<Vec<usize>>;
 
 /// A fold in a `ConstScope`.
 enum Folded {
@@ -839,13 +970,6 @@ impl<'a> ConstScope<'a> {
             Folded::Value(v) => Some(v),
             _ => None,
         }
-    }
-
-    pub(crate) fn generate_condition(self, cond: &Expression) -> Option<bool> {
-        if !width_is_confident(cond, self) {
-            return None;
-        }
-        self.value(cond).map(|v| v != 0)
     }
 
     /// The width of `dt`, 0 when it is not known here.
@@ -2555,6 +2679,74 @@ fn build_port_map(defs: &[&SourceDefinition]) -> HashMap<String, HashSet<String>
         }
     }
     m
+}
+
+/// The definitions some elaborated instance may come from: the root, the
+/// definition of every elaborated instance, and whatever an instantiation in
+/// one of those reaches in the source (in any generate branch, or bound in
+/// with `bind`), so the set errs on the side of checking. Port connections
+/// are checked at elaboration (§23.3.2, §23.3.3), so a definition outside the
+/// set — another top-level module that `-s` did not select — has none of its
+/// instantiations judged. None when the elaboration recorded no instances.
+fn elaborated_definitions(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+) -> Option<HashSet<String>> {
+    if elab.instances.is_empty() {
+        return None;
+    }
+    fn instantiated(items: &[ModuleItem], out: &mut Vec<String>) {
+        for it in items {
+            match it {
+                ModuleItem::ModuleInstantiation(mi) => out.push(mi.module_name.name.clone()),
+                ModuleItem::Bind(b) => out.push(b.instantiation.module_name.name.clone()),
+                ModuleItem::GenerateRegion(g) => instantiated(&g.items, out),
+                ModuleItem::GenerateIf(g) => {
+                    g.branches.iter().for_each(|(_, i)| instantiated(i, out))
+                }
+                ModuleItem::GenerateFor(g) => instantiated(&g.items, out),
+                ModuleItem::GenerateCase(g) => {
+                    g.arms.iter().for_each(|a| instantiated(&a.items, out))
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut kids: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut bound: Vec<String> = Vec::new();
+    for def in defs {
+        let (name, items) = match def {
+            SourceDefinition::Module(m) => (&m.name.name, &m.items),
+            SourceDefinition::Interface(m) => (&m.name.name, &m.items),
+            SourceDefinition::Program(m) => (&m.name.name, &m.items),
+            _ => continue,
+        };
+        let mut out = Vec::new();
+        instantiated(items, &mut out);
+        bound.extend(items.iter().filter_map(|it| match it {
+            ModuleItem::Bind(b) => Some(b.instantiation.module_name.name.clone()),
+            _ => None,
+        }));
+        kids.insert(name.as_str(), out);
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = std::iter::once(elab.name.clone())
+        .chain(elab.instances.iter().map(|i| i.def_name.clone()))
+        .chain(bound)
+        .chain(
+            elab.resolved_binds
+                .values()
+                .flatten()
+                .map(|b| b.instantiation.module_name.name.clone()),
+        )
+        .collect();
+    while let Some(n) = stack.pop() {
+        if let Some(k) = kids.get(n.as_str()) {
+            stack.extend(k.iter().filter(|k| !seen.contains(*k)).cloned());
+        }
+        seen.insert(n);
+    }
+    Some(seen)
 }
 
 /// §23.3.2: a `.name(...)` (or `.name` implicit) connection in an instantiation
