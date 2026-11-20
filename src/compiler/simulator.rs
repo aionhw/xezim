@@ -401,7 +401,9 @@ fn method_boost_enabled() -> bool {
 // §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §6.21, §13.5.3: output-before-read locals and literal default actuals compile.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3096;
+// §6.12.1, §6.24.1, §12.5: `RealToInt` rounds a value that may be real fitted to 64 integral
+// bits; a value stored into a real target converts first; a real `case` runs interpreted.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3097;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1840,7 +1842,10 @@ struct CombEntryCold {
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
 // process, not as a combinational entry.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB054";
+// §6.12.1, §6.24.1, §12.5: `RealToInt` (a new opcode) rounds a value that may be real fitted
+// to 64 integral bits, continuous assignments see which signals are real, a value stored into
+// a real target converts first, and a real `case` runs interpreted.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB055";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
