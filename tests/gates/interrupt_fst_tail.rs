@@ -275,14 +275,53 @@ fn sigint_fst_ends_at_the_interrupt_time() {
     run.wait_for("TICK", Duration::from_secs(10));
     run.signal(libc::SIGINT);
     let (status, out) = run.finish(Duration::from_secs(10));
-    assert!(
-        status.success(),
-        "interrupted run should exit cleanly:\n{out}"
+    // Through the normal exit, which reports the interrupt: 128 + SIGINT.
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "interrupted run should leave through its normal exit with status 130:\n{out}"
     );
     let t = interrupt_time(&out);
     let d = decode(&fst, "cnt");
     assert_eq!(d.end_time, t, "the FST should end at the interrupt time");
     assert_counter_reaches(&d, t, "interrupted run");
+}
+
+/// SIGTERM (what `timeout` and job schedulers send) stops the run the same
+/// way, and the run exits 143 (128 + SIGTERM) rather than 0, so a harness
+/// does not take a killed run for a passing one.
+#[test]
+fn sigterm_finalizes_the_fst_and_exits_143() {
+    let mut s = Scratch::new();
+    let sv = s.write(
+        "term",
+        "sv",
+        &design(r#"initial forever begin #20000; $display("TICK %0t", $time); end"#),
+    );
+    let fst = s.path("term", "fst");
+    let mut run = Run::start(
+        &[
+            "--no-cache",
+            "-s",
+            "top",
+            "--fst",
+            fst.to_str().unwrap(),
+            sv.to_str().unwrap(),
+        ],
+        &[],
+    );
+    run.wait_for("TICK", Duration::from_secs(10));
+    run.signal(libc::SIGTERM);
+    let (status, out) = run.finish(Duration::from_secs(10));
+    assert_eq!(
+        status.code(),
+        Some(143),
+        "a run SIGTERM stopped should exit 143:\n{out}"
+    );
+    let t = interrupt_time(&out);
+    let d = decode(&fst, "cnt");
+    assert_eq!(d.end_time, t, "the FST should end at the interrupt time");
+    assert_counter_reaches(&d, t, "terminated run");
 }
 
 #[test]
@@ -318,9 +357,10 @@ fn sigint_stops_a_long_loop_inside_one_time_slot() {
     run.wait_for("LOOPING", Duration::from_secs(10));
     run.signal(libc::SIGINT);
     let (status, out) = run.finish(Duration::from_secs(10));
-    assert!(
-        status.success(),
-        "the loop should stop on the interrupt and the run exit cleanly:\n{out}"
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "the loop should stop on the interrupt and the run leave through its normal exit:\n{out}"
     );
     assert_eq!(interrupt_time(&out), 1000, "{out}");
     assert!(!out.contains("done "), "the loop ran to completion:\n{out}");
