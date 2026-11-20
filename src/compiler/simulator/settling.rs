@@ -894,6 +894,12 @@ impl Simulator {
                 };
                 // §20.3.1, §20.3.3: statement fallbacks in top blocks need the top unit.
                 let saved_ts = if compiled.has_fallback
+                    && matches!(entry.item, CombItem::CompiledContAssign { .. })
+                {
+                    Some(self.timescale_scope_override.replace(
+                        entry.cold.rhs_time_scope.as_deref().unwrap_or_default().to_owned(),
+                    ))
+                } else if compiled.has_fallback
                     && entry.cold.scope_hint.is_none()
                     && matches!(entry.item, CombItem::CompiledAlwaysBlock { .. })
                 {
@@ -2644,8 +2650,7 @@ impl Simulator {
                                     // re-enters the interpreter here.
                                     let saved_hint = if compiled.has_fallback {
                                         let prev = self.name_resolve_hint.borrow().clone();
-                                        *self.name_resolve_hint.borrow_mut() =
-                                            entries[eidx].cold.scope_hint.clone();
+                                        *self.name_resolve_hint.borrow_mut() = entries[eidx].cold.scope_hint.clone();
                                         Some(prev)
                                     } else {
                                         None

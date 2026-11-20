@@ -2928,7 +2928,8 @@ impl ProcCont {
         fn append(frame: &ProcCont, out: &mut Vec<Statement>) {
             let offset = out.len();
             out.extend_from_slice(frame.frame());
-            if let (Some(tail), Some(remaining)) = (frame.loop_tail_at, frame.repeat_remaining)
+            if let (Some(tail), Some(remaining)) =
+                (frame.loop_tail_at, frame.repeat_remaining)
                 && tail >= frame.start
                 && let Some(stmt) = out.get_mut(offset + tail - frame.start)
                 && let StatementKind::Repeat { count, .. } = &mut stmt.kind
@@ -2954,6 +2955,7 @@ impl ProcCont {
         }
         out
     }
+
 }
 
 impl From<Vec<Statement>> for ProcCont {
@@ -3128,44 +3130,43 @@ impl NbaFastIndex {
 }
 
 mod aggregate_assignments;
+mod pattern_array_items;
+mod intra_pattern_shape;
+mod annex_n;
 mod aggregate_expressions;
 mod aggregate_members;
-mod annex_n;
 mod arguments;
-mod assert_ctl;
 mod assertions;
+mod sva_until;
 mod assignments;
 mod bytecode_runtime;
 mod calls;
 mod checkpoint;
 mod checkpoint_calls;
 mod class_access;
-mod class_array_constants;
 mod class_members;
 mod class_methods;
 mod class_specialization;
+mod class_array_constants;
+mod property_initialization;
 mod clocking;
-mod code_cov;
 mod collection_methods;
 mod collections;
+mod conditional_aggregates;
 mod comb_compilation;
 mod compilation;
 mod compiled_methods;
-mod conditional_aggregates;
 mod constraint_domains;
 mod constraint_solver;
 mod constraint_targets;
 mod construction;
 mod coverage;
-mod dpi_export;
 mod dpi_imports;
-mod dpi_task;
 mod edges;
 mod enum_receivers;
-mod event_bits;
-mod event_loop;
-mod event_stamps;
 mod event_waiters;
+mod event_loop;
+mod stall_progress;
 mod expression_types;
 mod expressions;
 mod file_io;
@@ -3174,32 +3175,22 @@ mod functions;
 mod initialization;
 mod inline_constraints;
 mod inspection;
-mod intra_pattern_shape;
 mod isolated_gates;
 mod jit_runtime;
 mod mailboxes;
 mod method_types;
-mod module_paths;
 mod named_events;
-mod names;
 mod packed_assignment_patterns;
-mod pattern_array_items;
 mod process_control;
 mod process_scopes;
 mod processes;
 mod profiling;
-mod property_initialization;
-mod rand_csp;
-mod rand_diag;
-mod ref_aliases;
 mod sensitivity;
 mod settling;
 mod setup;
 mod signal_commits;
-mod stall_progress;
 mod statement_assignments;
 mod statements;
-mod sva_until;
 mod system_tasks;
 mod time0_effects;
 mod two_state;
@@ -3209,6 +3200,17 @@ mod unpacked_slices;
 mod value_display;
 mod virtual_interfaces;
 mod waveforms;
+mod assert_ctl;
+mod code_cov;
+mod dpi_export;
+mod dpi_task;
+mod event_bits;
+mod event_stamps;
+mod module_paths;
+mod names;
+mod rand_csp;
+mod ref_aliases;
+mod rand_diag;
 
 /// Marks a `dist` target recorded by MEMBER path in `rand_order_sensitive`.
 const MEMBER_DIST_MARK: &str = "\u{1}member:";
@@ -3898,6 +3900,7 @@ fn meta_key_bits(key: &str) -> u64 {
 fn note_store_write(bits: u64) {
     STORE_WRITE_MASK.with(|m| m.set(m.get() | bits));
 }
+
 
 /// An event was triggered or re-bound, so every `<event>.triggered` read may
 /// have changed. A stamp is not a property write, so without this a gated
