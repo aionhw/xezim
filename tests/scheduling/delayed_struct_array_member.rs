@@ -135,3 +135,21 @@ endmodule
 "#);
     assert_eq!(lines, ["before tag=0 a=0", "after tag=7 a=7"]);
 }
+
+/// §10.3.3: a change to the whole value restarts its inertial delay.
+#[test]
+fn changing_one_member_reschedules_the_pending_structure() {
+    let lines = run(r#"
+module top;
+  typedef struct {int tag; int a[1];} S;
+  S s;
+  int x, y;
+  assign #3 s = '{tag:x, a:'{y}};
+  initial begin
+    x=5; y=7; #2; x=6;
+    #2 $display("pending %0d %0d", s.tag, s.a[0]);
+    #2 $display("arrived %0d %0d", s.tag, s.a[0]);
+  end
+endmodule"#);
+    assert_eq!(lines, ["pending 0 0", "arrived 6 7"]);
+}
