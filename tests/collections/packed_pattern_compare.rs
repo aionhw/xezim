@@ -92,7 +92,7 @@ endmodule
 
 #[test]
 fn wildcard_ops_on_packed_aggregate_vs_pattern() {
-    // §11.4.6 `==?`/`!=?` on a packed aggregate vs a bare pattern: these were
+    // §11.4.6 `==?`/`!=?` on a packed aggregate vs a typed pattern: these were
     // not dispatched through the pattern comparator (bug cousin of J) and so
     // reported unequal — a no-wildcard pattern must compare like `==`. An x/z
     // in the pattern item is a don't-care; an x/z in the element at a
@@ -129,7 +129,7 @@ endmodule
 #[test]
 fn packed_slice_vs_typed_pattern() {
     // A packed sub-array slice (`d2[0]`, an Index expression into a packed
-    // array) compared against a bare pattern must compare its rows element-
+    // array) compared against a typed pattern must compare its rows element-
     // wise like the whole array. This was a separate latent gap (fallback to
     // the packed-scalar compare always returned 0). Reference-verified.
     let msgs = run(r#"

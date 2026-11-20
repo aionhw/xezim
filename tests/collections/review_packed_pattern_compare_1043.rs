@@ -1,6 +1,6 @@
-//! §10.8, §10.9, §11.4.5, §11.4.6 (#1043): a bare assignment pattern compared
-//! with a PACKED operand takes the operand's type and is one packed value of
-//! it, so the comparison is bit for bit: an x/z bit leaves `==` x, and the
+//! §10.8, §10.9, §11.4.5, §11.4.6 (#1043): a typed assignment pattern produces
+//! a packed value that can be compared bit for bit. An x/z bit can leave
+//! `==` unknown. The other
 //! operand's type comes from wherever it is declared — a class property (also
 //! through implicit `this`), a function result, a packed element of an
 //! unpacked array, a nested or arrayed packed struct, a plain vector, a
