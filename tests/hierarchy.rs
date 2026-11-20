@@ -541,3 +541,5 @@ mod vif_whole_unpacked_1311;
 mod clocking_blocks_per_scope;
 #[path = "hierarchy/scope_named_like_a_package.rs"]
 mod scope_named_like_a_package;
+#[path = "hierarchy/generate_if_package_param_member.rs"]
+mod generate_if_package_param_member;
