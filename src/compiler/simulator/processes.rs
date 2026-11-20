@@ -3317,6 +3317,72 @@ impl Simulator {
     }
 
     pub(super) fn run_process_stmts(&mut self, pid: usize, pc: &ProcCont) {
+        // A call chain that never waits nests one activation per call; stop
+        // it with a diagnostic before it exhausts the native stack.
+        let at_limit = self.stall_limit != 0 && u64::from(self.stmts_depth) >= self.stall_limit;
+        if (at_limit || self.stmts_depth >= 64) && self.process_nesting_exceeded(pid) {
+            return;
+        }
+        self.stmts_depth += 1;
+        self.run_process_stmts_scoped(pid, pc);
+        self.stmts_depth -= 1;
+    }
+
+    /// Whether the activation about to nest at depth `stmts_depth` must stop.
+    /// A task that can wait (`@`, `#`, `wait`) runs inside its caller's
+    /// activation and resumes the caller's remaining statements from inside
+    /// its own, so a process whose calls never actually wait — a task that
+    /// calls itself, or two that call each other, at one time step — nests
+    /// one native frame per call. That is a zero-delay loop: simulated time
+    /// can never advance. It is reported, naming the process, when the depth
+    /// reaches `XEZIM_STALL_LIMIT` or when the native stack is nearly
+    /// exhausted, whichever comes first; overflowing the stack aborted the
+    /// whole run with no message about the design.
+    #[cold]
+    #[inline(never)]
+    fn process_nesting_exceeded(&mut self, pid: usize) -> bool {
+        if self.finished {
+            return true;
+        }
+        let depth = u64::from(self.stmts_depth);
+        let over_limit = self.stall_limit != 0 && depth >= self.stall_limit;
+        let low_stack = depth % 16 == 0 && stack_nearly_exhausted();
+        if !over_limit && !low_stack {
+            return false;
+        }
+        eprintln!(
+            "[xezim][error] simulation STALLED at time {} — a process nested {} task calls and blocks without waiting.",
+            self.time, depth
+        );
+        let id = self.stall_pid_identity(pid);
+        eprintln!(
+            "{} — calls a task that can wait but does not, again and again",
+            id
+        );
+        if let Some(src) = self.stall_pid_source(pid) {
+            eprintln!("                 its source: {}", src);
+        }
+        eprintln!(
+            "               This is a zero-delay loop (a task that calls itself, or tasks that call each"
+        );
+        eprintln!(
+            "               other, with no wait taken): simulated time can never advance past it."
+        );
+        if low_stack {
+            eprintln!(
+                "               It was stopped before the native stack ran out. If the recursion is finite,"
+            );
+            eprintln!("               raise the stack with XEZIM_STACK_MB=<MiB>.");
+        } else {
+            eprintln!(
+                "               Raise or disable the check with XEZIM_STALL_LIMIT=<n> (0 = never stall-check)."
+            );
+        }
+        self.abort_run();
+        true
+    }
+
+    fn run_process_stmts_scoped(&mut self, pid: usize, pc: &ProcCont) {
         // Install this activation's own scope (see `activation_scope`) —
         // the ratchet-proof twin of the hint reset performed inside. A
         // mid-block hierarchical reference (`u_child.x = 1` right before
@@ -6147,4 +6213,63 @@ impl Simulator {
             }
         }
     }
+}
+
+/// Whether the current thread has used all but its reserve of native stack:
+/// an eighth of the stack, at least 256 KiB and at most 64 MiB, which is
+/// room to report and unwind. False where the stack bounds are unknown.
+fn stack_nearly_exhausted() -> bool {
+    thread_local! {
+        /// (lowest stack address, reserve), probed once per thread.
+        static BOUNDS: std::cell::Cell<Option<Option<(usize, usize)>>> =
+            const { std::cell::Cell::new(None) };
+    }
+    let bounds = BOUNDS.with(|b| {
+        if b.get().is_none() {
+            b.set(Some(thread_stack_bounds().map(|(low, size)| {
+                (low, (size / 8).clamp(256 << 10, 64 << 20))
+            })));
+        }
+        b.get().flatten()
+    });
+    let Some((low, reserve)) = bounds else {
+        return false;
+    };
+    let here = std::hint::black_box(&low) as *const usize as usize;
+    here.saturating_sub(low) < reserve
+}
+
+/// The lowest address and the size of the current thread's stack.
+#[cfg(target_os = "linux")]
+fn thread_stack_bounds() -> Option<(usize, usize)> {
+    // SAFETY: `attr` is initialized by `pthread_getattr_np` before it is
+    // read and destroyed after; both out-pointers are valid locals.
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+            return None;
+        }
+        let mut addr: *mut libc::c_void = std::ptr::null_mut();
+        let mut size: libc::size_t = 0;
+        let ok = libc::pthread_attr_getstack(&attr, &mut addr, &mut size) == 0;
+        libc::pthread_attr_destroy(&mut attr);
+        (ok && !addr.is_null() && size > 0).then_some((addr as usize, size))
+    }
+}
+
+/// The lowest address and the size of the current thread's stack.
+#[cfg(target_os = "macos")]
+fn thread_stack_bounds() -> Option<(usize, usize)> {
+    // SAFETY: plain queries about the calling thread.
+    unsafe {
+        let me = libc::pthread_self();
+        let top = libc::pthread_get_stackaddr_np(me) as usize;
+        let size = libc::pthread_get_stacksize_np(me);
+        (top > size && size > 0).then_some((top - size, size))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn thread_stack_bounds() -> Option<(usize, usize)> {
+    None
 }

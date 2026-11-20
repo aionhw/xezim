@@ -95,6 +95,50 @@ endmodule"
     assert_eq!(lines(&src), vec!["T formal 63"]);
 }
 
+/// §5.13, §6.19.5: a class property, a property through a handle or `this`,
+/// an array element and a structure member take the parenless methods from
+/// their declared type, in a class method and at module scope. A property
+/// named `name` stays a property read.
+#[test]
+fn parenless_enum_methods_on_properties_elements_and_members() {
+    let src = format!(
+        "module t;\n{E}\
+  typedef struct {{ e_t f; int k; }} s_t;\n\
+  class N; string name = \"obj\"; endclass\n\
+  class C;\n\
+    e_t p = C1;\n\
+    e_t a[2] = '{{C0, CC}};\n\
+    s_t s = '{{f: CC, k: 1}};\n\
+    N h = new;\n\
+    function void show();\n\
+      string n = p.name;\n\
+      $display(\"T prop %0s %0d %0d %0d %0d %0d\", n, p.first, p.last, p.next, p.prev, p.num);\n\
+      $display(\"T this %0s %0s\", this.p.name, $sformatf(\"%0s\", p.name));\n\
+      $display(\"T elem %0s %0s\", a[1].name, s.f.name);\n\
+      $display(\"T guard %0s\", h.name);\n\
+    endfunction\n\
+  endclass\n\
+  s_t ms = '{{f: C1, k: 2}};\n\
+  initial begin\n\
+    C c = new;\n\
+    c.show();\n\
+    $display(\"T mod %0s %0s %0d\", c.p.name, ms.f.name, ms.f.last);\n\
+  end\n\
+endmodule"
+    );
+    assert_eq!(
+        lines(&src),
+        vec![
+            "T prop C1 0 63 63 0 3",
+            "T this C1 C1",
+            "T elem CC CC",
+            "T guard obj",
+            "T mod C1 C1 63",
+        ],
+        "a parenless enum method must equal its with-parens form"
+    );
+}
+
 /// GUARD: the routing must key on the receiver being enum-typed. A struct
 /// member that merely SHARES a method name stays an ordinary data read.
 #[test]

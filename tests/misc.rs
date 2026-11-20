@@ -257,8 +257,12 @@ mod part_select_negative_bound_compiled;
 mod placeholder_parameter_replication;
 #[path = "misc/port_width_mismatch_explains.rs"]
 mod port_width_mismatch_explains;
+#[path = "misc/readmem_associative_array.rs"]
+mod readmem_associative_array;
 #[path = "misc/readmem_hierarchical_target.rs"]
 mod readmem_hierarchical_target;
+#[path = "misc/readmem_multidim.rs"]
+mod readmem_multidim;
 #[path = "misc/real_call_bytecode.rs"]
 mod real_call_bytecode;
 #[path = "misc/reduce_loop_unroll.rs"]
@@ -667,3 +671,5 @@ mod declaration_order_snapshots;
 
 #[path = "misc/shared_procedural_bodies.rs"]
 mod shared_procedural_bodies;
+#[path = "misc/deferred_assertion_counts.rs"]
+mod deferred_assertion_counts;

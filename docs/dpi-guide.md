@@ -287,6 +287,11 @@ xezim --dpi-lib /abs/path/to/libfoo.so [more --dpi-lib paths …] <sv files>
   pass `-Wl,-rpath,$PREFIX/lib` at link time. Because the symbols are global,
   one `--dpi-lib` library can call into another (a protocol library on top of
   a bridge library, say), in either command-line order.
+* An import that no `--dpi-lib` library defines is looked up among the
+  libraries the process already has loaded (`dlsym(RTLD_DEFAULT, …)`), as
+  a Verilator model links any C function, so a C library function needs
+  no library of its own:
+  `import "DPI-C" function string getenv(input string name);`.
 * A library that cannot be loaded is an error: xezim prints why and exits 1
   without simulating. Calling an imported function that no loaded library
   defines is a `Fatal` that ends the run (exit 1); imports that are never

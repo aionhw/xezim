@@ -187,6 +187,8 @@ mod nba_fast_vs_queue_order;
 mod nba_index_freeze_and_elem_selects;
 #[path = "scheduling/nba_intra_event_control.rs"]
 mod nba_intra_event_control;
+#[path = "scheduling/nonblocking_update_rewakes_star_block.rs"]
+mod nonblocking_update_rewakes_star_block;
 #[path = "scheduling/nba_leak_waiter_active_region.rs"]
 mod nba_leak_waiter_active_region;
 #[path = "scheduling/nba_region_join_none_order.rs"]
@@ -265,6 +267,8 @@ mod waiter_edge_ordering;
 mod xtrace_conformance;
 #[path = "scheduling/zero_delay_inactive_region.rs"]
 mod zero_delay_inactive_region;
+#[path = "scheduling/zero_delay_task_recursion.rs"]
+mod zero_delay_task_recursion;
 
 #[path = "scheduling/compiled_for_loops.rs"]
 mod compiled_for_loops;

@@ -72,6 +72,10 @@ extern "C" fn handle_interrupt_alarm(_sig: libc::c_int) {
     }
 }
 
+/// Whether `install_interrupt_handler` has run, so `take_pending_interrupt`
+/// never unblocks a signal whose default action would end the process.
+static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
 /// Install the SIGINT/SIGTERM handler and the SIGALRM backstop, once.
 pub(crate) fn install_interrupt_handler() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -88,7 +92,58 @@ pub(crate) fn install_interrupt_handler() {
             libc::SIGALRM,
             handle_interrupt_alarm as *const () as libc::sighandler_t,
         );
+        HANDLER_INSTALLED.store(true, Ordering::Relaxed);
     });
+}
+
+/// The exit status of a run that SIGINT or SIGTERM stopped: 128 plus the
+/// signal number (130, 143), the status a shell reports for a process that
+/// signal ended. The run still leaves through its normal exit and finalizes
+/// its dumps first, but a harness must not take a killed run for a passing
+/// one. `None` when no signal stopped the run.
+pub fn interrupted_exit_status() -> Option<i32> {
+    take_pending_interrupt();
+    let sig = INTERRUPT_SIGNAL.load(Ordering::Relaxed);
+    (sig != 0).then_some(128 + sig)
+}
+
+/// Let a SIGINT or SIGTERM that is pending for the process run its handler
+/// before the exit status is decided. Linux offers a signal sent to the
+/// process or its group to the main thread first, and the main thread only
+/// waits for the simulation thread, so it handles the signal whenever it is
+/// next scheduled. A run that signals its own group (`kill(0, SIGTERM)` from
+/// a VPI routine) could therefore end and pick its status before the handler
+/// set the flag, and exit 0 or 143 by timing. Blocking the two signals here
+/// makes `sigpending` report one the process has not taken yet; unblocking
+/// them again delivers it, on this thread or the main one, and this waits
+/// (100 ms at most) until the handler has recorded it.
+fn take_pending_interrupt() {
+    if !HANDLER_INSTALLED.load(Ordering::Relaxed) || INTERRUPT_SIGNAL.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let pending = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+        let mut pend: libc::sigset_t = std::mem::zeroed();
+        libc::sigpending(&mut pend);
+        let pending = libc::sigismember(&pend, libc::SIGINT) == 1
+            || libc::sigismember(&pend, libc::SIGTERM) == 1;
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        pending
+    };
+    // `INTERRUPTED` is set first, so a handler that is already running on
+    // the main thread is waited for too.
+    if pending || INTERRUPTED.load(Ordering::Relaxed) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        while INTERRUPT_SIGNAL.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+    }
 }
 
 /// Whether Ctrl-C / SIGTERM asked the run to stop. Stays true after the
