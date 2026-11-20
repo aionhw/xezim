@@ -94,21 +94,24 @@ impl Simulator {
         let mut path = String::new();
         let mut selected = false;
         append(expr, &self.module, &mut path, &mut selected)?;
-        // An ordinary array element keeps its unpacked and packed selectors:
-        // its declaration supplies packed lane widths, bounds and pattern types.
-        // Only an indexed scope in the path hides the stored leaf from them.
-        if !selected || !path.rsplit_once('.').is_some_and(|(scope, _)| scope.contains(']')) {
+        if !selected {
             return None;
         }
         let rooted = path.strip_prefix("$root.");
         let name = rooted.unwrap_or(&path);
-        if rooted.is_none() && self.signal_name_to_id.contains_key(name) {
-            return Some(path);
-        }
-        let short = name.strip_prefix(&self.module.name)?.strip_prefix('.')?;
-        self.signal_name_to_id
-            .contains_key(short)
-            .then(|| short.to_string())
+        let stored = if rooted.is_none() && self.signal_name_to_id.contains_key(name) {
+            name
+        } else {
+            let short = name.strip_prefix(&self.module.name)?.strip_prefix('.')?;
+            self.signal_name_to_id.get(short)?;
+            short
+        };
+        // Ordinary arrays need their selectors for packed bounds and element
+        // types. An indexed scope or an unpacked struct member instead names
+        // a separately stored leaf, which a delayed write needs to address.
+        let (owner, _) = stored.rsplit_once('.')?;
+        (owner.contains(']') || self.module.struct_members.contains_key(owner))
+            .then(|| stored.to_string())
     }
 
     /// An `Ident` whose single segment is already the fully-qualified stored
@@ -132,19 +135,6 @@ impl Simulator {
             }),
             span,
         )
-    }
-
-    /// The stored (`signal_name_to_id`) name a hierarchical path stands for
-    /// when that path enters a scope through an INDEX, or `None` for any
-    /// other shape.
-    pub(super) fn indexed_hier_flat_name(&self, e: &Expression) -> Option<String> {
-        // A plain `u.sig` already folds upstream, and a select on the LAST
-        // segment (`u.sig[2]`) is an ordinary leaf select that compiles
-        // today; only a scope ENTERED through a select needs this.
-        if !matches!(e.kind, ExprKind::MemberAccess { .. }) {
-            return None;
-        }
-        self.select_entered_stored_name(e)
     }
 
     /// #1108, §9.4.2: an element of an unpacked array in a scope entered
