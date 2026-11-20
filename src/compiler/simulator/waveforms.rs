@@ -262,9 +262,16 @@ impl Simulator {
         match &e.kind {
             ExprKind::Paren(inner) => self.dump_scope_arg(inner),
             ExprKind::Ident(hier) => {
-                // A package- or `$unit`-qualified root is not a signal-table
-                // path; `$root` is a marker the table's names do not carry.
-                if hier.root.is_some() {
+                // A `$root` ROOT (not a `$root.` first segment) is the
+                // elaborator's mark on a name it has already resolved to an
+                // absolute signal-table path: an upward or cross-top
+                // reference (§23.6, §23.8), such as `tb_top.u` named in a
+                // second top-level module, which arrives as the rooted
+                // `tb_top.u`. Its segments are that path, so join them like
+                // any other; rejecting every rooted name dropped the argument
+                // and the dump selected nothing (§21.7.1.2). Any other root
+                // (`local::`, §18.7.1) is not a scope.
+                if hier.root.as_deref().is_some_and(|r| r != "$root") {
                     return None;
                 }
                 let skip_root =
