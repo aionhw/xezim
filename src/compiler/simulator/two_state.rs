@@ -4392,10 +4392,14 @@ impl Simulator {
                 let (Some(cid), Some(pid)) = (mirror.ids[c], mirror.ids[p]) else {
                     continue;
                 };
+                // §6.11.2, §23.3.3.2: a 2-state formal of a 4-state actual
+                // keeps the connect that drops X and Z; sharing the actual's
+                // id read them through.
                 if cid == pid
                     || self.signal_widths[cid] != self.signal_widths[pid]
                     || self.signal_signed[cid] != self.signal_signed[pid]
                     || self.signal_real[cid] != self.signal_real[pid]
+                    || (self.signal_two_state[cid] && !self.signal_two_state[pid])
                 {
                     continue;
                 }
