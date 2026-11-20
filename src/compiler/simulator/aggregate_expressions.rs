@@ -1416,6 +1416,34 @@ impl Simulator {
         })
     }
 
+    /// §23.2.2.3, §7.4.1: the type of a packed vector whose declaration is
+    /// not on file, from the dimensions elaboration recorded for it. An ANSI
+    /// port of an instantiated module (`output logic [0:0][31:1] f`) is
+    /// registered with its dimensions and width but no declared type, so its
+    /// nested selects missed the declaration walk below and took the generic
+    /// select path. For a plain vector those dimensions are all the type has.
+    fn recorded_vector_type(&self, name: &str) -> Option<DataType> {
+        let dims = self.module.packed_full_dims.get(name)?;
+        let id = *self.signal_name_to_id.get(name)?;
+        let mut total: u64 = 1;
+        for &(l, r) in dims {
+            total = total.checked_mul(l.abs_diff(r) + 1)?;
+        }
+        if dims.len() < 2 || total != u64::from(self.signal_widths[id]) {
+            return None;
+        }
+        Some(DataType::IntegerVector {
+            kind: if self.module.two_state_signals.contains(name) {
+                crate::ast::types::IntegerVectorType::Bit
+            } else {
+                crate::ast::types::IntegerVectorType::Logic
+            },
+            signing: self.signal_signed[id].then_some(crate::ast::types::Signing::Signed),
+            dimensions: Vec::new(),
+            span: crate::ast::Span::dummy(),
+        })
+    }
+
     pub(super) fn declared_packed_access(
         &mut self,
         expr: &Expression,
@@ -1475,7 +1503,14 @@ impl Simulator {
                 if self.is_associative_array(&name) {
                     return None;
                 }
-                let dt = self.module.var_decl_types.get(&name)?;
+                let recorded_type;
+                let dt = match self.module.var_decl_types.get(&name) {
+                    Some(dt) => dt,
+                    None => {
+                        recorded_type = self.recorded_vector_type(&name)?;
+                        &recorded_type
+                    }
+                };
                 // §23.10: a declaration inside an instantiated module sizes its
                 // dimensions with THAT instance's parameters, which the
                 // design-wide table keys as `<inst>.N`. Evaluated against that
