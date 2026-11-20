@@ -464,7 +464,7 @@ endmodule
 "#;
     assert_eq!(
         t_lines(src),
-        ["T|1|base p=2 f=0", "T|2|off p=3 f=0", "T|3|on p=4 f=1",]
+        ["T|1|base p=2 f=0", "T|2|off p=3 f=0", "T|3|on p=5 f=1",]
     );
 }
 

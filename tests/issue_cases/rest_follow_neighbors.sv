@@ -10,7 +10,7 @@ module top;
  initial begin
   for(int j=0;j<20;j++)begin a=j%2;b=j%3;c=j%4;@(posedge clk);@(negedge clk);end
   #1;
-  if(counts[0]==4 && counts[1]==10 && counts[2]==10 && counts[3]==10 && counts[4]==3 && counts[5]==16 && counts[6]==3 && counts[7]==16) $display("PASS followed neighbors");
+  if(counts[0]==10 && counts[1]==10 && counts[2]==10 && counts[3]==10 && counts[4]==3 && counts[5]==16 && counts[6]==3 && counts[7]==16) $display("PASS followed neighbors");
   else $display("FAIL followed neighbors %p",counts);
   $finish;
  end

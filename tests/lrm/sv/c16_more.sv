@@ -1,5 +1,7 @@
 // top: c16_more
 module c16_more;
+  // The trace records nonvacuous matches and failures.
+  initial $assertvacuousoff(0);
   bit clk, a, b, c; int k;
   always #5 clk = ~clk;
   bit [3:0] va [0:9] = '{4'b0001,4'b0010,4'b0100,4'b0001,4'b0011,4'b0110,4'b0000,4'b0001,4'b0000,4'b0000};
