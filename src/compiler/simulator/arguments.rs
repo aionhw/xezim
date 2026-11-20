@@ -2516,16 +2516,27 @@ impl Simulator {
             let param = self.array_formal_key(port);
             let callers = self.nd_formal_suffixes(&caller)?;
             let declared = self.declared_fixed_dims(&dims)?;
-            let numeric: Vec<_> = declared.iter().map(|&(l,r)| (l.min(r),l.max(r))).collect();
+            let numeric: Vec<_> = declared
+                .iter()
+                .map(|&(l, r)| (l.min(r), l.max(r)))
+                .collect();
             let suffixes = Self::nd_elem_suffixes(&declared);
-            let w = self.module.arrays_2d.get(&*caller).map(|s|s.2)
-                .or_else(||self.module.arrays_nd.get(&*caller).map(|s|s.1))?;
+            let w = self
+                .module
+                .arrays_2d
+                .get(&*caller)
+                .map(|s| s.2)
+                .or_else(|| self.module.arrays_nd.get(&*caller).map(|s| s.1))?;
             if numeric.len() == 2 {
-                self.module.arrays_2d.insert(param.clone(),(numeric[0],numeric[1],w));
+                self.module
+                    .arrays_2d
+                    .insert(param.clone(), (numeric[0], numeric[1], w));
             } else {
-                self.module.arrays_nd.insert(param.clone(),(numeric,w));
+                self.module.arrays_nd.insert(param.clone(), (numeric, w));
             }
-            self.module.unpacked_decl_dims.insert(param.clone(), declared);
+            self.module
+                .unpacked_decl_dims
+                .insert(param.clone(), declared);
             self.multi_dim_array_names.insert(param.clone());
             if param != caller {
                 let w = match self.module.arrays_2d.get(&param) {
@@ -2664,21 +2675,35 @@ impl Simulator {
 
     /// §7.6: storage bounds are normalized; positional operations start at the
     /// declared left bound of each remaining dimension.
-    pub(super) fn nd_ordered_suffixes(&self, name: &str, shape: &[(i64, i64)], skip: usize) -> Vec<String> {
+    pub(super) fn nd_ordered_suffixes(
+        &self,
+        name: &str,
+        shape: &[(i64, i64)],
+        skip: usize,
+    ) -> Vec<String> {
         let declared = self.unpacked_decl_dims_of(name);
-        let ordered = declared.as_deref().filter(|dims| dims.len() == shape.len())
+        let ordered = declared
+            .as_deref()
+            .filter(|dims| dims.len() == shape.len())
             .unwrap_or(shape);
         Self::nd_elem_suffixes(&ordered[skip..])
     }
 
-    pub(super) fn declared_fixed_dims(&self, dims: &[crate::ast::types::UnpackedDimension]) -> Option<Vec<(i64, i64)>> {
+    pub(super) fn declared_fixed_dims(
+        &self,
+        dims: &[crate::ast::types::UnpackedDimension],
+    ) -> Option<Vec<(i64, i64)>> {
         use crate::ast::types::UnpackedDimension as D;
-        let bound = |e: &Expression| super::elaborate::const_eval_i64_with_params(e, Some(&self.module.parameters));
-        dims.iter().map(|dim| match dim {
-            D::Range {left, right, ..} => Some((bound(left)?, bound(right)?)),
-            D::Expression {expr, ..} => Some((0, bound(expr)?-1)),
-            _ => None,
-        }).collect()
+        let bound = |e: &Expression| {
+            super::elaborate::const_eval_i64_with_params(e, Some(&self.module.parameters))
+        };
+        dims.iter()
+            .map(|dim| match dim {
+                D::Range { left, right, .. } => Some((bound(left)?, bound(right)?)),
+                D::Expression { expr, .. } => Some((0, bound(expr)? - 1)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Element suffixes of a name registered as a multi-dimensional array.
@@ -2787,7 +2812,7 @@ impl Simulator {
                 };
                 let rest: Vec<(i64, i64)> =
                     if let Some(&(a, b, _)) = self.module.arrays_2d.get(&*name) {
-                        vec![a,b]
+                        vec![a, b]
                     } else if let Some((shape, _)) = self.module.arrays_nd.get(&*name) {
                         if shape.len() < 2 {
                             return None;
@@ -2926,7 +2951,9 @@ impl Simulator {
                         .p_elem_type(param)
                         .or_else(|| self.p_elem_type(caller))
                         .and_then(|dt| self.unpacked_struct_of(&dt));
-                    let Some(destinations) = self.nd_formal_suffixes(caller) else { continue; };
+                    let Some(destinations) = self.nd_formal_suffixes(caller) else {
+                        continue;
+                    };
                     for (sfx, dst) in sfxs.iter().zip(destinations) {
                         if let Some(su) = &elem_su {
                             let (d, s) =

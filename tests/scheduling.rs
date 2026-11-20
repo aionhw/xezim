@@ -297,6 +297,7 @@ mod comb_sens_param_range;
 mod comb_self_member_sensitivity;
 #[path = "scheduling/delay_always_compound_body.rs"]
 mod delay_always_compound_body;
+#[path = "scheduling/delayed_struct_array_member.rs"] mod delayed_struct_array_member;
 #[path = "scheduling/delayed_write_pending_semantics.rs"]
 mod delayed_write_pending_semantics;
 #[path = "scheduling/edge_skip_shared_output.rs"]
