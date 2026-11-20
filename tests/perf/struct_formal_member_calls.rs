@@ -7,8 +7,14 @@
 //! count; the digest is the reference simulator's.
 
 fn run_profiled(src: &str) -> String {
-    let dir =
-        std::env::temp_dir().join(format!("xezim_struct_formal_calls_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "xezim_struct_formal_calls_{}_{}",
+        std::process::id(),
+        std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .replace(':', "_")
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temporary directory");
     let path = dir.join("design.sv");
@@ -135,4 +141,46 @@ endmodule
         })
         .unwrap_or_else(|| panic!("missing fallback count:\n{text}"));
     assert_eq!(fallbacks, "0", "{text}");
+}
+
+/// §7.2, §13.5: each member of a whole struct result keeps its real value.
+#[test]
+fn whole_struct_constructor_compiles() {
+    let text = run_profiled(
+        r#"`timescale 1ns/1ps
+module top;
+  typedef struct { real v; real i; real r; } rec;
+  function automatic rec through(input rec a, input rec b);
+    rec t;
+    t.v = (a.v + b.v) * 0.5;
+    t.i = a.i - b.i;
+    t.r = a.r + b.r;
+    return t;
+  endfunction
+  rec p, n, q;
+  int k;
+  always_comb q = through(p, n);
+  initial begin
+    for (k = 0; k < 16; k++) begin
+      p.v = k; p.i = 1.0; p.r = 2.0;
+      n.v = 1.0; n.i = 0.5; n.r = 3.0;
+      #1;
+    end
+    $display("q.v=%g q.i=%g q.r=%g", q.v, q.i, q.r);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(text.contains("q.v=8 q.i=0.5 q.r=5"), "{text}");
+    let profile = text
+        .lines()
+        .find(|l| l.starts_with("[PROF] edge_detect="))
+        .expect("profile");
+    assert!(
+        profile
+            .split_whitespace()
+            .any(|field| field == "fallbacks=0"),
+        "{text}"
+    );
 }

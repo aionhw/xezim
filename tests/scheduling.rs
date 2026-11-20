@@ -89,6 +89,8 @@ mod comb_result_clobbered_by_process;
 mod computed_edge_expressions;
 #[path = "scheduling/condition_waiter_name_gate.rs"]
 mod condition_waiter_name_gate;
+#[path = "scheduling/continuous_assign_time_unit.rs"]
+mod continuous_assign_time_unit;
 #[path = "scheduling/dead_clock_watchdog.rs"]
 mod dead_clock_watchdog;
 #[path = "scheduling/decl_init_time_literal_scaling.rs"]
@@ -107,6 +109,8 @@ mod determinism_and_stall;
 mod disable_loop_label;
 #[path = "scheduling/disable_own_block_and_loop_jumps.rs"]
 mod disable_own_block_and_loop_jumps;
+#[path = "scheduling/disable_same_named_blocks.rs"]
+mod disable_same_named_blocks;
 #[path = "scheduling/edge_delivery.rs"]
 mod edge_delivery;
 #[path = "scheduling/edge_event_lsb.rs"]
@@ -291,10 +295,13 @@ mod clock_gen_fifo_rank;
 mod clocking_cont_trigger_same_step;
 #[path = "scheduling/comb_packed_element_sensitivity.rs"]
 mod comb_packed_element_sensitivity;
+#[path = "scheduling/comb_sens_param_range.rs"]
+mod comb_sens_param_range;
 #[path = "scheduling/comb_self_member_sensitivity.rs"]
 mod comb_self_member_sensitivity;
 #[path = "scheduling/delay_always_compound_body.rs"]
 mod delay_always_compound_body;
+#[path = "scheduling/delayed_struct_array_member.rs"] mod delayed_struct_array_member;
 #[path = "scheduling/delayed_write_pending_semantics.rs"]
 mod delayed_write_pending_semantics;
 #[path = "scheduling/edge_skip_shared_output.rs"]

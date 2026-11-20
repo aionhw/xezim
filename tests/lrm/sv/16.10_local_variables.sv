@@ -1,5 +1,6 @@
 // top: t16_10
 module t16_10;
+  initial $assertvacuousoff(0);
   bit clk, start, done; int din, dout;
   always #5 clk = ~clk;
   initial begin

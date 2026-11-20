@@ -1098,11 +1098,7 @@ impl Simulator {
         }
         let fitted = match self.heap_prop_width(handle, prop) {
             Some(w) => {
-                let mut fitted = if w != val.width {
-                    val.resize_for_assign(w)
-                } else {
-                    val.clone()
-                };
+                let mut fitted = val.resize_for_assign(w);
                 fitted.is_signed = self.class_prop_signed_of(handle, prop);
                 fitted
             }

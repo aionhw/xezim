@@ -51,6 +51,8 @@ mod format_lrm_compliance;
 mod format_real_integral_889;
 #[path = "strings/format_sibling_fixes.rs"]
 mod format_sibling_fixes;
+#[path = "strings/fscanf_whitespace_directive_eof.rs"]
+mod fscanf_whitespace_directive_eof;
 #[path = "strings/fwrite_buffered_flush_points.rs"]
 mod fwrite_buffered_flush_points;
 #[path = "strings/fwrite_mcd_fd.rs"]
@@ -93,6 +95,8 @@ mod ref_arg_assoc_writeback;
 mod ref_arg_collection_writeback;
 #[path = "strings/review_vpi_unlabelled_block_data.rs"]
 mod review_vpi_unlabelled_block_data;
+#[path = "strings/scanf_four_state_digits.rs"]
+mod scanf_four_state_digits;
 #[path = "strings/string_eq_relational_2state.rs"]
 mod string_eq_relational_2state;
 #[path = "strings/string_index_write_frame_local.rs"]
@@ -133,6 +137,8 @@ mod vpi_array_ports;
 mod vpi_assertion_controls;
 #[path = "strings/vpi_callbacks.rs"]
 mod vpi_callbacks;
+#[path = "strings/vpi_deposit_unchanged_driver.rs"]
+mod vpi_deposit_unchanged_driver;
 #[path = "strings/vpi_mcd_and_time_queries.rs"]
 mod vpi_mcd_and_time_queries;
 #[path = "strings/vpi_net_kinds.rs"]

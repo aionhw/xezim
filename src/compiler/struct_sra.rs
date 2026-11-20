@@ -88,6 +88,53 @@ fn bare_name(e: &Expression) -> Option<&str> {
     }
 }
 
+/// A side-effect-free constructor can be projected once per destination member.
+/// Only an automatic local may be written; calls and effectful actuals retain
+/// the ordinary single-call path.
+pub(crate) fn projectable_constructor(fd: &FunctionDeclaration, args: &[Expression]) -> bool {
+    if fd.lifetime != Some(crate::ast::types::Lifetime::Automatic)
+        || !args.iter().all(effect_free)
+        || !fd.ports.iter().all(|p| p.direction == PortDirection::Input)
+    {
+        return false;
+    }
+    let Some((last, stmts)) = fd.items.split_last() else {
+        return false;
+    };
+    let StatementKind::Return(Some(result)) = &last.kind else {
+        return false;
+    };
+    let Some(local) = bare_name(result) else {
+        return false;
+    };
+    let Some((decl, writes)) = stmts.split_first() else {
+        return false;
+    };
+    let StatementKind::VarDecl { declarators, .. } = &decl.kind else {
+        return false;
+    };
+    if declarators.len() != 1 || declarators[0].name.name != local || declarators[0].init.is_some()
+    {
+        return false;
+    }
+    writes.iter().all(|stmt| {
+        let StatementKind::BlockingAssign { lvalue, rvalue } = &stmt.kind else {
+            return false;
+        };
+        let local_field = match &lvalue.kind {
+            ExprKind::MemberAccess { expr, .. } => bare_name(expr) == Some(local),
+            ExprKind::Ident(h) => {
+                h.root.is_none()
+                    && h.path.len() == 2
+                    && h.path[0].name.name == local
+                    && h.path.iter().all(|p| p.selects.is_empty())
+            }
+            _ => false,
+        };
+        local_field && effect_free(rvalue)
+    })
+}
+
 /// True when evaluating `e` has no effect: names, literals and operators over
 /// them. A call, an increment or an assignment may, so a part holding one
 /// must not be dropped or evaluated once per member (§13.5).

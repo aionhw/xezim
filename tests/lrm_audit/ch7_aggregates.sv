@@ -1,5 +1,6 @@
 // IEEE 1800-2017 Ch.7 — aggregate types
 module tb;
+  typedef int int_queue_t[$];
   int fails = 0;
   `define CK(name, cond) if (!(cond)) begin $display("FAIL[7] %s", name); fails++; end
   initial begin
@@ -69,8 +70,8 @@ module tb;
       int a[5] = '{4, 1, 3, 5, 2};
       int q[$], idx[$];
       `CK("sum", a.sum() == 15)
-      `CK("min", a.min() == '{1})
-      `CK("max", a.max() == '{5})
+      `CK("min", a.min() == int_queue_t'{1})
+      `CK("max", a.max() == int_queue_t'{5})
       q = a.find with (item > 2);
       `CK("find", q.size() == 3)
       idx = a.find_first_index with (item == 3);

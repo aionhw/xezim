@@ -283,6 +283,8 @@ mod shadow_name_matrix;
 mod simulation_version_banner;
 #[path = "misc/spec_static_and_pkg_queue.rs"]
 mod spec_static_and_pkg_queue;
+#[path = "misc/struct_member_unselected_generate.rs"]
+mod struct_member_unselected_generate;
 #[path = "misc/struct_members_and_constant_targets.rs"]
 mod struct_members_and_constant_targets;
 #[path = "misc/subroutine_port_redeclaration.rs"]
@@ -297,6 +299,8 @@ mod svtb_suite;
 mod system_task_value;
 #[path = "misc/time0_x_defaults.rs"]
 mod time0_x_defaults;
+#[path = "misc/unelaborated_top_port_connections.rs"]
+mod unelaborated_top_port_connections;
 #[path = "misc/unnamed_block_end_label.rs"]
 mod unnamed_block_end_label;
 #[path = "misc/unsized_decimal_wrap_warning.rs"]

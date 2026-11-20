@@ -12445,18 +12445,8 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
-    /// §11.8.2 operators with a REAL operand. Neither operand real: None, and
-    /// the integral rules apply. Otherwise:
-    /// - an arithmetic operator's result is real, so each integral operand is
-    ///   evaluated SELF-determined and then converted. The surrounding context
-    ///   width never reaches it — `(u - 2) * 1.0` with `int unsigned u = 1`
-    ///   converts the 32-bit 4294967295, not a 64-bit all-ones;
-    /// - a relational or equality operator's operands take real type from
-    ///   each other, so the real type propagates ONE operator into the
-    ///   integral side, whose own operands are then self-determined (see
-    ///   `compile_in_real_context`): `3.5 == 7/2` compares 3.5 with 3.5. As
-    ///   in the reference simulator, this happens only for a constant
-    ///   integral side; a run-time one is converted whole.
+    /// §11.8.2: integral operands of real arithmetic and comparisons are
+    /// self-determined before conversion, including constant expressions.
     fn compile_real_operator(
         &mut self,
         op: BinaryOp,
@@ -12484,26 +12474,10 @@ impl<'a> BytecodeCompiler<'a> {
         if !lr && !rr {
             return None;
         }
-        // The reference simulator propagates into a comparison only when the
-        // integral side is itself CONSTANT (`3.5 == 7/2` divides as reals);
-        // a run-time integral side is converted from its self-determined
-        // value (`x == a/b` divides as integers).
-        let lp = cmp && !lr && self.expr_is_constant(left);
-        let rp = cmp && !rr && self.expr_is_constant(right);
-        let l = if lp {
-            self.compile_in_real_context(left)
-        } else {
-            self.compile_real_operand(left, lr)
-        };
-        let Some(l) = l else {
+        let Some(l) = self.compile_real_operand(left, lr) else {
             return Some(None);
         };
-        let r = if rp {
-            self.compile_in_real_context(right)
-        } else {
-            self.compile_real_operand(right, rr)
-        };
-        let Some(r) = r else {
+        let Some(r) = self.compile_real_operand(right, rr) else {
             return Some(None);
         };
         Some(Some(self.emit_real_binop(op, l, r)))
@@ -15098,6 +15072,35 @@ impl<'a> BytecodeCompiler<'a> {
             return Some(false);
         };
         let dst = map.get(&dst)?;
+        // §7.2 / §13.5: project an automatic scalar-member constructor to
+        // registers, then scatter. The destination may also be an actual.
+        if nb_delay.is_none()
+            && let ExprKind::Call { func, args } = &rvalue.kind
+        {
+            let ExprKind::Ident(h) = &func.kind else { return Some(false); };
+            let [segment] = h.path.as_slice() else { return Some(false); };
+            let constructor = self.scoped_callee_name(segment.name.name.clone())
+                .and_then(|name| self.functions?.get(&name));
+            if !constructor.is_some_and(|f| super::struct_sra::projectable_constructor(f, args)) {
+                return Some(false);
+            }
+            let leaves: Option<Vec<_>> = dst.iter().map(|(member, leaf)| {
+                let id = self.signal_name_to_id.get(leaf.as_str()).copied()?;
+                Some((member.clone(), id, *self.signal_widths.get(id)?))
+            }).collect();
+            let Some(leaves) = leaves else { return Some(false); };
+            let mut writes = Vec::with_capacity(leaves.len());
+            for (member, id, width) in leaves {
+                let Some(value) = self.compile_struct_member_call(func, args, &member) else {
+                    return Some(false);
+                };
+                writes.push(Insn::BlockingAssign(as_sig_id(id), value, width));
+            }
+            for insn in writes {
+                self.emit(insn);
+            }
+            return Some(true);
+        }
         let Some(src) = id_of(rvalue).flatten().and_then(|id| map.get(&id)) else {
             return Some(false);
         };
@@ -19259,19 +19262,24 @@ impl<'a> BytecodeCompiler<'a> {
                     ));
                     Some(dst)
                 }
-                "$signed" => {
-                    let r = self.compile_expr(args.first()?, 0)?;
-                    self.emit(Insn::SetSigned(r));
-                    Some(r)
-                }
-                "$unsigned" => {
-                    // §6.24.1: reinterpret as unsigned. This was a NO-OP,
-                    // so the operand kept its runtime signed flag and the
-                    // context Resize SIGN-extended — `unsigned'(sa)` in a
-                    // 32-bit context read fffffff4 instead of 000000f4
-                    // (the $display path was already correct).
-                    let r = self.compile_expr(args.first()?, 0)?;
-                    self.emit(Insn::ClearSigned(r));
+                "$signed" | "$unsigned" => {
+                    // §6.24.1: the sign conversion consumes a literal's fill.
+                    let arg = args.first()?;
+                    let signed = name == "$signed";
+                    let mut operand = arg;
+                    while let ExprKind::Paren(inner) = &operand.kind {
+                        operand = inner;
+                    }
+                    if let ExprKind::Number(n) = &operand.kind {
+                        let mut v = self.eval_number_static(n)?;
+                        v.is_fill = false;
+                        v.is_signed = signed;
+                        let dst = self.alloc_reg();
+                        self.emit(Insn::LoadConst(dst, Box::new(v)));
+                        return Some(dst);
+                    }
+                    let r = self.compile_expr(arg, 0)?;
+                    self.emit(if signed { Insn::SetSigned(r) } else { Insn::ClearSigned(r) });
                     Some(r)
                 }
                 "$__xz_size_cast" => {

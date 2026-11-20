@@ -399,22 +399,26 @@ impl Simulator {
                             _ => 10,
                         };
                         let signed = matches!(spec, 'd' | 'i');
-                        let negative =
-                            signed && input.take_if(self, |c| matches!(c, '-' | '+')) == Some('-');
-                        let mut text = input.token(self, w, |c| c.is_digit(radix) || c == '_');
-                        if text.is_empty() {
-                            break;
-                        }
-                        text.retain(|c| c != '_');
-                        // The scan above admits `char::is_digit`, which is
-                        // Unicode-aware, so a non-ASCII digit can land here.
-                        // `from_str_radix` would answer X; `$sscanf` has to
-                        // report a failed conversion and stop, the way the old
-                        // `i64::from_str_radix` returning `Err` did.
-                        if text
-                            .bytes()
-                            .any(|b| !b.is_ascii() || (b as char).to_digit(radix).is_none())
+                        let sign = if signed {
+                            input.take_if(self, |c| matches!(c, '-' | '+'))
+                        } else {
+                            None
+                        };
+                        let remaining = w - usize::from(sign.is_some());
+                        let negative = sign == Some('-');
+                        let is_four_state = |c| matches!(c, 'x' | 'X' | 'z' | 'Z' | '?');
+                        // §21.3.4.3: a decimal x/z represents the entire value.
+                        let mut text = if signed && remaining > 0
+                            && let Some(digit) = input.take_if(self, is_four_state)
                         {
+                            digit.to_string()
+                        } else {
+                            input.token(self, remaining, |c| {
+                                c.is_digit(radix) || c == '_' || (!signed && is_four_state(c))
+                            })
+                        };
+                        text.retain(|c| c != '_');
+                        if text.is_empty() {
                             break;
                         }
                         let dest_width = outs

@@ -282,3 +282,69 @@ endmodule
     // And the instance still owns its copies.
     assert_eq!(g("u_s.shared_name"), 0xDD);
 }
+
+/// §27.5 and §23.3.2: lookup follows the selected branches and instances,
+/// including an override in just one of several instances of a definition.
+#[test]
+fn struct_member_lint_uses_instance_generate_selection() {
+    let dir = std::env::temp_dir().join(format!("xezim_generate_lint_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = r#"
+package p;
+  typedef struct packed { logic [7:0] a; } s_t;
+endpackage
+module child #(parameter bit Full = 1, Enable = 0) (output logic [7:0] o);
+  import p::*;
+  s_t r;
+  assign r.a = 8'h5a;
+  if (Enable) begin : outer
+    if (Full) begin : bad
+      assign o = r.missing;
+    end else assign o = r.a;
+  end else assign o = r.a;
+endmodule
+module legal;
+  wire [7:0] a,b;
+  child #(.Full(1), .Enable(0)) one(a);
+  child #(.Full(0), .Enable(1)) two(b);
+  initial #1 $display("values %h %h", a,b);
+endmodule
+module bad_member;
+  wire [7:0] o;
+  child #(.Full(1), .Enable(1)) bad(o);
+endmodule
+module bad_port;
+  child u(.unknown());
+endmodule
+"#;
+    let path = dir.join("check.sv");
+    std::fs::write(&path, src).unwrap();
+    for (top, diagnostic) in [
+        ("legal", None),
+        ("bad_member", Some("'missing' is not a member")),
+        ("bad_port", Some("port 'unknown'")),
+    ] {
+        let run = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+            .args(["--no-cache", "-s", top])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        if let Some(diagnostic) = diagnostic {
+            assert!(
+                !run.status.success() && output.contains(diagnostic),
+                "{top}: {output}"
+            );
+        } else {
+            assert!(
+                run.status.success() && output.contains("values 5a 5a"),
+                "{top}: {output}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

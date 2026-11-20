@@ -5774,8 +5774,7 @@ impl Simulator {
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
                 if let Some(nm) = block_name {
-                    self.fork_block_children
-                        .insert(nm.name.clone(), child_pids.clone());
+                    self.register_named_fork(&nm.name, &child_pids);
                 }
 
                 // An empty fork (or one whose only items were declarations)

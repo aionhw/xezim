@@ -1,5 +1,7 @@
 // top: c16_local
 module c16_local;
+  // The trace records nonvacuous matches and failures.
+  initial $assertvacuousoff(0);
   bit clk; bit start, done; int din, dout; bit rst;
   always #5 clk = ~clk;
   initial begin

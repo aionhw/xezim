@@ -42,7 +42,7 @@ class cfg;
 endclass
 class user;
   cfg c = new();
-  function void outer();
+  task outer();
     string str[$];
     int n;
     str = {"first", "second"};
@@ -51,7 +51,7 @@ class user;
     c.tparse("abc", n);
     $display("task %0d", n);
     $display("own %0d", str.size());
-  endfunction
+  endtask
 endclass
 module t;
   initial begin

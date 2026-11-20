@@ -4370,7 +4370,8 @@ impl Simulator {
         let mut port_links: Vec<(usize, usize)> = Vec::new();
         for (lhs_name, rhs_name) in &port_candidates {
             let (child, parent): (&str, &str) = (lhs_name, rhs_name);
-            if self.module.port_aliases.get(child).map(String::as_str) != Some(parent)
+            if self.module.sampled_input_ports.contains(child)
+                || self.module.port_aliases.get(child).map(String::as_str) != Some(parent)
                 || ca_driver_counts.get(child).copied().unwrap_or(0) != 1
                 || self.module.events.contains(child)
                 || self.module.events.contains(parent)
@@ -4496,7 +4497,8 @@ impl Simulator {
                         return None;
                     }
                     let (ln, rn) = (flat_name(lh, &self.module), flat_name(rh, &self.module));
-                    if alias_members.contains(ln.as_ref())
+                    if self.module.sampled_input_ports.contains(ln.as_ref())
+                        || alias_members.contains(ln.as_ref())
                         || alias_members.contains(rn.as_ref())
                     {
                         return None;

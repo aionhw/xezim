@@ -42,11 +42,11 @@ fn unary_neighbors() {
     );
 }
 
-/// §11.8.2: a real context reaches a constant operand; a run-time formal stays integral.
+/// §11.8.2: both the parameter and the formal wrap at their unsigned width.
 #[test]
 fn unsigned_negation_real_context() {
     check(
         include_str!("../issue_cases/next_real_unary_context.sv"),
-        &["MODULE 0", "FUNCTION 1"],
+        &["MODULE 1", "FUNCTION 1"],
     );
 }

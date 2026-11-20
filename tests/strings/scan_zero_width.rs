@@ -151,3 +151,19 @@ endmodule
         );
     }
 }
+
+#[test]
+fn scanf_four_state_integer_digits() {
+    let sim = simulate(r#"
+module top;
+  logic [3:0] binary_value;
+  logic [7:0] hex_value, oct_value, dec_value;
+  int n;
+  initial begin
+    n = $sscanf("Xx1? x1 1z Z", "%b %h %o %d", binary_value, hex_value, oct_value, dec_value);
+    $display("%0d %b %b %b %b", n, binary_value, hex_value, oct_value, dec_value);
+  end
+endmodule
+"#, 100).unwrap();
+    assert!(sim.output.iter().any(|line| line.message == "4 xx1z xxxx0001 00001zzz zzzzzzzz"));
+}

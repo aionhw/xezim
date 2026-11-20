@@ -8,6 +8,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Check type names in selected generate branches, retain instance-specific sensitivity widths, and preserve cross-top waveform selections (#1374, #1375, #1378).
+- **Correctness:** Read four-state digits in integer scan conversions, store unpacked concatenations in fixed queue rows, and resolve rooted queue-element members (#1377, #1379, #1380).
+- **Correctness:** Evaluate continuous-assignment time queries in their declaring instance, retain VPI deposits until a driver changes, and sample input-net defaults on clock edges (#1381, #1382, #1356).
+- **Correctness:** Evaluate integral operands at their declared width before a real comparison and apply the real default to an ambiguous conditional result (#1344, #1345).
+- **Performance:** Compile supported whole unpacked-structure constructor assignments. On a 2,000-iteration reproducer, the median instruction count across three Callgrind runs fell from 760,750,106 to 216,426,263. The scalar control used 65,620,020 and 65,804,112 instructions respectively (#1394).
+- **Correctness:** Bind whole interface-array ports by position, fold header array parameters in the declaring instance, honor inferred pull net types, and size fill literals through comparisons (#1402, #1404, #1400, #1399).
+- **Correctness:** Drive nested unpacked leaves at their declared widths, copy fixed rows in declaration order, resolve drivers per wire-array element and delay whole unpacked structures (#1403, #1398, #1395, #1393).
+- **Correctness:** Resolve named fork activations in their declaring scope, describe types in declared dimension order, and apply packed assignment-pattern defaults recursively (#1396, #1348, #1343).
 - **Correctness:** Use the declared clocking edge for bare clocking block waits and default clocking cycle delays (§14.10–11, #1332).
 - Store contiguous fixed class-array elements in dense runs while retaining their declared widths and typed values (#1053).
 
@@ -18,6 +26,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 - **Correctness:** Preserve every unknown and high-impedance digit in minimum-width binary, octal and hexadecimal output (§21.2.1.2–3, #1347).
 
 - **Correctness:** Resolve class method return widths in declaration scope when callers shadow a typedef (§6.18, §23.9, #1366).
+- **Correctness:** Concurrent assertions run their pass action on vacuous success by default. Assertion control tasks can disable it (§20.11, #1339).
+
 - **Correctness:** Resolve an unadorned parameterized class name in a typedef type argument to its default specialization (§8.25, #1357).
 - **Correctness:** Use all case items to determine signedness for `case`, `casez`, and `casex` comparisons (§12.5, #1355).
 

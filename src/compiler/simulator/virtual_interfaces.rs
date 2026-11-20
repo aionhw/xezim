@@ -1192,25 +1192,46 @@ impl Simulator {
                     // virtual-interface element is an independent alias to the
                     // corresponding structural interface instance.
                     if let Some(&(lo, hi, _)) = self.module.arrays.get(name) {
-                        if let ExprKind::Ident(rhs_h) = &rvalue.kind {
-                            if rhs_h.path.len() == 1 && rhs_h.path[0].selects.is_empty() {
-                                let rhs_base = &rhs_h.path[0].name.name;
-                                let targets: Vec<String> = (lo..=hi)
-                                    .map(|idx| format!("{}[{}]", rhs_base, idx))
-                                    .collect();
-                                if targets
-                                    .iter()
-                                    .all(|target| self.is_interface_instance(target))
+                        let lhs_dims = self.module.unpacked_decl_dims.get(name)
+                            .and_then(|dims| dims.first()).copied()
+                            .unwrap_or_else(|| if self.module.descending_arrays.contains(name) {
+                                (hi, lo)
+                            } else { (lo, hi) });
+                        let rhs = match &rvalue.kind {
+                            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                                let base = &h.path[0].name.name;
+                                let bounds = self.module.unpacked_decl_dims.get(base)
+                                    .and_then(|dims| dims.first()).copied().unwrap_or(lhs_dims);
+                                Some((base, bounds))
+                            }
+                            ExprKind::RangeSelect { expr, kind: RangeKind::Constant, left, right } => {
+                                if let ExprKind::Ident(h) = &expr.kind
+                                    && h.path.len() == 1 && h.path[0].selects.is_empty()
                                 {
-                                    for (idx, target) in (lo..=hi).zip(targets) {
-                                        self.vif_tokens_stored = true;
-                                        self.set_signal_value_by_name(
-                                            &format!("{}[{}]", name, idx),
-                                            Value::from_u64(Self::iface_handle_token(&target), 32),
-                                        );
-                                    }
-                                    return true;
+                                    let l = self.eval_expr(left).to_i64();
+                                    let r = self.eval_expr(right).to_i64();
+                                    l.zip(r).map(|dims| (&h.path[0].name.name, dims))
+                                } else { None }
+                            }
+                            _ => None,
+                        };
+                        if let Some((base, (left, right))) = rhs
+                            && left.abs_diff(right) == lo.abs_diff(hi)
+                        {
+                            let targets: Vec<_> = (lo..=hi).map(|idx| {
+                                let offset = idx.abs_diff(lhs_dims.0) as i64;
+                                let actual = if left <= right { left + offset } else { left - offset };
+                                format!("{base}[{actual}]")
+                            }).collect();
+                            if targets.iter().all(|target| self.is_interface_instance(target)) {
+                                for (idx, target) in (lo..=hi).zip(targets) {
+                                    self.vif_tokens_stored = true;
+                                    self.set_signal_value_by_name(
+                                        &format!("{name}[{idx}]"),
+                                        Value::from_u64(Self::iface_handle_token(&target), 32),
+                                    );
                                 }
+                                return true;
                             }
                         }
                     }

@@ -1,5 +1,7 @@
 // top: c16_misc2
 module c16_misc2;
+  // The trace records nonvacuous matches and failures.
+  initial $assertvacuousoff(0);
   bit clk; bit start, done, rst;
   always #5 clk = ~clk;
   initial begin

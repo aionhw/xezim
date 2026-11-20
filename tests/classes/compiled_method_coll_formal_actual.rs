@@ -59,7 +59,7 @@ class der_t extends base_t;
     sq_t r = {"m", "kk"};
     return r;
   endfunction
-  function void run();
+  task run();
     string loc[$];
     string a = "p", b = "qq";
     string r;
@@ -112,7 +112,7 @@ class der_t extends base_t;
     $display("T|ctor %0d %s", o.log.size(), o.log[$]);
     $display("T|superctor %0d %s", log.size(), log[$]);
     for (int i = 0; i < 2; i++) iq.push_back(i);
-  endfunction
+  endtask
 endclass
 
 module top;

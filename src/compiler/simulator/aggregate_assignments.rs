@@ -1254,7 +1254,7 @@ impl Simulator {
                 combined_types
             };
             if e.is_some() || !member_outer.is_empty() {
-                self.assign_pattern_over_dims_with_types(&target, &mdt, &lists, e, member_outer);
+                self.assign_pattern_over_dims_with_types(&target, &mdt, &lists, e, !explicit, member_outer);
             }
         }
     }
@@ -1351,6 +1351,7 @@ impl Simulator {
         dt: &DataType,
         lists: &[Vec<i64>],
         e: Option<&'a Expression>,
+        from_default: bool,
         outer_types: &[(DataType, &'a Expression)],
     ) {
         let Some((first, rest)) = lists.split_first() else {
@@ -1390,6 +1391,20 @@ impl Simulator {
                     self.write_pattern_leaf(target, v);
                     return;
                 }
+                // §10.9.1: an inherited default can descend further into the
+                // packed element; a value of matching type is stored whole.
+                if from_default && !matches!(e.kind, ExprKind::AssignmentPattern(_))
+                    && crate::compiler::packed_assignment_pattern_plan::is_packed_aggregate(leaf_dt.as_ref(), self)
+                {
+                    let items = [AssignmentPatternItem::Default(e.clone())];
+                    let capture = self.pattern_nba_leaves.take();
+                    let v = self.eval_default_in_packed_type(&items, leaf_dt.as_ref(), &|_| false);
+                    self.pattern_nba_leaves = capture;
+                    if let Some(v) = v {
+                        self.write_pattern_leaf(target, v);
+                        return;
+                    }
+                }
                 self.assign_pattern_or_leaf(target, leaf_dt.as_ref(), e);
             }
             return;
@@ -1420,7 +1435,7 @@ impl Simulator {
         for idx in first {
             elem_target.truncate(base_len);
             let _ = write!(&mut elem_target, "[{}]", idx);
-            self.assign_pattern_over_dims_with_types(&elem_target, dt, rest, e, outer_types);
+            self.assign_pattern_over_dims_with_types(&elem_target, dt, rest, e, from_default, outer_types);
         }
     }
 
@@ -1468,6 +1483,7 @@ impl Simulator {
                     dt,
                     rest,
                     Some(v),
+                    false,
                     outer_types,
                 );
             }
@@ -1539,6 +1555,7 @@ impl Simulator {
                     dt,
                     rest,
                     Some(v),
+                    false,
                     outer_types,
                 );
                 continue;
@@ -1550,7 +1567,7 @@ impl Simulator {
                     .find(|(kt, _)| self.pattern_subarray_matches(dt, rest, kt))
                     .map(|(_, v)| *v)
             {
-                self.assign_pattern_over_dims_with_types(&elem_target, dt, rest, Some(matched), &[]);
+                self.assign_pattern_over_dims_with_types(&elem_target, dt, rest, Some(matched), false, &[]);
                 continue;
             }
             if dflt.is_some() || !combined_types.is_empty() {
@@ -1559,6 +1576,7 @@ impl Simulator {
                     dt,
                     rest,
                     dflt,
+                    true,
                     combined_types,
                 );
             }
@@ -3109,11 +3127,7 @@ impl Simulator {
         }
     }
 
-    /// §11.8.2 operators with a REAL operand (see the bytecode compiler's
-    /// `compile_real_operator`): an arithmetic operator converts each integral
-    /// operand from its SELF-determined value; a relational or equality
-    /// operator propagates the real type one operator into a CONSTANT integral
-    /// side. None when neither operand is real.
+    /// §11.8.2: convert each integral operand from its self-determined value.
     #[inline(never)]
     pub(super) fn eval_real_operator(
         &mut self,
@@ -3137,32 +3151,13 @@ impl Simulator {
         ) {
             return None;
         }
-        let cmp = matches!(
-            op,
-            BinaryOp::Eq
-                | BinaryOp::Neq
-                | BinaryOp::Lt
-                | BinaryOp::Leq
-                | BinaryOp::Gt
-                | BinaryOp::Geq
-        );
         let lr = self.expr_is_real_static(left);
         let rr = self.expr_is_real_static(right);
         if !lr && !rr {
             return None;
         }
-        // Only a CONSTANT integral side takes the real type in a comparison,
-        // as in the reference simulator (see the bytecode compiler).
-        let l = if cmp && !lr && self.expr_is_constant(left) {
-            self.eval_in_real_context(left)
-        } else {
-            self.real_operand(left)
-        };
-        let r = if cmp && !rr && self.expr_is_constant(right) {
-            self.eval_in_real_context(right)
-        } else {
-            self.real_operand(right)
-        };
+        let l = self.real_operand(left);
+        let r = self.real_operand(right);
         Some(Self::real_binop(op, &l, &r))
     }
 
@@ -3222,15 +3217,17 @@ impl Simulator {
             return None;
         }
         let c = self.eval_expr(condition);
-        let taken = if !c.has_unknown() && c.is_true() {
-            then_expr
-        } else {
-            else_expr
+        let mut arm = |e: &Expression| {
+            if self.expr_is_constant(e) {
+                self.eval_in_real_context(e)
+            } else {
+                self.real_operand(e)
+            }
         };
-        Some(if self.expr_is_constant(taken) {
-            self.eval_in_real_context(taken)
-        } else {
-            self.real_operand(taken)
+        Some(match c.is_nonzero() {
+            Some(true) => arm(then_expr),
+            Some(false) => arm(else_expr),
+            None => arm(then_expr).merge_unknown(&arm(else_expr)),
         })
     }
 
@@ -3890,11 +3887,21 @@ impl Simulator {
                     return;
                 }
             }
-            if let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(arg).kind {
-                let vals: Vec<Value> = items.iter().map(|it| self.eval_expr(it.expr())).collect();
-                for (k, j) in dst.iter().enumerate() {
-                    let v = vals.get(k).cloned().unwrap_or_else(|| Value::zero(32));
-                    self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);
+            let values = match &self.unpacked_pattern(arg).kind {
+                ExprKind::AssignmentPattern(items) => {
+                    Some(items.iter().map(|it| self.eval_expr(it.expr())).collect())
+                }
+                // §10.10: an array operand contributes its elements in order.
+                ExprKind::Concatenation(parts) => {
+                    Some(self.unpacked_concat_operand_values(parts.iter().collect()))
+                }
+                _ => None,
+            };
+            if let Some(values) = values {
+                let mut values = values.into_iter();
+                for j in dst {
+                    let v = values.next().unwrap_or_else(|| Value::zero(32));
+                    self.set_signal_value_by_name(&format!("{elem}[{j}]"), v);
                 }
                 return;
             }
@@ -5796,7 +5803,7 @@ impl Simulator {
     /// Declared (left, right) bounds of each unpacked dimension of the array
     /// stored at `name`: a module or local array's, or a class member's
     /// (`<handle>#prop`). A dynamic dimension may be listed or left out.
-    fn unpacked_decl_dims_of(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+    pub(super) fn unpacked_decl_dims_of(&self, name: &str) -> Option<Vec<(i64, i64)>> {
         if let Some(d) = self.module.unpacked_decl_dims.get(name) {
             return Some(d.clone());
         }

@@ -1,4 +1,5 @@
 module t;
+  initial $assertvacuousoff(0);
   logic clk = 0;
   always #5 clk = ~clk;
   logic [31:0] st = 0;

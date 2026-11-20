@@ -9,7 +9,7 @@
 //! - An edge-controlled always block whose body blocks runs as a process and
 //!   had no inferred clock at all.
 //! - A tick before the first one compares against the operand's default
-//!   sampled value (its declaration value), not "no change".
+//!   sampled value (§16.5.1). A logic input net defaults to x.
 //! - `$fell` from x/z to 0 is a fall, and `$stable`/`$changed` compare with
 //!   `===` (`2'bx1` to `2'b01` changed).
 //! - Off its clock's tick (`$rose(x, @(posedge ck))` in a negedge block) the
@@ -89,20 +89,23 @@ module tb;
   end
 endmodule"#;
     let sim = simulate(SRC, 1000).expect("sim");
+    // The first 0 on a child input net falls from x; a zero vector changes
+    // from the all-x default. The generated top-level variables start at 0.
     assert_eq!(
         t_lines(&sim),
         [
             "T|c1 1 1 0 2 1 0 0",
-            "T|c2 1 1 0 6 10 9 2",
-            "T|c3 4 4 2 14 28 24 0",
-            "T|e1 4 4 2 14 28 24 0",
-            "T|e2 4 4 3 14 28 24 4",
+            "T|c2 1 2 0 6 10 9 2",
+            "T|c3 4 5 1 15 28 24 0",
+            "T|e1 4 5 1 15 28 24 0",
+            "T|e2 4 5 2 15 28 24 4",
             "T|g 4 1 prr 4",
         ],
     );
 }
 
-/// The first tick of a clock that starts late reads the declaration value.
+/// §16.5.1, §16.9.3: a child input net has its own default sampled
+/// value, even when its driver is a declaration-initialized variable.
 #[test]
 fn first_tick_compares_with_the_default_value() {
     const SRC: &str = r#"
@@ -133,9 +136,9 @@ endmodule"#;
     assert_eq!(
         t_lines(&sim),
         [
-            "T|40 tb.c1 rose=1 fell=0 st=0 ch=1 past=0 past2=0 v=5",
-            "T|60 tb.c2 rose=0 fell=0 st=0 ch=1 past=0 past2=0 v=1",
-            "T|80 tb.c2 rose=0 fell=0 st=0 ch=1 past=3 past2=0 v=2",
+            "T|40 tb.c1 rose=1 fell=0 st=0 ch=1 past=x past2=x v=5",
+            "T|60 tb.c2 rose=0 fell=1 st=0 ch=1 past=x past2=x v=1",
+            "T|80 tb.c2 rose=0 fell=0 st=0 ch=1 past=3 past2=x v=2",
         ],
     );
 }

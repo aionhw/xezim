@@ -92,9 +92,9 @@ endmodule
         [
             "T|ia=int$[0:1] la=reg[7:0]$[0:3] ra=real$[0:2]",
             "T|e7=bit signed[31:0] ip1=int bp1=bit signed[31:0] bb=byte lp1=reg[31:0] h=bit[7:0] b1=bit cat=reg[15:0]",
-            "T|v10=reg[9:0] s16=reg signed[15:0] b4=bit[3:0] sl=reg m2=int$[0:2][0:1] bd=byte$[3:1] ig=integer r4=reg[3:0] si=shortint li=longint bs=bit signed[4:0] iu=int",
+            "T|v10=reg[9:0] s16=reg signed[15:0] b4=bit[3:0] sl=reg m2=int$[0:1][0:2] bd=byte$[3:1] ig=integer r4=reg[3:0] si=shortint li=longint bs=bit signed[4:0] iu=int unsigned",
             "T|x1=int x2=integer x3=byte x4=bit[3:0] x5=bit x6=reg[3:0] x7=reg x8=int",
-            "T|y1=shortint y2=longint y3=int y4=bit signed[3:0] y5=bit y6=byte",
+            "T|y1=shortint y2=longint y3=int unsigned y4=bit signed[3:0] y5=bit y6=byte",
         ]
     );
 }
@@ -139,12 +139,12 @@ endmodule
     assert_eq!(
         t_lines(SRC),
         [
-            "T|a dq=int$[] qq=int$[] aa=int$[string] md=int$[0:2][0:1] pkd=logic[3:0][1:0] bq=byte$[] tbq=byte$[]",
-            "T|b ms=struct top.ms_t mps=struct packed top.mps_t me=enum bit[1:0] top.me_t pst=struct pk::pst_t pe=enum int pk::pe_t pu=union packed pk::pu_t mea=enum bit[1:0] top.me_t$[0:2] tpe=enum int pk::pe_t",
-            "T|c msb=reg[3:0] mpsa=logic[3:0] cx=int cy=byte cz=reg[4:0] mea0=enum bit[1:0] top.me_t me1=bit[31:0]",
-            "T|d div=integer mod=reg[31:0] pow=integer p2i=reg signed[31:0] bp=reg signed[7:0] lid=reg signed[63:0] sisi=reg signed[15:0] iu2=integer tm2=time",
+            "T|a dq=int$[] qq=int$[$] aa=int$[string] md=int$[0:1][0:2] pkd=logic[1:0][3:0] bq=byte$[$] tbq=byte$[$]",
+            "T|b ms=struct{int a;logic[3:0] b;}top.ms_t mps=struct packed{logic[3:0] a;bit[3:0] b;}top.mps_t me=enum{M0=2'd0,M1=2'd1}top.me_t pst=struct{int a;}pk::pst_t pe=enum{PA=32'sd0,PB=32'sd1}pk::pe_t pu=union packed{logic[3:0] a;bit[3:0] b;}pk::pu_t mea=enum{M0=2'd0,M1=2'd1}top.me_t$[0:2] tpe=enum{PA=32'sd0,PB=32'sd1}pk::pe_t",
+            "T|c msb=reg[3:0] mpsa=logic[3:0] cx=int cy=byte cz=reg[4:0] mea0=enum{M0=2'd0,M1=2'd1}top.me_t me1=bit[31:0]",
+            "T|d div=integer mod=reg[31:0] pow=integer p2i=reg signed[31:0] bp=reg signed[7:0] lid=reg signed[63:0] sisi=reg signed[15:0] iu2=integer unsigned tm2=time",
             "T|e lit=bit signed[31:0] sgn=reg signed[7:0] uns=bit[7:0] ceq=reg cond=reg signed[7:0] rep=reg[7:0] cint=int cu=bit[31:0] csz=bit signed[3:0] cbyte=byte",
-            "T|f fi=bit signed[31:0] fl=bit[5:0] sz=int ln=int clg=bit signed[31:0] tim=time ss=string ixl=reg signed[31:0]",
+            "T|f fi=int fl=logic[5:0] sz=int ln=int clg=bit signed[31:0] tim=time ss=string ixl=reg signed[31:0]",
         ]
     );
 }

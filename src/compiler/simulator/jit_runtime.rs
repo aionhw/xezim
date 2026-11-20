@@ -1512,7 +1512,13 @@ impl Simulator {
                 ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
             )
         };
-        let width = if op(expr) || (!inside && patterns.clone().any(op)) {
+        let fill_item = inside && patterns.clone().any(|p| {
+            matches!(
+                Self::unparen(p).kind,
+                ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(_))
+            )
+        });
+        let width = if fill_item || op(expr) || (!inside && patterns.clone().any(op)) {
             let bounds: Vec<_> = patterns
                 .filter(|p| !matches!(p.kind, ExprKind::Range(..)))
                 .map(|p| (p, inside))
@@ -1521,8 +1527,12 @@ impl Simulator {
         } else {
             0
         };
+        let mut selector = self.eval_expr_typed(expr, width, unsigned);
+        if fill_item && width > 0 {
+            selector = selector.resize_for_assign(width);
+        }
         CaseComparison {
-            selector: self.eval_expr_typed(expr, width, unsigned),
+            selector,
             width,
             unsigned,
         }

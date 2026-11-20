@@ -3286,36 +3286,17 @@ impl Simulator {
                             l_prefix = std::borrow::Cow::Owned(format!("{}[{}]", l_prefix, lv));
                             r_prefix = std::borrow::Cow::Owned(format!("{}[{}]", r_prefix, rv));
                         }
-                        let remaining: Vec<(i64, i64)> = ls[given..].to_vec();
-                        let rem_r: Vec<(i64, i64)> = rs[given..].to_vec();
-                        if remaining == rem_r {
-                            fn enum_idx(
-                                dims: &[(i64, i64)],
-                                lp: String,
-                                rp: String,
-                                out: &mut Vec<(String, String)>,
-                            ) {
-                                if dims.is_empty() {
-                                    out.push((lp, rp));
-                                    return;
-                                }
-                                let (lo, hi) = dims[0];
-                                for i in lo..=hi {
-                                    enum_idx(
-                                        &dims[1..],
-                                        format!("{}[{}]", lp, i),
-                                        format!("{}[{}]", rp, i),
-                                        out,
-                                    );
-                                }
-                            }
-                            let mut pairs = Vec::new();
-                            enum_idx(
-                                &remaining,
-                                l_prefix.into_owned(),
-                                r_prefix.into_owned(),
-                                &mut pairs,
-                            );
+                        if ls[given..]
+                            .iter()
+                            .zip(&rs[given..])
+                            .all(|(&(l, h), &(r, t))| h - l == t - r)
+                        {
+                            let left = self.nd_ordered_suffixes(&lname, &ls, given);
+                            let right = self.nd_ordered_suffixes(&rname, &rs, given);
+                            let pairs = left
+                                .into_iter()
+                                .zip(right)
+                                .map(|(l, r)| (format!("{l_prefix}{l}"), format!("{r_prefix}{r}")));
                             // §7.2: an element of an unpacked-struct array is
                             // its member leaves.
                             let elem_su = self

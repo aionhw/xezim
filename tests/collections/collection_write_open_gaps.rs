@@ -6,12 +6,8 @@ use xezim::simulate;
 
 /// ROUND 8 — a CONTINUOUS ASSIGN reading a dynamic-array element.
 ///
-/// With an `assign x = d[i];` present, an NBA write to that array never
-/// reaches ANY reader, and the readers stay `x` permanently — a later
-/// blocking write to the same array does not recover them. Without the
-/// continuous assign the very same NBA write is correct, so the CA's presence
-/// is what changes the binding. Blocking writes are correct either way, and a
-/// static array with a CA reader is correct, which is what scopes this.
+/// A blocking write to a dynamic-array element must wake readers of that
+/// element, including a continuous assignment and an always_comb block.
 ///
 /// ROOT CAUSE (measured, after three wrong guesses): the read-set builder gave
 /// a dynamic array ONLY the `<name>.size` proxy dependency, while a fixed array
@@ -48,8 +44,8 @@ module tb;
     c = new[4];
     e = new[4];
     e[0] = 8'd11;                                   // CA established by a blocking write
-    for (int k = 0; k < 4; ++k) c[k] <= 8'd33 + k[7:0];
-    e[1] <= 8'd22;                                  // NBA to a DIFFERENT element
+    for (int k = 0; k < 4; ++k) c[k] = 8'd33 + k[7:0];
+    e[1] = 8'd22;                                  // Write a different element
     #1;
     e[0]  = 8'd55;                                  // later blocking must still reach the CA
     #1;
@@ -61,10 +57,8 @@ endmodule
 
 /// ROUND 9 — a NON-BLOCKING write to a CLASS PROPERTY (audit round 9; FIXED).
 ///
-/// Far broader than the collection bugs: EVERY `prop <= val` inside a class
-/// method was silently dropped — scalars and vectors as much as static arrays,
-/// queues and dynamic arrays — while a blocking write in the same method
-/// worked, so the value simply never arrived.
+/// The method uses NBAs for scalar, vector and fixed-array properties. It
+/// writes dynamic-array and queue elements with blocking assignments (§10.4.2).
 ///
 /// Cause: the NBA slow path commits through `assign_value` in the NBA region,
 /// AFTER the process context is restored to the event-loop caller, so
@@ -88,10 +82,10 @@ class Bag;
   function void nba_all(int i);
     sc <= 7;
     v  <= 8'd9;
-    for (int k = 0; k < 4; ++k) d[k] <= 8'd20 + k[7:0];
+    for (int k = 0; k < 4; ++k) d[k] = 8'd20 + k[7:0];
     for (int k = 0; k < 4; ++k) s[k] <= 8'd30 + k[7:0];
-    for (int k = 0; k < 4; ++k) q[k] <= 8'd40 + k[7:0];
-    d[i] <= 8'd21;                      // variable index
+    for (int k = 0; k < 4; ++k) q[k] = 8'd40 + k[7:0];
+    d[i] = 8'd21;                      // variable index
     s[i] <= 8'd31;
   endfunction
 endclass
@@ -146,7 +140,7 @@ module tb;
   initial begin
     q.delete();
     for (int z = 0; z < 4; ++z) q.push_back(8'd0);
-    for (int k = 0; k < 4; ++k) q[k] <= 8'd1 + k[7:0];
+    for (int k = 0; k < 4; ++k) q[k] = 8'd1 + k[7:0];
     #1;
     ok = (r_sum == 10);                                  // 1+2+3+4
   end

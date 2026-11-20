@@ -35,7 +35,7 @@ endmodule",
     );
     assert_line(
         &msgs,
-        "m=00000000000000000000 di=beef,beef pi=0102,0304,0506,0708",
+        "m=00000000000000000000 di=efef,efef pi=0102,0304,0506,0708",
     );
 }
 
@@ -63,7 +63,7 @@ endmodule",
     );
     assert_line(
         &msgs,
-        "n=00000000000000000000 a2=1234,1234 a6=1111,1111,2222 a7=7777,7777",
+        "n=00000000000000000000 a2=3434,3434 a6=1111,1111,2222 a7=7777,7777",
     );
     assert_line(
         &msgs,
@@ -91,7 +91,7 @@ endmodule",
     );
     assert_line(
         &msgs,
-        "a4=0102030405060708,0102030405060708 a5=4321,4321 sel=05060708",
+        "a4=0808080808080808,0808080808080808 a5=2121,2121 sel=08080808",
     );
     assert_line(&msgs, "asc=0102,0304,0506,0708");
 }
@@ -111,7 +111,7 @@ fn typedef_and_packed_struct_array_elements() {
   end
 endmodule",
     );
-    assert_line(&msgs, "td=d00d,d00d sp=01020304,01020304");
+    assert_line(&msgs, "td=0d0d,0d0d sp=04040404,04040404");
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn nonblocking_always_comb_and_variable_default() {
   end
 endmodule",
     );
-    assert_line(&msgs, "nb=f00d,f00d ac=1357,0001,1357 vr=1357");
+    assert_line(&msgs, "nb=0d0d,0d0d ac=1357,0001,1357 vr=1357");
 }
 
 // Guards: shapes that already stored every element.
@@ -143,7 +143,9 @@ fn one_dimensional_packed_one_dimensional_unpacked_and_continuous_forms() {
   logic [79:0]      c1 [2][2];
   logic [1:0][39:0] c2 [2];
   ps_t              st [2][2];
-  logic [1:0][7:0]  ca [2][2];
+  logic [1:0][7:0]  ca [2][2], cv [2];
+  logic [1:0][7:0]  word = 16'h1234;
+  assign cv = '{default: word};
   logic [1:0][7:0]  pk;
   assign ca = '{default: 16'hcafe};
   initial begin
@@ -151,13 +153,13 @@ fn one_dimensional_packed_one_dimensional_unpacked_and_continuous_forms() {
     c2 = '{default: 80'h6};
     st = '{default: 16'h5a5a};
     pk = '{8'h12, 8'h34};
-    #1 $display(\"c1=%h c2=%h st=%h,%h ca=%h,%h pk=%h\", c1[1][1], c2[1], st[0][0], st[1][1],
-                ca[0][0], ca[1][1], pk);
+    #1 $display(\"c1=%h c2=%h st=%h,%h ca=%h,%h cv=%h pk=%h\", c1[1][1], c2[1], st[0][0], st[1][1],
+                ca[0][0], ca[1][1], cv[1], pk);
   end
 endmodule",
     );
     assert_line(
         &msgs,
-        "c1=00000000000000000005 c2=00000000000000000006 st=5a5a,5a5a ca=cafe,cafe pk=1234",
+        "c1=00000000000000000005 c2=00000000060000000006 st=5a5a,5a5a ca=fefe,fefe cv=1234 pk=1234",
     );
 }

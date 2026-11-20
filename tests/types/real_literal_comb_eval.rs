@@ -77,14 +77,8 @@ endmodule
     );
 }
 
-/// A compiled `cond ? real : real` with an X condition (at time 0, before the
-/// condition is driven) must yield a defined real branch value, NOT the
-/// bit-merge of the two IEEE-754 operands (which surfaced as garbage like
-/// 4.65e18). The interpreter path already did this (§11.3.1); the bytecode
-/// VM's `Select` did not, so a real ternary in a compiled `always @(*)` /
-/// `assign` glitched — in a PLL model `plloutperiod = sel ? vcofb : vcofb*mo`
-/// briefly became 4.65e18, and `always #(plloutperiod/2.0)` could sample it
-/// and schedule the clock edge ~2.3e18 ticks out (vclk effectively stops).
+/// §11.4.11: compiled real conditionals use 0.0 for different arms and an
+/// ambiguous condition.
 #[test]
 fn compiled_real_conditional_x_cond_no_bit_garbage() {
     const SRC: &str = r#"
@@ -99,11 +93,9 @@ endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
     let out = output_of(&sim);
-    // X condition => the else/false branch (7.0), a defined real — NOT the
-    // bit-merge of the two IEEE-754 operands (which came out as ~4.6e18).
     assert!(
-        out.contains("C r_assign=7.000 r_always=7.000"),
-        "compiled real ternary with X cond must yield the else branch, not bit garbage:\n{}",
+        out.contains("C r_assign=0.000 r_always=0.000"),
+        "compiled real conditional with unequal arms:\n{}",
         out
     );
 }

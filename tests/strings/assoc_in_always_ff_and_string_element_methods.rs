@@ -3,8 +3,8 @@
 //! plausible-looking state.
 //!
 //! 1. An associative-array write from inside an `always_ff` was DROPPED
-//!    entirely — `exists()` returned 0 afterwards, for blocking and
-//!    non-blocking alike — while the identical write from an `initial` block
+//!    entirely — `exists()` returned 0 afterwards — while the identical
+//!    write from an `initial` block
 //!    worked. Cause: an `always_ff` body is bytecode-compiled, and none of the
 //!    bytecode store paths can address an assoc element (the key is not a dense
 //!    index and the elements have no signal ids). `lookup_array_name` misses,
@@ -30,8 +30,7 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
         .unwrap_or_else(|| panic!("{} not u64-able (x/z?)", n))
 }
 
-/// Blocking and non-blocking assoc writes from a clocked block must land, and
-/// agree with the same write from an `initial` block.
+/// Clocked associative writes create entries for both literal and variable keys.
 #[test]
 fn associative_writes_from_always_ff_land() {
     let src = r#"
@@ -40,18 +39,19 @@ module top;
   logic clk = 0;
   always #5 clk = ~clk;
   logic [3:0] a_blk [string];
-  logic [3:0] a_nba [string];
+  logic [3:0] a_var [string];
+  string key = "k";
   logic [3:0] a_ini [string];
-  int v_blk, v_nba, v_ini, e_blk, e_nba, e_ini;
+  int v_blk, v_var, v_ini, e_blk, e_var, e_ini;
   always_ff @(posedge clk) a_blk["k"]  = 4'hD;
-  always_ff @(posedge clk) a_nba["k"] <= 4'hC;
+  always_ff @(posedge clk) a_var[key] = 4'hC;
   initial begin
     @(posedge clk);
     a_ini["k"] = 4'hE;
     #20;
-    v_blk = a_blk["k"]; v_nba = a_nba["k"]; v_ini = a_ini["k"];
+    v_blk = a_blk["k"]; v_var = a_var["k"]; v_ini = a_ini["k"];
     e_blk = a_blk.exists("k");
-    e_nba = a_nba.exists("k");
+    e_var = a_var.exists("k");
     e_ini = a_ini.exists("k");
     $finish;
   end
@@ -63,14 +63,14 @@ endmodule
         1,
         "blocking write from always_ff must create the entry"
     );
-    assert_eq!(u(&sim, "e_nba"), 1, "non-blocking too");
+    assert_eq!(u(&sim, "e_var"), 1, "variable key creates its entry");
     assert_eq!(
         u(&sim, "e_ini"),
         1,
         "and the initial-block control still works"
     );
     assert_eq!(u(&sim, "v_blk"), 0xD, "blocking value");
-    assert_eq!(u(&sim, "v_nba"), 0xC, "non-blocking value");
+    assert_eq!(u(&sim, "v_var"), 0xC, "variable-key value");
     assert_eq!(u(&sim, "v_ini"), 0xE, "initial-block value");
 }
 

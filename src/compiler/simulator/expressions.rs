@@ -2582,6 +2582,24 @@ impl Simulator {
                     let rewritten = Expression::new(ExprKind::Ident(abs), expr.span);
                     return self.eval_expr_ctx_inner(&rewritten, ctx_width, unsigned_context);
                 }
+                if h.path.len() >= 4 && h.path[0].name.name == "$root" {
+                    for i in 2..h.path.len() - 1 {
+                        if h.path[i].selects.is_empty() {
+                            continue;
+                        }
+                        let mut prefix = h.clone();
+                        prefix.path.truncate(i + 1);
+                        prefix.path[i].selects.clear();
+                        prefix.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                        prefix.cached_resolved_name = crate::ast::cache::NameCache::new();
+                        prefix.bound = crate::ast::binding::Bound::UNSET;
+                        let name = self.resolve_hier_name(&prefix);
+                        if self.module.dynamic_arrays.contains(name.as_ref()) {
+                            let selected = Self::hier_select_chain_from(h, expr.span, i);
+                            return self.eval_expr_ctx_inner(&selected, ctx_width, unsigned_context);
+                        }
+                    }
+                }
                 if h.path.len() >= 2
                     && !self.local_stack.is_empty()
                     && let Some(v) = self.frame_handle_path_read(expr)
@@ -5050,7 +5068,7 @@ impl Simulator {
                 // §11.4.11/§11.8.2: with a REAL arm the result is real; the
                 // integral arm converts from its self-determined value
                 // (`c ? (u - 2) : 1.5` is 4294967295.0 for `int unsigned u =
-                // 1`). An x condition yields the else arm, as below.
+                // 1`).
                 // (A node with a known non-64 static width is integral.)
                 let maybe_real = |e: &Expression| !e.cached_width.get().is_some_and(|w| w != 64);
                 if (maybe_real(then_expr) || maybe_real(else_expr))
@@ -5069,7 +5087,7 @@ impl Simulator {
                 } else {
                     ctx_width
                 };
-                if c.has_unknown() {
+                if c.is_nonzero().is_none() {
                     // IEEE 1800 §11.4.11 Table 11-21: per-bit merge — bit is known
                     // only where both branches agree; otherwise X.
                     let mut t = self.eval_expr_typed(then_expr, arm_ctx, arms_unsigned);
@@ -5081,16 +5099,7 @@ impl Simulator {
                     } else if e.is_fill && !t.is_fill {
                         e = e.resize(t.width);
                     }
-                    // A REAL result cannot hold X, so the bitwise merge would
-                    // read the IEEE-754 bits of the operands as garbage (e.g. a
-                    // real `1000.0` came out as 4.65e18). §11.3.1: the result is
-                    // real when either branch is real — return a defined real
-                    // value (x condition → the else/false branch) instead.
-                    if t.is_real || e.is_real {
-                        e
-                    } else {
-                        t.merge_unknown(&e)
-                    }
+                    t.merge_unknown(&e)
                 } else {
                     let (taken, other): (&Expression, &Expression) = if c.is_true() {
                         (then_expr, else_expr)
@@ -6830,11 +6839,17 @@ impl Simulator {
                 // bits (256), not at the 8 bits of `a8`.
                 let jw = self.inside_joint_width(expr, ranges);
                 let val = match jw {
-                    Some(w) => self.eval_expr_ctx(expr, w),
+                    Some(w) => {
+                        let v = self.eval_expr_ctx(expr, w);
+                        if v.is_fill { v.resize(w) } else { v }
+                    }
                     None => self.eval_expr(expr),
                 };
                 let item = |me: &mut Self, e: &Expression| match jw {
-                    Some(w) => me.eval_expr_ctx(e, w),
+                    Some(w) => {
+                        let v = me.eval_expr_ctx(e, w);
+                        if v.is_fill { v.resize(w) } else { v }
+                    }
                     None => me.eval_expr(e),
                 };
                 for r in ranges {

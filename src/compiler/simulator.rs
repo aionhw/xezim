@@ -395,11 +395,13 @@ fn method_boost_enabled() -> bool {
 // §6.18, §7.4.1: a cast to a typedef of real and a function returning one are real operands,
 // and a subroutine or block selecting a packed array of a named signed type does not compile.
 // §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
+// §11.8.2: preserve integral arithmetic in constant operands of real comparisons.
+// §6.24.1: a signing conversion consumes an unsized fill literal.
 // §20.8.1, §7.4.1: `$clog2` of a constant folds; unfolded select bounds map labels.
 // §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §6.21, §13.5.3: output-before-read locals and literal default actuals compile.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3095;
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3096;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -922,6 +924,10 @@ fn dpi_trampoline_cc_command(
     cmd.push(so.into());
     cmd.push(c.into());
     cmd
+}
+
+pub(crate) fn foreign_libraries_configured() -> bool {
+    !configured_dpi_libs().is_empty() || !configured_vpi_libs().is_empty()
 }
 
 fn configured_dpi_libs() -> Vec<String> {
@@ -1760,6 +1766,9 @@ impl CombEntry {
 /// Cold half of a `CombEntry` — see `CombEntry::cold`.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CombEntryCold {
+    /// Lexical instance of a continuous RHS that may enter the interpreter.
+    /// An empty scope selects the top module independently of the waking process.
+    rhs_time_scope: Option<Arc<str>>,
     /// Preferred hierarchical scope for resolving unqualified identifiers.
     scope_hint: Option<String>,
     /// Pre-resolved signal IDs for reads (for fast dependency lookup).
@@ -1822,13 +1831,16 @@ struct CombEntryCold {
 // §9.2.2.2, §10.3: CombEntryCold::time0_effects; a variable a called function writes is
 // not a read of its caller.
 // §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
+// §9.2.2.2.1: parameterized instance vectors retain disjoint sensitivity regions.
+// §6.24.1: compiled sign conversions use the self-determined operand width.
+// §10.9.1: packed array default drivers retain their element type.
 // §20.8.1, §7.4.1: `$clog2` of a constant folds, and a select bound that does
 // not fold still maps its label to a physical bit.
 // §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
 // process, not as a combinational entry.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB053";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB054";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

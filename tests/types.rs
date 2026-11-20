@@ -93,6 +93,8 @@ mod constructor_new_not_static;
 mod constructor_new_property_type;
 #[path = "types/constructor_typedef_dispatch.rs"]
 mod constructor_typedef_dispatch;
+#[path = "types/continuous_nested_array_leaves.rs"]
+mod continuous_nested_array_leaves;
 #[path = "types/copy_constructor_decl_init.rs"]
 mod copy_constructor_decl_init;
 #[path = "types/copy_ctor_type_mismatch.rs"]
@@ -137,6 +139,8 @@ mod enum_signedness_and_pkg_scope;
 mod enum_typeparam_wrapper_from_name;
 #[path = "types/enum_xz_and_package_shapes.rs"]
 mod enum_xz_and_package_shapes;
+#[path = "types/fill_literal_contexts.rs"]
+mod fill_literal_contexts;
 #[path = "types/formal_type_metadata_and_typedef_packed_array.rs"]
 mod formal_type_metadata_and_typedef_packed_array;
 #[path = "types/forward_referenced_parameter.rs"]
@@ -151,6 +155,8 @@ mod function_return_width;
 mod generate_scope_struct_metadata;
 #[path = "types/generate_with_array_queries.rs"]
 mod generate_with_array_queries;
+#[path = "types/header_array_parameter_elements.rs"]
+mod header_array_parameter_elements;
 #[path = "types/header_parameter_declared_signedness.rs"]
 mod header_parameter_declared_signedness;
 #[path = "types/hierarchy_and_type_overrides.rs"]

@@ -1,10 +1,10 @@
 //! IEEE 1800-2017 §11.4.5 / §10.9: `==`, `!=`, `===` and `!==` between an
 //! unpacked aggregate and an ASSIGNMENT PATTERN compare element by element
-//! (member by member for a struct). The pattern is in an assignment-like
-//! context, so it takes the other operand's type: `index:`, `default:`,
+//! (member by member for a struct). An explicit assignment pattern type (§10.9)
+//! determines how `index:`, `default:`,
 //! nested patterns and the element-type conversion of each item apply.
 //! The pattern used to evaluate to a packed concatenation compared with the
-//! array's nonexistent container signal, so `a == '{9, 5, 5, 5}` was 0.
+//! array's nonexistent container signal, so `a == int4_t'{9, 5, 5, 5}` was 0.
 //! Expected values are the reference simulator's, except an open relation
 //! (x/z elements and no differing one), which is x (§11.4.5).
 
@@ -21,15 +21,26 @@ fn t_lines(src: &str) -> Vec<String> {
 
 const PATTERN_EQ: &str = r#"
 typedef struct { int x; int y; } st_t;
+typedef int int4_t[4];
+typedef int int_matrix_t[2][2];
+typedef int int_cube_t[2][2][2];
+typedef int int_dynamic_t[];
+typedef int int_queue_t[$];
+typedef string str_pair_t[2];
+typedef int descending_t[3:1];
+typedef int slice_t[1:3];
+typedef st_t struct_pair_t[2];
+typedef logic [3:0] logic_pair_t[2];
+typedef bit [7:0] bytes_t[3];
 class C;
   int a[4]; int m[2][2]; int d[]; int q[$]; string sa[2]; st_t s;
   function string run();
     a = '{9, 5, 5, 5}; m = '{'{1, 2}, '{3, 4}}; d = '{1, 2, 3}; q = '{7, 8};
     sa = '{"a", "b"}; s = '{1, 2};
-    return $sformatf("%0d%0d%0d%0d%0d %0d%0d%0d%0d%0d%0d %0d%0d%0d%0d%0d", a == '{9, 5, 5, 5}, a != '{9, 5, 5, 6},
-      a === '{9, 5, 5, 5}, '{9, 5, 5, 5} == a, a != '{9, 5, 5, 5},
-      m == '{'{1, 2}, '{3, 4}}, m == '{'{1, 2}, '{3, 5}}, d == '{1, 2, 3}, d == '{1, 2, 4}, q == '{7, 8}, q != '{7, 8},
-      sa == '{"a", "b"}, sa == '{"a", "c"}, s == '{1, 2}, s == '{1, 3}, a == '{default: 5});
+    return $sformatf("%0d%0d%0d%0d%0d %0d%0d%0d%0d%0d%0d %0d%0d%0d%0d%0d", a == int4_t'{9, 5, 5, 5}, a != int4_t'{9, 5, 5, 6},
+      a === int4_t'{9, 5, 5, 5}, int4_t'{9, 5, 5, 5} == a, a != int4_t'{9, 5, 5, 5},
+      m == int_matrix_t'{'{1, 2}, '{3, 4}}, m == int_matrix_t'{'{1, 2}, '{3, 5}}, d == int_dynamic_t'{1, 2, 3}, d == int_dynamic_t'{1, 2, 4}, q == int_queue_t'{7, 8}, q != int_queue_t'{7, 8},
+      sa == str_pair_t'{"a", "b"}, sa == str_pair_t'{"a", "c"}, s == st_t'{1, 2}, s == st_t'{1, 3}, a == int4_t'{default: 5});
   endfunction
 endclass
 module top;
@@ -39,19 +50,19 @@ module top;
     C c;
     a = '{9, 5, 5, 5}; m = '{'{1, 2}, '{3, 4}}; d = '{1, 2, 3}; q = '{7, 8};
     sa = '{"a", "b"}; s = '{1, 2};
-    $display("T|m1 %0d%0d%0d%0d%0d %0d%0d%0d%0d%0d%0d %0d%0d%0d%0d%0d", a == '{9, 5, 5, 5}, a != '{9, 5, 5, 6},
-      a === '{9, 5, 5, 5}, '{9, 5, 5, 5} == a, a != '{9, 5, 5, 5},
-      m == '{'{1, 2}, '{3, 4}}, m == '{'{1, 2}, '{3, 5}}, d == '{1, 2, 3}, d == '{1, 2, 4}, q == '{7, 8}, q != '{7, 8},
-      sa == '{"a", "b"}, sa == '{"a", "c"}, s == '{1, 2}, s == '{1, 3}, a == '{default: 5});
-    if (a == '{9, 5, 5, 5}) $display("T|m2 if yes"); else $display("T|m2 if no");
-    k = 0; while (!(a == '{9, 5, 5, 5}) && k < 3) k++;
-    $display("T|m3 k=%0d tern=%0d slice=%0d", k, (a == '{9, 5, 5, 5}) ? 11 : 22, a[1:3] == '{5, 5, 5});
+    $display("T|m1 %0d%0d%0d%0d%0d %0d%0d%0d%0d%0d%0d %0d%0d%0d%0d%0d", a == int4_t'{9, 5, 5, 5}, a != int4_t'{9, 5, 5, 6},
+      a === int4_t'{9, 5, 5, 5}, int4_t'{9, 5, 5, 5} == a, a != int4_t'{9, 5, 5, 5},
+      m == int_matrix_t'{'{1, 2}, '{3, 4}}, m == int_matrix_t'{'{1, 2}, '{3, 5}}, d == int_dynamic_t'{1, 2, 3}, d == int_dynamic_t'{1, 2, 4}, q == int_queue_t'{7, 8}, q != int_queue_t'{7, 8},
+      sa == str_pair_t'{"a", "b"}, sa == str_pair_t'{"a", "c"}, s == st_t'{1, 2}, s == st_t'{1, 3}, a == int4_t'{default: 5});
+    if (a == int4_t'{9, 5, 5, 5}) $display("T|m2 if yes"); else $display("T|m2 if no");
+    k = 0; while (!(a == int4_t'{9, 5, 5, 5}) && k < 3) k++;
+    $display("T|m3 k=%0d tern=%0d slice=%0d", k, (a == int4_t'{9, 5, 5, 5}) ? 11 : 22, a[1:3] == slice_t'{5, 5, 5});
     ds = '{1, 2, 3}; stv = '{'{1, 2}, '{3, 4}}; lx = '{4'b1x01, 4'b0011}; by = '{1, 2, 255};
     m3 = '{'{'{1, 2}, '{3, 4}}, '{'{5, 6}, '{7, 8}}};
-    $display("T|m4 ds=%0d%0d stv=%0d%0d lx=%0d%0d%0d%0d", ds == '{1, 2, 3}, ds == '{3, 2, 1}, stv == '{'{1, 2}, '{3, 4}}, stv == '{'{1, 2}, '{3, 5}},
-      lx == '{4'b1x01, 4'b0011}, lx != '{4'b1x01, 4'b0011}, lx === '{4'b1x01, 4'b0011}, lx !== '{4'b1x01, 4'b0011});
-    $display("T|m5 key=%0d%0d by=%0d%0d m3=%0d%0d sn=%0d%0d%0d", a == '{0: 9, default: 5}, a == '{0: 5, default: 9}, by == '{1, 2, 255}, by == '{1, 2, -1},
-      m3 == '{'{'{1, 2}, '{3, 4}}, '{'{5, 6}, '{7, 8}}}, m3 == '{default: 1}, s == '{x: 1, y: 2}, s == '{y: 1, x: 2}, s == '{default: 1});
+    $display("T|m4 ds=%0d%0d stv=%0d%0d lx=%0d%0d%0d%0d", ds == descending_t'{1, 2, 3}, ds == descending_t'{3, 2, 1}, stv == struct_pair_t'{'{1, 2}, '{3, 4}}, stv == struct_pair_t'{'{1, 2}, '{3, 5}},
+      lx == logic_pair_t'{4'b1x01, 4'b0011}, lx != logic_pair_t'{4'b1x01, 4'b0011}, lx === logic_pair_t'{4'b1x01, 4'b0011}, lx !== logic_pair_t'{4'b1x01, 4'b0011});
+    $display("T|m5 key=%0d%0d by=%0d%0d m3=%0d%0d sn=%0d%0d%0d", a == int4_t'{0: 9, default: 5}, a == int4_t'{0: 5, default: 9}, by == bytes_t'{1, 2, 255}, by == bytes_t'{1, 2, -1},
+      m3 == int_cube_t'{'{'{1, 2}, '{3, 4}}, '{'{5, 6}, '{7, 8}}}, m3 == int_cube_t'{default: 1}, s == st_t'{x: 1, y: 2}, s == st_t'{y: 1, x: 2}, s == st_t'{default: 1});
     c = new;
     repeat (3) $display("T|c1 %s", c.run());
   end
@@ -78,10 +89,11 @@ fn unpacked_aggregates_compare_with_assignment_patterns() {
 
 const CONT_ASSIGN: &str = r#"
 module top;
-  logic [3:0] cc[2]; int cd[2];
+  typedef int int_pair_t[2];
+  logic [3:0] cc[2]; int_pair_t cd;
   assign cc = '{4'd3, 4'd4};
   assign cd = '{5, 6};
-  initial #1 $display("T|ca %0d %0d %0d %0d %0d", cc[0], cc[1], cd[0], cd[1], cd == '{5, 6});
+  initial #1 $display("T|ca %0d %0d %0d %0d %0d", cc[0], cc[1], cd[0], cd[1], cd == int_pair_t'{5, 6});
 endmodule
 "#;
 
@@ -97,7 +109,8 @@ const CONT_ASSIGN_SHAPES: &str = r#"module sub(output int so[2]);
   assign so = '{11, 12};
 endmodule
 module top;
-  logic [3:0] cc[2]; int cd[2]; int dd[1:0]; int ee[3]; int ff[3]; int gg[0:3]; int kk[4]; logic [1:0][3:0] pk;
+  typedef int int_pair_t[2];
+  logic [3:0] cc[2]; int_pair_t cd; int dd[1:0]; int ee[3]; int ff[3]; int gg[0:3]; int kk[4]; logic [1:0][3:0] pk;
   int so[2]; logic [7:0] v = 8'd9; int hh[2][2];
   assign cc = '{4'd3, 4'd4};
   assign cd = '{5, 6};
@@ -110,7 +123,7 @@ module top;
   assign hh = '{'{1,2},'{3,4}};
   sub u(so);
   initial begin
-    #1 $display("T|ca %0d %0d %0d %0d %0d", cc[0], cc[1], cd[0], cd[1], cd == '{5, 6});
+    #1 $display("T|ca %0d %0d %0d %0d %0d", cc[0], cc[1], cd[0], cd[1], cd == int_pair_t'{5, 6});
     $display("T|dd %0d %0d ee %0d %0d %0d ff %0d %0d", dd[1], dd[0], ee[0], ee[1], ee[2], ff[0], ff[2]);
     $display("T|gg %0d %0d %0d %0d kk %0d %0d %0d %0d pk %h", gg[0], gg[1], gg[2], gg[3], kk[0], kk[1], kk[2], kk[3], pk);
     $display("T|so %0d %0d hh %0d %0d %0d %0d", so[0], so[1], hh[0][0], hh[0][1], hh[1][0], hh[1][1]);

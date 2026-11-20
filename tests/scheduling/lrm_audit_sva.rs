@@ -253,6 +253,7 @@ fn assertion_local_variables() {
         r#"
 // top: t16_10
 module t16_10;
+  initial $assertvacuousoff(0); // Trace only nonvacuous passes.
   bit clk, start, done; int din, dout;
   always #5 clk = ~clk;
   initial begin
@@ -273,6 +274,7 @@ endmodule
         "t",
         r#"
 module t;
+  initial $assertvacuousoff(0); // Trace only nonvacuous passes.
   bit clk, a, b, c; int d, e;
   always #5 clk = ~clk;
   // pipeline: every cycle a new attempt captures d; e must equal it 2 cycles later
@@ -446,6 +448,7 @@ fn default_disable_iff() {
         r#"
 // top: t16_15
 module t16_15;
+  initial $assertvacuousoff(0); // Trace only nonvacuous passes.
   bit clk, start, done, rst;
   always #5 clk = ~clk;
   initial begin
@@ -662,6 +665,7 @@ fn unclocked_named_properties_use_default_clocking() {
         "t",
         r#"
 module t;
+  initial $assertvacuousoff(0); // Trace only nonvacuous passes.
   bit clk, a, b, rst;
   always #5 clk = ~clk;
   default clocking cb @(posedge clk); endclocking

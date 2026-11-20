@@ -980,13 +980,18 @@ void delays_probe(void) {
     vpi_put_delays(y3, &dl);
     CHECK(vpi_chk_error(NULL) == 0, "put y3 (a zero-delay gate)");
 
+    /* VPI-visible continuous drivers retain their update events (§38.34).
+     * A delay installed on a vector driver is readable and affects its net. */
+    vpiHandle vy = H("top.vy");
+    put(vy, 1, 5, 0, 0);
+    CHECK(vpi_chk_error(NULL) == 0, "put vy");
+    show("vy_after", vy, 1);
+
     /* Refusals write nothing. */
     put(y1, 4, 1, 1, 1);
     refused("four delays on a net");
     put(y1, 2, 0, 3, 0);
     refused("a zero rise delay with a non-zero fall delay");
-    put(H("top.vy"), 1, 5, 0, 0);
-    refused("a delay on a compiled vector driver");
     setup(1, vpiSimTime);
     dl.pulsere_flag = 1;
     da[0].low = 2; da[1].low = 1; da[2].low = 2;
@@ -1103,6 +1108,7 @@ module top;
   always @(y1) $display("E y1=%b t=%0t", y1, $time);
   always @(y2) $display("E y2=%b t=%0t", y2, $time);
   always @(y3) $display("E y3=%b t=%0t", y3, $time);
+  always @(vy) $display("E vy=%b t=%0t", vy, $time);
   always @(q) $display("E q=%b t=%0t", q, $time);
   import "DPI-C" context function void delays_probe();
   initial begin
@@ -1141,6 +1147,7 @@ fn vpi_delays_and_intermodule_paths() {
             // mtm + pulsere: 9 slots per delay, all the value in use.
             "CHK|y1_mtm_pulse|3|3|3|3|3|3|3|3|3|5|5|5|5|5|5|5|5|5",
             "CHK|y2_after|3|5|7",
+            "CHK|vy_after|5",
             "CHK|y1_after|1|9",
             "CHK|path2|4|7",
             "CHK|path12|4|7|4|4|7|7|4|4|7|7|7|4",
@@ -1157,6 +1164,8 @@ fn vpi_delays_and_intermodule_paths() {
             "E y1=0 t=59",
             "E y2=1 t=33",
             "E y2=0 t=55",
+            "E vy=1010 t=35",
+            "E vy=0000 t=55",
             "E y3=1 t=32",
             "E y3=0 t=52",
             "E q=1 t=72",

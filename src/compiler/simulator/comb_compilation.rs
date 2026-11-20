@@ -30,7 +30,9 @@ impl Simulator {
     /// A select on the leaf (`g[0].u.c[0]`, `g[0].u.c[2:1]`) stays a select
     /// of the folded name, the shape `u.c[0]` already has.
     pub(super) fn fold_indexed_hier_path(&self, e: &Expression) -> Option<Expression> {
-        if let Some(flat) = self.indexed_hier_flat_name(e) {
+        // A constant unpacked select can name a stored scalar leaf. Resolve
+        // the complete path first, then peel any remaining packed selects.
+        if let Some(flat) = self.constant_selected_storage(e) {
             return Some(Self::flat_name_ident(flat, e.span));
         }
         let (ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. }) = &e.kind else {
@@ -42,6 +44,74 @@ impl Simulator {
             **expr = base;
         }
         Some(out)
+    }
+
+    fn constant_selected_storage(&self, expr: &Expression) -> Option<String> {
+        fn append(
+            e: &Expression,
+            module: &ElaboratedModule,
+            name: &mut String,
+            selected: &mut bool,
+        ) -> Option<()> {
+            use std::fmt::Write;
+            let index = |name: &mut String, sel: &Expression| {
+                let i =
+                    super::elaborate::const_eval_i64_with_params(sel, Some(&module.parameters))?;
+                write!(name, "[{i}]").ok()
+            };
+            match &e.kind {
+                ExprKind::Ident(h) => {
+                    if h.root.as_deref() == Some("$root") {
+                        name.push_str("$root.");
+                    } else if h.root.is_some() {
+                        return None;
+                    }
+                    for (i, seg) in h.path.iter().enumerate() {
+                        if i != 0 {
+                            name.push('.');
+                        }
+                        name.push_str(&seg.name.name);
+                        for sel in &seg.selects {
+                            index(name, sel)?;
+                            *selected = true;
+                        }
+                    }
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    append(expr, module, name, selected)?;
+                    name.push('.');
+                    name.push_str(&member.name);
+                }
+                ExprKind::Index { expr, index: sel } => {
+                    append(expr, module, name, selected)?;
+                    index(name, sel)?;
+                    *selected = true;
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+        let mut path = String::new();
+        let mut selected = false;
+        append(expr, &self.module, &mut path, &mut selected)?;
+        if !selected {
+            return None;
+        }
+        let rooted = path.strip_prefix("$root.");
+        let name = rooted.unwrap_or(&path);
+        let stored = if rooted.is_none() && self.signal_name_to_id.contains_key(name) {
+            name
+        } else {
+            let short = name.strip_prefix(&self.module.name)?.strip_prefix('.')?;
+            self.signal_name_to_id.get(short)?;
+            short
+        };
+        // Ordinary arrays need their selectors for packed bounds and element
+        // types. An indexed scope or an unpacked struct member instead names
+        // a separately stored leaf, which a delayed write needs to address.
+        let (owner, _) = stored.rsplit_once('.')?;
+        (owner.contains(']') || self.module.struct_members.contains_key(owner))
+            .then(|| stored.to_string())
     }
 
     /// An `Ident` whose single segment is already the fully-qualified stored
@@ -65,19 +135,6 @@ impl Simulator {
             }),
             span,
         )
-    }
-
-    /// The stored (`signal_name_to_id`) name a hierarchical path stands for
-    /// when that path enters a scope through an INDEX, or `None` for any
-    /// other shape.
-    pub(super) fn indexed_hier_flat_name(&self, e: &Expression) -> Option<String> {
-        // A plain `u.sig` already folds upstream, and a select on the LAST
-        // segment (`u.sig[2]`) is an ordinary leaf select that compiles
-        // today; only a scope ENTERED through a select needs this.
-        if !matches!(e.kind, ExprKind::MemberAccess { .. }) {
-            return None;
-        }
-        self.select_entered_stored_name(e)
     }
 
     /// #1108, §9.4.2: an element of an unpacked array in a scope entered
@@ -698,15 +755,7 @@ impl Simulator {
                     .map(|p| p.materialize(&params_snapshot)),
             )
             .flat_map(|ca| {
-                crate::compiler::elaborate::whole_array_assign_parts_dir_with_params(
-                    &ca.lhs,
-                    &ca.rhs,
-                    ca.delay,
-                    &arrays_snapshot,
-                    Some(&descending_snapshot),
-                    Some(&decl_dims_snapshot),
-                    Some(&params_snapshot),
-                )
+                self.module.whole_array_driver_parts(&ca.lhs, &ca.rhs, ca.delay, &decl_dims_snapshot)
                 .or_else(|| {
                     crate::compiler::elaborate::whole_array_row_assign_parts(
                         &ca.lhs,
@@ -731,7 +780,7 @@ impl Simulator {
                     )
                 })
                 .or_else(|| {
-                    Self::row_pattern_assign_parts(&ca, &decl_dims_snapshot, &params_snapshot)
+                    Self::row_pattern_assign_parts(&self.module, &ca, &decl_dims_snapshot, &params_snapshot)
                 })
                 .unwrap_or_else(|| vec![ca])
             })
@@ -1856,10 +1905,37 @@ impl Simulator {
             if matches!(&item, CombItem::Noop) {
                 continue;
             }
+            // §20.3: the name hint can follow a hierarchical destination. Time
+            // calls belong to the module that authored the RHS. For synthesized
+            // input connections the expression belongs to the port's parent;
+            // a synthesized resolver runs in its net's own scope.
+            let rhs_time_scope = if matches!(&item, CombItem::ContAssign { .. })
+                || matches!(&item, CombItem::CompiledContAssign { compiled } if compiled.has_fallback)
+            {
+                ca.origin.map(|(_, scope)| scope).or_else(|| {
+                    let name = self.name_opt(*wids.first()?)?;
+                    let (owner, _) = name.rsplit_once('.')?;
+                    let input_port = ca.rhs_parent_scoped
+                        && matches!(
+                            self.vpi_port_directions.get(name),
+                            Some(PortDirection::Input | PortDirection::Inout)
+                        );
+                    let scope = if input_port {
+                        self.instance_by_path(owner)
+                            .map_or(owner, |inst| inst.parent.as_str())
+                    } else {
+                        owner
+                    };
+                    Some(Arc::from(scope))
+                })
+            } else {
+                None
+            };
             let cov = cov_counter.filter(|_| matches!(&item, CombItem::ContAssign { .. }));
             entries.push(CombEntry {
                 item,
                 cold: Box::new(CombEntryCold {
+                    rhs_time_scope,
                     scope_hint,
                     read_signal_ids: rids,
                     write_signal_ids: wids,
@@ -2228,6 +2304,7 @@ impl Simulator {
                 entries.push(CombEntry {
                     item,
                     cold: Box::new(CombEntryCold {
+                        rhs_time_scope: None,
                         scope_hint,
                         read_signal_ids: rids,
                         write_signal_ids: wids,
@@ -5409,6 +5486,7 @@ impl Simulator {
     /// constant indices, as for a whole-array pattern assign, and each element
     /// assignment keeps the row's own selects.
     fn row_pattern_assign_parts(
+        module: &ElaboratedModule,
         ca: &crate::compiler::elaborate::ContinuousAssignment,
         decl_dims: &HashMap<String, Vec<(i64, i64)>>,
         params: &HashMap<String, Value>,
@@ -5448,15 +5526,7 @@ impl Simulator {
         // parts come back as `name[j]...`, and only their indices are kept.
         let row_dims: HashMap<String, Vec<(i64, i64)>> =
             std::iter::once((name.clone(), dims[k..].to_vec())).collect();
-        let parts = crate::compiler::elaborate::whole_array_assign_parts_dir_with_params(
-            cur,
-            &ca.rhs,
-            ca.delay,
-            &HashMap::default(),
-            None,
-            Some(&row_dims),
-            Some(params),
-        )?;
+        let parts = module.whole_array_driver_parts(cur, &ca.rhs, ca.delay, &row_dims)?;
         Some(
             parts
                 .into_iter()
