@@ -5237,6 +5237,10 @@ impl Simulator {
                         let parts = self.typename_args_text_parts(type_args_text);
                         return Value::from_string(&self.class_typename_with_args(&bn, parts));
                     }
+                    // A class property declared with a specialization.
+                    if let Some(t) = self.prop_decl_class_typename(arg) {
+                        return Value::from_string(&t);
+                    }
                     // A class-typed variable: "class <name> #(<args>)".
                     if let Some((base, ta)) = self.class_declared_type_of(arg) {
                         return Value::from_string(&self.format_class_typename(&base, &ta));

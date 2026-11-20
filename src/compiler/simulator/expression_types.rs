@@ -559,8 +559,11 @@ impl Simulator {
             // by BARE name and shared by every process, so an unrelated task
             // suspended with a same-named local of another class decided this
             // name's type and `$typename` reported that class (issue #239).
+            // A property reached through a handle (`h.p`) is not the handle:
+            // the first segment names the variable only for a bare name.
             let bname = &hier.path[0].name.name;
-            for key in [&*name, bname.as_str()] {
+            let bare = hier.path.len() == 1;
+            for key in [&*name, bname.as_str()].into_iter().take(1 + bare as usize) {
                 if let Some(base) = self.local_class_type_of(key) {
                     let ta = self.var_type_args.get(key).cloned().unwrap_or_default();
                     return Some((base, ta));
@@ -570,7 +573,7 @@ impl Simulator {
                 let ta = self.var_type_args.get(&*name).cloned().unwrap_or_default();
                 return Some((base.clone(), ta));
             }
-            if let Some(base) = self.var_class_types.get(bname) {
+            if bare && let Some(base) = self.var_class_types.get(bname) {
                 let ta = self.var_type_args.get(bname).cloned().unwrap_or_default();
                 return Some((base.clone(), ta));
             }
@@ -781,6 +784,78 @@ impl Simulator {
             }
         }
         Some(self.class_spec_typename(&cls, None))
+    }
+
+    /// §20.6.1, §8.25: `$typename` of a class property declared with a
+    /// specialization (`drv_c #(W) p;` in a `holder_c #(16)` object) names
+    /// that specialization, a value argument that is a parameter of the
+    /// holder read in the holder object's own specialization. `None` for any
+    /// other operand.
+    pub(super) fn prop_decl_class_typename(&mut self, arg: &Expression) -> Option<String> {
+        if !matches!(arg.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. }) {
+            return None;
+        }
+        let (handle, prop) = self.class_prop_receiver(arg)?;
+        let cd = self.class_prop_declarer(handle, &prop)?;
+        let DataType::TypeReference {
+            name, type_args, ..
+        } = cd.property_types.get(&prop)?
+        else {
+            return None;
+        };
+        let base = name.name.name.clone();
+        if type_args.is_empty() || name.has_scope() || !self.module.classes.contains_key(&base) {
+            return None;
+        }
+        let saved = self.seed_callee_spec_from_instance(handle, &cd.name);
+        self.this_stack.push(Some(handle));
+        self.class_context_stack.push(Some(cd.name.clone()));
+        let args: Vec<Expression> = type_args
+            .iter()
+            .map(|a| self.typename_param_arg(a, &cd.param_order))
+            .collect();
+        self.class_context_stack.pop();
+        self.this_stack.pop();
+        self.restore_spec_pooled(saved);
+        Some(self.format_class_typename(&base, &args))
+    }
+
+    /// The specialization argument `a`, with a bare name of one of `params`
+    /// (the holder's value parameters) replaced by its current value.
+    fn typename_param_arg(&mut self, a: &Expression, params: &[String]) -> Expression {
+        match &a.kind {
+            ExprKind::NamedArg {
+                name,
+                expr: Some(x),
+            } => Expression::new(
+                ExprKind::NamedArg {
+                    name: name.clone(),
+                    expr: Some(Box::new(self.typename_param_arg(x, params))),
+                },
+                a.span,
+            ),
+            ExprKind::Ident(h)
+                if h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && params.contains(&h.path[0].name.name) =>
+            {
+                let v = self.eval_expr(a);
+                match (v.has_xz(), v.to_i64()) {
+                    (false, Some(n)) if n >= 0 => Expression::new(
+                        ExprKind::Number(NumberLiteral::Integer {
+                            size: None,
+                            signed: false,
+                            base: NumberBase::Decimal,
+                            value: n.to_string(),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
+                        }),
+                        a.span,
+                    ),
+                    _ => a.clone(),
+                }
+            }
+            _ => a.clone(),
+        }
     }
 
     /// Format a single specialization argument (a type or a value).
