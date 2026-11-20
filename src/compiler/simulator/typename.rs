@@ -77,7 +77,11 @@ impl TnType {
         if self.four {
             return self;
         }
-        let name = (self.name.as_deref() == Some("int")).then(|| "integer".to_string());
+        let name = match self.name.as_deref() {
+            Some("int") => Some("integer".into()),
+            Some("int unsigned") => Some("integer unsigned".into()),
+            _ => None,
+        };
         TnType {
             four: true,
             name,
@@ -112,8 +116,9 @@ impl TnType {
 #[derive(Debug, Clone)]
 pub(super) enum TnDim {
     Fixed(i64, i64),
-    /// A queue or dynamic array: `[]`.
+    /// A dynamic array: `[]`.
     Unsized,
+    Queue(Option<i64>),
     /// An associative array, by its index type: `[string]`.
     Assoc(String),
 }
@@ -238,9 +243,11 @@ impl Simulator {
         if !is_string {
             s.push('$');
         }
-        for d in dims.iter().rev() {
+        for d in dims {
             match d {
                 TnDim::Fixed(l, r) => s.push_str(&format!("[{}:{}]", l, r)),
+                TnDim::Queue(None) => s.push_str("[$]"),
+                TnDim::Queue(Some(max)) => s.push_str(&format!("[$:{max}]")),
                 TnDim::Unsized => s.push_str("[]"),
                 TnDim::Assoc(k) => s.push_str(&format!("[{}]", k)),
             }
@@ -266,7 +273,10 @@ impl Simulator {
                     Some(n) => TnDim::Fixed(0, n - 1),
                     None => TnDim::Unsized,
                 },
-                UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. } => TnDim::Unsized,
+                UnpackedDimension::Unsized(_) => TnDim::Unsized,
+                UnpackedDimension::Queue { max_size, .. } => {
+                    TnDim::Queue(max_size.as_deref().and_then(|e| self.tn_const(e)))
+                }
                 UnpackedDimension::Associative { data_type, .. } => TnDim::Assoc(
                     data_type
                         .as_deref()
@@ -317,7 +327,7 @@ impl Simulator {
                 if matches!(signing, Some(Signing::Signed)) {
                     s.push_str(" signed");
                 }
-                for d in dimensions.iter().rev() {
+                for d in dimensions {
                     if let PackedDimension::Range { left, right, .. } = d {
                         match (self.tn_const(left), self.tn_const(right)) {
                             (Some(l), Some(r)) => s.push_str(&format!("[{}:{}]", l, r)),
@@ -327,17 +337,22 @@ impl Simulator {
                 }
                 Some(s)
             }
-            DataType::IntegerAtom { kind, .. } => Some(
-                match kind {
+            DataType::IntegerAtom { kind, signing, .. } => {
+                let base = match kind {
                     A::Byte => "byte",
                     A::ShortInt => "shortint",
                     A::Int => "int",
                     A::LongInt => "longint",
                     A::Integer => "integer",
                     A::Time => "time",
-                }
-                .to_string(),
-            ),
+                };
+                let modifier = match signing {
+                    Some(Signing::Unsigned) if !matches!(kind, A::Time) => " unsigned",
+                    Some(Signing::Signed) if matches!(kind, A::Time) => " signed",
+                    _ => "",
+                };
+                Some(format!("{base}{modifier}"))
+            }
             DataType::Real { kind, .. } => Some(
                 match kind {
                     RealType::ShortReal => "shortreal",
@@ -436,14 +451,33 @@ impl Simulator {
                     _ => "union",
                 };
                 let packed = if su.packed { " packed" } else { "" };
-                Some(format!("{}{} {}", kw, packed, scoped))
+                let mut fields = String::new();
+                for member in &su.members {
+                    let ty = self.tn_base_text(&member.data_type, true)?;
+                    for decl in &member.declarators {
+                        let dims = self.tn_dims_of(&decl.dimensions);
+                        let text = self.tn_with_dims(ty.clone(), &member.data_type, &dims);
+                        fields.push_str(&format!("{text} {};", decl.name.name));
+                    }
+                }
+                Some(format!("{kw}{packed}{{{fields}}}{scoped}"))
             }
             DataType::Enum(et) => {
-                let base = match et.base_type.as_deref() {
-                    Some(b) => self.tn_base_text(b, false)?,
-                    None => "int".to_string(),
+                let (width, signed) = match et.base_type.as_deref() {
+                    Some(base) => {
+                        let t = self.tn_type_of_dt(base, true)?;
+                        (t.width, t.signed)
+                    }
+                    None => (32, true),
                 };
-                Some(format!("enum {} {}", base, scoped))
+                let members = self.enum_members_named(&name.qualified())?;
+                let sign = if signed { "s" } else { "" };
+                let values = members
+                    .iter()
+                    .map(|(id, bits)| format!("{id}={width}'{sign}d{bits}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                Some(format!("enum{{{values}}}{scoped}"))
             }
             _ => None,
         }
@@ -526,7 +560,15 @@ impl Simulator {
         if let Some(d) = self.module.unpacked_decl_dims.get(base) {
             return d.iter().map(|&(l, r)| TnDim::Fixed(l, r)).collect();
         }
-        if self.module.queue_vars.contains(base) || self.module.dynamic_arrays.contains(base) {
+        if self.module.queue_vars.contains(base) {
+            return vec![TnDim::Queue(
+                self.module
+                    .queue_max_sizes
+                    .get(base)
+                    .map(|n| i64::from(*n) - 1),
+            )];
+        }
+        if self.module.dynamic_arrays.contains(base) {
             return vec![TnDim::Unsized];
         }
         if let Some(&string_keyed) = self.module.associative_arrays.get(base) {
@@ -829,8 +871,7 @@ impl Simulator {
                     .get(&h.path[0].name.name)?
                     .return_type
                     .clone();
-                let t = self.tn_type_of_dt(&rt, false)?;
-                Some(TnType::generic(t.width, t.signed, false))
+                self.tn_type_of_dt(&rt, true)
             }
             _ => None,
         }

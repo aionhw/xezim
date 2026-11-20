@@ -227,6 +227,47 @@ impl Simulator {
         Some(info.continuation)
     }
 
+    /// §9.6.2: a named fork belongs to a lexical declaration. Concurrent
+    /// activations of that declaration share a target, sibling instances do not.
+    pub(super) fn register_named_fork(&mut self, label: &str, children: &HashSet<usize>) {
+        let key = format!("{}.{label}", self.m_path());
+        let mut all = self.fork_block_children.remove(&key).unwrap_or_default();
+        all.retain(|pid| {
+            !self.killed_pids.contains(pid) && (!self.finished_pids.contains(pid)
+                || self.process_parents.values().any(|parent| parent == pid))
+        });
+        all.extend(children.iter().copied());
+        self.fork_block_children.insert(key, all);
+    }
+
+    pub(super) fn named_fork_target(
+        &self,
+        target: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<String> {
+        let mut path = String::new();
+        for segment in &target.path {
+            if !path.is_empty() { path.push('.'); }
+            path.push_str(&segment.name.name);
+            for index in &segment.selects {
+                use std::fmt::Write;
+                write!(path, "[{}]", Self::try_const_u64(index)?).ok()?;
+            }
+        }
+        if let Some(path) = path.strip_prefix("$root.") {
+            return self.fork_block_children.contains_key(path).then(|| path.to_owned());
+        }
+        if self.fork_block_children.contains_key(&path) {
+            return Some(path);
+        }
+        let current = self.m_path();
+        let mut scope = if target.root.is_some() { self.module.name.as_str() } else { &current };
+        loop {
+            let key = format!("{scope}.{path}");
+            if self.fork_block_children.contains_key(&key) { return Some(key); }
+            scope = scope.rsplit_once('.')?.0;
+        }
+    }
+
     /// IEEE 1800-2023 §9.6.2: `disable x` where `x` is a block (or task)
     /// that ANOTHER process is executing — an ancestor the disabling process
     /// was forked inside, or any process parked inside it. That process
