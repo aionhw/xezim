@@ -61,7 +61,8 @@ fn wildcard_case_uses_all_item_types() {
 #[test]
 fn late_unsigned_item_changes_match_without_being_evaluated() {
     for keyword in ["case", "casez", "casex"] {
-        let src = format!(r#"
+        let src = format!(
+            r#"
 module top;
   logic signed [3:0] sel = -1;
   int calls = 0;
@@ -80,7 +81,8 @@ module top;
       8'sh0f: $display("NOTE: wrong");
     endcase
   end
-endmodule"#);
+endmodule"#
+        );
         assert_eq!(notes(&src), ["NOTE: zero 0", "NOTE: signed"], "{keyword}");
     }
 }

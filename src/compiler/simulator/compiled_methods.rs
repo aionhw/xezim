@@ -2070,7 +2070,11 @@ impl Simulator {
                 // Collection return: the VALUE leaves via the side channel;
                 // the result register is never consumed by the caller.
                 (0u32, false)
-            } else if let Some(pair) = self.scalar_integral_in(&_f.return_type, self.method_typedef_types(), self.method_typedef_widths()) {
+            } else if let Some(pair) = self.scalar_integral_in(
+                &_f.return_type,
+                self.method_typedef_types(),
+                self.method_typedef_widths(),
+            ) {
                 pair
             } else if let Some(pair) = self.enum_type_info(&_f.return_type) {
                 // Step 6: an enum RETURN is integral — width of the enum's base

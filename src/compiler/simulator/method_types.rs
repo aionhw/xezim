@@ -4,11 +4,15 @@ use super::*;
 
 impl Simulator {
     pub(super) fn method_typedef_widths(&self) -> &super::elaborate::TypedefTable {
-        self.declaration_typedefs.as_ref().map_or(&self.module.typedefs, |t| &t.0)
+        self.declaration_typedefs
+            .as_ref()
+            .map_or(&self.module.typedefs, |t| &t.0)
     }
 
     pub(super) fn method_typedef_types(&self) -> &super::elaborate::SharedMap<DataType> {
-        self.declaration_typedefs.as_ref().map_or(&self.module.typedef_types, |t| &t.1)
+        self.declaration_typedefs
+            .as_ref()
+            .map_or(&self.module.typedef_types, |t| &t.1)
     }
 
     /// Declared return width of the function `func` names, without calling it.

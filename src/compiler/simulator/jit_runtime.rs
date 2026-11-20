@@ -1503,19 +1503,29 @@ impl Simulator {
         // type. Inspect its type without evaluating the item.
         let unsigned = !inside
             && (self.expression_signed_hint(expr) == Some(false)
-                || patterns.clone().any(|p| self.expression_signed_hint(p) == Some(false)));
-        let op = |e: &Expression| matches!(
-            Self::unparen(e).kind,
-            ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
-        );
+                || patterns
+                    .clone()
+                    .any(|p| self.expression_signed_hint(p) == Some(false)));
+        let op = |e: &Expression| {
+            matches!(
+                Self::unparen(e).kind,
+                ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
+            )
+        };
         let width = if op(expr) || (!inside && patterns.clone().any(op)) {
-            let bounds: Vec<_> = patterns.filter(|p| !matches!(p.kind, ExprKind::Range(..)))
-                .map(|p| (p, inside)).collect();
+            let bounds: Vec<_> = patterns
+                .filter(|p| !matches!(p.kind, ExprKind::Range(..)))
+                .map(|p| (p, inside))
+                .collect();
             self.inside_joint_width_of(expr, &bounds).unwrap_or(0)
         } else {
             0
         };
-        CaseComparison { selector: self.eval_expr_typed(expr, width, unsigned), width, unsigned }
+        CaseComparison {
+            selector: self.eval_expr_typed(expr, width, unsigned),
+            width,
+            unsigned,
+        }
     }
 
     pub(super) fn case_item_matches(
@@ -1533,7 +1543,8 @@ impl Simulator {
             CaseKind::Casez => selector.casez_eq(&item),
             CaseKind::Casex => selector.casex_eq(&item),
             _ => selector.case_eq(&item),
-        }.is_true()
+        }
+        .is_true()
     }
 
     /// Self-determined width of `expr`. Cached on the node when the answer

@@ -6556,7 +6556,10 @@ impl Simulator {
                 );
                 self.type_tables_gen += 1;
                 self.declaration_typedefs.get_or_insert_with(|| {
-                    (self.module.typedefs.clone(), self.module.typedef_types.clone())
+                    (
+                        self.module.typedefs.clone(),
+                        self.module.typedef_types.clone(),
+                    )
                 });
                 self.module.typedefs.insert(td.name.name.clone(), w);
                 self.module

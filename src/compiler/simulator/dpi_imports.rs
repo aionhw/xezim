@@ -143,8 +143,7 @@ impl Simulator {
         if pw == 0 {
             return None;
         }
-        let signed =
-            super::elaborate::is_type_signed_resolved(&resolved, types);
+        let signed = super::elaborate::is_type_signed_resolved(&resolved, types);
         Some((pw, signed))
     }
 
