@@ -406,22 +406,10 @@ impl Simulator {
                             vm_regs[*else_r as usize] = vm_regs[*else_r as usize].resize(tw);
                         }
                     }
-                    let v = if vm_regs[*cond as usize].has_unknown() {
-                        let t = &vm_regs[*then_r as usize];
-                        let e = &vm_regs[*else_r as usize];
-                        // §11.3.1: a real result can't hold X, so bit-merging the
-                        // branches reads their IEEE-754 bits as garbage (a real
-                        // 1000.0 came out as 4.65e18). Return a defined real value
-                        // (x condition → the else/false branch) instead.
-                        if t.is_real || e.is_real {
-                            e.clone()
-                        } else {
-                            t.merge_unknown(e)
-                        }
-                    } else if vm_regs[*cond as usize].is_true() {
-                        vm_regs[*then_r as usize].clone()
-                    } else {
-                        vm_regs[*else_r as usize].clone()
+                    let v = match vm_regs[*cond as usize].is_nonzero() {
+                        Some(true) => vm_regs[*then_r as usize].clone(),
+                        Some(false) => vm_regs[*else_r as usize].clone(),
+                        None => vm_regs[*then_r as usize].merge_unknown(&vm_regs[*else_r as usize]),
                     };
                     vm_regs[*dest as usize] = v;
                 }
@@ -1213,22 +1201,10 @@ impl Simulator {
                             vm_regs[*else_r as usize] = vm_regs[*else_r as usize].resize(tw);
                         }
                     }
-                    let v = if vm_regs[*cond as usize].has_unknown() {
-                        let t = &vm_regs[*then_r as usize];
-                        let e = &vm_regs[*else_r as usize];
-                        // §11.3.1: a real result can't hold X, so bit-merging the
-                        // branches reads their IEEE-754 bits as garbage (a real
-                        // 1000.0 came out as 4.65e18). Return a defined real value
-                        // (x condition → the else/false branch) instead.
-                        if t.is_real || e.is_real {
-                            e.clone()
-                        } else {
-                            t.merge_unknown(e)
-                        }
-                    } else if vm_regs[*cond as usize].is_true() {
-                        vm_regs[*then_r as usize].clone()
-                    } else {
-                        vm_regs[*else_r as usize].clone()
+                    let v = match vm_regs[*cond as usize].is_nonzero() {
+                        Some(true) => vm_regs[*then_r as usize].clone(),
+                        Some(false) => vm_regs[*else_r as usize].clone(),
+                        None => vm_regs[*then_r as usize].merge_unknown(&vm_regs[*else_r as usize]),
                     };
                     vm_regs[*dest as usize] = v;
                 }
@@ -3745,22 +3721,10 @@ impl Simulator {
                                 self.vm_regs[*else_r as usize].resize(tw);
                         }
                     }
-                    let v = if self.vm_regs[*cond as usize].has_unknown() {
-                        let t = self.vm_regs[*then_r as usize].clone();
-                        let e = self.vm_regs[*else_r as usize].clone();
-                        // §11.3.1: a real result can't hold X — bit-merging the
-                        // branches would read their IEEE-754 bits as garbage.
-                        // Return a defined real value (else branch) when either
-                        // branch is real.
-                        if t.is_real || e.is_real {
-                            e
-                        } else {
-                            t.merge_unknown(&e)
-                        }
-                    } else if self.vm_regs[*cond as usize].is_true() {
-                        self.vm_regs[*then_r as usize].clone()
-                    } else {
-                        self.vm_regs[*else_r as usize].clone()
+                    let v = match self.vm_regs[*cond as usize].is_nonzero() {
+                        Some(true) => self.vm_regs[*then_r as usize].clone(),
+                        Some(false) => self.vm_regs[*else_r as usize].clone(),
+                        None => self.vm_regs[*then_r as usize].merge_unknown(&self.vm_regs[*else_r as usize]),
                     };
                     self.vm_regs[*dest as usize] = v;
                 }

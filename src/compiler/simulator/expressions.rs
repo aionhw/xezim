@@ -5039,7 +5039,7 @@ impl Simulator {
                 // §11.4.11/§11.8.2: with a REAL arm the result is real; the
                 // integral arm converts from its self-determined value
                 // (`c ? (u - 2) : 1.5` is 4294967295.0 for `int unsigned u =
-                // 1`). An x condition yields the else arm, as below.
+                // 1`).
                 // (A node with a known non-64 static width is integral.)
                 let maybe_real = |e: &Expression| !e.cached_width.get().is_some_and(|w| w != 64);
                 if (maybe_real(then_expr) || maybe_real(else_expr))
@@ -5058,7 +5058,7 @@ impl Simulator {
                 } else {
                     ctx_width
                 };
-                if c.has_unknown() {
+                if c.is_nonzero().is_none() {
                     // IEEE 1800 §11.4.11 Table 11-21: per-bit merge — bit is known
                     // only where both branches agree; otherwise X.
                     let mut t = self.eval_expr_typed(then_expr, arm_ctx, arms_unsigned);
@@ -5070,16 +5070,7 @@ impl Simulator {
                     } else if e.is_fill && !t.is_fill {
                         e = e.resize(t.width);
                     }
-                    // A REAL result cannot hold X, so the bitwise merge would
-                    // read the IEEE-754 bits of the operands as garbage (e.g. a
-                    // real `1000.0` came out as 4.65e18). §11.3.1: the result is
-                    // real when either branch is real — return a defined real
-                    // value (x condition → the else/false branch) instead.
-                    if t.is_real || e.is_real {
-                        e
-                    } else {
-                        t.merge_unknown(&e)
-                    }
+                    t.merge_unknown(&e)
                 } else {
                     let (taken, other): (&Expression, &Expression) = if c.is_true() {
                         (then_expr, else_expr)

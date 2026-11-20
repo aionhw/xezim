@@ -3109,11 +3109,7 @@ impl Simulator {
         }
     }
 
-    /// §11.8.2 operators with a REAL operand (see the bytecode compiler's
-    /// `compile_real_operator`): an arithmetic operator converts each integral
-    /// operand from its SELF-determined value; a relational or equality
-    /// operator propagates the real type one operator into a CONSTANT integral
-    /// side. None when neither operand is real.
+    /// §11.8.2: convert each integral operand from its self-determined value.
     #[inline(never)]
     pub(super) fn eval_real_operator(
         &mut self,
@@ -3203,15 +3199,17 @@ impl Simulator {
             return None;
         }
         let c = self.eval_expr(condition);
-        let taken = if !c.has_unknown() && c.is_true() {
-            then_expr
-        } else {
-            else_expr
+        let mut arm = |e: &Expression| {
+            if self.expr_is_constant(e) {
+                self.eval_in_real_context(e)
+            } else {
+                self.real_operand(e)
+            }
         };
-        Some(if self.expr_is_constant(taken) {
-            self.eval_in_real_context(taken)
-        } else {
-            self.real_operand(taken)
+        Some(match c.is_nonzero() {
+            Some(true) => arm(then_expr),
+            Some(false) => arm(else_expr),
+            None => arm(then_expr).merge_unknown(&arm(else_expr)),
         })
     }
 
