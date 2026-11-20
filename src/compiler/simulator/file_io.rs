@@ -1440,8 +1440,8 @@ impl Simulator {
     }
 
     /// §21.5 `$writememb/h/d`: dump a memory array to a file in the specified
-    /// radix. Each line is `@<addr_hex> <value_in_radix>`, matching the
-    /// `$readmem*` format so the file is round-trippable.
+    /// radix, in the `$readmem*` format (see [`MemDump`]) so the file is
+    /// round-trippable.
     pub(super) fn write_memory_file(&mut self, args: &[Expression], tn: &str) -> Value {
         self.flush_file_writes();
         if args.len() < 2 {
@@ -1520,19 +1520,22 @@ impl Simulator {
             if start > end {
                 words.reverse();
             }
-            let mut out = String::new();
+            // A load with no start address begins at address 0.
+            let first = key_order(0, bias);
+            let mut out = MemDump::new(first, if start > end { -1 } else { 1 }, radix);
+            out.wide = wide_key.is_some();
+            out.bias = bias;
             for (addr, val) in &words {
-                let addr = key_order(*addr, bias);
-                Self::push_memory_word(&mut out, addr, val, radix, wide_key.is_some());
+                out.word(*addr, val);
             }
-            let _ = std::fs::write(&path, out);
+            let _ = std::fs::write(&path, out.text);
             return Value::zero(32);
         }
         let step: i128 = if start <= end { 1 } else { -1 };
         let min_idx = lo.min(hi);
         let max_idx = lo.max(hi);
         let dense_array = self.array_first_id.get(mem_name.as_str()).copied();
-        let mut out = String::new();
+        let mut out = MemDump::new(lo, step, radix);
         let (mut addr, last) = if step > 0 {
             (start.max(min_idx), end.min(max_idx))
         } else {
@@ -1552,26 +1555,11 @@ impl Simulator {
             } else {
                 Value::zero(width)
             };
-            Self::push_memory_word(&mut out, addr, &val, radix, false);
+            out.word(addr, &val);
             addr += step;
         }
-        let _ = std::fs::write(&path, out);
+        let _ = std::fs::write(&path, out.text);
         Value::zero(32)
-    }
-
-    /// One `$writemem*` line, `@<addr_hex> <value_in_radix>`; `wide` as for
-    /// [`memory_file_address_text`].
-    fn push_memory_word(out: &mut String, addr: i128, val: &Value, radix: u32, wide: bool) {
-        out.push('@');
-        out.push_str(&Self::memory_file_address_text(addr, wide));
-        out.push(' ');
-        let s = match radix {
-            2 => val.to_bin_string(),
-            16 => val.to_hex_string(),
-            _ => val.to_dec_string(),
-        };
-        out.push_str(&s);
-        out.push('\n');
     }
 
     pub(super) fn base_ident_name(expr: &Expression) -> Option<String> {
@@ -1832,7 +1820,7 @@ impl Simulator {
         } else {
             Box::new((end.max(lo)..=start.min(hi)).rev())
         };
-        let mut out = String::new();
+        let mut out = MemDump::new(lo.into(), if start <= end { 1 } else { -1 }, radix);
         for addr in addrs {
             let idx = mem.indices(addr);
             let val = match self.elem_cell(&mem.base, &idx) {
@@ -1842,16 +1830,9 @@ impl Simulator {
                     .lookup_signal_value(&Self::elem_name(&mem.base, &idx))
                     .unwrap_or_else(|| Value::zero(mem.width)),
             };
-            out.push_str(&format!("@{:x} ", addr));
-            let s = match radix {
-                2 => val.to_bin_string(),
-                16 => val.to_hex_string(),
-                _ => val.to_dec_string(),
-            };
-            out.push_str(&s);
-            out.push('\n');
+            out.word(addr.into(), &val);
         }
-        let _ = std::fs::write(&path, out);
+        let _ = std::fs::write(&path, out.text);
         Value::zero(32)
     }
 }
@@ -1904,6 +1885,68 @@ impl NdMemory {
         let mut idx = self.prefix.clone();
         idx.extend(tail);
         idx
+    }
+}
+
+/// The text of a `$writemem*` file (§21.5): one word per line, in the
+/// radix of the task. An `@<address>` line comes before a word only where
+/// `$readmem*` would not load it there otherwise: before the first word
+/// unless it is at the address a load with no start address begins at, and
+/// after a gap in the addresses (an associative array's missing keys). So
+/// a dump of a whole array is data only, as Verilator writes it, and a dump
+/// of a range starts with one address line, which tools that compare dumps
+/// skip. §21.5.3 has address specifiers written for an associative array
+/// and left out for an unpacked one; the leading line of a range is kept so
+/// that `$readmem*` with no addresses loads the range back where it came
+/// from. With `--writemem-every-address` every word is written as
+/// `@<address> <word>`, the form xezim used to write.
+struct MemDump {
+    text: String,
+    /// The address the next word lands at without an `@` line; `None`
+    /// after the last address in the direction of the dump.
+    next: Option<i128>,
+    /// +1 or -1: the direction from the start address to the finish one.
+    step: i128,
+    radix: u32,
+    every: bool,
+    /// An associative array's index type is wider than 64 bits: a negative
+    /// address is written as its 128-bit two's complement.
+    wide: bool,
+    /// The target's `bias`: the addresses given to [`MemDump::word`] are in
+    /// [`key_order`], and written as the key's own bits.
+    bias: u128,
+}
+
+impl MemDump {
+    /// A dump whose words run in direction `step`, read back by a load that
+    /// begins at address `first`.
+    fn new(first: i128, step: i128, radix: u32) -> Self {
+        MemDump {
+            text: String::new(),
+            next: Some(first),
+            step,
+            radix,
+            every: writemem_every_address(),
+            wide: false,
+            bias: 0,
+        }
+    }
+
+    fn word(&mut self, addr: i128, val: &Value) {
+        if self.every || self.next != Some(addr) {
+            self.text.push('@');
+            let key = key_order(addr, self.bias);
+            self.text
+                .push_str(&Simulator::memory_file_address_text(key, self.wide));
+            self.text.push(if self.every { ' ' } else { '\n' });
+        }
+        self.text.push_str(&match self.radix {
+            2 => val.to_bin_string(),
+            16 => val.to_hex_string(),
+            _ => val.to_dec_string(),
+        });
+        self.text.push('\n');
+        self.next = addr.checked_add(self.step);
     }
 }
 

@@ -295,6 +295,9 @@ fn print_usage() {
     eprintln!("                   as --dpi-lib");
     eprintln!("  --show-env-avail Print every XEZIM_* environment variable with a description");
     eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
+    eprintln!("  --writemem-every-address  $writememh/$writememb write `@<address> <word>`");
+    eprintln!("                   on every line (the old layout) instead of one word per");
+    eprintln!("                   line with an @<address> line only where one is needed.");
     eprintln!("  --x-warn         Warn when a signal holding a valid 0/1 value takes an x bit");
     eprintln!("                   after time 0, naming the signal, its instance/module and its");
     eprintln!("                   drivers. Signals x/z from the start are never reported.");
@@ -2783,6 +2786,9 @@ fn run_main() -> i32 {
             // scripts reach for different ones.
             "--x-warn" | "--X_WARN" | "-X_WARN" | "+X_WARN" => {
                 xezim::compiler::simulator::set_warn_x(true);
+            }
+            "--writemem-every-address" => {
+                xezim::compiler::simulator::set_writemem_every_address(true);
             }
             "--x-warn-limit" | "--X_WARN_LIMIT" => {
                 i += 1;
