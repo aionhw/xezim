@@ -170,6 +170,11 @@ impl Simulator {
                     dims.iter().try_fold(1u64, |w, &(l, r)| {
                         w.checked_mul(l.abs_diff(r).checked_add(1)?)
                     })?
+                } else if module.signals.get(&name).is_none()
+                    && let Some((l, r)) = Self::scoped_vector_range(&name, module)
+                {
+                    dims.push((l, r));
+                    l.abs_diff(r).checked_add(1)?
                 } else {
                     let w = module.signals.get(&name).map(|s| s.width).or_else(|| {
                         module.var_decl_types.get(&name).map(|dt| {
@@ -268,6 +273,58 @@ impl Simulator {
             }
             _ => None,
         }
+    }
+
+    /// §6.20.2, §23.10: the one packed range a vector variable was declared
+    /// with, its bounds evaluated in the scope that declares it. An inlined
+    /// instance's `logic [P+1:0] b` is keyed `u.b`, and its `P` is `u.P`
+    /// (`u.g.P` and so on for generate scopes, searched innermost first).
+    /// Evaluated against the top's parameters, `P` was unknown and the vector
+    /// came out one bit wide, so a select of any other bit fell outside it and
+    /// counted as a read of the whole vector, which the block's own element
+    /// write then excluded: an `always_comb` that reads `b[1]` and writes
+    /// `b[0]` never woke again (§9.2.2.2.1). `None` when the declaration is not
+    /// a one-dimensional vector or a bound names something that is not a
+    /// parameter; the caller keeps its former width then.
+    fn scoped_vector_range(name: &str, module: &ElaboratedModule) -> Option<(i64, i64)> {
+        use crate::ast::types::{DataType, PackedDimension};
+        let dims = match module.var_decl_types.get(name)? {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                dimensions
+            }
+            _ => return None,
+        };
+        let [PackedDimension::Range { left, right, .. }] = dims.as_slice() else {
+            return None;
+        };
+        let mut names = HashSet::default();
+        Self::collect_leaf_idents(left, &mut names);
+        Self::collect_leaf_idents(right, &mut names);
+        let scope = name.rsplit_once('.').map_or("", |(s, _)| s);
+        // Only the parameters the bounds name, each as its declaring scope
+        // sees it.
+        fn empty_like<T: Default>(_: &T) -> T {
+            T::default()
+        }
+        let mut view = empty_like(&module.parameters);
+        for n in names {
+            let mut s = scope;
+            let value = loop {
+                if s.is_empty() {
+                    break module.parameters.get(&n);
+                }
+                if let Some(v) = module.parameters.get(&format!("{s}.{n}")) {
+                    break Some(v);
+                }
+                s = s.rsplit_once('.').map_or("", |(outer, _)| outer);
+            };
+            if let Some(v) = value {
+                view.insert(n, v.clone());
+            }
+        }
+        let l = super::elaborate::const_eval_i64_with_params(left, Some(&view))?;
+        let r = super::elaborate::const_eval_i64_with_params(right, Some(&view))?;
+        Some((l, r))
     }
 
     pub(super) fn collect_leaf_idents(expr: &Expression, out: &mut HashSet<String>) {
