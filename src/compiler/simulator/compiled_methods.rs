@@ -5627,8 +5627,11 @@ impl Simulator {
         if let Some(t) = self.class_prop_type_named(type_name, member) {
             return Some(t);
         }
-        if let Some(dt) = self.module.typedef_types.get(type_name).cloned() {
-            let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
+        // Read the typedef in place: a register-block struct has hundreds
+        // of members, and this runs for every dotted name the interpreter
+        // reads or writes (`dotted_name_declared_class`).
+        if let Some(dt) = self.module.typedef_types.get(type_name) {
+            let resolved = Self::resolve_type_ref_borrowed(dt, &self.module.typedef_types);
             if let DataType::Struct(su) = resolved {
                 for m in &su.members {
                     for d in &m.declarators {
@@ -5637,7 +5640,7 @@ impl Simulator {
                                 return Some(name.name.name.clone());
                             }
                             if let DataType::TypeReference { name, .. } =
-                                self.resolve_dt(&m.data_type)
+                                self.resolve_dt_ref(&m.data_type)
                             {
                                 return Some(name.name.name.clone());
                             }
