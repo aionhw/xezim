@@ -3225,32 +3225,13 @@ impl Simulator {
         }
     }
 
-    /// §6.16.6 compare/icompare, matching the reference simulator: the
-    /// byte difference at the first mismatch within the common length,
-    /// or ±1 by length when one string is a prefix of the other.
-    /// `compare` takes the difference of the characters as SIGNED bytes
-    /// (`"\x80".compare("\x7f")` is -255), `icompare` as unsigned bytes
-    /// after ASCII case folding. Both operands are string text forms (one
-    /// Latin-1 char per byte), so they are walked by char, never by their
-    /// UTF-8 encoding.
+    /// IEEE 1800-2023 §6.16.6 and Table 6-9 use unsigned byte ordering.
+    /// The text representation stores one Latin-1 character per SV byte.
     pub(super) fn sv_strcmp(a: &str, b: &str, icase: bool) -> i64 {
-        Self::sv_strcmp_by(a, b, |b| {
-            if icase {
-                b.to_ascii_lowercase() as i64
-            } else {
-                b as i8 as i64
-            }
-        })
-    }
-
-    /// The lexicographic ORDER of two strings for the `==`/`<` operator
-    /// family (§6.16 Table 6-9): unsigned byte differences.
-    pub(super) fn sv_str_order(a: &str, b: &str) -> i64 {
-        Self::sv_strcmp_by(a, b, |b| b as i64)
-    }
-
-    pub(super) fn sv_strcmp_by(a: &str, b: &str, byte: impl Fn(u8) -> i64) -> i64 {
-        let byte = |c: char| byte(c as u32 as u8);
+        let byte = |c: char| {
+            let b = c as u8;
+            i64::from(if icase { b.to_ascii_lowercase() } else { b })
+        };
         for (ca, cb) in a.chars().zip(b.chars()) {
             let (ca, cb) = (byte(ca), byte(cb));
             if ca != cb {
