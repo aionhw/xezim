@@ -471,51 +471,82 @@ impl Simulator {
         layout: UnpackedLayout<'_>,
         values: &mut Vec<Value>,
     ) {
-        let Some(row) = self.unpacked_elems_from_layout(layout, true) else {
-            return;
+        if let Some(row) = self.unpacked_elems_from_layout(layout, true) {
+            self.append_unpacked_elem_values(&row, values);
+        }
+    }
+
+    /// §7.4.5, §10.10: a slice of a fixed unpacked array or of one of its
+    /// rows (`a[i +: 2]`, `w[3 -: 2]`, `m[1][0:1]`) contributes its elements
+    /// left to right, in the order the range selects them. False when `e` is
+    /// no such slice (a queue or dynamic-array slice keeps its own path).
+    pub(super) fn append_fixed_slice_concat_values(
+        &mut self,
+        e: &Expression,
+        values: &mut Vec<Value>,
+    ) -> bool {
+        // Decline before naming any element: a queue slice (`q[1:$]`) is the
+        // common operand here, and it keeps its own path.
+        let Some(layout) = self
+            .unpacked_operand_layout::<false>(e)
+            .filter(|l| matches!(l.steps.last(), Some(Step::Range(..))))
+            .filter(|l| self.live_coll_size(&l.root_name).is_none())
+        else {
+            return false;
         };
+        let Some(el) = self.unpacked_elems_from_layout(layout, false) else {
+            return false;
+        };
+        self.append_unpacked_elem_values(&el, values);
+        true
+    }
+
+    /// The values of `el`'s elements; one outside the declared range reads
+    /// as the element type's default (§7.4.5 Table 7-1).
+    fn append_unpacked_elem_values(&self, el: &UnpackedElems, values: &mut Vec<Value>) {
         let mut missing = None;
-        values.extend(row.names.iter().map(|name| {
+        values.extend(el.names.iter().map(|name| {
             self.read_unpacked_elem(name.as_deref()).unwrap_or_else(|| {
-                // §7.4.5 Table 7-1: an invalid fixed row has a default value in every cell.
                 missing
-                    .get_or_insert_with(|| {
-                        let dt = self.concat_row_elem_type(&row.root_name);
-                        match dt.as_deref().map(|dt| self.resolve_dt_ref(dt)) {
-                            Some(DataType::Simple {
-                                kind: SimpleType::String,
-                                ..
-                            }) => Value::from_string(""),
-                            Some(DataType::Simple {
-                                kind: SimpleType::Chandle | SimpleType::Event,
-                                ..
-                            }) => Value::zero(row.ew),
-                            Some(dt) if self.decl_is_virtual_iface(dt) => Value::zero(row.ew),
-                            Some(
-                                dt @ (DataType::IntegerAtom { .. }
-                                | DataType::IntegerVector { .. }
-                                | DataType::Struct(_)
-                                | DataType::Enum(_)),
-                            ) => {
-                                let types = &self.module.typedef_types;
-                                let mut value =
-                                    if super::elaborate::is_type_two_state_resolved(dt, types) {
-                                        Value::zero(row.ew)
-                                    } else {
-                                        Value::new(row.ew)
-                                    };
-                                value.is_signed =
-                                    super::elaborate::is_type_signed_resolved(dt, types);
-                                value
-                            }
-                            _ => self
-                                .coll_missing_elem_value(&row.root_name)
-                                .unwrap_or_else(|| Value::new(row.ew)),
-                        }
-                    })
+                    .get_or_insert_with(|| self.unpacked_elem_default(&el.root_name, el.ew))
                     .clone()
             })
         }));
+    }
+
+    /// §7.4.5 Table 7-1: the value an invalid element of the fixed array
+    /// `root` reads, by its element type.
+    fn unpacked_elem_default(&self, root: &str, ew: u32) -> Value {
+        let dt = self.concat_row_elem_type(root);
+        match dt.as_deref().map(|dt| self.resolve_dt_ref(dt)) {
+            Some(DataType::Simple {
+                kind: SimpleType::String,
+                ..
+            }) => Value::from_string(""),
+            Some(DataType::Simple {
+                kind: SimpleType::Chandle | SimpleType::Event,
+                ..
+            }) => Value::zero(ew),
+            Some(dt) if self.decl_is_virtual_iface(dt) => Value::zero(ew),
+            Some(
+                dt @ (DataType::IntegerAtom { .. }
+                | DataType::IntegerVector { .. }
+                | DataType::Struct(_)
+                | DataType::Enum(_)),
+            ) => {
+                let types = &self.module.typedef_types;
+                let mut value = if super::elaborate::is_type_two_state_resolved(dt, types) {
+                    Value::zero(ew)
+                } else {
+                    Value::new(ew)
+                };
+                value.is_signed = super::elaborate::is_type_signed_resolved(dt, types);
+                value
+            }
+            _ => self
+                .coll_missing_elem_value(root)
+                .unwrap_or_else(|| Value::new(ew)),
+        }
     }
 
     /// The elements of a selected part of an unpacked array, a slice or a

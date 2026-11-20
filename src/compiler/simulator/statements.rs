@@ -91,13 +91,27 @@ impl Simulator {
                 ..
             } = &expr.kind
             {
-                if let ExprKind::Ident(rhier) = &rbase.kind {
-                    let mut rname = self.resolve_hier_name(rhier);
-                    // Instance-scope a member-queue slice
-                    // operand inside a concat (`{q[0:i], …}`).
-                    if let Some(s) = self.instance_assoc_member(&rname) {
-                        rname = std::borrow::Cow::Owned(s);
+                let rname = match &rbase.kind {
+                    ExprKind::Ident(rhier) => {
+                        let mut rname = self.resolve_hier_name(rhier);
+                        // Instance-scope a member-queue slice
+                        // operand inside a concat (`{q[0:i], …}`).
+                        if let Some(s) = self.instance_assoc_member(&rname) {
+                            rname = std::borrow::Cow::Owned(s);
+                        }
+                        Some(rname)
                     }
+                    _ => None,
+                };
+                // §7.4.5, §10.10: a slice of a fixed array or of one of its
+                // rows; a queue or dynamic-array slice takes the path below.
+                let collection = rname.as_deref().is_some_and(|n| {
+                    self.module.dynamic_arrays.contains(n) || self.class_queue_prop(n)
+                });
+                if !collection && self.append_fixed_slice_concat_values(expr, &mut all_vals) {
+                    continue;
+                }
+                if let Some(rname) = rname {
                     if self.module.arrays.contains_key(&*rname) {
                         let (r_lo_a, r_hi_a, _) = self.module.arrays[&*rname];
                         let r_is_dyn = self.module.dynamic_arrays.contains(&*rname);
