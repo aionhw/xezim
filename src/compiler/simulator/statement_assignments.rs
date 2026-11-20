@@ -3109,6 +3109,7 @@ impl Simulator {
                     Some(w) => self.eval_expr_ctx(rvalue, w),
                     None => self.eval_expr(rvalue),
                 };
+                let v = self.fill_into_real_target(lvalue, v);
                 self.assign_value(lvalue, &v);
                 self.settle_after_proc_write();
                 return;
@@ -4336,6 +4337,7 @@ impl Simulator {
         } else {
             self.eval_assign_rhs(lvalue, rvalue, w)
         };
+        let val = self.fill_into_real_target(lvalue, val);
         // A collection RETURNED by the call in `rvalue` (recorded at
         // its `return` statement): copy it into a collection lvalue.
         if matches!(&rvalue.kind, ExprKind::Call { .. }) {

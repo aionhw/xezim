@@ -4508,6 +4508,7 @@ impl Simulator {
                     (None, ExprKind::AssignmentPattern(_)) => self.eval_expr(rvalue),
                     (None, _) => self.eval_target_rhs(packed_lvalue, rvalue),
                 };
+                let val = self.fill_into_real_target(lvalue, val);
                 // LRM §14.4: clocking-block output drive
                 // `cb.<out_sig> <= val`. Defer to the cb's next clock
                 // edge (output skew) instead of driving now. Handles both a

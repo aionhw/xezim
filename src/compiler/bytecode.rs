@@ -13033,6 +13033,40 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// The assignment target `lv` is known to be real: a real variable or
+    /// net, or an element of a real unpacked array.
+    fn lvalue_is_real(&self, lv: &Expression) -> bool {
+        match &lv.kind {
+            ExprKind::Ident(_) => self.expr_is_real_static(lv),
+            ExprKind::Index { expr: base, .. } => match &base.kind {
+                ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                    if let Some(ab) = self.local_var_array.get(&Self::hier_raw_name(h)) {
+                        return ab.is_real;
+                    }
+                    self.signal_real.is_some()
+                        && self.lookup_array_name(h).is_some_and(|name| {
+                            let lo = self.arrays.get(&name).map_or(0, |&(lo, _, _)| lo);
+                            self.lookup_signal_id_by_name(&format!("{name}[{lo}]"))
+                                .is_some_and(|id| self.signal_is_real(id))
+                        })
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// §10.7, §6.12.1: a value stored into a real target converts to real
+    /// first, at its own width. Fitting it to the target's 64-bit storage
+    /// first would widen an unbased unsized `'1` to 2**64-1 (§5.7.1: it has
+    /// one bit where the context gives no width) and truncate an integral
+    /// value wider than 64 bits.
+    fn emit_real_target_fit(&mut self, reg: RegId, rhs: &Expression) {
+        if !self.expr_is_real_static(rhs) {
+            self.emit_to_real(reg);
+        }
+    }
+
     fn lookup_signal_id(&self, hier: &HierarchicalIdentifier) -> Option<usize> {
         // §26.3: package code's own parameter is a constant; its own (or
         // imported) variable is that package's signal.
@@ -15754,7 +15788,13 @@ impl<'a> BytecodeCompiler<'a> {
                 self.pattern_ctx = self.lvalue_pattern_ctx(lvalue, rvalue);
                 let compiled = self.compile_expr(rvalue, rctx);
                 self.pattern_ctx = None;
-                if let Some(val_reg) = compiled {
+                if let Some(mut val_reg) = compiled {
+                    if self.lvalue_is_real(lvalue) && !self.expr_is_real_static(rvalue) {
+                        let t = self.alloc_reg();
+                        self.emit(Insn::Move(t, val_reg));
+                        self.emit_real_target_fit(t, rvalue);
+                        val_reg = t;
+                    }
                     // Note: NbaAssign itself performs §10.7 assignment-padding resize,
                     // so we don't emit a generic (zero-extending) Resize here — that
                     // would strip X/Z from the MSB before the assignment could X/Z-extend.
@@ -15873,6 +15913,8 @@ impl<'a> BytecodeCompiler<'a> {
                         // variable is rounded (`l = r;` with `longint l`).
                         if !self.value_may_be_real(lvalue) {
                             self.emit_real_to_int_fit(val_reg, rvalue, width);
+                        } else if self.lvalue_is_real(lvalue) {
+                            self.emit_real_target_fit(val_reg, rvalue);
                         }
                         self.emit(Insn::Resize(val_reg, width));
                     }
@@ -23614,8 +23656,12 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // §10.3.2, §6.12.1: an integral net or variable driven by a real
             // takes the real rounded (`wire [63:0] w = r;`).
-            if self.signal_real.is_some() && !self.signal_is_real(dst_id) {
-                self.emit_real_to_int_fit(val_reg, rhs, width);
+            if self.signal_real.is_some() {
+                if self.signal_is_real(dst_id) {
+                    self.emit_real_target_fit(val_reg, rhs);
+                } else {
+                    self.emit_real_to_int_fit(val_reg, rhs, width);
+                }
             }
             self.emit(Insn::Resize(val_reg, width));
             self.emit(Insn::BlockingAssign(as_sig_id(dst_id), val_reg, width));

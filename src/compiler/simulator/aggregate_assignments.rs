@@ -2957,6 +2957,36 @@ impl Simulator {
         }
     }
 
+    /// §5.7.1, §6.12.1: an unbased unsized literal stored into a real target
+    /// converts at its self-determined one bit (`r <= '1` stores 1.0); the
+    /// target's 64-bit storage width would otherwise widen it to 2**64-1
+    /// first. Any other value is returned unchanged.
+    pub(super) fn fill_into_real_target(&mut self, lvalue: &Expression, val: Value) -> Value {
+        if !val.is_fill {
+            return val;
+        }
+        let real = self.assign_rhs_ctx(lvalue, 64) == 0
+            || self
+                .resolve_nba_target(lvalue)
+                .is_some_and(|id| self.signal_real.get(id).copied().unwrap_or(false))
+            || match &lvalue.kind {
+                // An element of a real array, queue or associative array.
+                ExprKind::Index { expr: base, .. } => match &base.kind {
+                    ExprKind::Ident(h) => {
+                        let n = self.resolve_hier_name(h).into_owned();
+                        self.coll_elem_is_real(&n)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+        if real {
+            Value::from_f64(val.to_f64())
+        } else {
+            val
+        }
+    }
+
     #[inline(never)]
     pub(super) fn assign_rhs_ctx(&mut self, lvalue: &Expression, w: u32) -> u32 {
         // A real variable is 64 bits wide; any other width is integral.
@@ -4025,8 +4055,12 @@ impl Simulator {
         let mut val = self.queue_eval_arg(obj_name, arg);
         // §5.7.1: an unsized fill (`q.push_back('1)`) takes the element's
         // width, not one bit.
+        // A real element converts it at that one bit (§6.12.1), not at the
+        // element's 64-bit storage width.
         if val.is_fill && !val.is_real {
-            if let Some(&(_, _, w)) = self.module.arrays.get(obj_name) {
+            if self.coll_elem_is_real(obj_name) {
+                val = Value::from_f64(val.to_f64());
+            } else if let Some(&(_, _, w)) = self.module.arrays.get(obj_name) {
                 if w > 0 {
                     val = val.resize(w);
                 }
