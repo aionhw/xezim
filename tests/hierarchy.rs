@@ -432,6 +432,8 @@ mod prepared_body_shared_across_ancestors;
 
 #[path = "hierarchy/param_port_actual_no_implicit_net.rs"]
 mod param_port_actual_no_implicit_net;
+#[path = "hierarchy/enum_label_port_actual_no_implicit_net.rs"]
+mod enum_label_port_actual_no_implicit_net;
 
 #[path = "hierarchy/generate_region_parameter_override.rs"]
 mod generate_region_parameter_override;
