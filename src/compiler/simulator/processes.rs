@@ -3319,7 +3319,8 @@ impl Simulator {
     pub(super) fn run_process_stmts(&mut self, pid: usize, pc: &ProcCont) {
         // A call chain that never waits nests one activation per call; stop
         // it with a diagnostic before it exhausts the native stack.
-        if self.stmts_depth >= 64 && self.process_nesting_exceeded(pid) {
+        let at_limit = self.stall_limit != 0 && u64::from(self.stmts_depth) >= self.stall_limit;
+        if (at_limit || self.stmts_depth >= 64) && self.process_nesting_exceeded(pid) {
             return;
         }
         self.stmts_depth += 1;

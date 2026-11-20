@@ -28,13 +28,13 @@ module t;
 endmodule
 "#;
 
-fn run(case: &str, env: &[(&str, &str)]) -> (std::process::ExitStatus, String) {
+fn run(case: &str, src: &str, env: &[(&str, &str)]) -> (std::process::ExitStatus, String) {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("zero_delay_task_recursion")
         .join(case);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("t.sv");
-    std::fs::write(&path, SRC).unwrap();
+    std::fs::write(&path, src).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
     cmd.args(["--no-cache", "-s", "t"]).arg(&path);
     for (k, v) in env {
@@ -64,9 +64,19 @@ fn assert_reported(status: std::process::ExitStatus, text: &str) {
 /// `XEZIM_STALL_LIMIT` bounds the nesting like the other stall checks.
 #[test]
 fn zero_delay_task_recursion_stops_at_the_stall_limit() {
-    let (status, text) = run("limit", &[("XEZIM_STALL_LIMIT", "500")]);
+    let (status, text) = run("limit", SRC, &[("XEZIM_STALL_LIMIT", "500")]);
     assert_reported(status, &text);
     assert!(text.contains("nested 500 task calls"), "{text}");
+}
+
+/// A finite chain that crosses an explicit cap must stop even below the
+/// depth at which the simulator starts polling native stack space.
+#[test]
+fn finite_task_recursion_obeys_a_small_explicit_limit() {
+    let src = SRC.replace("    run();", "    if (n < 40) run();");
+    let (status, text) = run("small_limit", &src, &[("XEZIM_STALL_LIMIT", "32")]);
+    assert_reported(status, &text);
+    assert!(text.contains("nested 32 task calls"), "{text}");
 }
 
 /// On a small native stack the check stops the run before the stack runs out.
@@ -79,6 +89,7 @@ fn zero_delay_task_recursion_stops_at_the_stall_limit() {
 fn zero_delay_task_recursion_stops_before_the_stack_runs_out() {
     let (status, text) = run(
         "stack",
+        SRC,
         &[("XEZIM_STACK_MB", "64"), ("XEZIM_STALL_LIMIT", "0")],
     );
     assert_reported(status, &text);
