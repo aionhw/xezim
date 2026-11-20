@@ -2,6 +2,12 @@
 
 use super::*;
 
+pub(super) struct CaseComparison {
+    selector: Value,
+    width: u32,
+    unsigned: bool,
+}
+
 impl Simulator {
     #[inline]
     pub(crate) fn jit_load_signal_slice_xz(&self, id: usize, lo: u32, w: u32) -> u64 {
@@ -1485,30 +1491,49 @@ impl Simulator {
     /// (a8 + 8'd1) 256: ...` adds at 32 bits. A `case inside` selector is
     /// sized by its value items only — the reference simulator does not
     /// widen it for a range item.
-    pub(super) fn case_selector_value(
+    pub(super) fn case_comparison(
         &mut self,
         kind: &CaseKind,
         expr: &Expression,
         items: &[crate::ast::stmt::CaseItem],
-    ) -> Value {
-        if !matches!(
-            Self::unparen(expr).kind,
-            ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
-        ) {
-            return self.eval_expr(expr);
-        }
+    ) -> CaseComparison {
         let inside = matches!(kind, CaseKind::CaseInside);
-        let bounds: Vec<(&Expression, bool)> = items
-            .iter()
-            .filter(|it| !it.is_default)
-            .flat_map(|it| it.patterns.iter())
-            .filter(|p| !matches!(p.kind, ExprKind::Range(..)))
-            .map(|p| (p, inside))
-            .collect();
-        match self.inside_joint_width_of(expr, &bounds) {
-            Some(w) => self.eval_expr_ctx(expr, w),
-            None => self.eval_expr(expr),
+        let patterns = items.iter().flat_map(|item| &item.patterns);
+        // §12.5: even an item after the first match sets the comparison
+        // type. Inspect its type without evaluating the item.
+        let unsigned = !inside
+            && (self.expression_signed_hint(expr) == Some(false)
+                || patterns.clone().any(|p| self.expression_signed_hint(p) == Some(false)));
+        let op = |e: &Expression| matches!(
+            Self::unparen(e).kind,
+            ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
+        );
+        let width = if op(expr) || (!inside && patterns.clone().any(op)) {
+            let bounds: Vec<_> = patterns.filter(|p| !matches!(p.kind, ExprKind::Range(..)))
+                .map(|p| (p, inside)).collect();
+            self.inside_joint_width_of(expr, &bounds).unwrap_or(0)
+        } else {
+            0
+        };
+        CaseComparison { selector: self.eval_expr_typed(expr, width, unsigned), width, unsigned }
+    }
+
+    pub(super) fn case_item_matches(
+        &mut self,
+        kind: &CaseKind,
+        comparison: &CaseComparison,
+        pat: &Expression,
+    ) -> bool {
+        let selector = &comparison.selector;
+        if matches!(kind, CaseKind::CaseInside) {
+            return self.case_inside_match(selector, pat);
         }
+        let item = self.eval_expr_typed(pat, comparison.width, comparison.unsigned);
+        match kind {
+            CaseKind::Casez => selector.casez_eq(&item),
+            CaseKind::Casex => selector.casex_eq(&item),
+            _ => selector.case_eq(&item),
+        }.is_true()
     }
 
     /// Self-determined width of `expr`. Cached on the node when the answer
