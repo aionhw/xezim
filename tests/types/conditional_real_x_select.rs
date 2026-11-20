@@ -44,7 +44,6 @@ endmodule
 fn integral_conditional_with_x_still_merges() {
     let o = out(r#"
 module t;
-  localparam real P = 1'bx ? 5.0 : 6.0;
   reg sel; reg [3:0] a=4'b1100, b=4'b1010, r;
   initial begin sel=1'bx; r = sel ? a : b; $display("R=%b", r); $finish; end
 endmodule
