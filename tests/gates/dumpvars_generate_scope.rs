@@ -238,7 +238,11 @@ fn fst_vars(tag: &str, scopes: &[&str]) -> Vec<String> {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let file = fs::File::open(&fst).expect("open fst");
+    read_fst_vars(&fst)
+}
+
+fn read_fst_vars(fst: &std::path::Path) -> Vec<String> {
+    let file = fs::File::open(fst).expect("open fst");
     let mut reader = FstReader::open_and_read_time_table(BufReader::new(file))
         .expect("FST header does not decode");
     let mut stack: Vec<String> = Vec::new();
@@ -657,4 +661,61 @@ fn root_and_descendant_scopes_1195() {
         fst_names("fst1195", &["1:tb_top", "1:tb_top.u_chan"]),
         expected
     );
+}
+
+/// IEEE 1800-2023 §23.6, §21.7.1.2: scope selection from another top.
+#[test]
+fn dump_subinstance_from_another_top() {
+    for (task, file_task, ext) in [
+        ("$dumpvars", "$dumpfile", "vcd"),
+        ("$fsdbDumpvars", "$fsdbDumpfile", "fst"),
+    ] {
+        let dir = tmp("cross_top", ext);
+        fs::create_dir_all(&dir).unwrap();
+        let requested_ext = if ext == "fst" { "fsdb" } else { ext };
+        let src = format!(
+            r#"
+module leaf;
+  bit active;
+  always #1 active = !active;
+endmodule
+module tb_top;
+  leaf selected(), sibling();
+  initial #10 $finish;
+endmodule
+module dump_ctl;
+  initial begin
+    {file_task}("out.{requested_ext}");
+    {task}(0, tb_top.selected);
+  end
+endmodule
+"#
+        );
+        fs::write(dir.join("dut.sv"), src).unwrap();
+        let run = Command::new(xezim())
+            .current_dir(&dir)
+            .args(["--simulate", "--no-cache", "--wave", "dut.sv"])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let path = dir.join(format!("out.{ext}"));
+        let vars = if ext == "vcd" {
+            read_vcd(&path).1
+        } else {
+            read_fst_vars(&path)
+        };
+        assert!(
+            vars.iter().any(|v| v.ends_with(".selected.active")),
+            "{task}: {vars:?}"
+        );
+        assert!(
+            !vars.iter().any(|v| v.contains(".sibling.")),
+            "{task}: {vars:?}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

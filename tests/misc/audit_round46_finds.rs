@@ -53,10 +53,8 @@ endmodule
     );
 }
 
-/// §11.8.3: an ALL-LITERAL integer subtree next to a real operand folds
-/// with real arithmetic (`3.5 == 7/2` is true); variable operands keep
-/// integer division (`x == a/b` with a=7,b=2 is false, `x + a/b` = 6.5).
-/// Both reference-verified.
+/// §11.8.2: both literal and variable operands divide as integers before
+/// their result is compared to a real.
 #[test]
 fn real_context_literal_subtree_folding() {
     let msgs = out(r#"
@@ -69,8 +67,8 @@ module test;
 endmodule
 "#);
     assert!(
-        msgs.iter().any(|m| m == "T|1 0 6.5"),
-        "literal-only real folding; got {:?}",
+        msgs.iter().any(|m| m == "T|0 0 6.5"),
+        "integer division before real conversion; got {:?}",
         msgs
     );
 }

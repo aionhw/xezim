@@ -101,6 +101,9 @@ impl Simulator {
             for (prop, &(w, max)) in &cd.queue_properties {
                 let s_name = format!("{}#{}", src_handle, prop);
                 let n_name = format!("{}#{}", new_handle, prop);
+                if cd.queue_property_names.contains(prop) {
+                    self.module.queue_vars.insert(n_name.clone());
+                }
                 self.module.dynamic_arrays.insert(n_name.clone());
                 if let Some(&t) = self.module.arrays_2d.get(&s_name) {
                     self.module.arrays_2d.insert(n_name.clone(), t);
@@ -3016,6 +3019,9 @@ impl Simulator {
                     ) && super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types)
                 }) {
                     self.signed_class_colls.insert(scoped.clone());
+                }
+                if cdef.queue_property_names.contains(prop) {
+                    self.module.queue_vars.insert(scoped.clone());
                 }
                 self.module.dynamic_arrays.insert(scoped.clone());
                 // The object is not on the heap yet: its value parameters

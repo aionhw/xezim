@@ -715,10 +715,19 @@ impl Simulator {
                 }
                 let w = self.infer_lhs_width(lhs);
                 // §10.8, §10.9: a pattern takes the net's declared type.
+                let saved_ts = self.timescale_scope_override.replace(
+                    entry
+                        .cold
+                        .rhs_time_scope
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
                 let val = match self.eval_pattern_for_lvalue(lhs, rhs) {
                     Some(v) => v.resize(w),
                     None => self.eval_expr_ctx(rhs, w).resize(w),
                 };
+                self.timescale_scope_override = saved_ts;
                 let delay = if *explicit_delay > 0 {
                     *explicit_delay
                 } else {
@@ -885,6 +894,12 @@ impl Simulator {
                 };
                 // §20.3.1, §20.3.3: statement fallbacks in top blocks need the top unit.
                 let saved_ts = if compiled.has_fallback
+                    && matches!(entry.item, CombItem::CompiledContAssign { .. })
+                {
+                    Some(self.timescale_scope_override.replace(
+                        entry.cold.rhs_time_scope.as_deref().unwrap_or_default().to_owned(),
+                    ))
+                } else if compiled.has_fallback
                     && entry.cold.scope_hint.is_none()
                     && matches!(entry.item, CombItem::CompiledAlwaysBlock { .. })
                 {
@@ -2520,7 +2535,14 @@ impl Simulator {
                                         let sc = entries[eidx].cold.scope_hint.clone();
                                         self.set_m_block_scope(sc.as_deref());
                                         *self.name_resolve_hint.borrow_mut() = sc.clone();
-                                        self.timescale_scope_override = sc;
+                                        self.timescale_scope_override = Some(
+                                            entries[eidx]
+                                                .cold
+                                                .rhs_time_scope
+                                                .as_deref()
+                                                .unwrap_or_default()
+                                                .to_owned(),
+                                        );
                                         Some((prev_hint, prev_ts))
                                     } else {
                                         None

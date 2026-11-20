@@ -141,6 +141,36 @@ fn note_packed_access(selection: &PackedSelection, write: bool) {
 }
 
 impl Simulator {
+    /// Single-dimensional vectors usually have no packed_full_dims entry.
+    /// Resolve their declared range with the parameters of this instance,
+    /// including overrides and localparams shadowing a name in the top.
+    fn instance_vector_bounds(name: &str, module: &ElaboratedModule) -> Option<Vec<(i64, i64)>> {
+        let (scope, _) = name.rsplit_once('.')?;
+        let dt = module.var_decl_types.get(name)?;
+        let (DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. }) = dt else {
+            return None;
+        };
+        if dimensions.is_empty() || Self::packed_dims_are_literal(dt) {
+            return None;
+        }
+        let mut names = HashSet::default();
+        for dim in dimensions {
+            if let crate::ast::types::PackedDimension::Range { left, right, .. } = dim {
+                Self::collect_leaf_idents(left, &mut names);
+                Self::collect_leaf_idents(right, &mut names);
+            }
+        }
+        let mut locals = HashMap::default();
+        for param in names {
+            let mut scopes = std::iter::successors(Some(scope), |s| s.rsplit_once('.').map(|(p, _)| p));
+            if let Some(value) = scopes.find_map(|s| module.parameters.get(&format!("{s}.{param}"))) {
+                locals.insert(param, value.clone());
+            }
+        }
+        let env = super::elaborate::ParamEnv::Overlay { base: &module.parameters, top: &locals };
+        Self::packed_range_bounds(dimensions, &env)
+    }
+
     /// §9.2.2.2.1 / §11.5 (#844): keep the longest static packed prefix
     /// until self-written regions have been excluded. Signal ids alone lose
     /// the distinction between, for example, `ds[0]` and `ds[1]`.
@@ -165,6 +195,7 @@ impl Simulator {
                     .packed_full_dims
                     .get(&name)
                     .cloned()
+                    .or_else(|| Self::instance_vector_bounds(&name, module))
                     .unwrap_or_default();
                 let width = if !dims.is_empty() {
                     dims.iter().try_fold(1u64, |w, &(l, r)| {

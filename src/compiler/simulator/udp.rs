@@ -312,6 +312,7 @@ impl Simulator {
                             },
                         },
                         cold: Box::new(CombEntryCold {
+                            rhs_time_scope: None,
                             scope_hint: None,
                             read_signal_ids: read_ids,
                             write_signal_ids: write_ids,
@@ -369,6 +370,7 @@ impl Simulator {
             entries.push(CombEntry {
                 item: CombItem::Udp { idx },
                 cold: Box::new(CombEntryCold {
+                    rhs_time_scope: None,
                     scope_hint: None,
                     read_signal_ids: read_ids,
                     write_signal_ids: write_ids,
@@ -394,6 +396,7 @@ impl Simulator {
                     indices: indices.into_boxed_slice(),
                 },
                 cold: Box::new(CombEntryCold {
+                    rhs_time_scope: None,
                     scope_hint: None,
                     read_signal_ids: vec![event_ref.sig_id as usize],
                     write_signal_ids,

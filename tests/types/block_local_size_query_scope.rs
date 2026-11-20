@@ -18,7 +18,7 @@ const CHILD_BODY: &str = r#"
   logic clk;
   logic [7:0] ff_idx;
   logic [7:0] ff_w;
-  always @(*) begin
+  always_comb begin
     logic [$clog2($size(mem))-1:0] v;
     comb_w = $bits(v);
     v = 6;
@@ -85,7 +85,7 @@ fn top_level_block_local_uses_own_mem() {
   logic [6:0] mem [0:6];
   logic [7:0] idx;
   logic [7:0] w;
-  always @(*) begin
+  always_comb begin
     logic [$clog2($size(mem))-1:0] v;
     w = $bits(v);
     v = 6;

@@ -1856,10 +1856,37 @@ impl Simulator {
             if matches!(&item, CombItem::Noop) {
                 continue;
             }
+            // §20.3: the name hint can follow a hierarchical destination. Time
+            // calls belong to the module that authored the RHS. For synthesized
+            // input connections the expression belongs to the port's parent;
+            // a synthesized resolver runs in its net's own scope.
+            let rhs_time_scope = if matches!(&item, CombItem::ContAssign { .. })
+                || matches!(&item, CombItem::CompiledContAssign { compiled } if compiled.has_fallback)
+            {
+                ca.origin.map(|(_, scope)| scope).or_else(|| {
+                    let name = self.name_opt(*wids.first()?)?;
+                    let (owner, _) = name.rsplit_once('.')?;
+                    let input_port = ca.rhs_parent_scoped
+                        && matches!(
+                            self.vpi_port_directions.get(name),
+                            Some(PortDirection::Input | PortDirection::Inout)
+                        );
+                    let scope = if input_port {
+                        self.instance_by_path(owner)
+                            .map_or(owner, |inst| inst.parent.as_str())
+                    } else {
+                        owner
+                    };
+                    Some(Arc::from(scope))
+                })
+            } else {
+                None
+            };
             let cov = cov_counter.filter(|_| matches!(&item, CombItem::ContAssign { .. }));
             entries.push(CombEntry {
                 item,
                 cold: Box::new(CombEntryCold {
+                    rhs_time_scope,
                     scope_hint,
                     read_signal_ids: rids,
                     write_signal_ids: wids,
@@ -2228,6 +2255,7 @@ impl Simulator {
                 entries.push(CombEntry {
                     item,
                     cold: Box::new(CombEntryCold {
+                        rhs_time_scope: None,
                         scope_hint,
                         read_signal_ids: rids,
                         write_signal_ids: wids,

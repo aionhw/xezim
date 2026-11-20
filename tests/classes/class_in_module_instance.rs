@@ -242,7 +242,7 @@ module kid #(parameter int B = 0, parameter int W = 4);
   class helper;
     int own;
     static int scount;
-    function void run();
+    task run();
       own = mf(5);                 // S1 module function
       mt(B);                       // S2 module task
       x = LP;                      // S3 localparam
@@ -253,7 +253,7 @@ module kid #(parameter int B = 0, parameter int W = 4);
       bif.d = B / 1000;            // S8 interface instance member
       pr.a = B + 11;               // S9 unpacked struct member
       scount++;                    // S10 static class member (shared)
-    endfunction
+    endtask
     function int peek();
       return $bits(narrow);        // S11 $bits of param-sized var
     endfunction

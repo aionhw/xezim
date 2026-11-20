@@ -3,9 +3,9 @@ module mwe14_task_local_arrays ;
    typedef logic [3:0]  u4_t ;
 
    int failures = 0 ;
-   task automatic chk(bit ok, string msg);
+   function automatic void chk(bit ok, string msg);
       if (!ok) begin failures++ ; $display("FAIL : %s", msg) ; end
-   endtask
+   endfunction
 
    // =====================================================================
    // FAILING t1 (mwe7/mwe13): byte array LOCAL to an automatic task

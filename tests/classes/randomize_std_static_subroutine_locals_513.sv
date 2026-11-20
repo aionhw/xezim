@@ -5,13 +5,13 @@ module tb;
    typedef struct packed { bit [7:0] a; bit [7:0] b; } S;
    S mp;              // module-scope struct (control that works)
 
-   task automatic chk(input int id, input int got, input int exp);
+   function automatic void chk(input int id, input int got, input int exp);
       checks++;
       if (got !== exp) begin
          errors++;
          $display("CHECK_FAIL id=%0d got=%0d exp=%0d", id, got, exp);
       end
-   endtask
+   endfunction
 
    // =====================================================================
    // (A) static subroutine locals: scalar + array   -- checks 1..26

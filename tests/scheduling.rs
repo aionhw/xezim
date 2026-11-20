@@ -89,6 +89,8 @@ mod comb_result_clobbered_by_process;
 mod computed_edge_expressions;
 #[path = "scheduling/condition_waiter_name_gate.rs"]
 mod condition_waiter_name_gate;
+#[path = "scheduling/continuous_assign_time_unit.rs"]
+mod continuous_assign_time_unit;
 #[path = "scheduling/dead_clock_watchdog.rs"]
 mod dead_clock_watchdog;
 #[path = "scheduling/decl_init_time_literal_scaling.rs"]

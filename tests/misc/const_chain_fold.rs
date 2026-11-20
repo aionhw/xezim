@@ -53,7 +53,8 @@ fn folded_compare_and_xor_match_interpreter() {
 module tb;
   logic [7:0] r;
   integer k;
-  always @* begin
+  // IEEE 1800-2023 §9.2.2.2.2: evaluate once without external stimulus.
+  always_comb begin
     k = 3;
     k = k + 4;                 // 7
     r[0] = (k == 7);

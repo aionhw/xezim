@@ -92,3 +92,26 @@ endmodule
         ]
     );
 }
+
+#[test]
+fn push_unpacked_concatenation_into_fixed_row() {
+    // §7.10.2.6, §10.10: the queue element supplies the unpacked array context.
+    let src = r#"module t;
+  typedef int pair_t [2];
+  pair_t pairs[$], e;
+  int rows[$][3:1];
+  initial begin
+    pairs.push_back('{1, 2});
+    pairs.push_back({3, 4});
+    e = '{5, 6};
+    pairs.push_back(e);
+    rows.push_back({e, 7});
+    $display("pairs %0d %p", pairs.size(), pairs);
+    $display("row %0d %0d %0d", rows[0][3], rows[0][2], rows[0][1]);
+  end
+endmodule"#;
+    assert_eq!(
+        shown(src, &["pairs ", "row "]),
+        ["pairs 3 '{'{1, 2}, '{3, 4}, '{5, 6}}", "row 5 6 7"]
+    );
+}

@@ -91,7 +91,8 @@ module tb;
     $display("n2=[%2h]",  r16);  // reference: "2a5" (minimal wider than field)
     $display("z6=[%6h]",  8'hzz);   // reference: "0000zz" (x/z run KEPT with a width)
     $display("m6=[%6h]",  16'hxx3f);// reference: "00xx3f"
-    $display("m0=[%0h]",  16'hxx3f);// reference: "x3f" (bare %0 collapses the run)
+    $display("m0=[%0h]",  16'hxx3f);// §21.2.1.2–3: four nonzero digits
+    $display("digits=[%0h,%0o,%0b]", 12'h0zz, 9'o0xx, 5'b00zz1);
     $display("zero4=[%4h]", 8'h00); // reference: "0000"
   end
 endmodule
@@ -119,7 +120,8 @@ fn radix_width_honours_zero_flag_and_natural_width() {
     assert_eq!(line(&sim, "n2="), "n2=[2a5]");
     assert_eq!(line(&sim, "z6="), "z6=[0000zz]");
     assert_eq!(line(&sim, "m6="), "m6=[00xx3f]");
-    assert_eq!(line(&sim, "m0="), "m0=[x3f]");
+    assert_eq!(line(&sim, "m0="), "m0=[xx3f]");
+    assert_eq!(line(&sim, "digits="), "digits=[zz,xx,zz1]");
     assert_eq!(line(&sim, "zero4="), "zero4=[0000]");
 }
 

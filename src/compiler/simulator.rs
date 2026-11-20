@@ -395,7 +395,8 @@ fn method_boost_enabled() -> bool {
 // §6.18, §7.4.1: a cast to a typedef of real and a function returning one are real operands,
 // and a subroutine or block selecting a packed array of a named signed type does not compile.
 // §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308e;
+// §11.8.2: preserve integral arithmetic in constant operands of real comparisons.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308f;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -918,6 +919,10 @@ fn dpi_trampoline_cc_command(
     cmd.push(so.into());
     cmd.push(c.into());
     cmd
+}
+
+pub(crate) fn foreign_libraries_configured() -> bool {
+    !configured_dpi_libs().is_empty() || !configured_vpi_libs().is_empty()
 }
 
 fn configured_dpi_libs() -> Vec<String> {
@@ -1756,6 +1761,9 @@ impl CombEntry {
 /// Cold half of a `CombEntry` — see `CombEntry::cold`.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CombEntryCold {
+    /// Lexical instance of a continuous RHS that may enter the interpreter.
+    /// An empty scope selects the top module independently of the waking process.
+    rhs_time_scope: Option<Arc<str>>,
     /// Preferred hierarchical scope for resolving unqualified identifiers.
     scope_hint: Option<String>,
     /// Pre-resolved signal IDs for reads (for fast dependency lookup).
@@ -1818,7 +1826,8 @@ struct CombEntryCold {
 // §9.2.2.2, §10.3: CombEntryCold::time0_effects; a variable a called function writes is
 // not a read of its caller.
 // §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB045";
+// §9.2.2.2.1: parameterized instance vectors retain disjoint sensitivity regions.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB049";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

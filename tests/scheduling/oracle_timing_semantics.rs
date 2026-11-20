@@ -321,3 +321,25 @@ endmodule
         "the single fire is the z->0 change"
     );
 }
+
+#[test]
+fn implicit_event_control_waits_for_its_input_to_change() {
+    // IEEE 1800-2023 §9.2.2.2.2: both blocks read the same undriven
+    // variable at startup, but only always_comb has a time-zero trigger.
+    expect(
+        r#"
+module top;
+  logic input_bit, from_star, from_comb;
+  always @* from_star = (input_bit === 1'bx);
+  always_comb from_comb = (input_bit === 1'bx);
+  initial begin
+    #1 $display("initial %b %b", from_star, from_comb);
+    input_bit = 0;
+    #1 $display("changed %b %b", from_star, from_comb);
+    $finish;
+  end
+endmodule
+"#,
+        &["initial x 1", "changed 0 0"],
+    );
+}

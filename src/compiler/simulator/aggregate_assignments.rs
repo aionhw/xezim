@@ -3109,11 +3109,7 @@ impl Simulator {
         }
     }
 
-    /// §11.8.2 operators with a REAL operand (see the bytecode compiler's
-    /// `compile_real_operator`): an arithmetic operator converts each integral
-    /// operand from its SELF-determined value; a relational or equality
-    /// operator propagates the real type one operator into a CONSTANT integral
-    /// side. None when neither operand is real.
+    /// §11.8.2: convert each integral operand from its self-determined value.
     #[inline(never)]
     pub(super) fn eval_real_operator(
         &mut self,
@@ -3137,32 +3133,13 @@ impl Simulator {
         ) {
             return None;
         }
-        let cmp = matches!(
-            op,
-            BinaryOp::Eq
-                | BinaryOp::Neq
-                | BinaryOp::Lt
-                | BinaryOp::Leq
-                | BinaryOp::Gt
-                | BinaryOp::Geq
-        );
         let lr = self.expr_is_real_static(left);
         let rr = self.expr_is_real_static(right);
         if !lr && !rr {
             return None;
         }
-        // Only a CONSTANT integral side takes the real type in a comparison,
-        // as in the reference simulator (see the bytecode compiler).
-        let l = if cmp && !lr && self.expr_is_constant(left) {
-            self.eval_in_real_context(left)
-        } else {
-            self.real_operand(left)
-        };
-        let r = if cmp && !rr && self.expr_is_constant(right) {
-            self.eval_in_real_context(right)
-        } else {
-            self.real_operand(right)
-        };
+        let l = self.real_operand(left);
+        let r = self.real_operand(right);
         Some(Self::real_binop(op, &l, &r))
     }
 
@@ -3222,15 +3199,17 @@ impl Simulator {
             return None;
         }
         let c = self.eval_expr(condition);
-        let taken = if !c.has_unknown() && c.is_true() {
-            then_expr
-        } else {
-            else_expr
+        let mut arm = |e: &Expression| {
+            if self.expr_is_constant(e) {
+                self.eval_in_real_context(e)
+            } else {
+                self.real_operand(e)
+            }
         };
-        Some(if self.expr_is_constant(taken) {
-            self.eval_in_real_context(taken)
-        } else {
-            self.real_operand(taken)
+        Some(match c.is_nonzero() {
+            Some(true) => arm(then_expr),
+            Some(false) => arm(else_expr),
+            None => arm(then_expr).merge_unknown(&arm(else_expr)),
         })
     }
 
@@ -3890,11 +3869,21 @@ impl Simulator {
                     return;
                 }
             }
-            if let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(arg).kind {
-                let vals: Vec<Value> = items.iter().map(|it| self.eval_expr(it.expr())).collect();
-                for (k, j) in dst.iter().enumerate() {
-                    let v = vals.get(k).cloned().unwrap_or_else(|| Value::zero(32));
-                    self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);
+            let values = match &self.unpacked_pattern(arg).kind {
+                ExprKind::AssignmentPattern(items) => {
+                    Some(items.iter().map(|it| self.eval_expr(it.expr())).collect())
+                }
+                // §10.10: an array operand contributes its elements in order.
+                ExprKind::Concatenation(parts) => {
+                    Some(self.unpacked_concat_operand_values(parts.iter().collect()))
+                }
+                _ => None,
+            };
+            if let Some(values) = values {
+                let mut values = values.into_iter();
+                for j in dst {
+                    let v = values.next().unwrap_or_else(|| Value::zero(32));
+                    self.set_signal_value_by_name(&format!("{elem}[{j}]"), v);
                 }
                 return;
             }

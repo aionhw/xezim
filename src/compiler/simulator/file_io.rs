@@ -4,6 +4,49 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// File input advances only as far as the current directive requires. A
+/// nonmatching byte stays available to subsequent scans and other file reads.
+enum ScanInput<'a> {
+    Text(std::iter::Peekable<std::str::Chars<'a>>),
+    File(i32),
+}
+
+impl ScanInput<'_> {
+    fn take_if(&mut self, sim: &mut Simulator, accept: impl FnOnce(char) -> bool) -> Option<char> {
+        match self {
+            Self::Text(chars) => chars.next_if(|&c| accept(c)),
+            Self::File(fd) => {
+                let mut byte = [0];
+                if sim.fread_bytes(*fd, &mut byte) == 0 {
+                    return None;
+                }
+                let c = char::from(byte[0]);
+                if accept(c) {
+                    Some(c)
+                } else {
+                    sim.ungetc_buf.entry(*fd).or_default().push(byte[0]);
+                    None
+                }
+            }
+        }
+    }
+
+    fn skip_whitespace(&mut self, sim: &mut Simulator) {
+        while self.take_if(sim, char::is_whitespace).is_some() {}
+    }
+
+    fn token(
+        &mut self,
+        sim: &mut Simulator,
+        width: usize,
+        accept: impl Fn(char) -> bool,
+    ) -> String {
+        (0..width)
+            .map_while(|_| self.take_if(sim, &accept))
+            .collect()
+    }
+}
+
 impl Simulator {
     /// Whether `$display`/`$write` output is handed to a background writer.
     ///
@@ -262,31 +305,13 @@ impl Simulator {
     /// conversions to `outs` in order (C-scanf semantics — stops at the
     /// first mismatch). Returns the number of conversions assigned.
     pub(super) fn sv_sscanf(&mut self, src: &str, fmt: &str, outs: &[Expression]) -> i64 {
-        self.sv_sscanf_consumed(src, fmt, outs).0
+        self.scan_format(&mut ScanInput::Text(src.chars().peekable()), fmt, outs)
     }
 
-    /// Like `sv_sscanf`, but also returns how many CHARS of `src` were
-    /// consumed, so `$fscanf` can push the unread remainder back (§21.3.4.3:
-    /// the file position advances only past what the format matched — reading
-    /// one `%s` of a two-word line must leave the second word readable, and
-    /// `$feof` false).
-    pub(super) fn sv_sscanf_consumed(
-        &mut self,
-        src: &str,
-        fmt: &str,
-        outs: &[Expression],
-    ) -> (i64, usize) {
-        let s: Vec<char> = src.chars().collect();
-        let mut si = 0usize;
-        let mut oi = 0usize;
-        let mut assigned = 0i64;
+    fn scan_format(&mut self, input: &mut ScanInput<'_>, fmt: &str, outs: &[Expression]) -> i64 {
+        let mut assigned = 0usize;
+        let mut completed_conversion = false;
         let mut fi = fmt.chars().peekable();
-        fn skip_ws(s: &[char], mut i: usize) -> usize {
-            while i < s.len() && s[i].is_whitespace() {
-                i += 1;
-            }
-            i
-        }
         while let Some(fc) = fi.next() {
             if fc == '%' {
                 let suppress = if fi.peek() == Some(&'*') {
@@ -304,62 +329,36 @@ impl Simulator {
                 // display-side meaning of `%0d` (§21.2.1.3).
                 let w: usize = width.parse().ok().filter(|&n| n != 0).unwrap_or(usize::MAX);
                 let Some(spec) = fi.next() else { break };
+                if spec != 'c' {
+                    input.skip_whitespace(self);
+                }
                 if spec == '%' {
-                    si = skip_ws(&s, si);
-                    if si < s.len() && s[si] == '%' {
-                        si += 1;
+                    if input.take_if(self, |c| c == '%').is_some() {
                         continue;
                     }
                     break;
                 }
-                if spec == 'c' {
-                    if si >= s.len() {
-                        break;
+                let value = match spec {
+                    'c' => {
+                        let Some(c) = input.take_if(self, |_| true) else {
+                            break;
+                        };
+                        Value::from_u64(c as u64, 8)
                     }
-                    let v = Value::from_u64(s[si] as u64, 8);
-                    si += 1;
-                    if !suppress && oi < outs.len() {
-                        self.assign_value(&outs[oi], &v);
-                        oi += 1;
-                        assigned += 1;
-                    }
-                    continue;
-                }
-                si = skip_ws(&s, si);
-                let start = si;
-                match spec {
                     's' => {
-                        while si < s.len() && !s[si].is_whitespace() && si - start < w {
-                            si += 1;
-                        }
-                        if si == start {
+                        let text = input.token(self, w, |c| !c.is_whitespace());
+                        if text.is_empty() {
                             break;
                         }
-                        if !suppress && oi < outs.len() {
-                            let text: String = s[start..si].iter().collect();
-                            self.assign_value(&outs[oi], &Value::from_string(&text));
-                            oi += 1;
-                            assigned += 1;
-                        }
+                        Value::from_string(&text)
                     }
                     'f' | 'e' | 'g' => {
-                        while si < s.len()
-                            && (s[si].is_ascii_digit() || "+-.eE".contains(s[si]))
-                            && si - start < w
-                        {
-                            si += 1;
-                        }
-                        let text: String = s[start..si].iter().collect();
-                        match text.parse::<f64>() {
-                            Ok(f) => {
-                                if !suppress && oi < outs.len() {
-                                    self.assign_value(&outs[oi], &Value::from_f64(f));
-                                    oi += 1;
-                                    assigned += 1;
-                                }
-                            }
-                            Err(_) => break,
-                        }
+                        let text =
+                            input.token(self, w, |c| c.is_ascii_digit() || "+-.eE".contains(c));
+                        let Ok(value) = text.parse::<f64>() else {
+                            break;
+                        };
+                        Value::from_f64(value)
                     }
                     'd' | 'i' | 'h' | 'x' | 'X' | 'o' | 'b' => {
                         let radix: u32 = match spec {
@@ -369,69 +368,62 @@ impl Simulator {
                             _ => 10,
                         };
                         let signed = matches!(spec, 'd' | 'i');
-                        let mut si2 = si;
-                        let mut neg = false;
-                        if signed && si2 < s.len() && (s[si2] == '-' || s[si2] == '+') {
-                            neg = s[si2] == '-';
-                            si2 += 1;
-                        }
-                        let dstart = si2;
-                        while si2 < s.len()
-                            && (s[si2].is_digit(radix) || s[si2] == '_')
-                            && si2 - dstart < w
+                        let sign = if signed {
+                            input.take_if(self, |c| matches!(c, '-' | '+'))
+                        } else {
+                            None
+                        };
+                        let remaining = w - usize::from(sign.is_some());
+                        let negative = sign == Some('-');
+                        let is_four_state = |c| matches!(c, 'x' | 'X' | 'z' | 'Z' | '?');
+                        // §21.3.4.3: a decimal x/z represents the entire value.
+                        let mut text = if signed && remaining > 0
+                            && let Some(digit) = input.take_if(self, is_four_state)
                         {
-                            si2 += 1;
-                        }
-                        if si2 == dstart {
+                            digit.to_string()
+                        } else {
+                            input.token(self, remaining, |c| {
+                                c.is_digit(radix) || c == '_' || (!signed && is_four_state(c))
+                            })
+                        };
+                        text.retain(|c| c != '_');
+                        if text.is_empty() {
                             break;
                         }
-                        let text: String = s[dstart..si2].iter().filter(|c| **c != '_').collect();
-                        // The scan above admits `char::is_digit`, which is
-                        // Unicode-aware, so a non-ASCII digit can land here.
-                        // `from_str_radix` would answer X; `$sscanf` has to
-                        // report a failed conversion and stop, the way the old
-                        // `i64::from_str_radix` returning `Err` did.
-                        if text
-                            .bytes()
-                            .any(|b| !b.is_ascii() || (b as char).to_digit(radix).is_none())
-                        {
-                            break;
+                        let dest_width = outs
+                            .get(assigned)
+                            .filter(|_| !suppress)
+                            .map_or(1, |out| self.infer_lhs_width(out).max(1));
+                        let mut v = Value::from_str_radix(&text, radix, dest_width);
+                        if negative {
+                            v = Self::negate_twos_complement(v);
+                        } else {
+                            v.is_signed = signed;
                         }
-                        si = si2;
-                        if !suppress && oi < outs.len() {
-                            // Parse at the destination's width, not a fixed 32: a
-                            // 160-bit field has to keep all 160 bits of the token.
-                            let dest_width = self.infer_lhs_width(&outs[oi]).max(1);
-                            let mut v = Value::from_str_radix(&text, radix, dest_width);
-                            if neg {
-                                v = Self::negate_twos_complement(v);
-                            } else {
-                                v.is_signed = signed;
-                            }
-                            self.assign_value(&outs[oi], &v);
-                            oi += 1;
-                            assigned += 1;
-                        }
+                        v
                     }
                     _ => break,
+                };
+                completed_conversion = true;
+                if !suppress && assigned < outs.len() {
+                    self.assign_value(&outs[assigned], &value);
+                    assigned += 1;
                 }
             } else if fc.is_whitespace() {
-                si = skip_ws(&s, si);
-            } else {
-                if si < s.len() && s[si] == fc {
-                    si += 1;
-                } else {
-                    break;
-                }
+                input.skip_whitespace(self);
+            } else if input.take_if(self, |c| c == fc).is_none() {
+                break;
             }
         }
-        (assigned, si)
+        if let ScanInput::File(fd) = input {
+            if !completed_conversion && self.file_eof.contains(fd) {
+                return -1;
+            }
+        }
+        assigned as i64
     }
 
-    /// §21.3.4.3 `$fscanf(fd, format, …)`: line-buffered scan of `fd`.
-    /// Returns the number of assigned conversions, or -1 at end of file.
-    /// Shared by the function form (`n = $fscanf(…)`) and the task form
-    /// (`$fscanf(…);`), which discards the count.
+    /// §21.3.4.3: both task and function forms scan the file as a byte stream.
     pub(super) fn fscanf_impl(&mut self, args: &[Expression]) -> i64 {
         let fd = args
             .first()
@@ -447,77 +439,14 @@ impl Simulator {
                 }
             })
             .unwrap_or_default();
-        // A previous partial read may have pushed back just the tail
-        // whitespace of its line ("\n"). For conversions that skip leading
-        // whitespace (§21.3.4.3: the numeric/string ones do, across lines) a
-        // whitespace-only line is transparent — pull the next. But when the
-        // format's first item matches WITHOUT skipping (`%c` reads exactly
-        // one character, whitespace included; a literal must match exactly),
-        // that line carries the very byte the format must see (issue #262: a
-        // file holding one space read as empty, and repeated `%c` lost every
-        // '\n' between lines).
-        let mut first_line = self.sv_read_line(fd);
-        if Self::scanf_leading_item_skips_ws(&fmt) {
-            while first_line.as_deref().is_some_and(|l| l.trim().is_empty()) {
-                first_line = self.sv_read_line(fd);
-            }
+        if !self.file_handles.contains_key(&fd) {
+            return -1;
         }
-        match first_line {
-            Some(line) => {
-                let (n, consumed) = self.sv_sscanf_consumed(&line, &fmt, &args[2..]);
-                // §21.3.4.3: the position advances only past what the format
-                // matched. `sv_read_line` pulled a whole line, so push the
-                // unread tail back (reversed — the pushback buffer is a LIFO
-                // whose top is the next char). Without this,
-                // `$fscanf(fd, "%s", w)` on a two-word line dropped the
-                // second word and `$feof` reported end-of-file with data
-                // left. `sv_read_line` maps bytes onto chars one-to-one
-                // (Latin-1), so the reverse mapping `ch as u8` restores the
-                // ORIGINAL byte — re-encoding as UTF-8 turned a pushed-back
-                // 0xff into the two bytes C3 BF.
-                let rest: Vec<char> = line.chars().skip(consumed).collect();
-                if !rest.is_empty() {
-                    let buf = self.ungetc_buf.entry(fd).or_default();
-                    for ch in rest.iter().rev() {
-                        buf.push(*ch as u8);
-                    }
-                    // Data is readable again: an end-of-file flag that the
-                    // final line's read raised must come down, the way
-                    // `$ungetc` lowers it — `$feof` must not report EOF
-                    // while the pushed-back tail is still unread.
-                    self.file_eof.remove(&fd);
-                }
-                n
-            }
-            None => -1, // EOF (§21.3.4.3)
-        }
-    }
-
-    /// Does the FIRST item of a scanf format skip leading input whitespace
-    /// before it matches? Explicit whitespace in the format does, and so do
-    /// the numeric/string conversions (`%d %i %h %x %X %o %b %s %f %e %g`).
-    /// `%c` matches any single character — whitespace included
-    /// (§21.3.4.3, issue #262) — and `%%` and literal characters must match
-    /// exactly, so for those the input's leading whitespace is significant
-    /// and the line-buffered reader must not step over it.
-    pub(super) fn scanf_leading_item_skips_ws(fmt: &str) -> bool {
-        let mut it = fmt.chars().peekable();
-        while let Some(c) = it.next() {
-            if c.is_whitespace() {
-                return true;
-            }
-            if c != '%' {
-                return false; // literal: exact match, no skipping
-            }
-            while it.peek().is_some_and(|d| d.is_ascii_digit()) {
-                it.next(); // field width
-            }
-            return match it.next() {
-                Some('d' | 'i' | 'h' | 'x' | 'X' | 'o' | 'b' | 's' | 'f' | 'e' | 'g') => true,
-                _ => false, // %c, %%, unknown: no whitespace skipping
-            };
-        }
-        false
+        self.scan_format(
+            &mut ScanInput::File(fd),
+            &fmt,
+            args.get(2..).unwrap_or_default(),
+        )
     }
 
     pub(super) fn eval_file_handle_arg(&mut self, expr: &Expression) -> i32 {

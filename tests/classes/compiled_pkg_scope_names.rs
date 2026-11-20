@@ -59,7 +59,7 @@ package q;
   class user;
     function string label(); return {prefix(), "end"}; endfunction
     function int qget(); return get(); endfunction
-    function int qt(); int o; tget(o); return o; endfunction
+    task qt(output int o); tget(o); endtask
   endclass
   class d extends p::c;
     function int dget(); return NUM; endfunction
@@ -81,7 +81,7 @@ module top;
     for (int i = 0; i < 1500; i++) begin
       s[0] = o.get(); s[1] = o.getc(); s[2] = o.getg(); s[3] = p::c::sget();
       s[4] = o3.get(); s[5] = u.qget(); s[6] = dd.dget(); s[7] = dd.get();
-      s[8] = o.shl(4); s[9] = u.qt(); s[10] = p::get(); s[11] = o.callf();
+      s[8] = o.shl(4); u.qt(s[9]); s[10] = p::get(); s[11] = o.callf();
       l1 = u.label(); l2 = q::qlabel();
       e = o.elem(1);
     end
