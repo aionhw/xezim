@@ -292,7 +292,9 @@ impl Simulator {
     /// an anonymous aggregate, which other paths name.
     fn tn_base_text(&self, dt: &DataType, logic_kw: bool) -> Option<String> {
         match dt {
-            DataType::TypeReference { name, .. } => {
+            DataType::TypeReference {
+                name, dimensions, ..
+            } => {
                 let n = name.name.name.as_str();
                 if self.module.interfaces.contains(n) {
                     return Some(format!("virtual {}", n));
@@ -305,12 +307,23 @@ impl Simulator {
                 } else {
                     self.module.typedef_types.get(&name.qualified()).cloned()
                 }?;
-                match &target {
+                let mut s = match &target {
                     DataType::Struct(_) | DataType::Enum(_) => {
                         self.tn_named_aggregate(&target, name)
                     }
                     _ => self.tn_base_text(&target, logic_kw),
+                }?;
+                // §20.6.1: the packed dimensions written on the type name
+                // (`lane_t [0:1] a`) follow the typedef's own, innermost
+                // first, as for a vector's dimensions above.
+                for d in dimensions.iter().rev() {
+                    if let PackedDimension::Range { left, right, .. } = d
+                        && let (Some(l), Some(r)) = (self.tn_const(left), self.tn_const(right))
+                    {
+                        s.push_str(&format!("[{}:{}]", l, r));
+                    }
                 }
+                Some(s)
             }
             DataType::IntegerVector {
                 kind,
@@ -486,6 +499,26 @@ impl Simulator {
     /// The integral type facts of a declared type; `logic_kw` as for
     /// [`tn_base_text`]. An enum reads as its base type.
     fn tn_type_of_dt(&self, dt: &DataType, logic_kw: bool) -> Option<TnType> {
+        let mut t = self.tn_type_of_resolved(dt, logic_kw)?;
+        // §20.6.1, §7.4.1: packed dimensions written on a typedef name
+        // (`lane_t [0:1]`) make a packed array of the typedef's type.
+        if let DataType::TypeReference { dimensions, .. } = dt
+            && !dimensions.is_empty()
+        {
+            let mut w = t.width as u64;
+            for d in dimensions {
+                if let PackedDimension::Range { left, right, .. } = d {
+                    let (l, r) = (self.tn_const(left)?, self.tn_const(right)?);
+                    w *= (l - r).unsigned_abs() + 1;
+                }
+            }
+            t.width = u32::try_from(w).ok()?;
+            t.name = self.tn_base_text(dt, logic_kw);
+        }
+        Some(t)
+    }
+
+    fn tn_type_of_resolved(&self, dt: &DataType, logic_kw: bool) -> Option<TnType> {
         let cur = self.resolve_dt_ref(dt);
         match cur {
             DataType::IntegerAtom { kind, signing, .. } => {
