@@ -143,7 +143,9 @@ fn one_dimensional_packed_one_dimensional_unpacked_and_continuous_forms() {
   logic [79:0]      c1 [2][2];
   logic [1:0][39:0] c2 [2];
   ps_t              st [2][2];
-  logic [1:0][7:0]  ca [2][2];
+  logic [1:0][7:0]  ca [2][2], cv [2];
+  logic [1:0][7:0]  word = 16'h1234;
+  assign cv = '{default: word};
   logic [1:0][7:0]  pk;
   assign ca = '{default: 16'hcafe};
   initial begin
@@ -151,13 +153,13 @@ fn one_dimensional_packed_one_dimensional_unpacked_and_continuous_forms() {
     c2 = '{default: 80'h6};
     st = '{default: 16'h5a5a};
     pk = '{8'h12, 8'h34};
-    #1 $display(\"c1=%h c2=%h st=%h,%h ca=%h,%h pk=%h\", c1[1][1], c2[1], st[0][0], st[1][1],
-                ca[0][0], ca[1][1], pk);
+    #1 $display(\"c1=%h c2=%h st=%h,%h ca=%h,%h cv=%h pk=%h\", c1[1][1], c2[1], st[0][0], st[1][1],
+                ca[0][0], ca[1][1], cv[1], pk);
   end
 endmodule",
     );
     assert_line(
         &msgs,
-        "c1=00000000000000000005 c2=00000000060000000006 st=5a5a,5a5a ca=fefe,fefe pk=1234",
+        "c1=00000000000000000005 c2=00000000060000000006 st=5a5a,5a5a ca=fefe,fefe cv=1234 pk=1234",
     );
 }

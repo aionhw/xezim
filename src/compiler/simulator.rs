@@ -1829,7 +1829,8 @@ struct CombEntryCold {
 // §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
 // §9.2.2.2.1: parameterized instance vectors retain disjoint sensitivity regions.
 // §6.24.1: compiled sign conversions use the self-determined operand width.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB050";
+// §10.9.1: packed array default drivers retain their element type.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB051";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
