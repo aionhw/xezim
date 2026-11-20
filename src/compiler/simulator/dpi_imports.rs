@@ -716,20 +716,28 @@ impl Simulator {
             DpiRetKind::String => Type::pointer(),
         };
         let cif = Cif::new(arg_types, ret_type);
-        for lib in &self.dpi_libraries {
-            let sym = unsafe { lib.get::<*mut c_void>(&cname) };
-            if let Ok(s) = sym {
-                self.dpi_bindings.insert(
-                    sv_name.to_string(),
-                    DpiBinding {
-                        ret,
-                        arg_kinds: arg_kinds.clone(),
-                        cif: cif.clone(),
-                        fn_ptr: CodePtr::from_ptr(*s),
-                    },
-                );
-                return;
-            }
+        let fn_ptr = self
+            .dpi_libraries
+            .iter()
+            .find_map(|lib| unsafe { lib.get::<*mut c_void>(&cname) }.ok().map(|s| *s))
+            // §35.5.1: an import names a C function wherever it is defined.
+            // One that no --dpi-lib library defines is looked up among the
+            // libraries the process already has loaded (the C library, the
+            // xezim executable), so
+            // `import "DPI-C" function string getenv(input string name);`
+            // needs no library of its own. A name found nowhere stays
+            // unbound and keeps its "no implementation" diagnostic.
+            .or_else(|| loaded_c_symbol(&cname));
+        if let Some(p) = fn_ptr {
+            self.dpi_bindings.insert(
+                sv_name.to_string(),
+                DpiBinding {
+                    ret,
+                    arg_kinds,
+                    cif,
+                    fn_ptr: CodePtr::from_ptr(p),
+                },
+            );
         }
     }
 
@@ -2044,4 +2052,20 @@ impl Simulator {
         self.compile();
         self.simulate();
     }
+}
+
+/// The address of the C symbol `cname` (NUL-terminated) in the global symbol
+/// scope: the executable, the libraries it was linked with (the C library)
+/// and every library opened `RTLD_GLOBAL`. `None` when no loaded object
+/// defines it.
+#[cfg(unix)]
+fn loaded_c_symbol(cname: &[u8]) -> Option<*mut c_void> {
+    // SAFETY: `cname` is NUL-terminated, and `dlsym` only looks the name up.
+    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr().cast()) };
+    (!p.is_null()).then_some(p)
+}
+
+#[cfg(not(unix))]
+fn loaded_c_symbol(_cname: &[u8]) -> Option<*mut c_void> {
+    None
 }
