@@ -48,11 +48,7 @@ impl Simulator {
             K::ToLower => Value::from_string(&Self::sv_ascii_case(&v(0).to_sv_string(), false)),
             K::Compare | K::ICompare | K::Order => {
                 let (a, b) = (v(0).to_sv_string(), v(1).to_sv_string());
-                let d = match kind {
-                    K::Compare => Self::sv_strcmp(&a, &b, false),
-                    K::ICompare => Self::sv_strcmp(&a, &b, true),
-                    _ => Self::sv_str_order(&a, &b),
-                };
+                let d = Self::sv_strcmp(&a, &b, matches!(kind, K::ICompare));
                 let mut out = Value::from_u64(d as u64, 32);
                 out.is_signed = true;
                 out

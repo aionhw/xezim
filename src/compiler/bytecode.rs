@@ -359,9 +359,7 @@ pub enum StrOpKind {
     HexToA,   // [v]
     OctToA,   // [v]
     BinToA,   // [v]
-    /// [a, b] -> unsigned-byte strcmp difference: the ORDER the `==`/`<`
-    /// family of operators compares strings by (§6.16 Table 6-9). Only the
-    /// `compare()` METHOD takes signed-byte differences.
+    /// Unsigned byte ordering for relational operators (§6.16 Table 6-9).
     Order,
     /// [v] -> the operand converted to a `string` value: its bytes with
     /// every NUL removed (§6.16 — `string'(24'hab0063)` is 2 characters,
