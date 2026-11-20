@@ -158,7 +158,7 @@ endmodule
     assert!(sim.get_signal("u.storage[1].value").is_some());
 }
 
-/// §10.4.2, §7.10: a nonblocking write of a member of a queue element wakes
+/// §10.4.2, §7.10: a blocking write of a member of a queue element wakes
 /// the processes that read it. Readers of a queue element watch the queue, so
 /// the write must not be redirected to a flat member signal.
 #[test]
