@@ -5383,7 +5383,7 @@ impl Simulator {
                 // owns the §12.5.3 unique/unique0/priority violation checks,
                 // so only intercept when some arm can actually suspend.
                 if !items.iter().any(|i| i.pattern.is_some()) && self.stmt_is_blocking(stmt) {
-                    let val = self.case_selector_value(kind, expr, items);
+                    let comparison = self.case_comparison(kind, expr, items);
                     let chosen: Option<&Statement> = items
                         .iter()
                         .find_map(|item| {
@@ -5391,22 +5391,7 @@ impl Simulator {
                                 return None;
                             }
                             for pat in &item.patterns {
-                                let hit = match kind {
-                                    CaseKind::CaseInside => self.case_inside_match(&val, pat),
-                                    CaseKind::Casez => {
-                                        let pv = self.eval_expr(pat);
-                                        val.casez_eq(&pv).is_true()
-                                    }
-                                    CaseKind::Casex => {
-                                        let pv = self.eval_expr(pat);
-                                        val.casex_eq(&pv).is_true()
-                                    }
-                                    _ => {
-                                        let pv = self.eval_expr(pat);
-                                        val.case_eq(&pv).is_true()
-                                    }
-                                };
-                                if hit {
+                                if self.case_item_matches(kind, &comparison, pat) {
                                     return Some(&item.stmt);
                                 }
                             }

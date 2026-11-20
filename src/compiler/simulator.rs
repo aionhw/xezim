@@ -390,11 +390,12 @@ fn method_boost_enabled() -> bool {
 // declared with an ascending or offset range does not inline.
 // §9.3, §13.3: block bodies in shared statement lists, a continuation tree per task call
 // site, and boxed optional delays, initializers and case item patterns (#721).
+// §12.5: an unsigned item makes the entire case comparison unsigned.
 // §10.9.1, §26.3: a named assignment pattern key carries its lexically bound type name.
 // §6.18, §7.4.1: a cast to a typedef of real and a function returning one are real operands,
 // and a subroutine or block selecting a packed array of a named signed type does not compile.
 // §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308d;
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308e;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -9956,6 +9957,12 @@ pub struct Simulator {
     meta_pending: usize,
     /// Call plans by `Arc<ClassMethod>` address (see `MethodCallPlan`).
     method_plans: std::cell::RefCell<HashMap<usize, std::rc::Rc<MethodCallPlan>>>,
+    /// Declaration-scope typedefs before a procedural typedef shadows a name.
+    /// The tables share storage until a write (§6.18, §23.9).
+    declaration_typedefs: Option<(
+        super::elaborate::TypedefTable,
+        super::elaborate::SharedMap<DataType>,
+    )>,
     /// Moves whenever a procedural `typedef` or an inline-enum local edits the
     /// type tables at run time (see `MethodCallPlan`).
     type_tables_gen: u64,

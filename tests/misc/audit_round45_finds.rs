@@ -166,3 +166,54 @@ endmodule
         "flag after the failed read:\n{out}"
     );
 }
+
+/// §21.3.4.3, §21.3.8: file input spans lines. EOF records a read attempt,
+/// including a trailing whitespace directive looking for the next token.
+#[test]
+fn fscanf_directives_cross_lines_and_set_eof_on_attempted_read() {
+    let path = std::env::temp_dir().join(format!("xezim_fscanf_1376_{}.txt", std::process::id()));
+    let path_sv = path.to_string_lossy().replace('\\', "/");
+    let src = format!(
+        r#"
+module top;
+  int fd, n, a, b, loops;
+  byte c;
+  string word;
+  initial begin
+    fd = $fopen("{path_sv}", "w");
+    $fwrite(fd, "hello.hex\n");
+    $fclose(fd);
+    fd = $fopen("{path_sv}", "r");
+    loops = 0;
+    while (!$feof(fd) && loops < 3) begin
+      n = $fscanf(fd, "%s\n", word);
+      loops++;
+    end
+    $display("T|words=%0d n=%0d word=%s eof=%0d", loops, n, word, $feof(fd));
+    $fclose(fd);
+    fd = $fopen("{path_sv}", "w");
+    $fwrite(fd, "12\n34\n;!");
+    $fclose(fd);
+    fd = $fopen("{path_sv}", "r");
+    n = $fscanf(fd, "%d %d\n;", a, b);
+    $display("T|nums=%0d,%0d n=%0d eof=%0d", a, b, n, $feof(fd));
+    n = $fscanf(fd, "%c", c);
+    $display("T|last=%0d n=%0d eof=%0d", c, n, $feof(fd));
+    n = $fscanf(fd, "%c", c);
+    $display("T|past=%0d n=%0d eof=%0d", c, n, $feof(fd));
+    $fclose(fd);
+  end
+endmodule"#
+    );
+    let result = simulate(&src, 10);
+    let _ = std::fs::remove_file(path);
+    let out = outs(&result.expect("sim"));
+    for expected in [
+        "T|words=1 n=1 word=hello.hex eof=1",
+        "T|nums=12,34 n=2 eof=0",
+        "T|last=33 n=1 eof=0",
+        "T|past=33 n=-1 eof=1",
+    ] {
+        assert!(out.lines().any(|line| line == expected), "{out}");
+    }
+}

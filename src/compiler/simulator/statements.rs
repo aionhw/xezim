@@ -4862,7 +4862,7 @@ impl Simulator {
                     self.exec_case_matches(expr, items);
                     return;
                 }
-                let val = self.case_selector_value(kind, expr, items);
+                let comparison = self.case_comparison(kind, expr, items);
                 // SV-2023: under unique/unique0/priority, pre-pass the items
                 // and emit a violation message if multiple match or (for
                 // unique/priority) none match without a default.
@@ -4878,22 +4878,7 @@ impl Simulator {
                             continue;
                         }
                         for pat in &item.patterns {
-                            let hit = match kind {
-                                CaseKind::CaseInside => self.case_inside_match(&val, pat),
-                                CaseKind::Casez => {
-                                    let pv = self.eval_expr(pat);
-                                    val.casez_eq(&pv).is_true()
-                                }
-                                CaseKind::Casex => {
-                                    let pv = self.eval_expr(pat);
-                                    val.casex_eq(&pv).is_true()
-                                }
-                                _ => {
-                                    let pv = self.eval_expr(pat);
-                                    val.case_eq(&pv).is_true()
-                                }
-                            };
-                            if hit {
+                            if self.case_item_matches(kind, &comparison, pat) {
                                 match_count += 1;
                                 break;
                             }
@@ -4929,22 +4914,7 @@ impl Simulator {
                         continue;
                     }
                     for pat in &item.patterns {
-                        let hit = match kind {
-                            CaseKind::CaseInside => self.case_inside_match(&val, pat),
-                            CaseKind::Casez => {
-                                let pv = self.eval_expr(pat);
-                                val.casez_eq(&pv).is_true()
-                            }
-                            CaseKind::Casex => {
-                                let pv = self.eval_expr(pat);
-                                val.casex_eq(&pv).is_true()
-                            }
-                            _ => {
-                                let pv = self.eval_expr(pat);
-                                val.case_eq(&pv).is_true()
-                            }
-                        };
-                        if hit {
+                        if self.case_item_matches(kind, &comparison, pat) {
                             self.exec_statement(&item.stmt);
                             matched = true;
                             break;
@@ -6582,6 +6552,12 @@ impl Simulator {
                     )
                 };
                 self.type_tables_gen += 1;
+                self.declaration_typedefs.get_or_insert_with(|| {
+                    (
+                        self.module.typedefs.clone(),
+                        self.module.typedef_types.clone(),
+                    )
+                });
                 self.module.typedefs.insert(td.name.name.clone(), w);
                 self.module
                     .typedef_types

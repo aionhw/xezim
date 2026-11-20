@@ -263,7 +263,7 @@ impl Simulator {
     /// the class (or an ancestor) wins over a same-named global one, and a
     /// type parameter takes the type bound on the running object (§8.25).
     pub(super) fn method_ret_conv(&self, rt: &DataType, cname: &str) -> RetConv {
-        let tt = &self.module.typedef_types;
+        let tt = self.method_typedef_types();
         if let DataType::TypeReference {
             name, dimensions, ..
         } = rt
@@ -284,7 +284,7 @@ impl Simulator {
                 };
             }
         }
-        self.fn_ret_conv(rt)
+        Self::ret_conv_of(super::elaborate::resolve_typedef_chain(rt, tt), tt)
     }
 
     /// `ret_conv_of` for a concrete type-parameter binding, given by name.
@@ -339,7 +339,7 @@ impl Simulator {
     #[cold]
     #[inline(never)]
     pub(super) fn method_ret_typedef_fit(&self, rt: &DataType, cname: &str) -> (u32, Option<bool>) {
-        let tt = &self.module.typedef_types;
+        let tt = self.method_typedef_types();
         let dt = match rt {
             DataType::TypeReference {
                 name, dimensions, ..
@@ -361,7 +361,7 @@ impl Simulator {
         let w = resolve_type_width(
             dt,
             Some(&self.module.parameters),
-            Some(&self.module.typedefs),
+            Some(self.method_typedef_widths()),
         );
         (w, Some(super::elaborate::is_type_signed_resolved(dt, tt)))
     }

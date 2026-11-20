@@ -550,7 +550,7 @@ impl Simulator {
         }
         self.colliding_static_colls = colliding_names.iter().cloned().collect();
         self.colliding_static_colls_ready = true;
-        let mut static_cols: Vec<(String, bool, u32, bool)> = Vec::new();
+        let mut static_cols = Vec::new();
         for cd in self.module.classes.values() {
             for (name, is_assoc, width) in &cd.static_collections {
                 let is_str = cd
@@ -574,11 +574,15 @@ impl Simulator {
                     *is_assoc,
                     *width,
                     is_str,
+                    cd.queue_property_names.contains(name),
                 ));
             }
         }
         self.register_struct_member_collections();
-        for (name, is_assoc, width, is_str) in static_cols {
+        for (name, is_assoc, width, is_str, is_queue) in static_cols {
+            if is_queue {
+                self.module.queue_vars.insert(name.clone());
+            }
             if is_assoc {
                 self.module
                     .associative_arrays
