@@ -529,13 +529,21 @@ impl Simulator {
                 idx.push(i);
             }
         }
+        // Evaluated as the settle evaluates them at any later change: in the
+        // entry's scope, and with a deferred assertion report owned by the
+        // block, not by the process that happens to be current, so that a
+        // re-evaluation in the same time step supersedes it (§16.4.2).
+        self.comb_direct_eval = true;
         for i in idx {
             if self.finished {
                 break;
             }
             let entry = self.comb_entries[i].clone();
+            *self.name_resolve_hint.borrow_mut() = entry.cold.scope_hint.clone();
             self.eval_comb_entry_full(&entry);
         }
+        self.comb_direct_eval = false;
+        *self.name_resolve_hint.borrow_mut() = None;
         if self.dirty_any && !self.finished {
             self.settle_combinatorial();
         }

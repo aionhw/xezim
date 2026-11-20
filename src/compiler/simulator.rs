@@ -11448,6 +11448,10 @@ pub struct Simulator {
     edge_forced_fire: Vec<usize>,
     /// True while the compile-time (pre-process) time-0 settle runs.
     in_pre_process_settle: bool,
+    /// A combinational entry is being evaluated outside the settle
+    /// (`release_time0_held`): its deferred assertion reports are the
+    /// block's, as in the settle (`queue_deferred_assert`).
+    comb_direct_eval: bool,
     /// Call-site (expression span start) → per activation scope (see
     /// `sampled_scope`) → index into `sampled_watches`. Every instance of a
     /// child module shares the call's span, so the scope tells them apart.
