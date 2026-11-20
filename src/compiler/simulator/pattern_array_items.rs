@@ -85,6 +85,131 @@ impl Simulator {
         out.filter(|v| !v.is_empty() && v.iter().all(|(s, _)| s.starts_with('[')))
     }
 
+    /// §7.6, §7.4.6: the leaves of the unpacked array `e`, a whole fixed
+    /// array, a subarray (`m[1]`, `m3[1][0]`) or a slice (`a[1:2]`,
+    /// `m[1][0+:2]`) of a design variable, a local, a formal or a class
+    /// property, read now in declared order, left bound first. Each leaf
+    /// carries its position below `e`, one `[k]` per dimension counted from
+    /// the left bound, then `.member` steps under an element that is an
+    /// unpacked struct (whose members are separate leaves). An element
+    /// outside the declared range reads as x. None when `e` is anything else
+    /// (a call, a single element, a dynamic or associative array).
+    pub(super) fn unpacked_array_leaves(&mut self, e: &Expression) -> Option<Vec<(String, Value)>> {
+        let e = Self::unparen(e);
+        let mut cur = e;
+        let mut sliced = false;
+        // A select with a side effect (`m[i++]`) is left to the caller's
+        // single evaluation.
+        if let ExprKind::RangeSelect {
+            expr, left, right, ..
+        } = &cur.kind
+        {
+            if !Self::cond_expr_is_effect_free(left, false)
+                || !Self::cond_expr_is_effect_free(right, false)
+            {
+                return None;
+            }
+            sliced = true;
+            cur = expr;
+        }
+        let mut fixed = 0usize;
+        while let ExprKind::Index { expr, index } = &cur.kind {
+            if !Self::cond_expr_is_effect_free(index, false) {
+                return None;
+            }
+            fixed += 1;
+            cur = expr;
+        }
+        if !matches!(cur.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. }) {
+            return None;
+        }
+        // A plain design name, with no class object or subroutine local to
+        // resolve it otherwise, is answered from the declared ranks: every
+        // scalar fill and element read of a pattern store comes through here.
+        if let ExprKind::Ident(h) = &cur.kind
+            && h.root.is_none()
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && self.no_class_objects()
+            && self.dyn_name_lookup(&h.path[0].name.name).is_none()
+        {
+            let name = self.resolve_hier_name(h);
+            let rank = if self.module.arrays.contains_key(&*name) {
+                1
+            } else if self.module.arrays_2d.contains_key(&*name) {
+                2
+            } else {
+                self.module.arrays_nd.get(&*name).map_or(0, |(s, _)| s.len())
+            };
+            if rank == 0 || fixed == rank || fixed + usize::from(sliced) > rank {
+                return None;
+            }
+        }
+        let el = self.unpacked_operand_elems(e)?;
+        if !el.selected && (fixed > 0 || sliced) {
+            return None;
+        }
+        let (dims, _) = self.unpacked_decl_shape(&el.root_name)?;
+        if self.live_coll_size(&el.root_name).is_some() {
+            return None;
+        }
+        // The extent of each dimension below `e`: a slice's own length for
+        // the sliced one.
+        let mut extents: Vec<usize> = dims
+            .iter()
+            .skip(fixed)
+            .map(|&(l, r)| l.abs_diff(r) as usize + 1)
+            .collect();
+        if sliced {
+            let below: usize = extents.iter().skip(1).product();
+            *extents.first_mut()? = el.names.len() / below.max(1);
+        }
+        if extents.iter().product::<usize>() != el.names.len() {
+            return None;
+        }
+        let elem_su = self
+            .class_member_coll_type(&el.root_name)
+            .cloned()
+            .or_else(|| self.p_elem_type(&el.root_name))
+            .and_then(|dt| self.unpacked_struct_of(&dt));
+        let mut out = Vec::new();
+        for (pos, name) in el.names.iter().enumerate() {
+            let mut path = String::new();
+            let mut rest = pos;
+            let mut steps = Vec::with_capacity(extents.len());
+            for &n in extents.iter().rev() {
+                steps.push(rest % n);
+                rest /= n;
+            }
+            for k in steps.iter().rev() {
+                path.push_str(&format!("[{k}]"));
+            }
+            match &elem_su {
+                Some(su) => {
+                    let Some(name) = name else {
+                        return None;
+                    };
+                    let mut leaves = Vec::new();
+                    self.unpacked_struct_leaves(name, e, su, 0, &mut leaves);
+                    for (key, _, w, _) in leaves {
+                        let v = self
+                            .get_signal_value_by_name(&key)
+                            .unwrap_or_else(|| Value::new(w.max(1)));
+                        out.push((format!("{path}{}", &key[name.len()..]), v));
+                    }
+                }
+                None => {
+                    let v = name
+                        .as_ref()
+                        .and_then(|n| self.get_signal_value_by_name(n))
+                        .unwrap_or_else(|| Value::new(el.ew));
+                    out.push((path, v));
+                }
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
     fn array_item_elements_now(&mut self, e: &Expression) -> Option<Vec<(String, Value)>> {
         if let Some(suffixes) = self.unpacked_row_suffixes(e) {
             return Some(

@@ -4514,6 +4514,40 @@ impl Simulator {
                     }
                     return;
                 }
+                // §10.4.2, §7.6: a subarray or slice of a multidimensional
+                // array (a design variable's, a class property's) that the
+                // element-wise paths above do not pair with the target
+                // (`q <= src[1]` into a one-dimensional array) is read element
+                // by element now and stored as the pattern of those values.
+                // It was read as one scalar, so every element received 0.
+                // Only a design with multidimensional storage has one.
+                if packed_pattern.is_none()
+                    && intra_cycles.is_none()
+                    && (!self.module.arrays_2d.is_empty() || !self.module.arrays_nd.is_empty())
+                    && let Some((pattern, release)) =
+                        self.unpacked_array_snapshot(rvalue, rvalue.span)
+                {
+                    let d = intra_d.unwrap_or_else(|| {
+                        delay
+                            .as_ref()
+                            .map(|e| self.eval_delay_ticks(e))
+                            .unwrap_or(0)
+                    });
+                    let delay = (d > 0)
+                        .then(|| self.make_intra_saved_expr(Value::from_u64(d, 64), stmt.span));
+                    self.exec_statement(&Statement::new(
+                        StatementKind::NonblockingAssign {
+                            lvalue: packed_lvalue.clone(),
+                            delay: delay.map(Box::new),
+                            rvalue: pattern,
+                        },
+                        stmt.span,
+                    ));
+                    if let Some(release) = release {
+                        self.exec_statement(&release);
+                    }
+                    return;
+                }
                 let val = match (packed_pattern, &rvalue.kind) {
                     (Some(v), _) => v,
                     (None, ExprKind::AssignmentPattern(_)) => self.eval_expr(rvalue),

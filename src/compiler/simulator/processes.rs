@@ -2613,6 +2613,13 @@ impl Simulator {
         if let Some(values) = self.capture_array_rhs(lvalue, inner) {
             return (self.saved_array_pattern(values, span), None);
         }
+        // §9.4.5, §7.6: any other unpacked array (a whole multidimensional
+        // array, a subarray or slice of one, an array of unpacked structs, a
+        // class property's row) is read element by element now. It was
+        // captured as one scalar, so the delayed store wrote zeros.
+        if let Some(snapshot) = self.unpacked_array_snapshot(inner, span) {
+            return snapshot;
+        }
         if matches!(inner.kind, ExprKind::AssignmentPattern(_)) {
             // A packed target shapes the pattern now; its value is the one
             // evaluation of the items (a second would repeat their calls).
@@ -2622,24 +2629,71 @@ impl Simulator {
             let mut slots = Vec::new();
             let shape = self.intra_target_shape(lvalue);
             let captured = self.capture_intra_pattern(inner, &mut slots, shape.as_ref());
-            let args = slots
-                .iter()
-                .map(|&idx| Self::intra_slot_literal(idx, span))
-                .collect();
-            let release = Statement::new(
-                StatementKind::Expr(Expression::new(
-                    ExprKind::SystemCall {
-                        name: INTRA_RELEASE_MARKER.to_string(),
-                        args,
-                    },
-                    span,
-                )),
-                span,
-            );
-            return (captured, Some(release));
+            return (captured, Some(Self::intra_release_stmt(&slots, span)));
         }
         let val = self.eval_target_rhs(lvalue, rhs);
         (self.make_intra_saved_expr(val, span), None)
+    }
+
+    /// The statement that frees the captured pattern items `slots` once the
+    /// store that reads them has run.
+    fn intra_release_stmt(slots: &[u64], span: crate::ast::Span) -> Statement {
+        let args = slots
+            .iter()
+            .map(|&idx| Self::intra_slot_literal(idx, span))
+            .collect();
+        Statement::new(
+            StatementKind::Expr(Expression::new(
+                ExprKind::SystemCall {
+                    name: INTRA_RELEASE_MARKER.to_string(),
+                    args,
+                },
+                span,
+            )),
+            span,
+        )
+    }
+
+    /// §7.6, §9.4.5: the unpacked array `e` (see `unpacked_array_leaves`)
+    /// read now, as an assignment pattern of the captured elements nested
+    /// like the array, with the statement that frees them after the store.
+    /// None, with nothing read, when `e` names no such array.
+    pub(super) fn unpacked_array_snapshot(
+        &mut self,
+        e: &Expression,
+        span: crate::ast::Span,
+    ) -> Option<(Expression, Option<Statement>)> {
+        let e = Self::unparen(e);
+        if !matches!(
+            e.kind,
+            ExprKind::Ident(_)
+                | ExprKind::Index { .. }
+                | ExprKind::RangeSelect { .. }
+                | ExprKind::MemberAccess { .. }
+        ) {
+            return None;
+        }
+        let leaves = self.unpacked_array_leaves(e)?;
+        let rows = Self::leaf_rows(leaves);
+        let mut slots = Vec::new();
+        let captured = self.kept_element_pattern(rows, span, &mut slots);
+        Some((captured, Some(Self::intra_release_stmt(&slots, span))))
+    }
+
+    /// Leaf paths (`[1][0]`, `[1].a`) split into one step per dimension or
+    /// member, in declared order, so `kept_element_pattern` nests them.
+    fn leaf_rows(leaves: Vec<(String, Value)>) -> Vec<(Vec<String>, Value)> {
+        leaves
+            .into_iter()
+            .map(|(suffix, v)| {
+                let path = suffix
+                    .split(['[', '.'])
+                    .filter(|c| !c.is_empty())
+                    .map(|c| c.trim_end_matches(']').to_string())
+                    .collect();
+                (path, v)
+            })
+            .collect()
     }
 
     /// The pattern `e` with each item's value captured (`capture_intra_rhs`),
@@ -2723,17 +2777,7 @@ impl Simulator {
                     // `[1][0]` or, for an element that is an unpacked
                     // struct, `[1].a`: one path step per dimension or member,
                     // in declared order, so the steps nest positionally.
-                    let rows = elems
-                        .into_iter()
-                        .map(|(suffix, v)| {
-                            let path = suffix
-                                .split(['[', '.'])
-                                .filter(|c| !c.is_empty())
-                                .map(|c| c.trim_end_matches(']').to_string())
-                                .collect();
-                            (path, v)
-                        })
-                        .collect();
+                    let rows = Self::leaf_rows(elems);
                     return self.kept_element_pattern(rows, e.span, slots);
                 }
                 let val = self.intra_item_value(shape, e);
