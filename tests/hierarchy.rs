@@ -261,6 +261,8 @@ mod vif_in_subroutines;
 mod vif_typedef_null_default;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
 mod wildcard_import_shadow;
+#[path = "hierarchy/wildcard_to_implicit_nets.rs"]
+mod wildcard_to_implicit_nets;
 
 #[path = "hierarchy/nested_modules_and_zpad.rs"]
 mod nested_modules_and_zpad;
@@ -515,6 +517,8 @@ mod generate_real_struct_members_1099;
 
 #[path = "hierarchy/rooted_packed_scope.rs"]
 mod rooted_packed_scope;
+#[path = "hierarchy/clog2_port_connection_select.rs"]
+mod clog2_port_connection_select;
 #[path = "hierarchy/nettype_input_port_actuals_1280.rs"]
 mod nettype_input_port_actuals_1280;
 #[path = "hierarchy/prepared_body_release_721.rs"]

@@ -61,7 +61,8 @@ on a mailbox that was never constructed, a loop or delta cycle that can never
 let time advance, an SDF file `$sdf_annotate` cannot read), a
 `--dpi-lib` library that cannot be loaded, and an `-s` that names no module
 (`--no-strict-top` falls back to finding tops automatically). `$error` exits 0
-unless `--error-exit` is given.
+unless `--error-exit` is given. A run that Ctrl-C or SIGTERM stopped exits 130
+or 143.
 
 Current `main` also diagnoses undeclared type names and duplicate class
 definitions. Declare or import the intended type before using it, and keep
@@ -198,7 +199,9 @@ entries still apply inside it. A compiled artifact takes the options when it
 is run.
 
 Ctrl-C (SIGINT) or SIGTERM stops the run at the current time and closes the
-dumps normally; this includes a long loop inside one time slot. If the run
+dumps normally; this includes a long loop inside one time slot. The run then
+exits 130 or 143 (128 + the signal number), as a shell reports a process the
+signal ended, so a harness does not take it for a run that passed. If the run
 cannot stop (a DPI call that does not return), the FST dump is closed at the
 current time after half a second, and the process ends 5 seconds after the
 signal. A second Ctrl-C ends it at once. An FST dump is also written out every

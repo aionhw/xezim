@@ -397,7 +397,10 @@ fn method_boost_enabled() -> bool {
 // §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
 // §11.8.2: preserve integral arithmetic in constant operands of real comparisons.
 // §6.24.1: a signing conversion consumes an unsized fill literal.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3092;
+// §20.8.1, §7.4.1: `$clog2` of a constant folds; unfolded select bounds map labels.
+// §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
+// §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3094;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1830,7 +1833,13 @@ struct CombEntryCold {
 // §9.2.2.2.1: parameterized instance vectors retain disjoint sensitivity regions.
 // §6.24.1: compiled sign conversions use the self-determined operand width.
 // §10.9.1: packed array default drivers retain their element type.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB051";
+// §20.8.1, §7.4.1: `$clog2` of a constant folds, and a select bound that does
+// not fold still maps its label to a physical bit.
+// §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
+// §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
+// §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
+// process, not as a combinational entry.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB052";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -4217,6 +4226,12 @@ struct DeferredReport {
     class_context: Option<String>,
     /// §20.12: what an assertion control selects the assertion by.
     ctl: CtlIdent,
+    /// §16.4.2: the `assertion_stats` entry the outcome is counted in when
+    /// the report matures, with its kind tag (0 assert, 1 assume, 2 cover)
+    /// and location. A flushed or superseded report is no attempt.
+    stat_key: usize,
+    stat_kind: u8,
+    stat_loc: (Option<u32>, usize),
 }
 
 /// LRM §4.4 / §16 observed-region probe entry. A concurrent property's
@@ -10875,6 +10890,11 @@ pub struct Simulator {
     /// While this is non-zero, procedural comb entries triggered mid-process
     /// are parked in `deferred_comb` and run at the process's exit instead.
     proc_depth: u32,
+    /// Nesting of `run_process_stmts` activations on the native stack. A
+    /// process that calls a task which can wait but does not resumes the
+    /// caller from inside the callee's activation, so a call chain that never
+    /// waits nests one level per call (see `process_nesting_exceeded`).
+    stmts_depth: u32,
     /// (comb entry index, outputs it produced) for procedural entries that ran
     /// while a process was mid-flight. Checked for clobbering at process exit.
     deferred_comb: Vec<(usize, Vec<(usize, Value)>)>,
@@ -13491,7 +13511,11 @@ pub extern "C" fn vpi_chk_error(error_info_p: *mut s_vpi_error_info) -> libc::c_
         info.message = vpi_err_scratch(&msg);
         info.product = b"xezim\0".as_ptr() as *mut libc::c_char;
         info.code = b"\0".as_ptr() as *mut libc::c_char;
-        info.file = std::ptr::null_mut();
+        // §38.3: every string field points at a string. An error has no
+        // source file, so `file` is empty rather than NULL: cocotb logs
+        // `file` and `product` as C strings, and a NULL `file` crashed it
+        // on the first error it checked.
+        info.file = b"\0".as_ptr() as *mut libc::c_char;
         info.line = 0;
     }
     level

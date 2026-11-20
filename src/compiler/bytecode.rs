@@ -11481,7 +11481,17 @@ impl<'a> BytecodeCompiler<'a> {
                     _ => return None,
                 }
             }
-            ExprKind::MemberAccess { expr, member } => self.const_param_member(expr, &member.name)?,
+            ExprKind::MemberAccess { expr, member } => {
+                self.const_param_member(expr, &member.name)?
+            }
+            // §20.8.1: as the interpreter computes it, a 32-bit result, signed
+            // as `system_function_result` types it (`$clog2(1) - 1 < 0`).
+            ExprKind::SystemCall { name, args } if name == "$clog2" && args.len() == 1 => {
+                let v = self.clog2_const_operand(&args[0])?;
+                let mut r = Value::from_u64(u64::from(clog2_u64(v)), 32);
+                r.is_signed = true;
+                r
+            }
             _ => return None,
         };
         (!v.has_xz() && !v.is_real).then_some(v)
@@ -18614,8 +18624,50 @@ impl<'a> BytecodeCompiler<'a> {
                         ));
                         return Some(dest);
                     }
-                    let l = self.compile_expr(left, 0)?;
-                    let r = self.compile_expr(right, 0)?;
+                    // §7.4.1, §11.5.1: bounds the compiler cannot fold are
+                    // still labels of the declared range. A descending range
+                    // that does not start at 0 (`input [11:2] a`) shifts them
+                    // to physical bits; an ascending one also mirrors their
+                    // order, which only the interpreter's select does.
+                    // Only for a plain vector: on a packed multi-D base the
+                    // bounds select whole elements (`a[$clog2(2+2)-1:0]` on
+                    // `logic [3:0][7:0] a` is two bytes), which the bit-range
+                    // `RangeSelect` below does not scale, so that select is
+                    // the interpreter's too.
+                    let elems = matches!(&expr.kind, ExprKind::Ident(h)
+                        if self.packed_elem_width_of(h).is_some_and(|w| w > 1));
+                    let plain =
+                        !elems && matches!(&expr.kind, ExprKind::Ident(_) | ExprKind::Index { .. });
+                    let dim = self.sel_base_dim(expr).filter(|_| plain);
+                    let interpreted = if elems {
+                        Some("range_sel_dyn_elements")
+                    } else if dim.is_some_and(|(l, r)| l < r) {
+                        Some("range_sel_dyn_ascending")
+                    } else {
+                        None
+                    };
+                    if let Some(site) = interpreted {
+                        self.truncate_insns(base_start);
+                        self.next_reg = base_reg;
+                        if let Some(r) = self.emit_expr_fallback(whole, ctx_width, site) {
+                            return Some(r);
+                        }
+                        self.bail(site);
+                        return None;
+                    }
+                    let mut l = self.compile_expr(left, 0)?;
+                    let mut r = self.compile_expr(right, 0)?;
+                    if let Some((_, lo)) = dim.filter(|&(_, lo)| lo != 0) {
+                        let off = self.alloc_reg();
+                        self.emit(Insn::LoadConst(
+                            off,
+                            Box::new(Value::from_u64(lo as u64, 32)),
+                        ));
+                        let (pl, pr) = (self.alloc_reg(), self.alloc_reg());
+                        self.emit(Insn::Sub(pl, l, off));
+                        self.emit(Insn::Sub(pr, r, off));
+                        (l, r) = (pl, pr);
+                    }
                     let dest = self.alloc_reg();
                     self.emit(Insn::RangeSelect(dest, base, l, r));
                     Some(dest)
@@ -18940,6 +18992,14 @@ impl<'a> BytecodeCompiler<'a> {
                     None
                 }
                 crate::compiler::simulator::COV_COND_FN => self.compile_cov_cond(args),
+                // §20.8.1: `$clog2` of a constant (a parameter, a literal) is
+                // that constant; anything else keeps the interpreter call.
+                "$clog2" if args.len() == 1 && self.fold_const(expr).is_some() => {
+                    let v = self.fold_const(expr)?;
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::LoadConst(dest, Box::new(v)));
+                    Some(dest)
+                }
                 // §21.3.3 `$sformatf` with a LITERAL template and specs the
                 // native filler covers exactly — parsed once here, filled
                 // from register Values at exec. Anything else (non-literal
@@ -22725,8 +22785,47 @@ impl<'a> BytecodeCompiler<'a> {
                     pv.to_u64().map(|u| u as i64)
                 }
             }
+            // §20.8.1: `$clog2` of a constant is a constant (`a[$clog2(N)-1:3]`).
+            ExprKind::SystemCall { name, args } if name == "$clog2" && args.len() == 1 => {
+                Some(i64::from(clog2_u64(self.clog2_const_operand(&args[0])?)))
+            }
             _ => self.eval_const_expr(e).map(|v| v as i64),
         }
+    }
+
+    /// §20.8.1: the operand of a `$clog2` that folds, as the unsigned value
+    /// the interpreter's `$clog2` reads: a literal at its full value up to 64
+    /// bits (`64'h1_0000_0000`, which `eval_const_expr` would narrow to 32), a
+    /// parameter, or an unrolled loop's index, optionally in parentheses.
+    /// An operator expression is self-determined (§11.6.1: `8'hff + 8'h01` is
+    /// 0, `64'd1 << 33` keeps bit 33), which neither `eval_const_bound`
+    /// (64-bit integers) nor `eval_const_expr` (32 bits) models, so it keeps
+    /// the interpreter's call. So does a frame local that hides a parameter
+    /// (§23.9), and an x/z or wider than 64-bit value.
+    fn clog2_const_operand(&self, e: &Expression) -> Option<u64> {
+        let v = match &e.kind {
+            ExprKind::Paren(inner) => return self.clog2_const_operand(inner),
+            ExprKind::Number(n) => self.eval_number_static(n)?,
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                let name = h.path[0].name.name.as_str();
+                // A `foreach` index is an `int` (§12.7.3).
+                if let Some(&k) = self.const_var_binds.get(name) {
+                    return Some(u64::from(k as u32));
+                }
+                match self.local_const_vars.get(name) {
+                    Some(v) => v.clone(),
+                    None if self.frame_bound_target(e) => return None,
+                    None => self.lookup_param_value(h)?,
+                }
+            }
+            _ => return None,
+        };
+        if v.has_xz() || v.is_real || v.width > 64 {
+            return None;
+        }
+        v.to_u64()
     }
 
     fn eval_const_expr(&self, e: &Expression) -> Option<u32> {
@@ -27429,5 +27528,15 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
             return hit;
         }
         None
+    }
+}
+
+/// §20.8.1: the ceiling of the base-2 logarithm, with `$clog2(0)` and
+/// `$clog2(1)` both 0 (the interpreter's `$clog2`).
+fn clog2_u64(v: u64) -> u32 {
+    if v <= 1 {
+        0
+    } else {
+        64 - (v - 1).leading_zeros()
     }
 }
