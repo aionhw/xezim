@@ -7543,6 +7543,13 @@ pub struct Simulator {
     /// Nets released while a settle pass was running (the entry table is
     /// taken out then); re-driven when the pass ends.
     pending_release_ids: Vec<usize>,
+    /// §10.6.2: the comb entries that write each signal, by entry index in
+    /// table order, for re-driving a released net. Built at the first
+    /// release from `comb_entries` (whose read and write lists are fixed once
+    /// compiled) and dropped whenever that table is replaced; `None` until
+    /// then. The length is the table's when it was built.
+    #[serde(skip)]
+    comb_writer_index: Option<(usize, HashMap<usize, Vec<u32>>)>,
     /// Memoization for `prop_bound_collection`: (class, member) → resolved
     /// raw type name (hierarchy walk), and type name → is-collection verdict
     /// (which otherwise LINEAR-SCANS every class's local typedefs — 5% of an
