@@ -45,6 +45,8 @@ fn local_coll_queues_all_shapes() {
     let src = r#"
 class C;
   int mq[$];
+  string last;
+  int r, t, p, d, n, lq, lmq, lqs, lmqs, dv, hn, heq, ht, b1, b0;
   function new();
   endfunction
   function void fill(int n, int base);
@@ -120,8 +122,6 @@ class C;
       b0 = q.size();
     end
   endfunction
-  string last;
-  int r, t, p, d, n, lq, lmq, lqs, lmqs, dv, hn, heq, ht, b1, b0;
 endclass
 
 module top;
