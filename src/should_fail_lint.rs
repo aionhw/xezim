@@ -190,7 +190,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     check_nettype_partial_drivers(defs, elab, &mut errs);
     check_named_block_refs(defs, &mut errs);
     if xezim_core::sv_parser::strict_checks() {
-        errs.extend(crate::type_lint::check(defs, elab, &gen_sel));
+        errs.extend(crate::type_lint::check_with_selection(defs, elab, &gen_sel));
         // §23.8: a hierarchical name that does not resolve is an error.
         errs.extend(crate::hier_ref_lint::check(defs, elab));
     }

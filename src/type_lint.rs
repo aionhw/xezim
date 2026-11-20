@@ -3105,7 +3105,11 @@ fn dpi_name(d: &xezim_core::ast::decl::DPIImport) -> Option<String> {
 }
 
 /// Run the checks over every definition; returns the error messages.
-pub fn check(
+pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String> {
+    check_with_selection(defs, elab, &GenerateSelection::new(elab))
+}
+
+pub(crate) fn check_with_selection(
     defs: &[&SourceDefinition],
     elab: &ElaboratedModule,
     gen_sel: &GenerateSelection<'_>,
