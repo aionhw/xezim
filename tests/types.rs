@@ -801,6 +801,8 @@ mod inside_compiled_forms;
 mod nettype_declaration_initializer_drivers;
 #[path = "types/unsized_decimal_width_1120.rs"]
 mod unsized_decimal_width_1120;
+#[path = "types/two_state_struct_member_array_init.rs"]
+mod two_state_struct_member_array_init;
 #[path = "types/negative_bound_packed_slice_write_1193.rs"]
 mod negative_bound_packed_slice_write_1193;
 #[path = "types/review_pattern_type_keys_params.rs"]
