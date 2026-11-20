@@ -743,7 +743,7 @@ pub enum Insn {
     LoadCollElem(RegId, RegId, Box<str>, RegId),
     /// Element WRITE `q[i] = v` / `aa[k] = v` on the same receivers.
     /// (handle_reg, member, index_reg, value_reg). The exec arm mirrors the
-    /// `expr_assoc_name` arm of `assign_value_index` directly — §7.10.2.3
+    /// `expr_assoc_name` arm of `assign_value_index` directly — §7.10.1
     /// queue append, §10.7 width fit off the live store, exact changed-
     /// detect insert, touch_queue, waiter notify, settle — so storage and
     /// side effects match the AST path. No-op on a null receiver.

@@ -8,9 +8,6 @@
 //! body is unnamed, auto-named, or explicitly labelled — all flatten to the
 //! same bare-name `signals` slot), and skips any name a nested block
 //! redeclares. Reference-validated (tmp/ac/ac16b, ac25b).
-//!
-//! Also: §21.2.1.3 `%0h` of an all-x value prints a single collapsed "x",
-//! not one x per digit — leading x/z runs trim like leading zeros.
 
 use xezim::simulate;
 
