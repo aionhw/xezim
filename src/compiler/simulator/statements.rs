@@ -3187,6 +3187,9 @@ impl Simulator {
                         bare
                     };
                     self.adopt_local_shape(&name);
+                    if let Some(bounds) = self.declared_fixed_dims(dims) {
+                        self.module.unpacked_decl_dims.insert(name.clone(), bounds);
+                    }
                     match shape.len() {
                         2 => {
                             self.module
