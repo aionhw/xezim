@@ -721,20 +721,10 @@ impl Simulator {
                 | BinaryOp::ArithShiftLeft
                 | BinaryOp::ArithShiftRight
                 | BinaryOp::Power => self.lrm_self_width(left),
-                BinaryOp::Eq
-                | BinaryOp::Neq
-                | BinaryOp::CaseEq
-                | BinaryOp::CaseNeq
-                | BinaryOp::WildcardEq
-                | BinaryOp::WildcardNeq
-                | BinaryOp::Lt
-                | BinaryOp::Leq
-                | BinaryOp::Gt
-                | BinaryOp::Geq
-                | BinaryOp::LogAnd
-                | BinaryOp::LogOr => Some(1),
+                op if Self::binary_yields_one_bit(*op) => Some(1),
                 _ => None,
             },
+            ExprKind::Inside { .. } => Some(1),
             ExprKind::Conditional {
                 then_expr,
                 else_expr,
@@ -1575,6 +1565,42 @@ impl Simulator {
         (self.infer_width(expr), None)
     }
 
+    /// §11.6.1 Table 11-21: the binary operators whose result is one bit.
+    pub(super) fn binary_yields_one_bit(op: BinaryOp) -> bool {
+        matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::CaseEq
+                | BinaryOp::CaseNeq
+                | BinaryOp::WildcardEq
+                | BinaryOp::WildcardNeq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+                | BinaryOp::LogAnd
+                | BinaryOp::LogOr
+                | BinaryOp::LogImplies
+                | BinaryOp::LogEquiv
+        )
+    }
+
+    /// §11.6.1 Table 11-21: the unary operators whose result is one bit
+    /// (logical negation and the reductions).
+    pub(super) fn unary_yields_one_bit(op: UnaryOp) -> bool {
+        matches!(
+            op,
+            UnaryOp::LogNot
+                | UnaryOp::BitAnd
+                | UnaryOp::BitNand
+                | UnaryOp::BitOr
+                | UnaryOp::BitNor
+                | UnaryOp::BitXor
+                | UnaryOp::BitXnor
+        )
+    }
+
     /// `infer_width` body; the flag says whether every branch taken was
     /// static, i.e. safe to pin on the node.
     pub(super) fn infer_width_walk(&mut self, expr: &Expression) -> (u32, bool) {
@@ -1654,6 +1680,16 @@ impl Simulator {
                 self.infer_width(lvalue),
                 lvalue.cached_width.get().is_some(),
             ),
+            // §11.6.1 Table 11-21: an equality, relational, logical,
+            // reduction or `inside` operator yields one bit, whatever its
+            // operands' widths, which are sized among themselves. Reporting
+            // the operands' width sized the sibling of `|` in a
+            // self-determined `if` condition at it: in
+            // `(~a) | (m == 5'd12)` over a 1-bit `a` and a 5-bit `m`, `~a`
+            // read 5'b11110 and the branch was taken.
+            ExprKind::Binary { op, .. } if Self::binary_yields_one_bit(*op) => (1, true),
+            ExprKind::Unary { op, .. } if Self::unary_yields_one_bit(*op) => (1, true),
+            ExprKind::Inside { .. } => (1, true),
             ExprKind::Binary { left, right, .. } => {
                 let w = self.infer_width(left).max(self.infer_width(right));
                 (
