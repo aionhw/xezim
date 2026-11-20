@@ -1821,7 +1821,8 @@ struct CombEntryCold {
 // §9.2.2.2, §10.3: CombEntryCold::time0_effects; a variable a called function writes is
 // not a read of its caller.
 // §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB046";
+// §9.2.2.2.1: parameterized instance vectors retain disjoint sensitivity regions.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB047";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
