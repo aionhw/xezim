@@ -1353,3 +1353,5 @@ mod review_writeback_actual_forms;
 mod class_constraint_sharing_721;
 #[path = "classes/class_struct_array_member_patterns.rs"]
 mod class_struct_array_member_patterns;
+#[path = "classes/multidim_property_pattern_init.rs"]
+mod multidim_property_pattern_init;
