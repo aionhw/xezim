@@ -2078,6 +2078,37 @@ impl Simulator {
     /// re-stamp the declared signedness (`struct packed { int s; ... } x;`
     /// printed `x.s` as 4294967276 instead of -20). Resolves through the
     /// root's declared struct type; nested paths use the leaf member name.
+    /// §7.3: `field` is a `real` or `realtime` member of the unpacked
+    /// untagged union variable `root`. The union is one piece of storage, so
+    /// the member holds the real's IEEE 754 bits: a write stores them
+    /// (`$realtobits`) and a read takes them back (`$bitstoreal`).
+    pub(super) fn union_real_member(&self, root: &str, field: &str) -> bool {
+        let Some(dt) = self.module.var_decl_types.get(root) else {
+            return false;
+        };
+        let crate::ast::types::DataType::Struct(su) =
+            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types)
+        else {
+            return false;
+        };
+        if su.packed || su.tagged || !matches!(su.kind, crate::ast::types::StructUnionKind::Union) {
+            return false;
+        }
+        su.members.iter().any(|m| {
+            m.declarators.iter().any(|d| d.name.name == field)
+                && matches!(
+                    super::elaborate::resolve_typedef_chain(&m.data_type, &self.module.typedef_types),
+                    crate::ast::types::DataType::Real { kind, .. }
+                        if !matches!(kind, crate::ast::types::RealType::ShortReal)
+                )
+        })
+    }
+
+    /// The value read from a `union_real_member`: its bits as a real.
+    pub(super) fn union_real_read(v: Value) -> Value {
+        Value::from_f64(f64::from_bits(v.to_u64().unwrap_or(0)))
+    }
+
     pub(super) fn struct_member_signed(&self, root: &str, field: &str) -> bool {
         let Some(dt) = self.module.var_decl_types.get(root) else {
             return false;

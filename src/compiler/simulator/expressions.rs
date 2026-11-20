@@ -551,6 +551,9 @@ impl Simulator {
                         for i in 0..w {
                             out.set_bit(i as usize, cur.get_bit((off + i) as usize));
                         }
+                        if w == 64 && self.union_real_member(&base_flat, &member.name) {
+                            return Self::union_real_read(out);
+                        }
                         // §7.2.1: a 2-state member of a 4-state struct.
                         if out.has_xz()
                             && !self.mixed_packed_vars.is_empty()
@@ -1134,6 +1137,9 @@ impl Simulator {
                 {
                     if let Some(sig) = self.get_local_or_signal(&name) {
                         let mut v = sig.range_select((off + w - 1) as usize, off as usize);
+                        if w == 64 && self.union_real_member(&name, &member.name) {
+                            return Self::union_real_read(v);
+                        }
                         if self.struct_member_signed(&name, &member.name) {
                             v.is_signed = true;
                         }

@@ -3161,6 +3161,9 @@ impl Simulator {
                 // member's DECLARED signedness (`int s` in a packed struct
                 // printed as unsigned without this).
                 if let Some(field) = name.strip_prefix(&format!("{}.", base)) {
+                    if w == 64 && self.union_real_member(&base, field) {
+                        return Some(Self::union_real_read(v));
+                    }
                     if self.struct_member_signed(&base, field) {
                         v.is_signed = true;
                     }
@@ -3315,6 +3318,16 @@ impl Simulator {
             let through_alias = aliased.is_some();
             if let Some(cur) = aliased.or_else(|| self.get_local_or_signal(&base)) {
                 let mut next = cur.clone();
+                // §7.3: a real member of an untagged union stores the real's
+                // bits; an integral value converts to real first (§6.12.1).
+                let val = match name.strip_prefix(&format!("{base}.")) {
+                    Some(field)
+                        if w == 64 && !val.is_real && self.union_real_member(&base, field) =>
+                    {
+                        Value::from_f64(val.to_f64())
+                    }
+                    _ => val,
+                };
                 let mut piece = val.resize(w);
                 if !self.mixed_packed_vars.is_empty() {
                     piece = self.packed_member_piece(&base, name, piece);

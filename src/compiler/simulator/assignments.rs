@@ -4667,8 +4667,18 @@ impl Simulator {
                         && let Some(cur) = self.get_signal_value_by_name(&base)
                     {
                         let mut next = cur.clone();
-                        let rhs =
-                            self.packed_member_piece(&base, name, val.resize_for_assign(width));
+                        // §7.3: a real union member stores real bits.
+                        let real_member = width == 64
+                            && !val.is_real
+                            && name
+                                .strip_prefix(&format!("{base}."))
+                                .is_some_and(|f| self.union_real_member(&base, f));
+                        let fitted = if real_member {
+                            Value::from_f64(val.to_f64())
+                        } else {
+                            val.resize_for_assign(width)
+                        };
+                        let rhs = self.packed_member_piece(&base, name, fitted);
                         for bit in 0..width as usize {
                             next.set_bit(off as usize + bit, rhs.get_bit(bit));
                         }
@@ -6896,7 +6906,15 @@ impl Simulator {
                             if let Some(cur_sig) = self.get_signal_value_by_name(&name) {
                                 let total_w = cur_sig.width;
                                 let mut cur = cur_sig.resize(total_w);
-                                let piece = val.resize_for_assign(w);
+                                // §7.3: a real union member stores real bits.
+                                let piece = if w == 64
+                                    && !val.is_real
+                                    && self.union_real_member(&name, &member.name)
+                                {
+                                    Value::from_f64(val.to_f64()).resize(w)
+                                } else {
+                                    val.resize_for_assign(w)
+                                };
                                 for i in 0..w {
                                     let bit = piece.get_bit(i as usize);
                                     cur.set_bit((off + i) as usize, bit);
