@@ -186,7 +186,10 @@ impl Simulator {
     /// The wide rand members among `names` that no constraint reads, or
     /// reads only through `size()` / `$size` (§7.5.1, §7.10.1). Empty when
     /// a constraint calls a user method, which may read any member.
-    pub(super) fn csp_wide_unread(constraints: &[ClassConstraint], names: &[&str]) -> HashSet<String> {
+    pub(super) fn csp_wide_unread(
+        constraints: &[ClassConstraint],
+        names: &[&str],
+    ) -> HashSet<String> {
         let mut read: HashSet<String> = HashSet::default();
         let mut opaque = false;
         for c in constraints {
@@ -652,7 +655,12 @@ impl Simulator {
 
     /// §7.2.1: the fields of the packed structs nested in a wide struct
     /// variable, listed by their dotted paths (`a.b`) after its own fields.
-    pub(super) fn csp_nested_fields(&self, csp: &Csp, name: &str, fields: &mut Vec<(String, u32, u32)>) {
+    pub(super) fn csp_nested_fields(
+        &self,
+        csp: &Csp,
+        name: &str,
+        fields: &mut Vec<(String, u32, u32)>,
+    ) {
         let (owner, name) = Self::csp_owner(csp, name);
         let Some(su) = self.class_prop_struct(owner, name) else {
             return;
@@ -931,35 +939,58 @@ impl Simulator {
 
     /// `e` may read a wide variable (see `csp_may_read_wide`).
     pub(super) fn csp_wide_touch(&self, csp: &Csp, e: &Expression, _env: &Env) -> bool {
-        let mut read=HashSet::default();let mut opaque=false;
-        Self::csp_wide_expr_reads_with(e,&mut read,&mut opaque,&|x|self.csp_state_record_path(csp,x));
-        Self::csp_wide_named(csp,&read,opaque)
+        let mut read = HashSet::default();
+        let mut opaque = false;
+        Self::csp_wide_expr_reads_with(e, &mut read, &mut opaque, &|x| {
+            self.csp_state_record_path(csp, x)
+        });
+        Self::csp_wide_named(csp, &read, opaque)
     }
 
     /// §18.5: a field of a non-rand packed-record collection is state,
     /// even if its leaf name matches a separate wide rand property.
     fn csp_state_record_path(&self, csp: &Csp, e: &Expression) -> bool {
-        let mut indexed=false;let mut x=e;
-        let root=loop {
+        let mut indexed = false;
+        let mut x = e;
+        let root = loop {
             match &Self::unparen(x).kind {
-                ExprKind::MemberAccess{expr,..}=>x=expr,
-                ExprKind::Index{expr,..}=>{indexed=true;x=expr;}
-                ExprKind::Ident(h) if h.root.is_none() && !h.path.is_empty()=>{
-                    indexed|=h.path.iter().any(|s|!s.selects.is_empty());
+                ExprKind::MemberAccess { expr, .. } => x = expr,
+                ExprKind::Index { expr, .. } => {
+                    indexed = true;
+                    x = expr;
+                }
+                ExprKind::Ident(h) if h.root.is_none() && !h.path.is_empty() => {
+                    indexed |= h.path.iter().any(|s| !s.selects.is_empty());
                     break &h.path[0].name.name;
                 }
-                _=>return false,
+                _ => return false,
             }
         };
-        if !indexed || csp.scope.is_some() || csp.scalars.contains_key(root)||csp.arrays.contains_key(root) {return false;}
-        let Some(dt)=self.csp_prop_decl_type(csp.handle,root) else {return false;};
+        if !indexed
+            || csp.scope.is_some()
+            || csp.scalars.contains_key(root)
+            || csp.arrays.contains_key(root)
+        {
+            return false;
+        }
+        let Some(dt) = self.csp_prop_decl_type(csp.handle, root) else {
+            return false;
+        };
         matches!(super::elaborate::resolve_typedef_chain(&dt,&self.module.typedef_types),DataType::Struct(su) if su.packed)
     }
 
     fn csp_wide_named(csp: &Csp, read: &HashSet<String>, opaque: bool) -> bool {
-        fn leaf(n: &str) -> &str { n.rsplit_once('.').map_or(n,|p|p.1) }
-        opaque || csp.scalars.iter().any(|(n,v)|csp.wide.contains(v)&&read.contains(leaf(n)))
-            || csp.arrays.iter().any(|(n,a)|a.elems.first().is_some_and(|e|csp.wide.contains(&e.1))&&read.contains(n))
+        fn leaf(n: &str) -> &str {
+            n.rsplit_once('.').map_or(n, |p| p.1)
+        }
+        opaque
+            || csp
+                .scalars
+                .iter()
+                .any(|(n, v)| csp.wide.contains(v) && read.contains(leaf(n)))
+            || csp.arrays.iter().any(|(n, a)| {
+                a.elems.first().is_some_and(|e| csp.wide.contains(&e.1)) && read.contains(n)
+            })
     }
 
     /// The wide variable and bit range `e` names: Some((v, lsb, width,
