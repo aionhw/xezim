@@ -377,6 +377,8 @@ mod unpacked_array_ports_and_vif_arrays;
 mod unpacked_array_slices_867;
 #[path = "types/unpacked_indexed_slice_size_869.rs"]
 mod unpacked_indexed_slice_size_869;
+#[path = "types/unpacked_struct_array_continuous_copy.rs"]
+mod unpacked_struct_array_continuous_copy;
 #[path = "types/unpacked_struct_array_members.rs"]
 mod unpacked_struct_array_members;
 #[path = "types/unpacked_struct_func_arg.rs"]
