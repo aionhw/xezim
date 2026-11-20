@@ -847,3 +847,5 @@ mod struct_array_member_defaults;
 mod union_real_member;
 #[path = "types/local_struct_member_arrays.rs"]
 mod local_struct_member_arrays;
+#[path = "types/struct_parameter_percent_p.rs"]
+mod struct_parameter_percent_p;
