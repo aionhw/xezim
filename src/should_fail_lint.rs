@@ -2618,12 +2618,60 @@ fn collect_scope_names(ports: &PortList, items: &[ModuleItem]) -> Option<HashSet
             ModuleItem::ModuleInstantiation(mi) => {
                 for inst in &mi.instances {
                     names.insert(inst.name.name.clone());
+                    // §6.10: an undeclared identifier in an instance's port
+                    // connection list is an implicit scalar net of this scope,
+                    // so a `.name` / `.*` elsewhere in the scope binds to it.
+                    if !xezim_core::sv_parser::default_nettype_none_seen() {
+                        for conn in &inst.connections {
+                            match conn {
+                                xezim_core::ast::decl::PortConnection::Ordered(Some(e))
+                                | xezim_core::ast::decl::PortConnection::Named {
+                                    expr: Some(e),
+                                    ..
+                                } => collect_implicit_net_names(e, &mut names),
+                                _ => {}
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
         }
     }
     Some(names)
+}
+
+/// The identifiers of a port actual that §6.10 declares as implicit nets when
+/// nothing else declares them: the same operand walk as elaboration's
+/// `collect_implicit_net_candidates` (xezim-core), which creates those nets
+/// before the instances of the scope are connected.
+fn collect_implicit_net_names(e: &Expression, out: &mut HashSet<String>) {
+    match &e.kind {
+        ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+            out.insert(h.path[0].name.name.clone());
+        }
+        ExprKind::Unary { operand, .. } => collect_implicit_net_names(operand, out),
+        ExprKind::Binary { left, right, .. } => {
+            collect_implicit_net_names(left, out);
+            collect_implicit_net_names(right, out);
+        }
+        ExprKind::Paren(inner) => collect_implicit_net_names(inner, out),
+        ExprKind::Concatenation(parts) => {
+            for p in parts {
+                collect_implicit_net_names(p, out);
+            }
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_implicit_net_names(condition, out);
+            collect_implicit_net_names(then_expr, out);
+            collect_implicit_net_names(else_expr, out);
+        }
+        _ => {}
+    }
 }
 
 /// §23.3.2.2/§23.3.2.4: an implicit `.name` connection and a `.*` wildcard

@@ -257,6 +257,8 @@ mod vif_in_subroutines;
 mod vif_typedef_null_default;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
 mod wildcard_import_shadow;
+#[path = "hierarchy/wildcard_to_implicit_nets.rs"]
+mod wildcard_to_implicit_nets;
 
 #[path = "hierarchy/nested_modules_and_zpad.rs"]
 mod nested_modules_and_zpad;
