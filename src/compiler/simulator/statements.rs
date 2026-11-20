@@ -5421,8 +5421,7 @@ impl Simulator {
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
                 if let Some(nm) = block_name {
-                    self.fork_block_children
-                        .insert(nm.name.clone(), child_set.clone());
+                    self.register_named_fork(&nm.name, &child_set);
                 }
                 match join_type {
                     // `join` waits for all, `join_any` for the first; both suspend
@@ -5932,9 +5931,10 @@ impl Simulator {
             }
             StatementKind::Disable(target) => {
                 let name = crate::ast::stmt::disable_name(target);
+                let fork_target = self.named_fork_target(target);
                 // §38.36.1 cbDisable, reported once the disable took effect.
                 if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_DISABLE) != 0 {
-                    self.vpi_note_disable(name);
+                    self.vpi_note_disable(name, fork_target.as_deref());
                 }
                 // IEEE 1800-2017 §9.6.2. `disable_target` was set but never
                 // read: the only effect was `break_flag`, a GLOBAL flag. So a
@@ -5947,7 +5947,7 @@ impl Simulator {
                 // fork block has already returned, so trying to unwind to it
                 // below would run off the end of the disabling process and drop
                 // its continuation — which is exactly what used to happen.
-                if let Some(children) = self.fork_block_children.get(name).cloned() {
+                if let Some(children) = fork_target.as_ref().and_then(|key| self.fork_block_children.get_mut(key)).map(std::mem::take) {
                     let mut to_kill: HashSet<usize> = HashSet::default();
                     for &c in &children {
                         to_kill.insert(c);

@@ -1139,12 +1139,12 @@ impl Simulator {
     }
 
     /// A `disable name` is executing in the current process.
-    pub(super) fn vpi_note_disable(&mut self, name: &str) {
+    pub(super) fn vpi_note_disable(&mut self, name: &str, fork_target: Option<&str>) {
         let leaf = scope_leaf(name);
         // Processes the disable terminates, as the Disable arm computes them.
         let mut affected: HashSet<usize> = HashSet::default();
         affected.insert(self.current_pid);
-        if let Some(children) = self.fork_block_children.get(name).cloned() {
+        if let Some(children) = fork_target.and_then(|key| self.fork_block_children.get(key)).cloned() {
             for c in children {
                 affected.insert(c);
                 affected.extend(self.collect_fork_descendants(c));
