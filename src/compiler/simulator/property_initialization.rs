@@ -346,6 +346,33 @@ impl Simulator {
                 self.populate_queue_from_init(&scoped_q, &init);
                 continue;
             }
+            // §10.9.1: a pattern initializing a MULTIDIMENSIONAL fixed
+            // property (`int a2[2][2] = '{default: '{0: 1, default: 2}}`)
+            // spreads over every dimension into the element signals
+            // `<handle>#a2[i][j]`, as for a module array; evaluated as one
+            // value it wrote nothing those elements read. Elements that are
+            // unpacked structs keep the member-wise paths.
+            if cdef.array_nd_properties.contains_key(&pname)
+                && let ExprKind::AssignmentPattern(items) = &init.kind
+                && let Some(elem_dt) = self.class_prop_elem_type(cdef, &pname).cloned()
+                && !matches!(self.resolve_dt(&elem_dt), DataType::Struct(su) if Self::spreads_member_wise(&su))
+            {
+                let scoped = format!("{}#{}", handle, pname);
+                if let Some((dims, _)) = self.unpacked_decl_shape(&scoped) {
+                    let lists: Vec<Vec<i64>> = dims
+                        .iter()
+                        .map(|&(l, r)| {
+                            if l <= r {
+                                (l..=r).collect()
+                            } else {
+                                (r..=l).rev().collect()
+                            }
+                        })
+                        .collect();
+                    self.assign_pattern_items_over_dims(&scoped, &elem_dt, &lists, items);
+                    continue;
+                }
+            }
             // Fixed-size UNPACKED array member initializer
             // (`int fa[4] = '{1,2,3,4}`): per-instance storage is the
             // element signals `<handle>#fa[i]` (registered above as a real
