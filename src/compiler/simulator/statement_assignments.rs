@@ -1571,6 +1571,48 @@ impl Simulator {
         reads(rvalue, var)
     }
 
+    /// §11.4.12.1, §10.9.1: whether the pattern `rvalue` replicates an item
+    /// with a side effect (`'{2{f()}}`). The replicated items are evaluated
+    /// exactly once; the store matches each copy to an element and would
+    /// evaluate it once per element.
+    fn pattern_replicates_effect(rvalue: &Expression) -> bool {
+        let ExprKind::AssignmentPattern(items) = &rvalue.kind else {
+            return false;
+        };
+        items.iter().any(|item| {
+            let x = Self::unparen(item.expr());
+            match &x.kind {
+                ExprKind::Replication { exprs, .. } => {
+                    exprs.iter().any(Self::pattern_item_has_effect)
+                }
+                ExprKind::AssignmentPattern(_) => Self::pattern_replicates_effect(x),
+                _ => false,
+            }
+        })
+    }
+
+    /// Whether evaluating the pattern item `e` has a side effect. An item
+    /// already captured (`$__xz_intra_kept(k)`) only reads its slot.
+    fn pattern_item_has_effect(e: &Expression) -> bool {
+        use crate::ast::expr::AssignmentPatternItem as Item;
+        match &Self::unparen(e).kind {
+            ExprKind::SystemCall { name, .. }
+                if name == INTRA_KEPT_MARKER || name == INTRA_SAVED_MARKER =>
+            {
+                false
+            }
+            ExprKind::AssignmentPattern(items) => items.iter().any(|item| match item {
+                Item::Ordered(x)
+                | Item::Named(_, x)
+                | Item::Typed(_, x)
+                | Item::Default(x)
+                | Item::Keyed(_, x) => Self::pattern_item_has_effect(x),
+            }),
+            ExprKind::Replication { exprs, .. } => exprs.iter().any(Self::pattern_item_has_effect),
+            _ => !Self::cond_expr_is_effect_free(e, false),
+        }
+    }
+
     pub(super) fn exec_stmt_blocking_assign_body(
         &mut self,
         stmt: &Statement,
@@ -1657,8 +1699,11 @@ impl Simulator {
         // target (`a = '{a[1], a[0]}`) read elements it had already written.
         // Capture every item first, as an intra-assignment delay does (keys,
         // nesting and element types kept), then store the captured values.
+        // A replicated item with a side effect (`'{2{f()}}`) is captured the
+        // same way, so it is evaluated once (§11.4.12.1), not per element.
         if matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
-            && Self::pattern_reads_target(lvalue, rvalue)
+            && (Self::pattern_reads_target(lvalue, rvalue)
+                || Self::pattern_replicates_effect(rvalue))
         {
             let (saved, release) = self.capture_intra_rhs(lvalue, rvalue, rvalue.span);
             self.exec_stmt_blocking_assign_body(stmt, lvalue, &saved);
