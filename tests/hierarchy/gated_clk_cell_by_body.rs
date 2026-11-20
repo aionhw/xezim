@@ -124,3 +124,39 @@ fn passthrough_with_a_net_delay_keeps_the_delay() {
         "the clock rises at 5 and its net delay adds 3: {out:?}"
     );
 }
+
+/// The pass-through body with a two-bit `clk_out` and a scalar `clk_in`: the
+/// input port keeps one bit and the output zero-extends it (§23.3.3), where
+/// a direct assignment would copy both bits of the connection.
+const VECTOR_CLOCK: &str = r#"
+module gated_clk_cell(clk_in, en, clk_out);
+  input clk_in;
+  input en;
+  output [1:0] clk_out;
+  wire en_q;
+  assign en_q = en;
+  assign clk_out = clk_in;
+endmodule
+module tb;
+  reg [1:0] clk = 2'b11;
+  wire [1:0] g;
+  gated_clk_cell u (.clk_in(clk), .en(1'b1), .clk_out(g));
+  initial begin
+    #1 $display("vec 11->%b", g);
+    clk = 2'b10;
+    #1 $display("vec 10->%b", g);
+    $finish;
+  end
+endmodule
+"#;
+
+#[test]
+fn passthrough_with_a_vector_clock_output_extends() {
+    let out = lines(VECTOR_CLOCK);
+    let got: Vec<&str> = out
+        .iter()
+        .map(String::as_str)
+        .filter(|l| l.starts_with("vec "))
+        .collect();
+    assert_eq!(got, ["vec 11->01", "vec 10->00"], "{out:?}");
+}
