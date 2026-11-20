@@ -470,6 +470,8 @@ mod inside_const_members;
 mod issue_233_parenless_calls;
 #[path = "types/multi_dim_unpacked_arrays.rs"]
 mod multi_dim_unpacked_arrays;
+#[path = "types/nettype_nested_struct_drivers.rs"]
+mod nettype_nested_struct_drivers;
 #[path = "types/nettype_struct_variable_driver.rs"]
 mod nettype_struct_variable_driver;
 #[path = "types/package_data_members_in_subroutine.rs"]
