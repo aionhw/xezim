@@ -30,7 +30,9 @@ impl Simulator {
     /// A select on the leaf (`g[0].u.c[0]`, `g[0].u.c[2:1]`) stays a select
     /// of the folded name, the shape `u.c[0]` already has.
     pub(super) fn fold_indexed_hier_path(&self, e: &Expression) -> Option<Expression> {
-        if let Some(flat) = self.indexed_hier_flat_name(e) {
+        // A constant unpacked select can name a stored scalar leaf. Resolve
+        // the complete path first, then peel any remaining packed selects.
+        if let Some(flat) = self.constant_selected_storage(e) {
             return Some(Self::flat_name_ident(flat, e.span));
         }
         let (ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. }) = &e.kind else {
@@ -42,6 +44,61 @@ impl Simulator {
             **expr = base;
         }
         Some(out)
+    }
+
+    fn constant_selected_storage(&self, expr: &Expression) -> Option<String> {
+        fn append(
+            e: &Expression,
+            module: &ElaboratedModule,
+            name: &mut String,
+            selected: &mut bool,
+        ) -> Option<()> {
+            use std::fmt::Write;
+            let index = |name: &mut String, sel: &Expression| {
+                let i = super::elaborate::const_eval_i64_with_params(sel, Some(&module.parameters))?;
+                write!(name, "[{i}]").ok()
+            };
+            match &e.kind {
+                ExprKind::Ident(h) => {
+                    if h.root.as_deref() == Some("$root") {
+                        name.push_str("$root.");
+                    } else if h.root.is_some() {
+                        return None;
+                    }
+                    for (i, seg) in h.path.iter().enumerate() {
+                        if i != 0 { name.push('.'); }
+                        name.push_str(&seg.name.name);
+                        for sel in &seg.selects {
+                            index(name, sel)?;
+                            *selected = true;
+                        }
+                    }
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    append(expr, module, name, selected)?;
+                    name.push('.');
+                    name.push_str(&member.name);
+                }
+                ExprKind::Index { expr, index: sel } => {
+                    append(expr, module, name, selected)?;
+                    index(name, sel)?;
+                    *selected = true;
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+        let mut path = String::new();
+        let mut selected = false;
+        append(expr, &self.module, &mut path, &mut selected)?;
+        if !selected { return None; }
+        let rooted = path.strip_prefix("$root.");
+        let name = rooted.unwrap_or(&path);
+        if rooted.is_none() && self.signal_name_to_id.contains_key(name) {
+            return Some(path);
+        }
+        let short = name.strip_prefix(&self.module.name)?.strip_prefix('.')?;
+        self.signal_name_to_id.contains_key(short).then(|| short.to_string())
     }
 
     /// An `Ident` whose single segment is already the fully-qualified stored
