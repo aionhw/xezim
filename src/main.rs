@@ -1967,13 +1967,13 @@ fn append_adopted_libs_to_merged(
         let _ = strip_duplicate_unit_typedefs(&primary, &mut seen_typedefs);
     }
     for (path, mods) in &adopted {
-        // Preprocess with the SAME context the -v/-y indexing pass used
-        // (fresh preprocessor, run include dirs, post-primary macro
-        // snapshot) so the appended text has its includes inlined and
-        // macros expanded. Raw bytes broke the standalone re-compile the
-        // moment merged.sv left the original directory: the library's
-        // relative include paths no longer resolved and its macros came
-        // out undefined.
+        // The text the -v/-y indexing pass preprocessed the file to (run
+        // include dirs, and the macros the design and the library files
+        // read before it left, §22.5.1), so the appended text has its
+        // includes inlined and macros expanded. Raw bytes broke the
+        // standalone re-compile the moment merged.sv left the original
+        // directory: the library's relative include paths no longer
+        // resolved and its macros came out undefined.
         let (text, how) = match xezim::preprocess_adopted_lib(path) {
             Some(t) => (t, "preprocessed"),
             None => match std::fs::read(path) {
