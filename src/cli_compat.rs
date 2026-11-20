@@ -36,6 +36,11 @@ pub(crate) struct CompatArgs {
     /// `--wave-suppress-file` files named inside args files: the waveform
     /// exclusion list, one entry per line.
     pub wave_suppress_files: Vec<String>,
+    /// `-CFLAGS <args>` / `-LDFLAGS <args>` (also `-ccflags`/`-ldflags`):
+    /// extra compiler and linker arguments for the C/C++ DPI sources named
+    /// among the design files (src/dpi_sources.rs), split on whitespace.
+    pub dpi_cflags: Vec<String>,
+    pub dpi_ldflags: Vec<String>,
 }
 
 /// The code coverage `+cover[=<letters>]` and `-coverage` ask for, as
@@ -221,6 +226,18 @@ pub(crate) fn handle_flag(
         }
         "-sv_lib" => {
             cx.sv_libs.push(value()?);
+            Ok(2)
+        }
+        // C/C++ DPI sources among the design files are compiled and linked
+        // into one library; these add to the compile and the link.
+        "-CFLAGS" | "-ccflags" => {
+            cx.dpi_cflags
+                .extend(value()?.split_whitespace().map(str::to_string));
+            Ok(2)
+        }
+        "-LDFLAGS" | "-ldflags" => {
+            cx.dpi_ldflags
+                .extend(value()?.split_whitespace().map(str::to_string));
             Ok(2)
         }
         "-do" => {
