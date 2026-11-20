@@ -819,6 +819,24 @@ impl Simulator {
                 || Self::packed_dims_are_constant(&port.data_type))
     }
 
+    /// `actual_context_width` for a module- or package-scope task or
+    /// function, whose formal bounds may also name a parameter
+    /// (`input [W-1:0] v`): such a bound resolves where the call binds, to
+    /// the width the bound value is then fitted to (`fit_scalar_formal_seed`),
+    /// so the actual is evaluated at that width.
+    pub(super) fn free_actual_context_width(
+        &self,
+        port: &crate::ast::decl::FunctionPort,
+    ) -> Option<u32> {
+        self.actual_context_width(port).or_else(|| {
+            Self::actual_ctx_shape(port)
+                .then(|| self.scalar_formal_integral(&port.data_type))
+                .flatten()
+                .map(|(w, _)| w)
+                .filter(|w| *w > 0)
+        })
+    }
+
     /// Parameter-free arithmetic bounds (including macro-expanded `[64-1:0]`)
     /// have a fixed width just like literal bounds.
     pub(super) fn packed_dims_are_constant(dt: &DataType) -> bool {
