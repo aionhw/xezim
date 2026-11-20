@@ -1018,14 +1018,56 @@ impl Simulator {
         items: &[AssignmentPatternItem],
         depth: usize,
     ) {
+        let is_member = |n: &str| {
+            su.members
+                .iter()
+                .any(|m| m.declarators.iter().any(|md| md.name.name == n))
+        };
         for (mname, mdt, dims, e, explicit) in self.bind_struct_pattern_items(su, items) {
-            let Some(e) = e else {
+            // §10.9.1, §10.9.2: a fixed unpacked-array member takes a pattern
+            // element by element, and a value reached through a type key of
+            // its element type (the last one written, before `default:`) or
+            // through `default:` is a value of each element. Assigned whole,
+            // neither wrote any element.
+            let fixed_lists = (!dims.is_empty() && Self::coll_kind_of(&dims).is_none())
+                .then(|| self.member_dim_indices(&dims))
+                .flatten();
+            let whole_item = items.iter().any(|it| match it {
+                AssignmentPatternItem::Named(id, _) => id.name == mname,
+                AssignmentPatternItem::Ordered(_) => true,
+                _ => false,
+            });
+            let mut elem_key = None;
+            if fixed_lists.is_some() && !whole_item {
+                for it in items.iter().rev() {
+                    let member_key =
+                        matches!(it, AssignmentPatternItem::Named(id, _) if is_member(&id.name));
+                    if !member_key
+                        && let Some((key_dt, v)) = self.array_pattern_type_key(it)
+                        && self.pattern_type_matches(&mdt, &key_dt)
+                    {
+                        elem_key = Some(v);
+                        break;
+                    }
+                }
+            }
+            let Some(e) = elem_key.or(e) else {
                 continue;
             };
             if !explicit && dims.len() == 1 && Self::coll_kind_of(&dims).is_some() {
                 continue;
             }
             let lhs = Self::append_member_expr(lvalue, &mname);
+            if let Some(lists) = &fixed_lists
+                && (!whole_item
+                    || matches!(
+                        self.unpacked_pattern(e).kind,
+                        ExprKind::AssignmentPattern(_)
+                    ))
+            {
+                self.assign_class_member_elems(stmt, &lhs, &mdt, lists, e);
+                continue;
+            }
             if dims.is_empty()
                 && depth < 8
                 && let Some(inner) = self.unpacked_struct_of(&mdt)
@@ -1044,6 +1086,42 @@ impl Simulator {
                 }
             }
             self.exec_stmt_blocking_assign_body(stmt, &lhs, e);
+        }
+    }
+
+    /// The elements of the fixed unpacked-array member `lhs` of a class
+    /// struct property, indexed by `lists` (one index list per dimension),
+    /// take `e`: a pattern spreads over the outermost dimension (its type
+    /// keys matching `elem_dt` at the last one) and anything else is the
+    /// value of every element.
+    fn assign_class_member_elems(
+        &mut self,
+        stmt: &Statement,
+        lhs: &Expression,
+        elem_dt: &DataType,
+        lists: &[Vec<i64>],
+        e: &Expression,
+    ) {
+        let Some((indices, rest)) = lists.split_first() else {
+            self.exec_stmt_blocking_assign_body(stmt, lhs, e);
+            return;
+        };
+        let items: Vec<Option<Expression>> = match &self.unpacked_pattern(e).kind {
+            ExprKind::AssignmentPattern(items) => {
+                let elems = if rest.is_empty() {
+                    self.pattern_elems_for_type(items, indices, elem_dt)
+                } else {
+                    self.pattern_elems(items, indices)
+                };
+                elems.into_iter().map(|x| x.cloned()).collect()
+            }
+            _ => vec![Some(e.clone()); indices.len()],
+        };
+        for (&i, item) in indices.iter().zip(items) {
+            if let Some(item) = item {
+                let elem = Self::index_expr(lhs, i);
+                self.assign_class_member_elems(stmt, &elem, elem_dt, rest, &item);
+            }
         }
     }
 
