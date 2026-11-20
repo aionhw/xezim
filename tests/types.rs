@@ -833,3 +833,5 @@ mod real_to_integral_cast;
 mod real_into_integral_64;
 #[path = "types/real_case_items.rs"]
 mod real_case_items;
+#[path = "types/real_items_integral_aggregates.rs"]
+mod real_items_integral_aggregates;
