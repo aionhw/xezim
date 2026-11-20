@@ -2642,6 +2642,7 @@ impl Simulator {
                             }
                             self.signals.insert(k, dv);
                         }
+                        self.register_local_struct_member_arrays(&d.name.name, &su, 0);
                         if self.struct_colls_possible() {
                             self.fresh_struct_colls(&d.name.name, &su);
                         }

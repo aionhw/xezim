@@ -1020,6 +1020,76 @@ impl Simulator {
         (!earlier.iter().any(|p| p.name.name == name)).then_some(name)
     }
 
+    /// §6.18, §7.4: the unpacked dimensions of a structure member: its own,
+    /// then those of a dimensioned typedef it is declared with (`typedef
+    /// real A[2]; struct { A m; }` has `m[0]` and `m[1]`), as the elaborator
+    /// registers a module-scope variable's members.
+    pub(super) fn member_decl_dims(
+        &self,
+        m_dt: &DataType,
+        own: &[crate::ast::types::UnpackedDimension],
+    ) -> Vec<crate::ast::types::UnpackedDimension> {
+        let mut dims = own.to_vec();
+        if let DataType::TypeReference {
+            name, dimensions, ..
+        } = m_dt
+            && dimensions.is_empty()
+            && let Some(td) = self.typedef_unpacked_dims_of(&name.name.name)
+        {
+            dims.extend(td.iter().cloned());
+        }
+        dims
+    }
+
+    /// §7.2, §7.4: the shape of each fixed one-dimensional unpacked array
+    /// member of the procedural-block unpacked structure `base`, whose leaves
+    /// live by name, as a module-scope variable's members get theirs at
+    /// elaboration: a whole-array write (`s.m = '{default: 2.5}`) finds its
+    /// elements through it.
+    pub(super) fn register_local_struct_member_arrays(
+        &mut self,
+        base: &str,
+        su: &crate::ast::types::StructUnionType,
+        depth: u32,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        for m in &su.members {
+            let nested = self.unpacked_struct_of(&m.data_type);
+            for md in &m.declarators {
+                let key = format!("{}.{}", base, md.name.name);
+                let dims = self.member_decl_dims(&m.data_type, &md.dimensions);
+                match (&nested, dims.as_slice()) {
+                    (Some(inner), []) => {
+                        let inner = inner.clone();
+                        self.register_local_struct_member_arrays(&key, &inner, depth + 1);
+                    }
+                    (None, [_]) => {
+                        let Some(lists) = self.member_dim_indices(&dims) else {
+                            continue;
+                        };
+                        let (Some(&lo), Some(&hi)) = (lists[0].iter().min(), lists[0].iter().max())
+                        else {
+                            continue;
+                        };
+                        let w = super::elaborate::resolve_type_width(
+                            &m.data_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        )
+                        .max(1);
+                        if !self.module.arrays.contains_key(&key) {
+                            self.meta_note(&key);
+                            self.module.arrays.insert(key, (lo, hi, w));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// §7.2: every storage LEAF of an unpacked struct, as
     /// `(key_suffix, caller_expr, width, is_real)`. Recurses into nested
     /// unpacked structs and expands fixed member dimensions, matching the
@@ -1062,7 +1132,8 @@ impl Simulator {
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
                 let mexpr = mk_member(base, &md.name.name);
-                match self.member_elem_indices(&md.dimensions) {
+                let dims = self.member_decl_dims(&m.data_type, &md.dimensions);
+                match self.member_elem_indices(&dims) {
                     Some(tups) => {
                         // Every element, last dimension varying fastest —
                         // `m[2][3]` addresses elements `m[i][j]`.
@@ -1157,7 +1228,8 @@ impl Simulator {
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
                 // Same keys as `unpacked_struct_leaves`.
-                let keys = match self.member_elem_indices(&md.dimensions) {
+                let dims = self.member_decl_dims(&m.data_type, &md.dimensions);
+                let keys = match self.member_elem_indices(&dims) {
                     Some(tups) => tups
                         .iter()
                         .map(|t| format!("{}{}", mkey, Self::index_suffix(t)))
@@ -1170,7 +1242,7 @@ impl Simulator {
                 // assignments). Scalar members only; the default is an
                 // assignment to the member's type.
                 let member_default = match (&md.init, &nested) {
-                    (Some(init), None) if md.dimensions.is_empty() => {
+                    (Some(init), None) if dims.is_empty() => {
                         let raw = self.eval_expr_ctx(init, mw.max(1));
                         let two_state = super::elaborate::is_type_two_state_resolved(
                             &m.data_type,
