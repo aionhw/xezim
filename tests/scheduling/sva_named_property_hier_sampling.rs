@@ -17,8 +17,8 @@
 //! property's consequent is negated, so a correct run fails each assertion
 //! exactly once, at the edge after its antecedent matched. A run that misses
 //! the antecedent, or reads the consequent after the edge's update, fails it
-//! no times. Failures are counted rather than passes because whether a
-//! vacuous success runs the pass action is left to the tool (§20.12).
+//! no times. Counting failures isolates the sampling check from the vacuous
+//! pass actions enabled by default (§20.11).
 //!
 //! Verilator 5.038 reports one failure for every assertion of this design
 //! that it can build; it rejects the named sequences (`a4`-`a6`, "Unsupported:

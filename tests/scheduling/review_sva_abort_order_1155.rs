@@ -4,10 +4,8 @@
 //! evaluation of the outer operand, so a later `a` no longer accepts it.
 //! When both hold in the same time step, the outer operator wins. An
 //! asynchronous abort between ticks is reported at the next tick, and an
-//! accepted attempt is a vacuous success (§16.14.8 ab), so it runs no pass
-//! action. The reference simulator reports at the next tick too, but it
-//! accepts the first case and runs the pass action of an accepted attempt;
-//! these expectations follow the LRM.
+//! accepted attempt is a vacuous success (§16.14.8 ab). Both fixtures call
+//! `$assertvacuousoff` to isolate abort ordering from vacuous pass actions.
 use xezim::simulate;
 
 fn lines(src: &str) -> Vec<String> {
