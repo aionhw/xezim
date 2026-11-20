@@ -835,3 +835,5 @@ mod real_into_integral_64;
 mod real_case_items;
 #[path = "types/real_items_integral_aggregates.rs"]
 mod real_items_integral_aggregates;
+#[path = "types/real_fill_literal_stores.rs"]
+mod real_fill_literal_stores;
