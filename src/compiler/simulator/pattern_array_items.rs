@@ -18,6 +18,7 @@ impl Simulator {
             e.kind,
             ExprKind::Ident(_)
                 | ExprKind::Index { .. }
+                | ExprKind::RangeSelect { .. }
                 | ExprKind::MemberAccess { .. }
                 | ExprKind::Call { .. }
         )
@@ -27,9 +28,10 @@ impl Simulator {
     /// `target` whose dimensions list their indices in declared order, left
     /// bound first. Every source element is read before any is written, and
     /// each write goes through the pattern leaf store, so a nonblocking
-    /// pattern still collects it. False, with nothing written, when `e` is
-    /// not an unpacked array, its element count differs or the elements are
-    /// unpacked structs; the caller then fills the elements with `e`.
+    /// pattern still collects it; an element that is an unpacked struct is
+    /// written member by member. False, with nothing written, when `e` is
+    /// not an unpacked array or its element count differs; the caller then
+    /// fills the elements with `e`.
     pub(super) fn assign_array_item(
         &mut self,
         target: &str,
@@ -40,6 +42,41 @@ impl Simulator {
         let e = Self::unparen(e);
         if lists.is_empty() || !Self::may_be_array_item(e) {
             return false;
+        }
+        let cells: usize = lists.iter().map(Vec::len).product();
+        // §10.9.1, §7.6: a slice (`big[1:2]`), or an array whose elements
+        // are unpacked structs (`'{sa, sa}`), supplies its elements too,
+        // each struct member by member. A slice repeated its first element
+        // and a struct array stored zeros.
+        if !matches!(e.kind, ExprKind::Call { .. }) {
+            let capture = self.pattern_nba_leaves.take();
+            let leaves = self.unpacked_array_leaves(e);
+            self.pattern_nba_leaves = capture;
+            if let Some(leaves) = leaves {
+                let names = Self::cell_names(target, lists);
+                let mut writes = Vec::with_capacity(leaves.len());
+                let mut elem = None::<(String, usize)>;
+                for (path, v) in leaves {
+                    let split = path.find('.').unwrap_or(path.len());
+                    let ord = match &elem {
+                        Some((p, k)) if *p == path[..split] => *k,
+                        Some((_, k)) => k + 1,
+                        None => 0,
+                    };
+                    let Some(dst) = names.get(ord) else {
+                        return false;
+                    };
+                    writes.push((format!("{dst}{}", &path[split..]), v));
+                    elem = Some((path[..split].to_string(), ord));
+                }
+                if elem.is_none_or(|(_, k)| k + 1 != cells) {
+                    return false;
+                }
+                for (name, v) in writes {
+                    self.write_pattern_leaf(&name, v);
+                }
+                return true;
+            }
         }
         if let DataType::Struct(su) = self.resolve_dt(dt)
             && Self::spreads_member_wise(&su)
@@ -52,11 +89,19 @@ impl Simulator {
         let Some(vals) = vals else {
             return false;
         };
-        let cells: usize = lists.iter().map(Vec::len).product();
         if vals.len() != cells {
             // A call has already run; filling with it would run it again.
             return matches!(e.kind, ExprKind::Call { .. });
         }
+        for (name, v) in Self::cell_names(target, lists).iter().zip(vals) {
+            self.write_pattern_leaf(name, v);
+        }
+        true
+    }
+
+    /// The element names of the sub-array `target` whose dimensions list
+    /// their indices in declared order, left bound first.
+    fn cell_names(target: &str, lists: &[Vec<i64>]) -> Vec<String> {
         let mut names = vec![target.to_string()];
         for list in lists {
             names = names
@@ -64,10 +109,7 @@ impl Simulator {
                 .flat_map(|p| list.iter().map(move |i| format!("{p}[{i}]")))
                 .collect();
         }
-        for (name, v) in names.iter().zip(vals) {
-            self.write_pattern_leaf(name, v);
-        }
-        true
+        names
     }
 
     /// §9.4.5: the elements of the unpacked array named by `e` (a whole
@@ -211,6 +253,9 @@ impl Simulator {
     }
 
     fn array_item_elements_now(&mut self, e: &Expression) -> Option<Vec<(String, Value)>> {
+        if let Some(leaves) = self.unpacked_array_leaves(e) {
+            return Some(leaves);
+        }
         if let Some(suffixes) = self.unpacked_row_suffixes(e) {
             return Some(
                 suffixes
