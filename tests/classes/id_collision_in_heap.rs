@@ -7,7 +7,7 @@
 //!   writes — queue element (t3), flat variable (c1), fixed array (c2),
 //!   dynamic array (c3), 2-segment chained struct head (c4), associative
 //!   array (c7), cross-module hierarchical (c9), interface-instance
-//!   hierarchical (f6), NBA queue+flat (f3), foreach loop head (f4),
+//!   hierarchical (f6), blocking queue write and flat NBA (f3), foreach loop head (f4),
 //!   ref formal (f5), 3-segment chained (f10), compound RMW (f13),
 //!   part-selected element field (f14);
 //!

@@ -1,14 +1,8 @@
 //! Four gaps closed in one sweep, all previously recorded as known-broken.
 //! Each is pinned against reference-simulator behaviour.
 //!
-//! 1. §10.4.2 — NBA to an ASSOCIATIVE-array element (`aa[key] <= v`) queued
-//!    the value cut to `infer_lhs_width`, which knows nothing about an assoc
-//!    element and answered 1: every such write committed the LOW BIT,
-//!    sign-extended (11 arrived as -1). Blocking writes stored the value at
-//!    its own width. The queue now skips the resize for assoc targets
-//!    (`nba_target_is_assoc_elem`). The reference REJECTS this construct
-//!    outright ("not currently supported"), so working support is a xezim
-//!    extension; the old silent low-bit corruption was the worst of both.
+//! 1. §7.8, §10.4.2 — blocking writes to associative-array elements with
+//!    string and integer keys retain the full element value.
 //!
 //! 2. §26.2.2 — `import pkg::MEMBER;` where MEMBER is an enum member died
 //!    with "Symbol not found in package": the explicit-import resolver
@@ -41,7 +35,7 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
         .unwrap_or_else(|| panic!("{} not u64-able (x/z?)", n))
 }
 
-/// Gap 1: assoc-element NBA with a string-literal key, a string-variable key,
+/// Gap 1: associative element writes with a string-literal key, a string-variable key,
 /// an int key, and a wide (96-bit) element value.
 #[test]
 fn associative_element_writes_store_full_values() {
