@@ -291,6 +291,8 @@ mod clock_gen_fifo_rank;
 mod clocking_cont_trigger_same_step;
 #[path = "scheduling/comb_packed_element_sensitivity.rs"]
 mod comb_packed_element_sensitivity;
+#[path = "scheduling/comb_sens_param_range.rs"]
+mod comb_sens_param_range;
 #[path = "scheduling/comb_self_member_sensitivity.rs"]
 mod comb_self_member_sensitivity;
 #[path = "scheduling/delay_always_compound_body.rs"]
