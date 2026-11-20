@@ -106,3 +106,153 @@ endmodule
         "missing `{want}` in {got:#?}"
     );
 }
+
+/// §7.4.1: a type parameter bound to an integer atom (`int`, `byte`,
+/// `integer`, `int unsigned`) with packed dimensions in a block local is a
+/// packed array of the atom: its elements keep the atom's signedness, and
+/// the whole array is unsigned, as for the same declaration in the module.
+/// Expected values are the reference simulator's.
+#[test]
+fn integer_atom_binding_with_packed_dimensions() {
+    let got = lines(
+        r#"
+module child #(parameter type T = logic);
+  T [1:0] m;
+  initial begin
+    T [1:0] a;
+    a[0] = -1; a[1] = 5; m[0] = -1; m[1] = 5;
+    #1 $display("%m blk bits=%0d a0=%0d a1=%0d whole_neg=%0d", $bits(a), a[0], a[1], a < 0);
+    $display("%m mod bits=%0d m0=%0d m1=%0d whole_neg=%0d", $bits(m), m[0], m[1], m < 0);
+  end
+endmodule
+module top;
+  child #(.T(int)) c();
+  child #(.T(byte)) c2();
+  child #(.T(integer)) c3();
+  child #(.T(int unsigned)) c4();
+endmodule
+"#,
+    );
+    for want in [
+        "top.c blk bits=64 a0=-1 a1=5 whole_neg=0",
+        "top.c mod bits=64 m0=-1 m1=5 whole_neg=0",
+        "top.c2 blk bits=16 a0=-1 a1=5 whole_neg=0",
+        "top.c3 blk bits=64 a0=-1 a1=5 whole_neg=0",
+        "top.c4 blk bits=64 a0=4294967295 a1=5 whole_neg=0",
+    ] {
+        assert!(
+            got.iter().any(|l| l == want),
+            "missing `{want}` in {got:#?}"
+        );
+    }
+}
+
+/// §6.18, §7.2: a block typedef built on a type parameter, a struct written
+/// in the declaration, a queue of the packed array, a function's return and
+/// argument types and a `for` loop variable, with the type bound to a
+/// typedef of the top and of a module below the top (§6.20.3). Expected
+/// values are the reference simulator's.
+#[test]
+fn block_typedefs_structs_and_subroutines_of_a_type_parameter() {
+    let got = lines(
+        r#"
+module child #(parameter type T = logic);
+  function automatic T [1:0] f(T [1:0] x);
+    T [1:0] y;
+    y = x;
+    y[0] = '1;
+    return y;
+  endfunction
+  initial begin
+    #1;
+    begin
+      typedef T [1:0] pair_t;
+      pair_t p;
+      struct packed { T a; T b; } s;
+      T [1:0] q [$];
+      p = 16'h1234;
+      s = 16'h5678;
+      q.push_back(16'h9abc);
+      $display("pair bits=%0d p[1]=%h", $bits(p), p[1]);
+      $display("struct bits=%0d s.a=%h", $bits(s), s.a);
+      $display("queue elem bits=%0d q[0][0]=%h", $bits(q[0]), q[0][0]);
+      $display("f=%h bits=%0d", f(16'h1200), $bits(f(16'h1200)));
+    end
+    for (T [1:0] i = 0; i < 2; i++) $display("for bits=%0d i=%0d", $bits(i), i);
+  end
+endmodule
+module child2 #(parameter type T = logic);
+  initial begin
+    T [1:0] a;
+    a[1] = 4'h9; a[0] = 4'h3;
+    #1 $display("nontop bits=%0d a=%h", $bits(a), a);
+  end
+endmodule
+module mid;
+  typedef logic [3:0] nib_t;
+  child2 #(.T(nib_t)) c2();
+endmodule
+module top;
+  typedef logic [7:0] byte_t;
+  child #(.T(byte_t)) u();
+  mid m();
+endmodule
+"#,
+    );
+    for want in [
+        "pair bits=16 p[1]=12",
+        "struct bits=16 s.a=56",
+        "queue elem bits=16 q[0][0]=bc",
+        "f=12ff bits=16",
+        "for bits=16 i=0",
+        "for bits=16 i=1",
+        "nontop bits=8 a=93",
+    ] {
+        assert!(
+            got.iter().any(|l| l == want),
+            "missing `{want}` in {got:#?}"
+        );
+    }
+}
+
+/// §7.4.1: a type parameter bound to an enum with packed dimensions, in a
+/// task, a block and the module: an element written through a cast of the
+/// type reads back. Expected values are the reference simulator's.
+#[test]
+fn enum_binding_with_packed_dimensions() {
+    let got = lines(
+        r#"
+module child #(parameter type E = logic);
+  E [2:0] me;
+  task automatic tk(output int o);
+    E [2:0] e;
+    e[1] = E'(2);
+    o = $bits(e) * 100 + e[1];
+  endtask
+  initial begin
+    int o;
+    me[1] = E'(2);
+    #1 tk(o);
+    $display("tk=%0d me1=%0d", o, me[1]);
+    begin
+      E [2:0] b;
+      E s;
+      b[1] = E'(2);
+      s = E'(2);
+      $display("blk b1=%0d s=%0d bits=%0d", b[1], s, $bits(b));
+    end
+  end
+endmodule
+module top;
+  typedef enum logic [1:0] {X0, X1, X2} e_t;
+  child #(.E(e_t)) u();
+endmodule
+"#,
+    );
+    for want in ["tk=602 me1=2", "blk b1=2 s=2 bits=6"] {
+        assert!(
+            got.iter().any(|l| l == want),
+            "missing `{want}` in {got:#?}"
+        );
+    }
+}
