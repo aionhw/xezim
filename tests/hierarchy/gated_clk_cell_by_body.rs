@@ -124,3 +124,25 @@ fn passthrough_with_a_net_delay_keeps_the_delay() {
         "the clock rises at 5 and its net delay adds 3: {out:?}"
     );
 }
+
+#[test]
+fn passthrough_keeps_scalar_port_conversions() {
+    let out = lines(r#"
+module gated_clk_cell(input clk_in, output clk_out);
+  assign clk_out = clk_in;
+endmodule
+module tb;
+  reg [3:0] bus = 4'b1010;
+  wire [3:0] result;
+  gated_clk_cell cell_i(.clk_in(bus), .clk_out(result));
+  initial begin
+    #1; $display("first %b", result);
+    bus = 4'b1011;
+    #1; $display("second %b", result);
+    $finish;
+  end
+endmodule
+"#);
+    assert!(out.iter().any(|line| line == "first 0000"), "{out:?}");
+    assert!(out.iter().any(|line| line == "second 0001"), "{out:?}");
+}
