@@ -225,6 +225,8 @@ mod packed_elem_shift_context_width;
 mod packed_element_range_select;
 #[path = "types/packed_local_nested_select.rs"]
 mod packed_local_nested_select;
+#[path = "types/packed_middle_dim_slice_width.rs"]
+mod packed_middle_dim_slice_width;
 #[path = "types/packed_multidim_unpacked_select.rs"]
 mod packed_multidim_unpacked_select;
 #[path = "types/packed_struct_array_elem_member_in_instance.rs"]
