@@ -236,10 +236,10 @@ module mid #(parameter int ID = 0) ();
   function int fdown(); return g_in[0].u.get(); endfunction
 endmodule
 class C;
-  function void go();
+  task go();
     tb.g_one[0].u_leaf.report();
     $display("T| cls fn=%0d", tb.g_one[1].u_leaf.get());
-  endfunction
+  endtask
 endclass
 module tb;
   localparam int N = 2;

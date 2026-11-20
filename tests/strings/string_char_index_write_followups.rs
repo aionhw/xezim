@@ -21,7 +21,7 @@ module top;
   endtask
   function void f(output string a);
     a = "abcdef";
-    t(a);
+    a[2] = "r";
   endfunction
   initial begin
     string a = "abcdef";

@@ -35,7 +35,7 @@ endmodule
 class C;
   string s;
   int i;
-  function void run();
+  task run();
     s = tb.m.u_h.const_path(); $display("T|cls_const_var|%s", s);
     $display("T|cls_const_inline|%s", tb.m.u_h.const_path());
     s = tb.m.u_h.ret_path(); $display("T|cls_ret|%s", s);
@@ -50,7 +50,7 @@ class C;
     s = tb.m.u_h.inst_path; $display("T|cls_var|%s", s);
     i = tb.m.u_h.counter; $display("T|cls_cvar|%0d", i);
     s = tb.top_fn(); $display("T|cls_topfn|%s", s);
-  endfunction
+  endtask
   static function string sget();
     return tb.m.u_h.get_ip();
   endfunction
