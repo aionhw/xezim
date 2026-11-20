@@ -223,36 +223,31 @@ impl Simulator {
         }
     }
 
+    /// Read one byte from `fd`, honoring the ungetc pushback buffer first
+    /// (C stdio order). A read that comes up empty raises the sticky
+    /// end-of-file flag `$feof` reports (§21.3.8). None at EOF.
+    pub(super) fn sv_read_byte(&mut self, fd: i32) -> Option<u8> {
+        use std::io::Read;
+        if let Some(c) = self.ungetc_buf.get_mut(&fd).and_then(|b| b.pop()) {
+            return Some(c);
+        }
+        let f = self.file_handles.get_mut(&fd)?;
+        let mut b = [0u8; 1];
+        if f.read(&mut b).unwrap_or(0) == 1 {
+            return Some(b[0]);
+        }
+        self.file_eof.insert(fd);
+        None
+    }
+
     /// Read one line (through '\n', included) from `fd`, honoring the
     /// ungetc pushback buffer. None at EOF.
     pub(super) fn sv_read_line(&mut self, fd: i32) -> Option<String> {
-        use std::io::Read;
         let mut out = String::new();
-        loop {
-            let mut got: Option<u8> = None;
-            if let Some(buf) = self.ungetc_buf.get_mut(&fd) {
-                if let Some(c) = buf.pop() {
-                    got = Some(c);
-                }
-            }
-            if got.is_none() {
-                if let Some(f) = self.file_handles.get_mut(&fd) {
-                    let mut b = [0u8; 1];
-                    if f.read(&mut b).unwrap_or(0) == 1 {
-                        got = Some(b[0]);
-                    } else {
-                        self.file_eof.insert(fd);
-                    }
-                }
-            }
-            match got {
-                Some(c) => {
-                    out.push(c as char);
-                    if c == b'\n' {
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(c) = self.sv_read_byte(fd) {
+            out.push(c as char);
+            if c == b'\n' {
+                break;
             }
         }
         if out.is_empty() { None } else { Some(out) }
@@ -262,31 +257,77 @@ impl Simulator {
     /// conversions to `outs` in order (C-scanf semantics — stops at the
     /// first mismatch). Returns the number of conversions assigned.
     pub(super) fn sv_sscanf(&mut self, src: &str, fmt: &str, outs: &[Expression]) -> i64 {
-        self.sv_sscanf_consumed(src, fmt, outs).0
+        let mut s: Vec<char> = src.chars().collect();
+        self.sv_scan_formatted(&mut s, None, fmt, outs).0
     }
 
-    /// Like `sv_sscanf`, but also returns how many CHARS of `src` were
-    /// consumed, so `$fscanf` can push the unread remainder back (§21.3.4.3:
-    /// the file position advances only past what the format matched — reading
-    /// one `%s` of a two-word line must leave the second word readable, and
-    /// `$feof` false).
-    pub(super) fn sv_sscanf_consumed(
+    /// Is there an input char at `i`? `$sscanf` input is all of `s` up
+    /// front. A `$fscanf` stream (`stream: Some(fd)`) is read on demand
+    /// instead: `s` holds the chars read so far (less the white space
+    /// `scan_skip_ws` drops) and grows a byte at a time (one char per byte,
+    /// like `sv_read_line`), so white space, literals and `%c` are read
+    /// across line ends as far as the format examines, and only a read that
+    /// comes up empty raises `$feof`'s flag.
+    fn scan_has(&mut self, s: &mut Vec<char>, i: usize, stream: Option<i32>) -> bool {
+        while i >= s.len() {
+            match stream.and_then(|fd| self.sv_read_byte(fd)) {
+                Some(b) => s.push(b as char),
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Skip input white space from `i` (a white-space directive, or the
+    /// leading white space of a conversion); returns the first other index.
+    /// A `$fscanf` stream does not keep what it skips: once everything read
+    /// so far has matched, `s` is emptied (the scan never looks back past
+    /// `i`), so skipping any number of blank lines holds one char at a time.
+    fn scan_skip_ws(&mut self, s: &mut Vec<char>, mut i: usize, stream: Option<i32>) -> usize {
+        loop {
+            if stream.is_some() && i == s.len() {
+                s.clear();
+                i = 0;
+            }
+            if !(self.scan_has(s, i, stream) && s[i].is_whitespace()) {
+                return i;
+            }
+            i += 1;
+        }
+    }
+
+    /// Read a `$fscanf` stream on to the end of the current line, so the
+    /// token a conversion is about to match is in `s` whole (a token never
+    /// spans a line end); what it leaves unmatched goes back to the stream.
+    fn scan_rest_of_line(&mut self, s: &mut Vec<char>, stream: Option<i32>) {
+        let Some(fd) = stream else { return };
+        while s.last() != Some(&'\n') {
+            match self.sv_read_byte(fd) {
+                Some(b) => s.push(b as char),
+                None => break,
+            }
+        }
+    }
+
+    /// The scanner shared by `$sscanf` and `$fscanf` (§21.3.4.3, C `scanf`
+    /// semantics). Input is `s`, or the file `stream` read on demand into
+    /// `s` (see `scan_has`). Returns the number of conversions assigned, how
+    /// many chars of `s` were consumed (`$fscanf` pushes the rest back), and
+    /// whether the scan stopped because input ran out where a directive
+    /// needed a char (an input failure; before any assignment `$fscanf`
+    /// reports EOF).
+    fn sv_scan_formatted(
         &mut self,
-        src: &str,
+        s: &mut Vec<char>,
+        stream: Option<i32>,
         fmt: &str,
         outs: &[Expression],
-    ) -> (i64, usize) {
-        let s: Vec<char> = src.chars().collect();
+    ) -> (i64, usize, bool) {
         let mut si = 0usize;
         let mut oi = 0usize;
         let mut assigned = 0i64;
+        let mut input_failed = false;
         let mut fi = fmt.chars().peekable();
-        fn skip_ws(s: &[char], mut i: usize) -> usize {
-            while i < s.len() && s[i].is_whitespace() {
-                i += 1;
-            }
-            i
-        }
         while let Some(fc) = fi.next() {
             if fc == '%' {
                 let suppress = if fi.peek() == Some(&'*') {
@@ -305,15 +346,20 @@ impl Simulator {
                 let w: usize = width.parse().ok().filter(|&n| n != 0).unwrap_or(usize::MAX);
                 let Some(spec) = fi.next() else { break };
                 if spec == '%' {
-                    si = skip_ws(&s, si);
-                    if si < s.len() && s[si] == '%' {
+                    si = self.scan_skip_ws(s, si, stream);
+                    if !self.scan_has(s, si, stream) {
+                        input_failed = true;
+                        break;
+                    }
+                    if s[si] == '%' {
                         si += 1;
                         continue;
                     }
                     break;
                 }
                 if spec == 'c' {
-                    if si >= s.len() {
+                    if !self.scan_has(s, si, stream) {
+                        input_failed = true;
                         break;
                     }
                     let v = Value::from_u64(s[si] as u64, 8);
@@ -325,7 +371,12 @@ impl Simulator {
                     }
                     continue;
                 }
-                si = skip_ws(&s, si);
+                si = self.scan_skip_ws(s, si, stream);
+                if !self.scan_has(s, si, stream) {
+                    input_failed = true;
+                    break;
+                }
+                self.scan_rest_of_line(s, stream);
                 let start = si;
                 match spec {
                     's' => {
@@ -416,22 +467,24 @@ impl Simulator {
                     _ => break,
                 }
             } else if fc.is_whitespace() {
-                si = skip_ws(&s, si);
+                si = self.scan_skip_ws(s, si, stream);
+            } else if !self.scan_has(s, si, stream) {
+                input_failed = true;
+                break;
+            } else if s[si] == fc {
+                si += 1;
             } else {
-                if si < s.len() && s[si] == fc {
-                    si += 1;
-                } else {
-                    break;
-                }
+                break;
             }
         }
-        (assigned, si)
+        (assigned, si, input_failed)
     }
 
-    /// §21.3.4.3 `$fscanf(fd, format, …)`: line-buffered scan of `fd`.
-    /// Returns the number of assigned conversions, or -1 at end of file.
-    /// Shared by the function form (`n = $fscanf(…)`) and the task form
-    /// (`$fscanf(…);`), which discards the count.
+    /// §21.3.4.3 `$fscanf(fd, format, …)`: scan `fd` as a stream, C
+    /// `fscanf` style. Returns the number of assigned conversions, or -1
+    /// (EOF) when input runs out before the first one. Shared by the
+    /// function form (`n = $fscanf(…)`) and the task form (`$fscanf(…);`),
+    /// which discards the count.
     pub(super) fn fscanf_impl(&mut self, args: &[Expression]) -> i64 {
         let fd = args
             .first()
@@ -447,77 +500,35 @@ impl Simulator {
                 }
             })
             .unwrap_or_default();
-        // A previous partial read may have pushed back just the tail
-        // whitespace of its line ("\n"). For conversions that skip leading
-        // whitespace (§21.3.4.3: the numeric/string ones do, across lines) a
-        // whitespace-only line is transparent — pull the next. But when the
-        // format's first item matches WITHOUT skipping (`%c` reads exactly
-        // one character, whitespace included; a literal must match exactly),
-        // that line carries the very byte the format must see (issue #262: a
-        // file holding one space read as empty, and repeated `%c` lost every
-        // '\n' between lines).
-        let mut first_line = self.sv_read_line(fd);
-        if Self::scanf_leading_item_skips_ws(&fmt) {
-            while first_line.as_deref().is_some_and(|l| l.trim().is_empty()) {
-                first_line = self.sv_read_line(fd);
+        // The scan reads the file on demand, not one line read ahead: a
+        // white-space directive or a conversion's leading white space reads
+        // on past line ends to the next non-white-space char (`"%d %d"`
+        // over "12\n34"), so a trailing `"\n"` directive that runs into the
+        // end of the file raises `$feof`'s flag (§21.3.8) the way C `fscanf`
+        // does. A line-at-a-time scan stopped at the line end instead: the
+        // loop `while (!$feof(f)) $fscanf(f, "%s\n", s);` ran once more than
+        // the file had lines, and `$feof` was set by the line read's
+        // look-ahead (`%c` on a final "a" without a newline) rather than by
+        // what the format read.
+        let mut s = Vec::new();
+        let (n, consumed, input_failed) =
+            self.sv_scan_formatted(&mut s, Some(fd), &fmt, &args[2..]);
+        // The position advances only past what the format matched: return
+        // what the scan read but did not match (the rest of a token's line,
+        // or the char that stopped a white-space directive) to the stream,
+        // reversed — the pushback buffer is a LIFO whose top is the next
+        // char. The scan maps bytes onto chars one-to-one (Latin-1), so
+        // `ch as u8` restores the original byte.
+        if consumed < s.len() {
+            let buf = self.ungetc_buf.entry(fd).or_default();
+            for ch in s[consumed..].iter().rev() {
+                buf.push(*ch as u8);
             }
+            // Data is readable again: an end-of-file flag the scan raised
+            // must come down, the way `$ungetc` lowers it.
+            self.file_eof.remove(&fd);
         }
-        match first_line {
-            Some(line) => {
-                let (n, consumed) = self.sv_sscanf_consumed(&line, &fmt, &args[2..]);
-                // §21.3.4.3: the position advances only past what the format
-                // matched. `sv_read_line` pulled a whole line, so push the
-                // unread tail back (reversed — the pushback buffer is a LIFO
-                // whose top is the next char). Without this,
-                // `$fscanf(fd, "%s", w)` on a two-word line dropped the
-                // second word and `$feof` reported end-of-file with data
-                // left. `sv_read_line` maps bytes onto chars one-to-one
-                // (Latin-1), so the reverse mapping `ch as u8` restores the
-                // ORIGINAL byte — re-encoding as UTF-8 turned a pushed-back
-                // 0xff into the two bytes C3 BF.
-                let rest: Vec<char> = line.chars().skip(consumed).collect();
-                if !rest.is_empty() {
-                    let buf = self.ungetc_buf.entry(fd).or_default();
-                    for ch in rest.iter().rev() {
-                        buf.push(*ch as u8);
-                    }
-                    // Data is readable again: an end-of-file flag that the
-                    // final line's read raised must come down, the way
-                    // `$ungetc` lowers it — `$feof` must not report EOF
-                    // while the pushed-back tail is still unread.
-                    self.file_eof.remove(&fd);
-                }
-                n
-            }
-            None => -1, // EOF (§21.3.4.3)
-        }
-    }
-
-    /// Does the FIRST item of a scanf format skip leading input whitespace
-    /// before it matches? Explicit whitespace in the format does, and so do
-    /// the numeric/string conversions (`%d %i %h %x %X %o %b %s %f %e %g`).
-    /// `%c` matches any single character — whitespace included
-    /// (§21.3.4.3, issue #262) — and `%%` and literal characters must match
-    /// exactly, so for those the input's leading whitespace is significant
-    /// and the line-buffered reader must not step over it.
-    pub(super) fn scanf_leading_item_skips_ws(fmt: &str) -> bool {
-        let mut it = fmt.chars().peekable();
-        while let Some(c) = it.next() {
-            if c.is_whitespace() {
-                return true;
-            }
-            if c != '%' {
-                return false; // literal: exact match, no skipping
-            }
-            while it.peek().is_some_and(|d| d.is_ascii_digit()) {
-                it.next(); // field width
-            }
-            return match it.next() {
-                Some('d' | 'i' | 'h' | 'x' | 'X' | 'o' | 'b' | 's' | 'f' | 'e' | 'g') => true,
-                _ => false, // %c, %%, unknown: no whitespace skipping
-            };
-        }
-        false
+        if input_failed && n == 0 { -1 } else { n }
     }
 
     pub(super) fn eval_file_handle_arg(&mut self, expr: &Expression) -> i32 {
