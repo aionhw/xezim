@@ -105,7 +105,7 @@ fn continuous_always_ff_and_delayed_stores() {
   assign ca[1] = 80'h0;
   always_ff @(posedge clk) ff[1][0] <= v;
   initial begin
-    ff[1] = '0; dl[0] = '0;
+    ff[1][1] = '0; dl[0] = '0;
     dl[0][1] <= #1 v;
     #1 clk = 1;
     #1 $display(\"ca=%h ff=%h dl=%h\", ca[0], ff[1], dl[0]);
