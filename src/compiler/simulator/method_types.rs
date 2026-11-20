@@ -551,6 +551,14 @@ impl Simulator {
                         }
                     }
                 }
+                // §7.4.3: after an index the labels count ELEMENTS of the
+                // next dimension — `a[1][4:2]` on `logic [3:0][5:0][7:0] a`
+                // is 24 bits, the context its RHS is evaluated in (§11.6.1).
+                if matches!(rs_base.kind, ExprKind::Index { .. })
+                    && let Some(ew) = self.select_base_elem_stride(rs_base)
+                {
+                    return count.saturating_mul(ew);
+                }
                 count
             }
             ExprKind::Index { expr: e, index: _ } => {
