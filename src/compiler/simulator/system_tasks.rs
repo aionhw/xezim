@@ -2793,6 +2793,16 @@ impl Simulator {
                                     result.push_str(&self.render_p_value_typed(&v, ty));
                                     continue;
                                 }
+                                // §21.2.1.7: a parameter of a structure type.
+                                if let ExprKind::Ident(h) = &arg.kind
+                                    && h.path.len() == 1
+                                    && h.path[0].selects.is_empty()
+                                    && let Some(s) =
+                                        self.render_p_struct_param(&h.path[0].name.name)
+                                {
+                                    result.push_str(&s);
+                                    continue;
+                                }
                                 // §8.9: a static fixed array spelled `Cls::S`
                                 // or `C#(T)::S`, or one element of it,
                                 // `Cls::S[i]`.
