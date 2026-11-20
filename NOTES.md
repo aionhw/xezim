@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** A trailing whitespace directive in `$fscanf` sets EOF when it reads to the end of the file (§21.3.4.3, #1376).
+
 - **Correctness:** Queue element writes append at the current size and warn when an invalid index is ignored (§7.10.1, #1353).
 
 - **Correctness:** Preserve every unknown and high-impedance digit in minimum-width binary, octal and hexadecimal output (§21.2.1.2–3, #1347).
