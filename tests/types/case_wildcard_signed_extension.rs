@@ -1,13 +1,6 @@
-//! §12.5.1 + §11.6.1: casez/casex (and `==?`, §11.4.6) extend unequal-width
-//! operands to the common width SIGN-replicated when both operands are
-//! signed — including an X/Z sign bit, which replicates as itself (so a Z
-//! sign bit extends into wildcard fill for casez).
-//!
-//! The `===` paths already did this; the wildcard comparisons zero-filled
-//! past the narrower operand's width in both the packed fast path and the
-//! per-bit slow path, so `casez (signed_sel) 8'sb11111111:` never matched a
-//! negative 4-bit selector. All expectations verified against the reference
-//! simulator.
+//! IEEE 1800-2023 §12.5–12.5.1: all items contribute to case signedness.
+//! An all-signed case replicates the sign bit, including an X/Z sign bit.
+//! Binary wildcard equality (§11.4.6) uses its own two operands.
 
 use xezim::simulate;
 
@@ -55,12 +48,41 @@ endmodule
 "#;
 
 #[test]
-fn wildcard_case_sign_extends_when_both_operands_signed() {
+fn wildcard_case_uses_all_item_types() {
     assert_eq!(
         notes(SRC),
         [
-            "NOTE: 1 15 1 0",  // -1: casez matches signed arm; A7 low bits 111 wild-match
+            "NOTE: 2 15 1 0",  // -1: mixed casez zero-extends; A7 low bits 111 wild-match
             "NOTE: 15 1 15 1", // -2: casex matches; FE fails ?111; ==? -2 true
         ]
     );
+}
+
+#[test]
+fn late_unsigned_item_changes_match_without_being_evaluated() {
+    for keyword in ["case", "casez", "casex"] {
+        let src = format!(
+            r#"
+module top;
+  logic signed [3:0] sel = -1;
+  int calls = 0;
+  function automatic bit [7:0] late();
+    calls++;
+    return 8'h55;
+  endfunction
+  initial begin
+    {keyword} (sel)
+      8'shff: #1 $display("NOTE: wrong");
+      8'sh0f: #1 $display("NOTE: zero %0d", calls);
+      late(): #1 $display("NOTE: late");
+    endcase
+    {keyword} (sel)
+      8'shff: $display("NOTE: signed");
+      8'sh0f: $display("NOTE: wrong");
+    endcase
+  end
+endmodule"#
+        );
+        assert_eq!(notes(&src), ["NOTE: zero 0", "NOTE: signed"], "{keyword}");
+    }
 }

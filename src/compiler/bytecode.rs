@@ -15496,28 +15496,42 @@ impl<'a> BytecodeCompiler<'a> {
                 // §12.5: the selector and the items are sized to the widest
                 // of them. An operation selector (`a8 + 8'd1`) narrower than
                 // an item is computed at that width, in the compare chain.
-                let sel_w = if matches!(
-                    expr.kind,
-                    ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
-                ) {
-                    let own = self.lrm_self_width(expr);
-                    let mut w = own;
-                    for p in items.iter().flat_map(|it| it.patterns.iter()) {
-                        if !matches!(p.kind, ExprKind::Range(..)) {
-                            w = w.max(self.lrm_self_width(p));
-                        }
-                    }
-                    (w > own).then_some(w)
-                } else {
-                    None
+                let operation = |e: &Expression| {
+                    matches!(
+                        e.kind,
+                        ExprKind::Binary { .. }
+                            | ExprKind::Unary { .. }
+                            | ExprKind::Conditional { .. }
+                    )
                 };
+                let patterns = items.iter().flat_map(|it| &it.patterns);
+                let op_selector = operation(expr);
+                let op_item = !inside_kind && patterns.clone().any(operation);
+                let common_w = if op_selector || op_item {
+                    let own = self.lrm_self_width(expr);
+                    patterns
+                        .clone()
+                        .filter(|p| !matches!(p.kind, ExprKind::Range(..)))
+                        .fold(own, |w, p| w.max(self.lrm_self_width(p)))
+                } else {
+                    0
+                };
+                let sel_w =
+                    (op_selector && common_w > self.lrm_self_width(expr)).then_some(common_w);
+                let case_unsigned = !inside_kind
+                    && (self.expr_signedness(expr) == Some(false)
+                        || patterns
+                            .clone()
+                            .any(|p| self.expr_signedness(p) == Some(false)));
                 // ROM shape: plain `case` whose every arm assigns a CONSTANT
                 // to the SAME variable, constant patterns throughout. One
                 // table lookup replaces the whole compare chain. `===`
                 // semantics hold exactly: the patterns are fully defined, so
                 // a selector with any x/z bit matches none of them → default.
                 if sel_w.is_none() && matches!(kind, crate::ast::stmt::CaseKind::Case) {
-                    if let Some((lhs, table, default, res_w)) = self.case_lut_shape(items) {
+                    if case_unsigned
+                        && let Some((lhs, table, default, res_w)) = self.case_lut_shape(items)
+                    {
                         if let Some(sel) = self.compile_expr(expr, 0) {
                             let dst = self.alloc_reg();
                             self.emit(Insn::CaseLut(
@@ -15544,7 +15558,9 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     return true;
                 }
-                if let Some(val_reg) = self.compile_expr(expr, sel_w.unwrap_or(0)) {
+                if let Some(val_reg) =
+                    self.compile_expr_typed(expr, sel_w.unwrap_or(0), case_unsigned)
+                {
                     let mut end_jumps: Vec<usize> = Vec::new();
                     let mut default_item: Option<&Statement> = None;
                     // Every pattern arm is mutually exclusive and jumps to the
@@ -15575,7 +15591,9 @@ impl<'a> BytecodeCompiler<'a> {
                                 let cmp_reg = self.alloc_reg();
                                 self.emit(Insn::CaseEq(cmp_reg, masked, known_reg));
                                 Some(cmp_reg)
-                            } else if let Some(pat_reg) = self.compile_expr(pat, 0) {
+                            } else if let Some(pat_reg) =
+                                self.compile_expr_typed(pat, common_w, case_unsigned)
+                            {
                                 let cmp_reg = self.alloc_reg();
                                 self.emit(match kind {
                                     crate::ast::stmt::CaseKind::Casez => {

@@ -4669,6 +4669,7 @@ impl Simulator {
             method_plans: std::cell::RefCell::new(HashMap::default()),
             meta_frames: Vec::new(),
             meta_pending: 0,
+            declaration_typedefs: None,
             type_tables_gen: 0,
             formal_struct_layouts: HashMap::default(),
             local_type_pool: Vec::new(),

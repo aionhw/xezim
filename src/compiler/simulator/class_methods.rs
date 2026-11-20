@@ -1067,7 +1067,7 @@ impl Simulator {
                     width: super::elaborate::resolve_type_width(
                         rt,
                         Some(&self.module.parameters),
-                        Some(&self.module.typedefs),
+                        Some(self.method_typedef_widths()),
                     ),
                     signed: super::elaborate::is_type_signed(rt),
                     real: self.dt_is_real(rt),
@@ -2293,14 +2293,8 @@ impl Simulator {
                                 self.method_formal_param_width(handle, cname, &f.return_type)
                             {
                                 w
-                            } else if plan.type_gen == self.type_tables_gen {
-                                rp.width
                             } else {
-                                super::elaborate::resolve_type_width(
-                                    &f.return_type,
-                                    Some(&self.module.parameters),
-                                    Some(&self.module.typedefs),
-                                )
+                                rp.width
                             }
                             .max(1);
                             match self.widths.get_mut(rn) {
