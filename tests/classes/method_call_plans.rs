@@ -1,6 +1,6 @@
 //! Class method calls run from a per-method call plan: the declaration facts
 //! of the formals and the return value are computed once. The facts that read
-//! the procedural type tables must follow a run-time `typedef`, the virtual
+//! the procedural type tables respect declaration scope, the virtual
 //! interface bookkeeping of plain formals must follow a same-named formal
 //! keyed inside the body, and instantiation / local declarations must keep
 //! their per-call semantics.
@@ -14,10 +14,9 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
         .unwrap_or_else(|| panic!("{} not u64-able", n))
 }
 
-/// The implicit return cell takes the width of the return typedef as it is
-/// when the call runs, also after a procedural `typedef` re-declared it.
+/// §6.18 and §23.9: a caller-local typedef cannot change a method signature.
 #[test]
-fn return_width_follows_runtime_typedef() {
+fn return_width_uses_declaration_scope() {
     const SRC: &str = "typedef bit [7:0] w_t;
 class c;
   function w_t get2(); get2 = 16'hABCD; endfunction
@@ -50,8 +49,8 @@ endmodule
     assert_eq!(u(&sim, "r1"), 0xCD, "8-bit return cell before the typedef");
     assert_eq!(
         u(&sim, "r3"),
-        0xABCD,
-        "16-bit return cell after the typedef"
+        0xCD,
+        "8-bit method return inside the shadowing block"
     );
     assert_eq!(u(&sim, "q1"), 2);
     assert_eq!(u(&sim, "q2"), 2);

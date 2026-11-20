@@ -10,7 +10,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 - **Correctness:** Preserve every unknown and high-impedance digit in minimum-width binary, octal and hexadecimal output (§21.2.1.2–3, #1347).
 
+- **Correctness:** Resolve class method return widths in declaration scope when callers shadow a typedef (§6.18, §23.9, #1366).
 - **Correctness:** Resolve an unadorned parameterized class name in a typedef type argument to its default specialization (§8.25, #1357).
+- **Correctness:** Use all case items to determine signedness for `case`, `casez`, and `casex` comparisons (§12.5, #1355).
 
 - **Correctness:** Schedule delayed nonblocking updates even when the target already holds the captured value (§4.9.4, #1354).
 
