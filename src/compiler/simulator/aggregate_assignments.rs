@@ -3890,11 +3890,21 @@ impl Simulator {
                     return;
                 }
             }
-            if let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(arg).kind {
-                let vals: Vec<Value> = items.iter().map(|it| self.eval_expr(it.expr())).collect();
-                for (k, j) in dst.iter().enumerate() {
-                    let v = vals.get(k).cloned().unwrap_or_else(|| Value::zero(32));
-                    self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);
+            let values = match &self.unpacked_pattern(arg).kind {
+                ExprKind::AssignmentPattern(items) => {
+                    Some(items.iter().map(|it| self.eval_expr(it.expr())).collect())
+                }
+                // §10.10: an array operand contributes its elements in order.
+                ExprKind::Concatenation(parts) => {
+                    Some(self.unpacked_concat_operand_values(parts.iter().collect()))
+                }
+                _ => None,
+            };
+            if let Some(values) = values {
+                let mut values = values.into_iter();
+                for j in dst {
+                    let v = values.next().unwrap_or_else(|| Value::zero(32));
+                    self.set_signal_value_by_name(&format!("{elem}[{j}]"), v);
                 }
                 return;
             }
