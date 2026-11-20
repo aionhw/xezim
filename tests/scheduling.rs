@@ -139,6 +139,8 @@ mod forever_break_and_disable_fork_label;
 mod fork_automatic_capture;
 #[path = "scheduling/fork_children_start_in_spawn_slot.rs"]
 mod fork_children_start_in_spawn_slot;
+#[path = "scheduling/fork_intra_assignment_child_start.rs"]
+mod fork_intra_assignment_child_start;
 #[path = "scheduling/fork_join_edge.rs"]
 mod fork_join_edge;
 #[path = "scheduling/fork_join_none_await_context.rs"]
