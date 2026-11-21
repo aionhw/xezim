@@ -3208,6 +3208,8 @@ mod sensitivity;
 mod settling;
 mod setup;
 mod signal_commits;
+mod signal_width_table;
+pub use signal_width_table::SignalWidths;
 mod statement_assignments;
 mod statements;
 mod system_tasks;
@@ -7910,7 +7912,7 @@ pub struct Simulator {
     /// here. Populated once at construction so `module.signals` can
     /// be freed afterwards.
     signal_type_names: HashMap<usize, String>,
-    pub widths: HashMap<String, u32>,
+    pub widths: SignalWidths,
     pub signed_signals: HashSet<String>,
     /// Names of ARRAY locals whose packed element geometry
     /// `exec_stmt_var_decl` registered in `packed_full_dims` (so a later

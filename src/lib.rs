@@ -1630,6 +1630,11 @@ fn simulate_multi_inner(
     sim.simulate();
     rss_trace("simulated");
     if std::env::var_os("XEZIM_MEM_CENSUS").is_some() {
+        let (named_widths, width_ranges) = sim.widths.storage_counts();
+        eprintln!(
+            "[MEM-CENSUS] signal widths: {} logical entries ({} named, {} fixed-array ranges)",
+            sim.widths.len(), named_widths, width_ranges
+        );
         let named = sim.signals.map_entries().count();
         eprintln!(
             "[MEM-CENSUS] end of run: runtime name->value map {} entries ({} named, {} dense); {}",

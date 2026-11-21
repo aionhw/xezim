@@ -18,6 +18,21 @@ use crate::ast::types::PortDirection;
 use std::sync::Arc;
 use xezim_core::hasher::{HashMap, HashSet};
 
+/// Name-keyed declared widths used by expression-width inference.
+pub trait SignalWidthLookup {
+    fn declared_width(&self, name: &str) -> Option<u32>;
+}
+impl SignalWidthLookup for HashMap<String, u32> {
+    fn declared_width(&self, name: &str) -> Option<u32> {
+        self.get(name).copied()
+    }
+}
+impl SignalWidthLookup for super::simulator::SignalWidths {
+    fn declared_width(&self, name: &str) -> Option<u32> {
+        self.get(name).copied()
+    }
+}
+
 /// §7.2: unpacked-struct variables by container signal id → (member path,
 /// leaf signal name) in declaration order. An empty list: a struct whose
 /// leaves are not all plain signals (array or union members).
@@ -1860,7 +1875,7 @@ pub struct BytecodeCompiler<'a> {
     signal_real: Option<&'a [bool]>,
     arrays: &'a HashMap<String, (i64, i64, u32)>,
     array_first_id: Option<&'a HashMap<Arc<str>, (usize, i64, i64)>>,
-    widths: &'a HashMap<String, u32>,
+    widths: &'a dyn SignalWidthLookup,
     pub bail_reason: Option<&'static str>,
     /// When true, unsupported statements emit `StmtFallback` instead of
     /// failing compilation. Safe for edge blocks where the AST interpreter's
@@ -2424,7 +2439,7 @@ impl<'a> BytecodeCompiler<'a> {
         signal_signed: &'a [bool],
         signal_widths: &'a [u32],
         arrays: &'a HashMap<String, (i64, i64, u32)>,
-        widths: &'a HashMap<String, u32>,
+        widths: &'a dyn SignalWidthLookup,
     ) -> Self {
         Self {
             insns: Vec::with_capacity(64),
@@ -22815,7 +22830,7 @@ impl<'a> BytecodeCompiler<'a> {
                     mw
                 } else {
                     let raw = Self::hier_raw_name(hier);
-                    self.widths.get(&raw).copied().unwrap_or(32)
+                    self.widths.declared_width(&raw).unwrap_or(32)
                 }
             }
             ExprKind::Index { expr, .. } => {
