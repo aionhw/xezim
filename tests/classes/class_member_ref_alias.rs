@@ -108,3 +108,34 @@ endmodule
 "#;
     check(src, "T|module variable 11");
 }
+
+#[test]
+fn a_ref_element_is_selected_once_and_remains_on_the_original_object() {
+    check(
+        r#"
+module top;
+  class C;
+    int a[2];
+  endclass
+  C original, current, other;
+  int count;
+  function automatic int pick();
+    count++;
+    return 1;
+  endfunction
+  task automatic update(ref int x);
+    current = other;
+    x = 23;
+    $display("T|%0d %0d %0d", original.a[1], current.a[1], count);
+  endtask
+  initial begin
+    original = new;
+    other = new;
+    current = original;
+    update(current.a[pick()]);
+  end
+endmodule
+"#,
+        "T|23 0 1",
+    );
+}

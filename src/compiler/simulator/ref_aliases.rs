@@ -439,6 +439,20 @@ impl Simulator {
         if !self.module.associative_arrays.is_empty() {
             self.ref_alloc_assoc_actual(arg);
         }
+        if let ExprKind::Index { expr, index } = &arg.kind {
+            let store = self.handle_member_array_name(expr).or_else(|| self.expr_assoc_name(expr))?;
+            let (handle, member) = store.split_once('#')?;
+            let handle = handle.parse::<usize>().ok()?;
+            let class = self.class_prop_declarer(handle, member)?;
+            if !class.array_properties.contains_key(member)
+                && !class.queue_properties.contains_key(member)
+            {
+                return None;
+            }
+            let idx = self.eval_expr(index).to_index()?;
+            let cell = format!("{store}[{idx}]");
+            return self.get_signal_value_by_name(&cell).map(|_| cell);
+        }
         let (handle, prop): (usize, &str) = match &arg.kind {
             ExprKind::MemberAccess { expr, member } => match self.eval_handle_expr(expr) {
                 Some(h) => (h, member.name.as_str()),
@@ -623,12 +637,19 @@ impl Simulator {
         false
     }
 
+    fn ref_storage_owner(storage: &str) -> Option<usize> {
+        Self::ref_pin_parts(storage).map(|(handle, _)| handle).or_else(|| {
+            let (handle, member) = storage.split_once('#')?;
+            member.ends_with(']').then(|| handle.parse().ok()).flatten()
+        })
+    }
+
     /// Create (or count one more user of) the pin of every pinned storage in
     /// a callee's alias frame.
     pub(super) fn ref_pins_acquire(&mut self, frame: &HashMap<String, String>) {
         for storage in frame.values() {
-            if let Some((h, prop)) = Self::ref_pin_parts(storage) {
-                let pin = storage[..storage.len() - prop.len() - 1].to_string();
+            if let Some(h) = Self::ref_storage_owner(storage) {
+                let pin = format!("{REF_PIN_PREFIX}{h}");
                 let n = self.ref_pin_users.entry(h).or_insert(0);
                 *n += 1;
                 if *n == 1 {
@@ -642,8 +663,8 @@ impl Simulator {
     /// removes the pin, so it does not keep its object alive.
     pub(super) fn ref_pins_release(&mut self, frame: &HashMap<String, String>) {
         for storage in frame.values() {
-            if let Some((h, prop)) = Self::ref_pin_parts(storage) {
-                let pin = storage[..storage.len() - prop.len() - 1].to_string();
+            if let Some(h) = Self::ref_storage_owner(storage) {
+                let pin = format!("{REF_PIN_PREFIX}{h}");
                 if let Some(n) = self.ref_pin_users.get_mut(&h) {
                     *n -= 1;
                     if *n == 0 {
