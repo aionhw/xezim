@@ -4514,6 +4514,20 @@ impl Simulator {
                 }
                 let inner_is_call =
                     matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Call { .. }));
+                // §6.24.1: a field of a struct parameter (`pt.DEPTH'(x)`) is
+                // a SIZE cast, its value the operand's context width. Looked
+                // up by its leaf (`DEPTH`) below it named nothing, and the
+                // operand passed through at its self-determined width:
+                // `pt.BHT_ARRAY_DEPTH'(en << addr)` in the VeeR branch
+                // predictor shifted a 1-bit value and read 0.
+                if let Some(w) = args.first().and_then(|a| self.member_cast_size(a)) {
+                    let v = match args.get(1) {
+                        Some(a) if !inner_is_call => self.eval_expr_ctx(a, w),
+                        Some(a) => self.eval_expr(a),
+                        None => Value::zero(w),
+                    };
+                    return v.resize(w);
+                }
                 // §6.24.1: an integral target (typedef, enum, or a constant
                 // size) is the operand's context width — see the type-cast
                 // arm above.

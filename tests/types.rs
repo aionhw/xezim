@@ -297,6 +297,8 @@ mod compiled_member_operand_width;
 mod signedness_and_power_context;
 #[path = "types/size_cast_context_and_fn_return_default.rs"]
 mod size_cast_context_and_fn_return_default;
+#[path = "types/size_cast_struct_param_field.rs"]
+mod size_cast_struct_param_field;
 #[path = "types/static_typedef_singleton.rs"]
 mod static_typedef_singleton;
 #[path = "types/stmt_local_scoped_decls.rs"]
