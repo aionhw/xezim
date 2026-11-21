@@ -1141,6 +1141,7 @@ macro_rules! write_sig {
         if __wsig_val.is_real && $self.shortreal_signals.contains(&__wsig_id) {
             let __wsig_f = __wsig_val.to_f64() as f32 as f64;
             __wsig_val = Value::from_f64(__wsig_f);
+            __wsig_val.is_signed = $self.signal_signed[__wsig_id];
         }
         // LRM §9.3.1: skip writes to forced signals. The `is_empty` guard
         // keeps the common no-force case to one branch — `contains_key`
