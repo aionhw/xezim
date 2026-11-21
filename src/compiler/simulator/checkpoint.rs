@@ -953,6 +953,13 @@ impl Simulator {
             let inline_bits = std::mem::take(&mut self.signal_inline_bits);
             let has_xz = std::mem::take(&mut self.signal_has_xz);
             self.checkpoint_decode_state(&mut fields)?;
+            // Resolve backend choices against this run's available native slots.
+            // Keep two-state islands, which carry their portable instructions.
+            for plan in &mut self.comb_plan {
+                if matches!(plan, CombPlan::Jit | CombPlan::Tpl | CombPlan::Interp) {
+                    *plan = CombPlan::Unresolved;
+                }
+            }
             self.refill_inline_bits(inline_bits)?;
             refill_in_place(&mut self.signal_has_xz, has_xz, "signal_has_xz")?;
             #[cfg(feature = "jit")]

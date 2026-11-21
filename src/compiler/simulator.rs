@@ -7532,11 +7532,10 @@ enum CombPlan {
     /// (forces, X inputs); the plan then falls through JIT-then-interp,
     /// exactly like the unplanned dispatch.
     Ts(std::sync::Arc<super::bytecode::TwoStateBlock>),
-    /// Native slot; its function is stored in `comb_jit_fns`.
-    #[cfg(feature = "jit")]
+    /// Native slot; its function is stored in `comb_jit_fns`. Keep the same
+    /// checkpoint discriminants in builds with and without the JIT feature.
     Jit,
     /// Template slot; its function and mapping window are in `comb_tpl_fns`.
-    #[cfg(feature = "jit")]
     Tpl,
     Interp,
 }
