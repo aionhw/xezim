@@ -2797,6 +2797,17 @@ impl Simulator {
     }
 
     /// Does the event expression need value evaluation for selects or calls?
+    /// §9.4.2, §8.4: a property reached through a selected class handle
+    /// (`ca[1].v`) lives in the object, not in a signal of the handle array,
+    /// so it is waited on as a class property and not through a select.
+    pub(super) fn event_member_of_class_handle(&self, e: &Expression) -> bool {
+        let ExprKind::MemberAccess { expr, .. } = &Self::peel_parens(e).kind else {
+            return false;
+        };
+        self.get_expr_type_name(expr)
+            .is_some_and(|class| self.module.classes.contains_key(&class))
+    }
+
     pub(super) fn event_expr_needs_value_wait(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Index { .. } | ExprKind::RangeSelect { .. } => true,
@@ -2951,7 +2962,7 @@ impl Simulator {
                 let Some(e) = &s.value_of else {
                     return false;
                 };
-                if !Self::event_expr_needs_value_wait(e) {
+                if !Self::event_expr_needs_value_wait(e) || self.event_member_of_class_handle(e) {
                     return false;
                 }
                 return s.edge != EdgeKind::AnyEdge
@@ -2963,6 +2974,7 @@ impl Simulator {
                     // exists. A scoped struct can have no container slot.
                     self.unpacked_dims_of(name) > 0
                         || Self::event_expr_needs_value_wait(e)
+                            && !self.event_member_of_class_handle(e)
                             && !self.event_struct_collection(name)
                             && self.module.var_decl_types.get(name).is_some_and(|dt| {
                                 matches!(
@@ -3373,7 +3385,8 @@ impl Simulator {
                     // reached through handles (`vif.data[0]`), which only
                     // the waiting process can evaluate.
                     let selects = Self::event_expr_needs_value_wait(&ee.expr)
-                        && self.this_stack.last().copied().flatten().is_none();
+                        && self.this_stack.last().copied().flatten().is_none()
+                        && !self.event_member_of_class_handle(&ee.expr);
                     let value_expr = Self::peel_parens(&ee.expr);
                     let expand_structs = selects && !self.unpacked_struct_sens.is_empty();
                     let mut idents = Vec::new();
