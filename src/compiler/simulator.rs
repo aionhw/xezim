@@ -1137,10 +1137,8 @@ macro_rules! write_sig {
         }
         // §6.12/§20.5: a SHORTREAL holds an IEEE binary32 value, so a write
         // rounds to binary32 (16777216.25 -> 16777216.0). A `real` (binary64)
-        // keeps every bit. Only a REAL write pays the type-name lookup.
-        if __wsig_val.is_real
-            && $self.shortreal_signals.contains(&__wsig_id)
-        {
+        // keeps every bit. Only a real write checks destination precision.
+        if __wsig_val.is_real && $self.shortreal_signals.contains(&__wsig_id) {
             let __wsig_f = __wsig_val.to_f64() as f32 as f64;
             __wsig_val = Value::from_f64(__wsig_f);
         }
@@ -7907,8 +7905,9 @@ pub struct Simulator {
     /// `Signal` struct — most regular bit/logic signals have None
     /// here. Populated once at construction so `module.signals` can
     /// be freed afterwards.
-    shortreal_signals: HashSet<usize>,
     signal_type_names: HashMap<usize, String>,
+    /// Real signal slots that round writes to binary32.
+    shortreal_signals: HashSet<usize>,
     pub widths: HashMap<String, u32>,
     pub signed_signals: HashSet<String>,
     /// Names of ARRAY locals whose packed element geometry
