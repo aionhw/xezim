@@ -345,3 +345,30 @@ endmodule
         ],
     );
 }
+
+#[test]
+fn explicit_array_import_wins_in_both_declaration_orders() {
+    for imports in [
+        "import other::*; import chosen::V;",
+        "import chosen::V; import other::*;",
+    ] {
+        let src = r#"
+package chosen; parameter int V [2] = '{2, 5}; endpackage
+package other; parameter int V [2] = '{7, 1}; endpackage
+module child(output wire [1:0] flags);
+  IMPORTS
+  for (genvar k = 0; k < 2; k++) begin
+    if (V[k] == 5) assign flags[k] = 1'b1;
+    else assign flags[k] = 1'b0;
+  end
+endmodule
+module top;
+  wire [1:0] flags;
+  child c(flags);
+  initial #1 $display("selected=%b", flags);
+endmodule
+"#
+        .replace("IMPORTS", imports);
+        assert_has(&src, &["selected=10"]);
+    }
+}
