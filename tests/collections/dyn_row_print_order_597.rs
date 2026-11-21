@@ -115,3 +115,32 @@ endmodule"#;
         ["pairs 3 '{'{1, 2}, '{3, 4}, '{5, 6}}", "row 5 6 7"]
     );
 }
+
+/// IEEE 1800-2023 §7.6, §10.9.1, §10.10 (#1467).
+#[test]
+fn whole_row_writes_through_a_class_handle() {
+    let src = r#"module tb;
+  typedef int pair_t[2];
+  class K;
+    pair_t q[$], d[];
+    int f[2][2];
+  endclass
+  K k; pair_t p;
+  int i;
+  initial begin
+    k = new; p = '{5, 6};
+    repeat (3) k.q.push_back('{0, 0});
+    k.d = new[2];
+    k.q[i++] = '{1, 2}; k.q[i++] = {3, 4}; k.q[i++] = p;
+    k.d[0] = '{7, 8}; k.d[1] = {9, 10};
+    k.f[0] = '{1, 2}; k.f[1] = {3, 4};
+    $display("Q %p D %p F %p i=%0d", k.q, k.d, k.f, i);
+    k.d[2] = '{3, 4}; k.q[$+1] = '{default:11};
+    $display("size %0d %0d append %p", k.d.size(), k.q.size(), k.q);
+  end
+endmodule"#;
+    assert_eq!(shown(src, &["Q ", "size "]), [
+        "Q '{'{1, 2}, '{3, 4}, '{5, 6}} D '{'{7, 8}, '{9, 10}} F '{'{1, 2}, '{3, 4}} i=3",
+        "size 2 4 append '{'{1, 2}, '{3, 4}, '{5, 6}, '{11, 11}}",
+    ]);
+}
