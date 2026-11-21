@@ -2418,6 +2418,31 @@ pub struct BytecodeCompiler<'a> {
     packed_struct_fields: Option<&'a HashMap<String, Vec<(String, u32, u32)>>>,
 }
 
+/// Where `packed_path_dyn_range` places a store in its root signal.
+enum PackedPathTarget {
+    /// `width` bits from the bit in register `lo`.
+    Range(RegId, u32),
+    /// A part-select with a run-time base, which may run past either end of
+    /// its dimension (see `emit_slot_run_store`).
+    Slots(SlotRun),
+}
+
+/// `n` consecutive slots of `ew` bits, the lowest at run-time slot `first`,
+/// of a dimension of `count` slots whose slot 0 starts at the bit in `base`.
+/// Value bits `[k*ew +: ew]` go to slot `first + k`.
+struct SlotRun {
+    base: RegId,
+    first: RegId,
+    n: u64,
+    ew: u32,
+    count: u64,
+}
+
+/// The longest `SlotRun` whose elements are stored one at a time when it
+/// leaves its dimension. Each takes a few registers and instructions, so a
+/// longer run is stored as one range with run-time ends instead.
+const MAX_SLOT_RUN: u64 = 16;
+
 impl<'a> BytecodeCompiler<'a> {
     pub fn new(
         signal_name_to_id: &'a NameMap,
@@ -3708,6 +3733,40 @@ impl<'a> BytecodeCompiler<'a> {
             self.emit(Insn::Sub(out, k, idx_reg));
             out
         }
+    }
+
+    /// Bit offset `slot * ew + bit` of bit `bit` of the `ew`-bit element in
+    /// run-time slot `slot` (see `emit_packed_slot_index`).
+    fn emit_slot_bit(&mut self, slot: RegId, ew: u32, bit: u32) -> RegId {
+        let w = self.alloc_reg();
+        self.emit(Insn::LoadConst(w, Box::new(Value::from_u64(ew as u64, 32))));
+        let scaled = self.alloc_reg();
+        self.emit(Insn::Mul(scaled, slot, w));
+        if bit == 0 {
+            return scaled;
+        }
+        let out = self.alloc_reg();
+        self.emit(Insn::BinOpConst(
+            out,
+            scaled,
+            Box::new(Value::from_u64(bit as u64, 32)),
+            BinOpConstKind::Add,
+        ));
+        out
+    }
+
+    /// §11.5.1: the run-time base `base` (compiled from `left`) of a
+    /// part-select of packed elements, widened to the 32 bits of the slot
+    /// arithmetic it feeds. `Resize` sign-extends a signed register, so
+    /// `bit signed [7:0] j = -1` stays label -1, as an `int` -1 is; added to
+    /// 32-bit constants as 8 bits it read as 255.
+    fn widen_part_select_base(&mut self, left: &Expression, base: RegId) -> RegId {
+        if self.lrm_self_width(left) >= 32 {
+            return base;
+        }
+        let wide = self.alloc_reg();
+        self.emit(Insn::MoveResize(wide, base, 32));
+        wide
     }
 
     pub fn set_ast_fallback(&mut self, allow: bool) {
@@ -13906,6 +13965,74 @@ impl<'a> BytecodeCompiler<'a> {
         dims.get(layers).copied()
     }
 
+    /// §7.4.3, §11.5.1: a part-select picks whole ELEMENTS of the declared
+    /// dimension that follows the indices already applied — `a[1:0]` on
+    /// `logic [3:0][7:0] a` is two 8-bit elements, and `a[0][5:0]` on
+    /// `logic [3:0][5:0][7:0] a` is six of them, 48 bits, not bits 5..0.
+    /// Returns that dimension and the width in bits of one of its elements,
+    /// for a packed variable or packed-struct member and for an element of a
+    /// one- or two-dimensional unpacked array. None when the select addresses
+    /// single bits (the last dimension) or the layout is not on file; those
+    /// keep their bit-level paths.
+    fn part_select_elem(&self, base: &Expression) -> Option<((i64, i64), u32)> {
+        let mut cur = base;
+        let mut layers = 0usize;
+        while let ExprKind::Index { expr: inner, .. } = &cur.kind {
+            cur = inner;
+            layers += 1;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        if self.formal_struct_member(cur).is_some()
+            || self.frame_bound_target(base)
+            || self.is_assoc_target(h)
+            || self.collection_store_denied(h)
+        {
+            return None;
+        }
+        // Unpacked indices come first and select a whole stored element.
+        let (depth, total) = if let Some((_, shape)) = self.arrays_2d_entry(h) {
+            (2, shape.2)
+        } else if self.is_multi_dim_array(h) {
+            return None;
+        } else if let Some(name) = self.lookup_array_name(h) {
+            (1, self.arrays.get(&name)?.2)
+        } else {
+            let total = match self.lookup_signal_id(h) {
+                Some(id) => self.signal_widths[id],
+                None => self.packed_struct_member_target(h)?.2,
+            };
+            (0, total)
+        };
+        let level = layers.checked_sub(depth)?;
+        // A plain vector selects bits; skip the layout copy below.
+        if depth == 0
+            && self.packed_elem_width_of(h).is_none()
+            && self
+                .packed_full_dims_of(h)
+                .is_none_or(|d| d.len() <= level + 1)
+        {
+            return None;
+        }
+        let (dims, labelled) = self.elem_packed_dims(h, Some(total))?;
+        // Without the declared labels only the widths are known, which is
+        // enough for the outermost dimension of a variable — its select
+        // arms assume `[N-1:0]` already — but not to place a deeper slice.
+        if !labelled && layers > 0 {
+            return None;
+        }
+        let counts: Vec<u64> = dims
+            .iter()
+            .map(|&(l, r)| (l.max(r) - l.min(r) + 1) as u64)
+            .collect();
+        if dims.len() <= level + 1 || counts.iter().product::<u64>() != u64::from(total) {
+            return None;
+        }
+        let stride = u32::try_from(counts[level + 1..].iter().product::<u64>()).ok()?;
+        (stride > 1).then_some((dims[level], stride))
+    }
+
     /// §7.4.1 physical bit position of a declared label: a descending range
     /// counts up from its low bound, an ascending one mirrors. Selects on
     /// such bases used to go to the AST interpreter for want of this map.
@@ -18788,13 +18915,26 @@ impl<'a> BytecodeCompiler<'a> {
                         // §7.4.1: labels to physical bits, for an ascending
                         // range or an element dimension that does not start
                         // at zero as much as for the plain descending case.
+                        // §7.4.3: after an index into a multi-D packed value
+                        // the labels count ELEMENTS of the next dimension
+                        // (`a[0][5:0]` on `logic [3:0][5:0][7:0] a` is 48
+                        // bits), so the mapped slots scale by their width.
+                        let elem = match &expr.kind {
+                            ExprKind::Ident(_) => None,
+                            _ => self.part_select_elem(expr),
+                        };
                         let (mut phys_l, mut phys_r) = (l as i64, r as i64);
-                        if let Some(d) = self.sel_base_dim(expr) {
+                        if let Some(d) = elem.map(|(d, _)| d).or_else(|| self.sel_base_dim(expr)) {
                             phys_l = Self::label_to_phys(d, phys_l);
                             phys_r = Self::label_to_phys(d, phys_r);
                             if phys_l < phys_r {
                                 std::mem::swap(&mut phys_l, &mut phys_r);
                             }
+                        }
+                        if let Some((_, ew)) = elem {
+                            let ew = i64::from(ew);
+                            phys_l = phys_l * ew + ew - 1;
+                            phys_r *= ew;
                         }
                         let dest = self.alloc_reg();
                         if phys_l.min(phys_r) < 0 {
@@ -18903,6 +19043,9 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("sel_base_interpreted");
                         return None;
                     }
+                    // §7.4.3: `[i +: W]` on a multi-D packed value counts W
+                    // ELEMENTS of the selected dimension, each `ew` bits.
+                    let elem = self.part_select_elem(expr);
                     // A constant base index (genvar-unrolled `x[n*W +: W]`)
                     // gives static bounds: select the range directly instead
                     // of computing `idx*W + W-1` in registers on every eval.
@@ -18916,21 +19059,28 @@ impl<'a> BytecodeCompiler<'a> {
                             ExprKind::Ident(h) => {
                                 self.packed_elem_width_of(h).filter(|&w| w > 1).is_none()
                             }
-                            // An index has already selected an element, so
-                            // what remains is a plain vector.
+                            // An index has already selected an element; what
+                            // remains is a vector of bits or of elements.
                             ExprKind::Index { .. } => true,
                             _ => false,
                         };
-                        if plain && r >= 0 {
+                        if (plain || elem.is_some()) && r >= 0 {
                             // Both label bounds map, then order them: on an
                             // ascending base `+:` runs DOWN the physical bits.
                             let (mut phys_l, mut phys_r) = (l, r);
-                            if let Some(d) = self.sel_base_dim(expr) {
+                            if let Some(d) =
+                                elem.map(|(d, _)| d).or_else(|| self.sel_base_dim(expr))
+                            {
                                 phys_l = Self::label_to_phys(d, phys_l);
                                 phys_r = Self::label_to_phys(d, phys_r);
                                 if phys_l < phys_r {
                                     std::mem::swap(&mut phys_l, &mut phys_r);
                                 }
+                            }
+                            if let Some((_, ew)) = elem {
+                                let ew = i64::from(ew);
+                                phys_l = phys_l * ew + ew - 1;
+                                phys_r *= ew;
                             }
                             if phys_r >= 0 {
                                 let dest = self.alloc_reg();
@@ -18945,13 +19095,17 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                     let idx = self.compile_expr(left, 0)?;
+                    let idx = match elem {
+                        Some(_) => self.widen_part_select_base(left, idx),
+                        None => idx,
+                    };
                     // §7.4.6/§11.5.1: the base index is a DECLARED index, but
                     // `RangeSelect` takes physical bit offsets — rebase it for a
                     // non-zero-based vector exactly as the plain bit select
                     // does. Without this `w[1 +: 2]` on a `logic [3:1] w` read
                     // physical 2:1 (declared 3:2) instead of declared 2:1, and
                     // `w[3 -: 2]` ran off the top of the signal and returned x.
-                    let sel_dim = self.sel_base_dim(expr);
+                    let sel_dim = elem.map(|(d, _)| d).or_else(|| self.sel_base_dim(expr));
                     let idx = match sel_dim {
                         Some(d) => self.emit_packed_slot_index(Some(d), idx),
                         None => idx,
@@ -18960,6 +19114,15 @@ impl<'a> BytecodeCompiler<'a> {
                     // way, so `+:` becomes a downward physical range.
                     let ascending = sel_dim.is_some_and(|d| d.0 < d.1);
                     let up = (*kind == RangeKind::IndexedUp) != ascending;
+                    // Element slot to bit offset: the first bit of the slot
+                    // for an upward range, its last bit for a downward one.
+                    let (idx, width) = match elem {
+                        Some((_, ew)) => (
+                            self.emit_slot_bit(idx, ew, if up { 0 } else { ew - 1 }),
+                            width.saturating_mul(ew),
+                        ),
+                        None => (idx, width),
+                    };
                     let dest = self.alloc_reg();
                     self.emit(Insn::RangeSelectW(dest, base, idx, width, up));
                     Some(dest)
@@ -20634,11 +20797,12 @@ impl<'a> BytecodeCompiler<'a> {
     /// one dynamic bit offset into the ROOT signal, which the existing
     /// dynamic-range stores take as-is.
     ///
-    /// Returns `(root signal id, lo-bit register, width)`, or `None` when a
-    /// level is not statically resolvable — the caller's bail then stands.
-    /// An x/z index poisons the offset arithmetic, so the dynamic-range store
-    /// discards the write exactly as the single-level arms do (§11.5.1).
-    fn packed_path_dyn_range(&mut self, lhs: &Expression) -> Option<(usize, RegId, u32)> {
+    /// Returns the root signal id and where the store goes in it, or `None`
+    /// when a level is not statically resolvable — the caller's bail then
+    /// stands. An x/z index poisons the offset arithmetic, so the
+    /// dynamic-range store discards the write exactly as the single-level
+    /// arms do (§11.5.1).
+    fn packed_path_dyn_range(&mut self, lhs: &Expression) -> Option<(usize, PackedPathTarget)> {
         // A member or part-select may only sit at the LEAF; everything above
         // it must be an index chain over a packed root.
         let mut tail_member: Option<&str> = None;
@@ -20728,6 +20892,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
 
         let mut acc: Option<RegId> = None;
+        let mut slots: Option<(RegId, u64, u32, u64)> = None;
         let add_term = |c: &mut Self, term: RegId, acc: &mut Option<RegId>| match *acc {
             None => *acc = Some(term),
             Some(a) => {
@@ -20780,6 +20945,71 @@ impl<'a> BytecodeCompiler<'a> {
             }
             const_off = const_off.checked_add(off)?;
             mw
+        } else if let Some((left, right, kind)) = tail_range
+            && idx_nodes.len() + 1 < dims.len()
+        {
+            // §7.4.3, §11.5.1: the part-select addresses the NEXT declared
+            // dimension, whose elements are `ew` bits wide — on
+            // `logic [3:0][5:0][7:0] a`, `a[0][5:0]` is six bytes. Treating
+            // its labels as bit offsets wrote 6 of the 48 bits.
+            let level = idx_nodes.len();
+            let dim = dims[level];
+            let ew = u32::try_from(stride(level)).ok()?;
+            let count = counts[level] as i64;
+            let in_dim = |s: i64| (0..count).contains(&s);
+            let n = match kind {
+                RangeKind::Constant => {
+                    let a = Self::label_to_phys(dim, self.eval_const_bound(left)?);
+                    let b = Self::label_to_phys(dim, self.eval_const_bound(right)?);
+                    // A partly out-of-range select keeps the interpreter's
+                    // per-bit placement (§11.5.1).
+                    if !in_dim(a) || !in_dim(b) {
+                        return None;
+                    }
+                    let lsb = u32::try_from(a.min(b)).ok()?.checked_mul(ew)?;
+                    const_off = const_off.checked_add(lsb)?;
+                    a.abs_diff(b) + 1
+                }
+                RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                    let w = self
+                        .fold_const(right)
+                        .and_then(|v| v.to_u64())
+                        .filter(|&w| w > 0 && w <= count as u64)?;
+                    // On an ascending dimension `+:` runs down the slots.
+                    let up = (*kind == RangeKind::IndexedUp) != Self::dim_is_ascending(Some(dim));
+                    if let Some(b) = self.eval_const_bound(left) {
+                        let first = Self::label_to_phys(dim, b);
+                        let low = if up { first } else { first - (w as i64 - 1) };
+                        if !in_dim(low) || !in_dim(low + w as i64 - 1) {
+                            return None;
+                        }
+                        let lsb = u32::try_from(low).ok()?.checked_mul(ew)?;
+                        const_off = const_off.checked_add(lsb)?;
+                    } else {
+                        // §11.5.1: a run-time base can run past either end
+                        // of the dimension; only the slots inside it are
+                        // written (see `emit_slot_run_store`).
+                        let base = self.compile_expr(left, 0)?;
+                        let base = self.widen_part_select_base(left, base);
+                        let slot = self.emit_packed_slot_index(Some(dim), base);
+                        let low = if up {
+                            slot
+                        } else {
+                            let out = self.alloc_reg();
+                            self.emit(Insn::BinOpConst(
+                                out,
+                                slot,
+                                Box::new(Value::from_u64(w - 1, 32)),
+                                BinOpConstKind::Sub,
+                            ));
+                            out
+                        };
+                        slots = Some((low, w, ew, count as u64));
+                    }
+                    w
+                }
+            };
+            u32::try_from(n).ok()?.checked_mul(ew)?
         } else if let Some((left, right, kind)) = tail_range {
             match kind {
                 RangeKind::Constant => {
@@ -20855,7 +21085,173 @@ impl<'a> BytecodeCompiler<'a> {
                 sum
             }
         };
-        Some((id, lo_reg, width))
+        Some(match slots {
+            Some((first, n, ew, count)) => (
+                id,
+                PackedPathTarget::Slots(SlotRun {
+                    base: lo_reg,
+                    first,
+                    n,
+                    ew,
+                    count,
+                }),
+            ),
+            None => (id, PackedPathTarget::Range(lo_reg, width)),
+        })
+    }
+
+    /// §11.5.1: store a part-select whose base is only known at run time,
+    /// writing only its slots inside the dimension. The store instructions
+    /// clip to the whole ROOT signal, so a slice that ran past the end of its
+    /// own dimension wrote into the neighbouring element: `a[0][j +: 2]` on
+    /// `logic [3:0][5:0][7:0] a` with `j = 5` put its second byte in `a[1][0]`.
+    ///
+    /// When the whole run is inside the dimension, one store of fixed width
+    /// does it, as before. Otherwise each slot is stored on its own, if it is
+    /// inside; every store then has a constant width, which the two-state
+    /// executor needs. A run longer than `MAX_SLOT_RUN` instead stores the
+    /// part inside as one range whose ends are clipped at run time, which
+    /// keeps its registers and instructions fixed. An x/z base fails every
+    /// check and writes nothing.
+    fn emit_slot_run_store(&mut self, sig: SigId, run: SlotRun, val_reg: RegId, nba: bool) {
+        let store = |c: &mut Self, lo: RegId, w: u32, v: RegId| {
+            let hi = if w == 1 {
+                lo
+            } else {
+                let hi = c.alloc_reg();
+                c.emit(Insn::BinOpConst(
+                    hi,
+                    lo,
+                    Box::new(Value::from_u64(u64::from(w) - 1, 32)),
+                    BinOpConstKind::Add,
+                ));
+                hi
+            };
+            c.emit(if nba {
+                Insn::NbaAssignRangeDyn(sig, hi, lo, v)
+            } else {
+                Insn::BlockingAssignRangeDyn(sig, hi, lo, v)
+            });
+        };
+        let slot_bit = |c: &mut Self, slot: RegId| {
+            let rel = c.emit_slot_bit(slot, run.ew, 0);
+            let bit = c.alloc_reg();
+            c.emit(Insn::Add(bit, run.base, rel));
+            bit
+        };
+        let total = u32::try_from(run.n)
+            .unwrap_or(u32::MAX)
+            .saturating_mul(run.ew);
+        let value = self.alloc_reg();
+        self.emit(Insn::MoveResize(value, val_reg, total));
+        let count = self.alloc_reg();
+        self.emit(Insn::LoadConst(
+            count,
+            Box::new(Value::from_u64(run.count, 32)),
+        ));
+        // Unsigned compares: a slot below 0 has wrapped to a large value.
+        let last = self.alloc_reg();
+        self.emit(Insn::BinOpConst(
+            last,
+            run.first,
+            Box::new(Value::from_u64(run.n - 1, 32)),
+            BinOpConstKind::Add,
+        ));
+        let first_in = self.alloc_reg();
+        self.emit(Insn::Lt(first_in, run.first, count));
+        let last_in = self.alloc_reg();
+        self.emit(Insn::Lt(last_in, last, count));
+        let inside = self.alloc_reg();
+        self.emit(Insn::LogAnd(inside, first_in, last_in));
+        let to_slots = self.insns.len();
+        self.emit(Insn::BranchIfFalse(inside, 0));
+        let lo = slot_bit(self, run.first);
+        store(self, lo, total, value);
+        let to_end = self.insns.len();
+        self.emit(Insn::Jump(0));
+        let slots_pc = self.insns.len() as u32;
+        self.insns[to_slots] = Insn::BranchIfFalse(inside, slots_pc);
+        if run.n > MAX_SLOT_RUN {
+            let any = self.alloc_reg();
+            self.emit(Insn::LogOr(any, first_in, last_in));
+            let skip = self.insns.len();
+            self.emit(Insn::BranchIfFalse(any, 0));
+            let pick = |c: &mut Self, cond: RegId, t: RegId, e: RegId| {
+                let out = c.alloc_reg();
+                c.emit(Insn::Select(out, cond, t, e));
+                out
+            };
+            // An end outside the dimension moves in to that end of it.
+            let lo_full = slot_bit(self, run.first);
+            let lo = pick(self, first_in, lo_full, run.base);
+            let hi_rel = self.emit_slot_bit(last, run.ew, run.ew - 1);
+            let hi_full = self.alloc_reg();
+            self.emit(Insn::Add(hi_full, run.base, hi_rel));
+            let top = self.alloc_reg();
+            self.emit(Insn::BinOpConst(
+                top,
+                run.base,
+                Box::new(Value::from_u64(run.count * u64::from(run.ew) - 1, 32)),
+                BinOpConstKind::Add,
+            ));
+            let hi = pick(self, last_in, hi_full, top);
+            // A run starting below slot 0 loses its low `n - 1 - last`
+            // elements: shift their bits out of the value.
+            let n_last = self.alloc_reg();
+            self.emit(Insn::LoadConst(
+                n_last,
+                Box::new(Value::from_u64(run.n - 1, 32)),
+            ));
+            let below = self.alloc_reg();
+            self.emit(Insn::Sub(below, n_last, last));
+            let below_bits = self.emit_slot_bit(below, run.ew, 0);
+            let zero = self.alloc_reg();
+            self.emit(Insn::LoadConst(zero, Box::new(Value::from_u64(0, 32))));
+            let shift = pick(self, first_in, zero, below_bits);
+            let shifted = self.alloc_reg();
+            self.emit(Insn::Shr(shifted, value, shift));
+            self.emit(if nba {
+                Insn::NbaAssignRangeDyn(sig, hi, lo, shifted)
+            } else {
+                Insn::BlockingAssignRangeDyn(sig, hi, lo, shifted)
+            });
+            let end = self.insns.len() as u32;
+            self.insns[skip] = Insn::BranchIfFalse(any, end);
+            self.insns[to_end] = Insn::Jump(end);
+            return;
+        }
+        for k in 0..run.n {
+            let slot = if k == 0 {
+                run.first
+            } else {
+                let s = self.alloc_reg();
+                self.emit(Insn::BinOpConst(
+                    s,
+                    run.first,
+                    Box::new(Value::from_u64(k, 32)),
+                    BinOpConstKind::Add,
+                ));
+                s
+            };
+            let ok = self.alloc_reg();
+            self.emit(Insn::Lt(ok, slot, count));
+            let skip = self.insns.len();
+            self.emit(Insn::BranchIfFalse(ok, 0));
+            let part = self.alloc_reg();
+            let k = k as u32;
+            self.emit(Insn::RangeSelectConst(
+                part,
+                value,
+                (k + 1) * run.ew - 1,
+                k * run.ew,
+            ));
+            let lo = slot_bit(self, slot);
+            store(self, lo, run.ew, part);
+            let next = self.insns.len() as u32;
+            self.insns[skip] = Insn::BranchIfFalse(ok, next);
+        }
+        let end = self.insns.len() as u32;
+        self.insns[to_end] = Insn::Jump(end);
     }
 
     /// `(hi, lo)` registers and the value resized to `width`, for the dynamic
@@ -20892,9 +21288,16 @@ impl<'a> BytecodeCompiler<'a> {
         let start = self.insns.len();
         let start_reg = self.next_reg;
         let saved_reason = self.bail_reason;
-        if let Some((id, lo_reg, w)) = self.packed_path_dyn_range(lhs) {
-            let (hi_reg, resized) = self.packed_path_store_regs(lo_reg, w, val_reg);
+        if let Some((id, target)) = self.packed_path_dyn_range(lhs) {
             let sig = as_sig_id(id);
+            let (lo_reg, w) = match target {
+                PackedPathTarget::Range(lo, w) => (lo, w),
+                PackedPathTarget::Slots(run) => {
+                    self.emit_slot_run_store(sig, run, val_reg, nba);
+                    return true;
+                }
+            };
+            let (hi_reg, resized) = self.packed_path_store_regs(lo_reg, w, val_reg);
             self.emit(if nba {
                 Insn::NbaAssignRangeDyn(sig, hi_reg, lo_reg, resized)
             } else {
@@ -21098,6 +21501,14 @@ impl<'a> BytecodeCompiler<'a> {
                     return false;
                 }
                 if let ExprKind::Ident(hier) = &expr.kind {
+                    // §7.4.1, §7.4.3: on a multi-D PACKED vector the labels
+                    // count ELEMENTS (`pv[4:3] <= v` on `logic [5:0][7:0] pv`
+                    // is 16 bits) — the interpreter's element-aware store, as
+                    // in the blocking arm. The bit range below wrote 2 bits.
+                    if self.packed_elem_width_of(hier).is_some() {
+                        self.bail("nba_range_packed_multid");
+                        return false;
+                    }
                     if let Some(id) = self.lookup_signal_id(hier) {
                         // §7.4.1: rebase declared indices to physical offsets
                         // for a non-zero-based vector (see the blocking arm).
@@ -21183,6 +21594,18 @@ impl<'a> BytecodeCompiler<'a> {
                             }
                         }
                     }
+                }
+                // §7.4.3: after an index into a multi-D packed value the
+                // labels count ELEMENTS of the next dimension; the arms below
+                // place bit ranges. The packed path scales them, else the
+                // interpreter's store does.
+                if !matches!(expr.kind, ExprKind::Ident(_)) && self.part_select_elem(expr).is_some()
+                {
+                    if self.try_packed_path_nba(lhs, val_reg) {
+                        return true;
+                    }
+                    self.bail("nba_range_elem_slice");
+                    return false;
                 }
                 if let Some(id) = self.flattened_outer_const_signal_id(expr) {
                     match kind {
@@ -22496,6 +22919,19 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
+                // §7.4.3: after an index into a multi-D packed value the
+                // labels count ELEMENTS of the next dimension; the arms below
+                // place bit ranges (`assign a[0][5:0] = b` on
+                // `logic [3:0][5:0][7:0] a` wrote bits 5..0 of `a[0]`). The
+                // packed path scales them, else the interpreter's store does.
+                if !matches!(expr.kind, ExprKind::Ident(_)) && self.part_select_elem(expr).is_some()
+                {
+                    if self.try_packed_path_blocking(lhs, val_reg) {
+                        return true;
+                    }
+                    self.bail("blocking_range_elem_slice");
+                    return false;
+                }
                 if let Some(id) = self.flattened_outer_const_signal_id(expr) {
                     match kind {
                         RangeKind::Constant => {
@@ -22904,24 +23340,35 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             }
             ExprKind::RangeSelect {
-                left, right, kind, ..
-            } => match kind {
-                RangeKind::IndexedUp | RangeKind::IndexedDown => {
-                    self.eval_const_expr(right).unwrap_or(32)
+                expr: base,
+                left,
+                right,
+                kind,
+            } => {
+                let count = match kind {
+                    RangeKind::IndexedUp | RangeKind::IndexedDown => self.eval_const_expr(right),
+                    RangeKind::Constant => self
+                        .eval_const_bound(left)
+                        .zip(self.eval_const_bound(right))
+                        .map(|(l, r)| {
+                            // Signed bounds: `x[4:-1]` is 6 bits wide, not the
+                            // u32-wrapped 4294967292 that clamped to the cap.
+                            let (hi, lo) = if l >= r { (l, r) } else { (r, l) };
+                            (hi - lo + 1).clamp(1, u32::MAX as i64) as u32
+                        }),
+                };
+                match count {
+                    // §7.4.3: `count` whole elements of the selected
+                    // dimension. Sizing the target by the label count wrote
+                    // 6 of the 48 bits of `assign a[0][5:0] = b` on
+                    // `logic [3:0][5:0][7:0] a`.
+                    Some(n) => match self.part_select_elem(base) {
+                        Some((_, ew)) => n.saturating_mul(ew),
+                        None => n,
+                    },
+                    None => 32,
                 }
-                RangeKind::Constant => {
-                    if let (Some(l), Some(r)) =
-                        (self.eval_const_bound(left), self.eval_const_bound(right))
-                    {
-                        // Signed bounds: `x[4:-1]` is 6 bits wide, not the
-                        // u32-wrapped 4294967292 that clamped to the cap.
-                        let (hi, lo) = if l >= r { (l, r) } else { (r, l) };
-                        (hi - lo + 1).clamp(1, u32::MAX as i64) as u32
-                    } else {
-                        32
-                    }
-                }
-            },
+            }
             ExprKind::Concatenation(parts) => parts.iter().map(|p| self.infer_lhs_width(p)).sum(),
             // §11.6.1: a heap-field store's context is the field's declared
             // width, for every admitted receiver, not just `this`, so
@@ -24077,12 +24524,14 @@ impl<'a> BytecodeCompiler<'a> {
                 kind,
                 ..
             } => {
+                // §7.4.3: a select of whole elements is that many elements wide.
+                let ew = self.part_select_elem(base).map_or(1, |(_, w)| w);
                 match kind {
                     RangeKind::Constant => {
                         if let (Some(l), Some(r)) =
                             (self.eval_const_bound(left), self.eval_const_bound(right))
                         {
-                            ((l as i64 - r as i64).unsigned_abs() as u32) + 1
+                            (((l as i64 - r as i64).unsigned_abs() as u32) + 1).saturating_mul(ew)
                         } else {
                             // Fallback when bounds aren't const-evaluable:
                             // use the base signal's full width. Returning a
@@ -24093,6 +24542,7 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     RangeKind::IndexedUp | RangeKind::IndexedDown => self
                         .eval_const_expr(right)
+                        .map(|n| n.saturating_mul(ew))
                         .unwrap_or_else(|| self.expr_max_width(base)),
                 }
             }
