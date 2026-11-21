@@ -384,8 +384,50 @@ impl Simulator {
                         Value::from_string(&text)
                     }
                     'f' | 'e' | 'g' => {
-                        let text =
-                            input.token(self, w, |c| c.is_ascii_digit() || "+-.eE".contains(c));
+                        // Table 21-7 (§21.3.4.3): a sign may start the field or
+                        // follow the exponent marker. A point belongs to the
+                        // mantissa, and each part must contain digits.
+                        let mut text = String::new();
+                        let mut sign_allowed = true;
+                        let mut point = false;
+                        let mut exponent = false;
+                        let mut digits = false;
+                        for _ in 0..w {
+                            let Some(c) = input.take_if(self, |c| match c {
+                                '0'..='9' => {
+                                    digits = true;
+                                    true
+                                }
+                                '+' | '-' => sign_allowed,
+                                '.' if !point && !exponent => {
+                                    point = true;
+                                    true
+                                }
+                                'e' | 'E' if !exponent && digits => {
+                                    exponent = true;
+                                    digits = false;
+                                    true
+                                }
+                                _ => false,
+                            }) else {
+                                break;
+                            };
+                            sign_allowed = matches!(c, 'e' | 'E');
+                            text.push(c);
+                        }
+                        if !digits {
+                            // Keep the existing file position and EOF behavior
+                            // for a malformed mantissa or incomplete exponent.
+                            for _ in text.len()..w {
+                                if input
+                                    .take_if(self, |c| c.is_ascii_digit() || "+-.eE".contains(c))
+                                    .is_none()
+                                {
+                                    break;
+                                }
+                            }
+                            break;
+                        }
                         let Ok(value) = text.parse::<f64>() else {
                             break;
                         };
