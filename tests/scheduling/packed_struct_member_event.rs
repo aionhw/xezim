@@ -147,3 +147,25 @@ endmodule
         ]
     );
 }
+
+/// §9.4.2, §7.2.1: watching a member may not replace another signal
+/// even when its legal identifier resembles a generated alias.
+#[test]
+fn packed_member_edge_preserves_declared_signal() {
+    let got = lines(r#"
+module top;
+  typedef struct packed { logic clock_bit; logic sibling; } bus_t;
+  bus_t bus;
+  logic [7:0] __xz_edgesel0 = 8'ha5;
+  int count = 0;
+  always @(posedge bus.clock_bit) count++;
+  initial begin
+    bus = '0;
+    #1 bus.sibling = 1;
+    #1 bus.clock_bit = 1;
+    #1 $display("count=%0d declared=%h", count, __xz_edgesel0);
+  end
+endmodule
+"#);
+    assert_eq!(got, ["count=1 declared=a5"]);
+}
