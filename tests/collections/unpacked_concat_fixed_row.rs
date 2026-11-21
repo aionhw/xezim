@@ -307,3 +307,27 @@ endmodule
         ],
     );
 }
+
+#[test]
+fn class_property_is_the_only_multidimensional_array() {
+    check(
+        r#"
+module top;
+  class holder;
+    int rows[2][2];
+  endclass
+  holder obj;
+  int dst[3];
+  initial begin
+    obj = new;
+    obj.rows[1][0] = 31;
+    obj.rows[1][1] = 42;
+    dst = {obj.rows[1], 53};
+    $display("T|class-only %0d %0d %0d", dst[0], dst[1], dst[2]);
+    $finish;
+  end
+endmodule
+"#,
+        &["T|class-only 31 42 53"],
+    );
+}

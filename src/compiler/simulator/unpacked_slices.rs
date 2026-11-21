@@ -412,7 +412,9 @@ impl Simulator {
     ) -> Option<UnpackedLayout<'e>> {
         let e = Self::unparen(e);
         if !matches!(e.kind, ExprKind::Index { .. })
-            || (self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty())
+            || (self.module.arrays_2d.is_empty()
+                && self.module.arrays_nd.is_empty()
+                && self.module.classes.is_empty())
         {
             return None;
         }
