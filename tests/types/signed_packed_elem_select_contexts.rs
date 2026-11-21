@@ -192,3 +192,54 @@ endmodule"#,
     );
     assert!(lines.contains(&"extended=-1887"), "{lines:?}");
 }
+
+#[test]
+fn signed_lane_in_collection_formals_interfaces_and_generate_arrays() {
+    let sim = simulate(r#"
+typedef logic signed [4:0] lane_t;
+typedef logic signed [11:0] result_t;
+typedef struct packed { lane_t [0:1] lanes; bit flag; } packet_t;
+interface bus;
+  lane_t [0:1] lanes;
+  lane_t [0:1] rows [1];
+  packet_t p;
+endinterface
+class reader;
+  virtual bus b;
+  function result_t sig(); return result_t'(b.lanes[1]); endfunction
+  function result_t field(); return result_t'(b.p.lanes[1]); endfunction
+  function result_t fixed_row(input lane_t [0:1] a [1]); return result_t'(a[0][1]); endfunction
+  function result_t queue_row(input lane_t [0:1] a [$]); return result_t'(a[0][1]); endfunction
+  function result_t dynamic_row(input lane_t [0:1] a []); return result_t'(a[0][1]); endfunction
+  function result_t assoc_row(input lane_t [0:1] a [int]); return result_t'(a[0][1]); endfunction
+endclass
+module top;
+  bus b();
+  reader obj;
+  lane_t [0:1] fixed_rows[1], queue_rows[$], dynamic_rows[], assoc_rows[int];
+  for (genvar i=0; i<2; i++) begin : g
+    lane_t [0:1] lanes;
+    initial lanes = {5'd6, 5'b11101};
+  end
+  initial begin
+    obj = new;
+    obj.b = b;
+    b.lanes = {5'd6, 5'b11101};
+    b.p.lanes = b.lanes;
+    b.rows[0] = b.lanes;
+    fixed_rows[0] = b.lanes;
+    queue_rows.push_back(b.lanes);
+    dynamic_rows = new[1];
+    dynamic_rows[0] = b.lanes;
+    assoc_rows[0] = b.lanes;
+    #1;
+    $display("methods %0d %0d %0d %0d", obj.fixed_row(fixed_rows), obj.queue_row(queue_rows),
+             obj.dynamic_row(dynamic_rows), obj.assoc_row(assoc_rows));
+    $display("paths %0d %0d %0d %0d", obj.sig(), obj.field(), result_t'(b.rows[0][1]),
+             result_t'(g[1].lanes[1]));
+  end
+endmodule
+"#, 100).expect("simulate");
+    let out: Vec<_> = sim.output.iter().map(|line| line.message.as_str()).collect();
+    assert_eq!(out, ["methods -3 -3 -3 -3", "paths -3 -3 -3 -3"]);
+}
