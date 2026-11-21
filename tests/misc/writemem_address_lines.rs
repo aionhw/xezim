@@ -137,6 +137,31 @@ endmodule
     );
 }
 
+/// Clipping a requested range still computes the first address marker from
+/// the first word actually written.
+#[test]
+fn writemem_clips_ranges_in_both_directions() {
+    let dir = scratch("clipped");
+    let up = dir.join("up.hex");
+    let down = dir.join("down.hex");
+    let sv = r#"
+module t;
+  logic [7:0] mem [4:6];
+  initial begin
+    mem = '{8'ha4, 8'hb5, 8'hc6};
+    $writememh("@UP@", mem, -10000, 5);
+    $writememh("@DOWN@", mem, 10000, 5);
+  end
+endmodule
+"#
+    .replace("@UP@", up.to_str().unwrap())
+    .replace("@DOWN@", down.to_str().unwrap());
+    t_lines(&sv);
+    assert_eq!(read(&up), "a4\nb5\n");
+    assert_eq!(read(&down), "@6\nc6\nb5\n");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// An associative array writes an address line where its keys skip; a
 /// multidimensional array is addressed by element (§21.4.3).
 #[test]
