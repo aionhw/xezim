@@ -473,6 +473,8 @@ mod issue_233_parenless_calls;
 mod multi_dim_unpacked_arrays;
 #[path = "types/nettype_struct_variable_driver.rs"]
 mod nettype_struct_variable_driver;
+#[path = "types/nettype_undriven.rs"]
+mod nettype_undriven;
 #[path = "types/package_data_members_in_subroutine.rs"]
 mod package_data_members_in_subroutine;
 #[path = "types/package_param_declared_signedness.rs"]
