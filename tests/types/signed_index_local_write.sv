@@ -52,6 +52,15 @@ module top;
     return r;
   endfunction
 
+  function automatic [7:0] place_wide(input logic signed [79:0] i);
+    logic [7:0] r;
+    r = 0;
+    r[i] = 1'b1;
+    return r;
+  endfunction
+
+  logic signed [79:0] wide_index;
+  wire [7:0] wide_placed = place_wide(wide_index);
   logic signed [2:0] narrow;
   wire [7:0] placed = place(narrow);
   wire [7:0] w_rev = reverse_bits(a);
@@ -63,8 +72,10 @@ module top;
   integer n_rev, n_copy, n_shift, n_top, n_unsigned;
   integer k;
   initial begin
+    wide_index = 80'h0100_0000_0000_0000_0001;
     narrow = -1;
     #1;
+    if (wide_placed !== 0) $fatal(1, "high index bits were discarded");
     if (placed !== 0) $fatal(1, "narrow negative index set bit 7");
     narrow = 3'bx01;
     #1;
