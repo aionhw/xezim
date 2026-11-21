@@ -411,3 +411,5 @@ mod pattern_self_read_scopes;
 mod queue_pop_drain_loop_1210;
 #[path = "collections/unpacked_concat_targets.rs"]
 mod unpacked_concat_targets;
+#[path = "collections/concat_operand_effects.rs"]
+mod concat_operand_effects;

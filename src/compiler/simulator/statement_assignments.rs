@@ -748,6 +748,96 @@ impl Simulator {
                 .filter(|an| !self.is_associative_array(an))
         })
     }
+    /// Snapshot the operands before replacing any destination elements (§10.10).
+    fn assign_unpacked_concat(&mut self, lname: &str, exprs: &[Expression]) {
+        let is_dyn = self.module.dynamic_arrays.contains(lname) || self.class_queue_prop(lname);
+        // IEEE 1800 §10.10.1: in an unpacked-array
+        // concatenation each item is read in the context of
+        // the ELEMENT type, so a nested plain-brace concat
+        // is itself an array value whose elements SPLICE
+        // into the outer one — `a = {1, {2, 3}}` assigns
+        // `{1, 2, 3}` — i.e. nested braces flatten. Only
+        // flatten when the element type is not itself an
+        // array (for a multi-dimensional target an inner
+        // brace denotes one whole sub-array element).
+        // Assignment patterns `'{...}` never flatten; they
+        // are handled separately.
+        fn flatten_unpacked_concat<'a>(
+            exprs: &'a [Expression],
+            out: &mut Vec<&'a Expression>,
+        ) {
+            for e in exprs {
+                if let ExprKind::Concatenation(inner) = &e.kind {
+                    flatten_unpacked_concat(inner, out);
+                } else {
+                    out.push(e);
+                }
+            }
+        }
+        let elem_is_scalar = self.foreach_dims(lname).is_none_or(|d| d.len() == 1);
+        let items: Vec<&Expression> = if elem_is_scalar {
+            let mut v = Vec::new();
+            flatten_unpacked_concat(exprs, &mut v);
+            v
+        } else {
+            exprs.iter().collect()
+        };
+        // §10.10 / §7.8: in a queue (or array) of ASSOCIATIVE
+        // arrays, an associative operand (`q = {src}`) is one
+        // whole element: its entries are copied into it.
+        // Evaluated as one value, the element kept no entries.
+        let assoc_srcs: Vec<Option<String>> =
+            if self.module.associative_arrays.is_empty() {
+                Vec::new()
+            } else {
+                items.iter().map(|e| self.assoc_value_operand(e)).collect()
+            };
+        if assoc_srcs.iter().any(Option::is_some) {
+            let lo = self.module.arrays.get(lname).map_or(0, |t| t.0);
+            for (i, (e, src)) in items.iter().zip(assoc_srcs).enumerate() {
+                let elem = format!("{}[{}]", lname, lo + i as i64);
+                match src {
+                    Some(src) => self.store_assoc_elem(&elem, &src),
+                    None => {
+                        let v = self.eval_expr(e);
+                        self.set_signal_value_by_name(&elem, v);
+                    }
+                }
+            }
+            if is_dyn {
+                self.set_queue_size(lname, items.len() as u64);
+            }
+            return;
+        }
+        // Expand queue/array elements in concat (e.g. q = {q, 4})
+        let all_vals = self.unpacked_concat_operand_values(items);
+        let (lo, hi, _w) = self
+            .module
+            .arrays
+            .get(lname)
+            .copied()
+            .unwrap_or((0, -1, 32));
+        let n_vals = all_vals.len();
+        for (i, v) in all_vals.into_iter().enumerate() {
+            let idx = lo + i as i64;
+            // Dynamic arrays/queues grow to fit; only fixed
+            // arrays are bounded by their declared range.
+            if !is_dyn && idx > hi {
+                break;
+            }
+            // §10.10: each item is an element-typed value.
+            let v = if is_dyn {
+                self.fit_queue_push_elem(lname, v)
+            } else {
+                v
+            };
+            self.set_signal_value_by_name(&format!("{}[{}]", lname, idx), v);
+        }
+        if is_dyn {
+            self.set_queue_size(lname, n_vals as u64);
+        }
+    }
+
     /// The extra conditions for `n = r` (both bare names) to reduce to a
     /// plain evaluate + assign: no `new`, no vif binding to carry, no
     /// struct copy or spread, and no collection / array / associative copy
@@ -1654,6 +1744,10 @@ impl Simulator {
                 self.exec_stmt_blocking_assign_body(stmt, &new_lhs, &new_rhs);
                 return;
             }
+        }
+        if self.assign_class_scalar_row(lvalue, rvalue) {
+            self.settle_after_proc_write();
+            return;
         }
         // #1108: a whole array member of an instance-array element on either
         // side (`w = lane[0].payload`, `lane[1].payload = '{...}`).
@@ -4223,6 +4317,26 @@ impl Simulator {
             }
             _ => None,
         };
+        if let ExprKind::Concatenation(parts) = &rvalue.kind
+            && let ExprKind::Ident(hier) = &lvalue.kind
+            && hier.path.iter().all(|part| part.selects.is_empty())
+            && !self.ident_shadowed_by_non_collection(hier)
+        {
+            let name = self.resolve_hier_name(hier);
+            let name = self.instance_assoc_member(&name).unwrap_or_else(|| name.into_owned());
+            let target = if self.module.arrays.contains_key(&name) {
+                Some(name)
+            } else {
+                self.expr_assoc_name(lvalue).filter(|n| {
+                    self.class_queue_prop(n) || self.module.arrays.contains_key(n)
+                })
+            };
+            if let Some(name) = target {
+                self.assign_unpacked_concat(&name, parts);
+                self.settle_after_proc_write();
+                return;
+            }
+        }
         // §8.8: `lhs = C::new(...)` builds a `C`, not the class `lhs` is
         // declared with (the `new` branch below), and the bare `C::new`
         // constructs too rather than reading a name.
@@ -4767,7 +4881,7 @@ impl Simulator {
             }
         }
         if let ExprKind::Ident(lhier) = &lvalue.kind {
-            let mut lname = if self.ident_shadowed_by_non_collection(lhier) {
+            let lname = if self.ident_shadowed_by_non_collection(lhier) {
                 std::borrow::Cow::Borrowed("")
             } else {
                 let mut n = self.resolve_hier_name(lhier);
@@ -4778,25 +4892,7 @@ impl Simulator {
                 }
                 n
             };
-            // §10.10: a class queue / dynamic-array member (`<handle>#q`)
-            // has no `arrays` row, but `obj.q = {obj.q, v}` is the same
-            // unpacked-array concatenation.
-            let mut class_dyn = false;
-            if matches!(rvalue.kind, ExprKind::Concatenation(_))
-                && !self.module.arrays.contains_key(&*lname)
-                && let Some(n) = self.expr_assoc_name(lvalue)
-            {
-                if self.class_queue_prop(&n) {
-                    lname = std::borrow::Cow::Owned(n);
-                    class_dyn = true;
-                } else if self.module.arrays.contains_key(&n) {
-                    // §8.9: a static queue or dynamic array reached
-                    // through an object (`h.sq = {h.sq, v}`) is the
-                    // class's store.
-                    lname = std::borrow::Cow::Owned(n);
-                }
-            }
-            if self.module.arrays.contains_key(&*lname) || class_dyn {
+            if self.module.arrays.contains_key(&*lname) {
                 // Queue/array slice assignment: lq = rq[a:b]
                 if let ExprKind::RangeSelect {
                     expr: rbase,

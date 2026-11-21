@@ -176,3 +176,29 @@ endmodule
     .expect("a reserved bin name must not parse");
     assert!(err.contains("expected a bin name, found 'small'"), "{err}");
 }
+
+/// §6.24.1 and §19.5: the real cast belongs to the sampled expression.
+#[test]
+fn sample_real_cast_coverpoint() {
+    let output = lines(
+        r#"
+module top;
+  int x;
+  covergroup cg;
+    cp: coverpoint real'(x) { bins three = {3.0}; }
+    seen: coverpoint x { bins three = {3}; }
+  endgroup
+  cg c;
+  initial begin
+    c = new;
+    x = 3;
+    #1;
+    c.sample();
+    $display("sampled=%0.0f", c.seen.get_inst_coverage());
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert_line(&output, "sampled=100");
+}

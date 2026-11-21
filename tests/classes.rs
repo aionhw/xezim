@@ -382,6 +382,8 @@ mod covergroup_options;
 mod covergroup_placement;
 #[path = "classes/covergroup_queries.rs"]
 mod covergroup_queries;
+#[path = "classes/covergroup_real_bins.rs"]
+mod covergroup_real_bins;
 #[path = "classes/covergroup_sample_args.rs"]
 mod covergroup_sample_args;
 #[path = "classes/covergroup_sampling_event.rs"]
@@ -1361,3 +1363,5 @@ mod multidim_property_pattern_init;
 mod static_string_queue_percent_p;
 #[path = "classes/typename_specialized_property.rs"]
 mod typename_specialized_property;
+#[path = "classes/queue_row_name_collision.rs"]
+mod queue_row_name_collision;

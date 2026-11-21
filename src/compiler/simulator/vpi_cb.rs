@@ -814,6 +814,7 @@ impl Simulator {
                 if self.finished || self.zero_delay_defer_pending {
                     break;
                 }
+                self.drain_active_driver_updates();
                 self.drain_condition_waiters(true, false);
                 if self.event_queue.next_time() == Some(now) {
                     continue;

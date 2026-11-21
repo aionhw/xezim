@@ -688,6 +688,7 @@ impl Simulator {
             // and run BEFORE this slot's NBA region — loop again at the same
             // time without applying NBAs yet. Settle first so they observe
             // completed active-region (cont-assign) state.
+            self.drain_active_driver_updates();
             if self.promote_inactive_to_active() && self.event_queue.next_time() == Some(self.time)
             {
                 if self.dirty_any {

@@ -193,6 +193,12 @@ fn design_cache_key(
     // Re-elaborate designs validated before duplicate package/typedef/interface
     // diagnostics (§3.13, §6.18, §25.3, §26.2) were added.
     hash.text("qualified-package-array-storage-and-pr-validation-v3");
+    // §6.20.2, §27.5: preserve resolved parameter bounds and generated types.
+    hash.text("scoped-value-parameter-types-v2");
+    // §11.2.1/§27.5: validate folded indices in package parameter generate conditions.
+    hash.text("scoped-generate-constant-selects-v1");
+    // §6.8/§7.2.1: cached initial values include the state domain of packed members.
+    hash.text("packed-struct-member-array-defaults-v1");
     hash.text(env!("CARGO_PKG_VERSION"));
     hash.text(&config.semantic_salt);
     hash.bytes(&xezim_core::elaborate::max_packed_width().to_le_bytes());
@@ -201,6 +207,8 @@ fn design_cache_key(
     // must not serve a run that may observe them.
     hash.bytes(&[xezim_core::elaborate::port_elision_requested() as u8]);
     hash.bytes(&[xezim_core::elaborate::vpi_net_drivers() as u8]);
+    // Prepared gate entries bake in the structural delay mode.
+    hash.bytes(&[compiler::simulator::delay_mode()]);
     // A run that downgraded driver conflicts to warnings must not serve one
     // that reports them as errors.
     hash.bytes(&[xezim_core::elaborate::relax_driver_conflicts() as u8]);

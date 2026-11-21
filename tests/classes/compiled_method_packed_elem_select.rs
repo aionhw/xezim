@@ -32,3 +32,31 @@ fn compiled_method_packed_elem_select() {
         ]
     );
 }
+
+/// §7.4.5, §7.10: the outer index selects a row, the inner one an entire
+/// integer. Accumulation must read the same cells as a direct display.
+#[test]
+fn method_queue_of_unpacked_rows() {
+    assert_eq!(t_lines(r#"
+module top;
+  typedef int pair_t[2];
+  class K;
+    pair_t q[$];
+    function int sum_foreach();
+      foreach (q[j]) sum_foreach += q[j][1];
+    endfunction
+    function int sum_local();
+      int s = 0;
+      for (int j = 0; j < q.size(); j++) s += q[j][1];
+      return s;
+    endfunction
+  endclass
+  initial begin
+    automatic K k = new;
+    k.q.push_back('{1, 2}); k.q.push_back('{3, 4});
+    $display("T|%0d %0d", k.sum_foreach(), k.sum_local());
+    $display("T|%0d %0d", k.q[0][1], k.q[1][1]);
+  end
+endmodule
+"#), ["T|6 6", "T|2 4"]);
+}

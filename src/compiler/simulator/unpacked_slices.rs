@@ -618,6 +618,14 @@ impl Simulator {
         name.and_then(|n| self.get_signal_value_by_name(n))
     }
 
+    /// A fixed-array function result can target a selected row even when
+    /// neither side has an explicit range select (§7.6, §13.4).
+    fn selected_array_call(&self, lhs: &Expression, rhs: &Expression) -> bool {
+        matches!(lhs.kind, ExprKind::Index { .. } | ExprKind::RangeSelect { .. })
+            && matches!(&Self::unparen(rhs).kind, ExprKind::Call { func, .. }
+                if self.call_returns_collection(func))
+    }
+
     /// §7.6: `lhs = rhs` when either side is a slice of an unpacked array:
     /// the elements pair left to right, the source read in full before any
     /// element is written (the two sides may overlap). False when it is not
@@ -627,7 +635,10 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) -> bool {
-        if !Self::is_range_select_chain(lvalue) && !Self::is_range_select_chain(rvalue) {
+        if !Self::is_range_select_chain(lvalue)
+            && !Self::is_range_select_chain(rvalue)
+            && !self.selected_array_call(lvalue, rvalue)
+        {
             return false;
         }
         let Some(dst) = self.unpacked_value_elems(lvalue) else {
@@ -635,7 +646,7 @@ impl Simulator {
         };
         // §10.9.1: a slice is an unpacked target, so a pattern supplies one
         // item per selected element in left-to-right order, not packed bits.
-        if let Some(values) = self.unpacked_slice_pattern_values(&dst, rvalue) {
+        if let Some(values) = self.unpacked_slice_rhs_values(&dst, rvalue) {
             for (name, value) in dst.names.iter().zip(values) {
                 if let Some(name) = name {
                     self.set_signal_value_by_name(name, value);
@@ -722,11 +733,19 @@ impl Simulator {
 
     /// Snapshot every pattern item before storing a slice: an item can read
     /// another selected element, and the two sides may overlap (§10.9.1).
-    fn unpacked_slice_pattern_values(
+    fn unpacked_slice_rhs_values(
         &mut self,
         dst: &UnpackedElems,
         rvalue: &Expression,
     ) -> Option<Vec<Value>> {
+        // A returned array is already snapshotted in declaration order.
+        // Once the call has run, a missing or differently sized result
+        // consumes the assignment without evaluating the call again.
+        let rhs = Self::unparen(rvalue);
+        if dst.selected && matches!(rhs.kind, ExprKind::Call { .. }) {
+            let values = self.unpacked_item_values(rhs)?;
+            return Some(if values.len() == dst.names.len() { values } else { Vec::new() });
+        }
         let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(rvalue).kind else {
             return None;
         };
@@ -774,11 +793,14 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) -> Option<Vec<(Expression, Value)>> {
-        if !Self::is_range_select_chain(lvalue) && !Self::is_range_select_chain(rvalue) {
+        if !Self::is_range_select_chain(lvalue)
+            && !Self::is_range_select_chain(rvalue)
+            && !self.selected_array_call(lvalue, rvalue)
+        {
             return None;
         }
         let dst = self.unpacked_value_elems(lvalue)?;
-        if let Some(values) = self.unpacked_slice_pattern_values(&dst, rvalue) {
+        if let Some(values) = self.unpacked_slice_rhs_values(&dst, rvalue) {
             return Some(
                 dst.names
                     .iter()

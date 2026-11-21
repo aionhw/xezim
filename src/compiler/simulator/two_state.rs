@@ -64,7 +64,6 @@ impl Simulator {
                 // slot lookup is fine here.
                 self.run_comb_jit_slot(eidx)
             }
-            #[cfg(feature = "jit")]
             CombPlan::Jit | CombPlan::Tpl => self.run_comb_jit_slot(eidx),
             CombPlan::Interp | CombPlan::Unresolved => false,
         }
@@ -4400,6 +4399,8 @@ impl Simulator {
                     || self.signal_signed[cid] != self.signal_signed[pid]
                     || self.signal_real[cid] != self.signal_real[pid]
                     || (self.signal_two_state[cid] && !self.signal_two_state[pid])
+                    || (self.signal_real[cid]
+                        && self.shortreal_signals.contains(&cid) != self.shortreal_signals.contains(&pid))
                 {
                     continue;
                 }
@@ -4539,6 +4540,8 @@ impl Simulator {
                         || self.signal_widths[lid] != self.signal_widths[rid]
                         || self.signal_signed[lid] != self.signal_signed[rid]
                         || self.signal_real[lid] != self.signal_real[rid]
+                        || (self.signal_real[lid]
+                            && self.shortreal_signals.contains(&lid) != self.shortreal_signals.contains(&rid))
                         || self.signal_two_state[lid] != self.signal_two_state[rid]
                         || self.signal_gate_driven.get(lid).copied().unwrap_or(false)
                     {

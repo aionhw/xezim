@@ -3015,7 +3015,7 @@ impl Simulator {
             Insn::CaseMaskJump(..) => "CaseMaskJump",
             Insn::CmpBranch(..) => "CmpBranch",
             Insn::CmpBranchConst(..) => "CmpBranchConst",
-            Insn::MoveResize(..) => "MoveResize",
+            Insn::MoveResize(..) | Insn::CastIntegral(..) => "MoveResize",
             Insn::Format(..) => "Format",
             Insn::StrOp(..) => "StrOp",
             Insn::BlockingAssignString(..) => "BlockingAssignString",

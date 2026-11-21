@@ -688,6 +688,9 @@ pub enum Insn {
     /// on and a stale element past `size()`. Main executor only: every other
     /// executor and lowering treats it like `EvalExprFallback`.
     LoadDynElem(RegId, Box<DynElemOp>, RegId),
+    /// Assignment conversion for an explicit integral cast. A real operand
+    /// must round even when its storage already has the target width.
+    CastIntegral(RegId, RegId, u32),
 }
 
 /// The collection a `LoadDynElem` reads.
@@ -927,6 +930,7 @@ impl Insn {
             }
             Move(a, b)
             | MoveResize(a, b, _)
+            | CastIntegral(a, b, _)
             | BitNot(a, b)
             | LogNot(a, b)
             | Negate(a, b)
@@ -1164,6 +1168,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::CmpBranch(..) => "CmpBr",
         Insn::CmpBranchConst(..) => "CmpBranchConst",
         Insn::MoveResize(..) => "MovRz",
+        Insn::CastIntegral(..) => "CastIntegral",
         Insn::BranchIfSignalFalse(..) => "BrSig",
         Insn::BranchUnlessZero(..) => "BrNz",
         Insn::LoadSignalBit(..) => "LoadBit",

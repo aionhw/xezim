@@ -418,6 +418,9 @@ mod enabled {
 
     pub struct JitModule {
         module: ClJitModule,
+        /// Statements whose addresses are embedded in this module’s native code.
+        /// Checkpoint restore can replace the bytecode that supplied them.
+        fallback_statements: Vec<std::sync::Arc<crate::ast::stmt::Statement>>,
         next_id: u64,
         /// JIT Stage 2 (JIT-REDESIGN-NOTES.md): when set, codegen for
         /// LoadSignal / LoadSignalSigned reads `signal_inline_bits[id*16]`
@@ -534,6 +537,7 @@ mod enabled {
             Some(Self {
                 module: ClJitModule::new(builder),
                 next_id: 0,
+                fallback_statements: Vec::new(),
                 inline_bits_ptr: None,
                 block_scope_hint: None,
                 signal_widths_snapshot: Vec::new(),
@@ -1482,9 +1486,9 @@ mod enabled {
                     }
                     // AST fallback statement: one bridge call into the
                     // interpreter, scope hint applied around it. The Arc'd
-                    // Statement pointer is baked as a constant; the owning
-                    // CompiledBlock keeps it alive for the JIT fn's life.
+                    // Statement pointer stays valid for the JIT module’s lifetime.
                     Insn::StmtFallback(payload) => {
+                        self.fallback_statements.push(payload.0.clone());
                         let stmt_ptr = std::sync::Arc::as_ptr(&payload.0) as i64;
                         let sp = builder.ins().iconst(pointer_type, stmt_ptr);
                         let (hp, hl) = self.block_scope_hint.unwrap_or((0, 0));
@@ -2565,7 +2569,7 @@ mod enabled {
             }
             // Fused Move+Resize: resize the SOURCE register's planes into
             // the destination. Same §11.8.1 sign-extension rule as Resize.
-            MoveResize(d, sr, width) => {
+            MoveResize(d, sr, width) | CastIntegral(d, sr, width) => {
                 if *width > 64 {
                     return Err(());
                 }
@@ -3058,7 +3062,7 @@ mod enabled {
             ClearSigned(r) => reg_s[*r as usize] = false,
             Concat(d, _) => reg_s[*d as usize] = false,
             Replicate(d, ..) | CaseLut(d, ..) => reg_s[*d as usize] = false,
-            MoveResize(d, sr, _) => reg_s[*d as usize] = reg_s[*sr as usize],
+            MoveResize(d, sr, _) | CastIntegral(d, sr, _) => reg_s[*d as usize] = reg_s[*sr as usize],
             CmpBranch(_, _, _, tmp, _) | CmpBranchConst(_, _, _, tmp, _) => {
                 reg_s[*tmp as usize] = false
             }
@@ -3166,7 +3170,7 @@ mod enabled {
                 set(reg_w, d, if known && total <= 64 { total } else { 0 })
             }
             Resize(d, w) => set(reg_w, d, *w),
-            MoveResize(d, _, w) => set(reg_w, d, *w),
+            MoveResize(d, _, w) | CastIntegral(d, _, w) => set(reg_w, d, *w),
             CmpBranch(_, _, _, tmp, _) | CmpBranchConst(_, _, _, tmp, _) => set(reg_w, tmp, 1),
             Replicate(d, sr, cnt) => {
                 let sw = get(reg_w, sr);
@@ -3543,6 +3547,7 @@ mod enabled {
                 | CmpBranch(..)
                 | CmpBranchConst(..)
                 | MoveResize(..)
+                | CastIntegral(..)
                 | Replicate(..)
                 | CaseLut(..)
                 | ReduceAnd(..)

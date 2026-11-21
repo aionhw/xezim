@@ -6017,30 +6017,7 @@ impl Simulator {
                         cur = inner_e.as_ref();
                     }
                     if let ExprKind::Ident(hier) = &cur.kind {
-                        let mut base_name = self.resolve_hier_name(hier);
-                        // Bare class-member N-D array inside a method:
-                        // resolve to its per-instance `<handle>#<member>`.
-                        // A member shadows a module array of the same name (§8.10).
-                        if !self.module.arrays_nd.contains_key(&*base_name)
-                            || (hier.path.len() == 1
-                                && hier.path[0].selects.is_empty()
-                                && *base_name == *hier.path[0].name.name)
-                        {
-                            if let Some(s) = self.instance_assoc_member(&base_name) {
-                                base_name = std::borrow::Cow::Owned(s);
-                            }
-                        }
-                        // `o.m[i][j][k]` on an object's member: its store is
-                        // `<handle>#m` (§7.4.5).
-                        if !self.module.arrays_nd.contains_key(&*base_name) && hier.path.len() >= 2
-                        {
-                            if let Some(s) = self
-                                .expr_assoc_name(cur)
-                                .filter(|s| self.module.arrays_nd.contains_key(s))
-                            {
-                                base_name = std::borrow::Cow::Owned(s);
-                            }
-                        }
+                        let base_name = self.multidim_array_store(hier, cur, |s, n| s.module.arrays_nd.contains_key(n));
                         if let Some((shape, w)) = self.module.arrays_nd.get(&*base_name).cloned() {
                             if rev_idxs.len() == shape.len() {
                                 let mut name = base_name.clone();
@@ -6071,29 +6048,7 @@ impl Simulator {
                 } = &expr.kind
                 {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
-                        let mut name = self.resolve_hier_name(hier);
-                        // Bare class-member 2D array inside a method:
-                        // resolve to its per-instance `<handle>#<member>`.
-                        // A member shadows a module array of the same name (§8.10).
-                        if !self.module.arrays_2d.contains_key(&*name)
-                            || (hier.path.len() == 1
-                                && hier.path[0].selects.is_empty()
-                                && *name == *hier.path[0].name.name)
-                        {
-                            if let Some(s) = self.instance_assoc_member(&name) {
-                                name = std::borrow::Cow::Owned(s);
-                            }
-                        }
-                        // `o.m[i][j]` on an object's member: its store is
-                        // `<handle>#m` (§7.4.5).
-                        if !self.module.arrays_2d.contains_key(&*name) && hier.path.len() >= 2 {
-                            if let Some(s) = self
-                                .expr_assoc_name(inner_expr)
-                                .filter(|s| self.module.arrays_2d.contains_key(s))
-                            {
-                                name = std::borrow::Cow::Owned(s);
-                            }
-                        }
+                        let name = self.multidim_array_store(hier, inner_expr, |s, n| s.module.arrays_2d.contains_key(n));
                         if self.module.arrays_2d.contains_key(&*name) {
                             // §11.5.1: an x/z index reads an all-x element.
                             let (Some(i), Some(j)) = (

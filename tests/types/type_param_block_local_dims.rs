@@ -256,3 +256,24 @@ endmodule
         );
     }
 }
+
+#[test]
+fn local_alias_of_a_dimensioned_type_parameter() {
+    let got = lines(r#"
+module child #(parameter type T = logic) (output int width);
+  function automatic int size_of_pair();
+    typedef T [1:0] pair_t;
+    pair_t pair;
+    return $bits(pair);
+  endfunction
+  initial width = size_of_pair();
+endmodule
+module top;
+  int a, b;
+  child #(.T(logic [5:0])) one(a);
+  child #(.T(logic [12:0])) two(b);
+  initial #1 $display("aliases %0d %0d", a, b);
+endmodule
+"#);
+    assert!(got.iter().any(|s| s == "aliases 12 26"), "{got:?}");
+}

@@ -4796,7 +4796,10 @@ impl Simulator {
                     return Self::sv_string_cast(&v);
                 }
                 if self.dt_is_real(&dt) {
-                    return Value::from_f64(v.to_f64());
+                    let f = v.to_f64();
+                    return Value::from_f64(if matches!(self.resolve_dt(&dt), crate::ast::types::DataType::Real {
+                        kind: crate::ast::types::RealType::ShortReal, ..
+                    }) { f as f32 as f64 } else { f });
                 }
                 // §6.24.1: a type cast to an UNPACKED ARRAY / QUEUE target
                 // (e.g. `bit_q_t'(stream)`) yields an unpacked collection.
@@ -5468,7 +5471,7 @@ impl Simulator {
                 // $set_randstate.
                 Value::from_string(&self.rng.to_state_string())
             }
-            "$typename" => {
+            "$typename" | "$__xz_scoped_typename" => {
                 // §20.6.1: a typed pattern has the type that prefixes it.
                 if let Some(ExprKind::TypedPattern { ty, .. }) = args.first().map(|a| &a.kind) {
                     return Value::from_string(&self.typename_of_dt(ty));
@@ -5505,6 +5508,11 @@ impl Simulator {
                                 return Value::from_string(kw);
                             }
                         }
+                    }
+                    // §6.20.2: a typed parameter can be real, shortreal or
+                    // integral independently of its initializer's type.
+                    if let Some(t) = self.typename_parameter_text(arg, name == "$__xz_scoped_typename") {
+                        return Value::from_string(&t);
                     }
                     // §20.6.1: an expression of type real — a real or time
                     // literal (§5.8: `1ns` is realtime), real arithmetic, a

@@ -46,7 +46,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // and value expressions of an event term are shared.
 // §9.2.2.2: Simulator::comb_time0_held, CombEntryCold::time0_effects.
 // §16.4.2: DeferredReport::stat_key, ::stat_kind and ::stat_loc, counted when the report matures.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x14";
+// §19.5: covergroup instances retain the real-valued coverpoint set.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x21";
 
 #[derive(Default)]
 struct Session {
@@ -954,6 +955,13 @@ impl Simulator {
             let has_xz = std::mem::take(&mut self.signal_has_xz);
             self.checkpoint_decode_state(&mut fields)?;
             self.restore_class_width_ranges();
+            // Resolve backend choices against this run's available native slots.
+            // Keep two-state islands, which carry their portable instructions.
+            for plan in &mut self.comb_plan {
+                if matches!(plan, CombPlan::Jit | CombPlan::Tpl | CombPlan::Interp) {
+                    *plan = CombPlan::Unresolved;
+                }
+            }
             self.refill_inline_bits(inline_bits)?;
             refill_in_place(&mut self.signal_has_xz, has_xz, "signal_has_xz")?;
             #[cfg(feature = "jit")]

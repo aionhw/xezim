@@ -140,7 +140,7 @@ fn syscall_reads_only(name: &str) -> bool {
             | "$exit"
             | "$test$plusargs"
             | "$urandom_range"
-            | "$typename"
+            | "$typename" | "$__xz_scoped_typename"
             | "$ln"
             | "$log10"
             | "$exp"

@@ -100,6 +100,111 @@ impl Simulator {
         true
     }
 
+    /// §7.6, §10.9.1, §10.10: a class member's fixed-size row lives in
+    /// the object's indexed leaf cells, including under a queue or dynamic
+    /// outer dimension. Snapshot the RHS before changing any destination.
+    pub(super) fn assign_class_scalar_row(&mut self, lhs: &Expression, rhs: &Expression) -> bool {
+        if self.module.arrays_2d.is_empty() || self.no_class_objects() {
+            return false;
+        }
+        if !matches!(&lhs.kind, ExprKind::Index { .. })
+            && !matches!(&lhs.kind, ExprKind::Ident(h) if h.path.last().is_some_and(|p| !p.selects.is_empty()))
+        {
+            return false;
+        }
+        let (base, selects) = Self::split_row_selects(lhs);
+        let [index] = selects.as_slice() else {
+            return false;
+        };
+        let Some(name) = self.expr_assoc_name(&base) else {
+            return false;
+        };
+        if Self::class_storage_owner(&name).is_none() {
+            return false;
+        }
+        let Some(&(outer, inner, width)) = self.module.arrays_2d.get(&name) else {
+            return false;
+        };
+        let Some(dt) = self.class_member_coll_type(&name).cloned() else {
+            return false;
+        };
+        if self.unpacked_struct_of(&dt).is_some() {
+            return false;
+        }
+        // A dynamic dimension may be omitted from the declared bounds.
+        let (left, right) = self
+            .unpacked_decl_dims_of(&name)
+            .and_then(|d| d.last().copied())
+            .unwrap_or(inner);
+        let mut positions: Vec<_> = (inner.0..=inner.1).collect();
+        if left > right {
+            positions.reverse();
+        }
+        let values: Vec<(i64, Value)> = match &self.unpacked_pattern(rhs).kind {
+            ExprKind::AssignmentPattern(items) => {
+                let items = self.pattern_elems_for_type(items, &positions, &dt);
+                positions
+                    .into_iter()
+                    .zip(items)
+                    .filter_map(|(j, item)| {
+                        Some((j, self.eval_pattern_leaf_value(&dt, item?, Some(width))))
+                    })
+                    .collect()
+            }
+            kind => {
+                let vals = if let ExprKind::Concatenation(items) = kind {
+                    self.unpacked_concat_operand_values(items.iter().collect())
+                } else if let Some((src, suffixes, _)) = self.nd_array_operand(rhs) {
+                    suffixes
+                        .iter()
+                        .map(|s| {
+                            self.get_signal_value_by_name(&format!("{src}{s}"))
+                                .unwrap_or_else(|| Value::new(width))
+                        })
+                        .collect()
+                } else {
+                    return false;
+                };
+                let ty = self.resolve_dt_ref(&dt);
+                let real = self.dt_is_real(&dt);
+                let signed = self.type_is_signed_concrete(&dt);
+                let two_state =
+                    super::elaborate::is_type_two_state_resolved(&dt, &self.module.typedef_types);
+                positions
+                    .into_iter()
+                    .zip(vals)
+                    .map(|(j, v)| {
+                        (
+                            j,
+                            Self::fit_local_decl_init(v, width, ty, two_state, real, signed),
+                        )
+                    })
+                    .collect()
+            }
+        };
+        let dynamic = self.module.dynamic_arrays.contains(&name);
+        let hi = if dynamic {
+            self.get_queue_size(&name) as i64 - 1
+        } else {
+            outer.1
+        };
+        self.dollar_bound.push(hi);
+        let selected = self.eval_expr(index);
+        self.dollar_bound.pop();
+        let i = if dynamic && self.is_queue_store(&name) {
+            self.prepare_sequence_write(&name, &selected)
+        } else {
+            let low = if dynamic { 0 } else { outer.0 };
+            selected.to_index().filter(|i| (low..=hi).contains(i))
+        };
+        if let Some(i) = i {
+            for (j, value) in values {
+                self.set_signal_value_by_name(&format!("{name}[{i}][{j}]"), value);
+            }
+        }
+        true
+    }
+
     /// `c.m[1]` / `c.m[1][2]` (either parse shape) as the unselected member
     /// expression and its index selects, outermost first. Range selects and
     /// anything else come back whole, with no selects.
@@ -1144,19 +1249,16 @@ impl Simulator {
         Option<&'a Expression>,
         bool,
     )> {
-        let members: Vec<(String, DataType, Vec<crate::ast::types::UnpackedDimension>)> = su
-            .members
-            .iter()
-            .flat_map(|m| {
-                m.declarators.iter().map(move |md| {
-                    (
-                        md.name.name.clone(),
-                        m.data_type.clone(),
-                        md.dimensions.clone(),
-                    )
-                })
-            })
-            .collect();
+        let mut members = Vec::new();
+        for m in &su.members {
+            for md in &m.declarators {
+                members.push((
+                    md.name.name.clone(),
+                    m.data_type.clone(),
+                    self.member_dims(&m.data_type, &md.dimensions).into_owned(),
+                ));
+            }
+        }
 
         let mut by_member: Vec<Option<&'a Expression>> = vec![None; members.len()];
         let mut by_type: Vec<Option<&'a Expression>> = vec![None; members.len()];
@@ -1356,6 +1458,29 @@ impl Simulator {
                         self.write_pattern_leaf(&target, v);
                         continue;
                     }
+                }
+                // §6.6.7, §7.2.2, §10.9.2: an explicit struct-valued item
+                // (including a resolver driver's nested member) supplies its
+                // own leaves. Only a scalar default broadcasts to every leaf.
+                if explicit
+                    && let ExprKind::Ident(h) = &e.kind
+                    && h.path.iter().all(|seg| seg.selects.is_empty())
+                    && let Some(inner) = self.unpacked_struct_of(&mdt)
+                    && let Some(src) = self.flat_member_name(e)
+                    && self.struct_storage_exists(&src, &inner)
+                {
+                    let leaves: Vec<_> = self.struct_leaf_suffixes(&inner)
+                        .into_iter()
+                        .map(|suffix| {
+                            let path = format!(".{suffix}");
+                            let source = Self::append_leaf_path(e, &path);
+                            (format!("{target}{path}"), self.eval_expr(&source))
+                        })
+                        .collect();
+                    for (key, value) in leaves {
+                        self.write_pattern_leaf(&key, value);
+                    }
+                    continue;
                 }
                 self.assign_pattern_or_leaf(&target, &mdt, e);
                 continue;
@@ -2052,14 +2177,15 @@ impl Simulator {
         for m in &su.members {
             let resolved = self.resolve_dt(&m.data_type);
             for md in &m.declarators {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let mbase = format!("{}.{}", base, md.name.name);
                 // §7.4.2: a member with fixed unpacked dimensions is one leaf
                 // per element, each defaulting like a scalar member; a
                 // dynamic member has no leaves to seed.
-                let leaves: Vec<String> = if md.dimensions.is_empty() {
+                let leaves: Vec<String> = if dims.is_empty() {
                     vec![mbase]
                 } else {
-                    match self.member_elem_indices(&md.dimensions) {
+                    match self.member_elem_indices(&dims) {
                         Some(tups) => tups
                             .iter()
                             .map(|t| format!("{}{}", mbase, Self::index_suffix(t)))
@@ -2137,7 +2263,8 @@ impl Simulator {
                 // element, and a nested unpacked struct per leaf: probe the
                 // first of them (a struct whose members are all arrays, like
                 // `struct { bit [7:0] m [2][2]; }`, has no `src.m` at all).
-                if let Some(lists) = self.member_dim_indices(&md.dimensions) {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
+                if let Some(lists) = self.member_dim_indices(&dims) {
                     let first: Vec<i64> = lists.iter().map(|l| l[0]).collect();
                     leaf.push_str(&Self::index_suffix(&first));
                 }
@@ -2489,9 +2616,10 @@ impl Simulator {
     ) {
         for m in &su.members {
             for md in &m.declarators {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let d = format!("{}.{}", dst, md.name.name);
                 let sname = format!("{}.{}", src, md.name.name);
-                if md.dimensions.is_empty() {
+                if dims.is_empty() {
                     if let DataType::Struct(inner) = self.resolve_dt(&m.data_type) {
                         if Self::spreads_member_wise(&inner) {
                             self.copy_unpacked_struct(&d, &sname, &inner);
@@ -2508,7 +2636,7 @@ impl Simulator {
                         );
                         self.write_struct_leaf(&d, v, is_str);
                     }
-                } else if md.dimensions.iter().any(|dim| {
+                } else if dims.iter().any(|dim| {
                     matches!(
                         dim,
                         crate::ast::types::UnpackedDimension::Unsized(_)
@@ -2524,15 +2652,15 @@ impl Simulator {
                     // saw (`pq[0].data`) — register it so `.size()`/push_back
                     // on it hit the collection paths instead of reading 0.
                     // §7.9.9: an ASSOCIATIVE member copies its entries by key.
-                    if md.dimensions.len() == 1
+                    if dims.len() == 1
                         && matches!(
-                            md.dimensions[0],
+                            dims[0],
                             crate::ast::types::UnpackedDimension::Associative { .. }
                         )
                     {
                         self.ensure_struct_member_coll(&sname);
                         if !self.ensure_struct_member_coll(&d) {
-                            let sk = self.string_keyed_dim(&md.dimensions[0]);
+                            let sk = self.string_keyed_dim(&dims[0]);
                             self.register_struct_member_coll_as(
                                 &d,
                                 StructCollKind::Assoc,
@@ -2554,7 +2682,7 @@ impl Simulator {
                         }
                     }
                     self.set_queue_size(&d, n);
-                } else if let Some(tups) = self.member_elem_indices(&md.dimensions) {
+                } else if let Some(tups) = self.member_elem_indices(&dims) {
                     // An array of unpacked STRUCTS has no element leaf of its
                     // own — each element copies member by member.
                     let elem_su = self.unpacked_struct_of(&m.data_type);
@@ -3690,8 +3818,9 @@ impl Simulator {
         let mut out = Vec::new();
         for m in &su.members {
             for md in &m.declarators {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let base = md.name.name.clone();
-                if md.dimensions.is_empty() {
+                if dims.is_empty() {
                     if let DataType::Struct(inner) = self.resolve_dt(&m.data_type) {
                         if Self::spreads_member_wise(&inner) {
                             for sfx in self.struct_leaf_suffixes(&inner) {
@@ -3701,7 +3830,7 @@ impl Simulator {
                         }
                     }
                     out.push(base);
-                } else if let Some(tups) = self.member_elem_indices(&md.dimensions) {
+                } else if let Some(tups) = self.member_elem_indices(&dims) {
                     let inner = self.unpacked_struct_of(&m.data_type);
                     for t in tups {
                         let elem = format!("{}{}", base, Self::index_suffix(&t));
@@ -3732,21 +3861,22 @@ impl Simulator {
         let mut out = Vec::new();
         for m in &su.members {
             for md in &m.declarators {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let base = md.name.name.as_str();
                 let inner = self.unpacked_struct_of(&m.data_type);
-                if md.dimensions.is_empty() {
+                if dims.is_empty() {
                     if let Some(inner) = inner {
                         for (sfx, k, dt, sk) in self.struct_coll_members(&inner) {
                             out.push((format!("{}.{}", base, sfx), k, dt, sk));
                         }
                     }
-                } else if md.dimensions.len() == 1
-                    && let Some(kind) = Self::coll_kind_of(&md.dimensions)
+                } else if dims.len() == 1
+                    && let Some(kind) = Self::coll_kind_of(&dims)
                 {
-                    let string_key = self.string_keyed_dim(&md.dimensions[0]);
+                    let string_key = self.string_keyed_dim(&dims[0]);
                     out.push((base.to_string(), kind, m.data_type.clone(), string_key));
                 } else if let (Some(inner), Some(tups)) =
-                    (inner, self.member_elem_indices(&md.dimensions))
+                    (inner, self.member_elem_indices(&dims))
                 {
                     let subs = self.struct_coll_members(&inner);
                     for t in tups {
@@ -5772,7 +5902,7 @@ impl Simulator {
                 m.declarators
                     .iter()
                     .find(|md| md.name.name == *seg)
-                    .map(|md| (m.data_type.clone(), md.dimensions.clone()))
+                    .map(|md| (m.data_type.clone(), self.member_dims(&m.data_type, &md.dimensions)))
             })?;
             dt = mdt;
             arr = self

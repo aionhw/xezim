@@ -299,6 +299,8 @@ mod shift_context_width;
 mod shift_width_and_scope_hint;
 #[path = "types/compiled_member_operand_width.rs"]
 mod compiled_member_operand_width;
+#[path = "types/shortreal_binary32.rs"]
+mod shortreal_binary32;
 #[path = "types/signedness_and_power_context.rs"]
 mod signedness_and_power_context;
 #[path = "types/size_cast_context_and_fn_return_default.rs"]
@@ -317,6 +319,7 @@ mod struct_copy_and_queue_ops;
 mod struct_member_array_of_structs_copy;
 #[path = "types/struct_member_typedef_element_dims.rs"]
 mod struct_member_typedef_element_dims;
+#[path = "types/typedef_unpacked_array_member.rs"] mod typedef_unpacked_array_member;
 #[path = "types/struct_named_patterns.rs"]
 mod struct_named_patterns;
 #[path = "types/struct_return_variable_whole_struct.rs"]
@@ -359,6 +362,8 @@ mod typedef_specialization_dispatch;
 mod typedef_two_state_and_untyped_param_sign;
 #[path = "types/typename_real_expressions.rs"]
 mod typename_real_expressions;
+#[path = "types/typename_value_parameters.rs"]
+mod typename_value_parameters;
 #[path = "types/typeparam_default_resolution.rs"]
 mod typeparam_default_resolution;
 #[path = "types/typeparam_typeid_create.rs"]
@@ -484,8 +489,12 @@ mod inside_const_members;
 mod issue_233_parenless_calls;
 #[path = "types/multi_dim_unpacked_arrays.rs"]
 mod multi_dim_unpacked_arrays;
+#[path = "types/nettype_nested_struct_drivers.rs"]
+mod nettype_nested_struct_drivers;
 #[path = "types/nettype_struct_variable_driver.rs"]
 mod nettype_struct_variable_driver;
+#[path = "types/nettype_undriven.rs"]
+mod nettype_undriven;
 #[path = "types/package_data_members_in_subroutine.rs"]
 mod package_data_members_in_subroutine;
 #[path = "types/package_param_declared_signedness.rs"]
@@ -878,3 +887,5 @@ mod class_scope_type_param_member_typedef;
 mod review_packed_slice_partial_range;
 #[path = "types/review_struct_param_cast_in_instance.rs"]
 mod review_struct_param_cast_in_instance;
+#[path = "types/shortreal_storage_1463.rs"]
+mod shortreal_storage_1463;

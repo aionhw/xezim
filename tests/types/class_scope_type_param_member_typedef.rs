@@ -208,3 +208,22 @@ endmodule
     );
     assert_has(&got, "g1: v<0=1 w<0=1 bits=8");
 }
+
+#[test]
+fn class_local_alias_chain_retains_each_specializations_width() {
+    let got = lines(&format!(
+        "{CLASSES}{}",
+        r#"
+class chain #(type T = cfg_t);
+  typedef T::hw_t original_t;
+  typedef original_t intermediate_t;
+  typedef intermediate_t result_t;
+endclass
+module top;
+  chain#(cfg2_t)::result_t narrow;
+  chain#(cfg_t)::result_t wide;
+  initial $display("alias widths %0d %0d", $bits(narrow), $bits(wide));
+endmodule"#
+    ));
+    assert_has(&got, "alias widths 16 128");
+}

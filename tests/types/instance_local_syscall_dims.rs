@@ -131,3 +131,22 @@ endmodule
         );
     }
 }
+
+#[test]
+fn local_declaration_query_and_parameter_value_share_a_dimension() {
+    let out = lines(r#"
+module leaf #(parameter int N = 16)();
+  initial begin
+    logic [4:0] local_value;
+    logic [$bits(local_value) + $clog2(N) - 1:0] mixed;
+    #1 $display("N=%0d width=%0d", N, $bits(mixed));
+  end
+endmodule
+module top;
+  leaf #(16) first();
+  leaf #(64) second();
+endmodule"#);
+    for expected in ["N=16 width=9", "N=64 width=11"] {
+        assert!(out.iter().any(|m| m == expected), "{out:?}");
+    }
+}
