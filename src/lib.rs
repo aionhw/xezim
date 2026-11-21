@@ -199,6 +199,8 @@ fn design_cache_key(
     hash.text("scoped-generate-constant-selects-v1");
     // §6.8/§7.2.1: cached initial values include the state domain of packed members.
     hash.text("packed-struct-member-array-defaults-v1");
+    // §6.10/§26.3: cached instance port connections retain their enum label binding.
+    hash.text("port-actual-enum-labels-v1");
     hash.text(env!("CARGO_PKG_VERSION"));
     hash.text(&config.semantic_salt);
     hash.bytes(&xezim_core::elaborate::max_packed_width().to_le_bytes());

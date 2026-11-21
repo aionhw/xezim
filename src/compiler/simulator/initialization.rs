@@ -1226,7 +1226,9 @@ impl Simulator {
             {
                 spellings.push(rest.to_string());
             }
-            spellings.iter().find_map(|name| {
+            for name in &spellings {
+                // A nearer standalone signal shadows a packed member of the same
+                // spelling in an outer scope. Its event already has its own signal.
                 if module.signals.contains_key(name.as_str()) {
                     return None;
                 }
@@ -1243,8 +1245,8 @@ impl Simulator {
                     }
                     cut = pos;
                 }
-                None
-            })
+            }
+            None
         }
         let mk_ident = |name: &str, span: crate::ast::Span| -> Expression {
             Expression::new(
@@ -1299,6 +1301,16 @@ impl Simulator {
             }
             deferred.push(DeferredAlways::Eager(Self::materialize_pending_always(p)));
         }
+        // A design may declare a signal with the internal alias spelling.
+        // Allocate a distinct name for every newly watched packed range.
+        let mut next_edge_alias = 0usize;
+        let mut allocate_edge_alias = || loop {
+            let name = format!("__xz_edgesel{next_edge_alias}");
+            next_edge_alias += 1;
+            if !module.signals.contains_key(name.as_str()) {
+                break name;
+            }
+        };
         let params = &module.parameters;
         let headers = always
             .iter_mut()
@@ -1393,7 +1405,7 @@ impl Simulator {
                             },
                             span,
                         );
-                        let alias = format!("__xz_edgesel{}", new_signals.len());
+                        let alias = allocate_edge_alias();
                         new_signals.push((alias.clone(), width));
                         new_assigns.push(super::elaborate::ContinuousAssignment {
                             gate_delay_fall: None,
@@ -1553,7 +1565,7 @@ impl Simulator {
                     );
                 }
                 let alias = aliases.entry(canon).or_insert_with(|| {
-                    let alias = format!("__xz_edgesel{}", new_signals.len());
+                    let alias = allocate_edge_alias();
                     new_signals.push((alias.clone(), 1));
                     new_assigns.push(super::elaborate::ContinuousAssignment {
                         delay_exprs: None,
