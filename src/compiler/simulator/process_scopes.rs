@@ -4863,6 +4863,21 @@ impl Simulator {
         applied
     }
 
+    /// A driver that evaluates to zero delay belongs to Active (§4.4.2).
+    /// Deliver its edges before an inactive continuation or NBA can observe
+    /// the old net or change the values an edge-sensitive process samples.
+    pub(super) fn drain_active_driver_updates(&mut self) {
+        if self.delayed_updates.is_empty() {
+            return;
+        }
+        let was_in_edge_cont = self.in_edge_cont;
+        self.in_edge_cont = true;
+        if self.apply_due_delayed_now() {
+            self.drain_edge_exec_rescan();
+        }
+        self.in_edge_cont = was_in_edge_cont;
+    }
+
     /// Get the next time a delayed update is due (for time advancement).
     pub(super) fn next_delayed_time(&self) -> Option<u64> {
         let a = self.delayed_updates.iter().map(|(t, _, _, _)| *t).min();

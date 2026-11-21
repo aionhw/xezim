@@ -754,7 +754,7 @@ pub fn set_delay_mode(mode: u8) {
     DELAY_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn delay_mode() -> u8 {
+pub(crate) fn delay_mode() -> u8 {
     DELAY_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 

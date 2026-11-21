@@ -201,6 +201,8 @@ fn design_cache_key(
     // must not serve a run that may observe them.
     hash.bytes(&[xezim_core::elaborate::port_elision_requested() as u8]);
     hash.bytes(&[xezim_core::elaborate::vpi_net_drivers() as u8]);
+    // Prepared gate entries bake in the structural delay mode.
+    hash.bytes(&[compiler::simulator::delay_mode()]);
     // A run that downgraded driver conflicts to warnings must not serve one
     // that reports them as errors.
     hash.bytes(&[xezim_core::elaborate::relax_driver_conflicts() as u8]);

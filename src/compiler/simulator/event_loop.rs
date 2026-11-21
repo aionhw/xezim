@@ -273,6 +273,7 @@ impl Simulator {
     /// POST-NBA r (one cycle "early" vs the reference simulator; the exact
     /// checker/BFM divergence shape of the rptr race-through report).
     pub(super) fn drain_inactive_pre_nba(&mut self) {
+        self.drain_active_driver_updates();
         let mut fuel = 1000u32;
         // §9.2: a `#0` continuation's write happens AFTER this slot's edge
         // detection; without recording it for the rescan drain, the caller
@@ -298,6 +299,7 @@ impl Simulator {
             if self.dirty_any {
                 self.settle_combinatorial();
             }
+            self.drain_active_driver_updates();
         }
         self.in_edge_cont = __prev_edge_cont;
         // Re-detect the recorded positions NOW, against the still-pre-write
@@ -1803,6 +1805,7 @@ impl Simulator {
             // slave's `wait(state!=BEGIN_RESP)` wakes on the clobbered value).
             // The end-of-tick fixpoint alone is too late: the `#0` resume has
             // already committed the overwrite by then.
+            self.drain_active_driver_updates();
             self.drain_condition_waiters(true, false);
             if self.promote_inactive_to_active() && self.event_queue.next_time() == Some(self.time)
             {
