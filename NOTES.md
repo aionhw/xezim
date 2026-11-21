@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- Store whole fixed-size rows assigned through class handles in queue, dynamic-array and fixed-array properties (#1467).
+- **Correctness:** Read unpacked queue rows from their element storage in class methods (§7.4.5, #1468).
 - **Correctness:** Evaluate each operand once when assigning an unpacked concatenation to a queue (§10.10, #1470).
 - **Correctness:** Select queue rows through their class handle when a module declares an array with the same property name (§8.4, #1469).
 

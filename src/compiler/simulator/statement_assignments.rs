@@ -1701,6 +1701,10 @@ impl Simulator {
                 return;
             }
         }
+        if self.assign_class_scalar_row(lvalue, rvalue) {
+            self.settle_after_proc_write();
+            return;
+        }
         // #1108: a whole array member of an instance-array element on either
         // side (`w = lane[0].payload`, `lane[1].payload = '{...}`).
         // An element select is folded where it is read or written.
