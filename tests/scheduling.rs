@@ -556,3 +556,5 @@ mod review_intra_delay_array_items;
 mod time0_effect_entries_1314;
 #[path = "scheduling/sva_default_actuals_1309.rs"]
 mod sva_default_actuals_1309;
+#[path = "scheduling/indexed_member_event.rs"]
+mod indexed_member_event;
