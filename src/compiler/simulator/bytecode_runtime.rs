@@ -1368,7 +1368,7 @@ impl Simulator {
                     // (the source of the 522 is_signed repr_diffs).
                     let id = *sig_id;
                     let w = *width;
-                    if shortreal_signals.contains(&id) {
+                    if view[id].is_real && shortreal_signals.contains(&id) {
                         let mut val = Value::from_f64(vm_regs[*val_reg as usize].to_f64() as f32 as f64);
                         val.is_signed = signal_signed[id];
                         comb_write_full!(id, val);
