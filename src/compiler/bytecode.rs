@@ -18395,8 +18395,8 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(r);
                     }
                     let r = self.alloc_reg();
+                    self.emit(Insn::Move(r, src));
                     if is_real {
-                        self.emit(Insn::Move(r, src));
                         self.emit_to_real(r);
                         return Some(r);
                     }
