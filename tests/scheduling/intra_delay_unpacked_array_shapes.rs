@@ -187,3 +187,24 @@ endmodule
     );
     assert_eq!(out, ["T|q='{41, 42} e='{51, 52} qq='{41, 42} dd='{31, 32}"]);
 }
+
+#[test]
+fn delayed_row_selector_is_evaluated_once_at_capture() {
+    let source = r#"
+module top;
+  int rows[2][2] = '{'{2, 3}, '{5, 7}};
+  int a[2], b[2], calls;
+  function automatic int choose();
+    calls++;
+    return 1;
+  endfunction
+  initial begin
+    b <= #4 rows[choose()];
+    a = #4 rows[choose()];
+    #1 $display("T|%0d %0d | %0d %0d | %0d", a[0], a[1], b[0], b[1], calls);
+  end
+  initial #1 rows[1] = '{11, 13};
+endmodule
+"#;
+    assert_eq!(lines(source), ["T|5 7 | 5 7 | 2"]);
+}

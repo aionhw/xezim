@@ -4297,6 +4297,8 @@ impl Simulator {
                     }
                     None => rvalue,
                 };
+                let frozen_rhs = self.freeze_array_rhs_selectors(rvalue);
+                let rvalue = frozen_rhs.as_ref().unwrap_or(rvalue);
                 // §9.4.5 intra-assignment EVENT control on an NBA
                 // (`lhs <= [repeat(n)] @(edge sig) rhs`, canonicalized to
                 // `$__xz_intra_ev(n, edge, sig, rhs)`). Only the BLOCKING arm

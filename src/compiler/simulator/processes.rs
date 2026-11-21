@@ -2489,6 +2489,25 @@ impl Simulator {
         }
     }
 
+    /// Freeze a selected RHS before trying the array and scalar capture paths.
+    /// Each path then sees the same label even when its selector calls a function.
+    pub(super) fn freeze_array_rhs_selectors(&mut self, rhs: &Expression) -> Option<Expression> {
+        let rhs = Self::unparen(rhs);
+        if (self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty())
+            || !matches!(rhs.kind, ExprKind::Index { .. } | ExprKind::RangeSelect { .. })
+            || Self::cond_expr_is_effect_free(rhs, false)
+        {
+            return None;
+        }
+        // Freeze just select chains on a name. Expressions that produce an
+        // array by calling a function keep their own call-result handling.
+        let mut base = rhs;
+        while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &base.kind {
+            base = expr;
+        }
+        matches!(base.kind, ExprKind::Ident(_)).then(|| self.freeze_conditional_path(rhs, true))
+    }
+
     /// §10.10: capture a one-dimensional unpacked array in element order.
     pub(super) fn capture_array_rhs(
         &mut self,
@@ -2592,6 +2611,8 @@ impl Simulator {
         rhs: &Expression,
         span: crate::ast::Span,
     ) -> (Expression, Option<Statement>) {
+        let frozen = self.freeze_array_rhs_selectors(rhs);
+        let rhs = frozen.as_ref().unwrap_or(rhs);
         let mut inner = rhs;
         while let ExprKind::Paren(e) = &inner.kind {
             inner = e;
