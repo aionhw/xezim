@@ -589,7 +589,14 @@ impl Simulator {
     /// §6.20.2, §23.10, §26.3: find the declaration in the active instance
     /// or in its imported package. The value supplies the final width only
     /// when the declaration specifies signing without a range.
-    fn tn_parameter(&self, path: &str) -> Option<TnOperand> {
+    fn tn_parameter(&self, path: &str, qualified: bool) -> Option<TnOperand> {
+        if qualified {
+            let (pkg, leaf) = path.split_once('.')?;
+            if !self.module.packages.contains(pkg) {
+                return None;
+            }
+            return self.tn_parameter_decl(&format!("{pkg}::{leaf}"));
+        }
         let types = &self.module.param_decl_types;
         let has_type = |key: &str| {
             types.contains_key(key)
@@ -637,25 +644,24 @@ impl Simulator {
                 return None;
             }
             if scope.is_empty() {
-                if let Some((owner, leaf)) = path.split_once('.') {
-                    if !self.module.packages.contains(owner)
-                        || self.signal_name_to_id.contains_key(owner)
-                    {
-                        return None;
-                    }
-                    break format!("{owner}::{leaf}");
+                if path.contains('.') {
+                    return None;
                 }
                 let pkg = self.scope_import_pkg(path, &|p| has_type(&format!("{p}::{path}")))?;
                 break format!("{pkg}::{path}");
             }
             scope.truncate(scope.rfind('.').unwrap_or(0));
         };
-        let mut dt = types
-            .get(&key)
+        self.tn_parameter_decl(&key)
+    }
+
+    fn tn_parameter_decl(&self, key: &str) -> Option<TnOperand> {
+        let mut dt = self.module.param_decl_types
+            .get(key)
             .or_else(|| {
-                self.module.unpacked_decl_dims.get(&key)?;
-                self.module.parameters.get(&key)?;
-                self.module.var_decl_types.get(&key)
+                self.module.unpacked_decl_dims.get(key)?;
+                self.module.parameters.get(key)?;
+                self.module.var_decl_types.get(key)
             })?
             .clone();
         if let DataType::Implicit {
@@ -665,7 +671,7 @@ impl Simulator {
         } = dt
         {
             let dimensions = if dimensions.is_empty() {
-                let width = self.module.parameters.get(&key)?.width.max(1);
+                let width = self.module.parameters.get(key)?.width.max(1);
                 vec![PackedDimension::Range {
                     left: Box::new(Self::int_lit_expr(i64::from(width) - 1, span)),
                     right: Box::new(Self::int_lit_expr(0, span)),
@@ -684,7 +690,7 @@ impl Simulator {
         let dims = self
             .module
             .unpacked_decl_dims
-            .get(&key)
+            .get(key)
             .into_iter()
             .flatten()
             .map(|&(l, r)| TnDim::Fixed(l, r))
@@ -697,11 +703,11 @@ impl Simulator {
         })
     }
 
-    fn tn_parameter_operand(&self, e: &Expression) -> Option<TnOperand> {
+    fn tn_parameter_operand(&self, e: &Expression, qualified: bool) -> Option<TnOperand> {
         match &e.kind {
-            ExprKind::Paren(inner) => self.tn_parameter_operand(inner),
+            ExprKind::Paren(inner) => self.tn_parameter_operand(inner, qualified),
             ExprKind::Index { expr, index } => {
-                let mut op = self.tn_parameter_operand(expr)?;
+                let mut op = self.tn_parameter_operand(expr, qualified)?;
                 Self::tn_select(&mut op, index);
                 Some(op)
             }
@@ -716,7 +722,7 @@ impl Simulator {
                     .map(|s| s.name.name.as_str())
                     .collect::<Vec<_>>()
                     .join(".");
-                let mut op = self.tn_parameter(&path)?;
+                let mut op = self.tn_parameter(&path, qualified)?;
                 for index in &last.selects {
                     Self::tn_select(&mut op, index);
                 }
@@ -724,7 +730,7 @@ impl Simulator {
             }
             ExprKind::MemberAccess { .. } => {
                 let path = crate::compiler::packed_assignment_pattern_plan::scoped_name_key(e)?;
-                self.tn_parameter(&path.replace("::", "."))
+                self.tn_parameter(&path.replace("::", "."), qualified)
             }
             _ => None,
         }
@@ -826,12 +832,12 @@ impl Simulator {
     pub(super) fn typename_operand_text(&mut self, e: &Expression) -> Option<String> {
         let op = self
             .tn_operand(e)
-            .or_else(|| self.tn_parameter_operand(e))?;
+            .or_else(|| self.tn_parameter_operand(e, false))?;
         self.tn_render_operand(e, op)
     }
 
-    pub(super) fn typename_parameter_text(&mut self, e: &Expression) -> Option<String> {
-        let op = self.tn_parameter_operand(e)?;
+    pub(super) fn typename_parameter_text(&mut self, e: &Expression, qualified: bool) -> Option<String> {
+        let op = self.tn_parameter_operand(e, qualified)?;
         self.tn_render_operand(e, op)
     }
 
@@ -862,7 +868,7 @@ impl Simulator {
     fn tn_operand_type(&mut self, e: &Expression) -> Option<TnType> {
         let op = self
             .tn_operand(e)
-            .or_else(|| self.tn_parameter_operand(e))?;
+            .or_else(|| self.tn_parameter_operand(e, false))?;
         if !op.dims.is_empty() {
             return None;
         }

@@ -232,7 +232,7 @@ impl Simulator {
                 | "$atan2" | "$hypot"
                 | "$sinh" | "$cosh" | "$tanh" | "$asinh" | "$acosh" | "$atanh"
                 | "$shortrealtobits" | "$bitstoshortreal"
-                | "$dimensions" | "$unpacked_dimensions" | "$typename"
+                | "$dimensions" | "$unpacked_dimensions" | "$typename" | "$__xz_scoped_typename"
                 | "$isunbounded"
                 | "$countbits" | "$countones" | "$onehot" | "$onehot0"
                 | "$left" | "$right" | "$high" | "$low" | "$size" | "$increment"

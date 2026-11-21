@@ -5124,7 +5124,7 @@ impl Simulator {
                 // $set_randstate.
                 Value::from_string(&self.rng.to_state_string())
             }
-            "$typename" => {
+            "$typename" | "$__xz_scoped_typename" => {
                 // §20.6.1: a typed pattern has the type that prefixes it.
                 if let Some(ExprKind::TypedPattern { ty, .. }) = args.first().map(|a| &a.kind) {
                     return Value::from_string(&self.typename_of_dt(ty));
@@ -5164,7 +5164,7 @@ impl Simulator {
                     }
                     // §6.20.2: a typed parameter can be real, shortreal or
                     // integral independently of its initializer's type.
-                    if let Some(t) = self.typename_parameter_text(arg) {
+                    if let Some(t) = self.typename_parameter_text(arg, sn == "$__xz_scoped_typename") {
                         return Value::from_string(&t);
                     }
                     // §20.6.1: an expression of type real — a real or time

@@ -158,11 +158,11 @@ module top;
   typedef int count_t;
   initial begin : blk
     count_t Q;
-    $display("T|blk.Q %s", $typename(blk.Q));
+    $display("T|blk.Q %s %s", $typename(blk.Q), $typename(blk::Q));
   end
 endmodule
 "#;
-    check_types(SRC, &["T|blk.Q int"]);
+    check_types(SRC, &["T|blk.Q int real"]);
 }
 
 /// §23.9, §27.5: a block-local variable can hide a parameter, and a
