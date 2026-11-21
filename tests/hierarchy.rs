@@ -217,6 +217,8 @@ mod review_implicit_net_scope;
 mod review_unit_names_in_blocks;
 #[path = "hierarchy/same_name_port_hop.rs"]
 mod same_name_port_hop;
+#[path = "hierarchy/signed_literal_port_actuals.rs"]
+mod signed_literal_port_actuals;
 #[path = "hierarchy/submodule_array_element_assigns.rs"]
 mod submodule_array_element_assigns;
 #[path = "hierarchy/submodule_net_array_shapes.rs"]
