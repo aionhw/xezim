@@ -5,17 +5,6 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
-    #[inline]
-    fn cast_integral_value(value: &Value, width: u32) -> Value {
-        if value.is_real {
-            Self::real_to_int(value.to_f64(), width)
-        } else if value.width == width {
-            value.clone()
-        } else {
-            value.resize_for_assign(width)
-        }
-    }
-
     /// Execute bytecode instructions in isolation (no &mut self).
     /// Returns NBA entries produced. Used for parallel edge block execution.
     pub(super) fn exec_insns_isolated(
@@ -725,9 +714,6 @@ impl Simulator {
                 Insn::Move(d, s) => {
                     vm_regs[*d as usize] = vm_regs[*s as usize].clone();
                 }
-                Insn::CastIntegral(d, s, width) => {
-                    vm_regs[*d as usize] = Self::cast_integral_value(&vm_regs[*s as usize], *width);
-                }
                 Insn::MoveResize(d, s, w) => {
                     // Exact composition of Move+Resize, including the Resize
                     // arm's runtime same-width skip (which preserves a fill
@@ -1276,9 +1262,6 @@ impl Simulator {
                 }
                 Insn::Move(d, s) => {
                     vm_regs[*d as usize] = vm_regs[*s as usize].clone();
-                }
-                Insn::CastIntegral(d, s, width) => {
-                    vm_regs[*d as usize] = Self::cast_integral_value(&vm_regs[*s as usize], *width);
                 }
                 Insn::MoveResize(d, s, w) => {
                     // Exact composition of Move+Resize, including the Resize
@@ -3640,9 +3623,6 @@ impl Simulator {
                         pc = *target as usize;
                         continue;
                     }
-                }
-                Insn::CastIntegral(d, s, width) => {
-                    self.vm_regs[*d as usize] = Self::cast_integral_value(&self.vm_regs[*s as usize], *width);
                 }
                 Insn::MoveResize(d, s, w) => {
                     // Exact composition of Move+Resize (same-width runtime

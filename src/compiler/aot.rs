@@ -801,7 +801,7 @@ fn emit_insn_rust(
         Move(d, s) => {
             let _ = writeln!(w, "r{d}v = r{s}v; r{d}x = r{s}x;");
         }
-        MoveResize(d, sr, width) | CastIntegral(d, sr, width) => {
+        MoveResize(d, sr, width) => {
             if *width > 64 {
                 return None;
             }
