@@ -64,7 +64,6 @@ impl Simulator {
                 // slot lookup is fine here.
                 self.run_comb_jit_slot(eidx)
             }
-            #[cfg(feature = "jit")]
             CombPlan::Jit | CombPlan::Tpl => self.run_comb_jit_slot(eidx),
             CombPlan::Interp | CombPlan::Unresolved => false,
         }
