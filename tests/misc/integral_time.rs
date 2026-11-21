@@ -209,3 +209,25 @@ endmodule
         ],
     );
 }
+
+#[test]
+fn scoped_stime_wraps_before_a_time_cast() {
+    check(
+        r#"
+package p;
+  timeunit 1fs; timeprecision 1fs;
+  function automatic time wide(); return time'($stime); endfunction
+  function automatic time full(); return $time; endfunction
+endpackage
+module top;
+  timeunit 1ps; timeprecision 1fs;
+  initial begin
+    #4294967ps;
+    #297fs;
+    $display("scoped %0d %0d local %0d", p::wide(), p::full(), $stime);
+  end
+endmodule
+"#,
+        &["scoped 1 4294967297 local 4294967"],
+    );
+}
