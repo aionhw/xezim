@@ -1,3 +1,4 @@
+// The five loop cases are from git-hevangel, aionhw/xezim#1337.
 // Functions that write a bit of their own vector local through a signed index,
 // called by continuous assigns (IEEE 1800-2023 section 11.5.1).
 //
