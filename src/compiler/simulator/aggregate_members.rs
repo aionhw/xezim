@@ -1778,6 +1778,7 @@ impl Simulator {
         for m in &su.members {
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let mkey = format!("{}.{}", prefix, md.name.name);
                 let mw = resolve_type_width(
                     &m.data_type,
@@ -1785,7 +1786,7 @@ impl Simulator {
                     Some(&self.module.typedefs),
                 )
                 .max(1);
-                match self.member_elem_indices(&md.dimensions) {
+                match self.member_elem_indices(&dims) {
                     Some(tups) => {
                         // Element order, last dimension varying fastest —
                         // the enumeration order of `unpacked_struct_leaves`.
@@ -1864,8 +1865,9 @@ impl Simulator {
         // whole-member copy. (IEEE 1800-2023 §7.2)
         for m in &su.members {
             for md in &m.declarators {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let mname = md.name.name.as_str();
-                if let Some(tups) = self.member_elem_indices(&md.dimensions) {
+                if let Some(tups) = self.member_elem_indices(&dims) {
                     for tup in tups {
                         let lhs_f = Self::append_elem_path(lvalue, mname, &tup);
                         let rhs_f = Self::append_elem_path(rvalue, mname, &tup);
@@ -1875,7 +1877,7 @@ impl Simulator {
                 }
                 let lhs_f = Self::append_member_expr(lvalue, mname);
                 let rhs_f = Self::append_member_expr(rvalue, mname);
-                self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &md.dimensions);
+                self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &dims);
             }
         }
         Some(())
@@ -1943,8 +1945,9 @@ impl Simulator {
             if let Some(inner) = self.unpacked_struct_of(dt) {
                 for m in &inner.members {
                     for md in &m.declarators {
+                        let dims = self.member_dims(&m.data_type, &md.dimensions);
                         let mname = md.name.name.as_str();
-                        if let Some(tups) = self.member_elem_indices(&md.dimensions) {
+                        if let Some(tups) = self.member_elem_indices(&dims) {
                             for tup in tups {
                                 let lhs_f = Self::append_elem_path(lhs, mname, &tup);
                                 let rhs_f = Self::append_elem_path(rhs, mname, &tup);
@@ -1954,7 +1957,7 @@ impl Simulator {
                         }
                         let lhs_f = Self::append_member_expr(lhs, mname);
                         let rhs_f = Self::append_member_expr(rhs, mname);
-                        self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &md.dimensions);
+                        self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &dims);
                     }
                 }
                 return;
@@ -2023,6 +2026,7 @@ impl Simulator {
         // every element of a copied-out array member read back 0.
         for m in &su.members {
             for md in &m.declarators {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let mname = md.name.name.as_str();
                 // §7.2.1: a dynamic member copies as a whole collection from
                 // the property's `<handle>#<prop>.<m>` store.
@@ -2050,7 +2054,7 @@ impl Simulator {
                         continue;
                     }
                 }
-                if let Some(tups) = self.member_elem_indices(&md.dimensions) {
+                if let Some(tups) = self.member_elem_indices(&dims) {
                     for tup in tups {
                         let lhs_f = Self::append_elem_path(lvalue, mname, &tup);
                         let rhs_f = Self::append_elem_path(rvalue, mname, &tup);
@@ -2060,7 +2064,7 @@ impl Simulator {
                 }
                 let lhs_f = Self::append_member_expr(lvalue, mname);
                 let rhs_f = Self::append_member_expr(rvalue, mname);
-                self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &md.dimensions);
+                self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &dims);
             }
         }
         Some(())
@@ -4845,13 +4849,14 @@ impl Simulator {
         for m in &su.members {
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let mn = md.name.name.as_str();
                 let lhs_f = Self::append_member_expr(lvalue, mn);
                 let rhs_f = Self::append_member_expr(rvalue, mn);
-                let pairs: Vec<(Expression, Expression)> = if md.dimensions.is_empty() {
+                let pairs: Vec<(Expression, Expression)> = if dims.is_empty() {
                     vec![(lhs_f, rhs_f)]
                 } else {
-                    match self.member_elem_indices(&md.dimensions) {
+                    match self.member_elem_indices(&dims) {
                         Some(tups) => tups
                             .iter()
                             .map(|t| {

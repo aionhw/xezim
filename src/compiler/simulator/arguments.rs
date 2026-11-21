@@ -252,6 +252,7 @@ impl Simulator {
     /// unresolved type) keeps its value.
     pub(super) fn ret_conv_of(ty: &DataType, typedef_types: &HashMap<String, DataType>) -> RetConv {
         match ty {
+            DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. } => RetConv::ShortReal,
             DataType::Real { .. } => RetConv::Real,
             DataType::IntegerVector { .. }
             | DataType::IntegerAtom { .. }
@@ -302,7 +303,10 @@ impl Simulator {
 
     /// `ret_conv_of` for a concrete type-parameter binding, given by name.
     pub(super) fn concrete_ret_conv(&self, name: &str) -> RetConv {
-        if matches!(name, "real" | "realtime" | "shortreal") {
+        if name == "shortreal" {
+            return RetConv::ShortReal;
+        }
+        if matches!(name, "real" | "realtime") {
             return RetConv::Real;
         }
         if let Some(dt) = self.module.typedef_types.get(name) {
@@ -341,6 +345,7 @@ impl Simulator {
                 }
                 r
             }
+            RetConv::ShortReal => Value::from_f64(v.to_f64() as f32 as f64),
             RetConv::Real if !v.is_real && !v.is_fill => Value::from_f64(v.to_f64()),
             _ => v,
         }
@@ -398,6 +403,7 @@ impl Simulator {
     pub(super) fn ret_needs_convert(v: &Value, conv: RetConv) -> bool {
         match conv {
             RetConv::Keep => false,
+            RetConv::ShortReal => true,
             RetConv::Real => !v.is_real && !v.is_fill,
             RetConv::Int { .. } => v.is_real,
         }
@@ -1196,8 +1202,8 @@ impl Simulator {
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let mexpr = mk_member(base, &md.name.name);
-                let dims = self.member_decl_dims(&m.data_type, &md.dimensions);
                 match self.member_elem_indices(&dims) {
                     Some(tups) => {
                         // Every element, last dimension varying fastest —
@@ -1292,8 +1298,8 @@ impl Simulator {
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 // Same keys as `unpacked_struct_leaves`.
-                let dims = self.member_decl_dims(&m.data_type, &md.dimensions);
                 let keys = match self.member_elem_indices(&dims) {
                     Some(tups) => tups
                         .iter()
@@ -1584,6 +1590,14 @@ impl Simulator {
             }
         }
         Some(lv)
+    }
+
+    pub(super) fn member_dims<'a>(
+        &self,
+        dt: &DataType,
+        declared: &'a [crate::ast::types::UnpackedDimension],
+    ) -> std::borrow::Cow<'a, [crate::ast::types::UnpackedDimension]> {
+        super::elaborate::struct_member_dims(dt, declared, &self.module.typedef_unpacked_dims)
     }
 
     /// The resolved struct type when `dt` is an UNPACKED struct whose members
@@ -1991,7 +2005,10 @@ impl Simulator {
             self.unpacked_struct_of(&m.data_type).is_some()
                 || m.declarators
                     .iter()
-                    .any(|md| self.member_dim_indices(&md.dimensions).is_some())
+                    .any(|md| {
+                        self.member_dim_indices(&self.member_dims(&m.data_type, &md.dimensions))
+                            .is_some()
+                    })
         });
         if nested_leaves {
             let mut leaves = Vec::new();

@@ -214,7 +214,7 @@ impl Opcode {
             },
             Insn::CmpBranch(..) => Self::CmpBranch,
             Insn::CmpBranchConst(..) => Self::CmpBranchConst,
-            Insn::MoveResize(..) => Self::MoveResize,
+            Insn::MoveResize(..) | Insn::CastIntegral(..) => Self::MoveResize,
             Insn::WaitDelayReg(..) => Self::WaitDelayReg,
             Insn::BinOpConstAdd2(..) => Self::BinOpConstAdd2,
             Insn::WaitEdge(..) => Self::WaitEdge,

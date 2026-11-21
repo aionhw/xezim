@@ -407,7 +407,8 @@ fn method_boost_enabled() -> bool {
 // scoped `$time` read is 64 bits wide. §6.24.1, §7.4.3, §11.5.1: a struct-parameter field
 // sizes its cast, and a part-select after a packed index selects whole elements, clipped to
 // its dimension.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3098;
+// §7.4.5: member collection reads that yield unpacked rows use their row storage.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3171;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -759,7 +760,7 @@ pub fn set_delay_mode(mode: u8) {
     DELAY_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn delay_mode() -> u8 {
+pub(crate) fn delay_mode() -> u8 {
     DELAY_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -1143,15 +1144,11 @@ macro_rules! write_sig {
         }
         // §6.12/§20.5: a SHORTREAL holds an IEEE binary32 value, so a write
         // rounds to binary32 (16777216.25 -> 16777216.0). A `real` (binary64)
-        // keeps every bit. Only a REAL write pays the type-name lookup.
-        if __wsig_val.is_real
-            && $self
-                .signal_type_names
-                .get(&__wsig_id)
-                .is_some_and(|tn| tn == "shortreal")
-        {
+        // keeps every bit. Only a real write checks destination precision.
+        if __wsig_val.is_real && $self.shortreal_signals.contains(&__wsig_id) {
             let __wsig_f = __wsig_val.to_f64() as f32 as f64;
             __wsig_val = Value::from_f64(__wsig_f);
+            __wsig_val.is_signed = $self.signal_signed[__wsig_id];
         }
         // LRM §9.3.1: skip writes to forced signals. The `is_empty` guard
         // keeps the common no-force case to one branch — `contains_key`
@@ -1266,6 +1263,8 @@ enum CombItem {
         /// §10.3.3 / §28.16: the original target before driver widening,
         /// boxed like the ASTs so the entry stays cache compact.
         delay_target: Option<Box<DelayTarget>>,
+        // §10.3.3: expressions are evaluated when the right-hand side changes.
+        delay_exprs: Option<Box<[Option<Expression>; 3]>>,
     },
     /// Fast path: direct signal-to-signal copy (assign b = a) with pre-resolved IDs.
     DirectCopy {
@@ -1883,7 +1882,8 @@ struct CombEntryCold {
 // by their result. §6.11.2: a gate-shaped assignment to a 2-state scalar is no fused gate.
 // §6.24.1, §7.4.3, §9.4.2: struct-parameter field casts, part-selects of whole elements after a
 // packed index, and alias nets for event controls on packed-struct members.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB056";
+// §9.4.2: a selected member can require a value waiter instead of a comb block.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB071";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -4928,6 +4928,8 @@ const CG_HANDLE_TAG: usize = 1 << 30;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CovergroupInstance {
+    /// Coverpoints whose declared expression or sample formal is real (§19.5).
+    real_points: HashSet<String>,
     cg_name: String,
     /// The object whose constructor ran `cg = new` (a class-body
     /// covergroup): coverpoint expressions read ITS properties, so sampling
@@ -5361,8 +5363,9 @@ struct PortPlan {
 enum RetConv {
     /// Not a numeric scalar: the value passes through untouched.
     Keep,
-    /// `real` / `shortreal` / `realtime`.
+    /// Binary64 real and realtime.
     Real,
+    ShortReal,
     /// An integral type; `two_state` for bit, byte, int, ... (§6.11.1).
     Int { two_state: bool },
 }
@@ -7992,6 +7995,8 @@ pub struct Simulator {
     /// here. Populated once at construction so `module.signals` can
     /// be freed afterwards.
     signal_type_names: HashMap<usize, String>,
+    /// Real signal slots that round writes to binary32.
+    shortreal_signals: HashSet<usize>,
     pub widths: HashMap<String, u32>,
     pub signed_signals: HashSet<String>,
     /// Names of ARRAY locals whose packed element geometry

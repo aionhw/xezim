@@ -115,6 +115,8 @@ pub(crate) struct MethodAdmission {
 /// See `MethodAdmission::instance_colls`.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ClassColls {
+    /// §7.4.5: selecting these members once still yields an unpacked row.
+    pub row_members: HashSet<String>,
     pub members: HashSet<String>,
     /// Queues and dynamic arrays: a `foreach` index is a plain integer.
     pub dense: HashSet<String>,
@@ -938,6 +940,9 @@ pub enum Insn {
     /// on and a stale element past `size()`. Main executor only: every other
     /// executor and lowering treats it like `EvalExprFallback`.
     LoadDynElem(RegId, Box<DynElemOp>, RegId),
+    /// Assignment conversion for an explicit integral cast. A real operand
+    /// must round even when its storage already has the target width.
+    CastIntegral(RegId, RegId, u32),
 }
 
 /// The collection a `LoadDynElem` reads.
@@ -1366,6 +1371,7 @@ impl Insn {
             }
             Move(a, b)
             | MoveResize(a, b, _)
+            | CastIntegral(a, b, _)
             | BitNot(a, b)
             | LogNot(a, b)
             | Negate(a, b)
@@ -1603,6 +1609,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::CmpBranch(..) => "CmpBr",
         Insn::CmpBranchConst(..) => "CmpBranchConst",
         Insn::MoveResize(..) => "MovRz",
+        Insn::CastIntegral(..) => "CastIntegral",
         Insn::BranchIfSignalFalse(..) => "BrSig",
         Insn::BranchUnlessZero(..) => "BrNz",
         Insn::LoadSignalBit(..) => "LoadBit",
@@ -4401,6 +4408,12 @@ impl<'a> BytecodeCompiler<'a> {
                 (fd, false)
             }
         };
+        if self.decl_is_shortreal(&fd.return_type, Some(&name))
+            || fd.ports.iter().any(|p| self.decl_is_shortreal(&p.data_type, Some(&name)))
+        {
+            self.bail("shortreal_call");
+            return None;
+        }
         if !scalarized
             && let Some(items) = self.materialize_deferred_fn(&name, &fd)
         {
@@ -5124,6 +5137,11 @@ impl<'a> BytecodeCompiler<'a> {
         lifetime: &Option<crate::ast::types::Lifetime>,
         decl: &crate::ast::stmt::VarDeclarator,
     ) -> bool {
+        if self.decl_is_shortreal(data_type, None) {
+            self.bail("shortreal_local");
+            return false;
+        }
+
         // §6.18: a local declared through a typedef that carries
         // unpacked dims is a collection too. A queue / unsized
         // array without an initializer takes the local-collection
@@ -5417,6 +5435,11 @@ impl<'a> BytecodeCompiler<'a> {
         data_type: &crate::ast::types::DataType,
         d: &crate::ast::stmt::VarDeclarator,
     ) -> bool {
+        if self.decl_is_shortreal(data_type, None) {
+            self.bail("shortreal_local");
+            return false;
+        }
+
         // Step 6: a CLASS-typed local holds a heap HANDLE in a
         // register — default null (0), no resize (handles
         // round-trip untouched), and the name joins
@@ -9437,6 +9460,12 @@ impl<'a> BytecodeCompiler<'a> {
             .is_some_and(|dt| self.decl_is_real(dt, None))
     }
 
+    fn decl_is_shortreal(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> bool {
+        matches!(self.resolved_decl_type(dt, scope), crate::ast::types::DataType::Real {
+            kind: crate::ast::types::RealType::ShortReal, ..
+        })
+    }
+
     fn decl_is_real(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> bool {
         crate::compiler::elaborate::is_type_real(self.resolved_decl_type(dt, scope))
     }
@@ -10797,6 +10826,26 @@ impl<'a> BytecodeCompiler<'a> {
             selects += 1;
             root = base;
         }
+        // A member of an indexed packed struct keeps the member declaration.
+        // Its container index does not consume a dimension of the member.
+        if let ExprKind::MemberAccess { expr: container, member } = &root.kind
+            && let ExprKind::Index { expr: base, .. } = &container.kind
+            && let ExprKind::Ident(h) = &base.kind
+            && self.local_var_reg_of(h).is_none()
+        {
+            let raw = Self::hier_raw_name(h);
+            let dt = self.scope_hint.as_ref()
+                .and_then(|scope| decls.get(&format!("{scope}.{raw}")))
+                .or_else(|| decls.get(&raw));
+            if let Some(crate::ast::types::DataType::Struct(st)) = dt
+                .map(|dt| crate::compiler::elaborate::resolve_typedef_chain(dt, types))
+                && st.packed
+                && let Some(field) = st.members.iter().find(|m|
+                    m.declarators.iter().any(|d| d.name.name == member.name))
+            {
+                return signed_named_packed_elem_depth(&field.data_type, types) == Some(selects);
+            }
+        }
         let ExprKind::Ident(h) = &root.kind else {
             return false;
         };
@@ -11698,6 +11747,7 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::LoadArrayElem(..)
             | Insn::Resize(..)
             | Insn::MoveResize(..)
+            | Insn::CastIntegral(..)
             | Insn::Move(..)
             | Insn::SetSigned(..)
             | Insn::ClearSigned(..)
@@ -18832,6 +18882,19 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::StrOp(dst, StrOpKind::GetC, Box::new(vec![src, i])));
                     return Some(dst);
                 }
+                // §7.4.5: an unpacked row occupies multiple storage cells.
+                // LoadCollElem reads a single cell; a second index would then
+                // select a bit of that placeholder rather than a row element.
+                if self.method_mode
+                    && let Some((name, _, receiver)) = self.member_coll_elem_target(expr)
+                    && let Some(owner) = self.coll_owner_class(receiver.as_ref())
+                    && self.method_admission.as_ref()
+                        .and_then(|facts| facts.instance_colls.get(&owner))
+                        .is_some_and(|colls| colls.row_members.contains(&name))
+                {
+                    self.bail("unpacked_member_collection_row");
+                    return None;
+                }
                 // class-perf Step 9b-ii: element READ of a member collection
                 // (`q[i]`, `aa[k]`, `this.aa[k]`, `obj.aa[k]`) inside a
                 // method body — lower to LoadCollElem (delegated exec). Sit
@@ -19959,6 +20022,9 @@ impl<'a> BytecodeCompiler<'a> {
                             _ => false,
                         }
                     }
+                    if self.decl_is_shortreal(&dt, None) {
+                        return self.emit_expr_fallback(expr, ctx_width, "shortreal_cast");
+                    }
                     if is_stream(inner) {
                         if let Some(r) =
                             self.emit_expr_fallback(expr, ctx_width, "type_cast_stream")
@@ -19991,8 +20057,8 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(r);
                     }
                     let r = self.alloc_reg();
-                    self.emit(Insn::Move(r, src));
                     if is_real {
+                        self.emit(Insn::Move(r, src));
                         self.emit_to_real(r);
                         return Some(r);
                     }
@@ -25706,7 +25772,7 @@ impl<'a> BytecodeCompiler<'a> {
                 f(*l);
                 f(*rr);
             }
-            Insn::MoveResize(_, s, _) | Insn::CmpBranchConst(_, s, _, _, _) => f(*s),
+            Insn::CastIntegral(_, s, _) | Insn::MoveResize(_, s, _) | Insn::CmpBranchConst(_, s, _, _, _) => f(*s),
             Insn::CaseLut(_, src, _) => f(*src),
             Insn::CaseJump(src, _) => f(*src),
             Insn::CaseMaskJump(src, _) => f(*src),
@@ -26260,6 +26326,7 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::ReduceXor(d, _)
             | Insn::Move(d, _)
             | Insn::MoveResize(d, _, _)
+            | Insn::CastIntegral(d, _, _)
             | Insn::Replicate(d, _, _)
             | Insn::BinOpConst(d, _, _, _)
             | Insn::BitSelect(d, _, _)
@@ -26359,6 +26426,7 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::ReduceXor(_, a)
             | Insn::Move(_, a)
             | Insn::MoveResize(_, a, _)
+            | Insn::CastIntegral(_, a, _)
             | Insn::Replicate(_, a, _)
             | Insn::BinOpConst(_, a, _, _)
             | Insn::CmpBranchConst(_, a, _, _, _)
@@ -27113,6 +27181,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::AShr(d, _, _)
                 | Insn::CaseLut(d, _, _)
                 | Insn::MoveResize(d, _, _)
+                | Insn::CastIntegral(d, _, _)
                 | Insn::Format(d, _)
                 | Insn::StrOp(d, _, _)
                 | Insn::BitNot(d, _)
@@ -27595,8 +27664,18 @@ impl<'a> BytecodeCompiler<'a> {
                 rw.iter_mut().for_each(|f| *f = None);
             }
 
-            // Handled before the match because this is the only arm that
-            // rewrites the instruction it is looking at.
+            // A proven integral source keeps the ordinary copy/resize path.
+            if let Insn::CastIntegral(d, src, width) = insns[i]
+                && let Some((source_width, true)) = fact(&rw, src)
+            {
+                insns[i] = if source_width == width {
+                    Insn::Move(d, src)
+                } else {
+                    Insn::MoveResize(d, src, width)
+                };
+            }
+
+            // Elide ordinary resizes whose source already has the target width.
             if let &Insn::Resize(r, width) = &insns[i] {
                 let target = ok(width);
                 let prev = fact(&rw, r);
@@ -27703,7 +27782,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // `dst = resize(src, w)`: width is known, but a same-width
                 // source passes through `clone()` (fill/real preserved), so
                 // never claim plain-ness — conservative fact, no bad elision.
-                Insn::MoveResize(d, _, w) => {
+                Insn::MoveResize(d, _, w) | Insn::CastIntegral(d, _, w) => {
                     store(&mut rw, *d, ok(*w).map(|t| (t, false)));
                 }
                 // String result: width is the text length, not static.
@@ -28174,7 +28253,8 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::Shr(d, sr, _)
                 | Insn::Replicate(d, sr, _)
                 | Insn::Move(d, sr)
-                | Insn::MoveResize(d, sr, _) => set_to = Some((*d, clean.contains(sr))),
+                | Insn::MoveResize(d, sr, _)
+                | Insn::CastIntegral(d, sr, _) => set_to = Some((*d, clean.contains(sr))),
                 Insn::Resize(_, _) => {}
                 Insn::LoadConst(d, v) => set_to = Some((*d, !v.is_signed && !v.is_real)),
                 Insn::LoadSignal(d, sig) => set_to = Some((*d, sig_unsigned(*sig))),

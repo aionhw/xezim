@@ -2800,7 +2800,9 @@ impl Simulator {
     pub(super) fn event_expr_needs_value_wait(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Index { .. } | ExprKind::RangeSelect { .. } => true,
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => Self::event_expr_needs_value_wait(x),
+            ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. } => Self::event_expr_needs_value_wait(x),
             ExprKind::Binary { left, right, .. } => {
                 Self::event_expr_needs_value_wait(left) || Self::event_expr_needs_value_wait(right)
             }
@@ -2830,6 +2832,7 @@ impl Simulator {
         match &e.kind {
             ExprKind::Ident(h) => out.push((h, None)),
             ExprKind::NamedArg { expr: Some(x), .. }
+            | ExprKind::MemberAccess { expr: x, .. }
             | ExprKind::Paren(x)
             | ExprKind::Unary { operand: x, .. } => Self::collect_select_operands(x, out),
             ExprKind::Index { expr, index } => {
@@ -4480,7 +4483,8 @@ impl Simulator {
                     || self.expr_selects_array_cell(left)
                     || self.expr_selects_array_cell(right)
             }
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
+            ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
                 self.expr_selects_array_cell(x)
             }
             ExprKind::Binary { left, right, .. } => {
@@ -4547,6 +4551,7 @@ impl Simulator {
                 self.collect_selected_cells(right, out);
             }
             ExprKind::NamedArg { expr: Some(x), .. }
+            | ExprKind::MemberAccess { expr: x, .. }
             | ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
                 self.collect_selected_cells(x, out)
             }

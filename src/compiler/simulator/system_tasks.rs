@@ -229,7 +229,7 @@ impl Simulator {
                 | "$atan2" | "$hypot"
                 | "$sinh" | "$cosh" | "$tanh" | "$asinh" | "$acosh" | "$atanh"
                 | "$shortrealtobits" | "$bitstoshortreal"
-                | "$dimensions" | "$unpacked_dimensions" | "$typename"
+                | "$dimensions" | "$unpacked_dimensions" | "$typename" | "$__xz_scoped_typename"
                 | "$isunbounded"
                 | "$countbits" | "$countones" | "$onehot" | "$onehot0"
                 | "$left" | "$right" | "$high" | "$low" | "$size" | "$increment"
@@ -3172,6 +3172,16 @@ impl Simulator {
                                         result.push_str(&s);
                                         continue;
                                     }
+                                }
+                                // An indexed lane of a signed named integral type keeps
+                                // its signing even if its flattened storage is unsigned.
+                                if matches!(arg.kind, ExprKind::Index { .. })
+                                    && self.packed_named_select_signed(arg)
+                                {
+                                    let mut v = self.eval_expr(arg);
+                                    v.is_signed = true;
+                                    result.push_str(&v.to_dec_string());
+                                    continue;
                                 }
                                 // §21.2.1.7: type-directed recursive render —
                                 // nested structs, unpacked arrays, enum labels,

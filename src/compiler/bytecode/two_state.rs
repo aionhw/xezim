@@ -3496,7 +3496,7 @@ pub fn lower_two_state(
             // Nor reals: real signals and real constants gate above.
             Insn::RealToInt(_) => {}
             // A copy with the Resize arm's narrow rules folded in.
-            Insn::MoveResize(d, s, w) => {
+            Insn::MoveResize(d, s, w) | Insn::CastIntegral(d, s, w) => {
                 let cur = rw[*s as usize]?;
                 if *w == 0 || *w > 64 || cur > 64 {
                     gate!("wide move-resize");

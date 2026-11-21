@@ -2105,6 +2105,22 @@ impl Simulator {
             selects += 1;
             root = base;
         }
+        // Rebase a virtual interface receiver before asking for the signal's
+        // declared element type. A selected generate scope likewise names
+        // independently stored signals.
+        let physical = match &root.kind {
+            ExprKind::MemberAccess { .. } => self.vif_rebase_expr(root)
+                .or_else(|| self.fold_indexed_hier_path(root)),
+            ExprKind::Ident(h) if h.path.len() > 1 || h.path.iter().any(|s| !s.selects.is_empty()) =>
+                self.vif_rebase_expr(root).or_else(|| {
+                    h.path.iter().any(|s| !s.selects.is_empty())
+                        .then(|| self.fold_indexed_hier_path(root)).flatten()
+                }),
+            _ => None,
+        };
+        if let Some(ref physical) = physical {
+            root = physical;
+        }
         // A class property (`h.m_amb[1]`, or `m_amb[1]` in a method): its
         // declared type is its class's.
         if !self.packed_named_signed_props.is_empty() {
@@ -2165,23 +2181,21 @@ impl Simulator {
         // block. Its declaration is recorded under the bare name while the
         // frame is live, so the element type comes from there; the table
         // built at start-up only holds the design's own variables.
+        if let [seg] = h.path.as_slice()
+            && selects > 1
+            && let Some(store) = self.dyn_name_lookup(&seg.name.name)
+            && let Some(depth) = self.declared_signed_select_depth(store)
+        {
+            return depth == selects;
+        }
         if let Some(n) = self.frame_bound_bare_name(h) {
             return self.frame_named_signed_depth(n) == Some(selects);
         }
         let name = self.resolve_hier_name(h);
         let name = name.as_ref();
-        let depth = match self.packed_named_signed.get(name) {
-            Some(&d) => Some(d),
-            // §6.21: a block variable is recorded when its declaration
-            // runs, after the table was built.
-            None => self.module.var_decl_types.get(name).and_then(|dt| {
-                super::bytecode::signed_named_packed_elem_depth(dt, &self.module.typedef_types)
-            }),
-        };
+        let depth = self.declared_signed_select_depth(name);
         if depth == Some(selects) {
-            return !self.module.arrays.contains_key(name)
-                && !self.module.arrays_2d.contains_key(name)
-                && !self.module.arrays_nd.contains_key(name);
+            return true;
         }
         // §7.2, §7.4.1: a packed-array member reached through structure
         // members, elements of a packed array of structures or an instance
@@ -2196,6 +2210,23 @@ impl Simulator {
                 super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
                     == Some(selects)
             })
+    }
+
+    fn declared_signed_select_depth(&self, name: &str) -> Option<usize> {
+        let packed = self.packed_named_signed.get(name).copied().or_else(|| {
+            if name.starts_with('@') {
+                let dt = self.p_elem_type_ref(name)?;
+                super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
+            } else {
+                let dt = self.module.var_decl_types.get(name)?;
+                super::bytecode::signed_named_packed_elem_depth(dt, &self.module.typedef_types)
+            }
+        })?;
+        let unpacked = self.unpacked_dims_of(name).max(usize::from(
+            self.module.dynamic_arrays.contains(name) || self.module.queue_vars.contains(name)
+                || self.is_associative_array(name),
+        ));
+        Some(unpacked + packed)
     }
 
     /// §7.4.1: whether `dt` is a packed array of a named type, written with
@@ -2358,7 +2389,7 @@ impl Simulator {
                             || self.is_associative_array(name.as_ref()),
                     )
                 };
-                if unpacked == 0 && self.packed_named_signed.get(name.as_ref()) == Some(&indices) {
+                if self.declared_signed_select_depth(name.as_ref()) == Some(indices) {
                     // §7.4.1: an element of a named signed type.
                     return Some(true);
                 }
@@ -5959,30 +5990,7 @@ impl Simulator {
                         cur = inner_e.as_ref();
                     }
                     if let ExprKind::Ident(hier) = &cur.kind {
-                        let mut base_name = self.resolve_hier_name(hier);
-                        // Bare class-member N-D array inside a method:
-                        // resolve to its per-instance `<handle>#<member>`.
-                        // A member shadows a module array of the same name (§8.10).
-                        if !self.module.arrays_nd.contains_key(&*base_name)
-                            || (hier.path.len() == 1
-                                && hier.path[0].selects.is_empty()
-                                && *base_name == *hier.path[0].name.name)
-                        {
-                            if let Some(s) = self.instance_assoc_member(&base_name) {
-                                base_name = std::borrow::Cow::Owned(s);
-                            }
-                        }
-                        // `o.m[i][j][k]` on an object's member: its store is
-                        // `<handle>#m` (§7.4.5).
-                        if !self.module.arrays_nd.contains_key(&*base_name) && hier.path.len() >= 2
-                        {
-                            if let Some(s) = self
-                                .expr_assoc_name(cur)
-                                .filter(|s| self.module.arrays_nd.contains_key(s))
-                            {
-                                base_name = std::borrow::Cow::Owned(s);
-                            }
-                        }
+                        let base_name = self.multidim_array_store(hier, cur, |s, n| s.module.arrays_nd.contains_key(n));
                         if let Some((shape, w)) = self.module.arrays_nd.get(&*base_name).cloned() {
                             if rev_idxs.len() == shape.len() {
                                 let mut name = base_name.clone();
@@ -6013,29 +6021,7 @@ impl Simulator {
                 } = &expr.kind
                 {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
-                        let mut name = self.resolve_hier_name(hier);
-                        // Bare class-member 2D array inside a method:
-                        // resolve to its per-instance `<handle>#<member>`.
-                        // A member shadows a module array of the same name (§8.10).
-                        if !self.module.arrays_2d.contains_key(&*name)
-                            || (hier.path.len() == 1
-                                && hier.path[0].selects.is_empty()
-                                && *name == *hier.path[0].name.name)
-                        {
-                            if let Some(s) = self.instance_assoc_member(&name) {
-                                name = std::borrow::Cow::Owned(s);
-                            }
-                        }
-                        // `o.m[i][j]` on an object's member: its store is
-                        // `<handle>#m` (§7.4.5).
-                        if !self.module.arrays_2d.contains_key(&*name) && hier.path.len() >= 2 {
-                            if let Some(s) = self
-                                .expr_assoc_name(inner_expr)
-                                .filter(|s| self.module.arrays_2d.contains_key(s))
-                            {
-                                name = std::borrow::Cow::Owned(s);
-                            }
-                        }
+                        let name = self.multidim_array_store(hier, inner_expr, |s, n| s.module.arrays_2d.contains_key(n));
                         if self.module.arrays_2d.contains_key(&*name) {
                             // §11.5.1: an x/z index reads an all-x element.
                             let (Some(i), Some(j)) = (

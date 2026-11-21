@@ -5,6 +5,17 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    #[inline]
+    fn cast_integral_value(value: &Value, width: u32) -> Value {
+        if value.is_real {
+            Self::real_to_int(value.to_f64(), width)
+        } else if value.width == width {
+            value.clone()
+        } else {
+            value.resize_for_assign(width)
+        }
+    }
+
     /// Execute bytecode instructions in isolation (no &mut self).
     /// Returns NBA entries produced. Used for parallel edge block execution.
     pub(super) fn exec_insns_isolated(
@@ -714,6 +725,9 @@ impl Simulator {
                 Insn::Move(d, s) => {
                     vm_regs[*d as usize] = vm_regs[*s as usize].clone();
                 }
+                Insn::CastIntegral(d, s, width) => {
+                    vm_regs[*d as usize] = Self::cast_integral_value(&vm_regs[*s as usize], *width);
+                }
                 Insn::MoveResize(d, s, w) => {
                     // Exact composition of Move+Resize, including the Resize
                     // arm's runtime same-width skip (which preserves a fill
@@ -813,6 +827,7 @@ impl Simulator {
         view: &mut [Value],
         signal_widths: &[u32],
         signal_signed: &[bool],
+        shortreal_signals: &HashSet<usize>,
         signal_name_to_id: &NameMap,
         array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
         vm_regs: &mut Vec<Value>,
@@ -1262,6 +1277,9 @@ impl Simulator {
                 Insn::Move(d, s) => {
                     vm_regs[*d as usize] = vm_regs[*s as usize].clone();
                 }
+                Insn::CastIntegral(d, s, width) => {
+                    vm_regs[*d as usize] = Self::cast_integral_value(&vm_regs[*s as usize], *width);
+                }
                 Insn::MoveResize(d, s, w) => {
                     // Exact composition of Move+Resize, including the Resize
                     // arm's runtime same-width skip (which preserves a fill
@@ -1369,6 +1387,13 @@ impl Simulator {
                     // (the source of the 522 is_signed repr_diffs).
                     let id = *sig_id;
                     let w = *width;
+                    if view[id].is_real && shortreal_signals.contains(&id) {
+                        let mut val = Value::from_f64(vm_regs[*val_reg as usize].to_f64() as f32 as f64);
+                        val.is_signed = signal_signed[id];
+                        comb_write_full!(id, val);
+                        pc += 1;
+                        continue;
+                    }
                     let mut handled = false;
                     if w > 0 && w <= 64 && signal_widths[id] == w {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
@@ -1504,7 +1529,12 @@ impl Simulator {
                             unsupported = true;
                             break;
                         }
-                        let val = vm_regs[*val_reg as usize].resize(*width);
+                        let rhs = &vm_regs[*val_reg as usize];
+                        let val = if shortreal_signals.contains(&eid) {
+                            Value::from_f64(rhs.to_f64() as f32 as f64)
+                        } else {
+                            rhs.resize(*width)
+                        };
                         comb_write_full!(eid, val);
                     }
                 }
@@ -3610,6 +3640,9 @@ impl Simulator {
                         pc = *target as usize;
                         continue;
                     }
+                }
+                Insn::CastIntegral(d, s, width) => {
+                    self.vm_regs[*d as usize] = Self::cast_integral_value(&self.vm_regs[*s as usize], *width);
                 }
                 Insn::MoveResize(d, s, w) => {
                     // Exact composition of Move+Resize (same-width runtime

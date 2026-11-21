@@ -2565,7 +2565,7 @@ mod enabled {
             }
             // Fused Move+Resize: resize the SOURCE register's planes into
             // the destination. Same §11.8.1 sign-extension rule as Resize.
-            MoveResize(d, sr, width) => {
+            MoveResize(d, sr, width) | CastIntegral(d, sr, width) => {
                 if *width > 64 {
                     return Err(());
                 }
@@ -3058,7 +3058,7 @@ mod enabled {
             ClearSigned(r) => reg_s[*r as usize] = false,
             Concat(d, _) => reg_s[*d as usize] = false,
             Replicate(d, ..) | CaseLut(d, ..) => reg_s[*d as usize] = false,
-            MoveResize(d, sr, _) => reg_s[*d as usize] = reg_s[*sr as usize],
+            MoveResize(d, sr, _) | CastIntegral(d, sr, _) => reg_s[*d as usize] = reg_s[*sr as usize],
             CmpBranch(_, _, _, tmp, _) | CmpBranchConst(_, _, _, tmp, _) => {
                 reg_s[*tmp as usize] = false
             }
@@ -3166,7 +3166,7 @@ mod enabled {
                 set(reg_w, d, if known && total <= 64 { total } else { 0 })
             }
             Resize(d, w) => set(reg_w, d, *w),
-            MoveResize(d, _, w) => set(reg_w, d, *w),
+            MoveResize(d, _, w) | CastIntegral(d, _, w) => set(reg_w, d, *w),
             CmpBranch(_, _, _, tmp, _) | CmpBranchConst(_, _, _, tmp, _) => set(reg_w, tmp, 1),
             Replicate(d, sr, cnt) => {
                 let sw = get(reg_w, sr);
@@ -3543,6 +3543,7 @@ mod enabled {
                 | CmpBranch(..)
                 | CmpBranchConst(..)
                 | MoveResize(..)
+                | CastIntegral(..)
                 | Replicate(..)
                 | CaseLut(..)
                 | ReduceAnd(..)

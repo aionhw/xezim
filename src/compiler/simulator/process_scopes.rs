@@ -4813,7 +4813,9 @@ impl Simulator {
     pub(super) fn fit_value_to_signal(&self, id: usize, val: &Value) -> Value {
         let width = self.signal_widths[id];
         if self.signal_real[id] {
-            let mut r = if val.is_real {
+            let mut r = if self.shortreal_signals.contains(&id) {
+                Value::from_f64(val.to_f64() as f32 as f64)
+            } else if val.is_real {
                 val.clone()
             } else {
                 Value::from_f64(val.to_f64())
@@ -4999,6 +5001,21 @@ impl Simulator {
         applied
     }
 
+    /// A driver that evaluates to zero delay belongs to Active (§4.4.2).
+    /// Deliver its edges before an inactive continuation or NBA can observe
+    /// the old net or change the values an edge-sensitive process samples.
+    pub(super) fn drain_active_driver_updates(&mut self) {
+        if self.delayed_updates.is_empty() {
+            return;
+        }
+        let was_in_edge_cont = self.in_edge_cont;
+        self.in_edge_cont = true;
+        if self.apply_due_delayed_now() {
+            self.drain_edge_exec_rescan();
+        }
+        self.in_edge_cont = was_in_edge_cont;
+    }
+
     /// Get the next time a delayed update is due (for time advancement).
     pub(super) fn next_delayed_time(&self) -> Option<u64> {
         let a = self.delayed_updates.iter().map(|(t, _, _, _)| *t).min();
@@ -5069,7 +5086,7 @@ impl Simulator {
 
     /// Schedule a delayed signal update with an explicit delay (inertial delay model).
     pub(super) fn schedule_delayed_with_delay(&mut self, id: usize, val: Value, delay: u64) {
-        self.schedule_delayed_transition(id, val, delay, None);
+        self.schedule_delayed_transition(id, val, delay, None, None);
     }
 
     /// §10.3.3 / §28.16: the delay of a change from `old` to `new` with the
@@ -5125,6 +5142,7 @@ impl Simulator {
         val: Value,
         delay: u64,
         delay_target: Option<DelayTarget>,
+        runtime: Option<(Option<u64>, Option<u64>)>,
     ) {
         // §30.4 path-delayed net: the module paths pick the delay.
         if let Some(k) = self.module_paths.as_ref().and_then(|mp| mp.table_of(id)) {
@@ -5138,7 +5156,7 @@ impl Simulator {
         // Scalar gate outputs are the case that matters; "to 0" is judged on
         // the whole value so a vector net keeps using the rise delay unless it
         // goes fully zero.
-        let delay = if self.gate_fall_delay_by_id.is_empty() && self.gate_off_delay_by_id.is_empty()
+        let delay = if runtime.is_none() && self.gate_fall_delay_by_id.is_empty() && self.gate_off_delay_by_id.is_empty()
         {
             delay
         } else {
@@ -5158,8 +5176,10 @@ impl Simulator {
             let old_value = selected
                 .as_ref()
                 .map_or(&self.signal_table[id], |(_, old)| old);
-            let fall = self.gate_fall_delay_by_id.get(&id).copied();
-            let off = self.gate_off_delay_by_id.get(&id).copied();
+            let (fall, off) = runtime.unwrap_or_else(|| (
+                self.gate_fall_delay_by_id.get(&id).copied(),
+                self.gate_off_delay_by_id.get(&id).copied(),
+            ));
             Self::transition_delay(new_value, old_value, delay, fall, off, vector_assign)
         };
         let target_time = self.time + delay;

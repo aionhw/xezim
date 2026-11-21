@@ -2970,29 +2970,7 @@ impl Simulator {
                 cur = inner_e.as_ref();
             }
             if let ExprKind::Ident(hier) = &cur.kind {
-                let mut base_name = self.resolve_hier_name(hier);
-                // Bare class-member N-D array inside a method:
-                // resolve to its per-instance `<handle>#<member>`.
-                // A member shadows a module array of the same name (§8.10).
-                if !self.module.arrays_nd.contains_key(&*base_name)
-                    || (hier.path.len() == 1
-                        && hier.path[0].selects.is_empty()
-                        && *base_name == *hier.path[0].name.name)
-                {
-                    if let Some(s) = self.instance_assoc_member(&base_name) {
-                        base_name = std::borrow::Cow::Owned(s);
-                    }
-                }
-                // `o.m[i][j][k]` on an object's member: its store is
-                // `<handle>#m` (§7.4.5).
-                if !self.module.arrays_nd.contains_key(&*base_name) && hier.path.len() >= 2 {
-                    if let Some(s) = self
-                        .expr_assoc_name(cur)
-                        .filter(|s| self.module.arrays_nd.contains_key(s))
-                    {
-                        base_name = std::borrow::Cow::Owned(s);
-                    }
-                }
+                let base_name = self.multidim_array_store(hier, cur, |s, n| s.module.arrays_nd.contains_key(n));
                 if let Some((shape, _w)) = self.module.arrays_nd.get(&*base_name).cloned() {
                     if rev_idxs.len() == shape.len() {
                         let mut name = base_name.clone();
@@ -3153,29 +3131,7 @@ impl Simulator {
         } = &expr.kind
         {
             if let ExprKind::Ident(hier) = &inner_expr.kind {
-                let mut name = self.resolve_hier_name(hier);
-                // Bare class-member 2D array inside a method: resolve to its
-                // per-instance `<handle>#<member>`. The member shadows a
-                // module array of the same name (§8.10); taking the module's
-                // first sent the write to it and left the member at 0 (#597).
-                let bare_member = hier.path.len() == 1
-                    && hier.path[0].selects.is_empty()
-                    && *name == *hier.path[0].name.name;
-                if !self.module.arrays_2d.contains_key(&*name) || bare_member {
-                    if let Some(s) = self.instance_assoc_member(&name) {
-                        name = std::borrow::Cow::Owned(s);
-                    }
-                }
-                // `o.m[i][j] = v` on an object's member: its store is
-                // `<handle>#m` (§7.4.5).
-                if !self.module.arrays_2d.contains_key(&*name) && hier.path.len() >= 2 {
-                    if let Some(s) = self
-                        .expr_assoc_name(inner_expr)
-                        .filter(|s| self.module.arrays_2d.contains_key(s))
-                    {
-                        name = std::borrow::Cow::Owned(s);
-                    }
-                }
+                let mut name = self.multidim_array_store(hier, inner_expr, |s, n| s.module.arrays_2d.contains_key(n));
                 // A bare name written from inside a SUBMODULE — e.g. the
                 // body of a `foreach` in an `always_comb`, evaluated from
                 // the settle path where no scope hint is installed and the
@@ -4819,7 +4775,11 @@ impl Simulator {
                             // locals are exempt (1024-bit internal packed
                             // text).
                             let is_str = self.p_local_is_string(name);
-                            let fitted = if prev_is_real && !val.is_real && !is_str {
+                            let fitted = if prev_is_real && self.module.var_decl_types.get(name).is_some_and(|dt| matches!(
+                                self.resolve_dt_ref(dt), DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }
+                            )) {
+                                Value::from_f64(val.to_f64() as f32 as f64)
+                            } else if prev_is_real && !val.is_real && !is_str {
                                 // §6.12.2: an integral value assigned to a REAL
                                 // local converts; stored as integral bits, a
                                 // `real t; t = k; h = t / 2;` divided as integers.
