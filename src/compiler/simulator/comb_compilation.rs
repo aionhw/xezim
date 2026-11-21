@@ -46,7 +46,7 @@ impl Simulator {
         Some(out)
     }
 
-    fn constant_selected_storage(&self, expr: &Expression) -> Option<String> {
+    pub(super) fn constant_selected_storage(&self, expr: &Expression) -> Option<String> {
         fn append(
             e: &Expression,
             module: &ElaboratedModule,

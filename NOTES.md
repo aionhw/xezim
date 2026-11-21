@@ -142,6 +142,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 - **Correctness:** Check `p.s` through an instance or a generate block that has a package's name as a hierarchical name: the design no longer fails with "'s' is not declared in package 'p'" (§23.6, §23.9, §26.3).
 
+- Share declared element widths across fixed class arrays, retaining indexed writes and checkpoint restore (#1053). The public Rust field `Simulator::widths` now has type `SignalWidths`. It supports key lookups, indexing, inserts, removals and logical iteration; iterated names are `Cow<str>`. Code requiring a concrete `HashMap<String, u32>` or its entry API needs adaptation.
+
 - **Correctness:** Check type names in selected generate branches, retain instance-specific sensitivity widths, and preserve cross-top waveform selections (#1374, #1375, #1378).
 - **Correctness:** Read four-state digits in integer scan conversions, store unpacked concatenations in fixed queue rows, and resolve rooted queue-element members (#1377, #1379, #1380).
 - **Correctness:** Evaluate continuous-assignment time queries in their declaring instance, retain VPI deposits until a driver changes, and sample input-net defaults on clock edges (#1381, #1382, #1356).
@@ -199,6 +201,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 - **Correctness:** Preserve input-port indices around UDP instances, schedule fixed-array and record assignment-pattern leaves in the NBA region, and combine root and descendant waveform scopes with independent depth limits (#1201, #1199, #1195).
 
 **Performance**
+
+- Compile process loops that write packed memory words through fixed banks or indexed instances, including reads through the same instance paths (#1456).
 
 - Inline literal default inputs on positional function calls and compile process locals overwritten by a function output before their first read (#1453).
 

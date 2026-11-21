@@ -953,6 +953,7 @@ impl Simulator {
             let inline_bits = std::mem::take(&mut self.signal_inline_bits);
             let has_xz = std::mem::take(&mut self.signal_has_xz);
             self.checkpoint_decode_state(&mut fields)?;
+            self.restore_class_width_ranges();
             self.refill_inline_bits(inline_bits)?;
             refill_in_place(&mut self.signal_has_xz, has_xz, "signal_has_xz")?;
             #[cfg(feature = "jit")]
