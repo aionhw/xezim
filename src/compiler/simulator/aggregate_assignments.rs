@@ -153,7 +153,7 @@ impl Simulator {
             }
             kind => {
                 let vals = if let ExprKind::Concatenation(items) = kind {
-                    self.unpacked_concat_operand_values(items.iter().collect())
+                    self.unpacked_concat_operand_values(items.iter().collect(), true, None)
                 } else if let Some((src, suffixes, _)) = self.nd_array_operand(rhs) {
                     suffixes
                         .iter()

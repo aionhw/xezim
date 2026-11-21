@@ -747,7 +747,13 @@ impl Simulator {
         })
     }
     /// Snapshot the operands before replacing any destination elements (§10.10).
-    fn assign_unpacked_concat(&mut self, lname: &str, exprs: &[Expression]) {
+    fn assign_unpacked_concat<'e>(
+        &mut self,
+        lname: &str,
+        exprs: &'e [Expression],
+        check_rows: bool,
+        first_row: Option<(&'e Expression, super::unpacked_slices::UnpackedLayout<'e>)>,
+    ) {
         let is_dyn = self.module.dynamic_arrays.contains(lname) || self.class_queue_prop(lname);
         // IEEE 1800 §10.10.1: in an unpacked-array
         // concatenation each item is read in the context of
@@ -808,7 +814,8 @@ impl Simulator {
             return;
         }
         // Expand queue/array elements in concat (e.g. q = {q, 4})
-        let all_vals = self.unpacked_concat_operand_values(items);
+        let expand_rows = check_rows && elem_is_scalar && self.concat_has_non_array_elements(lname);
+        let all_vals = self.unpacked_concat_operand_values(items, expand_rows, first_row);
         let (lo, hi, _w) = self
             .module
             .arrays
@@ -816,11 +823,12 @@ impl Simulator {
             .copied()
             .unwrap_or((0, -1, 32));
         let n_vals = all_vals.len();
+        let descending = self.module.descending_arrays.contains(lname);
         for (i, v) in all_vals.into_iter().enumerate() {
-            let idx = lo + i as i64;
+            let idx = if descending { hi - i as i64 } else { lo + i as i64 };
             // Dynamic arrays/queues grow to fit; only fixed
             // arrays are bounded by their declared range.
-            if !is_dyn && idx > hi {
+            if !is_dyn && (idx < lo || idx > hi) {
                 break;
             }
             // §10.10: each item is an element-typed value.
@@ -4330,7 +4338,7 @@ impl Simulator {
                 })
             };
             if let Some(name) = target {
-                self.assign_unpacked_concat(&name, parts);
+                self.assign_unpacked_concat(&name, parts, check_remaining_rows, first_row);
                 self.settle_after_proc_write();
                 return;
             }
@@ -4991,105 +4999,7 @@ impl Simulator {
                     return;
                 }
                 if let ExprKind::Concatenation(exprs) = &rvalue.kind {
-                    // IEEE 1800 §10.10.1: in an unpacked-array
-                    // concatenation each item is read in the context of
-                    // the ELEMENT type, so a nested plain-brace concat
-                    // is itself an array value whose elements SPLICE
-                    // into the outer one — `a = {1, {2, 3}}` assigns
-                    // `{1, 2, 3}` — i.e. nested braces flatten. Only
-                    // flatten when the element type is not itself an
-                    // array (for a multi-dimensional target an inner
-                    // brace denotes one whole sub-array element).
-                    // Assignment patterns `'{...}` never flatten; they
-                    // take the AssignmentPattern branch above.
-                    fn flatten_unpacked_concat<'a>(
-                        exprs: &'a [Expression],
-                        out: &mut Vec<&'a Expression>,
-                    ) {
-                        for e in exprs {
-                            if let ExprKind::Concatenation(inner) = &e.kind {
-                                flatten_unpacked_concat(inner, out);
-                            } else {
-                                out.push(e);
-                            }
-                        }
-                    }
-                    let elem_is_scalar = !self.module.arrays_2d.contains_key(&*lname)
-                        && !self.module.arrays_nd.contains_key(&*lname);
-                    let items: Vec<&Expression> = if elem_is_scalar {
-                        let mut v = Vec::new();
-                        flatten_unpacked_concat(exprs, &mut v);
-                        v
-                    } else {
-                        exprs.iter().collect()
-                    };
-                    // §10.10 / §7.8: in a queue (or array) of ASSOCIATIVE
-                    // arrays, an associative operand (`q = {src}`) is one
-                    // whole element: its entries are copied into it.
-                    // Evaluated as one value, the element kept no entries.
-                    let assoc_srcs: Vec<Option<String>> =
-                        if self.module.associative_arrays.is_empty() {
-                            Vec::new()
-                        } else {
-                            items.iter().map(|e| self.assoc_value_operand(e)).collect()
-                        };
-                    if assoc_srcs.iter().any(Option::is_some) {
-                        let is_dyn = class_dyn || self.module.dynamic_arrays.contains(&*lname);
-                        let lo = self.module.arrays.get(&*lname).map_or(0, |t| t.0);
-                        for (i, (e, src)) in items.iter().zip(assoc_srcs).enumerate() {
-                            let elem = format!("{}[{}]", lname, lo + i as i64);
-                            match src {
-                                Some(src) => self.store_assoc_elem(&elem, &src),
-                                None => {
-                                    let v = self.eval_expr(e);
-                                    self.set_signal_value_by_name(&elem, v);
-                                }
-                            }
-                        }
-                        if is_dyn {
-                            self.set_queue_size(&lname, items.len() as u64);
-                        }
-                        self.settle_after_proc_write();
-                        return;
-                    }
-                    // Expand queue/array elements in concat (e.g. q = {q, 4})
-                    let expand_rows = check_remaining_rows
-                        && elem_is_scalar
-                        && self.concat_has_non_array_elements(&lname);
-                    let all_vals =
-                        self.unpacked_concat_operand_values(items, expand_rows, first_row);
-                    let is_dyn = class_dyn || self.module.dynamic_arrays.contains(&*lname);
-                    let (lo, hi, _w) = self
-                        .module
-                        .arrays
-                        .get(&*lname)
-                        .copied()
-                        .unwrap_or((0, -1, 32));
-                    let n_vals = all_vals.len();
-                    // §7.6: the first value goes to the leftmost declared index.
-                    let descending = self.module.descending_arrays.contains(&*lname);
-                    for (i, v) in all_vals.into_iter().enumerate() {
-                        let idx = if descending {
-                            hi - i as i64
-                        } else {
-                            lo + i as i64
-                        };
-                        // Dynamic arrays/queues grow to fit; only fixed
-                        // arrays are bounded by their declared range.
-                        if !is_dyn && (idx < lo || idx > hi) {
-                            break;
-                        }
-                        // §10.10: each item is an element-typed value.
-                        let v = if is_dyn {
-                            self.fit_queue_push_elem(&lname, v)
-                        } else {
-                            v
-                        };
-                        self.set_signal_value_by_name(&format!("{}[{}]", lname, idx), v);
-                    }
-                    if is_dyn {
-                        self.set_queue_size(&lname, n_vals as u64);
-                    }
+                    self.assign_unpacked_concat(&lname, exprs, check_remaining_rows, first_row);
                     self.settle_after_proc_write();
                     return;
                 }
