@@ -2548,12 +2548,9 @@ impl Simulator {
                 let name = &path[0].name.name;
                 if name.starts_with('$') {
                     return match name.as_str() {
-                        "$time" => Value::from_u64(self.time_in_current_unit().round() as u64, 64),
+                        "$time" => Value::from_u64(self.rounded_time_in_current_unit(), 64),
                         "$realtime" => Value::from_f64(self.time_in_current_unit()),
-                        "$stime" => Value::from_u64(
-                            (self.time_in_current_unit().round() as u64) & 0xFFFF_FFFF,
-                            32,
-                        ),
+                        "$stime" => Value::from_u64(self.rounded_time_in_current_unit(), 32),
                         "$inferred_clock" | "$inferred_disable" if sv_parser::is_sv2023() => {
                             Value::from_u64(0, 1)
                         }
