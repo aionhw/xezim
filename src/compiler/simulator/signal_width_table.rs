@@ -129,6 +129,10 @@ impl SignalWidths {
         self.iter().map(|(key, _)| key)
     }
 
+    pub fn values(&self) -> impl Iterator<Item = &u32> {
+        self.iter().map(|(_, width)| width)
+    }
+
     /// Called at allocation, before the new instance's member has any keys.
     pub(super) fn declare_fixed(&mut self, name: &str, first: u64, last: u64, width: u32) {
         self.ranges
@@ -146,6 +150,23 @@ impl SignalWidths {
     pub(super) fn remove_dead_owners(&mut self, dead: impl Fn(&str) -> bool) {
         self.named.retain(|name, _| !dead(name));
         self.ranges.retain(|name, _| !dead(name));
+    }
+}
+
+impl<K: AsRef<str> + ?Sized> std::ops::Index<&K> for SignalWidths {
+    type Output = u32;
+
+    fn index(&self, key: &K) -> &Self::Output {
+        self.get(key.as_ref()).expect("no entry found for key")
+    }
+}
+
+impl<'a> IntoIterator for &'a SignalWidths {
+    type Item = (Cow<'a, str>, &'a u32);
+    type IntoIter = Box<dyn Iterator<Item = Self::Item> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
     }
 }
 
@@ -222,6 +243,9 @@ mod tests {
         assert_eq!(table.remove("17#data[8]"), Some(8));
         assert_eq!(table.len(), 12);
         assert_eq!(table.keys().count(), table.len());
+        assert_eq!(table.values().count(), table.len());
+        assert_eq!(table["17#data[5]"], 32);
+        assert_eq!((&table).into_iter().count(), table.len());
 
         let cfg = xezim_core::xez_bincode_config();
         let bytes = bincode::serde::encode_to_vec(&table, cfg).unwrap();
