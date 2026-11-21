@@ -5815,6 +5815,32 @@ impl Simulator {
                         }
                     }
                 }
+                // A per-call collection stores each unpacked element separately.
+                // Select a packed lane from that element using the formal's bounds.
+                if let ExprKind::Index { expr: array, .. } = &expr.kind
+                    && let ExprKind::Ident(h) = &array.kind
+                    && let [seg] = h.path.as_slice()
+                    && seg.selects.is_empty()
+                    && let Some(store) = self.dyn_name_lookup(&seg.name.name)
+                    && (self.module.queue_vars.contains(store)
+                        || self.module.dynamic_arrays.contains(store)
+                        || self.is_associative_array(store))
+                    && self.unpacked_dims_of(store) <= 1
+                    && let Some(dims) = self.module.packed_full_dims.get(store)
+                    && let [outer, inner @ ..] = dims.as_slice()
+                    && !inner.is_empty()
+                {
+                    let (l, r) = *outer;
+                    let width: u32 = inner.iter().map(|(a, b)| a.abs_diff(*b) as u32 + 1).product();
+                    let elem = self.eval_expr(expr);
+                    let Some(i) = self.eval_expr(index).to_index()
+                        .filter(|i| (l.min(r)..=l.max(r)).contains(i))
+                    else {
+                        return Value::new(width);
+                    };
+                    let lo = (r.abs_diff(i) * u64::from(width)) as usize;
+                    return elem.range_select(lo + width as usize - 1, lo);
+                }
                 // Element of an unpacked ARRAY OF QUEUES: `q[i][k]` selects
                 // element k of the queue `q[i]` (§7.4.5). Without this the base
                 // resolves to a scalar and `[k]` becomes a bit-select.
