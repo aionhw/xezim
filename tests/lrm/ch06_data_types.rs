@@ -269,6 +269,10 @@ fn c6_types_more() {
     // Known gap (§6.12.1): `6.12.1c` reference `7766279631452241920`, xezim `9223372036854775807`
     // Known gap (§6.19): `6.19b` reference `[] 001`, xezim `[XB] 001`
     // Known gap (§6.24.1): `6.24.1l` reference `4`, xezim `0`
+    // IEEE 1800-2023 over the reference (§6.12, #1463): `shortreal` holds an
+    // IEEE 754 binary32 value, so `6.12a` reads `0.3333333433` and `6.12b`
+    // (1e40 stored in a shortreal) reads `inf`; the reference keeps binary64
+    // (`0.3333333333`, `1.000000e+40`).
     check(
         "c06_more",
         include_str!("sv/c06_more.sv"),
@@ -280,8 +284,6 @@ fn c6_types_more() {
             "T|6.20.3|c06x.t3 0 bits=32 w=3",
             "T|6.8a|3 1 1",
             "T|6.20.6|42",
-            "T|6.12a|0.3333333333",
-            "T|6.12b|1.000000e+40",
             "T|6.12.1a|4",
             "T|6.12.1b|-4",
             "T|6.12.1d|0",
@@ -300,6 +302,13 @@ fn c6_types_more() {
             "T|6.14b|1 1",
             "T|6.16w|2 AB",
         ],
-        &["T|6.20.2|", "T|6.12.1c|", "T|6.19b|", "T|6.24.1l|"],
+        &[
+            "T|6.20.2|",
+            "T|6.12.1c|",
+            "T|6.19b|",
+            "T|6.24.1l|",
+            "T|6.12a|",
+            "T|6.12b|",
+        ],
     );
 }
