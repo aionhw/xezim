@@ -782,6 +782,15 @@ impl Simulator {
                 .or_else(|| {
                     Self::row_pattern_assign_parts(&self.module, &ca, &decl_dims_snapshot, &params_snapshot)
                 })
+                .map(|mut parts| {
+                    if ca.delay_exprs.is_some() {
+                        for part in &mut parts {
+                            part.delay_exprs.clone_from(&ca.delay_exprs);
+                            part.origin.clone_from(&ca.origin);
+                        }
+                    }
+                    parts
+                })
                 .unwrap_or_else(|| vec![ca])
             })
             .flat_map(|ca| {

@@ -61,3 +61,30 @@ endmodule"#,
         ["rise-pending=0", "fall-pending=1", "off-pending=0", "off=z"]
     );
 }
+
+#[test]
+fn net_declaration_and_gate_cancel_short_pulses() {
+    let sim = simulate(
+        r#"
+`timescale 1ns/1ns
+module top;
+  logic a = 0;
+  int d = 2;
+  wire #(d) net_copy = a;
+  wire gated;
+  buf #(d) g(gated,a);
+  initial begin
+    #4 a = 1;
+    #1 a = 0;
+    #2 $display("filtered=%b%b", net_copy, gated);
+    d = 4; a = 1;
+    #3 $display("pending=%b%b", net_copy, gated);
+    #2 $display("arrived=%b%b", net_copy, gated);
+  end
+endmodule"#,
+        20,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(lines, ["filtered=00", "pending=00", "arrived=11"]);
+}
