@@ -172,7 +172,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate");
-    let messages: Vec<_> = sim.output.iter().map(|line| line.message.as_str()).collect();
+    let messages: Vec<_> = sim
+        .output
+        .iter()
+        .map(|line| line.message.as_str())
+        .collect();
     for expected in [
         "top.tie_off en_bits=1 inv_en=0 rst_bits=1 inv_rst=1",
         "top.decimal bits=8 value=44",
@@ -235,7 +239,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 2000).expect("simulate");
-    let messages: Vec<_> = sim.output.iter().map(|line| line.message.as_str()).collect();
+    let messages: Vec<_> = sim
+        .output
+        .iter()
+        .map(|line| line.message.as_str())
+        .collect();
     for expected in [
         "top.drop_x value=-16",
         "top.drop_alias_x bits=1001",
@@ -258,7 +266,9 @@ endmodule
 /// §6.6.5: each port resolves the bits driven by a concatenation against its own pull.
 #[test]
 fn concatenation_actual_resolves_through_pulled_formals() {
-    let sim = simulate(r#"
+    let sim = simulate(
+        r#"
+`timescale 1ns/1ns
 module sink(input tri0 [3:0] lo, input tri1 [3:0] hi);
   initial begin
     #1 $display("first %b %b", lo, hi);
@@ -270,8 +280,15 @@ module top;
   sink u({v, 2'bz0}, {v, 2'bz0});
   initial begin v = 2'b1z; #2 v = 2'bz0; end
 endmodule
-"#, 10).expect("simulate");
-    let lines: Vec<_> = sim.output.iter().map(|line| line.message.as_str()).collect();
+"#,
+        10,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim
+        .output
+        .iter()
+        .map(|line| line.message.as_str())
+        .collect();
     assert!(lines.contains(&"first 1000 1110"), "{lines:?}");
     assert!(lines.contains(&"second 0000 1010"), "{lines:?}");
 }
