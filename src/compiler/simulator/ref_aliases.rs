@@ -449,7 +449,18 @@ impl Simulator {
             {
                 return None;
             }
-            let idx = self.eval_expr(index).to_index()?;
+            let size = class.queue_properties.contains_key(member).then(|| self.get_queue_size(&store));
+            if let Some(size) = size {
+                self.dollar_bound.push(size as i64 - 1);
+            }
+            let idx = self.eval_expr(index).to_index();
+            if size.is_some() {
+                self.dollar_bound.pop();
+            }
+            let idx = idx?;
+            if size.is_some_and(|n| idx < 0 || idx as u64 >= n) {
+                return None;
+            }
             let cell = format!("{store}[{idx}]");
             return self.get_signal_value_by_name(&cell).map(|_| cell);
         }

@@ -139,3 +139,26 @@ endmodule
         "T|23 0 1",
     );
 }
+
+#[test]
+fn a_queue_ref_accepts_the_last_element_selector() {
+    check(
+        r#"
+module top;
+  class C;
+    int q[$] = '{4, 9};
+    function void increment(ref int x);
+      x++;
+      $display("T|%0d %0d", q[0], q[$]);
+    endfunction
+    function void run();
+      increment(q[$]);
+    endfunction
+  endclass
+  C c;
+  initial begin c = new; c.run(); end
+endmodule
+"#,
+        "T|4 10",
+    );
+}
