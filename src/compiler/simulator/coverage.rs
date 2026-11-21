@@ -62,10 +62,20 @@ impl Simulator {
             .and_then(|h| self.heap.get(h))
             .and_then(Option::as_ref)
         {
-            for (name, value) in &obj.properties {
+            for name in obj.properties.keys() {
+                let real = self
+                    .class_property_decl_type(&obj.class_name, name)
+                    .is_some_and(|(dt, dims)| {
+                        dims.is_empty()
+                            && matches!(
+                                self.cg_sample_type(&def.name.name, owner, &dt),
+                                SampleType::Real
+                            )
+                    });
+
                 frame.insert(
                     name.clone(),
-                    if value.is_real {
+                    if real {
                         Value::from_f64(0.0)
                     } else {
                         Value::zero(1)
@@ -80,6 +90,13 @@ impl Simulator {
             };
             frame.insert(port.name.name.clone(), value);
         }
+        let scope = def
+            .name
+            .name
+            .rsplit_once('.')
+            .filter(|_| !def.name.name.contains("::"));
+        let saved_hint =
+            scope.map(|(scope, _)| self.name_resolve_hint.replace(Some(scope.to_owned())));
         self.push_local_frame(frame);
         let points = def
             .items
@@ -94,6 +111,9 @@ impl Simulator {
             })
             .collect();
         self.pop_local_frame();
+        if let Some(hint) = saved_hint {
+            *self.name_resolve_hint.borrow_mut() = hint;
+        }
         points
     }
 
