@@ -10651,6 +10651,26 @@ impl<'a> BytecodeCompiler<'a> {
             selects += 1;
             root = base;
         }
+        // A member of an indexed packed struct keeps the member declaration.
+        // Its container index does not consume a dimension of the member.
+        if let ExprKind::MemberAccess { expr: container, member } = &root.kind
+            && let ExprKind::Index { expr: base, .. } = &container.kind
+            && let ExprKind::Ident(h) = &base.kind
+            && self.local_var_reg_of(h).is_none()
+        {
+            let raw = Self::hier_raw_name(h);
+            let dt = self.scope_hint.as_ref()
+                .and_then(|scope| decls.get(&format!("{scope}.{raw}")))
+                .or_else(|| decls.get(&raw));
+            if let Some(crate::ast::types::DataType::Struct(st)) = dt
+                .map(|dt| crate::compiler::elaborate::resolve_typedef_chain(dt, types))
+                && st.packed
+                && let Some(field) = st.members.iter().find(|m|
+                    m.declarators.iter().any(|d| d.name.name == member.name))
+            {
+                return signed_named_packed_elem_depth(&field.data_type, types) == Some(selects);
+            }
+        }
         let ExprKind::Ident(h) = &root.kind else {
             return false;
         };

@@ -292,7 +292,7 @@ impl Simulator {
     /// an anonymous aggregate, which other paths name.
     fn tn_base_text(&self, dt: &DataType, logic_kw: bool) -> Option<String> {
         match dt {
-            DataType::TypeReference { name, .. } => {
+            DataType::TypeReference { name, dimensions, .. } => {
                 let n = name.name.name.as_str();
                 if self.module.interfaces.contains(n) {
                     return Some(format!("virtual {}", n));
@@ -308,6 +308,17 @@ impl Simulator {
                 match &target {
                     DataType::Struct(_) | DataType::Enum(_) => {
                         self.tn_named_aggregate(&target, name)
+                    }
+                    _ if !dimensions.is_empty()
+                        && matches!(self.resolve_dt_ref(&target), DataType::IntegerVector { .. }) => {
+                        let mut text = self.tn_base_text(&target, true)?;
+                        let mut outer = String::new();
+                        for dim in dimensions {
+                            let PackedDimension::Range { left, right, .. } = dim else { return None; };
+                            outer.push_str(&format!("[{}:{}]", self.tn_const(left)?, self.tn_const(right)?));
+                        }
+                        text.insert_str(text.find('[').unwrap_or(text.len()), &outer);
+                        Some(text)
                     }
                     _ => self.tn_base_text(&target, logic_kw),
                 }
