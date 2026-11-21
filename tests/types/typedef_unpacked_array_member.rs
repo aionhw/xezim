@@ -244,3 +244,33 @@ endmodule"#,
         &["1.5 2.5 0"],
     );
 }
+
+/// §6.18 and §7.2.2: each qualified typedef supplies its own member bounds,
+/// even when another package declares a typedef with the same leaf name.
+#[test]
+fn same_named_package_typedefs_keep_independent_member_bounds() {
+    assert_output(
+        r#"
+package north;
+  typedef int row[7:6];
+endpackage
+package south;
+  typedef int row[-2:0];
+endpackage
+module top;
+  typedef struct { north::row n; south::row s; } pair_t;
+  function automatic pair_t build();
+    build.n[7] = 11;
+    build.n[6] = 22;
+    build.s[-2] = 33;
+    build.s[0] = 44;
+  endfunction
+  pair_t result;
+  initial begin
+    result = build();
+    $display("%0d %0d %0d %0d", result.n[7], result.n[6], result.s[-2], result.s[0]);
+  end
+endmodule"#,
+        &["11 22 33 44"],
+    );
+}
