@@ -8768,6 +8768,15 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
                 ExprKind::Paren(i) => expr_ok(i, bound, me, ext),
+                ExprKind::AssignExpr { lvalue, rvalue } => {
+                    // §11.4.1: an assignment expression writes its target
+                    // just as a blocking assignment statement does.
+                    expr_ok(lvalue, bound, me, false) && expr_ok(rvalue, bound, me, ext)
+                }
+                ExprKind::Unary {
+                    op: UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr,
+                    operand,
+                } => expr_ok(operand, bound, me, false),
                 ExprKind::Unary { operand, .. } => expr_ok(operand, bound, me, ext),
                 ExprKind::Binary { left, right, .. } => {
                     expr_ok(left, bound, me, ext) && expr_ok(right, bound, me, ext)

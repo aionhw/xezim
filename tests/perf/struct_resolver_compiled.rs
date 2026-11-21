@@ -88,3 +88,28 @@ endmodule
     assert_eq!(entry_hist(&text, "contassign_ast"), 0, "{text}");
     assert!(entry_hist(&text, "contassign_c") >= 3, "{text}");
 }
+
+/// §11.4.1 / §13.4: assignments to local loop counters are pure. The two
+/// counter forms must produce the same values on successive compiled calls.
+#[test]
+fn local_assignment_loop_steps_compile() {
+    let text = run_profiled(r#"
+module top;
+  function automatic int f(input int x);
+    int i, j, a;
+    a=0;
+    for (i=0; i<3; i=i+1)
+      for (j=0; j<2; j+=1) a += x+i+j;
+    return a;
+  endfunction
+  int x=1;
+  wire [31:0] out=f(x);
+  initial begin #1 $display("first=%0d",out);
+    x=2; #1 $display("second=%0d",out);
+  end
+endmodule
+"#);
+    assert!(text.contains("first=15") && text.contains("second=21"), "{text}");
+    assert_eq!(entry_hist(&text, "contassign_ast"), 0, "{text}");
+    assert!(entry_hist(&text, "contassign_c") > 0, "{text}");
+}
