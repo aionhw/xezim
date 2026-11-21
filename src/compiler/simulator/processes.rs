@@ -2494,7 +2494,7 @@ impl Simulator {
     pub(super) fn freeze_array_rhs_selectors(&mut self, rhs: &Expression) -> Option<Expression> {
         let rhs = Self::unparen(rhs);
         if (self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty())
-            || !matches!(rhs.kind, ExprKind::Index { .. } | ExprKind::RangeSelect { .. })
+            || !matches!(rhs.kind, ExprKind::Index { .. })
             || Self::cond_expr_is_effect_free(rhs, false)
         {
             return None;
@@ -2502,10 +2502,22 @@ impl Simulator {
         // Freeze just select chains on a name. Expressions that produce an
         // array by calling a function keep their own call-result handling.
         let mut base = rhs;
-        while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &base.kind {
+        let mut selects = 0;
+        while let ExprKind::Index { expr, .. } = &base.kind {
+            selects += 1;
             base = expr;
         }
-        matches!(base.kind, ExprKind::Ident(_)).then(|| self.freeze_conditional_path(rhs, true))
+        let ExprKind::Ident(h) = &base.kind else { return None };
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let name = self.array_operand_name(base).unwrap_or_else(|| self.resolve_hier_name(h).into_owned());
+        let rank = if self.module.arrays_2d.contains_key(&name) {
+            2
+        } else {
+            self.module.arrays_nd.get(&name)?.0.len()
+        };
+        (rank > selects).then(|| self.freeze_conditional_path(rhs, true))
     }
 
     /// §10.10: capture a one-dimensional unpacked array in element order.
