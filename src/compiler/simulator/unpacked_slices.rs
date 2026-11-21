@@ -501,6 +501,37 @@ impl Simulator {
         true
     }
 
+    /// §10.10: a fixed one-dimensional array member of a structure
+    /// (`s.a`, `sa[1].a`) contributes its elements left to right. False when
+    /// `e` is no such member; a collection member keeps its own path.
+    pub(super) fn append_member_array_concat_values(
+        &mut self,
+        e: &Expression,
+        values: &mut Vec<Value>,
+    ) -> bool {
+        if !matches!(e.kind, ExprKind::MemberAccess { .. }) {
+            return false;
+        }
+        let Some(layout) = self
+            .unpacked_operand_layout::<false>(e)
+            .filter(|l| l.steps.is_empty() && l.dims.len() == 1)
+            .filter(|l| self.live_coll_size(&l.root_name).is_none())
+        else {
+            return false;
+        };
+        let Some(el) = self.unpacked_elems_from_layout(layout, false) else {
+            return false;
+        };
+        let Some(first) = el.names.iter().flatten().next() else {
+            return false;
+        };
+        if self.get_signal_value_by_name(first).is_none() {
+            return false;
+        }
+        self.append_unpacked_elem_values(&el, values);
+        true
+    }
+
     /// The values of `el`'s elements; one outside the declared range reads
     /// as the element type's default (§7.4.5 Table 7-1).
     fn append_unpacked_elem_values(&self, el: &UnpackedElems, values: &mut Vec<Value>) {

@@ -141,9 +141,87 @@ impl Simulator {
                     }
                 }
             }
+            // §10.10, §11.4.11, §6.24.1: a conditional choosing between two
+            // array operands contributes the chosen operand's elements, and a
+            // cast of an array operand to an unpacked array type
+            // (`row_t'(src[1])`) contributes its operand's. An ambiguous
+            // condition keeps the value path below.
+            if let Some(inner) = self.unpacked_concat_inner_operand(expr) {
+                let vals = self.unpacked_concat_operand_values(vec![inner], expand_rows, None);
+                all_vals.extend(vals);
+                continue;
+            }
+            if self.append_member_array_concat_values(expr, &mut all_vals) {
+                continue;
+            }
             all_vals.push(self.eval_expr(expr));
         }
         all_vals
+    }
+
+    /// The array operand that a conditional or an unpacked-array cast item
+    /// of an unpacked concatenation stands for; `None` for any other item.
+    /// Only the condition is evaluated.
+    fn unpacked_concat_inner_operand<'e>(&mut self, e: &'e Expression) -> Option<&'e Expression> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.unpacked_concat_inner_operand(inner),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } if self.concat_array_operand_like(then_expr)
+                && self.concat_array_operand_like(else_expr) =>
+            {
+                match self.eval_expr(condition).is_nonzero()? {
+                    true => Some(Self::unparen(then_expr)),
+                    false => Some(Self::unparen(else_expr)),
+                }
+            }
+            ExprKind::SystemCall { name, args }
+                if name == "$__xz_named_cast"
+                    && args.len() == 2
+                    && matches!(&args[0].kind, ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty()
+                        && {
+                            let class = self
+                                .class_context_stack
+                                .last()
+                                .and_then(|c| c.as_deref())
+                                .unwrap_or("");
+                            Self::typedef_dims_via_tables(&self.module, class, &h.path[0].name.name)
+                                .is_some()
+                        })
+                    && self.concat_array_operand_like(&args[1]) =>
+            {
+                Some(Self::unparen(&args[1]))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `e` names an array operand of an unpacked concatenation (a
+    /// collection, a fixed array or one of its rows), without evaluating it.
+    fn concat_array_operand_like(&mut self, e: &Expression) -> bool {
+        let e = Self::unparen(e);
+        self.fixed_row_concat_shape(e).is_some()
+            || self.array_operand_name(e).is_some()
+            || self.unpacked_concat_inner_operand_shape(e)
+    }
+
+    /// A nested conditional or cast of array operands, checked without
+    /// evaluating its condition.
+    fn unpacked_concat_inner_operand_shape(&mut self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.concat_array_operand_like(then_expr)
+                    && self.concat_array_operand_like(else_expr)
+            }
+            _ => false,
+        }
     }
 
     /// The size and optional source of a §7.5.1 dynamic-array constructor:

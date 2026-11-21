@@ -4200,7 +4200,13 @@ impl Simulator {
             (ExprKind::Ident(h), ExprKind::Concatenation(parts)) => {
                 let mut nested = false;
                 let first = parts.iter().find_map(|part| {
-                    nested |= matches!(part.kind, ExprKind::Concatenation(_));
+                    // A conditional or cast item can stand for a row too.
+                    nested |= matches!(
+                        Self::unparen(part).kind,
+                        ExprKind::Concatenation(_)
+                            | ExprKind::Conditional { .. }
+                            | ExprKind::SystemCall { .. }
+                    );
                     self.fixed_row_concat_shape(part).map(|row| (part, row))
                 });
                 check_remaining_rows = nested || first.is_some();
