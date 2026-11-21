@@ -4885,6 +4885,8 @@ const CG_HANDLE_TAG: usize = 1 << 30;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CovergroupInstance {
+    /// Coverpoints whose declared expression or sample formal is real (§19.5).
+    real_points: HashSet<String>,
     cg_name: String,
     /// The object whose constructor ran `cg = new` (a class-body
     /// covergroup): coverpoint expressions read ITS properties, so sampling
