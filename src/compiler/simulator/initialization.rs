@@ -1226,7 +1226,9 @@ impl Simulator {
             {
                 spellings.push(rest.to_string());
             }
-            spellings.iter().find_map(|name| {
+            for name in &spellings {
+                // A nearer standalone signal shadows a packed member of the same
+                // spelling in an outer scope. Its event already has its own signal.
                 if module.signals.contains_key(name.as_str()) {
                     return None;
                 }
@@ -1243,8 +1245,8 @@ impl Simulator {
                     }
                     cut = pos;
                 }
-                None
-            })
+            }
+            None
         }
         let mk_ident = |name: &str, span: crate::ast::Span| -> Expression {
             Expression::new(
