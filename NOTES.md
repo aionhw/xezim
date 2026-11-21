@@ -8,6 +8,86 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Size an equality, relational, logical, reduction or `inside` result as 1 bit in interpreted code, so it no longer widens the operator around it: `if ((~a) | (m == 5'd12))` over a 1-bit `a` reads `~a` as 0, not as `5'b11110`, in an `if` or `?:` condition, a loop condition, a `case` item, `wait`, an `iff` guard, an assertion and a `$display` argument (§11.6.1, #1369, contributed by akashlevy).
+
+- **Correctness:** Evaluate the operand of a size cast by a field of a struct parameter (`pt.DEPTH'(x)`, `(pt.DEPTH)'(x)`) at the field's value, in compiled and interpreted code and in an instance's body with that instance's value; it passed the operand through at its own width, or took the width of a same-named parameter (§6.24.1, #1370, contributed by akashlevy).
+
+- **Correctness:** Place a part-select through an index into a packed-array port of an instantiated module (`f[0][31:1]` on `output logic [0:0][31:1] f`) by the port's declared dimensions, as on a variable: offset and ascending elements and slices of a 3-D port's middle dimension wrote nothing or landed a bit low (§7.4.1, §11.5.1, #1371, contributed by akashlevy).
+
+- **Correctness:** Select whole elements of the next dimension in a part-select after an index into a multi-dimensional packed array in compiled code: `assign a[0][5:0] = b` on `logic [3:0][5:0][7:0] a` writes 48 bits, not 6, for constant, indexed and variable bases, reads, nonblocking writes and the right-hand side's context width. A run-time base that runs past the dimension writes only its elements inside it and reads x for the others, in compiled and interpreted code, and the interpreter selects whole elements in a slice of a packed struct member (`s.m[1][2:1]`) too (§7.4.3, §11.5.1, #1372, contributed by akashlevy).
+
+- **Correctness:** Wait on a packed struct member's own bits in an event control (`@(posedge a.clk)`, `@(a.valid)`), so a clock forwarded to a child's clock port through a struct member fires on its own edges and samples pre-edge data (§9.4.2, §7.2.1, #1373, contributed by akashlevy).
+
+- **Correctness:** Accept a cycle delay with no left operand whose operand opens with a clocking event, as in `b ##1 @(posedge clk2) ##1 ##1 @(posedge clk) $fell(b)`; this was a parse error (§16.13.1, A.2.10, aionhw/xezim-core#260, contributed by akashlevy).
+
+- **Correctness:** Accept a cycle delay operand that opens with a concatenation, an unbased, real or string literal, an escaped name or `first_match(...)`, and a clocking event inside a sequence written `@ identifier` (`a ##1 @e b`); each of these was a parse error (§16.13.1, §9.4.2, A.2.10, aionhw/xezim-core#260).
+
+- **Correctness:** Take `s_t [N-1:0]` as the type in a function or task body port declaration `input s_t [N-1:0] in;`, so the port is `in` and the body's next declaration is no longer reported as following a statement (§13.4, A.2.2.1, aionhw/xezim-core#262, contributed by akashlevy). Take a user-defined type before an escaped port name too, `input s_t \in ;`, in subroutine bodies and in a module's port declarations (§5.6.1, §23.2.2.1, aionhw/xezim-core#262, reported by akashlevy).
+
+- **Correctness:** Create no implicit net for an enum label of the instantiating module in a port actual (`.din(st == STREAM)`), also under `` `default_nettype none ``, and keep an imported or `$unit` label in a port actual as its own name, so it reads its value at any depth (§6.19, §6.10, §26.3, aionhw/xezim-core#263, contributed by akashlevy).
+
+- **Correctness:** Size a port connection through an index and a range of the next dimension by its elements, `.o(a[2][4:2])` on `logic [3:0][5:0][7:0] a` as 24 bits. This removes the bogus width warning, substitutes a matching input and pads no inout (§7.4.3, §23.3.3, aionhw/xezim-core#264, contributed by akashlevy). Elements of two- and three-dimensional unpacked arrays are sized the same way (§7.4.3, aionhw/xezim-core#264, reported by akashlevy).
+
+- **Correctness:** Simulate a module named `gated_clk_cell` from its body unless the body is a plain clock pass-through, so a real clock gate gates and its internals can be reached by hierarchical name. A cell whose clock net has a delay, strength or resolving net type is also simulated from its body (§23.3.2, §6.7.1, aionhw/xezim-core#265, contributed by akashlevy), and so is a pass-through whose clock port is a `bit`, a vector or signed (§6.11.2, §23.3.3, aionhw/xezim-core#265, reported by akashlevy).
+
+- **Correctness:** Connect an unpacked port to a slice with parameter bounds element by element inside an instance, `.p(arr[0:N-1])` and `.o(res[N:2*N-1])`; port element `t` read bit `t` of the first element, and an output slice drove nothing (§7.4.6, §23.3.3, aionhw/xezim-core#266, contributed by akashlevy).
+
+- **Correctness:** Keep the typedefs of a module below the top in a struct it passes to a child through a type parameter, so `a[i].id` on a packed array of the struct reads the member at its declared width and offset, also through a second type parameter, an interface, a generate block and a child typedef of the same name (§6.20.3, §23.10, aionhw/xezim-core#272, contributed by akashlevy).
+
+- **Correctness:** Take a member of an element of a package parameter named with its package (`p::Info[k].variant`) as a constant in a generate condition without an import (§27.5, §11.2.1, §26.3, aionhw/xezim-core#273, contributed by akashlevy).
+
+- **Correctness:** Declare a block-local variable of a type parameter with packed dimensions (`T [1:0] tmp;`) as a packed array of the bound type, including an `int` binding, a block typedef built on the parameter, a struct written in the declaration and a `for` loop variable; a block typedef of the parameter's name hides it (§6.20.3, §7.4.1, §6.18, §12.7.1, aionhw/xezim-core#274, contributed by akashlevy).
+
+- **Correctness:** Select a generate branch below the top by an element of an unpacked struct-array `localparam` of the module or of an imported package array parameter, reading a same-named array from the package each module imports (§27.5, §6.20.2, §26.3, aionhw/xezim-core#275, contributed by akashlevy).
+
+- **Correctness:** Resolve a parameterized class's typedef of a type parameter's member (`typedef T::hw_t hw_t;`) in the specialization that names it (`E#(cfg_t)::hw_t`, `E#(cfgw#(8))::hw_t`), and a typedef of a type parameter used as a class scope (`typedef C::hw_t h_t;`) (§8.25.1, §6.20.3, §6.18, aionhw/xezim-core#276, contributed by akashlevy).
+
+- **Correctness:** Start a 2-state packed struct with a packed array of 2-state structs or enums as a member at 0 (§7.2.1, §6.8, aionhw/xezim-core#277, contributed by akashlevy).
+
+- **Correctness:** Size a statement-local variable whose dimension calls a system function on an instance parameter (`[$clog2(P)-1:0]`, `[$signed(P)-1:0]`, `[int'(P)-1:0]`, `[$bits(P)-1:0]`) per instance, with `$signed` read at the operand's own width (§20.8.1, §20.6.2, §11.7, §6.20.2, aionhw/xezim-core#278, contributed by akashlevy).
+
+- **Correctness:** Keep a macro that a `-v`/`-y` library file defines for the library files read after it, and read a library file whose bytes are not UTF-8 instead of dropping it (§22.5.1, §3.12.1, aionhw/xezim-core#279, contributed by akashlevy).
+
+- **Compatibility:** Compile C and C++ DPI sources (`.c`, `.cc`, `.cpp`, `.cxx`, `.c++`, `.C`) named on the command line or in a `-f`/`-F` list with `$CC`/`$CXX` and xezim's DPI headers, link them with any listed `.o`/`.a` into one cached shared library and load it like `--dpi-lib`, instead of parsing them as SystemVerilog. A listed `.so`/`.dylib`/`.dll` is loaded as it is, `-CFLAGS`/`-LDFLAGS` add compiler and linker arguments, and `--compile -o` warns that the artifact does not include the C files (§35, #1443, contributed by akashlevy).
+
+- **Correctness:** Write an unpacked, dynamic or multidimensional array with `$writememh`/`$writememb` one word per line with no `@` address, also over a range that does not start at the lowest address, and keep `@<address> <word>` for an associative array (§21.5.3, #1444, reported by akashlevy).
+
+- **Correctness:** Write the elements a dynamic array's size counts with `$writememh`/`$writememb`, not the 64 storage slots set aside for it; an empty one writes an empty file (§21.5, §7.5).
+
+- **Correctness:** Read a literal input actual as the result of assigning it to the formal: the formal's width and sign, a real rounded to an integral formal, a string or time literal in the connecting scope's unit, and X and Z dropped for a 2-state formal; a Z bit on a `tri0` or `tri1` input is pulled (§23.3.3.8, §10.7, §6.11.2, §6.6.5, #1324, contributed by ds54e).
+
+- **Correctness:** Drop X and Z of any actual on a 2-state input or output formal: a net, a variable, a parameter, a package constant or an expression, and a gate-shaped continuous assignment to a `bit` scalar drops them too (§6.11.2, §23.3.3.2, #1324, reported by ds54e). Pull or hold the Z bits of any actual on a `tri0`, `tri1` or `trireg` input (§6.6.5, §6.6.4, #1324, reported by ds54e). Truncate a wider package constant and round a real net, variable or constant on an integral input (§10.7, §26.3, §6.12.1, #1324, reported by ds54e).
+
+- **Correctness:** Keep every tick of the simulation time above 2^53 in `$time` and `$stime` reads and in `%t` of an integral value (§20.3.1, §20.3.2, §20.4.3, #1329, contributed by ds54e).
+
+- **Correctness:** Keep every tick above 2^53 in integral delays, the severity `Time:` line and `%t` of `$realtime` (§9.4.1, §20.10, §20.3.3, #1329, reported by ds54e). Display `%t` of a time read in a package, class or compilation-unit subroutine from that scope's unit, and keep the low 32 bits of `$stime` there (§3.14.2.3, §20.3.2, #1329, reported by ds54e).
+
+- **Correctness:** Read `$time`, `$stime`, `$realtime` and time literals on the right of a continuous assignment in the declaring module's unit, not in the unit of the process that changed its operands (§3.14.2.3, §20.3, §5.8, #1329, reported by ds54e).
+
+- **Correctness:** Read a selected row of a fixed array (`src[1]`, `cube[i][0]`) as its elements, in declared order, in an unpacked array concatenation, in blocking, nonblocking, intra-assignment-delay and event-control assignments and in array arguments. An invalid row gives the element type's default in every element, and a blocking store to a descending fixed array starts at its left bound (§10.10, §7.4.5, §7.6, §9.4.5, #1322, contributed by ds54e).
+
+- **Correctness:** Spread a slice of a fixed array or of one of its rows (`src[1][0:1]`, `a[i +: 2]`, `w[3 -: 2]`) into an unpacked array concatenation in the order the range selects, instead of reading `[b +: w]` / `[b -: w]` as a constant range (§7.4.5, §10.10, #1322, reported by ds54e).
+
+- **Correctness:** Spread the array items of a concatenation returned from a function (`return {src[1], 9};`), initializing a class queue property (`int q[$] = {w, 5};`) or initializing a fixed array declaration (`int d[3] = {src[1], src[0][1]};`); a descending or offset target fills from its left bound (§13.4.1, §8.7, §6.8, §10.10, #1322, reported by ds54e).
+
+- **Correctness:** Drive each element of a one-dimensional fixed array from a continuous assignment of an unpacked array concatenation (`assign d = {w, s, 5};`, `assign d = {src[1], src[0][1]};`), which drove nothing (§10.3, §10.10, #1322, reported by ds54e).
+
+- **Correctness:** Fill a row (`m[1] = {…}`), a fixed-array member of a structure array element or object (`sa[1].up = {…}`, `h.fa = {…}`) or a descending array formal from its left bound with an unpacked array concatenation (§10.10, §7.6, §13.5, #1322, reported by ds54e). Initialize `new[n]({…})` from the concatenation's elements instead of broadcasting it as one value (§7.5.1), and spread a conditional of array operands, a cast to an unpacked array type and a structure member array used as items (§11.4.11, §6.24.1).
+
+- **Performance:** Size a packed declaration inside an instance against its instance's parameters without copying the design-wide parameter table at each move between instances: the overlaid table is kept per outermost scope and only the scopes two instances do not share are taken off and put on (§23.10, #1445, #1452, contributed by akashlevy).
+
+- **Performance:** Walk a dotted name's declared struct type without copying the typedef and its member list (§7.2, §23.6, #1446, contributed by akashlevy).
+
+- **Performance:** Find a net's continuous drivers for a `release`, and for a `force` or `release` of part of a net, through an index of the comb entries that write each signal instead of scanning every entry (§10.6.2, #1447, contributed by akashlevy).
+
+- **Performance:** Keep a subroutine call's own storage keys out of the interface-alias name cache, which grew by an entry per call and collection element on a design with interface ports (§13.5, §25.9, #1449, contributed by akashlevy).
+
+- **Performance:** Hold each token as its kind and its offsets into the preprocessed source, 8 bytes instead of 48 plus an owned spelling, in chunks of 4,096 tokens that the parser releases as it finishes each item: a 6.8 MB source of 262,144 declarations parses in 272 MiB of peak memory instead of 386 MiB (aionhw/xezim-core#190, contributed by Thomasb81).
+
+- **Performance:** Share the definition's body among the instance copies of a module function or task and rewrite it into its instance only where it is used: 128 instances of a module whose 16 functions read module state compile in 31 MiB instead of 133 MiB, as functions that read only their formals do (aionhw/xezim-core#193, contributed by Thomasb81).
+
+- **Performance:** Find all targets of a chain of nested binds in one elaboration that adds only the newly bound scopes on each step, then elaborate the design once more, instead of elaborating the whole design once per level: four levels of binds into 128 instances compile in 0.19 s of CPU time instead of 0.52 s and in 73 MiB instead of 85 MiB (§23.11, aionhw/xezim-core#194, contributed by Thomasb81).
+
 - **Correctness:** Round a real cast to or stored into a 64-bit integral type in compiled code: `longint'(r)`, `xlen_t'(r)`, `wire [63:0] w = r;`, `assign w = r;`, `always_comb l = r;`, a 64-bit packed structure member, `time` and `longint` variables, function formals, returns and local initializers, and a real input port actual read the real's IEEE 754 bits; other widths and the interpreter already rounded (§6.12.1, §6.24.1, §10.7, §23.3.3.2, #1319, reported by ds54e).
 
 - **Correctness:** Match a `case` statement whose case expression or item is real numerically: `case (r) 1:` matches `r = 1.0` and `case (i) 2.0:` matches `i = 2`, in interpreted and compiled code; they were compared bit for bit and never matched (§12.5, §11.8.2).
