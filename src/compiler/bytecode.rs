@@ -21681,17 +21681,35 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(true)
             }
             (None, Some(ix)) => {
-                // A negative index could still write in-range bits; only an
-                // unsigned one is a plain shift amount.
-                if self.expr_signedness(ix) != Some(false) {
+                let signed = self.expr_signedness(ix)?;
+                // A negative part-select base may still overlap the local.
+                if signed && fw != 1 {
                     return None;
                 }
                 let Some(lo_reg) = self.compile_expr(ix, 0) else {
                     return Some(false);
                 };
-                // §11.5.1: an x/z index writes nothing.
+                // §11.5.1: an unknown or out-of-range bit index writes
+                // nothing. Test the full signed value before shifting. A
+                // narrow -1 can otherwise address a valid positive bit, and
+                // a wide positive index can wrap when converted to a shift.
                 let known = self.alloc_reg();
-                self.emit(Insn::Eq(known, lo_reg, lo_reg));
+                if signed {
+                    let zero = self.alloc_reg();
+                    let limit = self.alloc_reg();
+                    let mut zero_val = Value::from_u64(0, 64);
+                    let mut limit_val = Value::from_u64(u64::from(yw), 64);
+                    zero_val.is_signed = true;
+                    limit_val.is_signed = true;
+                    self.emit(Insn::LoadConst(zero, Box::new(zero_val)));
+                    self.emit(Insn::LoadConst(limit, Box::new(limit_val)));
+                    let below_end = self.alloc_reg();
+                    self.emit(Insn::Geq(known, lo_reg, zero));
+                    self.emit(Insn::Lt(below_end, lo_reg, limit));
+                    self.emit(Insn::BitAnd(known, known, below_end));
+                } else {
+                    self.emit(Insn::Eq(known, lo_reg, lo_reg));
+                }
                 let skip = self.insns.len();
                 self.emit(Insn::BranchIfFalse(known, 0));
                 let mask_reg = self.alloc_reg();
