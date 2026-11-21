@@ -8,7 +8,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
-- Assign function-returned arrays to unpacked slices and rows in declaration order (#1471).
+- **Correctness:** Wake event-controlled blocks when a member of a selected class handle or packed struct changes (§9.4.2, #1472).
+
+- **Correctness:** Assign function-returned arrays to unpacked slices and rows in declaration order (#1471).
 - **Correctness:** Preserve nested unpacked structure members and fixed-array elements in user-defined nettype driver patterns (§6.6.7, #1464).
 
 - **Correctness:** Check type names in selected generate branches, retain instance-specific sensitivity widths, and preserve cross-top waveform selections (#1374, #1375, #1378).

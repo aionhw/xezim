@@ -707,7 +707,7 @@ impl Simulator {
             _ => {
                 self.selected_receiver_value_property(expr)
                     || self.expr_handle_prop_any(expr)
-                    .is_some_and(|(h, f)| !self.class_prop_is_event(h, &f))
+                        .is_some_and(|(h, f)| !self.class_prop_is_event(h, &f))
                     || (self.chain_rooted_at_handle(expr)
                         && !self.chain_may_name_vif(expr)
                         && self
