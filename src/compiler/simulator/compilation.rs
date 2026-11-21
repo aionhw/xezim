@@ -253,6 +253,7 @@ impl Simulator {
                 if !sig_edges.is_empty() {
                     self.clocking_sig_out_edge.insert(cb_name.clone(), sig_edges);
                 }
+                self.clocking_in_indexed_scope |= cb_name.contains('[');
                 self.clocking_meta.insert(cb_name.clone(), (clk, sigs));
                 self.clocking_edge.insert(cb_name.clone(), edge);
                 self.clocking_prev_clock.insert(cb_name.clone(), 2);

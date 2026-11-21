@@ -8096,6 +8096,11 @@ pub struct Simulator {
     /// LRM §14.3: per-cb metadata. `(clock_signal_name, [(signal_name, is_input)])`.
     /// Populated at compile() from `module.clocking_blocks`.
     clocking_meta: HashMap<String, (String, Vec<(String, bool)>)>,
+    /// §27.6: some clocking block is declared in a generate copy or an
+    /// instance-array element (its key holds a select, `gen[1].cb`), so a
+    /// name with a select (`gen[1].cb.a`) may reach a block. Without one, the
+    /// indexed lookups of member reads are skipped.
+    clocking_in_indexed_scope: bool,
     /// LRM §14.4: pending clocking-output drives. Each drive retains its
     /// clockvar name, physical net and value. `cb.<out_sig> <= val` queues here instead of driving
     /// immediately; `tick_clocking_blocks` applies them at the next

@@ -2515,7 +2515,7 @@ impl Simulator {
     ) -> Option<Vec<String>> {
         let n = h.path.len();
         if n < 2
-            || self.clocking_meta.is_empty()
+            || !self.clocking_in_indexed_scope
             || h.path[..n - 1].iter().all(|s| s.selects.is_empty())
             || !h.path[n - 2..]
                 .iter()
@@ -2531,7 +2531,7 @@ impl Simulator {
     /// flat identifier the clocking arms resolve: its segments spell the
     /// index (`gen[2]`). `None` for any other expression.
     pub(super) fn clocking_indexed_term_as_ident(&self, e: &Expression) -> Option<Expression> {
-        if self.clocking_meta.is_empty() {
+        if !self.clocking_in_indexed_scope {
             return None;
         }
         // The block is the last segment, or the one before a clockvar. This
