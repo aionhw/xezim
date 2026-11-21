@@ -8,9 +8,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
-- Preserve unpacked array dimensions supplied by struct member typedefs in function returns, assignment patterns, whole-struct copies and user-defined nettype resolution (#1460).
+- **Correctness:** Preserve unpacked array dimensions supplied by struct member typedefs in function returns, assignment patterns, whole-struct copies and user-defined nettype resolution (#1460).
 - **Correctness:** Run the resolution function of an undriven user-defined net at time zero with an empty driver array (§6.7.3, #1462).
-- Round shortreal storage and casts to IEEE binary32 precision (#1463).
+- **Correctness:** Report the resolved type and dimensions of value parameters in procedural `$typename` calls (#1461).
+- **Correctness:** Round `shortreal` storage and casts to IEEE binary32 precision (#1463).
 
 - **Correctness:** Check type names in selected generate branches, retain instance-specific sensitivity widths, and preserve cross-top waveform selections (#1374, #1375, #1378).
 - **Correctness:** Read four-state digits in integer scan conversions, store unpacked concatenations in fixed queue rows, and resolve rooted queue-element members (#1377, #1379, #1380).
