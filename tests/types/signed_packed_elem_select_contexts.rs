@@ -159,3 +159,36 @@ fn signed_named_elements_keep_their_sign_in_every_declaration_context() {
     ];
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn selected_port_lane_keeps_its_type_in_cast_and_formatting() {
+    let sim = simulate(
+        r#"
+typedef logic signed [16:0] lane_t;
+typedef struct packed { lane_t [0:1] m; } s_t;
+module child(lanes, data, extended);
+  input lane_t [0:1] lanes;
+  input s_t [0:1] data;
+  output wire signed [31:0] extended;
+  assign extended = int'(data[1].m[1]);
+  initial #1 $display("lane=%0p type=%s", lanes[1], $typename(lanes));
+endmodule
+module top;
+  lane_t [0:1] a;
+  s_t [0:1] data;
+  wire signed [31:0] ext;
+  child u(a,data,ext);
+  initial begin a='0; data='0; a[1]=-1887; data[1].m[1]=-1887;
+    #2 $display("extended=%0d", ext);
+  end
+endmodule"#,
+        100,
+    )
+    .expect("simulate");
+    let lines: Vec<_> = sim.output.iter().map(|e| e.message.as_str()).collect();
+    assert!(
+        lines.contains(&"lane=-1887 type=reg signed[16:0][0:1]"),
+        "{lines:?}"
+    );
+    assert!(lines.contains(&"extended=-1887"), "{lines:?}");
+}
