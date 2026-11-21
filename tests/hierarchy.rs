@@ -167,6 +167,8 @@ mod null_ports_lib_defines_nowarn;
 mod package_scoped_vars_and_methods;
 #[path = "hierarchy/packed_port_formal_type.rs"]
 mod packed_port_formal_type;
+#[path = "hierarchy/packed_port_offset_select.rs"]
+mod packed_port_offset_select;
 #[path = "hierarchy/packed_record_output_chain.rs"]
 mod packed_record_output_chain;
 #[path = "hierarchy/param_typedef_instance_isolation.rs"]
@@ -298,6 +300,10 @@ mod explicit_dollar_root_read_1124;
 mod interface_task_lexical_scope;
 #[path = "hierarchy/library_dir_on_demand.rs"]
 mod library_dir_on_demand;
+#[path = "hierarchy/library_file_macros.rs"]
+mod library_file_macros;
+#[path = "hierarchy/library_file_latin1.rs"]
+mod library_file_latin1;
 #[path = "hierarchy/lrm_package_variable_scoping.rs"]
 mod lrm_package_variable_scoping;
 #[path = "hierarchy/lrm_audit_time0_port_event.rs"]

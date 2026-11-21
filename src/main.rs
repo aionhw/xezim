@@ -286,8 +286,18 @@ fn print_usage() {
     eprintln!("  --dump-timescales  Print each module's timescale before the run (no source");
     eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
+    eprintln!("  <file>.c/.cc/.cpp/.cxx/.C  A DPI C/C++ source, on the command line or in a -f");
+    eprintln!("                   list: compiled with $CC/$CXX (else clang/clang++, else cc/c++)");
+    eprintln!("                   with xezim's svdpi.h and vpi_user.h on the include path,");
+    eprintln!("                   linked with any listed .o/.a into one library cached under");
+    eprintln!("                   $XEZIM_CACHE_DIR, $XDG_CACHE_HOME or ~/.cache (xezim/dpi),");
+    eprintln!("                   and loaded like --dpi-lib. A listed .so/.dylib/.dll is loaded");
+    eprintln!("                   as --dpi-lib");
     eprintln!("  --show-env-avail Print every XEZIM_* environment variable with a description");
     eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
+    eprintln!("  --writemem-every-address  $writememh/$writememb write `@<address> <word>`");
+    eprintln!("                   on every line (the old layout) instead of one word per");
+    eprintln!("                   line with an @<address> line only where one is needed.");
     eprintln!("  --x-warn         Warn when a signal holding a valid 0/1 value takes an x bit");
     eprintln!("                   after time 0, naming the signal, its instance/module and its");
     eprintln!("                   drivers. Signals x/z from the start are never reported.");
@@ -437,6 +447,8 @@ fn print_usage() {
     eprintln!("  -sv_seed <n|random>  Same as +seed=<n|random>; also -svseed, -seed and the");
     eprintln!("                   =<n> forms (-sv_seed=5), on the command line or in -f files");
     eprintln!("  -sv_lib <name>, -sv_root <dir>  DPI library <dir>/<name>.so (see --dpi-lib)");
+    eprintln!("  -CFLAGS \"<args>\", -LDFLAGS \"<args>\"  Extra compiler / linker arguments for the");
+    eprintln!("                   DPI C/C++ sources (-ccflags, -ldflags are the same)");
     eprintln!("  -logfile <file>  Same as -l (redirects; the terminal gets nothing)");
     eprintln!("  -c               With no file after it: accepted (batch mode is the only mode)");
     eprintln!(
@@ -1967,13 +1979,13 @@ fn append_adopted_libs_to_merged(
         let _ = strip_duplicate_unit_typedefs(&primary, &mut seen_typedefs);
     }
     for (path, mods) in &adopted {
-        // Preprocess with the SAME context the -v/-y indexing pass used
-        // (fresh preprocessor, run include dirs, post-primary macro
-        // snapshot) so the appended text has its includes inlined and
-        // macros expanded. Raw bytes broke the standalone re-compile the
-        // moment merged.sv left the original directory: the library's
-        // relative include paths no longer resolved and its macros came
-        // out undefined.
+        // The text the -v/-y indexing pass preprocessed the file to (run
+        // include dirs, and the macros the design and the library files
+        // read before it left, §22.5.1), so the appended text has its
+        // includes inlined and macros expanded. Raw bytes broke the
+        // standalone re-compile the moment merged.sv left the original
+        // directory: the library's relative include paths no longer
+        // resolved and its macros came out undefined.
         let (text, how) = match xezim::preprocess_adopted_lib(path) {
             Some(t) => (t, "preprocessed"),
             None => match std::fs::read(path) {
@@ -2775,6 +2787,9 @@ fn run_main() -> i32 {
             "--x-warn" | "--X_WARN" | "-X_WARN" | "+X_WARN" => {
                 xezim::compiler::simulator::set_warn_x(true);
             }
+            "--writemem-every-address" => {
+                xezim::compiler::simulator::set_writemem_every_address(true);
+            }
             "--x-warn-limit" | "--X_WARN_LIMIT" => {
                 i += 1;
                 if i < args.len() {
@@ -3492,6 +3507,12 @@ fn run_main() -> i32 {
         _ => {}
     }
 
+    // C/C++ DPI sources, object files, archives and shared libraries named
+    // among the design files, on the command line or in a `-f` list, are not
+    // HDL: they are built into (or are) DPI libraries and loaded as
+    // `--dpi-lib` is (src/dpi_sources.rs).
+    let foreign = xezim::dpi_sources::ForeignInputs::take_from(&mut source_files);
+
     // `--dump-files-list`: the fully resolved compilation file set, after every
     // `-f` args file has been expanded. Printed BEFORE the files are read so
     // the list still appears when a file is missing or fails to parse — that
@@ -3506,6 +3527,12 @@ fn run_main() -> i32 {
                 sf,
                 if exists { "" } else { "   [NOT FOUND]" }
             );
+        }
+        if !foreign.is_empty() {
+            println!("--- DPI C/C++ file(s): {} ---", foreign.files().count());
+            for f in foreign.files() {
+                println!("  {}", f);
+            }
         }
         if !lib_files.is_empty() {
             println!("--- -v library file(s): {} ---", lib_files.len());
@@ -3620,6 +3647,37 @@ suppressed but the explicit SDF annotation still applies."
     // every simulation log identifies the exact binary that produced it.
     if mode == Mode::Simulate {
         print_simulation_banner();
+    }
+
+    // The DPI C/C++ sources: compiled and linked into one cached library,
+    // loaded after the `--dpi-lib` libraries, with the shared libraries
+    // named among the files. Only a simulation loads DPI code.
+    if mode == Mode::Simulate && !foreign.is_empty() {
+        let built = if foreign.needs_build() {
+            xezim::dpi_sources::default_cache_dir().and_then(|cache| {
+                xezim::dpi_sources::build_library(
+                    &foreign,
+                    &compat.dpi_cflags,
+                    &compat.dpi_ldflags,
+                    &cache,
+                )
+            })
+        } else {
+            Ok(None)
+        };
+        match built {
+            Ok(lib) => dpi_libs.extend(lib.map(|p| p.to_string_lossy().into_owned())),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        dpi_libs.extend(
+            foreign
+                .shared_libraries
+                .iter()
+                .map(|p| xezim::dpi_sources::loadable_path(p)),
+        );
     }
 
     if design_cache_enabled && mode == Mode::Simulate {

@@ -1416,6 +1416,34 @@ impl Simulator {
         })
     }
 
+    /// §23.2.2.3, §7.4.1: the type of a packed vector whose declaration is
+    /// not on file, from the dimensions elaboration recorded for it. An ANSI
+    /// port of an instantiated module (`output logic [0:0][31:1] f`) is
+    /// registered with its dimensions and width but no declared type, so its
+    /// nested selects missed the declaration walk below and took the generic
+    /// select path. For a plain vector those dimensions are all the type has.
+    fn recorded_vector_type(&self, name: &str) -> Option<DataType> {
+        let dims = self.module.packed_full_dims.get(name)?;
+        let id = *self.signal_name_to_id.get(name)?;
+        let mut total: u64 = 1;
+        for &(l, r) in dims {
+            total = total.checked_mul(l.abs_diff(r) + 1)?;
+        }
+        if dims.len() < 2 || total != u64::from(self.signal_widths[id]) {
+            return None;
+        }
+        Some(DataType::IntegerVector {
+            kind: if self.module.two_state_signals.contains(name) {
+                crate::ast::types::IntegerVectorType::Bit
+            } else {
+                crate::ast::types::IntegerVectorType::Logic
+            },
+            signing: self.signal_signed[id].then_some(crate::ast::types::Signing::Signed),
+            dimensions: Vec::new(),
+            span: crate::ast::Span::dummy(),
+        })
+    }
+
     pub(super) fn declared_packed_access(
         &mut self,
         expr: &Expression,
@@ -1475,7 +1503,14 @@ impl Simulator {
                 if self.is_associative_array(&name) {
                     return None;
                 }
-                let dt = self.module.var_decl_types.get(&name)?;
+                let recorded_type;
+                let dt = match self.module.var_decl_types.get(&name) {
+                    Some(dt) => dt,
+                    None => {
+                        recorded_type = self.recorded_vector_type(&name)?;
+                        &recorded_type
+                    }
+                };
                 // §23.10: a declaration inside an instantiated module sizes its
                 // dimensions with THAT instance's parameters, which the
                 // design-wide table keys as `<inst>.N`. Evaluated against that
@@ -1916,6 +1951,29 @@ impl Simulator {
     }
 
     pub(super) fn select_base_elem_dim(&self, base: &Expression) -> Option<(i64, i64)> {
+        let (dims, level) = self.select_base_elem_level(base)?;
+        dims.get(level).copied()
+    }
+
+    /// §7.4.3, §11.5.1: width in bits of one element of the dimension a
+    /// part-select on the index chain `base` addresses, when it is not the
+    /// last one — `a[0][5:0]` on `logic [3:0][5:0][7:0] a` counts six 8-bit
+    /// elements. None for a select of bits.
+    pub(super) fn select_base_elem_stride(&self, base: &Expression) -> Option<u32> {
+        let (dims, level) = self.select_base_elem_level(base)?;
+        if level + 1 >= dims.len() {
+            return None;
+        }
+        let stride: u64 = dims[level + 1..]
+            .iter()
+            .map(|&(l, r)| (l - r).unsigned_abs() + 1)
+            .product();
+        u32::try_from(stride).ok().filter(|&w| w > 1)
+    }
+
+    /// The packed dimensions of the element an index chain `base` lands in,
+    /// and which of them a select on `base` addresses.
+    fn select_base_elem_level(&self, base: &Expression) -> Option<(&Vec<(i64, i64)>, usize)> {
         let mut cur = base;
         let mut layers = 0usize;
         while let ExprKind::Index { expr: inner, .. } = &cur.kind {
@@ -1964,7 +2022,7 @@ impl Simulator {
             // An unpacked SLICE (a row of a 2-D array), not a packed element.
             return None;
         }
-        dims.get(layers - udepth).copied()
+        Some((dims, layers - udepth))
     }
 
     /// `[N-1:0]` maps idx→(idx-lo)·w, an ASCENDING `[0:N-1]` mirrors the slot
@@ -4514,6 +4572,20 @@ impl Simulator {
                 }
                 let inner_is_call =
                     matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Call { .. }));
+                // §6.24.1: a field of a struct parameter (`pt.DEPTH'(x)`) is
+                // a SIZE cast, its value the operand's context width. Looked
+                // up by its leaf (`DEPTH`) below it named nothing, and the
+                // operand passed through at its self-determined width:
+                // `pt.BHT_ARRAY_DEPTH'(en << addr)` in the VeeR branch
+                // predictor shifted a 1-bit value and read 0.
+                if let Some(w) = args.first().and_then(|a| self.member_cast_size(a)) {
+                    let v = match args.get(1) {
+                        Some(a) if !inner_is_call => self.eval_expr_ctx(a, w),
+                        Some(a) => self.eval_expr(a),
+                        None => Value::zero(w),
+                    };
+                    return v.resize(w);
+                }
                 // §6.24.1: an integral target (typedef, enum, or a constant
                 // size) is the operand's context width — see the type-cast
                 // arm above.

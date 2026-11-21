@@ -313,9 +313,9 @@ endmodule
     assert_eq!(
         files,
         [
-            "@5 11\n@10000000000000000 22\n@ffff0000000000000000 33\n",
-            "@ffffffffffffffff0000000000000000 55\n@ffffffffffffffffffffffffffffffff 44\n\
-             @ffffffffffffffff 66\n",
+            "@5\n11\n@10000000000000000\n22\n@ffff0000000000000000\n33\n",
+            "@ffffffffffffffff0000000000000000\n55\n@ffffffffffffffffffffffffffffffff\n44\n\
+             @ffffffffffffffff\n66\n",
         ]
     );
     assert_eq!(

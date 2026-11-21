@@ -207,6 +207,8 @@ mod nested_packed_typedefs;
 mod nonzero_based_vector_reads;
 #[path = "types/nonzero_based_vector_writes.rs"]
 mod nonzero_based_vector_writes;
+#[path = "types/one_bit_operator_condition_width.rs"]
+mod one_bit_operator_condition_width;
 #[path = "types/package_base_constraint_inherited.rs"]
 mod package_base_constraint_inherited;
 #[path = "types/package_scope_resolution.rs"]
@@ -233,6 +235,8 @@ mod packed_elem_shift_context_width;
 mod packed_element_range_select;
 #[path = "types/packed_local_nested_select.rs"]
 mod packed_local_nested_select;
+#[path = "types/packed_middle_dim_slice_width.rs"]
+mod packed_middle_dim_slice_width;
 #[path = "types/packed_multidim_unpacked_select.rs"]
 mod packed_multidim_unpacked_select;
 #[path = "types/packed_struct_array_elem_member_in_instance.rs"]
@@ -297,6 +301,8 @@ mod compiled_member_operand_width;
 mod signedness_and_power_context;
 #[path = "types/size_cast_context_and_fn_return_default.rs"]
 mod size_cast_context_and_fn_return_default;
+#[path = "types/size_cast_struct_param_field.rs"]
+mod size_cast_struct_param_field;
 #[path = "types/static_typedef_singleton.rs"]
 mod static_typedef_singleton;
 #[path = "types/stmt_local_scoped_decls.rs"]

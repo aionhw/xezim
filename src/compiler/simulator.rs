@@ -401,7 +401,8 @@ fn method_boost_enabled() -> bool {
 // §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §6.21, §13.5.3: output-before-read locals and literal default actuals compile.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3096;
+// Struct-parameter casts and packed element selections change compiled instructions.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3098;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -740,6 +741,19 @@ pub fn set_run_length_requested(v: bool) {
 
 fn nospecify() -> bool {
     NOSPECIFY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `--writemem-every-address`: `$writemem*` writes `@<address> <word>` on
+/// every line, as xezim did before it wrote addresses only where needed.
+static WRITEMEM_EVERY_ADDRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_writemem_every_address(v: bool) {
+    WRITEMEM_EVERY_ADDRESS.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn writemem_every_address() -> bool {
+    WRITEMEM_EVERY_ADDRESS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Structural-delay mode (commercial-simulator GLS convention): 0 = normal (specify/SDF path
@@ -1840,7 +1854,8 @@ struct CombEntryCold {
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
 // process, not as a combinational entry.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB054";
+// Recompile combinational expressions with the updated packed selection and cast widths.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB056";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
