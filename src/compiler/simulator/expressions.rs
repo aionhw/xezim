@@ -2105,6 +2105,22 @@ impl Simulator {
             selects += 1;
             root = base;
         }
+        // Rebase a virtual interface receiver before asking for the signal's
+        // declared element type. A selected generate scope likewise names
+        // independently stored signals.
+        let physical = match &root.kind {
+            ExprKind::MemberAccess { .. } => self.vif_rebase_expr(root)
+                .or_else(|| self.fold_indexed_hier_path(root)),
+            ExprKind::Ident(h) if h.path.len() > 1 || h.path.iter().any(|s| !s.selects.is_empty()) =>
+                self.vif_rebase_expr(root).or_else(|| {
+                    h.path.iter().any(|s| !s.selects.is_empty())
+                        .then(|| self.fold_indexed_hier_path(root)).flatten()
+                }),
+            _ => None,
+        };
+        if let Some(ref physical) = physical {
+            root = physical;
+        }
         // A class property (`h.m_amb[1]`, or `m_amb[1]` in a method): its
         // declared type is its class's.
         if !self.packed_named_signed_props.is_empty() {
@@ -2124,6 +2140,15 @@ impl Simulator {
             }
         }
         let ExprKind::Ident(h) = &root.kind else {
+            // Rebasing intentionally leaves an identity-bound interface
+            // unchanged. Its source node can still be a member access while
+            // its physical signal declaration uses the flat instance path.
+            if let ExprKind::MemberAccess { expr: receiver, member } = &root.kind
+                && let Some((bound, _)) = self.vif_recv_target(receiver)
+            {
+                let name = format!("{bound}.{}", member.name);
+                return self.declared_signed_select_depth(&name) == Some(selects);
+            }
             // §7.2, §7.4.1: a member written as a member access
             // (`sa[1].m[1]`, `f().m[1]`, `h.st.m[1]`).
             return matches!(&root.kind, ExprKind::MemberAccess { member, .. }
@@ -2134,7 +2159,20 @@ impl Simulator {
                 });
         };
         if h.root.is_some() {
-            return false;
+            // Virtual-interface rebasing marks the physical instance rooted.
+            if h.root.as_deref() != Some("$root")
+                || h.path.iter().any(|seg| !seg.selects.is_empty())
+            {
+                return false;
+            }
+            let name = self.resolve_hier_name(h);
+            let flat = name.strip_prefix(&self.module.name)
+                .and_then(|tail| tail.strip_prefix('.')).unwrap_or(&name);
+            return self.declared_signed_select_depth(flat).or_else(|| {
+                let dt = super::bytecode::declared_type_of(
+                    flat, &self.module.var_decl_types, &self.module.typedef_types)?;
+                super::bytecode::signed_named_packed_elem_depth(dt, &self.module.typedef_types)
+            }) == Some(selects);
         }
         if h.path.iter().any(|s| !s.selects.is_empty()) {
             // A variable of an indexed scope (`g_loop[0].gv[1]`).
@@ -2165,23 +2203,21 @@ impl Simulator {
         // block. Its declaration is recorded under the bare name while the
         // frame is live, so the element type comes from there; the table
         // built at start-up only holds the design's own variables.
+        if let [seg] = h.path.as_slice()
+            && selects > 1
+            && let Some(store) = self.dyn_name_lookup(&seg.name.name)
+            && let Some(depth) = self.declared_signed_select_depth(store)
+        {
+            return depth == selects;
+        }
         if let Some(n) = self.frame_bound_bare_name(h) {
             return self.frame_named_signed_depth(n) == Some(selects);
         }
         let name = self.resolve_hier_name(h);
         let name = name.as_ref();
-        let depth = match self.packed_named_signed.get(name) {
-            Some(&d) => Some(d),
-            // §6.21: a block variable is recorded when its declaration
-            // runs, after the table was built.
-            None => self.module.var_decl_types.get(name).and_then(|dt| {
-                super::bytecode::signed_named_packed_elem_depth(dt, &self.module.typedef_types)
-            }),
-        };
+        let depth = self.declared_signed_select_depth(name);
         if depth == Some(selects) {
-            return !self.module.arrays.contains_key(name)
-                && !self.module.arrays_2d.contains_key(name)
-                && !self.module.arrays_nd.contains_key(name);
+            return true;
         }
         // §7.2, §7.4.1: a packed-array member reached through structure
         // members, elements of a packed array of structures or an instance
@@ -2196,6 +2232,23 @@ impl Simulator {
                 super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
                     == Some(selects)
             })
+    }
+
+    fn declared_signed_select_depth(&self, name: &str) -> Option<usize> {
+        let packed = self.packed_named_signed.get(name).copied().or_else(|| {
+            if name.starts_with('@') {
+                let dt = self.p_elem_type_ref(name)?;
+                super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
+            } else {
+                let dt = self.module.var_decl_types.get(name)?;
+                super::bytecode::signed_named_packed_elem_depth(dt, &self.module.typedef_types)
+            }
+        })?;
+        let unpacked = self.unpacked_dims_of(name).max(usize::from(
+            self.module.dynamic_arrays.contains(name) || self.module.queue_vars.contains(name)
+                || self.is_associative_array(name),
+        ));
+        Some(unpacked + packed)
     }
 
     /// §7.4.1: whether `dt` is a packed array of a named type, written with
@@ -2358,7 +2411,7 @@ impl Simulator {
                             || self.is_associative_array(name.as_ref()),
                     )
                 };
-                if unpacked == 0 && self.packed_named_signed.get(name.as_ref()) == Some(&indices) {
+                if self.declared_signed_select_depth(name.as_ref()) == Some(indices) {
                     // §7.4.1: an element of a named signed type.
                     return Some(true);
                 }
@@ -2796,6 +2849,11 @@ impl Simulator {
             }
             // §7.4.1/§11.5.1: a nested select of a packed variable the frame
             // owns, placed as its write is (`frame_packed_select_write`).
+            if Self::select_of_select(expr)
+                && let Some(v) = self.formal_collection_packed_read(expr)
+            {
+                return v;
+            }
             if Self::select_of_select(expr)
                 && let Some(v) = self.frame_packed_select_read(expr)
             {
@@ -7219,6 +7277,42 @@ impl Simulator {
     /// `idx_val`: the interpreter's element read of a fixed, dynamic or
     /// associative array once the operand is resolved. Also the slow path of
     /// a compiled `LoadDynElem`, which must read exactly what this reads.
+    /// A collection formal stores its unpacked elements under the activation's
+    /// key. Read the element there before applying its declared packed bounds.
+    fn formal_collection_packed_read(&mut self, expr: &Expression) -> Option<Value> {
+        let (h, selectors) = Self::index_chain(expr)?;
+        let [seg] = h.path.as_slice() else { return None };
+        let store = self.dyn_name_lookup(&seg.name.name)?;
+        if !(self.module.queue_vars.contains(store) || self.module.dynamic_arrays.contains(store)
+            || self.is_associative_array(store))
+            || self.coll_shape_at(store).is_some_and(|(shape, _)| shape.dims.len() != 1)
+        {
+            return None;
+        }
+        let dims = self.module.packed_full_dims.get(store)?;
+        let (row, packed) = selectors.split_first()?;
+        if packed.is_empty() || packed.len() > dims.len() { return None; }
+        let width: u32 = dims.iter().map(|(a,b)| a.abs_diff(*b) as u32 + 1).product();
+        let remaining: u32 = dims[packed.len()..].iter().map(|(a,b)| a.abs_diff(*b) as u32 + 1).product();
+        let dims = dims.clone();
+        let store = store.to_owned();
+        let has_bound = self.module.dynamic_arrays.contains(&store)
+            && Self::expr_contains_dollar(row);
+        if has_bound {
+            self.dollar_bound.push(self.get_queue_size(&store) as i64 - 1);
+        }
+        let key = self.eval_expr(row);
+        if has_bound {
+            self.dollar_bound.pop();
+        }
+        let elem = self.coll_elem_read(&store, &store, key, width);
+        let indices: Vec<_> = packed.iter().map(|sel| self.eval_expr(sel)).collect();
+        Some(match Self::packed_chain_slice(u64::from(width), &dims, &indices) {
+            Some((lo, w)) => elem.range_select((lo + w - 1) as usize, lo as usize),
+            None => Value::new(remaining),
+        })
+    }
+
     pub(super) fn coll_elem_read(
         &mut self,
         name: &str,

@@ -407,7 +407,7 @@ fn method_boost_enabled() -> bool {
 // scoped `$time` read is 64 bits wide. §6.24.1, §7.4.3, §11.5.1: a struct-parameter field
 // sizes its cast, and a part-select after a packed index selects whole elements, clipped to
 // its dimension.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3098;
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3176;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1883,7 +1883,7 @@ struct CombEntryCold {
 // by their result. §6.11.2: a gate-shaped assignment to a 2-state scalar is no fused gate.
 // §6.24.1, §7.4.3, §9.4.2: struct-parameter field casts, part-selects of whole elements after a
 // packed index, and alias nets for event controls on packed-struct members.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB056";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB076";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

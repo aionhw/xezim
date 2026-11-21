@@ -779,6 +779,8 @@ mod packed_struct_array_member_reads_1088;
 mod struct_negative_array_pattern;
 #[path = "types/negative_index_compiled_blocks.rs"]
 mod negative_index_compiled_blocks;
+#[path = "types/signed_index_local_write.rs"]
+mod signed_index_local_write;
 #[path = "types/signed_literal_pattern_index.rs"]
 mod signed_literal_pattern_index;
 #[path = "types/literal_pattern_key_sites.rs"]

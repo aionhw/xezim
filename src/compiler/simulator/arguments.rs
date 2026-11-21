@@ -2491,20 +2491,6 @@ impl Simulator {
         let dt = &port.data_type;
         let key = self.formal_dyn_key(&port.name.name, dt);
         self.module.var_decl_types.insert(key.clone(), dt.clone());
-        if let Some(dims) = super::elaborate::packed_full_dims_chained(
-            dt,
-            &self.module.parameters,
-            &self.module.typedef_types,
-        )
-        .filter(|dims| dims.len() > 1)
-        {
-            self.module.packed_full_dims.insert(key.clone(), dims);
-            if let Some(width) = self.ast_decl_elem_width(dt) {
-                self.module
-                    .packed_signal_elem_widths
-                    .insert(key.clone(), width);
-            }
-        }
         key
     }
 

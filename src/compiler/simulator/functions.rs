@@ -2850,7 +2850,9 @@ impl Simulator {
                         continue;
                     }
                     let val = if arg_supplied(i) {
-                        let value = self.eval_expr(&args[i]);
+                        let value = scope_aliases.get(i).and_then(Option::as_deref)
+                            .and_then(|key| self.ref_alias_peek(key))
+                            .unwrap_or_else(|| self.eval_expr(&args[i]));
                         self.vif_argument_value(port, &args[i], value)
                     } else {
                         Value::zero(32)

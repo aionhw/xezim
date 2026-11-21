@@ -1658,6 +1658,7 @@ impl Simulator {
                 // actual on return (e.g. `randomize_instr(output riscv_instr
                 // instr, …)` writing the picked instruction to `instr_list[i]`).
                 let mut output_bindings: Vec<(String, Expression)> = Vec::new();
+                let mut ref_aliases: HashMap<String, String> = HashMap::default();
                 // §25.9 __vif_local__: record vif actuals under formal names.
                 // A plain scalar or class formal cannot be bound to an
                 // interface; its actual is not resolved (a stale key under its
@@ -1772,6 +1773,17 @@ impl Simulator {
                         .get(i)
                         .filter(|_| arg_supplied(i))
                         .or_else(|| Self::default_actual(port));
+                    // Freeze the actual in the caller, before installing this method's
+                    // receiver and locals. Ref writes go directly to that storage.
+                    let ref_storage = if port.direction == PortDirection::Ref && arg_supplied(i) {
+                        self.ref_scope_alias_target(port, &args[i]).or_else(|| {
+                            let ExprKind::Ident(h) = &args[i].kind else { return None };
+                            if h.path.len() != 1 || !h.path[0].selects.is_empty() { return None; }
+                            self.ref_alias_stack.last()?.get(&h.path[0].name.name).cloned()
+                        })
+                    } else {
+                        None
+                    };
                     // An associative-array `output`/`inout`/`ref` formal
                     // is copied back via the assoc-param signal-namespace
                     // merge, NOT the scalar `output_bindings` path (which
@@ -1781,7 +1793,9 @@ impl Simulator {
                         PortDirection::Output | PortDirection::Inout | PortDirection::Ref
                     ) && !is_assoc
                     {
-                        if arg_supplied(i) {
+                        if let Some(storage) = &ref_storage {
+                            ref_aliases.insert(port.name.name.clone(), storage.clone());
+                        } else if arg_supplied(i) {
                             output_bindings.push((port.name.name.clone(), args[i].clone()));
                         } else if let Some(d) = port
                             .default
@@ -1982,7 +1996,9 @@ impl Simulator {
                     // Class methods have automatic lifetime. An output handle
                     // starts null on every call; it never copies in the caller's
                     // previous object (including when the actual is a default).
-                    let mut val = if plain_class && port.direction == PortDirection::Output {
+                    let mut val = if let Some(value) = ref_storage.as_deref().and_then(|key| self.ref_alias_peek(key)) {
+                        value
+                    } else if plain_class && port.direction == PortDirection::Output {
                         Value::zero(32)
                     } else if arg_supplied(i) {
                         let value = match self.formal_pattern_value(port, &args[i]) {
@@ -2463,6 +2479,15 @@ impl Simulator {
                     self.modclass_depth.set(self.modclass_depth.get() + 1);
                     self.activation_scope.replace(Some(inst))
                 });
+                let aliased_formals = !ref_aliases.is_empty();
+                let ref_frame = aliased_formals || self.ref_redirect_possible();
+                if ref_frame {
+                    self.ref_pins_acquire(&ref_aliases);
+                    self.ref_alias_stack.push(ref_aliases);
+                    self.ref_identity_stack.push(Vec::new());
+                    self.ref_binding_stack.push(HashMap::default());
+                    self.refresh_ref_redirect_hot();
+                }
                 self.push_local_frame_typed(locals, frame_types);
                 self.open_decl_shadow_frame();
                 // Record the `local_stack` depth BEFORE this method's own
@@ -2669,7 +2694,7 @@ impl Simulator {
                 // paid a whole plan + compile for each of the many tasks a
                 // UVM run calls only a few times.
                 let mut ast_string_cleanup = None;
-                if let Some(cval) = compiled_methods_enabled()
+                if let Some(cval) = (compiled_methods_enabled() && !aliased_formals)
                     .then(|| {
                         self.try_run_compiled_method(
                             handle,
@@ -2979,6 +3004,13 @@ impl Simulator {
                 } else {
                     self.snapshot_default_outs(&default_out_bindings)
                 };
+                if ref_frame {
+                    let frame = self.ref_alias_stack.pop().unwrap();
+                    self.ref_pins_release(&frame);
+                    self.ref_binding_stack.pop();
+                    self.ref_identity_stack.pop();
+                    self.refresh_ref_redirect_hot();
+                }
                 self.pop_local_frame();
                 if !default_wb.is_empty() {
                     self.apply_default_outs(default_wb, &cname);
