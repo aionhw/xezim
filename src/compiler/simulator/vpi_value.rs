@@ -1,4 +1,4 @@
-//! VPI value access (IEEE 1800 §38.16 and §38.36).
+//! VPI value access (IEEE 1800 §38.16 and §38.35).
 use super::*;
 
 /// Read a signal value via VPI.
