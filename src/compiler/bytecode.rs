@@ -6615,7 +6615,11 @@ impl<'a> BytecodeCompiler<'a> {
         ctx_width: u32,
         reason: &'static str,
     ) -> Option<RegId> {
-        if !self.allow_ast_fallback || !self.allow_expr_fallback {
+        // A math expression in a stepped process can use the existing
+        // frame-aware evaluator, including formals of an inlined function.
+        let stepped_math = self.allow_waits && matches!(&e.kind,
+            ExprKind::SystemCall { name, .. } if stepped_math_function(name));
+        if !stepped_math && (!self.allow_ast_fallback || !self.allow_expr_fallback) {
             return None;
         }
         // Sampled-value functions ($past/$rose/...) take their clock from the
@@ -27331,7 +27335,15 @@ pub(crate) fn system_function_is_real(name: &str) -> bool {
             | "$bitstoreal"
             | "$bitstoshortreal"
             | "$realtime"
-            | "$ln"
+    ) || real_math_function(name)
+}
+
+fn stepped_math_function(name: &str) -> bool {
+    name == "$rtoi" || real_math_function(name)
+}
+
+fn real_math_function(name: &str) -> bool {
+    matches!(name, "$ln"
             | "$log10"
             | "$exp"
             | "$sqrt"

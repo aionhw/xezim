@@ -222,10 +222,9 @@ impl BytecodeCompiler<'_> {
                     ) {
                         return args.iter().skip(1).all(|a| expr_ok(a, bound, me, ext));
                     }
-                    matches!(
-                        name.as_str(),
-                        "$sformatf" | "$psprintf" | "$signed" | "$unsigned"
-                    ) && args.iter().all(|a| expr_ok(a, bound, me, ext))
+                    (matches!(name.as_str(), "$sformatf" | "$psprintf" | "$signed" | "$unsigned")
+                        || (me.allow_waits && stepped_math_function(name)))
+                        && args.iter().all(|a| expr_ok(a, bound, me, ext))
                 }
                 ExprKind::Call { func, args } => {
                     let ExprKind::Ident(h) = &func.kind else {
