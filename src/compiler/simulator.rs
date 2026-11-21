@@ -401,7 +401,7 @@ fn method_boost_enabled() -> bool {
 // §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §6.21, §13.5.3: output-before-read locals and literal default actuals compile.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3096;
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3100;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1139,10 +1139,7 @@ macro_rules! write_sig {
         // rounds to binary32 (16777216.25 -> 16777216.0). A `real` (binary64)
         // keeps every bit. Only a REAL write pays the type-name lookup.
         if __wsig_val.is_real
-            && $self
-                .signal_type_names
-                .get(&__wsig_id)
-                .is_some_and(|tn| tn == "shortreal")
+            && $self.shortreal_signals.contains(&__wsig_id)
         {
             let __wsig_f = __wsig_val.to_f64() as f32 as f64;
             __wsig_val = Value::from_f64(__wsig_f);
@@ -1840,7 +1837,7 @@ struct CombEntryCold {
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
 // process, not as a combinational entry.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB054";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB060";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -5318,8 +5315,9 @@ struct PortPlan {
 enum RetConv {
     /// Not a numeric scalar: the value passes through untouched.
     Keep,
-    /// `real` / `shortreal` / `realtime`.
+    /// Binary64 real and realtime.
     Real,
+    ShortReal,
     /// An integral type; `two_state` for bit, byte, int, ... (§6.11.1).
     Int { two_state: bool },
 }
@@ -7909,6 +7907,7 @@ pub struct Simulator {
     /// `Signal` struct — most regular bit/logic signals have None
     /// here. Populated once at construction so `module.signals` can
     /// be freed afterwards.
+    shortreal_signals: HashSet<usize>,
     signal_type_names: HashMap<usize, String>,
     pub widths: HashMap<String, u32>,
     pub signed_signals: HashSet<String>,

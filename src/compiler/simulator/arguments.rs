@@ -239,6 +239,7 @@ impl Simulator {
     /// unresolved type) keeps its value.
     pub(super) fn ret_conv_of(ty: &DataType, typedef_types: &HashMap<String, DataType>) -> RetConv {
         match ty {
+            DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. } => RetConv::ShortReal,
             DataType::Real { .. } => RetConv::Real,
             DataType::IntegerVector { .. }
             | DataType::IntegerAtom { .. }
@@ -289,7 +290,10 @@ impl Simulator {
 
     /// `ret_conv_of` for a concrete type-parameter binding, given by name.
     pub(super) fn concrete_ret_conv(&self, name: &str) -> RetConv {
-        if matches!(name, "real" | "realtime" | "shortreal") {
+        if name == "shortreal" {
+            return RetConv::ShortReal;
+        }
+        if matches!(name, "real" | "realtime") {
             return RetConv::Real;
         }
         if let Some(dt) = self.module.typedef_types.get(name) {
@@ -328,6 +332,7 @@ impl Simulator {
                 }
                 r
             }
+            RetConv::ShortReal => Value::from_f64(v.to_f64() as f32 as f64),
             RetConv::Real if !v.is_real && !v.is_fill => Value::from_f64(v.to_f64()),
             _ => v,
         }
@@ -385,6 +390,7 @@ impl Simulator {
     pub(super) fn ret_needs_convert(v: &Value, conv: RetConv) -> bool {
         match conv {
             RetConv::Keep => false,
+            RetConv::ShortReal => true,
             RetConv::Real => !v.is_real && !v.is_fill,
             RetConv::Int { .. } => v.is_real,
         }

@@ -4463,7 +4463,10 @@ impl Simulator {
                     return Self::sv_string_cast(&v);
                 }
                 if self.dt_is_real(&dt) {
-                    return Value::from_f64(v.to_f64());
+                    let f = v.to_f64();
+                    return Value::from_f64(if matches!(self.resolve_dt(&dt), crate::ast::types::DataType::Real {
+                        kind: crate::ast::types::RealType::ShortReal, ..
+                    }) { f as f32 as f64 } else { f });
                 }
                 // §6.24.1: a type cast to an UNPACKED ARRAY / QUEUE target
                 // (e.g. `bit_q_t'(stream)`) yields an unpacked collection.

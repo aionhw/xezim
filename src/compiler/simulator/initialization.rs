@@ -2673,6 +2673,7 @@ impl Simulator {
         let mut signal_widths_vec: Vec<u32> = Vec::with_capacity(n);
         let mut signal_signed_vec: Vec<bool> = Vec::with_capacity(n);
         let mut signal_real_vec: Vec<bool> = Vec::with_capacity(n);
+        let mut shortreal_signals = HashSet::default();
         let mut signal_type_names: HashMap<usize, String> = HashMap::default();
         let phase_static = std::time::Instant::now();
         // Drain `names` so each String moves into the Arc allocation
@@ -2710,6 +2711,18 @@ impl Simulator {
                 }
                 if sig.is_real {
                     val.is_real = true;
+                    let declared = module.var_decl_types.get(name).or_else(|| {
+                        sig.type_name.as_ref().and_then(|ty| module.typedef_types.get(ty))
+                    });
+                    if sig.type_name.as_deref() == Some("shortreal")
+                        || declared.is_some_and(|dt| matches!(
+                            super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
+                            DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }
+                        ))
+                    {
+                        shortreal_signals.insert(id);
+                        val = Value::from_f64(val.to_f64() as f32 as f64);
+                    }
                 }
                 // XEZIM_INIT_ZERO=1: coerce all-X initial values to zero.
                 // Default (off) preserves Verilog 4-state semantics. Industry
@@ -4090,6 +4103,7 @@ impl Simulator {
             port_formal_two_state,
             collapse_settled: None,
             deferred_always,
+            shortreal_signals,
             signal_type_names,
             time: 0,
             output: Vec::new(),

@@ -4267,6 +4267,12 @@ impl<'a> BytecodeCompiler<'a> {
                 (fd, false)
             }
         };
+        if self.decl_is_shortreal(&fd.return_type, Some(&name))
+            || fd.ports.iter().any(|p| self.decl_is_shortreal(&p.data_type, Some(&name)))
+        {
+            self.bail("shortreal_call");
+            return None;
+        }
         // §13.5.4 named actuals (`.re(expr)`) normalize to positional order
         // (with §13.5.3 defaults filled) so every path below — delegation and
         // inline — sees a plain positional actual list.
@@ -4981,6 +4987,11 @@ impl<'a> BytecodeCompiler<'a> {
         lifetime: &Option<crate::ast::types::Lifetime>,
         decl: &crate::ast::stmt::VarDeclarator,
     ) -> bool {
+        if self.decl_is_shortreal(data_type, None) {
+            self.bail("shortreal_local");
+            return false;
+        }
+
         // §6.18: a local declared through a typedef that carries
         // unpacked dims is a collection too. A queue / unsized
         // array without an initializer takes the local-collection
@@ -5270,6 +5281,11 @@ impl<'a> BytecodeCompiler<'a> {
         data_type: &crate::ast::types::DataType,
         d: &crate::ast::stmt::VarDeclarator,
     ) -> bool {
+        if self.decl_is_shortreal(data_type, None) {
+            self.bail("shortreal_local");
+            return false;
+        }
+
         // Step 6: a CLASS-typed local holds a heap HANDLE in a
         // register — default null (0), no resize (handles
         // round-trip untouched), and the name joins
@@ -9260,6 +9276,12 @@ impl<'a> BytecodeCompiler<'a> {
             .and_then(|s| get(&format!("{s}::{leaf}")))
             .or_else(|| get(leaf))
             .is_some_and(|dt| self.decl_is_real(dt, None))
+    }
+
+    fn decl_is_shortreal(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> bool {
+        matches!(self.resolved_decl_type(dt, scope), crate::ast::types::DataType::Real {
+            kind: crate::ast::types::RealType::ShortReal, ..
+        })
     }
 
     fn decl_is_real(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> bool {
@@ -19362,6 +19384,9 @@ impl<'a> BytecodeCompiler<'a> {
                             ExprKind::Paren(i) => is_stream(i),
                             _ => false,
                         }
+                    }
+                    if self.decl_is_shortreal(&dt, None) {
+                        return self.emit_expr_fallback(expr, ctx_width, "shortreal_cast");
                     }
                     if is_stream(inner) {
                         if let Some(r) =

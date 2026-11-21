@@ -293,6 +293,8 @@ mod shift_context_width;
 mod shift_width_and_scope_hint;
 #[path = "types/compiled_member_operand_width.rs"]
 mod compiled_member_operand_width;
+#[path = "types/shortreal_binary32.rs"]
+mod shortreal_binary32;
 #[path = "types/signedness_and_power_context.rs"]
 mod signedness_and_power_context;
 #[path = "types/size_cast_context_and_fn_return_default.rs"]
@@ -830,3 +832,5 @@ mod pattern_type_key_scoped_and_lexical_1290;
 mod struct_element_return_1310;
 #[path = "types/review_pattern_type_keys_imports.rs"]
 mod review_pattern_type_keys_imports;
+#[path = "types/shortreal_storage_1463.rs"]
+mod shortreal_storage_1463;

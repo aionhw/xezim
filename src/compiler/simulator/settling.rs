@@ -333,6 +333,7 @@ impl Simulator {
                         let view_len = view.len();
                         let widths: &[u32] = &self.signal_widths;
                         let signed: &[bool] = &self.signal_signed;
+                        let shortreal_signals = &self.shortreal_signals;
                         let two_state: &[bool] = &self.signal_two_state;
                         let gate_driven: &[bool] = &self.signal_gate_driven;
                         let n2id = &self.signal_name_to_id;
@@ -377,6 +378,7 @@ impl Simulator {
                                             &entries[eidx].item,
                                             widths,
                                             signed,
+                                            shortreal_signals,
                                             two_state,
                                             gate_driven,
                                             n2id,
