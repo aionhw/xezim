@@ -1564,7 +1564,10 @@ impl Simulator {
                         .unwrap_or_else(|| Value::zero(width))
                 }
             } else {
-                Value::zero(width)
+                // A class property's elements are stored by name, where
+                // `$readmem*` loads them.
+                self.lookup_signal_value(&format!("{}[{}]", mem_name, addr))
+                    .unwrap_or_else(|| Value::zero(width))
             };
             Self::push_memory_data(&mut out, &val, radix);
             addr += step;
