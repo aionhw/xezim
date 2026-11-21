@@ -1440,8 +1440,10 @@ impl Simulator {
     }
 
     /// §21.5 `$writememb/h/d`: dump a memory array to a file in the specified
-    /// radix. Each line is `@<addr_hex> <value_in_radix>`, matching the
-    /// `$readmem*` format so the file is round-trippable.
+    /// radix, one word per line, in the `$readmem*` format. §21.5.3: an
+    /// associative array's words carry their address (`@<addr_hex> <word>`);
+    /// an unpacked or dynamic array's are data only, with no `@` address
+    /// even when the start address is not the memory's lowest.
     pub(super) fn write_memory_file(&mut self, args: &[Expression], tn: &str) -> Value {
         self.flush_file_writes();
         if args.len() < 2 {
@@ -1552,19 +1554,25 @@ impl Simulator {
             } else {
                 Value::zero(width)
             };
-            Self::push_memory_word(&mut out, addr, &val, radix, false);
+            Self::push_memory_data(&mut out, &val, radix);
             addr += step;
         }
         let _ = std::fs::write(&path, out);
         Value::zero(32)
     }
 
-    /// One `$writemem*` line, `@<addr_hex> <value_in_radix>`; `wide` as for
-    /// [`memory_file_address_text`].
+    /// One `$writemem*` line of an associative array, `@<addr_hex>
+    /// <value_in_radix>`; `wide` as for [`memory_file_address_text`].
     fn push_memory_word(out: &mut String, addr: i128, val: &Value, radix: u32, wide: bool) {
         out.push('@');
         out.push_str(&Self::memory_file_address_text(addr, wide));
         out.push(' ');
+        Self::push_memory_data(out, val, radix);
+    }
+
+    /// One `$writemem*` line holding only the word, in the task's radix:
+    /// §21.5.3 writes no address for an unpacked or dynamic array.
+    fn push_memory_data(out: &mut String, val: &Value, radix: u32) {
         let s = match radix {
             2 => val.to_bin_string(),
             16 => val.to_hex_string(),
@@ -1802,8 +1810,9 @@ impl Simulator {
     }
 
     /// `$writememb` / `$writememh` / `$writememd` of a multidimensional
-    /// array (§21.5): [`write_memory_file`] with one address per element, in
-    /// the order [`NdMemory`] describes, so `$readmem*` reads it back.
+    /// array (§21.5): [`write_memory_file`] one element per line, data only
+    /// (§21.5.3), in the order [`NdMemory`] describes (§21.4.3), so
+    /// `$readmem*` reads it back.
     fn write_nd_memory_file(&mut self, args: &[Expression], tn: &str, mem: NdMemory) -> Value {
         let path = self.system_string_arg(&args[0]);
         if path.is_empty() {
@@ -1842,14 +1851,7 @@ impl Simulator {
                     .lookup_signal_value(&Self::elem_name(&mem.base, &idx))
                     .unwrap_or_else(|| Value::zero(mem.width)),
             };
-            out.push_str(&format!("@{:x} ", addr));
-            let s = match radix {
-                2 => val.to_bin_string(),
-                16 => val.to_hex_string(),
-                _ => val.to_dec_string(),
-            };
-            out.push_str(&s);
-            out.push('\n');
+            Self::push_memory_data(&mut out, &val, radix);
         }
         let _ = std::fs::write(&path, out);
         Value::zero(32)
