@@ -272,6 +272,14 @@ fn design_cache_key(
     let mut dependencies = config.dependency_files.clone();
     dependencies.sort();
     dependencies.dedup();
+    if dependencies.is_empty() {
+        return (hash.finish(), preprocessed_texts, line_maps);
+    }
+    // A library can use macros that emitted no text in the primary files,
+    // including macros from a primary header and function-like definitions.
+    let inherited = pre
+        .map(|source| std::borrow::Cow::Borrowed(&source.macro_defines))
+        .unwrap_or_else(|| std::borrow::Cow::Owned(pp.snapshot_defines()));
     for path in dependencies {
         hash.text(&path.to_string_lossy());
         match std::fs::read(&path) {
@@ -281,15 +289,8 @@ fn design_cache_key(
                 for dir in include_dirs {
                     dep_pp.add_include_dir(std::path::PathBuf::from(dir));
                 }
-                for (name, value) in defines {
-                    dep_pp.define(
-                        name.clone(),
-                        preprocessor::MacroDef {
-                            name: name.clone(),
-                            params: None,
-                            body: value.clone().unwrap_or_default(),
-                        },
-                    );
+                for (name, definition) in inherited.iter() {
+                    dep_pp.define(name.clone(), definition.clone());
                 }
                 hash.text(&dep_pp.preprocess_file(&source, Some(&path)));
             }
@@ -420,6 +421,36 @@ mod design_cache_tests {
         let after = key(&config, "module top; endmodule", Some("top"));
         let _ = std::fs::remove_file(path);
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn design_cache_key_tracks_primary_macros_used_only_in_libraries() {
+        let dir = std::env::temp_dir().join(format!("xezim-library-header-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let header = dir.join("settings.svh");
+        let lib = dir.join("leaf.sv");
+        std::fs::write(&lib, "module leaf; localparam N = `SIZE(1); endmodule\n").unwrap();
+        let sources = vec!["`include \"settings.svh\"\nmodule top; leaf u(); endmodule".to_string()];
+        let paths = vec![dir.join("top.sv").display().to_string()];
+        let config = DesignCacheConfig {
+            directory: dir.clone(),
+            semantic_salt: String::new(),
+            dependency_files: vec![lib],
+        };
+        let keys = || {
+            let pre = xezim_core::preprocess_design(&sources, &paths, &[], &[]);
+            [None, Some(&pre)].map(|prepared| {
+                design_cache_key(&config, &sources, &paths, Some("top"), &[], &[], prepared).0
+            })
+        };
+        std::fs::write(&header, "`define SIZE(x) ((x) + 4)\n").unwrap();
+        let before = keys();
+        std::fs::write(&header, "`define SIZE(x) ((x) + 8)\n").unwrap();
+        let after = keys();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(before[0], before[1]);
+        assert_eq!(after[0], after[1]);
+        assert_ne!(before[0], after[0]);
     }
 
     #[test]
