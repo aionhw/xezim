@@ -403,7 +403,11 @@ fn method_boost_enabled() -> bool {
 // §6.21, §13.5.3: output-before-read locals and literal default actuals compile.
 // §6.12.1, §6.24.1, §12.5: `RealToInt` rounds a value that may be real fitted to 64 integral
 // bits; a value stored into a real target converts first; a real `case` runs interpreted.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3097;
+// §20.3, §3.14.2.3: a scoped `$realtime` read is a real that is not a constant, and a
+// scoped `$time` read is 64 bits wide. §6.24.1, §7.4.3, §11.5.1: a struct-parameter field
+// sizes its cast, and a part-select after a packed index selects whole elements, clipped to
+// its dimension.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3098;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1874,7 +1878,12 @@ struct CombEntryCold {
 // §6.12.1, §6.24.1, §12.5: `RealToInt` (a new opcode) rounds a value that may be real fitted
 // to 64 integral bits, continuous assignments see which signals are real, a value stored into
 // a real target converts first, and a real `case` runs interpreted.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB055";
+// §10.3, §10.10: a continuous assignment of an unpacked concatenation to a fixed array
+// drives each element. §3.14.2.3: scoped time reads of continuous assignments are typed
+// by their result. §6.11.2: a gate-shaped assignment to a 2-state scalar is no fused gate.
+// §6.24.1, §7.4.3, §9.4.2: struct-parameter field casts, part-selects of whole elements after a
+// packed index, and alias nets for event controls on packed-struct members.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB056";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
