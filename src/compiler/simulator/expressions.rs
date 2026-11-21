@@ -2841,6 +2841,11 @@ impl Simulator {
             // §7.4.1/§11.5.1: a nested select of a packed variable the frame
             // owns, placed as its write is (`frame_packed_select_write`).
             if Self::select_of_select(expr)
+                && let Some(v) = self.formal_collection_packed_read(expr)
+            {
+                return v;
+            }
+            if Self::select_of_select(expr)
                 && let Some(v) = self.frame_packed_select_read(expr)
             {
                 return v;
@@ -5815,32 +5820,6 @@ impl Simulator {
                         }
                     }
                 }
-                // A per-call collection stores each unpacked element separately.
-                // Select a packed lane from that element using the formal's bounds.
-                if let ExprKind::Index { expr: array, .. } = &expr.kind
-                    && let ExprKind::Ident(h) = &array.kind
-                    && let [seg] = h.path.as_slice()
-                    && seg.selects.is_empty()
-                    && let Some(store) = self.dyn_name_lookup(&seg.name.name)
-                    && (self.module.queue_vars.contains(store)
-                        || self.module.dynamic_arrays.contains(store)
-                        || self.is_associative_array(store))
-                    && self.unpacked_dims_of(store) <= 1
-                    && let Some(dims) = self.module.packed_full_dims.get(store)
-                    && let [outer, inner @ ..] = dims.as_slice()
-                    && !inner.is_empty()
-                {
-                    let (l, r) = *outer;
-                    let width: u32 = inner.iter().map(|(a, b)| a.abs_diff(*b) as u32 + 1).product();
-                    let elem = self.eval_expr(expr);
-                    let Some(i) = self.eval_expr(index).to_index()
-                        .filter(|i| (l.min(r)..=l.max(r)).contains(i))
-                    else {
-                        return Value::new(width);
-                    };
-                    let lo = (r.abs_diff(i) * u64::from(width)) as usize;
-                    return elem.range_select(lo + width as usize - 1, lo);
-                }
                 // Element of an unpacked ARRAY OF QUEUES: `q[i][k]` selects
                 // element k of the queue `q[i]` (§7.4.5). Without this the base
                 // resolves to a scalar and `[k]` becomes a bit-select.
@@ -7289,6 +7268,34 @@ impl Simulator {
     /// `idx_val`: the interpreter's element read of a fixed, dynamic or
     /// associative array once the operand is resolved. Also the slow path of
     /// a compiled `LoadDynElem`, which must read exactly what this reads.
+    /// A collection formal stores its unpacked elements under the activation's
+    /// key. Read the element there before applying its declared packed bounds.
+    fn formal_collection_packed_read(&mut self, expr: &Expression) -> Option<Value> {
+        let (h, selectors) = Self::index_chain(expr)?;
+        let [seg] = h.path.as_slice() else { return None };
+        let store = self.dyn_name_lookup(&seg.name.name)?;
+        if !(self.module.queue_vars.contains(store) || self.module.dynamic_arrays.contains(store)
+            || self.is_associative_array(store))
+            || self.coll_shape_at(store).is_some_and(|(shape, _)| shape.dims.len() != 1)
+        {
+            return None;
+        }
+        let dims = self.module.packed_full_dims.get(store)?;
+        let (row, packed) = selectors.split_first()?;
+        if packed.is_empty() || packed.len() > dims.len() { return None; }
+        let width: u32 = dims.iter().map(|(a,b)| a.abs_diff(*b) as u32 + 1).product();
+        let remaining: u32 = dims[packed.len()..].iter().map(|(a,b)| a.abs_diff(*b) as u32 + 1).product();
+        let dims = dims.clone();
+        let store = store.to_owned();
+        let key = self.eval_expr(row);
+        let elem = self.coll_elem_read(&store, &store, key, width);
+        let indices: Vec<_> = packed.iter().map(|sel| self.eval_expr(sel)).collect();
+        Some(match Self::packed_chain_slice(u64::from(width), &dims, &indices) {
+            Some((lo, w)) => elem.range_select((lo + w - 1) as usize, lo as usize),
+            None => Value::new(remaining),
+        })
+    }
+
     pub(super) fn coll_elem_read(
         &mut self,
         name: &str,
