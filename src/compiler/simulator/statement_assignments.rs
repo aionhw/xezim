@@ -1956,6 +1956,14 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
+        // §10.10, §7.6: so does an unpacked concatenation written to a row or
+        // to a fixed-array structure member, from the target's left bound.
+        if matches!(rvalue.kind, ExprKind::Concatenation(_))
+            && self.assign_unpacked_concat_elems(lvalue, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
         // §10.8, §10.9: a pattern written to a packed target takes the
         // target's declared type. The element-wise
         // spread below is for unpacked targets.

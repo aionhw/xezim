@@ -629,6 +629,66 @@ impl Simulator {
         true
     }
 
+    /// §10.10, §7.6: `dst = {…}` where `dst` is a one-dimensional fixed
+    /// unpacked array that the whole-name store does not reach: a row of a
+    /// multidimensional array (`m[1]`) or a structure member (`s.a`,
+    /// `sa[1].a`). The items' elements fill the target from its left bound;
+    /// every item is read before any element is written. False for any other
+    /// target, including a slice, a collection and an array of unpacked
+    /// structures (whose elements are member leaves).
+    pub(super) fn assign_unpacked_concat_elems(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> bool {
+        let ExprKind::Concatenation(parts) = &rvalue.kind else {
+            return false;
+        };
+        // A row needs a multidimensional array; a member, a structure or an
+        // object.
+        match lvalue.kind {
+            ExprKind::Index { .. }
+                if !(self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty()) => {}
+            ExprKind::MemberAccess { .. } => {}
+            _ => return false,
+        }
+        let Some(layout) = self
+            .unpacked_operand_layout::<false>(lvalue)
+            .filter(|l| l.dims.len() == l.steps.len() + 1)
+            .filter(|l| !l.steps.iter().any(|s| matches!(s, Step::Range(..))))
+            .filter(|l| self.live_coll_size(&l.root_name).is_none())
+        else {
+            return false;
+        };
+        // Element selects run once here; the stores below reuse the names.
+        let Some(dst) = self.unpacked_elems_from_layout(layout, false) else {
+            return false;
+        };
+        let Some(first) = dst.names.iter().flatten().next() else {
+            return false;
+        };
+        if self.get_signal_value_by_name(first).is_none() {
+            return false;
+        }
+        fn flatten<'a>(parts: &'a [Expression], out: &mut Vec<&'a Expression>) {
+            for e in parts {
+                match &e.kind {
+                    ExprKind::Concatenation(inner) => flatten(inner, out),
+                    _ => out.push(e),
+                }
+            }
+        }
+        let mut items = Vec::with_capacity(parts.len());
+        flatten(parts, &mut items);
+        let values = self.unpacked_concat_operand_values(items, true, None);
+        for (name, v) in dst.names.iter().zip(values) {
+            if let Some(name) = name {
+                self.set_signal_value_by_name(name, v);
+            }
+        }
+        true
+    }
+
     /// Snapshot every pattern item before storing a slice: an item can read
     /// another selected element, and the two sides may overlap (§10.9.1).
     fn unpacked_slice_pattern_values(
