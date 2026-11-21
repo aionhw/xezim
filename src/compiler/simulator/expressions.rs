@@ -7297,7 +7297,7 @@ impl Simulator {
         let dims = dims.clone();
         let store = store.to_owned();
         let has_bound = self.module.dynamic_arrays.contains(&store)
-            && Self::select_mentions_dollar(row);
+            && Self::expr_contains_dollar(row);
         if has_bound {
             self.dollar_bound.push(self.get_queue_size(&store) as i64 - 1);
         }
