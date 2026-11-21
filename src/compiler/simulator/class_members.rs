@@ -3,6 +3,33 @@
 use super::*;
 
 impl Simulator {
+    /// §8.4, §7.4.5: select the storage for a multidimensional array of
+    /// either an object or a module. A bare leaf produced by hierarchical
+    /// name lookup is only a fallback for an explicit receiver.
+    pub(super) fn multidim_array_store<'h>(
+        &mut self,
+        hier: &'h HierarchicalIdentifier,
+        base: &Expression,
+        has_shape: impl Fn(&Self, &str) -> bool,
+    ) -> std::borrow::Cow<'h, str> {
+        let name = self.resolve_hier_name(hier);
+        let bare_leaf = hier.path.last().is_some_and(|seg| {
+            seg.selects.is_empty() && seg.name.name == name.as_ref()
+        });
+        if hier.path.len() >= 2 {
+            if (!has_shape(self, &name) || (bare_leaf && !self.no_class_objects()))
+                && let Some(scoped) = self.expr_assoc_name(base)
+            {
+                return scoped.into();
+            }
+        } else if (bare_leaf || !has_shape(self, &name))
+            && let Some(scoped) = self.instance_assoc_member(&name)
+        {
+            return scoped.into();
+        }
+        name
+    }
+
     pub(super) fn class_static_set(&mut self, start_class: &str, prop: &str, val: Value) -> bool {
         if let Some(key) = self.static_prop_key(start_class, prop) {
             let val = self.fit_static_cell(&key, prop, val);
