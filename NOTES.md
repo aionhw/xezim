@@ -155,6 +155,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 - **Correctness:** Assign function-returned arrays to unpacked slices and rows in declaration order (#1471).
 - **Correctness:** Preserve nested unpacked structure members and fixed-array elements in user-defined nettype driver patterns (§6.6.7, #1464).
 - Round real operands of compiled 64-bit integral casts before using the result (§6.12.1, §6.24.1, #1319).
+- **Correctness:** Preserve type-parameter member widths through class typedefs, initialize two-state packed struct arrays to zero, and fold value system functions in instance-local declarations (core #276–#278).
+- Preserve event-triggered display statements when resuming a checkpoint with the JIT enabled (#1466).
 - **Correctness:** Check type names in selected generate branches, retain instance-specific sensitivity widths, and preserve cross-top waveform selections (#1374, #1375, #1378).
 - **Correctness:** Read four-state digits in integer scan conversions, store unpacked concatenations in fixed queue rows, and resolve rooted queue-element members (#1377, #1379, #1380).
 - **Correctness:** Evaluate continuous-assignment time queries in their declaring instance, retain VPI deposits until a driver changes, and sample input-net defaults on clock edges (#1381, #1382, #1356).

@@ -197,6 +197,8 @@ fn design_cache_key(
     hash.text("scoped-value-parameter-types-v2");
     // §11.2.1/§27.5: validate folded indices in package parameter generate conditions.
     hash.text("scoped-generate-constant-selects-v1");
+    // §6.8/§7.2.1: cached initial values include the state domain of packed members.
+    hash.text("packed-struct-member-array-defaults-v1");
     hash.text(env!("CARGO_PKG_VERSION"));
     hash.text(&config.semantic_salt);
     hash.text(top_module_name.unwrap_or(""));

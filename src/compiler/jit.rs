@@ -418,6 +418,9 @@ mod enabled {
 
     pub struct JitModule {
         module: ClJitModule,
+        /// Statements whose addresses are embedded in this module’s native code.
+        /// Checkpoint restore can replace the bytecode that supplied them.
+        fallback_statements: Vec<std::sync::Arc<crate::ast::stmt::Statement>>,
         next_id: u64,
         /// JIT Stage 2 (JIT-REDESIGN-NOTES.md): when set, codegen for
         /// LoadSignal / LoadSignalSigned reads `signal_inline_bits[id*16]`
@@ -534,6 +537,7 @@ mod enabled {
             Some(Self {
                 module: ClJitModule::new(builder),
                 next_id: 0,
+                fallback_statements: Vec::new(),
                 inline_bits_ptr: None,
                 block_scope_hint: None,
                 signal_widths_snapshot: Vec::new(),
@@ -1482,9 +1486,9 @@ mod enabled {
                     }
                     // AST fallback statement: one bridge call into the
                     // interpreter, scope hint applied around it. The Arc'd
-                    // Statement pointer is baked as a constant; the owning
-                    // CompiledBlock keeps it alive for the JIT fn's life.
+                    // Statement pointer stays valid for the JIT module’s lifetime.
                     Insn::StmtFallback(payload) => {
+                        self.fallback_statements.push(payload.0.clone());
                         let stmt_ptr = std::sync::Arc::as_ptr(&payload.0) as i64;
                         let sp = builder.ins().iconst(pointer_type, stmt_ptr);
                         let (hp, hl) = self.block_scope_hint.unwrap_or((0, 0));
