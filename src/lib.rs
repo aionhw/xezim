@@ -192,6 +192,8 @@ fn design_cache_key(
     // Re-elaborate designs validated before duplicate package/typedef/interface
     // diagnostics (§3.13, §6.18, §25.3, §26.2) were added.
     hash.text("qualified-package-array-storage-and-pr-validation-v3");
+    // §6.20.2, §27.5: preserve resolved parameter bounds and generated types.
+    hash.text("scoped-value-parameter-types-v1");
     hash.text(env!("CARGO_PKG_VERSION"));
     hash.text(&config.semantic_salt);
     hash.text(top_module_name.unwrap_or(""));

@@ -348,6 +348,8 @@ mod typedef_specialization_dispatch;
 mod typedef_two_state_and_untyped_param_sign;
 #[path = "types/typename_real_expressions.rs"]
 mod typename_real_expressions;
+#[path = "types/typename_value_parameters.rs"]
+mod typename_value_parameters;
 #[path = "types/typeparam_default_resolution.rs"]
 mod typeparam_default_resolution;
 #[path = "types/typeparam_typeid_create.rs"]
