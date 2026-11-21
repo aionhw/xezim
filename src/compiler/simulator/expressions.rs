@@ -2150,7 +2150,20 @@ impl Simulator {
                 });
         };
         if h.root.is_some() {
-            return false;
+            // Virtual-interface rebasing marks the physical instance rooted.
+            if h.root.as_deref() != Some("$root")
+                || h.path.iter().any(|seg| !seg.selects.is_empty())
+            {
+                return false;
+            }
+            let name = self.resolve_hier_name(h);
+            let flat = name.strip_prefix(&self.module.name)
+                .and_then(|tail| tail.strip_prefix('.')).unwrap_or(&name);
+            return self.declared_signed_select_depth(flat).or_else(|| {
+                let dt = super::bytecode::declared_type_of(
+                    flat, &self.module.var_decl_types, &self.module.typedef_types)?;
+                super::bytecode::signed_named_packed_elem_depth(dt, &self.module.typedef_types)
+            }) == Some(selects);
         }
         if h.path.iter().any(|s| !s.selects.is_empty()) {
             // A variable of an indexed scope (`g_loop[0].gv[1]`).
