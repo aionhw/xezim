@@ -97,6 +97,8 @@ mod ref_arg_assoc_writeback;
 mod ref_arg_collection_writeback;
 #[path = "strings/review_vpi_unlabelled_block_data.rs"]
 mod review_vpi_unlabelled_block_data;
+#[path = "strings/scan_real_field_end.rs"]
+mod scan_real_field_end;
 #[path = "strings/scanf_four_state_digits.rs"]
 mod scanf_four_state_digits;
 #[path = "strings/string_eq_relational_2state.rs"]
