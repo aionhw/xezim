@@ -55,9 +55,15 @@ fn cc() -> String {
 
 /// Build `dir/libmodel.a` holding `int model(int a, int b) { return <body>; }`.
 fn model_archive(dir: &Path, body: &str) {
-    write(dir, "model.c", &format!("int model(int a, int b) {{ return {body}; }}\n"));
+    write(
+        dir,
+        "model.c",
+        &format!("int model(int a, int b) {{ return {body}; }}\n"),
+    );
     let ok = |c: &mut Command| c.current_dir(dir).status().is_ok_and(|s| s.success());
-    assert!(ok(Command::new(cc()).args(["-fPIC", "-c", "model.c", "-o", "model.o"])));
+    assert!(ok(
+        Command::new(cc()).args(["-fPIC", "-c", "model.c", "-o", "model.o"])
+    ));
     let _ = std::fs::remove_file(dir.join("libmodel.a"));
     let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
     assert!(ok(Command::new(ar).args(["rcs", "libmodel.a", "model.o"])));
@@ -133,7 +139,11 @@ endmodule
 fn library_is_cached_by_preprocessed_source() {
     let d = scratch("cache");
     write(&d, "k.h", "#define K 0\n");
-    write(&d, "add.c", "#include \"k.h\"\nint c_add(int a, int b) { return a + b + K; }\n");
+    write(
+        &d,
+        "add.c",
+        "#include \"k.h\"\nint c_add(int a, int b) { return a + b + K; }\n",
+    );
     write(&d, "t.sv", ADD_SV);
     let (_, text) = run(&d, &["add.c", "t.sv"]);
     assert!(text.contains("sum=5"), "{text}");
@@ -142,7 +152,10 @@ fn library_is_cached_by_preprocessed_source() {
     assert_eq!(built_libraries(&d), 1, "an unchanged build was not reused");
     write(&d, "k.h", "#define K 100\n");
     let (_, text) = run(&d, &["add.c", "t.sv"]);
-    assert!(text.contains("sum=105"), "an edited header was not rebuilt: {text}");
+    assert!(
+        text.contains("sum=105"),
+        "an edited header was not rebuilt: {text}"
+    );
     assert_eq!(built_libraries(&d), 2);
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -157,11 +170,21 @@ fn objects_archives_and_shared_libraries_in_a_file_list() {
     write(&d, "four.c", "int c_four(void) { return 4; }\n");
     write(&d, "eight.c", "int c_eight(void) { return 8; }\n");
     let ok = |c: &mut Command| c.current_dir(&d).status().is_ok_and(|s| s.success());
-    assert!(ok(Command::new(cc()).args(["-fPIC", "-c", "two.c", "-o", "two.o"])));
-    assert!(ok(Command::new(cc()).args(["-fPIC", "-c", "four.c", "-o", "four.o"])));
+    assert!(ok(
+        Command::new(cc()).args(["-fPIC", "-c", "two.c", "-o", "two.o"])
+    ));
+    assert!(ok(
+        Command::new(cc()).args(["-fPIC", "-c", "four.c", "-o", "four.o"])
+    ));
     let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
     assert!(ok(Command::new(ar).args(["rcs", "libfour.a", "four.o"])));
-    assert!(ok(Command::new(cc()).args(["-shared", "-fPIC", "eight.c", "-o", "libeight.so"])));
+    assert!(ok(Command::new(cc()).args([
+        "-shared",
+        "-fPIC",
+        "eight.c",
+        "-o",
+        "libeight.so"
+    ])));
     write(
         &d,
         "t.sv",
@@ -175,7 +198,11 @@ module t;
 endmodule
 "#,
     );
-    write(&d, "files.f", "one.c\ntwo.o\nlibfour.a\nlibeight.so\nt.sv\n");
+    write(
+        &d,
+        "files.f",
+        "one.c\ntwo.o\nlibfour.a\nlibeight.so\nt.sv\n",
+    );
     let (out, text) = run(&d, &["--error-exit", "-f", "files.f"]);
     assert!(out.status.success(), "{text}");
     assert!(text.contains("total=15"), "{text}");
@@ -206,7 +233,10 @@ fn ldflags_archive_edit_reaches_the_next_run() {
     archive("a + b + 100");
     let (out, text) = run(&d, &["-LDFLAGS", "./libmodel.a", "add.c", "t.sv"]);
     assert!(out.status.success(), "{text}");
-    assert!(text.contains("sum=105"), "the edited archive was not linked: {text}");
+    assert!(
+        text.contains("sum=105"),
+        "the edited archive was not linked: {text}"
+    );
     assert_eq!(built_libraries(&d), 2, "{text}");
     assert_eq!(first.len(), 1);
     assert_eq!(objects(), first, "the unchanged source was compiled again");
@@ -250,7 +280,11 @@ fn ldflags_builds_of_one_key_keep_their_own_libraries() {
     assert!(out.status.success(), "{text}");
     assert!(text.contains("sum=105"), "{text}");
     let both = libraries();
-    assert_eq!(both.len(), 2, "the second run replaced the first run's library");
+    assert_eq!(
+        both.len(),
+        2,
+        "the second run replaced the first run's library"
+    );
     assert!(both.contains(&first[0]), "the first run's library changed");
     let (_, text) = run_with_cache(&a, &cache, &args);
     assert!(text.contains("sum=5"), "{text}");
@@ -325,5 +359,30 @@ fn files_list_shows_dpi_sources() {
     let (_, text) = run(&d, &["--dump-files-list", "-f", "files.f"]);
     assert!(text.contains("1 source file(s)"), "{text}");
     assert!(text.contains("--- DPI C/C++ file(s): 1 ---"), "{text}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A compiled artifact holds the elaborated design, not the DPI code:
+/// `--compile -o` warns that it leaves the C source out, and a run of the
+/// artifact with the source named again builds and loads it.
+#[test]
+fn compiled_artifact_runs_with_its_c_source_named_again() {
+    let d = scratch("artifact");
+    write(&d, "add.c", "int c_add(int a, int b) { return a + b; }\n");
+    write(&d, "t.sv", ADD_SV);
+    let (out, text) = run(&d, &["--compile", "-o", "t.xzc", "add.c", "t.sv"]);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("does not include the DPI C/C++ file(s) add.c"),
+        "{text}"
+    );
+    assert_eq!(
+        built_libraries(&d),
+        0,
+        "--compile built the library: {text}"
+    );
+    let (out, text) = run(&d, &["t.xzc", "add.c"]);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("sum=5"), "{text}");
     let _ = std::fs::remove_dir_all(&d);
 }
