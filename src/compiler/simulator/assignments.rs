@@ -4811,7 +4811,11 @@ impl Simulator {
                             // locals are exempt (1024-bit internal packed
                             // text).
                             let is_str = self.p_local_is_string(name);
-                            let fitted = if prev_is_real && !val.is_real && !is_str {
+                            let fitted = if prev_is_real && self.module.var_decl_types.get(name).is_some_and(|dt| matches!(
+                                self.resolve_dt_ref(dt), DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }
+                            )) {
+                                Value::from_f64(val.to_f64() as f32 as f64)
+                            } else if prev_is_real && !val.is_real && !is_str {
                                 // §6.12.2: an integral value assigned to a REAL
                                 // local converts; stored as integral bits, a
                                 // `real t; t = k; h = t / 2;` divided as integers.

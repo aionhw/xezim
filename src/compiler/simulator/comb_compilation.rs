@@ -1043,7 +1043,10 @@ impl Simulator {
                 // on the fast path.
                 let dst_real = self.signal_real.get(dst_id).copied().unwrap_or(false);
                 let src_real = self.signal_real.get(src_id).copied().unwrap_or(false);
-                if dst_real != src_real {
+                if dst_real != src_real
+                    || (dst_real && self.shortreal_signals.contains(&dst_id)
+                        && !self.shortreal_signals.contains(&src_id))
+                {
                     None
                 } else if width == self.signal_widths[src_id] {
                     if width <= 64 && delay == 0 {

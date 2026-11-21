@@ -1139,10 +1139,7 @@ macro_rules! write_sig {
         // rounds to binary32 (16777216.25 -> 16777216.0). A `real` (binary64)
         // keeps every bit. Only a REAL write pays the type-name lookup.
         if __wsig_val.is_real
-            && $self
-                .signal_type_names
-                .get(&__wsig_id)
-                .is_some_and(|tn| tn == "shortreal")
+            && $self.shortreal_signals.contains(&__wsig_id)
         {
             let __wsig_f = __wsig_val.to_f64() as f32 as f64;
             __wsig_val = Value::from_f64(__wsig_f);
@@ -5318,8 +5315,9 @@ struct PortPlan {
 enum RetConv {
     /// Not a numeric scalar: the value passes through untouched.
     Keep,
-    /// `real` / `shortreal` / `realtime`.
+    /// Binary64 real and realtime.
     Real,
+    ShortReal,
     /// An integral type; `two_state` for bit, byte, int, ... (§6.11.1).
     Int { two_state: bool },
 }
@@ -7909,6 +7907,7 @@ pub struct Simulator {
     /// `Signal` struct — most regular bit/logic signals have None
     /// here. Populated once at construction so `module.signals` can
     /// be freed afterwards.
+    shortreal_signals: HashSet<usize>,
     signal_type_names: HashMap<usize, String>,
     pub widths: HashMap<String, u32>,
     pub signed_signals: HashSet<String>,

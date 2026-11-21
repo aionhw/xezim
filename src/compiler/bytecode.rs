@@ -19363,6 +19363,11 @@ impl<'a> BytecodeCompiler<'a> {
                             _ => false,
                         }
                     }
+                    if matches!(self.resolved_decl_type(&dt, None), crate::ast::types::DataType::Real {
+                        kind: crate::ast::types::RealType::ShortReal, ..
+                    }) {
+                        return self.emit_expr_fallback(expr, ctx_width, "shortreal_cast");
+                    }
                     if is_stream(inner) {
                         if let Some(r) =
                             self.emit_expr_fallback(expr, ctx_width, "type_cast_stream")

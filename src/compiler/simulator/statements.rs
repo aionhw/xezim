@@ -2184,6 +2184,9 @@ impl Simulator {
         signed: bool,
     ) -> Value {
         if is_real_type {
+            if matches!(data_type, DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }) {
+                return Value::from_f64(raw.to_f64() as f32 as f64);
+            }
             return if raw.is_real {
                 raw
             } else {

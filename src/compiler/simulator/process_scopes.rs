@@ -4675,7 +4675,9 @@ impl Simulator {
     pub(super) fn fit_value_to_signal(&self, id: usize, val: &Value) -> Value {
         let width = self.signal_widths[id];
         if self.signal_real[id] {
-            let mut r = if val.is_real {
+            let mut r = if self.shortreal_signals.contains(&id) {
+                Value::from_f64(val.to_f64() as f32 as f64)
+            } else if val.is_real {
                 val.clone()
             } else {
                 Value::from_f64(val.to_f64())
