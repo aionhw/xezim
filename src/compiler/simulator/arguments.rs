@@ -2559,6 +2559,7 @@ impl Simulator {
             .max(1);
             let param = self.array_formal_key(port);
             self.module.arrays.insert(param.clone(), (lo, hi, w));
+            self.note_formal_direction(&param, descending);
             let indices: Vec<i64> = if descending {
                 (lo..=hi).rev().collect()
             } else {
@@ -2726,7 +2727,20 @@ impl Simulator {
             }
         }
         self.module.arrays.insert(param.clone(), (lo, hi, w));
+        // §7.6: a store to a descending formal (`output int o[5:3]`) starts
+        // at its left bound, as for any other descending array.
+        self.note_formal_direction(&param, descending);
         Some((param, caller.to_string(), lo, hi))
+    }
+
+    /// Record whether the one-dimensional array formal `param` is declared
+    /// descending, for the stores of the body (§7.6).
+    fn note_formal_direction(&mut self, param: &str, descending: bool) {
+        if descending {
+            self.module.descending_arrays.insert(param.to_string());
+        } else {
+            self.module.descending_arrays.remove(param);
+        }
     }
 
     /// §13.5.1: an `output` formal is not copied in: it starts at its type's
