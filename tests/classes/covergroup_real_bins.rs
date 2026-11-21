@@ -442,3 +442,36 @@ endmodule
         &["coverage 1/64"],
     );
 }
+
+/// §19.5.1 and §19.5.5: overlapping ignored ranges leave a fractional
+/// interval live. Signed zeroes select the same singleton.
+#[test]
+fn real_fractional_exclusions_and_signed_zero() {
+    check_coverage(
+        r#"
+module top;
+  covergroup cg with function sample(real v);
+    cp: coverpoint v {
+      bins zero = {0.0};
+      bins partial = {[-2.75:-1.25]};
+      ignore_bins ignored = {[-2.5:-2.0], [-2.25:-1.25]};
+    }
+  endgroup
+  cg c;
+  initial begin
+    int covered, total;
+    real pct;
+    c = new;
+    c.sample(-0.0);
+    c.sample(-2.25);
+    pct = c.cp.get_inst_coverage(covered, total);
+    $display("coverage %0d/%0d", covered, total);
+    c.sample(-2.625);
+    pct = c.cp.get_inst_coverage(covered, total);
+    $display("coverage %0d/%0d", covered, total);
+  end
+endmodule
+"#,
+        &["coverage 1/2", "coverage 2/2"],
+    );
+}
