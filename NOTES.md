@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Preserve type-parameter member widths through class typedefs, initialize two-state packed struct arrays to zero, and fold value system functions in instance-local declarations (core #276–#278).
+
 - Preserve event-triggered display statements when resuming a checkpoint with the JIT enabled (#1466).
 
 - **Correctness:** Check type names in selected generate branches, retain instance-specific sensitivity widths, and preserve cross-top waveform selections (#1374, #1375, #1378).
