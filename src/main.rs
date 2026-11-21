@@ -444,8 +444,8 @@ fn print_usage() {
     eprintln!("  -sv_seed <n|random>  Same as +seed=<n|random>; also -svseed, -seed and the");
     eprintln!("                   =<n> forms (-sv_seed=5), on the command line or in -f files");
     eprintln!("  -sv_lib <name>, -sv_root <dir>  DPI library <dir>/<name>.so (see --dpi-lib)");
-    eprintln!("  -CFLAGS \"<args>\", -LDFLAGS \"<args>\"  Extra compiler / linker arguments for the");
-    eprintln!("                   DPI C/C++ sources (-ccflags, -ldflags are the same)");
+    eprintln!("  -CFLAGS \"<args>\", -LDFLAGS \"<args>\"  Extra compiler / linker arguments");
+    eprintln!("                   for the DPI C/C++ sources (-ccflags, -ldflags are the same)");
     eprintln!("  -logfile <file>  Same as -l (redirects; the terminal gets nothing)");
     eprintln!("  -c               With no file after it: accepted (batch mode is the only mode)");
     eprintln!(
@@ -3507,6 +3507,15 @@ fn run_main() -> i32 {
     // HDL: they are built into (or are) DPI libraries and loaded as
     // `--dpi-lib` is (src/dpi_sources.rs).
     let foreign = xezim::dpi_sources::ForeignInputs::take_from(&mut source_files);
+    // A compiled artifact holds the elaborated design only, as it holds no
+    // `--dpi-lib` library: the run that loads it must name the files again.
+    if mode == Mode::Compile && _output_file.is_some() && !foreign.is_empty() {
+        eprintln!(
+            "[xezim][warning] the compiled artifact does not include the DPI C/C++ file(s) {}; \
+             name them again when running it",
+            foreign.files().collect::<Vec<_>>().join(", ")
+        );
+    }
 
     // `--dump-files-list`: the fully resolved compilation file set, after every
     // `-f` args file has been expanded. Printed BEFORE the files are read so

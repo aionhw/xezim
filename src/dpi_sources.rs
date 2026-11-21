@@ -210,9 +210,8 @@ fn compiler(var: &str, clang: &str, fallback: &str) -> Vec<OsString> {
             return words;
         }
     }
-    let on_path = std::env::var_os("PATH").is_some_and(|p| {
-        std::env::split_paths(&p).any(|d| d.join(clang).is_file())
-    });
+    let on_path = std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(clang).is_file()));
     vec![if on_path { clang } else { fallback }.into()]
 }
 
@@ -310,7 +309,11 @@ pub fn build_library(
     let cc = compiler("CC", "clang", "cc");
     let cxx = compiler("CXX", "clang++", "c++");
     let flags = |lang: ForeignKind| -> Vec<OsString> {
-        let mut cmd = if lang == ForeignKind::Cxx { cxx.clone() } else { cc.clone() };
+        let mut cmd = if lang == ForeignKind::Cxx {
+            cxx.clone()
+        } else {
+            cc.clone()
+        };
         cmd.extend(["-fPIC", "-O2", "-I"].map(OsString::from));
         cmd.push(include.clone().into());
         cmd.extend(cflags.iter().map(OsString::from));
@@ -330,18 +333,15 @@ pub fn build_library(
         let compile = flags(*lang);
         let mut pp = compile.clone();
         pp.extend(["-E".into(), src.into()]);
-        let out = Command::new(&pp[0])
-            .args(&pp[1..])
-            .output()
-            .map_err(|e| {
-                format!(
-                    "DPI source '{}': cannot run `{}` ({}); set $CC/$CXX or put clang or cc \
+        let out = Command::new(&pp[0]).args(&pp[1..]).output().map_err(|e| {
+            format!(
+                "DPI source '{}': cannot run `{}` ({}); set $CC/$CXX or put clang or cc \
                      on PATH",
-                    src,
-                    pp[0].to_string_lossy(),
-                    e
-                )
-            })?;
+                src,
+                pp[0].to_string_lossy(),
+                e
+            )
+        })?;
         if !out.status.success() {
             return Err(format!(
                 "DPI source '{}' failed to preprocess: {}\n{}",
@@ -358,11 +358,15 @@ pub fn build_library(
         obj_key.bytes(&out.stdout);
         let obj_key = obj_key.finish();
         key.text(&obj_key);
-        compiled.push((cache.join(format!("obj-{}.o", &obj_key[..24])), src.as_str(), *lang));
+        compiled.push((
+            cache.join(format!("obj-{}.o", &obj_key[..24])),
+            src.as_str(),
+            *lang,
+        ));
     }
     for obj in &inputs.objects {
-        let bytes = std::fs::read(obj)
-            .map_err(|e| format!("cannot read DPI object '{}': {}", obj, e))?;
+        let bytes =
+            std::fs::read(obj).map_err(|e| format!("cannot read DPI object '{}': {}", obj, e))?;
         key.text(obj);
         key.bytes(&bytes);
     }
@@ -502,7 +506,10 @@ mod tests {
         std::fs::create_dir(&open).unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o775)).unwrap();
         let e = private_dir(&open).unwrap_err();
-        assert!(e.contains("can be written by other users (mode 775)"), "{e}");
+        assert!(
+            e.contains("can be written by other users (mode 775)"),
+            "{e}"
+        );
         let link = base.join("link");
         std::os::unix::fs::symlink(&own, &link).unwrap();
         let e = private_dir(&link).unwrap_err();

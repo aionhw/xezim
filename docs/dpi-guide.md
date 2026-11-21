@@ -66,6 +66,10 @@ a `-l` library), so with `-LDFLAGS` the library is linked again on every
 run, from the cached objects. A compile or link error stops the run before
 it starts.
 
+A compiled artifact (`--compile -o design.xzc`) holds the elaborated design
+only, so name the DPI files again when running it
+(`xezim design.xzc add.c`); `--compile` warns when it leaves them out.
+
 ---
 
 ## What xezim expects
