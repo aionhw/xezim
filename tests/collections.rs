@@ -409,3 +409,5 @@ mod pattern_self_read;
 mod pattern_self_read_scopes;
 #[path = "collections/queue_pop_drain_loop_1210.rs"]
 mod queue_pop_drain_loop_1210;
+#[path = "collections/unpacked_concat_targets.rs"]
+mod unpacked_concat_targets;
