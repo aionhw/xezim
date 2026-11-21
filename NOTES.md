@@ -12,6 +12,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 - **Correctness:** Run the resolution function of an undriven user-defined net at time zero with an empty driver array (§6.7.3, #1462).
 - **Correctness:** Report the resolved type and dimensions of value parameters in procedural `$typename` calls (#1461).
 - **Correctness:** Round `shortreal` storage and casts to IEEE binary32 precision (#1463).
+- Store whole fixed-size rows assigned through class handles in queue, dynamic-array and fixed-array properties (#1467).
+- **Correctness:** Read unpacked queue rows from their element storage in class methods (§7.4.5, #1468).
+- **Correctness:** Evaluate each operand once when assigning an unpacked concatenation to a queue (§10.10, #1470).
+- **Correctness:** Select queue rows through their class handle when a module declares an array with the same property name (§8.4, #1469).
 
 - **Correctness:** Check type names in selected generate branches, retain instance-specific sensitivity widths, and preserve cross-top waveform selections (#1374, #1375, #1378).
 - **Correctness:** Read four-state digits in integer scan conversions, store unpacked concatenations in fixed queue rows, and resolve rooted queue-element members (#1377, #1379, #1380).

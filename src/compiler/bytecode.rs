@@ -115,6 +115,8 @@ pub(crate) struct MethodAdmission {
 /// See `MethodAdmission::instance_colls`.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ClassColls {
+    /// §7.4.5: selecting these members once still yields an unpacked row.
+    pub row_members: HashSet<String>,
     pub members: HashSet<String>,
     /// Queues and dynamic arrays: a `foreach` index is a plain integer.
     pub dense: HashSet<String>,
@@ -18293,6 +18295,19 @@ impl<'a> BytecodeCompiler<'a> {
                     let dst = self.alloc_reg();
                     self.emit(Insn::StrOp(dst, StrOpKind::GetC, Box::new(vec![src, i])));
                     return Some(dst);
+                }
+                // §7.4.5: an unpacked row occupies multiple storage cells.
+                // LoadCollElem reads a single cell; a second index would then
+                // select a bit of that placeholder rather than a row element.
+                if self.method_mode
+                    && let Some((name, _, receiver)) = self.member_coll_elem_target(expr)
+                    && let Some(owner) = self.coll_owner_class(receiver.as_ref())
+                    && self.method_admission.as_ref()
+                        .and_then(|facts| facts.instance_colls.get(&owner))
+                        .is_some_and(|colls| colls.row_members.contains(&name))
+                {
+                    self.bail("unpacked_member_collection_row");
+                    return None;
                 }
                 // class-perf Step 9b-ii: element READ of a member collection
                 // (`q[i]`, `aa[k]`, `this.aa[k]`, `obj.aa[k]`) inside a

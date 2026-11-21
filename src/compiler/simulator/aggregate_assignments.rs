@@ -100,6 +100,111 @@ impl Simulator {
         true
     }
 
+    /// §7.6, §10.9.1, §10.10: a class member's fixed-size row lives in
+    /// the object's indexed leaf cells, including under a queue or dynamic
+    /// outer dimension. Snapshot the RHS before changing any destination.
+    pub(super) fn assign_class_scalar_row(&mut self, lhs: &Expression, rhs: &Expression) -> bool {
+        if self.module.arrays_2d.is_empty() || self.no_class_objects() {
+            return false;
+        }
+        if !matches!(&lhs.kind, ExprKind::Index { .. })
+            && !matches!(&lhs.kind, ExprKind::Ident(h) if h.path.last().is_some_and(|p| !p.selects.is_empty()))
+        {
+            return false;
+        }
+        let (base, selects) = Self::split_row_selects(lhs);
+        let [index] = selects.as_slice() else {
+            return false;
+        };
+        let Some(name) = self.expr_assoc_name(&base) else {
+            return false;
+        };
+        if Self::class_storage_owner(&name).is_none() {
+            return false;
+        }
+        let Some(&(outer, inner, width)) = self.module.arrays_2d.get(&name) else {
+            return false;
+        };
+        let Some(dt) = self.class_member_coll_type(&name).cloned() else {
+            return false;
+        };
+        if self.unpacked_struct_of(&dt).is_some() {
+            return false;
+        }
+        // A dynamic dimension may be omitted from the declared bounds.
+        let (left, right) = self
+            .unpacked_decl_dims_of(&name)
+            .and_then(|d| d.last().copied())
+            .unwrap_or(inner);
+        let mut positions: Vec<_> = (inner.0..=inner.1).collect();
+        if left > right {
+            positions.reverse();
+        }
+        let values: Vec<(i64, Value)> = match &self.unpacked_pattern(rhs).kind {
+            ExprKind::AssignmentPattern(items) => {
+                let items = self.pattern_elems_for_type(items, &positions, &dt);
+                positions
+                    .into_iter()
+                    .zip(items)
+                    .filter_map(|(j, item)| {
+                        Some((j, self.eval_pattern_leaf_value(&dt, item?, Some(width))))
+                    })
+                    .collect()
+            }
+            kind => {
+                let vals = if let ExprKind::Concatenation(items) = kind {
+                    self.unpacked_concat_operand_values(items.iter().collect())
+                } else if let Some((src, suffixes, _)) = self.nd_array_operand(rhs) {
+                    suffixes
+                        .iter()
+                        .map(|s| {
+                            self.get_signal_value_by_name(&format!("{src}{s}"))
+                                .unwrap_or_else(|| Value::new(width))
+                        })
+                        .collect()
+                } else {
+                    return false;
+                };
+                let ty = self.resolve_dt_ref(&dt);
+                let real = self.dt_is_real(&dt);
+                let signed = self.type_is_signed_concrete(&dt);
+                let two_state =
+                    super::elaborate::is_type_two_state_resolved(&dt, &self.module.typedef_types);
+                positions
+                    .into_iter()
+                    .zip(vals)
+                    .map(|(j, v)| {
+                        (
+                            j,
+                            Self::fit_local_decl_init(v, width, ty, two_state, real, signed),
+                        )
+                    })
+                    .collect()
+            }
+        };
+        let dynamic = self.module.dynamic_arrays.contains(&name);
+        let hi = if dynamic {
+            self.get_queue_size(&name) as i64 - 1
+        } else {
+            outer.1
+        };
+        self.dollar_bound.push(hi);
+        let selected = self.eval_expr(index);
+        self.dollar_bound.pop();
+        let i = if dynamic && self.is_queue_store(&name) {
+            self.prepare_sequence_write(&name, &selected)
+        } else {
+            let low = if dynamic { 0 } else { outer.0 };
+            selected.to_index().filter(|i| (low..=hi).contains(i))
+        };
+        if let Some(i) = i {
+            for (j, value) in values {
+                self.set_signal_value_by_name(&format!("{name}[{i}][{j}]"), value);
+            }
+        }
+        true
+    }
+
     /// `c.m[1]` / `c.m[1][2]` (either parse shape) as the unselected member
     /// expression and its index selects, outermost first. Range selects and
     /// anything else come back whole, with no selects.
