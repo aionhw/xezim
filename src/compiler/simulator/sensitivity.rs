@@ -2339,6 +2339,17 @@ impl Simulator {
         {
             return None;
         }
+        // §6.11.2, §23.3.3.2: a 2-state target drops X and Z on every write.
+        // A gate evaluates four-state bits and stores them as they are, so a
+        // `bit` input formal bound to a 4-state scalar (`.b(x1)`) read x.
+        if self
+            .signal_two_state
+            .get(dst.sig_id as usize)
+            .copied()
+            .unwrap_or(false)
+        {
+            return None;
+        }
         // Strip outer parens on rhs
         fn unparen(e: &Expression) -> &Expression {
             if let ExprKind::Paren(inner) = &e.kind {
