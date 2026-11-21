@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Match explicit real coverpoint bins by numeric value and omit automatic bins for real points (§19.5, #1465).
+
 - **Correctness:** Wake event-controlled blocks when a member of a selected class handle or packed struct changes (§9.4.2, #1472).
 
 - **Correctness:** Assign function-returned arrays to unpacked slices and rows in declaration order (#1471).
