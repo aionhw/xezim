@@ -1236,12 +1236,17 @@ impl Simulator {
                 while let Some(pos) = name[..cut].rfind('.') {
                     let (base, field) = (&name[..pos], &name[pos + 1..]);
                     if module.signals.contains_key(base) {
-                        let (_, off, w) = module
+                        // A signal that is no packed structure with this
+                        // member leaves the next spelling to try.
+                        if let Some((_, off, w)) = module
                             .packed_struct_fields
-                            .get(base)?
-                            .iter()
-                            .find(|(m, _, _)| m == field)?;
-                        return (*w > 0).then(|| (base.to_string(), *off as i64, *w));
+                            .get(base)
+                            .and_then(|fields| fields.iter().find(|(m, _, _)| m == field))
+                            .filter(|(_, _, w)| *w > 0)
+                        {
+                            return Some((base.to_string(), *off as i64, *w));
+                        }
+                        break;
                     }
                     cut = pos;
                 }
