@@ -12553,7 +12553,8 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::SystemCall { name, args } => match name.as_str() {
                 "$__xz_type_cast" => args.get(1).is_some_and(|a| self.expr_is_constant(a)),
-                n if n != "$realtime" && system_function_is_real(n) => {
+                // A time read changes with the simulation time.
+                n if n != "$realtime" && n != "$__xz_realtime_at" && system_function_is_real(n) => {
                     args.iter().all(|a| self.expr_is_constant(a))
                 }
                 _ => false,
@@ -12840,6 +12841,7 @@ impl<'a> BytecodeCompiler<'a> {
                 matches!(
                     name.as_str(),
                     "$realtime"
+                        | "$__xz_realtime_at"
                         | "$itor"
                         | "$bitstoreal"
                         | "$shortrealtobits"
@@ -27868,6 +27870,7 @@ pub(crate) fn system_function_is_real(name: &str) -> bool {
             | "$bitstoreal"
             | "$bitstoshortreal"
             | "$realtime"
+            | "$__xz_realtime_at"
             | "$ln"
             | "$log10"
             | "$exp"
@@ -28035,7 +28038,7 @@ pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
         }
         "$onehot" | "$onehot0" | "$isunknown" | "$isunbounded" | "$rose" | "$fell" | "$stable"
         | "$changed" => (1, false),
-        "$time" | "$realtobits" => (64, false),
+        "$time" | "$__xz_time_at" | "$realtobits" => (64, false),
         _ => return None,
     })
 }

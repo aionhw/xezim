@@ -3337,7 +3337,10 @@ impl Simulator {
             }
             ExprKind::SystemCall { name, args } => match name.as_str() {
                 "$__xz_type_cast" => args.get(1).is_some_and(|a| self.expr_is_constant(a)),
-                n if n != "$realtime" && super::bytecode::system_function_is_real(n) => {
+                n if n != "$realtime"
+                    && n != "$__xz_realtime_at"
+                    && super::bytecode::system_function_is_real(n) =>
+                {
                     args.iter().all(|a| self.expr_is_constant(a))
                 }
                 _ => false,
