@@ -658,6 +658,23 @@ impl Simulator {
         }))
     }
 
+    // A fixed array can contain null handles when an always block first arms.
+    // The declared element class still identifies the property to sample.
+    fn selected_receiver_value_property(&self, e: &Expression) -> bool {
+        let ExprKind::MemberAccess { expr, member } = &e.kind else {
+            return false;
+        };
+        if !matches!(expr.kind, ExprKind::Index { .. }) {
+            return false;
+        }
+        self.get_expr_type_name(expr)
+            .and_then(|class| self.class_property_decl_type(&class, &member.name))
+            .is_some_and(|(dt, dims)| dims.is_empty() && !matches!(
+                self.resolve_dt_ref(&dt),
+                DataType::Simple { kind: crate::ast::types::SimpleType::Event, .. }
+            ))
+    }
+
     fn expr_has_non_event_prop(&mut self, expr: &Expression) -> bool {
         match &expr.kind {
             ExprKind::Paren(inner) => self.expr_has_non_event_prop(inner),
@@ -688,7 +705,8 @@ impl Simulator {
                     || self.expr_has_non_event_prop(else_expr)
             }
             _ => {
-                self.expr_handle_prop_any(expr)
+                self.selected_receiver_value_property(expr)
+                    || self.expr_handle_prop_any(expr)
                     .is_some_and(|(h, f)| !self.class_prop_is_event(h, &f))
                     || (self.chain_rooted_at_handle(expr)
                         && !self.chain_may_name_vif(expr)
@@ -904,6 +922,9 @@ impl Simulator {
                 .any(|f| f.contains_key(h.path[0].name.name.as_str()))
         {
             return false;
+        }
+        if self.selected_receiver_value_property(e) {
+            return true;
         }
         if let Some((h, f)) = self.expr_handle_prop_any(e) {
             return !self.class_prop_is_event(h, &f);
