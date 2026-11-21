@@ -4331,10 +4331,13 @@ impl Simulator {
                 let su = self
                     .class_prop_struct(handle, prop)
                     .filter(|su| Self::spreads_member_wise(su));
+                let shared_width = self.widths.specialize_fixed(&scoped, lo, hi, w);
                 for i in lo..=hi {
                     let en = format!("{}[{}]", scoped, i);
-                    self.signals.insert(en.clone(), fill.clone());
-                    self.widths.insert(en, w);
+                    if !shared_width {
+                        self.widths.insert(en.clone(), w);
+                    }
+                    self.signals.insert(en, fill.clone());
                     if let Some(su) = &su {
                         self.seed_class_struct_cells(handle, &format!("{}[{}]", prop, i), su);
                     }

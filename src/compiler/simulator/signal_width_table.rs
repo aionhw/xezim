@@ -20,6 +20,15 @@ struct WidthRange {
 }
 
 impl WidthRange {
+    fn new(first: u64, last: u64, width: u32) -> Self {
+        Self {
+            first,
+            last,
+            width,
+            changes: HashMap::default(),
+        }
+    }
+
     fn contains(&self, i: u64) -> bool {
         (self.first..=self.last).contains(&i)
     }
@@ -130,19 +139,47 @@ impl SignalWidths {
     }
 
     pub fn values(&self) -> impl Iterator<Item = &u32> {
-        self.iter().map(|(_, width)| width)
+        self.named.values().chain(
+            self.ranges
+                .values()
+                .flat_map(|r| (r.first..=r.last).filter_map(move |i| r.get(i))),
+        )
     }
 
-    /// Called at allocation, before the new instance's member has any keys.
+    /// Assign the declared width to each key in [first, last]. Construction
+    /// and specialization both use this operation; old cells outside the
+    /// bounds retain their widths, as for individual map inserts.
     pub(super) fn declare_fixed(&mut self, name: &str, first: u64, last: u64, width: u32) {
-        self.ranges
-            .entry(name.to_owned())
-            .or_insert_with(|| WidthRange {
-                first,
-                last,
-                width,
-                changes: HashMap::default(),
+        if let Some(old) = self.ranges.get(name)
+            && (first > old.first || last < old.last)
+        {
+            for i in first..=last {
+                self.insert(format!("{name}[{i}]"), width);
+            }
+            return;
+        }
+        // Drop any named cells the new range replaces. For a small range,
+        // inspect only its keys; for a large range, inspect the smaller map.
+        if self.named.len() as u64 > last - first + 1 {
+            for i in first..=last {
+                self.named.remove(&format!("{name}[{i}]"));
+            }
+        } else {
+            self.named.retain(|key, _| {
+                !matches!(split_elem_key(key),
+                Some((base, i)) if name == base && (first..=last).contains(&i))
             });
+        }
+        self.ranges
+            .insert(name.to_owned(), WidthRange::new(first, last, width));
+    }
+
+    pub(super) fn specialize_fixed(&mut self, name: &str, lo: i64, hi: i64, width: u32) -> bool {
+        if lo < 0 || lo > hi || hi >= 1_000_000_000 || !self.ranges.contains_key(name) {
+            return false;
+        }
+        self.declare_fixed(name, lo as u64, hi as u64, width);
+        true
     }
 
     /// Class GC tests ownership by the prefix preceding the first '#'.
@@ -202,19 +239,14 @@ impl super::Simulator {
                 continue;
             }
             let last = first + values.len() as u64 - 1;
-            self.widths.declare_fixed(name, first, last, width);
+            let mut range = WidthRange::new(first, last, width);
             for i in first..=last {
-                let key = format!("{name}[{i}]");
-                match self.widths.named.remove(&key) {
-                    Some(w) if w == width => {}
-                    Some(w) => {
-                        self.widths.insert(key, w);
-                    }
-                    None => {
-                        self.widths.remove(&key);
-                    }
+                let stored = self.widths.named.remove(&format!("{name}[{i}]"));
+                if stored != Some(width) {
+                    range.changes.insert(i, stored);
                 }
             }
+            self.widths.ranges.insert(name.to_owned(), range);
         }
         if !self.widths.ranges.is_empty() {
             self.widths.named.shrink_to_fit();
@@ -225,6 +257,31 @@ impl super::Simulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redeclared_widths_overwrite_only_their_own_bounds() {
+        let mut w = SignalWidths::default();
+        w.insert("1#d[1]".into(), 5);
+        w.insert("1#d[4]".into(), 99);
+        w.insert("12#d[4]".into(), 1);
+        w.declare_fixed("1#d", 3, 5, 8);
+        assert_eq!(w.storage_counts(), (2, 1));
+        w.insert("1#d[5]".into(), 9);
+        w.insert("1#d[6]".into(), 111);
+        assert!(w.specialize_fixed("1#d", 4, 7, 32));
+        assert_eq!(w["1#d[3]"], 8);
+        for i in 4..=7 {
+            assert_eq!(w[&format!("1#d[{i}]")], 32);
+        }
+        w.remove("1#d[4]");
+        assert!(w.specialize_fixed("1#d", 2, 7, 16));
+        assert_eq!(w.storage_counts(), (2, 1));
+        assert_eq!(w.len(), 8);
+        assert_eq!(w.iter().count(), 8);
+        assert_eq!(w["1#d[1]"], 5);
+        assert_eq!(w["1#d[4]"], 16);
+        assert_eq!(w["12#d[4]"], 1);
+    }
 
     #[test]
     fn fixed_widths_keep_independent_edits_and_legacy_map_encoding() {
