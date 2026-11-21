@@ -274,8 +274,9 @@ endmodule
 /// class method, the class's one-dimensional `mem` property, not the
 /// module's two-dimensional `mem`. An element that is a packed struct is a
 /// vector word (§21.4.1), loaded and written like any other; an unpacked
-/// struct is not. Negative addresses of a multidimensional array are written
-/// as 64-bit two's complement and read back.
+/// struct is not. A range of a multidimensional array between negative
+/// addresses is written data only (§21.5.3) and read back to the same
+/// addresses.
 #[test]
 fn readmem_multidim_name_kind_packed_struct_and_negative_addresses() {
     let dir = scratch("kinds");
@@ -311,7 +312,7 @@ module t;
     ng = '{'{8'h01, 8'h02}, '{8'h03, 8'h04}};
     foreach (nb[i, j]) nb[i][j] = 8'h00;
     $writememh("@NW@", ng, -1, 0);
-    $readmemh("@NW@", nb);
+    $readmemh("@NW@", nb, -1, 0);
     $display("T|negative %h %h %h %h", nb[-2][0], nb[-2][1], nb[-1][0], nb[-1][1]);
   end
 endmodule

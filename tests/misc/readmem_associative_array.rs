@@ -180,8 +180,8 @@ endmodule
 /// 64-bit two's complement and read back as negative (an `int`-width
 /// `@ffffffff` reads as -1 too), and a `bit [63:0]` key above `i64::MAX`
 /// keeps its value in the file, in a start address and in the default
-/// finish address. Negative indices of an unpacked memory round-trip the
-/// same way.
+/// finish address. A range of an unpacked memory between negative indices
+/// is written data only (§21.5.3) and reads back to the same indices.
 #[test]
 fn readmem_writemem_keys_beyond_i64_range() {
     let dir = scratch("wide");
@@ -220,7 +220,7 @@ module t;
              us[64'hffff_ffff_ffff_fffe], us[64'hffff_ffff_ffff_ffff]);
     pm = '{8'h01, 8'h02, 8'h03, 8'h04};
     $writememh("@PW@", pm, -1, 1);
-    $readmemh("@PW@", pr);
+    $readmemh("@PW@", pr, -1, 1);
     $display("T|unpacked [-2]=%h [-1]=%h [0]=%h [1]=%h", pr[-2], pr[-1], pr[0], pr[1]);
   end
 endmodule
