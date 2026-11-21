@@ -647,6 +647,13 @@ impl Simulator {
         }
     }
 
+    /// The elaborator has already scaled each delay expression to global ticks.
+    pub(super) fn eval_driver_delays(&mut self, exprs: &[Option<Expression>; 3]) -> [Option<u64>; 3] {
+        exprs.each_ref().map(|expr| {
+            expr.as_ref().map(|e| apply_delay_mode(self.eval_delay_ticks(e)))
+        })
+    }
+
     /// AST comb-entry eval (`CombItem::ContAssign` / `AlwaysBlock`). These need
     /// the full `&mut self` interpreter (`eval_expr_ctx` / `exec_statement`), so
     /// they can't go through `eval_comb_entry_isolated`. Factored out of the
@@ -730,11 +737,7 @@ impl Simulator {
                     Some(v) => v.resize(w),
                     None => self.eval_expr_ctx(rhs, w).resize(w),
                 };
-                let runtime = delay_exprs.as_deref().map(|exprs| {
-                    exprs.each_ref().map(|expr| {
-                        expr.as_ref().map(|e| apply_delay_mode(self.eval_delay_ticks(e)))
-                    })
-                });
+                let runtime = delay_exprs.as_deref().map(|exprs| self.eval_driver_delays(exprs));
                 self.timescale_scope_override = saved_ts;
                 let delay = if let Some([Some(rise), _, _]) = runtime {
                     rise
