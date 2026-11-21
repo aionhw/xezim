@@ -270,3 +270,28 @@ endmodule
         ],
     );
 }
+
+/// §8.3, §23.9: inside a method its property's declaration precedes the
+/// enclosing module parameter of the same name.
+#[test]
+fn class_property_shadows_module_parameter() {
+    check_types(
+        r#"
+module top;
+  parameter real RATE = 2.5;
+  class sensor;
+    shortint RATE;
+    function void show();
+      $display("T|property %s", $typename(RATE));
+    endfunction
+  endclass
+  initial begin
+    sensor s = new;
+    s.show();
+    $display("T|parameter %s", $typename(RATE));
+  end
+endmodule
+"#,
+        &["T|parameter real", "T|property shortint"],
+    );
+}

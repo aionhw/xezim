@@ -598,10 +598,18 @@ impl Simulator {
         };
         let first = path.split('.').next()?;
         let base = self.method_local_base.last().copied().unwrap_or(0);
-        if self.local_stack[base..]
+        if self
+            .local_stack
+            .get(base..)
+            .unwrap_or_default()
             .iter()
             .rev()
             .any(|frame| frame.contains_key(first) || frame.contains_key(path))
+            || self
+                .class_context_stack
+                .last()
+                .and_then(Option::as_deref)
+                .is_some_and(|class| self.class_property_decl_type(class, first).is_some())
             || self.query_root_decl_type(first).is_some() && !has_type(first)
         {
             return None;
