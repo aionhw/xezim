@@ -7296,7 +7296,15 @@ impl Simulator {
         let remaining: u32 = dims[packed.len()..].iter().map(|(a,b)| a.abs_diff(*b) as u32 + 1).product();
         let dims = dims.clone();
         let store = store.to_owned();
+        let has_bound = self.module.dynamic_arrays.contains(&store)
+            && Self::select_mentions_dollar(row);
+        if has_bound {
+            self.dollar_bound.push(self.get_queue_size(&store) as i64 - 1);
+        }
         let key = self.eval_expr(row);
+        if has_bound {
+            self.dollar_bound.pop();
+        }
         let elem = self.coll_elem_read(&store, &store, key, width);
         let indices: Vec<_> = packed.iter().map(|sel| self.eval_expr(sel)).collect();
         Some(match Self::packed_chain_slice(u64::from(width), &dims, &indices) {

@@ -209,7 +209,7 @@ class reader;
   function result_t sig(); return result_t'(b.lanes[1]); endfunction
   function result_t field(); return result_t'(b.p.lanes[1]); endfunction
   function result_t fixed_row(input lane_t [0:1] a [1]); return result_t'(a[0][1]); endfunction
-  function result_t queue_row(input lane_t [0:1] a [$]); return result_t'(a[0][1]); endfunction
+  function result_t queue_row(input lane_t [0:1] a [$]); return result_t'(a[$][1]); endfunction
   function result_t dynamic_row(input lane_t [0:1] a []); return result_t'(a[0][1]); endfunction
   function result_t assoc_row(input lane_t [0:1] a [int]); return result_t'(a[0][1]); endfunction
 endclass
@@ -228,6 +228,7 @@ module top;
     b.p.lanes = b.lanes;
     b.rows[0] = b.lanes;
     fixed_rows[0] = b.lanes;
+    queue_rows.push_back(0);
     queue_rows.push_back(b.lanes);
     dynamic_rows = new[1];
     dynamic_rows[0] = b.lanes;
