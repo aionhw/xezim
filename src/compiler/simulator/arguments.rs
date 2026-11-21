@@ -1048,8 +1048,9 @@ impl Simulator {
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let mexpr = mk_member(base, &md.name.name);
-                match self.member_elem_indices(&md.dimensions) {
+                match self.member_elem_indices(&dims) {
                     Some(tups) => {
                         // Every element, last dimension varying fastest —
                         // `m[2][3]` addresses elements `m[i][j]`.
@@ -1137,8 +1138,9 @@ impl Simulator {
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 // Same keys as `unpacked_struct_leaves`.
-                let keys = match self.member_elem_indices(&md.dimensions) {
+                let keys = match self.member_elem_indices(&dims) {
                     Some(tups) => tups
                         .iter()
                         .map(|t| format!("{}{}", mkey, Self::index_suffix(t)))
@@ -1151,7 +1153,7 @@ impl Simulator {
                 // assignments). Scalar members only; the default is an
                 // assignment to the member's type.
                 let member_default = match (&md.init, &nested) {
-                    (Some(init), None) if md.dimensions.is_empty() => {
+                    (Some(init), None) if dims.is_empty() => {
                         let raw = self.eval_expr_ctx(init, mw.max(1));
                         let two_state = super::elaborate::is_type_two_state_resolved(
                             &m.data_type,
@@ -1428,6 +1430,14 @@ impl Simulator {
             }
         }
         Some(lv)
+    }
+
+    pub(super) fn member_dims<'a>(
+        &self,
+        dt: &DataType,
+        declared: &'a [crate::ast::types::UnpackedDimension],
+    ) -> std::borrow::Cow<'a, [crate::ast::types::UnpackedDimension]> {
+        super::elaborate::struct_member_dims(dt, declared, &self.module.typedef_unpacked_dims)
     }
 
     /// The resolved struct type when `dt` is an UNPACKED struct whose members
@@ -1835,7 +1845,10 @@ impl Simulator {
             self.unpacked_struct_of(&m.data_type).is_some()
                 || m.declarators
                     .iter()
-                    .any(|md| self.member_dim_indices(&md.dimensions).is_some())
+                    .any(|md| {
+                        self.member_dim_indices(&self.member_dims(&m.data_type, &md.dimensions))
+                            .is_some()
+                    })
         });
         if nested_leaves {
             let mut leaves = Vec::new();

@@ -220,3 +220,27 @@ fn function_pattern_keeps_direct_array_member() {
         &["inside=7", "after=7"],
     );
 }
+
+#[test]
+fn declarator_indices_precede_scoped_typedef_indices() {
+    assert_output(
+        r#"
+package p;
+  typedef real row[7:6];
+  typedef row tile[3:2];
+endpackage
+module top;
+  typedef struct { p::tile a[4:5]; } S;
+  S result;
+  function automatic S f();
+    f.a[4][3][7] = 1.5;
+    f.a[5][2][6] = 2.5;
+  endfunction
+  initial begin
+    result = f();
+    $display("%g %g %g", result.a[4][3][7], result.a[5][2][6], result.a[5][3][7]);
+  end
+endmodule"#,
+        &["1.5 2.5 0"],
+    );
+}
