@@ -557,3 +557,5 @@ mod generate_if_package_param_member;
 mod bind_target_order_194;
 #[path = "hierarchy/deferred_callable_paths_193.rs"]
 mod deferred_callable_paths_193;
+#[path = "hierarchy/two_state_scalar_targets.rs"]
+mod two_state_scalar_targets;
