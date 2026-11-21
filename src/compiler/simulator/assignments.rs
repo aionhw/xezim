@@ -748,11 +748,12 @@ impl Simulator {
             return;
         };
         self.active_force_exprs.retain(|entry| entry.key != key);
+        // §10.6.2: the net's drivers from the writers index, as the release
+        // paths find them; a scan of every entry here ran on each force of
+        // part of the net.
         let mut ids: Vec<usize> = Vec::new();
-        for e in self.comb_entries.iter() {
-            if e.cold.write_signal_ids.contains(&id) {
-                ids.extend(e.cold.read_signal_ids.iter().copied());
-            }
+        for eidx in self.comb_writers_of(id) {
+            ids.extend(self.comb_entries[eidx].cold.read_signal_ids.iter().copied());
         }
         let mut reads: HashSet<String> = HashSet::default();
         if let Some(pf) = self.partial_forces.get(&id) {
