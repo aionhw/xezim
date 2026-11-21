@@ -4341,7 +4341,10 @@ impl Simulator {
     /// Scale a scope-unit value to the `$timeformat` unit and return the
     /// unpadded %t body and minimum field width (§20.4.3, §21.2.1).
     pub(super) fn format_time_parts(&self, value: &Value) -> (String, usize) {
-        let (scope_unit_exp, _) = self.current_timescale_exp();
+        self.format_time_parts_in_unit(value, self.current_timescale_exp().0)
+    }
+
+    pub(super) fn format_time_parts_in_unit(&self, value: &Value, scope_unit_exp: i32) -> (String, usize) {
         let (tf_units, tf_prec, tf_suffix, tf_width) = self
             .time_format
             .clone()
@@ -4354,9 +4357,8 @@ impl Simulator {
                 || value.get_bit(value.width.saturating_sub(1) as usize) == LogicBit::Zero)
             && (64..value.width as usize).all(|bit| value.get_bit(bit) == LogicBit::Zero)
             && let Some(integer) = value.to_u64()
-            && let Some(body) = Self::format_integral_time(integer, shift, tf_prec, &tf_suffix)
         {
-            return (body, tf_width);
+            return (Self::format_integral_time(integer, shift, tf_prec, &tf_suffix), tf_width);
         }
         let display = value.to_f64() * 10f64.powi(shift);
         let body = format!("{:.*}{}", tf_prec, display, tf_suffix);
@@ -4369,7 +4371,7 @@ impl Simulator {
         shift: i32,
         precision: usize,
         suffix: &str,
-    ) -> Option<String> {
+    ) -> String {
         let digits = precision.min((-shift).max(0) as usize);
         let exponent = shift + digits as i32;
         let value = u128::from(value);
@@ -4378,11 +4380,11 @@ impl Simulator {
         } else {
             let divisor = 10u128.pow(exponent.unsigned_abs());
             let twice_remainder = 2 * (value % divisor);
-            // Preserve the existing formatter's behavior at display ties.
-            if twice_remainder == divisor {
-                return None;
-            }
-            value / divisor + u128::from(twice_remainder > divisor)
+            let quotient = value / divisor;
+            // Round an exact half to the even adjacent display value, using
+            // its decimal quotient even when f64 cannot distinguish the two.
+            quotient + u128::from(twice_remainder > divisor
+                || (twice_remainder == divisor && quotient % 2 != 0))
         };
         let radix = 10u128.pow(digits as u32);
         let mut body = (scaled / radix).to_string();
@@ -4395,6 +4397,6 @@ impl Simulator {
             body.extend(std::iter::repeat_n('0', precision - digits));
         }
         body.push_str(suffix);
-        Some(body)
+        body
     }
 }

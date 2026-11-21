@@ -1245,8 +1245,8 @@ impl Simulator {
 
     /// `emit_severity_text` naming `scope` in the context line.
     pub(super) fn emit_severity_text_in(&mut self, severity: &str, body: &str, scope: &str) {
-        let time = Value::from_f64(self.time_in_current_unit());
-        let time_s = self.format_time_parts(&time).0;
+        let ticks = Value::from_u64(self.time, 64);
+        let time_s = self.format_time_parts_in_unit(&ticks, Self::secs_to_exp(self.tick_s)).0;
         let line = if body.is_empty() {
             format!("** {}", severity)
         } else {
