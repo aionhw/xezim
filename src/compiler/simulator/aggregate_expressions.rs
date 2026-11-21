@@ -5139,14 +5139,26 @@ impl Simulator {
                 Value::from_f64(f64::from_bits(v.to_u64().unwrap_or(0)))
             }
             "$itor" => {
-                // §20.4: convert a (signed) integer to real. `to_u64` read a
-                // negative arg as a huge unsigned value ($itor(-5) -> 4.29e9);
-                // `to_i64` honors the operand's signedness so -5 -> -5.0.
+                // Keep LLVM from speculating the rounding call for integral arguments.
+                #[cold]
+                #[inline(never)]
+                fn round_real_itor(v: &Value) -> f64 {
+                    // Integer zero converts back to positive real zero (§20.5).
+                    v.to_f64().round() + 0.0
+                }
+
                 let v = args
                     .first()
                     .map(|a| self.eval_expr(a))
                     .unwrap_or(Value::zero(32));
-                Value::from_f64(v.to_i64().unwrap_or(0) as f64)
+                // §20.5: convert the integer at its own width and signedness.
+                // Round a real argument as in an assignment to an integer (§6.12.1).
+                let real = if v.is_real {
+                    round_real_itor(&v)
+                } else {
+                    v.to_f64()
+                };
+                Value::from_f64(real)
             }
             // §11.4.13: a bound of a tolerance range `[A +/- B]`/`[A +%- B]`.
             n if n == xezim_core::ast::expr::TOLERANCE_BOUND_FN && args.len() == 3 => {
