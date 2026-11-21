@@ -599,6 +599,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     ("XEZIM_MAX_INST_DEPTH", "Elab: max instance recursion depth"),
     (
+        "XEZIM_MAX_PACKED_WIDTH",
+        "Maximum live packed declaration width in bits (default 16777216, maximum 134217728)",
+    ),
+    (
         "XEZIM_MBX_DBG",
         "Debug: trace mailbox get/put/peek operations",
     ),

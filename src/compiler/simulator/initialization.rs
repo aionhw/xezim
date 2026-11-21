@@ -1413,6 +1413,7 @@ impl Simulator {
                             origin: None,
                             lhs: mk_ident(&alias, span),
                             rhs,
+                            delay_exprs: None,
                             delay: 0,
                             rhs_parent_scoped: false,
                             delay_fall: None,
