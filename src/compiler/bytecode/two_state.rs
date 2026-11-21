@@ -3494,7 +3494,7 @@ pub fn lower_two_state(
             // Two-state registers hold no X/Z: nothing to drop.
             Insn::DropXz(_) => {}
             // A copy with the Resize arm's narrow rules folded in.
-            Insn::MoveResize(d, s, w) => {
+            Insn::MoveResize(d, s, w) | Insn::CastIntegral(d, s, w) => {
                 let cur = rw[*s as usize]?;
                 if *w == 0 || *w > 64 || cur > 64 {
                     gate!("wide move-resize");
