@@ -242,3 +242,31 @@ endmodule
         ],
     );
 }
+
+/// §6.20.2, §23.10, §27.5: names used to size a parameter are resolved
+/// where it is declared. A generated localparam keeps its own atom type.
+#[test]
+fn instance_bound_ranges_and_generated_parameters() {
+    check_types(
+        r#"
+module leaf #(parameter int W = 3, parameter bit [W:1] P = 0)();
+  if (1) begin : g
+    localparam shortint Q = 3;
+    initial $display("T|%m %s %s", $typename(P), $typename(Q));
+  end
+endmodule
+module top;
+  leaf #(4) a(); leaf #(7) b();
+  if (1) begin : g
+    localparam byte Q = 4;
+    initial $display("T|%m %s", $typename(Q));
+  end
+endmodule
+"#,
+        &[
+            "T|top.a.g bit[4:1] shortint",
+            "T|top.b.g bit[7:1] shortint",
+            "T|top.g byte",
+        ],
+    );
+}

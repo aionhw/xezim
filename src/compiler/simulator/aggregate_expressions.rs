@@ -5159,6 +5159,11 @@ impl Simulator {
                             }
                         }
                     }
+                    // §6.20.2: a typed parameter can be real, shortreal or
+                    // integral independently of its initializer's type.
+                    if let Some(t) = self.typename_parameter_text(arg) {
+                        return Value::from_string(&t);
+                    }
                     // §20.6.1: an expression of type real — a real or time
                     // literal (§5.8: `1ns` is realtime), real arithmetic, a
                     // real-valued system or user function call.
