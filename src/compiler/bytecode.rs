@@ -3634,6 +3634,19 @@ impl<'a> BytecodeCompiler<'a> {
         Some(dest)
     }
 
+    /// The unpacked bank owns the packed dimensions of each materialized
+    /// memory cell. A bracket in an indexed instance prefix is not a cell.
+    fn packed_shape_at<'t, T>(&self, table: &'t HashMap<String, T>, name: &str) -> Option<&'t T> {
+        table.get(name).or_else(|| {
+            let (base, idx) = name.strip_suffix(']')?.rsplit_once('[')?;
+            let shape = table.get(base)?;
+            let idx = idx.parse::<i64>().ok()?;
+            let &(lo, hi, _) = self.arrays.get(base)?;
+            ((lo.min(hi)..=lo.max(hi)).contains(&idx) && self.signal_name_to_id.contains_key(name))
+                .then_some(shape)
+        })
+    }
+
     /// Declared packed dimensions of `hier`: exact name, then the name under
     /// the current instance scope, then — for a SINGLE-segment name only —
     /// the bare leaf. A multi-segment name (a struct member, a hierarchical
@@ -3648,7 +3661,7 @@ impl<'a> BytecodeCompiler<'a> {
             .and_then(|top| raw.strip_prefix(top.as_str()).and_then(|s| s.strip_prefix('.')));
         let rooted = hier.root.is_some() || top_rest.is_some();
         let raw = top_rest.unwrap_or(raw.as_ref());
-        m.get(raw)
+        self.packed_shape_at(m, raw)
             .or_else(|| {
                 if rooted { return None; }
                 self.scope_hint
@@ -10550,13 +10563,6 @@ impl<'a> BytecodeCompiler<'a> {
             .scope_hint
             .as_ref()
             .map(|scope| format!("{}.{}", scope, raw));
-        fn lookup<'m, V>(
-            m: &'m HashMap<String, V>,
-            scoped: Option<&str>,
-            raw: &str,
-        ) -> Option<&'m V> {
-            scoped.and_then(|q| m.get(q)).or_else(|| m.get(raw))
-        }
         let (scoped, raw) = (scoped.as_deref(), raw.as_str());
         let declared = self
             .var_decl_types
@@ -10564,12 +10570,16 @@ impl<'a> BytecodeCompiler<'a> {
         let (Some(mut dt), Some(types)) = (declared, self.typedef_types) else {
             // No declaration on record (a net, say): the packed shape tables
             // decide, and a name in neither is a plain vector.
-            if let Some(&ew) = self.packed_elem_widths.and_then(|m| lookup(m, scoped, raw)) {
+            if let Some(&ew) = self.packed_elem_widths.and_then(|m| {
+                scoped.and_then(|q| self.packed_shape_at(m, q)).or_else(|| self.packed_shape_at(m, raw))
+            }) {
                 return (ew > 0).then_some(ew);
             }
             if self
                 .packed_full_dims
-                .and_then(|m| lookup(m, scoped, raw))
+                .and_then(|m| {
+                    scoped.and_then(|q| self.packed_shape_at(m, q)).or_else(|| self.packed_shape_at(m, raw))
+                })
                 .is_some_and(|dims| dims.len() > 1)
             {
                 return None;
@@ -13739,7 +13749,7 @@ impl<'a> BytecodeCompiler<'a> {
         let raw = Self::hier_raw_name(hier);
         self.packed_elem_widths
             .and_then(|m| {
-                m.get(raw.as_str()).copied().or_else(|| {
+                self.packed_shape_at(m, &raw).copied().or_else(|| {
                     hier.path
                         .last()
                         .and_then(|s| m.get(s.name.name.as_str()).copied())
@@ -13756,7 +13766,7 @@ impl<'a> BytecodeCompiler<'a> {
         let raw = top_rest.unwrap_or(raw.as_ref());
         self.packed_elem_widths
             .and_then(|m| {
-                m.get(raw)
+                self.packed_shape_at(m, raw)
                     .copied()
                     // Inside an inlined instance the name is spelled bare
                     // while the table holds it under the instance path.
@@ -22860,11 +22870,9 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     // Packed multi-D vector: element is N bits, not 1.
                     if let Some(elem_w) = self.packed_elem_widths.and_then(|m| {
-                        m.get(raw.as_str()).copied().or_else(|| {
-                            hier.path
-                                .last()
-                                .and_then(|s| m.get(s.name.name.as_str()).copied())
-                        })
+                        self.packed_shape_at(m, &raw)
+                            .copied()
+                            .or_else(|| hier.path.last().and_then(|s| m.get(s.name.name.as_str()).copied()))
                     }) {
                         if elem_w > 1 {
                             return elem_w;
