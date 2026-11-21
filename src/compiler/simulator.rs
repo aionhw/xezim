@@ -409,7 +409,8 @@ fn method_boost_enabled() -> bool {
 // its dimension.
 // Packed word selects inherit the declared dimensions of their bank.
 // §7.4.5: member collection reads that yield unpacked rows use their row storage.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3178;
+// §6.24.1: an integer atom cast of an integral operand copies the operand before it is fitted.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3179;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1885,7 +1886,9 @@ struct CombEntryCold {
 // packed index, and alias nets for event controls on packed-struct members.
 // Packed word selects inherit the declared dimensions of their bank.
 // §9.4.2: a selected member can require a value waiter instead of a comb block.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB078";
+// §6.24.1, §9.4.2: integer atom casts keep their operand, and a packed-struct member event
+// tries every scope spelling for its alias net.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB079";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
