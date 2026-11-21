@@ -90,3 +90,30 @@ fn slices_in_processes_match_the_reference() {
     ];
     assert_eq!(out, want);
 }
+
+/// IEEE 1800-2023 §7.6, §13.4: a call returns a whole unpacked value.
+#[test]
+fn function_return_to_unpacked_slice_and_row() {
+    let got = lines(r#"module tb;
+        typedef int pair_t[4:3];
+        int dst[4], m[2][3:2], calls;
+        function automatic pair_t f(int base);
+            calls++;
+            return '{base, base + 1};
+        endfunction
+        initial begin
+            dst[1:2] = f(7);
+            m[1] = f(3);
+            $display("T|blocking %p %0d %0d calls=%0d", dst, m[1][3], m[1][2], calls);
+            dst[0+:2] <= f(9);
+            m[0] <= f(12);
+            $display("T|before %0d %0d calls=%0d", dst[0], m[0][3], calls);
+            #1 $display("T|after %p %0d %0d calls=%0d", dst, m[0][3], m[0][2], calls);
+        end
+    endmodule"#);
+    assert_eq!(got, [
+        "T|blocking '{0, 7, 8, 0} 3 4 calls=2",
+        "T|before 0 0 calls=4",
+        "T|after '{9, 10, 8, 0} 12 13 calls=4",
+    ]);
+}
