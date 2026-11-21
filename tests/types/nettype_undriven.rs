@@ -469,3 +469,22 @@ endmodule
 "#;
     check_output(source, &["before=x", "after=7"]);
 }
+
+/// §5.6.1, §6.7.3: brackets inside an escaped scalar name belong to its name.
+#[test]
+fn undriven_escaped_scalar() {
+    let source = r#"
+function automatic real fold(input real d[]);
+  return 10.0 + d.size();
+endfunction
+nettype real N with fold;
+module top;
+  N \escaped[0] ;
+  initial begin
+    #1 $display("escaped=%g", \escaped[0] );
+    $finish;
+  end
+endmodule
+"#;
+    check_output(source, &["escaped=10"]);
+}
