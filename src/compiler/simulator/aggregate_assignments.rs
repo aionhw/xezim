@@ -1329,6 +1329,29 @@ impl Simulator {
                         continue;
                     }
                 }
+                // §6.6.7, §7.2.2, §10.9.2: an explicit struct-valued item
+                // (including a resolver driver's nested member) supplies its
+                // own leaves. Only a scalar default broadcasts to every leaf.
+                if explicit
+                    && let ExprKind::Ident(h) = &e.kind
+                    && h.path.iter().all(|seg| seg.selects.is_empty())
+                    && let Some(inner) = self.unpacked_struct_of(&mdt)
+                    && let Some(src) = self.flat_member_name(e)
+                    && self.struct_storage_exists(&src, &inner)
+                {
+                    let leaves: Vec<_> = self.struct_leaf_suffixes(&inner)
+                        .into_iter()
+                        .map(|suffix| {
+                            let path = format!(".{suffix}");
+                            let source = Self::append_leaf_path(e, &path);
+                            (format!("{target}{path}"), self.eval_expr(&source))
+                        })
+                        .collect();
+                    for (key, value) in leaves {
+                        self.write_pattern_leaf(&key, value);
+                    }
+                    continue;
+                }
                 self.assign_pattern_or_leaf(&target, &mdt, e);
                 continue;
             }

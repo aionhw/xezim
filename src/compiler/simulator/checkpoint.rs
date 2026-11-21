@@ -46,7 +46,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // and value expressions of an event term are shared.
 // §9.2.2.2: Simulator::comb_time0_held, CombEntryCold::time0_effects.
 // §16.4.2: DeferredReport::stat_key, ::stat_kind and ::stat_loc, counted when the report matures.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x14";
+// §19.5: covergroup instances retain the real-valued coverpoint set.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x19";
 
 #[derive(Default)]
 struct Session {

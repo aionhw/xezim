@@ -16,6 +16,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 - **Correctness:** Read unpacked queue rows from their element storage in class methods (§7.4.5, #1468).
 - **Correctness:** Evaluate each operand once when assigning an unpacked concatenation to a queue (§10.10, #1470).
 - **Correctness:** Select queue rows through their class handle when a module declares an array with the same property name (§8.4, #1469).
+- **Correctness:** Match explicit real coverpoint bins by numeric value and omit automatic bins for real points (§19.5, #1465).
+
+- **Correctness:** Wake event-controlled blocks when a member of a selected class handle or packed struct changes (§9.4.2, #1472).
+
+- **Correctness:** Assign function-returned arrays to unpacked slices and rows in declaration order (#1471).
+- **Correctness:** Preserve nested unpacked structure members and fixed-array elements in user-defined nettype driver patterns (§6.6.7, #1464).
 
 - **Correctness:** Check type names in selected generate branches, retain instance-specific sensitivity widths, and preserve cross-top waveform selections (#1374, #1375, #1378).
 - **Correctness:** Read four-state digits in integer scan conversions, store unpacked concatenations in fixed queue rows, and resolve rooted queue-element members (#1377, #1379, #1380).

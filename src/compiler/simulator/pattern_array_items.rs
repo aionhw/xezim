@@ -115,7 +115,7 @@ impl Simulator {
     /// first and rows before columns: a whole array or a row of one, a queue
     /// or dynamic array, or a call returning an unpacked array (which runs
     /// once). None for anything else.
-    fn unpacked_item_values(&mut self, e: &Expression) -> Option<Vec<Value>> {
+    pub(super) fn unpacked_item_values(&mut self, e: &Expression) -> Option<Vec<Value>> {
         if matches!(e.kind, ExprKind::Call { .. }) {
             // `Some(None)`: the call ran and returned no collection.
             let Some(src) = self.ret_collection_operand(e)? else {
@@ -124,9 +124,10 @@ impl Simulator {
             if self.is_associative_array(&src) {
                 return Some(Vec::new());
             }
-            return (0..self.get_queue_size(&src))
+            let values: Option<Vec<_>> = (0..self.get_queue_size(&src))
                 .map(|j| self.get_signal_value_by_name(&format!("{src}[{j}]")))
                 .collect();
+            return Some(values.unwrap_or_default());
         }
         if let Some(suffixes) = self.unpacked_row_suffixes(e) {
             return Some(
