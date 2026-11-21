@@ -194,6 +194,7 @@ fn design_cache_key(
     hash.text("qualified-package-array-storage-and-pr-validation-v3");
     hash.text(env!("CARGO_PKG_VERSION"));
     hash.text(&config.semantic_salt);
+    hash.bytes(&xezim_core::elaborate::max_packed_width().to_le_bytes());
     hash.text(top_module_name.unwrap_or(""));
     // An elaboration with unobserved-port elision on leaves nets out, so it
     // must not serve a run that may observe them.
