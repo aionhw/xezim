@@ -463,6 +463,26 @@ impl Simulator {
             self.set_queue_size(name, n);
             return;
         }
+        // §7.5.1, §10.10: `new[n]({src[1], 5})` initializes from the elements
+        // of an unpacked concatenation, read before the target is resized
+        // (`d = new[3]({d, 8})`). Read as one packed value, it was broadcast.
+        let concat_vals = match src_expr.map(|e| &e.kind) {
+            Some(ExprKind::Concatenation(parts))
+                if !self.module.arrays_2d.contains_key(name)
+                    && !self.module.arrays_nd.contains_key(name) =>
+            {
+                let mut items = Vec::with_capacity(parts.len());
+                let mut stack: Vec<&Expression> = parts.iter().rev().collect();
+                while let Some(e) = stack.pop() {
+                    match &e.kind {
+                        ExprKind::Concatenation(inner) => stack.extend(inner.iter().rev()),
+                        _ => items.push(e),
+                    }
+                }
+                Some(self.unpacked_concat_operand_values(items, true, None))
+            }
+            _ => None,
+        };
         let keep = match &src {
             Some(sn) => self.get_queue_size(sn).min(n),
             None => 0,
@@ -577,7 +597,12 @@ impl Simulator {
         // assignment pattern (array literal), not just a
         // named source array. Populate elements from it,
         // mirroring a plain `arr = '{...}` pattern assign.
-        if let Some(se) = src_expr
+        if let Some(vals) = concat_vals {
+            for (i, v) in vals.into_iter().take(n as usize).enumerate() {
+                let v = self.fit_queue_push_elem(name, v);
+                self.set_signal_value_by_name(&format!("{}[{}]", name, i), v);
+            }
+        } else if let Some(se) = src_expr
             && src.is_none()
         {
             match &self.unpacked_pattern(se).kind {
