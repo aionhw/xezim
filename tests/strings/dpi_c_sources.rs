@@ -209,6 +209,29 @@ endmodule
     let _ = std::fs::remove_dir_all(&d);
 }
 
+#[test]
+fn precompiled_cxx_object_links_its_runtime() {
+    let dir = scratch("cxx_object");
+    write(&dir, "model.cpp", r#"
+#include <string>
+extern "C" int c_add(int a, int b) {
+    return std::stoi(std::to_string(a + b));
+}
+"#);
+    let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".into());
+    assert!(Command::new(cxx)
+        .current_dir(&dir)
+        .args(["-std=c++11", "-fPIC", "-c", "model.cpp", "-o", "model.o"])
+        .status()
+        .unwrap()
+        .success());
+    write(&dir, "t.sv", ADD_SV);
+    let (out, text) = run(&dir, &["--error-exit", "model.o", "t.sv"]);
+    assert!(out.status.success(), "{text}");
+    assert!(text.lines().any(|line| line == "sum=5"), "{text}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A library named in `-LDFLAGS` is not in the cache key, so the library is
 /// linked again on every run: an edit to that archive reaches the next run,
 /// in a library of its own. The C source's object is compiled once.

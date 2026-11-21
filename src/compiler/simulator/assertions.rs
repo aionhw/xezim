@@ -39,7 +39,11 @@ impl Simulator {
     /// in memory, which cost 0.6% more instructions on a design with 288
     /// named properties.
     pub(super) fn fold_named_sva_members(module: &mut ElaboratedModule) {
-        if !module.property_decls.values().any(Self::has_member_access) {
+        if !module
+            .property_decls
+            .values()
+            .any(|body| Self::has_member_access(body))
+        {
             return;
         }
         // §3.12.1: keep `$unit::x` where the scope shadows `x`, as the
@@ -58,7 +62,8 @@ impl Simulator {
                     &HashMap::default(),
                     &unit,
                     &HashMap::default(),
-                );
+                )
+                .into();
             }
         }
     }
@@ -286,7 +291,7 @@ impl Simulator {
     pub(super) fn sva_body_with_defaults(&self, key: &str) -> Option<Expression> {
         let body = self.module.property_decls.get(key)?;
         if !self.module.property_param_defaults.contains_key(key) {
-            return Some(body.clone());
+            return Some(body.as_ref().clone());
         }
         let map = self.sva_bind_actuals(key, &[]);
         Some(super::elaborate::rewrite_expr(

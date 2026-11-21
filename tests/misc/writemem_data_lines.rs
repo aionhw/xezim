@@ -278,3 +278,27 @@ endmodule
     assert_eq!(text, ["52\n53\n54\n55\n"]);
     assert_eq!(got, ["T|52 53 54 55"]);
 }
+
+/// Out-of-range endpoints clip to the declared storage in either direction.
+#[test]
+fn writemem_clips_ranges_in_both_directions() {
+    let dir = scratch("clipped");
+    let up = dir.join("up.hex");
+    let down = dir.join("down.hex");
+    let sv = r#"
+module t;
+  logic [7:0] mem [4:6];
+  initial begin
+    mem = '{8'ha4, 8'hb5, 8'hc6};
+    $writememh("@UP@", mem, -10000, 5);
+    $writememh("@DOWN@", mem, 10000, 5);
+  end
+endmodule
+"#
+    .replace("@UP@", up.to_str().unwrap())
+    .replace("@DOWN@", down.to_str().unwrap());
+    t_lines(&sv);
+    assert_eq!(std::fs::read_to_string(&up).unwrap(), "a4\nb5\n");
+    assert_eq!(std::fs::read_to_string(&down).unwrap(), "c6\nb5\n");
+    std::fs::remove_dir_all(dir).unwrap();
+}

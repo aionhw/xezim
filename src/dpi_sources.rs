@@ -371,7 +371,18 @@ pub fn build_library(
         key.bytes(&bytes);
     }
     let any_cxx = inputs.sources.iter().any(|(_, k)| *k == ForeignKind::Cxx);
-    let mut link = if any_cxx { cxx.clone() } else { cc.clone() };
+    // An object or archive carries no source-language extension. Use the C++
+    // driver when available so precompiled C++ models can resolve their
+    // runtime symbols. A C-only installation can still link C objects.
+    let cxx_driver = std::env::var_os("CXX").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join(&cxx[0]).is_file())
+        });
+    let mut link = if any_cxx || (!inputs.objects.is_empty() && cxx_driver) {
+        cxx.clone()
+    } else {
+        cc.clone()
+    };
     link.extend(["-shared", "-fPIC"].map(OsString::from));
     // Exported SV subroutines and the svdpi/VPI calls resolve when the
     // library is loaded into xezim, not when it is linked.

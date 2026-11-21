@@ -649,7 +649,9 @@ impl Simulator {
             for (i, v) in vals.iter().enumerate() {
                 let name = format!("{RET_SNAP}[{i}]");
                 self.set_signal_value_by_name(&name, v.clone());
-                self.widths.entry(name).or_insert(32);
+                if !self.widths.contains_key(&name) {
+                    self.widths.insert(name, 32);
+                }
             }
             self.set_queue_size(RET_SNAP, vals.len() as u64);
         }

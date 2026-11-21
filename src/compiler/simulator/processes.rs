@@ -3025,6 +3025,175 @@ impl Simulator {
         false
     }
 
+    /// §23.6 / §7.4: resolve literal instance selectors and fixed memory
+    /// banks once, before checking a process loop for combinational feedback.
+    /// A packed word selector remains an ordinary select on its stored signal.
+    fn loop_memory_path(
+        &self,
+        e: &Expression,
+        locals: &[&str],
+        scope: Option<&str>,
+    ) -> Option<Expression> {
+        let ExprKind::Index { expr: base, .. } = &e.kind else {
+            return None;
+        };
+        let literal_index = |e: &Expression| {
+            let ExprKind::Number(n) = &e.kind else {
+                return None;
+            };
+            let v = self.eval_number(n);
+            if v.is_real {
+                return None;
+            }
+            v.to_index()
+        };
+        let (name, root) = match &base.kind {
+            ExprKind::MemberAccess { .. } => {
+                let mut path = Vec::new();
+                if !Self::fold_hier_path_segments(base, &mut path)
+                    || !path.iter().any(|seg| !seg.selects.is_empty())
+                    || path.iter().flat_map(|seg| seg.selects.iter()).any(|i| {
+                        literal_index(i)
+                            .is_none_or(|v| Some(v) != Self::constant_array_index(i, &self.module))
+                    })
+                {
+                    return None;
+                }
+                let name = self.constant_selected_storage(base)?;
+                let (scope, _) = name.rsplit_once('.')?;
+                if !self.module.instances.iter().any(|i| i.path == scope) {
+                    return None;
+                }
+                (name, path.first()?.name.name.clone())
+            }
+            ExprKind::Index { expr, index } if matches!(index.kind, ExprKind::Number(_)) => {
+                let ExprKind::Ident(h) = &expr.kind else {
+                    return None;
+                };
+                if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    return None;
+                }
+                let root = &h.path[0].name.name;
+                let &(lo, hi, width) = self.module.arrays.get(root)?;
+                let idx = literal_index(index)?;
+                if !(lo.min(hi)..=lo.max(hi)).contains(&idx)
+                    || !self.module.packed_signal_elem_widths.contains_key(root)
+                {
+                    return None;
+                }
+                let name = format!("{root}[{idx}]");
+                let id = *self.signal_name_to_id.get(name.as_str())?;
+                if self.signal_widths.get(id) != Some(&width) {
+                    return None;
+                }
+                (name, root.clone())
+            }
+            _ => return None,
+        };
+        if locals.contains(&root.as_str())
+            || self.frame_get(&root).is_some()
+            || scope.is_some_and(|s| {
+                self.signal_name_to_id
+                    .contains_key(format!("{s}.{name}").as_str())
+            })
+        {
+            return None;
+        }
+        Some(Self::flat_name_ident(name, base.span))
+    }
+
+    fn loop_memory_stmt<'a>(
+        &self,
+        stmt: &'a Statement,
+        locals: &mut Vec<&'a str>,
+        scope: Option<&str>,
+    ) -> Option<Statement> {
+        use crate::ast::stmt::ForInit;
+        use crate::compiler::elaborate::{for_each_sub_expr, for_each_sub_expr_mut};
+        if !self.this_stack.is_empty() {
+            return None;
+        }
+        let mut out;
+        match &stmt.kind {
+            StatementKind::For { init, body, .. } => {
+                let len = locals.len();
+                for i in init {
+                    if let ForInit::VarDecl { name, .. } = i {
+                        locals.push(&name.name);
+                    }
+                }
+                let changed = self.loop_memory_stmt(body, locals, scope);
+                locals.truncate(len);
+                let child = changed?;
+                out = stmt.clone();
+                if let StatementKind::For { body, .. } = &mut out.kind {
+                    **body = child;
+                }
+            }
+            StatementKind::SeqBlock { name, stmts } => {
+                // A block declaration may shadow an instance or memory bank.
+                if stmts.iter().any(|s| {
+                    matches!(
+                        s.kind,
+                        StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. }
+                    )
+                }) {
+                    return None;
+                }
+                let mut changed = None;
+                for (i, s) in stmts.iter().enumerate() {
+                    if let Some(child) = self.loop_memory_stmt(s, locals, scope) {
+                        changed.get_or_insert_with(|| stmts.clone())[i] = child;
+                    }
+                }
+                let stmts = changed?;
+                out = Statement::new(
+                    StatementKind::SeqBlock {
+                        name: name.clone(),
+                        stmts,
+                    },
+                    stmt.span,
+                );
+            }
+            StatementKind::BlockingAssign { lvalue, rvalue } => {
+                let rewrite = |e: &Expression| {
+                    let mut hit = false;
+                    for_each_sub_expr(e, &mut |sub| {
+                        if !hit && self.loop_memory_path(sub, locals, scope).is_some() {
+                            hit = true;
+                        }
+                    });
+                    if !hit {
+                        return None;
+                    }
+                    let mut result = e.clone();
+                    for_each_sub_expr_mut(&mut result, &mut |sub| {
+                        if let Some(folded) = self.loop_memory_path(sub, locals, scope)
+                            && let ExprKind::Index { expr, .. } = &mut sub.kind
+                        {
+                            **expr = folded;
+                        }
+                    });
+                    Some(result)
+                };
+                let l = rewrite(lvalue);
+                let r = rewrite(rvalue);
+                if l.is_none() && r.is_none() {
+                    return None;
+                }
+                out = Statement::new(
+                    StatementKind::BlockingAssign {
+                        lvalue: l.unwrap_or_else(|| lvalue.clone()),
+                        rvalue: r.unwrap_or_else(|| rvalue.clone()),
+                    },
+                    stmt.span,
+                );
+            }
+            _ => return None,
+        }
+        Some(out)
+    }
+
     /// Execute a process's continuation: the current frame from its cursor, then
     /// each chained frame behind it (see `ProcCont`).
     ///
@@ -3153,6 +3322,12 @@ impl Simulator {
             // The feedback walk is per-SPAN (cached below), not per
             // activation — collect_stmt_reads is too heavy to re-run on a
             // 10k-cycle stimulus loop.
+            let folded = self.loop_memory_stmt(
+                stmt,
+                &mut Vec::new(),
+                self.process_scope_hint.get(&pid).map(String::as_str),
+            );
+            let stmt = folded.as_ref().unwrap_or(stmt);
             let feedback = self.stmt_has_comb_feedback(stmt);
             let ok = !feedback && compiler.compile_stmt(stmt);
             if std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some() {
