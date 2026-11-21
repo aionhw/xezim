@@ -1470,6 +1470,18 @@ impl Simulator {
         else {
             return Value::zero(32);
         };
+        // A dynamic array or queue holds the elements its size counts, not
+        // the storage set aside for it (§7.5, §7.10).
+        let hi = if !assoc && self.module.dynamic_arrays.contains(&mem_name) {
+            let size = self.get_queue_size(&mem_name);
+            if size == 0 {
+                let _ = std::fs::write(&path, "");
+                return Value::zero(32);
+            }
+            lo + i128::from(size) - 1
+        } else {
+            hi
+        };
         let start = match args.get(2) {
             Some(a) => self
                 .memory_task_address(a)
