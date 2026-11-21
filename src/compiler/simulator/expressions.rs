@@ -2140,6 +2140,15 @@ impl Simulator {
             }
         }
         let ExprKind::Ident(h) = &root.kind else {
+            // Rebasing intentionally leaves an identity-bound interface
+            // unchanged. Its source node can still be a member access while
+            // its physical signal declaration uses the flat instance path.
+            if let ExprKind::MemberAccess { expr: receiver, member } = &root.kind
+                && let Some((bound, _)) = self.vif_recv_target(receiver)
+            {
+                let name = format!("{bound}.{}", member.name);
+                return self.declared_signed_select_depth(&name) == Some(selects);
+            }
             // §7.2, §7.4.1: a member written as a member access
             // (`sa[1].m[1]`, `f().m[1]`, `h.st.m[1]`).
             return matches!(&root.kind, ExprKind::MemberAccess { member, .. }
