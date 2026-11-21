@@ -4933,7 +4933,7 @@ impl Simulator {
 
     /// Schedule a delayed signal update with an explicit delay (inertial delay model).
     pub(super) fn schedule_delayed_with_delay(&mut self, id: usize, val: Value, delay: u64) {
-        self.schedule_delayed_transition(id, val, delay, None);
+        self.schedule_delayed_transition(id, val, delay, None, None);
     }
 
     /// §10.3.3 / §28.16: the delay of a change from `old` to `new` with the
@@ -4989,6 +4989,7 @@ impl Simulator {
         val: Value,
         delay: u64,
         delay_target: Option<DelayTarget>,
+        runtime: Option<(Option<u64>, Option<u64>)>,
     ) {
         // §30.4 path-delayed net: the module paths pick the delay.
         if let Some(k) = self.module_paths.as_ref().and_then(|mp| mp.table_of(id)) {
@@ -5002,7 +5003,7 @@ impl Simulator {
         // Scalar gate outputs are the case that matters; "to 0" is judged on
         // the whole value so a vector net keeps using the rise delay unless it
         // goes fully zero.
-        let delay = if self.gate_fall_delay_by_id.is_empty() && self.gate_off_delay_by_id.is_empty()
+        let delay = if runtime.is_none() && self.gate_fall_delay_by_id.is_empty() && self.gate_off_delay_by_id.is_empty()
         {
             delay
         } else {
@@ -5022,8 +5023,10 @@ impl Simulator {
             let old_value = selected
                 .as_ref()
                 .map_or(&self.signal_table[id], |(_, old)| old);
-            let fall = self.gate_fall_delay_by_id.get(&id).copied();
-            let off = self.gate_off_delay_by_id.get(&id).copied();
+            let (fall, off) = runtime.unwrap_or_else(|| (
+                self.gate_fall_delay_by_id.get(&id).copied(),
+                self.gate_off_delay_by_id.get(&id).copied(),
+            ));
             Self::transition_delay(new_value, old_value, delay, fall, off, vector_assign)
         };
         let target_time = self.time + delay;

@@ -1257,6 +1257,8 @@ enum CombItem {
         /// §10.3.3 / §28.16: the original target before driver widening,
         /// boxed like the ASTs so the entry stays cache compact.
         delay_target: Option<Box<DelayTarget>>,
+        // §10.3.3: expressions are evaluated when the right-hand side changes.
+        delay_exprs: Option<Box<[Option<Expression>; 3]>>,
     },
     /// Fast path: direct signal-to-signal copy (assign b = a) with pre-resolved IDs.
     DirectCopy {
@@ -1838,7 +1840,7 @@ struct CombEntryCold {
 // §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
 // process, not as a combinational entry.
 // §9.4.2: a selected member can require a value waiter instead of a comb block.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB063";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB071";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

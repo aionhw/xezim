@@ -1990,7 +1990,8 @@ fn set_net_delays(
         sim.comb_dep_edges.clear();
     } else {
         for e in explicit {
-            if let CombItem::ContAssign { delay, .. } = &mut sim.comb_entries[e].item {
+            if let CombItem::ContAssign { delay, delay_exprs, .. } = &mut sim.comb_entries[e].item {
+                *delay_exprs = None;
                 *delay = rise;
             }
         }

@@ -558,3 +558,6 @@ mod time0_effect_entries_1314;
 mod sva_default_actuals_1309;
 #[path = "scheduling/indexed_member_event.rs"]
 mod indexed_member_event;
+
+#[path = "scheduling/variable_assign_delay.rs"]
+mod variable_assign_delay;

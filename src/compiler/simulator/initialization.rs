@@ -1424,6 +1424,7 @@ impl Simulator {
                     let alias = format!("__xz_edgesel{}", new_signals.len());
                     new_signals.push(alias.clone());
                     new_assigns.push(super::elaborate::ContinuousAssignment {
+                        delay_exprs: None,
                         gate_delay_fall: None,
                         delay_select: None,
                         origin: None,
@@ -2430,6 +2431,7 @@ impl Simulator {
                 module
                     .continuous_assigns
                     .push(super::elaborate::ContinuousAssignment {
+                        delay_exprs: None,
                         gate_delay_fall: None,
                         delay_select: None,
                         origin: None,

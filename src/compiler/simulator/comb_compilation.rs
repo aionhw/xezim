@@ -1219,6 +1219,7 @@ impl Simulator {
                 || primitive_fall
                 || ca.delay_fall.is_some_and(|d| d > 0)
                 || ca.delay_off.is_some_and(|d| d > 0)
+                || ca.delay_exprs.is_some()
                 || (select_target && select_fall.is_some_and(|d| d > 0));
             // §10.3.3 versus §28.16: use the assignment's origin, not the
             // target's gate marker. Multi-driver lowering can give a gate
@@ -1242,7 +1243,7 @@ impl Simulator {
                     })
             } else if has_transition_delay
                 && select_target
-                && (select_fall.is_some_and(|f| f != explicit_delay)
+                && (ca.delay_exprs.is_some() || select_fall.is_some_and(|f| f != explicit_delay)
                     || ca.delay_off.is_some_and(|t| t != explicit_delay))
             {
                 // §10.3.3 / §28.16: a constant select keeps a select target
@@ -1272,7 +1273,7 @@ impl Simulator {
             // the one point where both the target and the new value are
             // known. Whole-net targets only, including widened overlapping
             // selects, like the gate form (§28.16).
-            if has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
+            if ca.delay_exprs.is_none() && has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
                 if let Some(f) = ca.delay_fall {
                     if f != explicit_delay {
                         self.gate_fall_delay_by_id.insert(wids[0], f);
@@ -1297,6 +1298,7 @@ impl Simulator {
                     rhs: Box::new(ca.rhs.clone()),
                     delay: explicit_delay,
                     delay_target: delay_target.map(Box::new),
+                    delay_exprs: ca.delay_exprs.take(),
                 }
             } else if let Some(op) = fused {
                 CombItem::FusedGate { op }
@@ -1395,6 +1397,7 @@ impl Simulator {
                             rhs: Box::new(ca.rhs),
                             delay: 0,
                             delay_target: None,
+                            delay_exprs: None,
                         }
                     }
                 }
@@ -1486,6 +1489,7 @@ impl Simulator {
                             rhs: Box::new(ca.rhs),
                             delay: 0,
                             delay_target: None,
+                            delay_exprs: None,
                         }
                     }
                 }
@@ -1495,6 +1499,7 @@ impl Simulator {
                     rhs: Box::new(ca.rhs),
                     delay: 0,
                     delay_target: None,
+                    delay_exprs: None,
                 }
             };
 

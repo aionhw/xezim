@@ -661,6 +661,7 @@ impl Simulator {
                 rhs,
                 delay: explicit_delay,
                 delay_target,
+                delay_exprs,
             } => {
                 if let Some(c) = entry.cold.cov {
                     self.cov_count(c);
@@ -729,8 +730,15 @@ impl Simulator {
                     Some(v) => v.resize(w),
                     None => self.eval_expr_ctx(rhs, w).resize(w),
                 };
+                let runtime = delay_exprs.as_deref().map(|exprs| {
+                    exprs.each_ref().map(|expr| {
+                        expr.as_ref().map(|e| apply_delay_mode(self.eval_delay_ticks(e)))
+                    })
+                });
                 self.timescale_scope_override = saved_ts;
-                let delay = if *explicit_delay > 0 {
+                let delay = if let Some([Some(rise), _, _]) = runtime {
+                    rise
+                } else if *explicit_delay > 0 {
                     *explicit_delay
                 } else {
                     lhs_id
@@ -761,7 +769,7 @@ impl Simulator {
                     }
                     self.packed_array_copy_values.insert(ids, val.clone());
                 }
-                if delay > 0
+                if runtime.is_some() || delay > 0
                     || delay_target.is_some_and(|t| t.select_delays.is_some())
                     || lhs_id.is_some_and(|id| {
                         self.gate_fall_delay_by_id.contains_key(&id)
@@ -771,7 +779,8 @@ impl Simulator {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {
                             if !self.delayed_update_pending_is(id, &val) {
-                                self.schedule_delayed_transition(id, val, delay, delay_target);
+                                self.schedule_delayed_transition(id, val, delay, delay_target,
+                                    runtime.map(|[_, fall, off]| (fall, off)));
                             }
                         } else {
                             self.cancel_delayed(id);
@@ -790,6 +799,7 @@ impl Simulator {
                                 select_delays: Some((fall, off)),
                                 ..
                             }) => {
+                                let (fall, off) = runtime.map_or((fall, off), |[_, f, o]| (f, o));
                                 let hi = (lo + sel_w - 1) as usize;
                                 let old = self.signal_table[base_id].range_select(hi, lo as usize);
                                 Self::transition_delay(
