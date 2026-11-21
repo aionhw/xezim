@@ -8,6 +8,60 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Round a real cast to or stored into a 64-bit integral type in compiled code: `longint'(r)`, `xlen_t'(r)`, `wire [63:0] w = r;`, `assign w = r;`, `always_comb l = r;`, a 64-bit packed structure member, `time` and `longint` variables, function formals, returns and local initializers, and a real input port actual read the real's IEEE 754 bits; other widths and the interpreter already rounded (§6.12.1, §6.24.1, §10.7, §23.3.3.2, #1319, reported by ds54e).
+
+- **Correctness:** Match a `case` statement whose case expression or item is real numerically: `case (r) 1:` matches `r = 1.0` and `case (i) 2.0:` matches `i = 2`, in interpreted and compiled code; they were compared bit for bit and never matched (§12.5, §11.8.2).
+
+- **Correctness:** Store a value written into a variable by name in the variable's type: a real pattern item for a 64-bit integral element (`time arr[2] = '{9200s, 1.5}`, `'{t: 9200s, l: 3000000000.0}`) is rounded instead of wrapped at 32 bits, and an integral value written into a real cell converts to real (§6.12.1, §10.9).
+
+- **Correctness:** Store an unbased unsized literal into a real, shortreal or realtime target at its one bit: `r <= '1`, `r <= #1 '1`, `assign r = '1`, `rq.push_back('1)`, `ra[k] = '1`, a compiled `r = '1` and a `'1` input port actual store 1.0; they stored 2**64-1, -1 or NaN (§5.7.1, §6.12.1).
+
+- **Correctness:** Read a signed member (`int`, `byte`, `shortint`, `longint`) of an unpacked structure declared in an `initial` or `always` block as signed, also after a real is rounded into it; `s.i = -1.5` read 4294967294 (§6.11.3, §7.2).
+
+- **Correctness:** Start each element of a module-scope fixed array of unpacked structures with the members' declared defaults (`struct { real a = 1.5; } arr[2]` reads 1.5); the elements read 0 (§7.2.2).
+
+- **Correctness:** Keep a `real` member of a module-scope unpacked untagged union as a real in interpreted code: `u.r = 1.5` reads 1.5 and the other members see its bits; it read back as a 64-bit integer (§7.3).
+
+- **Correctness:** Write a whole-array assignment to a fixed array member of an unpacked structure declared in an `initial` or `always` block to every element (`s.m = '{default: 2.5}`), and give a member declared with an array typedef (`typedef real A[2]; struct { A m; }`) its elements in procedural-block and subroutine locals; the elements kept their old values, read x or read 0 (§7.2, §7.4, §10.9.1).
+
+- **Correctness:** Read the right-hand side of an intra-assignment delay or event control (`dst = #4 src[1];`, `q <= #4 src[1];`, `r = @(go) src[1];`) that is a whole multidimensional array, a subarray or slice of one, an array of unpacked structures or a row of a class property or task local element by element when the statement runs, and store those elements when it matures; it stored zeros. The same copies without a timing control, a subarray selected by two or more indices (`e = s3[1][0];`), a row into a queue or dynamic array (`qq = src[1];`) and a nonblocking row copy into a one-dimensional array (`q <= src[1];`), copy the elements too; they stored zeros or nothing (§9.4.5, §7.6, §10.4.2, #1320, reported by ds54e).
+
+- **Correctness:** Store an assignment pattern item that is an array of unpacked structures (`ts = '{sa, sa};`) member by member, and an item that is a slice (`'{wc, big[1:2]}`, `'{big[2+:2], wc}`) as the slice's elements, with or without an intra-assignment delay; the structure array stored zeros and the slice repeated its first element (§10.9.1, §7.6).
+
+- **Correctness:** Store a pattern item that is a whole unpacked structure (`tb = '{s1, sb[0]};`) member by member, also when the pattern reads its own target (`sa = '{sa[1], sa[0]};`, a class property `ks = '{ks[1], ks[0]};`), has an intra-assignment delay or is nonblocking; each member received the whole structure, which stored zeros (§10.9.2, §7.2, §10.4.1).
+
+- **Correctness:** Return the structure assigned by name to a function's return variable (`f = t;` with `t` a whole unpacked structure local, formal, static local or design variable), as `return t;` does; the call returned zeros (§13.4.1, §7.2).
+
+- **Correctness:** Call a replicated item of a blocking assignment pattern (`fb = '{2{f()}};`) once and store its value in every copy; it was called once per element (§11.4.12.1, §10.9.1).
+
+- **Correctness:** Evaluate the right-hand side of a `fork ... join_none` child that is an intra-assignment delay (`fork x = #2 w; join_none`) when the child starts, after the parent blocks, like every other child; it was evaluated when the parent forked (§9.3.2, §9.4.5).
+
+- **Correctness:** Accept a `real` item of an unpacked array concatenation (`rd = {rw, 5.25};`, `rq = {rq, 2.5};`); a real operand is an error only in a packed concatenation (§10.10, §11.4.12).
+
+- **Correctness:** Assign a structure pattern to a fixed-array member of a class struct property element by element: a nested pattern, a type key of the element type and `default:` now reach every element, which kept its old value (§10.9.1, §10.9.2).
+
+- **Correctness:** Initialize a multidimensional fixed-size class property from an assignment pattern over every dimension (`int a2[2][2] = '{default: '{0: 1, default: 2}};`) instead of leaving zeros (§10.9.1, §8.7).
+
+- **Correctness:** Print a value parameter of a structure type with `%p` member by member (`localparam s_t P = '{3, 4};` prints `'{x:3, y:4}`) instead of as one number (§21.2.1.7, §6.20.2).
+
+- **Correctness:** Print the elements of a static string queue of a class with `%p` as quoted strings, not as numbers (§21.2.1.7, §8.9).
+
+- **Correctness:** Name the packed dimensions written on a typedef name in `$typename` (`lane_t [0:1] a` gives `reg signed[16:0][0:1]`) (§20.6.1, §7.4.1).
+
+- **Correctness:** Name the declared specialization of a class property in `$typename` (`drv_c #(W) p;` in a `holder_c #(16)` object gives `class drv_c #(16)`), not the holding object's class or the default specialization (§20.6.1, §8.25).
+
+- **Correctness:** Expand a macro chain inside a `` `" ... `" `` region to the end: with `` `define INST `TOP.u0 `` and `` `define STR(p) `"p`" ``, `` `STR(`INST.x) `` gave "`TOP.u0.x" instead of "top.u0.x", because the pass that expanded the first level wrote the delimiters as quotes and the next pass read the rest as a string literal. Escaped quotes, pastes and string literals inside the region and an `` `include `` name built this way are handled; a plain string literal still expands nothing (§22.5.1, #1338, reported by git-hevangel).
+
+- **Correctness:** Leave the white space after the formal list of a macro with arguments out of a string built by a `` `" ... `" `` region: `` `STR(`F(top)) `` with `` `define F(a) a.u0 `` is "top.u0", not " top.u0" (§22.5.1, #1338).
+
+- **Correctness:** Give each copy of a generate block and each module instance its own clocking block: a block of a generate loop samples its own copy's expression and the signals the copy declares, and `@(cb)` and `cb.v` in an instance name the instance's block, not a same-named block of the parent (which read x when it had no such clockvar); every copy registered one block under the bare name and the last copy answered all of them. Such a block is also reached from outside through the copy's index (`@(gen[2].cb)`, `gen[1].cb.a`, `u[0].cb.a`) (§14.3, §23.9, §27.4, §27.6).
+
+- **Correctness:** Size `[N]` in a scope that imports a package declaring a parameter N as a fixed dimension of size N, also when another package, which the scope does not import, declares a type named N; `logic [27:0] a [N]` was an associative array keyed by that type (`$high(a)` read 27) (§26.3, §7.4.2).
+
+- **Correctness:** Drive only the last value of two synchronous select drives of the same bits of a clocking output that mature in the same time step: `cb.e[0] <= 1; cb.e[0] <= 0;` no longer changes `e[0]` twice and wakes `@(e)` with the value unchanged (§14.16.2).
+
+- **Correctness:** Check `p.s` through an instance or a generate block that has a package's name as a hierarchical name: the design no longer fails with "'s' is not declared in package 'p'" (§23.6, §23.9, §26.3).
+
 - **Correctness:** Check type names in selected generate branches, retain instance-specific sensitivity widths, and preserve cross-top waveform selections (#1374, #1375, #1378).
 - **Correctness:** Read four-state digits in integer scan conversions, store unpacked concatenations in fixed queue rows, and resolve rooted queue-element members (#1377, #1379, #1380).
 - **Correctness:** Evaluate continuous-assignment time queries in their declaring instance, retain VPI deposits until a driver changes, and sample input-net defaults on clock edges (#1381, #1382, #1356).
