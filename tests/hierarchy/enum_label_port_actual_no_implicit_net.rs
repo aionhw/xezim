@@ -246,3 +246,34 @@ fn generate_block_label_keeps_the_module_implicit_net() {
 fn module_name_keeps_the_implicit_net() {
     run_link("module_name", "module LINK;\nendmodule", "");
 }
+
+/// §3.13, §6.10, §26.3: the bare port actual is a net even when a
+/// qualified actual in the same instance uses the identically named package.
+#[test]
+fn package_and_implicit_net_share_a_name_in_port_actuals() {
+    let sim = xezim::simulate(
+        r#"
+package LINK;
+  typedef enum bit {OFF = 0, ON = 1} state_t;
+endpackage
+module driver(output logic o);
+  initial begin o = 0; #2 o = 1; end
+endmodule
+module sink(input logic i, input logic tag);
+  initial begin
+    #1 $display("actuals=%b%b", i, tag);
+    #2 $display("actuals=%b%b", i, tag);
+  end
+endmodule
+module middle;
+  driver d(.o(LINK));
+  sink s(.i(LINK), .tag(LINK::ON));
+endmodule
+module top; middle u(); endmodule
+"#, 10_000,
+    ).expect("simulate actuals");
+    let observed: Vec<_> = sim.output.iter().map(|line| line.message.trim())
+        .filter(|line| line.starts_with("actuals=")).collect();
+    assert_eq!(sim.error_count, 0);
+    assert_eq!(observed, ["actuals=01", "actuals=11"]);
+}
