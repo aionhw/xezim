@@ -3066,8 +3066,14 @@ impl Simulator {
                 // Consecutive scalar elements share the same key prefix.
                 // Keep their Values in the existing dense run while preserving
                 // every indexed cell, its declared width and its typed default.
-                if elem_su.is_none() && lo < hi && (0..1_000_000_000).contains(&lo) {
+                let dense = elem_su.is_none() && lo < hi && (0..1_000_000_000).contains(&lo);
+                if dense {
                     self.signals.register_element_run(&scoped, false);
+                }
+                // Width ranges use the same canonical indices as dense values.
+                let shared_width = dense && hi < 1_000_000_000;
+                if shared_width {
+                    self.widths.declare_fixed(&scoped, lo as u64, hi as u64, width);
                 }
                 for i in lo..=hi {
                     let elem = format!("{}[{}]", scoped, i);
@@ -3083,8 +3089,10 @@ impl Simulator {
                             instance.properties.insert(k, v);
                         }
                     }
-                    self.signals.insert(elem.clone(), fill.clone());
-                    self.widths.insert(elem, width);
+                    if !shared_width {
+                        self.widths.insert(elem.clone(), width);
+                    }
+                    self.signals.insert(elem, fill.clone());
                 }
             }
             // Per-instance MULTI-dim fixed array members (`test_t foo[0:3][0:7]`):

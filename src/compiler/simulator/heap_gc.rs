@@ -522,8 +522,8 @@ impl Simulator {
         macro_rules! sets {
             ($($field:ident),* $(,)?) => { $(self.$field.retain(|name| !dead_name(name));)* };
         }
+        self.widths.remove_dead_owners(dead_name);
         maps!(
-            widths,
             var_class_types,
             var_typedef_types,
             var_container_types,

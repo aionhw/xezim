@@ -8,6 +8,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- Share declared element widths across fixed class arrays, retaining indexed writes and checkpoint restore (#1053). The public Rust field `Simulator::widths` now has type `SignalWidths`. It supports key lookups, indexing, inserts, removals and logical iteration; iterated names are `Cow<str>`. Code requiring a concrete `HashMap<String, u32>` or its entry API needs adaptation.
+
 - **Correctness:** Check type names in selected generate branches, retain instance-specific sensitivity widths, and preserve cross-top waveform selections (#1374, #1375, #1378).
 - **Correctness:** Read four-state digits in integer scan conversions, store unpacked concatenations in fixed queue rows, and resolve rooted queue-element members (#1377, #1379, #1380).
 - **Correctness:** Evaluate continuous-assignment time queries in their declaring instance, retain VPI deposits until a driver changes, and sample input-net defaults on clock edges (#1381, #1382, #1356).

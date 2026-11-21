@@ -367,7 +367,11 @@ impl Simulator {
         put(&mut self.var_class_types, name, &meta.class);
         put(&mut self.var_container_types, name, &meta.container);
         put(&mut self.var_type_args, name, &meta.type_args);
-        put(&mut self.widths, name, &meta.width);
+        if let Some(w) = meta.width {
+            self.widths.insert(name.to_owned(), w);
+        } else {
+            self.widths.remove(name);
+        }
         flag(&mut self.signed_signals, name, meta.signed);
         flag(&mut self.real_signals, name, meta.real);
         flag(&mut self.string_signals, name, meta.string);

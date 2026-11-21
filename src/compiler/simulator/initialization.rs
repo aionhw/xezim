@@ -1778,7 +1778,7 @@ impl Simulator {
         // c910-scale designs (585K signals × 2 stores × name + Value
         // duplication).
         let signals = SignalMap::new();
-        let widths: HashMap<String, u32> = HashMap::default();
+        let widths = SignalWidths::default();
         let signed_signals: HashSet<String> = HashSet::default();
         let real_signals: HashSet<String> = HashSet::default();
 
