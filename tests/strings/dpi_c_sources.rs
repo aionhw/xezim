@@ -194,7 +194,7 @@ extern "C" int c_add(int a, int b) {
     let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".into());
     assert!(Command::new(cxx)
         .current_dir(&dir)
-        .args(["-fPIC", "-c", "model.cpp", "-o", "model.o"])
+        .args(["-std=c++11", "-fPIC", "-c", "model.cpp", "-o", "model.o"])
         .status()
         .unwrap()
         .success());
