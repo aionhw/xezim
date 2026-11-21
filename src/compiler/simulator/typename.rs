@@ -311,17 +311,6 @@ impl Simulator {
                     DataType::Struct(_) | DataType::Enum(_) => {
                         self.tn_named_aggregate(&target, name)
                     }
-                    _ if !dimensions.is_empty()
-                        && matches!(self.resolve_dt_ref(&target), DataType::IntegerVector { .. }) => {
-                        let mut text = self.tn_base_text(&target, true)?;
-                        let mut outer = String::new();
-                        for dim in dimensions {
-                            let PackedDimension::Range { left, right, .. } = dim else { return None; };
-                            outer.push_str(&format!("[{}:{}]", self.tn_const(left)?, self.tn_const(right)?));
-                        }
-                        text.insert_str(text.find('[').unwrap_or(text.len()), &outer);
-                        Some(text)
-                    }
                     _ => self.tn_base_text(&target, logic_kw),
                 }?;
                 // §20.6.1: the packed dimensions written on the type name
