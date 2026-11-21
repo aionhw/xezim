@@ -4328,17 +4328,23 @@ impl Simulator {
         if let ExprKind::Concatenation(parts) = &rvalue.kind
             && let ExprKind::Ident(hier) = &lvalue.kind
             && hier.path.iter().all(|part| part.selects.is_empty())
-            && !self.ident_shadowed_by_non_collection(hier)
         {
-            let name = self.resolve_hier_name(hier);
-            let name = self.instance_assoc_member(&name).unwrap_or_else(|| name.into_owned());
-            let target = if self.module.arrays.contains_key(&name) {
-                Some(name)
-            } else {
+            // §10.10, §8.9: a name rooted at a class handle (`h.q`, `h.fu`)
+            // is shadowed for the module-scope lookup but is still an
+            // unpacked array of the object (`<handle>#q`), or a static
+            // collection of its class.
+            let name = (!self.ident_shadowed_by_non_collection(hier))
+                .then(|| {
+                    let name = self.resolve_hier_name(hier);
+                    self.instance_assoc_member(&name)
+                        .unwrap_or_else(|| name.into_owned())
+                })
+                .filter(|name| self.module.arrays.contains_key(name));
+            let target = name.or_else(|| {
                 self.expr_assoc_name(lvalue).filter(|n| {
                     self.class_queue_prop(n) || self.module.arrays.contains_key(n)
                 })
-            };
+            });
             if let Some(name) = target {
                 self.assign_unpacked_concat(&name, parts, check_remaining_rows, first_row);
                 self.settle_after_proc_write();
