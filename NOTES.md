@@ -66,6 +66,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
+- Compile process loops that write packed memory words through fixed banks or indexed instances, including reads through the same instance paths (#1456).
+
 - Inline literal default inputs on positional function calls and compile process locals overwritten by a function output before their first read (#1453).
 
 * Module bodies containing only declarations and continuous assignments reuse

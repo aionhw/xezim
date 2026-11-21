@@ -80,3 +80,5 @@ mod local_select_width_chain;
 
 #[path = "perf/fallback_hotspots.rs"]
 mod fallback_hotspots;
+#[path = "perf/process_memory_paths.rs"]
+mod process_memory_paths;
