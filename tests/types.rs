@@ -175,6 +175,8 @@ mod implicit_port_net_and_packed_typedef_array;
 mod inc_dec_result_signedness;
 #[path = "types/instance_queue_structs_and_loop_scope.rs"]
 mod instance_queue_structs_and_loop_scope;
+#[path = "types/itor_integral_width.rs"]
+mod itor_integral_width;
 #[path = "types/ivtest_cast_cluster.rs"]
 mod ivtest_cast_cluster;
 #[path = "types/local_localparam_width.rs"]
