@@ -380,6 +380,8 @@ mod covergroup_options;
 mod covergroup_placement;
 #[path = "classes/covergroup_queries.rs"]
 mod covergroup_queries;
+#[path = "classes/covergroup_real_cast.rs"]
+mod covergroup_real_cast;
 #[path = "classes/covergroup_sample_args.rs"]
 mod covergroup_sample_args;
 #[path = "classes/covergroup_sampling_event.rs"]
