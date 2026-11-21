@@ -2932,6 +2932,10 @@ impl Simulator {
                         let strings = self.class_string_coll_member_names(class);
                         let packed = self.class_coll_elem_packed_dims(class);
                         let mut colls = super::bytecode::ClassColls::default();
+                        colls.row_members = owners.iter()
+                            .filter(|(name, (_, cd))| cd.prop_coll_shapes.contains_key(name.as_str()))
+                            .map(|(name, _)| name.clone())
+                            .collect();
                         colls.members = self
                             .class_coll_member_names(class)
                             .into_iter()

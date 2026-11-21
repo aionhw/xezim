@@ -401,7 +401,8 @@ fn method_boost_enabled() -> bool {
 // §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §6.21, §13.5.3: output-before-read locals and literal default actuals compile.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3096;
+// §7.4.5: member collection reads that yield unpacked rows use their row storage.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3104;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
