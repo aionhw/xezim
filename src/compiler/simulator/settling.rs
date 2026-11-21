@@ -808,11 +808,7 @@ impl Simulator {
                 } else if let Some(id) = lhs_id {
                     let width = self.signal_widths[id];
                     let mut resized = if self.signal_real[id] {
-                        if val.is_real {
-                            val.clone()
-                        } else {
-                            Value::from_f64(val.to_f64())
-                        }
+                        self.fit_value_to_signal(id, &val)
                     } else if val.is_real {
                         Self::real_to_int(val.to_f64(), width)
                     } else {
