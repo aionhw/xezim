@@ -166,3 +166,68 @@ endmodule
         &["scaled 9223372035620195 922337203562019.5 922337203562019.5 922337203562019.5"],
     );
 }
+
+#[test]
+fn integral_display_rounds_large_decimal_ties_to_even() {
+    check(
+        r#"
+module top;
+  timeunit 1fs; timeprecision 1fs;
+  time t;
+  initial begin
+    $timeformat(-14, 0, "", 0);
+    t = 64'd90071992547409944;
+    repeat (3) begin $display("%0t", t); t++; end
+    t = 64'd90071992547409955;
+    $display("%0t", t);
+  end
+endmodule
+"#,
+        &["9007199254740994", "9007199254740994", "9007199254740995", "9007199254740996"],
+    );
+}
+
+#[test]
+fn severity_diagnostic_formats_the_scheduler_tick_exactly() {
+    check(
+        r#"
+module top;
+  timeunit 1ps; timeprecision 1fs;
+  initial begin
+    $timeformat(-15, 0, " fs", 0);
+    #500fs;
+    $info("half ps");
+    repeat (10) #(64'd900719925474);
+    #493fs;
+    $info("large");
+  end
+endmodule
+"#,
+        &[
+            "** Info: half ps", "   Time: 500 fs  Scope: top",
+            "** Info: large", "   Time: 9007199254740993 fs  Scope: top",
+        ],
+    );
+}
+
+#[test]
+fn scoped_stime_wraps_before_a_time_cast() {
+    check(
+        r#"
+package p;
+  timeunit 1fs; timeprecision 1fs;
+  function automatic time wide(); return time'($stime); endfunction
+  function automatic time full(); return $time; endfunction
+endpackage
+module top;
+  timeunit 1ps; timeprecision 1fs;
+  initial begin
+    #4294967ps;
+    #297fs;
+    $display("scoped %0d %0d local %0d", p::wide(), p::full(), $stime);
+  end
+endmodule
+"#,
+        &["scoped 1 4294967297 local 4294967"],
+    );
+}

@@ -147,3 +147,56 @@ endmodule
         ]
     );
 }
+
+#[test]
+fn packed_member_edge_preserves_declared_signal() {
+    let got = lines(r#"
+module top;
+  typedef struct packed { logic clock_bit; logic sibling; } bus_t;
+  bus_t bus;
+  logic [7:0] __xz_edgesel0 = 8'ha5;
+  int count = 0;
+  always @(posedge bus.clock_bit) count++;
+  initial begin
+    bus = '0;
+    #1 bus.sibling = 1;
+    #1 bus.clock_bit = 1;
+    #1 $display("count=%0d declared=%h", count, __xz_edgesel0);
+  end
+endmodule
+"#);
+    assert_eq!(got, ["count=1 declared=a5"]);
+}
+
+/// §23.9, §9.4.2: a nearer hierarchy member is a distinct signal despite
+/// the same spelling denoting a packed field at the top level.
+
+#[test]
+fn local_hierarchical_signal_shadows_outer_packed_member() {
+    let got = lines(r#"
+module child;
+  if (1) begin : bus
+    logic clock_bit;
+  end
+  int count = 0;
+  always @(posedge bus.clock_bit) count++;
+  initial begin
+    bus.clock_bit = 0;
+    #2 bus.clock_bit = 1;
+  end
+endmodule
+module top;
+  typedef struct packed { logic clock_bit; logic sibling; } bus_t;
+  bus_t bus;
+  child u();
+  initial begin
+    bus = '0;
+    #1 bus.clock_bit = 1;
+    #2 bus.clock_bit = 0;
+    #1 bus.clock_bit = 1;
+    #1 $display("inner=%0d", u.count);
+  end
+endmodule
+"#);
+    assert_eq!(got, ["inner=1"]);
+}
