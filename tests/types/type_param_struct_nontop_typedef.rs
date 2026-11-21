@@ -271,3 +271,29 @@ module top; mid #(4) m4(); mid #(8) m8(); endmodule
         ],
     );
 }
+
+/// §6.20.3: each actual sees the parent type parameter, including when an
+/// earlier named or positional connection binds a child formal of that name.
+#[test]
+fn child_type_formals_do_not_capture_sibling_actuals() {
+    assert_has(
+        r#"
+module child #(parameter type A = int, parameter type B = int) ();
+  A first;
+  B second;
+  initial #1 $display("scope %m %0d %0d", $bits(first), $bits(second));
+endmodule
+module parent #(parameter type A = logic) ();
+  child #(.A(byte), .B(A)) named();
+  child #(.B(A), .A(byte)) reversed();
+  child #(byte, A) ordered();
+endmodule
+module top; parent #(.A(logic [4:0])) p(); endmodule
+"#,
+        &[
+            "scope top.p.named 8 5",
+            "scope top.p.reversed 8 5",
+            "scope top.p.ordered 8 5",
+        ],
+    );
+}
