@@ -8,6 +8,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- Preserve live packed memories up to 16,777,216 bits by default, including declarations inside parameterized instances. Set `XEZIM_MAX_PACKED_WIDTH` to change the limit, up to 134,217,728 bits. Elaboration reports live declarations that exceed the configured limit (#1475).
+- Evaluate a delayed unpacked row selector once, bind class-property and queue-element reference arguments to live storage, and preserve signed packed lanes through collection formals and virtual interfaces (#1320, #1321, #1312).
+- Compile local assignment expressions in function loop steps and signed bit-index writes to function locals. Stepped processes can also call real math functions with inlined arguments (#1336, #1337, #1326).
+
 - **Correctness:** Size an equality, relational, logical, reduction or `inside` result as 1 bit in interpreted code, so it no longer widens the operator around it: `if ((~a) | (m == 5'd12))` over a 1-bit `a` reads `~a` as 0, not as `5'b11110`, in an `if` or `?:` condition, a loop condition, a `case` item, `wait`, an `iff` guard, an assertion and a `$display` argument (§11.6.1, #1369, contributed by akashlevy).
 
 - **Correctness:** Evaluate the operand of a size cast by a field of a struct parameter (`pt.DEPTH'(x)`, `(pt.DEPTH)'(x)`) at the field's value, in compiled and interpreted code and in an instance's body with that instance's value; it passed the operand through at its own width, or took the width of a same-named parameter (§6.24.1, #1370, contributed by akashlevy).
