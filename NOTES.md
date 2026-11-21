@@ -8,6 +8,22 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Evaluate a continuous assignment delay that names a variable (`assign #(d) w = a;`, `wire #(di) w = a;`, `#(rise, fall)`, `buf #(di)`, a submodule `assign #(dv + PD)`) in the declaring scope each time the right-hand side changes, with transition selection and inertial filtering; it was folded to 0 (§10.3.3, #1289, reported by ds54e).
+
+- **Correctness:** Parse a real cast as a coverpoint expression (`coverpoint real'(x)`) in SV-2023 mode, where it was read as the coverpoint type modifier (§6.24.1, §19.5, #1473, reported by ds54e).
+
+- **Correctness:** Keep a `shortreal` input port's own storage when it is connected to a bare `real` variable (and a `real` port's for a `shortreal` actual), so the connection rounds to binary32 (§6.12, §23.3.3.8, #1463, reported by ds54e).
+
+- **Correctness:** Round an exact `%t` display tie to the even value in decimal also above 2^53 ticks, where it fell back to a real (§20.4.3, §21.2.1, #1329, reported by ds54e).
+
+- **Correctness:** Give an ANSI port of the top module the packed shape of its type: `o[1]` of `output logic [5:0][7:0] o` reads element 1, not bit 1, a member of a packed-structure port reads its bits, not x, and a part-select of such a port connected to an instance is sized in elements (§7.4.1, §7.2, §23.2.2.2).
+
+- **Correctness:** Link precompiled DPI objects with the C++ runtime when one is available, and include macros defined in the primary files when preprocessing library files for the design cache (§35, §22.5.1).
+
+- **Correctness:** Accept an escaped typedef name in a subroutine port declaration, count packed elements in a port connection through a variable-start indexed part-select (`w[1][pos +: 2]`), and accept constant part-selects in package-parameter generate indices (§5.6.1, §11.5.1, §27.5, core #262, #264, #273).
+
+- **Performance:** Store a named property or sequence body that is identical in every instance once (`--compile` peak RSS 340 MB → 123 MB on 4,096 instances with 16 formal-only named properties each) (§16.6, §16.8, #721, contributed by amal-khailtash).
+
 - Preserve live packed memories up to 16,777,216 bits by default, including declarations inside parameterized instances. Set `XEZIM_MAX_PACKED_WIDTH` to change the limit, up to 134,217,728 bits. Elaboration reports live declarations that exceed the configured limit (#1475).
 - Evaluate a delayed unpacked row selector once, bind class-property and queue-element reference arguments to live storage, and preserve signed packed lanes through collection formals and virtual interfaces (#1320, #1321, #1312).
 - Compile local assignment expressions in function loop steps and signed bit-index writes to function locals. Stepped processes can also call real math functions with inlined arguments (#1336, #1337, #1326).
@@ -157,7 +173,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 - **Correctness:** Evaluate each operand once when assigning an unpacked concatenation to a queue (§10.10, #1470).
 - **Correctness:** Select queue rows through their class handle when a module declares an array with the same property name (§8.4, #1469).
 - **Correctness:** Match explicit real coverpoint bins by numeric value and omit automatic bins for real points (§19.5, #1465).
-- **Correctness:** Wake event-controlled blocks when a member of a selected class handle or packed struct changes (§9.4.2, #1472).
+- **Correctness:** Wake an event control on a member of a selected packed-structure element (`@(sa[1].a)`) only when that member changes (§9.4.2, #1472).
 - **Correctness:** Assign function-returned arrays to unpacked slices and rows in declaration order (#1471).
 - **Correctness:** Preserve nested unpacked structure members and fixed-array elements in user-defined nettype driver patterns (§6.6.7, #1464).
 - Round real operands of compiled 64-bit integral casts before using the result (§6.12.1, §6.24.1, #1319).
