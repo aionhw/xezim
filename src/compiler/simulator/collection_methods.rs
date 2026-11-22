@@ -741,7 +741,9 @@ impl Simulator {
                 .is_some_and(|d| d.len() == 1 && !matches!(d[0], UD::Associative { .. })),
             _ => false,
         };
-        let (lc, rc) = (seq_call(self, left), seq_call(self, right));
+        // §7.10.2.4: a pop of a queue of fixed-size rows returns a row too.
+        let lc = seq_call(self, left) || self.is_pop_row_call(left);
+        let rc = seq_call(self, right) || self.is_pop_row_call(right);
         if !lc && !rc {
             return None;
         }
