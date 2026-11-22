@@ -92,3 +92,5 @@ mod fallback_hotspots;
 mod process_memory_paths;
 #[path = "perf/packed_member_path_read.rs"]
 mod packed_member_path_read;
+#[path = "perf/decl_param_scope_scaling.rs"]
+mod decl_param_scope_scaling;
