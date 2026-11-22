@@ -645,9 +645,9 @@ impl Simulator {
     }
     /// §11.4.5, §16.9.3: a fixed-size unpacked array against `$past` or
     /// `$sampled` of a whole one (`mem == $past(mem)`). The call's value is
-    /// the concatenation of the cells, the left bound's first
-    /// (`whole_array_cells`), compared with the array's elements in order.
-    /// `None` for any other pair.
+    /// the concatenation of the cells in declared order
+    /// (`whole_array_cells`), compared with the array's elements in the same
+    /// order. `None` for any other pair.
     fn compare_fixed_array_sampled(
         &mut self,
         left: &Expression,
@@ -659,8 +659,8 @@ impl Simulator {
                 if matches!(name.as_str(), "$past" | "$sampled") =>
             {
                 args.first()
-                    .and_then(|a| me.whole_array_cells(a))
-                    .map(|(_, ids)| ids.len())
+                    .and_then(|a| me.whole_array_cell_list(a))
+                    .map(|(_, _, ids)| ids.len())
             }
             _ => None,
         };
@@ -671,18 +671,40 @@ impl Simulator {
             (Some(n), None) => (right, left, n, true),
             (None, None) => return None,
         };
-        let (name, lo, hi) = self.fixed_array_operand(arr)?;
-        let ew = self.coll_elem_width(&name)?;
-        if ew == 0 || (hi - lo + 1) as usize != n {
-            return (ew != 0).then_some(PatCmp::Unequal);
+        // The other operand's cells, in declared order: a whole array of any
+        // number of dimensions, or a class's fixed-size array property.
+        let cells: Vec<String> = if let Some((name, indices, _)) = self.whole_array_cell_list(arr) {
+            indices
+                .iter()
+                .map(|ix| {
+                    ix.iter()
+                        .fold(name.clone(), |base, &i| Self::name_with_index(&base, i))
+                })
+                .collect()
+        } else {
+            let (name, lo, hi) = self.fixed_array_operand(arr)?;
+            let order: Vec<i64> = if self.module.descending_arrays.contains(&name) {
+                (lo..=hi).rev().collect()
+            } else {
+                (lo..=hi).collect()
+            };
+            order
+                .into_iter()
+                .map(|i| Self::name_with_index(&name, i))
+                .collect()
+        };
+        if cells.len() != n {
+            return Some(PatCmp::Unequal);
         }
         let v = self.eval_expr(call);
-        let desc = self.module.descending_arrays.contains(&name);
+        if n == 0 || v.width as usize % n != 0 {
+            return None;
+        }
+        let ew = v.width / n as u32;
         let mut acc = PatCmp::Equal;
-        for k in 0..n {
-            let idx = if desc { hi - k as i64 } else { lo + k as i64 };
+        for (k, cell) in cells.iter().enumerate() {
             let a = self
-                .get_signal_value_by_name(&format!("{name}[{idx}]"))
+                .get_signal_value_by_name(cell)
                 .unwrap_or_else(|| Value::new(ew));
             let low = (n - 1 - k) * ew as usize;
             let b = v.range_select(low + ew as usize - 1, low);

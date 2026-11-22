@@ -853,7 +853,15 @@ impl Simulator {
         }
         // The watch's operand: a whole array's is the concatenation of its
         // cells, read the same way off the clock's tick.
-        let operand = self.sampled_watches[widx].expr.clone();
+        if matches!(operand.kind, ExprKind::Ident(_))
+            && matches!(
+                self.sampled_watches[widx].expr.kind,
+                ExprKind::Concatenation(_)
+            )
+        {
+            let cells = self.sampled_watches[widx].expr.clone();
+            return Some(self.sampled_cur_and_past(widx, &cells, n));
+        }
         Some(self.sampled_cur_and_past(widx, &operand, n))
     }
 
@@ -1670,10 +1678,37 @@ impl Simulator {
     }
     /// §16.9.3: the operand of `$past`, `$stable` or `$changed` may be a
     /// whole fixed-size unpacked array (`$stable(mem)`), whose name is no
-    /// signal. Its sampled value is the concatenation of its cells, the left
-    /// bound's first, with their signal ids. `None` for any other operand,
-    /// and for an array of the packed arena or with a negative bound.
+    /// signal. Its sampled value is the concatenation of its cells, in
+    /// declared order (each dimension from its left bound, §7.4.6), with
+    /// their signal ids. `None` for any other operand, and for an array of
+    /// the packed arena.
     pub(super) fn whole_array_cells(&self, e: &Expression) -> Option<(Expression, Vec<usize>)> {
+        let (_, indices, ids) = self.whole_array_cell_list(e)?;
+        let cells = indices
+            .iter()
+            .map(|ix| {
+                ix.iter().fold(e.clone(), |base, &i| {
+                    Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(base),
+                            index: Box::new(Self::signed_index_literal(i, e.span)),
+                        },
+                        e.span,
+                    )
+                })
+            })
+            .collect();
+        Some((Expression::new(ExprKind::Concatenation(cells), e.span), ids))
+    }
+
+    /// The cells of the whole fixed-size unpacked array `e` names, in
+    /// declared order: the array's storage name, each cell's indices and
+    /// each cell's signal id. `None` for any other operand, and when a cell
+    /// has no ordinary signal (the packed arena of a large memory).
+    pub(super) fn whole_array_cell_list(
+        &self,
+        e: &Expression,
+    ) -> Option<(String, Vec<Vec<i64>>, Vec<usize>)> {
         let ExprKind::Ident(h) = &e.kind else {
             return None;
         };
@@ -1681,42 +1716,82 @@ impl Simulator {
             return None;
         }
         let name = self.resolve_hier_name(h);
-        let &(first, lo, hi) = self.array_first_id.get(name.as_ref())?;
-        if is_packed_id(first) || lo < 0 || hi < lo {
+        let name = name.as_ref();
+        if self.module.dynamic_arrays.contains(name)
+            || self.module.associative_arrays.contains_key(name)
+        {
             return None;
         }
-        let desc = self.module.descending_arrays.contains(name.as_ref());
-        let order: Vec<i64> = if desc {
-            (lo..=hi).rev().collect()
+        let dims: Vec<(i64, i64)> = if let Some(&(_, lo, hi)) = self.array_first_id.get(name) {
+            if hi < lo {
+                return None;
+            }
+            if self.module.descending_arrays.contains(name) {
+                vec![(hi, lo)]
+            } else {
+                vec![(lo, hi)]
+            }
+        } else if self.module.arrays_2d.contains_key(name)
+            || self.module.arrays_nd.contains_key(name)
+        {
+            self.module.unpacked_decl_dims.get(name)?.clone()
         } else {
-            (lo..=hi).collect()
+            return None;
         };
-        let cells = order
+        let name = name.to_string();
+        let mut indices: Vec<Vec<i64>> = vec![Vec::new()];
+        for &(l, r) in &dims {
+            let order: Vec<i64> = if l <= r {
+                (l..=r).collect()
+            } else {
+                (r..=l).rev().collect()
+            };
+            indices = indices
+                .iter()
+                .flat_map(|ix| {
+                    order.iter().map(move |&i| {
+                        let mut ix = ix.clone();
+                        ix.push(i);
+                        ix
+                    })
+                })
+                .collect();
+        }
+        let ids = indices
             .iter()
-            .map(|&i| {
-                let index = Expression::new(
-                    ExprKind::Number(NumberLiteral::Integer {
-                        size: None,
-                        signed: false,
-                        base: NumberBase::Decimal,
-                        value: i.to_string(),
-                        cached_val: crate::ast::cache::LiteralCache::new(None),
-                    }),
-                    e.span,
-                );
-                Expression::new(
-                    ExprKind::Index {
-                        expr: Box::new(e.clone()),
-                        index: Box::new(index),
-                    },
-                    e.span,
-                )
+            .map(|ix| {
+                let cell = ix
+                    .iter()
+                    .fold(name.clone(), |base, &i| Self::name_with_index(&base, i));
+                self.resolve_signal_id(&cell)
+                    .filter(|&id| !is_packed_id(id) && id < self.signal_table.len())
             })
-            .collect();
-        let ids = (first..=first + (hi - lo) as usize)
-            .filter(|&id| id < self.signal_table.len())
-            .collect();
-        Some((Expression::new(ExprKind::Concatenation(cells), e.span), ids))
+            .collect::<Option<Vec<usize>>>()?;
+        Some((name, indices, ids))
+    }
+
+    /// The literal of index `i`, negative ones as a negation.
+    fn signed_index_literal(i: i64, span: crate::ast::Span) -> Expression {
+        let lit = Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: true,
+                base: NumberBase::Decimal,
+                value: i.unsigned_abs().to_string(),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
+            }),
+            span,
+        );
+        if i >= 0 {
+            return lit;
+        }
+        Expression::new(
+            ExprKind::Unary {
+                op: UnaryOp::Minus,
+                operand: Box::new(lit),
+            },
+            span,
+        )
     }
 
     /// Get-or-create the sampled watch for a call site. Registers the clock
