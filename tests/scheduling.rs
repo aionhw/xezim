@@ -317,6 +317,8 @@ mod comb_packed_element_sensitivity;
 mod comb_sens_param_range;
 #[path = "scheduling/comb_self_member_sensitivity.rs"]
 mod comb_self_member_sensitivity;
+#[path = "scheduling/comb_indexed_member_writes.rs"]
+mod comb_indexed_member_writes;
 #[path = "scheduling/delay_always_compound_body.rs"]
 mod delay_always_compound_body;
 #[path = "scheduling/delayed_struct_array_member.rs"] mod delayed_struct_array_member;
