@@ -122,6 +122,39 @@ fn a_restored_run_continues_where_the_saved_one_was() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+/// §16.14.6: a process saved while it waits on a delay still resumes from a
+/// delay after the restore, so the procedural assertion it then reaches
+/// attempts at the clock's next tick (15), not at once (8).
+#[test]
+fn a_restored_delay_keeps_its_assertion_at_the_next_tick() {
+    let d = dir("delay_assert");
+    let f = d.join("tb.sv");
+    std::fs::write(
+        &f,
+        r#"module tb;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  initial begin
+    @(posedge clk);
+    #3;
+    a: assert property (@(posedge clk) 1) $display("R A %0t", $time);
+    #20 $finish;
+  end
+endmodule
+"#,
+    )
+    .unwrap();
+    let (full, _) = run(&f, &[], &[]);
+    assert_eq!(full, ["R A 15"]);
+    let ck = d.join("c.ckpt");
+    let spec = format!("6ns,{}", ck.display());
+    let (saved, err) = run(&f, &["--save-at", &spec], &[]);
+    assert_eq!(saved, full, "saving must not change the run: {err}");
+    let (restored, err) = run(&f, &["--restore", ck.to_str().unwrap()], &[]);
+    assert!(err.contains("restored"), "{err}");
+    assert_eq!(restored, full, "{err}");
+    let _ = std::fs::remove_dir_all(&d);
+}
 
 #[test]
 fn save_and_restart_from_the_design() {
