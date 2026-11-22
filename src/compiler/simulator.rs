@@ -558,7 +558,8 @@ macro_rules! write_sig {
 // §7.2, §7.4.2: a member select through constant element selects of a packed struct, and a
 // nested packed-struct member read, compile to range stores and selects.
 // §7.4.5: signed constant labels of packed array elements.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB081";
+// §9.2.2.2.1: a write to a member of an indexed packed-struct element is its packed region.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB082";
 
 mod aggregate_assignments;
 mod pattern_array_items;
