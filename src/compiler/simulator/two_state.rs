@@ -5712,6 +5712,9 @@ impl Simulator {
                 compiler.set_string_signals(&self.module.string_signals);
                 compiler.set_signal_real(&self.signal_real);
                 compiler.top_module_name = Some(self.module.name.clone());
+                // §13.4: the body runs once per wakeup, so a call of a
+                // function with side effects keeps it compiled.
+                compiler.delegate_calls = true;
                 let body = if compiler.compile_stmt(&fast.body) {
                     Some(compiler.finish())
                 } else {

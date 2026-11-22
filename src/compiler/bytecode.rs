@@ -736,6 +736,11 @@ pub struct BytecodeCompiler<'a> {
     /// `@(event)` compile to WaitDelayReg / WaitEdge instead of bailing.
     /// Never set for edge or comb blocks.
     pub allow_waits: bool,
+    /// A timed process body that runs once per wakeup without waits of its
+    /// own (the retained `always #d x = f(x);` assignment). Like a process
+    /// FSM body it may run a call of a function with side effects on the
+    /// interpreter (§13.4). Never set for edge or comb blocks.
+    pub delegate_calls: bool,
     /// Event-control specs referenced by WaitEdge, in emission order.
     pub wait_specs: Vec<crate::ast::stmt::EventControl>,
     /// Per-for-loop leaf-name → signal_id override. Set by `compile_stmt`'s
@@ -1324,6 +1329,7 @@ impl<'a> BytecodeCompiler<'a> {
             method_enum_constants: HashMap::default(),
             class_scoped_enums: None,
             allow_waits: false,
+            delegate_calls: false,
             wait_specs: Vec::new(),
             for_loop_var_ids: std::collections::HashMap::default(),
             local_var_regs: std::collections::HashMap::default(),
