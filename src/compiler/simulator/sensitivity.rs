@@ -5394,3 +5394,89 @@ impl Simulator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::Span;
+
+    fn ident(name: &str) -> Expression {
+        let span = Span::new(0, 0);
+        Simulator::hier_ident_expr(Simulator::iface_path_segs(name, span), span)
+    }
+
+    fn index(base: Expression, i: u32) -> Expression {
+        let span = Span::new(0, 0);
+        let number = crate::ast::expr::NumberLiteral::Integer {
+            size: None,
+            signed: false,
+            base: crate::ast::expr::NumberBase::Decimal,
+            value: i.to_string(),
+            cached_val: Default::default(),
+        };
+        let index = Expression::new(ExprKind::Number(number), span);
+        Expression::new(
+            ExprKind::Index {
+                expr: Box::new(base),
+                index: Box::new(index),
+            },
+            span,
+        )
+    }
+
+    fn member(base: Expression, name: &str) -> Expression {
+        let span = Span::new(0, 0);
+        Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(base),
+                member: crate::ast::Identifier {
+                    name: name.to_string(),
+                    span,
+                },
+            },
+            span,
+        )
+    }
+
+    /// §7.2.1, §7.4.5, §9.2.2.2.1: a member of an indexed packed struct
+    /// element is its own bit region, and a member typed by a typedef with
+    /// packed ranges of its own (`lanes_t f`) is indexed by those ranges:
+    /// `r[0].f[0]` is four bits, not bit 0. A region one bit wide there let
+    /// a write of `r[0].f[0][0]` cover a read of all of `r[0].f[0]`.
+    #[test]
+    fn indexed_member_region_uses_typedef_ranges() {
+        let sim = crate::simulate(
+            r#"module test;
+  typedef logic [1:0][3:0] lanes_t;
+  typedef struct packed { logic [3:0] tag; lanes_t f; } e_t;
+  e_t [1:0] r;
+endmodule"#,
+            1,
+        )
+        .expect("simulate");
+        let region = |e: &Expression| {
+            Simulator::packed_sensitivity_selection(e, &sim.module)
+                .map(|s| (s.name, s.offset, s.width, s.dynamic))
+        };
+        let r0 = || index(ident("r"), 0);
+        // `r` is 24 bits: r[1] is 23:12 and r[0] 11:0. In an element, `tag`
+        // is 11:8 and `f` 7:0, so `f[1]` is 7:4 and `f[0]` 3:0.
+        assert_eq!(
+            region(&member(r0(), "tag")),
+            Some(("r".into(), 8, 4, false))
+        );
+        assert_eq!(region(&member(r0(), "f")), Some(("r".into(), 0, 8, false)));
+        assert_eq!(
+            region(&index(member(r0(), "f"), 1)),
+            Some(("r".into(), 4, 4, false))
+        );
+        assert_eq!(
+            region(&index(member(r0(), "f"), 0)),
+            Some(("r".into(), 0, 4, false))
+        );
+        assert_eq!(
+            region(&index(index(member(index(ident("r"), 1), "f"), 0), 2)),
+            Some(("r".into(), 14, 1, false))
+        );
+    }
+}
