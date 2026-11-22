@@ -4284,6 +4284,15 @@ impl Simulator {
                         pc += 1;
                         continue;
                     }
+                    // §10.6.2: a forced signal keeps its forced value. The
+                    // whole-signal branch below drops the write in
+                    // `write_sig!`; the partial ones write the table
+                    // directly, so check here (one branch when nothing is
+                    // forced, as in `write_sig!`).
+                    if !self.forced_signals.is_empty() && self.forced_signals.contains_key(&id) {
+                        pc += 1;
+                        continue;
+                    }
                     let copy_count = high_eff.saturating_add(1).saturating_sub(low) as usize;
 
                     if low == 0 && high_eff + 1 >= sig_w {

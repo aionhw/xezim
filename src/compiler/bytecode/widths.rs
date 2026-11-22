@@ -217,6 +217,12 @@ impl<'a> BytecodeCompiler<'a> {
                     32
                 }
             }
+            // §7.2, §7.4.2: a member select through constant element selects
+            // (`s.e[1].dw[0].value`) is as wide as its layout entry, which
+            // sizes the right-hand side before the compiled store.
+            ExprKind::MemberAccess { .. } => self
+                .packed_const_member_path_target(lhs)
+                .map_or(32, |(_, _, _, _, w)| w),
             _ => 32,
         }
     }

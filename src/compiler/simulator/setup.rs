@@ -2379,6 +2379,7 @@ impl Simulator {
         compiler.set_array_first_id(&self.array_first_id);
         compiler.set_string_signals(&self.module.string_signals);
         compiler.set_signal_real(&self.signal_real);
+        compiler.set_signal_two_state(&self.signal_two_state);
         // `<top>.<path>` reads (a testbench's `tb.dut.x` macros) resolve as
         // in every other compiled block; without it each one fell back and
         // the whole body stayed on the AST process path.

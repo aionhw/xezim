@@ -707,6 +707,9 @@ pub struct BytecodeCompiler<'a> {
     /// absent means "assume possibly-real", which only costs missed
     /// `Resize` elisions, never correctness.
     signal_real: Option<&'a [bool]>,
+    /// The runtime's per-signal 2-state marks (`Simulator::signal_two_state`),
+    /// which its writes use to drop x/z (§6.11.2). `None` until set.
+    signal_two_state: Option<&'a [bool]>,
     arrays: &'a HashMap<String, (i64, i64, u32)>,
     array_first_id: Option<&'a HashMap<Arc<str>, (usize, i64, i64)>>,
     widths: &'a dyn SignalWidthLookup,
@@ -1313,6 +1316,7 @@ impl<'a> BytecodeCompiler<'a> {
             signal_signed,
             signal_widths,
             signal_real: None,
+            signal_two_state: None,
             arrays,
             array_first_id: None,
             widths,
@@ -1475,6 +1479,12 @@ impl<'a> BytecodeCompiler<'a> {
     /// survives — measured at ~337K of the ~553K resizes still executing.
     pub fn set_signal_real(&mut self, r: &'a [bool]) {
         self.signal_real = Some(r);
+    }
+
+    /// The runtime's 2-state marks, by signal id. A compiled range store
+    /// into a container declines when its signal may be 2-state.
+    pub fn set_signal_two_state(&mut self, t: &'a [bool]) {
+        self.signal_two_state = Some(t);
     }
 
     pub fn set_multi_dim_arrays(&mut self, s: &'a HashSet<String>) {

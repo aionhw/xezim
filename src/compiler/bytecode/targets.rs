@@ -1086,6 +1086,21 @@ impl<'a> BytecodeCompiler<'a> {
                 if self.try_packed_path_nba(lhs, val_reg) {
                     return true;
                 }
+                // `s.e[1].dw[0].value <= v`: one static range of `s`.
+                if let Some((base_id, key, _, off, mw)) = self.packed_const_member_path_target(lhs)
+                    && self.packed_container_four_state(base_id, &key)
+                {
+                    let resized = self.alloc_reg();
+                    self.emit(Insn::Move(resized, val_reg));
+                    self.emit(Insn::Resize(resized, mw));
+                    self.emit(Insn::NbaAssignRange(
+                        as_sig_id(base_id),
+                        off + mw - 1,
+                        off,
+                        resized,
+                    ));
+                    return true;
+                }
                 self.bail("nba_member_access");
                 false
             }
@@ -1738,6 +1753,21 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     self.emit(Insn::BlockingAssignArrayRange(
                         array, idx_reg, hi_reg, lo_reg, resized,
+                    ));
+                    return true;
+                }
+                // `s.e[1].dw[0].value = v`: one static range of `s`.
+                if let Some((base_id, key, _, off, mw)) = self.packed_const_member_path_target(lhs)
+                    && self.packed_container_four_state(base_id, &key)
+                {
+                    let resized = self.alloc_reg();
+                    self.emit(Insn::Move(resized, val_reg));
+                    self.emit(Insn::Resize(resized, mw));
+                    self.emit(Insn::BlockingAssignRange(
+                        as_sig_id(base_id),
+                        off + mw - 1,
+                        off,
+                        resized,
                     ));
                     return true;
                 }
