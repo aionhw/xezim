@@ -487,25 +487,46 @@ impl Simulator {
     }
 
     /// The packed dimensions of a member of type `dt`, `width` bits wide,
-    /// as `packed_sensitivity_selection` indexes them: its declared ranges,
-    /// or one `[width-1:0]` range for a member declared without any.
+    /// as `packed_sensitivity_selection` indexes them: the ranges written on
+    /// a typedef reference, then those of the type it names
+    /// (`typedef logic [1:0][3:0] lanes_t;` gives `lanes_t` both), or one
+    /// `[width-1:0]` range for a type without any. `None` unless the ranges
+    /// times the width of one element of the type make up `width`, which is
+    /// not so when a typedef between the two carries ranges of its own.
     fn packed_member_dims(
         dt: &DataType,
         width: u64,
         module: &ElaboratedModule,
     ) -> Option<Vec<(i64, i64)>> {
         use crate::ast::types::PackedDimension;
-        let declared: &[PackedDimension] = match dt {
-            DataType::IntegerVector { dimensions, .. }
-            | DataType::Implicit { dimensions, .. }
-            | DataType::TypeReference { dimensions, .. } => dimensions,
-            DataType::Struct(su) => &su.dimensions,
-            DataType::Enum(en) => &en.dimensions,
+        let outer: &[PackedDimension] = match dt {
+            DataType::TypeReference { dimensions, .. } => dimensions,
             _ => &[],
         };
-        let mut dims = Vec::with_capacity(declared.len().max(1));
+        let resolved = super::elaborate::resolve_typedef_chain(dt, &module.typedef_types);
+        let type_width = |t: &DataType| {
+            u64::from(super::elaborate::resolve_type_width(
+                t,
+                Some(&module.parameters),
+                Some(&module.typedefs),
+            ))
+        };
+        let (inner, element): (&[PackedDimension], u64) = match resolved {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                (dimensions, 1)
+            }
+            DataType::IntegerAtom { .. } => (&[], type_width(resolved)),
+            DataType::Enum(en) if en.dimensions.is_empty() => (&[], type_width(resolved)),
+            DataType::Struct(su) => {
+                let mut one = su.clone();
+                one.dimensions.clear();
+                (&su.dimensions, type_width(&DataType::Struct(one)))
+            }
+            _ => return None,
+        };
+        let mut dims = Vec::with_capacity(outer.len() + inner.len() + 1);
         let mut count = 1u64;
-        for d in declared {
+        for d in outer.iter().chain(inner) {
             let PackedDimension::Range { left, right, .. } = d else {
                 return None;
             };
@@ -514,7 +535,7 @@ impl Simulator {
             count = count.checked_mul(l.abs_diff(r).checked_add(1)?)?;
             dims.push((l, r));
         }
-        if count == 0 || width % count != 0 {
+        if element == 0 || count.checked_mul(element)? != width {
             return None;
         }
         if dims.is_empty() && width > 1 {
