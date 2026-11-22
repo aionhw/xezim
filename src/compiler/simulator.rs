@@ -3929,6 +3929,13 @@ pub struct Simulator {
     /// XEZIM_CTL_MASK=0, or a settle mode that evaluates entries outside the
     /// canonical loop (partitioned / level-BSP), turns the skip off.
     ctl_on: bool,
+    mux_guard_on: bool,
+    mux_guards: Vec<MuxGuard>,
+    mux_guard_by_entry: Vec<Option<std::num::NonZeroU32>>,
+    prof_mux_skipped: u64,
+    ts_mux_stream_on: bool,
+    settle_pop_word: bool,
+    ts_range_delta: bool,
     /// Dirty records of the stores a two-state entry makes in the settle
     /// loop (direct mode), with each store's changed bits (`u64::MAX` when
     /// unknown): `ts_rec_n` records, the first in `ts_rec0` (most entries
@@ -4079,6 +4086,9 @@ pub struct Simulator {
     /// overhead.  Counted in the main interpreter path only; the
     /// parallel `exec_insns_isolated` path also elides but doesn't bump.
     prof_nba_elided: u64,
+    /// In profile mode, wide partial NBAs that skipped or needed a new queue value.
+    prof_wide_nba_quiet: u64,
+    prof_wide_nba_cloned: u64,
     // O1 event-driven-edge MEASUREMENT (XEZIM_EVENT_EDGE_MEASURE=1, no
     // behavior change): per-edge-block static DATA-read set (LoadSignal sids
     // minus sensitivity), whether the block is gateable (no dynamic reads),

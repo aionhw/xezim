@@ -1717,25 +1717,37 @@ impl Simulator {
                 width,
             } => {
                 let (sv, sx) = self.vector_ref_bits(s, width);
-                let (tv, tx) = self.vector_ref_bits(t, width);
-                let (ev, ex) = self.vector_ref_bits(e, width);
                 let mask = if width == 64 {
                     u64::MAX
                 } else {
                     (1u64 << width) - 1
                 };
+                // Each lane has its own select. Uniform known selects only
+                // need one data slice, including its X/Z plane.
+                if sx == 0 && (sv == 0 || sv == mask) {
+                    let (v, x) = self.vector_ref_bits(if sv == 0 { e } else { t }, width);
+                    return (dst, width, v & mask, x & mask);
+                }
+                let (tv, tx) = self.vector_ref_bits(t, width);
+                let (ev, ex) = self.vector_ref_bits(e, width);
+                if sx == 0 {
+                    return (
+                        dst,
+                        width,
+                        ((sv & tv) | (!sv & ev)) & mask,
+                        ((sv & tx) | (!sv & ex)) & mask,
+                    );
+                }
                 let known_one = sv & !sx & mask;
                 let known_zero = !sv & !sx & mask;
-                let equal = !(tv ^ ev | tx ^ ex) & mask;
-                let unknown_equal = sx & equal;
+                // On an ambiguous select only equal known data bits survive
+                // the conditional merge (Table 11-21), including for Z/Z.
+                let equal_known = !(tv ^ ev | tx | ex) & mask;
                 (
                     dst,
                     width,
-                    (known_one & tv) | (known_zero & ev) | (unknown_equal & tv),
-                    (known_one & tx)
-                        | (known_zero & ex)
-                        | (unknown_equal & tx)
-                        | (sx & !equal & mask),
+                    (known_one & tv) | (known_zero & ev) | (sx & equal_known & tv),
+                    (known_one & tx) | (known_zero & ex) | (sx & !equal_known & mask),
                 )
             }
         };

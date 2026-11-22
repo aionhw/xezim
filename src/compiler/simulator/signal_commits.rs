@@ -300,9 +300,13 @@ impl Simulator {
         branch: &FusedAndBranch,
         invert: bool,
     ) -> u8 {
+        // A known zero masks every private input in this fanout.
+        if common_code == 0 {
+            return u8::from(invert);
+        }
         let other =
             self.signal_table[branch.other.sig_id as usize].get_bit_code(branch.other.bit as usize);
-        let and = if common_code == 0 || other == 0 {
+        let and = if other == 0 {
             0
         } else if common_code == 1 && other == 1 {
             1
@@ -425,21 +429,16 @@ impl Simulator {
             }
             FusedGate::Mux2 { dst, s, t, e } => {
                 let vs = self.signal_table[s.sig_id as usize].get_bit_code(s.bit as usize);
-                let vt = self.signal_table[t.sig_id as usize].get_bit_code(t.bit as usize);
-                let ve = self.signal_table[e.sig_id as usize].get_bit_code(e.bit as usize);
-                // IEEE 1800 §11.4.11 Table 11-21: ambiguous select merges the
-                // branches per bit — 0/0→0, 1/1→1, every other pair (incl.
-                // z/z) → x.
-                let v = match vs {
-                    0 => ve,
-                    1 => vt,
-                    _ => {
-                        if vt == ve && vt < 2 {
-                            vt
-                        } else {
-                            2
-                        }
-                    }
+                // Select on the two-state control path while preserving the
+                // complete four-state code of the chosen data bit.
+                let read =
+                    |r: &BitRef| self.signal_table[r.sig_id as usize].get_bit_code(r.bit as usize);
+                let v = if vs < 2 {
+                    read(if vs == 1 { t } else { e })
+                } else {
+                    let vt = read(t);
+                    let ve = read(e);
+                    if vt == ve && vt < 2 { vt } else { 2 }
                 };
                 (dst, v)
             }

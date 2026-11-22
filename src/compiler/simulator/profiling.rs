@@ -2118,6 +2118,7 @@ impl Simulator {
                 .map(|&e| DepEdge {
                     mask: u64::MAX,
                     entry: e,
+                    gate_slot: 0,
                 })
                 .collect();
             self.bit_sens_pending.clear();
@@ -2127,6 +2128,10 @@ impl Simulator {
                 }
             }
             self.ctl_build();
+            self.build_mux_guards();
+            if self.gate_lane_valid && self.gate_lane.len() == self.comb_entries.len() {
+                self.refresh_gate_routes();
+            }
         } else if !self.bit_sens_pending.is_empty() {
             let pending = std::mem::take(&mut self.bit_sens_pending);
             if self.bit_sens_on {
@@ -2136,6 +2141,146 @@ impl Simulator {
             }
             self.bit_sens_pending = pending;
             self.bit_sens_pending.clear();
+        }
+    }
+
+    /// §10.3, §11.4.11: these continuous assignments have no effect except
+    /// copying the selected four-state slice to a single-driver net.
+    pub(super) fn build_mux_guards(&mut self) {
+        use super::bytecode::Insn;
+        self.mux_guards.clear();
+        self.mux_guard_by_entry.clear();
+        if !self.mux_guard_on || !self.sdf_delays.is_empty() {
+            return;
+        }
+        let mut candidates = Vec::new();
+        let mut writers = HashMap::default();
+        for (eidx, entry) in self.comb_entries.iter().enumerate() {
+            let CombItem::CompiledContAssign { compiled } = &entry.item else {
+                continue;
+            };
+            let [
+                Insn::LoadSignal(cond, selector) | Insn::LoadSignalSigned(cond, selector),
+                Insn::LoadSignalRange(yes, yes_id, yes_hi, yes_lo),
+                Insn::LoadSignalRange(no, no_id, no_hi, no_lo),
+                Insn::Select(result, test, when_true, when_false),
+                Insn::BlockingAssignRange(dst, dst_hi, dst_lo, src),
+            ] = compiled.instructions.as_slice()
+            else {
+                continue;
+            };
+            let (selector, yes_id, no_id, dst) = (
+                *selector as usize,
+                *yes_id as usize,
+                *no_id as usize,
+                *dst as usize,
+            );
+            let Some(span) = dst_hi.checked_sub(*dst_lo).filter(|&span| span < 64) else {
+                continue;
+            };
+            let in_bounds = |id: usize, hi: u32| {
+                self.signal_widths.get(id).is_some_and(|&w| hi < w)
+                    && !self.signal_real.get(id).copied().unwrap_or(true)
+            };
+            if entry.has_unresolved_reads
+                || cond != test
+                || yes != when_true
+                || no != when_false
+                || result != src
+                || cond == yes
+                || cond == no
+                || yes == no
+                || self.signal_widths.get(selector) != Some(&1)
+                || yes_hi.checked_sub(*yes_lo) != Some(span)
+                || no_hi.checked_sub(*no_lo) != Some(span)
+                || !in_bounds(yes_id, *yes_hi)
+                || !in_bounds(no_id, *no_hi)
+                || !in_bounds(dst, *dst_hi)
+                || [selector, yes_id, no_id].contains(&dst)
+                || yes_id == no_id
+                || selector == yes_id
+                || selector == no_id
+                || entry.cold.write_signal_ids.as_slice() != [dst]
+                || !self
+                    .name_opt(dst)
+                    .is_some_and(|name| self.module.nets.contains(name))
+            {
+                continue;
+            }
+            writers.insert(dst, 0usize);
+            candidates.push((
+                eidx,
+                MuxGuard {
+                    selector,
+                    arms: [(no_id, *no_lo as usize), (yes_id, *yes_lo as usize)],
+                    dst,
+                    dst_lo: *dst_lo as usize,
+                    width: (span + 1) as usize,
+                },
+            ));
+        }
+        for entry in &self.comb_entries {
+            for dst in &entry.cold.write_signal_ids {
+                if let Some(count) = writers.get_mut(dst) {
+                    *count += 1;
+                }
+            }
+        }
+        for (entry, guard) in candidates {
+            if writers[&guard.dst] != 1 {
+                continue;
+            }
+            if self.mux_guard_by_entry.is_empty() {
+                self.mux_guard_by_entry
+                    .resize(self.comb_entries.len(), None);
+            }
+            self.mux_guard_by_entry[entry] =
+                std::num::NonZeroU32::new(self.mux_guards.len() as u32 + 1);
+            self.mux_guards.push(guard);
+        }
+        chatter!(
+            "[CTL-MUX] eligible continuous assignments={}",
+            self.mux_guards.len()
+        );
+    }
+
+    /// Called at the original worklist position, so interleaved writes,
+    /// forces and changes to either input need no cached selection state.
+    pub(super) fn mux_body_unchanged(&self, slot: u32) -> bool {
+        let g = &self.mux_guards[slot as usize];
+        let select = &self.signal_table[g.selector];
+        let code = select.get_bit_code(0) as usize;
+        if code >= 2
+            || select.width != 1
+            || select.is_real
+            || select.is_fill
+            || self.forced_signals.contains_key(&g.dst)
+        {
+            return false;
+        }
+        let (source, lo) = g.arms[code];
+        let source = &self.signal_table[source];
+        let dst = &self.signal_table[g.dst];
+        if source.is_real
+            || source.is_fill
+            || dst.is_real
+            || dst.is_fill
+            || (source.width as usize) < lo + g.width
+            || dst.width != self.signal_widths[g.dst]
+            || dst.is_signed != self.signal_signed[g.dst]
+        {
+            return false;
+        }
+        let rhs = source.slice_bits_swar(lo, g.width);
+        if self.signal_two_state[g.dst] && rhs.1 != 0 {
+            return false;
+        }
+        if g.width == dst.width as usize {
+            // The VM compares the full Value on a whole-destination store.
+            // Let it handle noncanonical inline bits outside the HDL width.
+            dst.inline_bits() == Some(rhs)
+        } else {
+            rhs == dst.slice_bits_swar(g.dst_lo, g.width)
         }
     }
 
@@ -2171,7 +2316,7 @@ impl Simulator {
 
     /// Pick the controlling-value gates (`CtlGate`) once the dependency
     /// edges carry their static masks: every two-input AND/OR fused gate
-    /// (NAND/NOR included) with two distinct input signals, one of which
+    /// (NAND/NOR included), or mux with distinct select and arms. An input
     /// fans out to at least `CTL_MIN_FANOUT` comb entries (a clock or other
     /// broadcast net: the input whose toggles are worth skipping).
     ///
@@ -2199,22 +2344,39 @@ impl Simulator {
             let CombItem::FusedGate { op } = &entry.item else {
                 continue;
             };
-            let FusedGate::Bin2 {
-                dst, a, b, op: gop, ..
-            } = *op
-            else {
-                continue;
+            let (dst, hot, other, ctl) = match *op {
+                FusedGate::Bin2 { dst, a, b, op, .. } => {
+                    let ctl = match op {
+                        GateBin::And => 0,
+                        GateBin::Or => 1,
+                        GateBin::Xor => continue,
+                    };
+                    if a.sig_id == b.sig_id || dst.sig_id == a.sig_id || dst.sig_id == b.sig_id {
+                        continue;
+                    }
+                    if fanout(a.sig_id) >= fanout(b.sig_id) {
+                        (dst, a, b, ctl)
+                    } else {
+                        (dst, b, a, ctl)
+                    }
+                }
+                FusedGate::Mux2 { dst, s, t, e } => {
+                    // Edges are keyed by signal. Suppressing an aliased arm
+                    // could also suppress a select or active-arm update.
+                    if s.sig_id == t.sig_id || s.sig_id == e.sig_id || t.sig_id == e.sig_id
+                        || [s, t, e].iter().any(|r| r.sig_id == dst.sig_id)
+                    {
+                        continue;
+                    }
+                    if fanout(t.sig_id) >= fanout(e.sig_id) {
+                        (dst, t, s, 0)
+                    } else {
+                        (dst, e, s, 1)
+                    }
+                }
+                _ => continue,
             };
-            let ctl = match gop {
-                GateBin::And => 0u8,
-                GateBin::Or => 1u8,
-                GateBin::Xor => continue,
-            };
-            if a.sig_id == b.sig_id || dst.sig_id == a.sig_id || dst.sig_id == b.sig_id {
-                continue;
-            }
-            let (fa, fb) = (fanout(a.sig_id), fanout(b.sig_id));
-            if fa.max(fb) < CTL_MIN_FANOUT {
+            if fanout(hot.sig_id) < CTL_MIN_FANOUT {
                 continue;
             }
             // Only a declared net: nothing but its drivers, a force or a
@@ -2227,7 +2389,6 @@ impl Simulator {
             {
                 continue;
             }
-            let (hot, other) = if fa >= fb { (a, b) } else { (b, a) };
             // A clock-tree controlling input re-evaluates the gate only
             // through the eager tree pass, never through its own edge.
             if self
@@ -2291,7 +2452,7 @@ impl Simulator {
             let slot = self.ctl_gates.len() as u32;
             self.ctl_sig[g.hot as usize] = true;
             let dst = match g.op {
-                FusedGate::Bin2 { dst, .. } => dst.sig_id,
+                FusedGate::Bin2 { dst, .. } | FusedGate::Mux2 { dst, .. } => dst.sig_id,
                 _ => unreachable!(),
             };
             self.ctl_dsts.push((dst, slot));
@@ -2448,10 +2609,21 @@ impl Simulator {
                         {
                             let off = self.ts_arena.len() as u32;
                             self.ts_arena.extend(ts.insns.iter().cloned());
+                            let kind = if !cfg!(feature = "opcode-census") && Self::is_slice_transfer(&ts.insns) {
+                                Self::TS_SLICE_TRANSFER
+                            } else if !cfg!(feature = "opcode-census")
+                                && self.ts_mux_stream_on
+                                && Self::ts_kind_of(&ts) == 1
+                                && Self::is_mux_stream(&ts.insns)
+                            {
+                                Self::TS_MUX_STREAM
+                            } else {
+                                Self::ts_kind_of(&ts)
+                            };
                             self.ts_hdr[eidx] = TsHdr {
                                 off,
                                 len_kind: (ts.insns.len() as u16)
-                                    | ((Self::ts_kind_of(&ts) as u16) << TS_HDR_KIND_SHIFT),
+                                    | ((kind as u16) << TS_HDR_KIND_SHIFT),
                                 num_regs: ts.num_regs as u16,
                             };
                             if self.ts_hdr_tsx.len() <= eidx {

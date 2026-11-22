@@ -5167,6 +5167,13 @@ impl Simulator {
             ctl_on: !matches!(std::env::var("XEZIM_CTL_MASK").as_deref(), Ok("0"))
                 && std::env::var_os("XEZIM_BSP_SETTLE").is_none()
                 && std::env::var_os("XEZIM_BSP_SHADOW").is_none(),
+            mux_guard_on: std::env::var("XEZIM_CTL_MUX").as_deref() == Ok("1"),
+            mux_guards: Vec::new(),
+            mux_guard_by_entry: Vec::new(),
+            prof_mux_skipped: 0,
+            ts_mux_stream_on: std::env::var("XEZIM_TS_MUX_STREAM").as_deref() == Ok("1"),
+            settle_pop_word: std::env::var("XEZIM_SETTLE_POP_WORD").as_deref() == Ok("1"),
+            ts_range_delta: std::env::var("XEZIM_TS_RANGE_DELTA").as_deref() == Ok("1"),
             ts_rec0: (0, 0),
             ts_rec_n: 0,
             ts_recs: Vec::new(),
@@ -5224,6 +5231,8 @@ impl Simulator {
             is_edge_signal_non_clock: Vec::new(),
             nba_touched_edge_non_clock: false,
             prof_nba_elided: 0,
+            prof_wide_nba_quiet: 0,
+            prof_wide_nba_cloned: 0,
             event_measure: false,
             event_skip: false,
             event_after: 0,

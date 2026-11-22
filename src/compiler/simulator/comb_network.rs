@@ -137,7 +137,7 @@ pub(super) enum CombItem {
     TimingCheck {
         idx: usize,
     },
-    /// A `FusedGate` AND/OR (NAND/NOR) whose high-fanout input is ignored
+    /// A fused AND/OR, inverted gate, or mux whose high-fanout input is ignored
     /// while the other input holds the controlling value: the gate is
     /// `ctl_gates[slot]` (see `CtlGate`). Made from `FusedGate` entries at
     /// the first settle, never before the prepared-comb cache is written.
@@ -146,7 +146,8 @@ pub(super) enum CombItem {
     },
 }
 
-/// Controlling-value skip for one two-input AND/OR gate (`CombItem::CtlGate`).
+/// Controlling-value skip for a binary gate or one mux data arm.
+/// For muxes, only the inactive arm is masked. Select and active-arm edges stay live.
 ///
 /// `wl = clk & rs` cannot change while `rs` is 0, however `clk` toggles, so
 /// the gate's dependency edges from `clk` (the high-fanout input) carry mask
@@ -162,7 +163,7 @@ pub(super) enum CombItem {
 ///   read together).
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct CtlGate {
-    /// The gate (`FusedGate::Bin2` with `GateBin::And` / `GateBin::Or`).
+    /// The original binary gate or mux.
     pub(super) op: FusedGate,
     /// The input whose controlling value masks the other one.
     pub(super) other: BitRef,
@@ -173,8 +174,19 @@ pub(super) struct CtlGate {
     pub(super) npos: u32,
     /// Their static (bit-sensitivity) mask, restored when not controlled.
     pub(super) smask: u64,
-    /// Controlling bit code: 0 for AND/NAND, 1 for OR/NOR.
+    /// Known control code that makes changes on the hot input irrelevant.
     pub(super) ctl: u8,
+}
+
+/// A continuous mux with equal-width, in-bounds descending ranges. Arms
+/// are ordered false/true. The ordinary evaluator still owns every write.
+#[derive(serde::Serialize)]
+pub(super) struct MuxGuard {
+    pub(super) selector: usize,
+    pub(super) arms: [(usize, usize); 2],
+    pub(super) dst: usize,
+    pub(super) dst_lo: usize,
+    pub(super) width: usize,
 }
 
 /// Per-instance runtime state for a §29 UDP. Terminals are resolved to single
@@ -610,6 +622,10 @@ pub(super) struct CombEntryCold {
 pub(super) struct DepEdge {
     pub(super) mask: u64,
     pub(super) entry: u32,
+    /// Zero for ordinary work, otherwise the terminal gate's lane index plus
+    /// one. Derived from the lane map and stored next to the sensitivity mask.
+    #[serde(skip)]
+    pub(super) gate_slot: u32,
 }
 
 #[derive(serde::Serialize)]

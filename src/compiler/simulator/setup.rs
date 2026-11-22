@@ -2812,6 +2812,8 @@ impl Simulator {
             .unwrap_or(false)
         {
             let verbose = std::env::var("XEZIM_JIT_VERBOSE").is_ok();
+            let mut candidates = safe;
+            self.filter_aot_candidates(&blocks, &mut candidates, "comb");
             let mut names: Vec<(usize, String)> = Vec::new();
             let mut fns: Vec<String> = Vec::new();
             // XEZIM_AOT_TEMPLATE=1: emit ONE body per canonical block shape
@@ -2828,7 +2830,7 @@ impl Simulator {
                     .enumerate()
                     .filter_map(|(idx, b)| {
                         let cb = b.as_ref()?;
-                        if !safe[idx] {
+                        if !candidates[idx] {
                             return None;
                         }
                         Some((idx, cb.instructions.clone(), cb.num_regs))
@@ -2890,7 +2892,7 @@ impl Simulator {
                     break;
                 }
                 let Some(cb) = b else { continue };
-                if !safe[idx] {
+                if !candidates[idx] {
                     continue;
                 }
                 let name = format!("xezim_aot_cb_{idx}");
@@ -2950,10 +2952,10 @@ impl Simulator {
                 }
             }
             chatter!(
-                "[AOT] comb entries compiled {}/{} (width-safe candidates {})",
+                "[AOT] comb entries compiled {}/{} (native candidates {})",
                 n,
                 self.comb_entries.len(),
-                safe.iter().filter(|&&x| x).count()
+                candidates.iter().filter(|&&x| x).count()
             );
             return;
         }
@@ -3934,7 +3936,9 @@ impl Simulator {
                         .comb_dep_edges
                         .get(g.pos as usize)
                         .is_some_and(|d| d.mask == 0);
+                    // A mux still depends on its selected data arm.
                     if masked
+                        && matches!(g.op, FusedGate::Bin2 { .. })
                         && self.signal_table[g.other.sig_id as usize]
                             .get_bit_code(g.other.bit as usize)
                             == g.ctl

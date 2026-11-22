@@ -48,7 +48,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // §16.4.2: DeferredReport::stat_key, ::stat_kind and ::stat_loc, counted when the report matures.
 // §19.5: covergroup instances retain the real-valued coverpoint set.
 // Arm fanouts may retain the bit masks of their clocked readers.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x22";
+// Wide partial NBA profiling retains separate quiet and cloned counts.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x23";
 
 #[derive(Default)]
 struct Session {
@@ -1004,6 +1005,9 @@ impl Simulator {
         self.lazy_initial.clear();
         // #1149: the listed-once bits of the restored deferred reads.
         self.rebuild_deferred_proc_seen();
+        // Rebuild the derived edge routes and gate queues together after restore.
+        self.gate_lane_valid = false;
+        self.build_mux_guards();
         self.method_plans.borrow_mut().clear();
         self.fsm_clobber_cache.clear();
         // Annex D.9 / §8.3: this derived index borrows the class table.
@@ -1525,6 +1529,8 @@ checkpoint_state!(
     prof_fallback_insns,
     prof_insns_executed,
     prof_nba_elided,
+    prof_wide_nba_quiet,
+    prof_wide_nba_cloned,
     prof_observed_stores,
     prof_par_blocks,
     prof_par_dispatch_legacy,

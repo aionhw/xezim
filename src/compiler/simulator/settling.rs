@@ -4,6 +4,58 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// The caller deduplicates pending entries and lends the empty injection
+/// bitmap between passes. Leave both levels empty for forward propagation.
+fn sort_settle_batch(entries: &mut [usize], words: &mut [u64], summary: &mut [u64]) {
+    if entries.is_sorted() {
+        return;
+    }
+    if entries.len() < 64 || summary.len() > entries.len() {
+        entries.sort_unstable();
+        return;
+    }
+    for &e in entries.iter() {
+        let w = e >> 6;
+        words[w] |= 1u64 << (e & 63);
+        summary[w >> 6] |= 1u64 << (w & 63);
+    }
+    let mut out = 0;
+    for (si, occupied) in summary.iter_mut().enumerate() {
+        let mut occupied = std::mem::take(occupied);
+        while occupied != 0 {
+            let w = (si << 6) + occupied.trailing_zeros() as usize;
+            occupied &= occupied - 1;
+            let mut bits = std::mem::take(&mut words[w]);
+            while bits != 0 {
+                entries[out] = (w << 6) + bits.trailing_zeros() as usize;
+                out += 1;
+                bits &= bits - 1;
+            }
+        }
+    }
+    debug_assert_eq!(out, entries.len());
+}
+
+#[cfg(test)]
+mod batch_sort_tests {
+    use super::sort_settle_batch;
+
+    #[test]
+    fn sorted_batches_match_reference_and_release_all_scratch_bits() {
+        let mut words = vec![0; 193];
+        let mut summary = vec![0; 4];
+        for size in [0, 1, 2, 63, 64, 65, 256, 4097, 12289] {
+            // 4093 is coprime to 12289 and distributes the IDs across words.
+            let mut entries: Vec<_> = (0..size).map(|i| (i * 4093 + 63) % 12289).collect();
+            let mut expected = entries.clone();
+            expected.sort_unstable();
+            sort_settle_batch(&mut entries, &mut words, &mut summary);
+            assert_eq!(entries, expected);
+            assert!(words.iter().chain(&summary).all(|&w| w == 0));
+        }
+    }
+}
+
 impl Simulator {
     /// Install a register file of the evaluation's own for the bytecode of
     /// the combinational logic a settle evaluates, and return the caller's.
@@ -1357,6 +1409,19 @@ impl Simulator {
         out
     }
 
+    /// The lane map uses u32::MAX for ordinary work. Encode it as zero so a
+    /// newly created dependency edge defaults to the ordinary scheduler.
+    pub(super) fn refresh_gate_routes(&mut self) {
+        for edge in &mut self.comb_dep_edges {
+            edge.gate_slot = self
+                .gate_lane
+                .get(edge.entry as usize)
+                .copied()
+                .unwrap_or(u32::MAX)
+                .wrapping_add(1);
+        }
+    }
+
     pub(super) fn build_gate_lane(&mut self) {
         let n = self.comb_entries.len();
         self.gate_lane.clear();
@@ -1396,6 +1461,7 @@ impl Simulator {
         self.gate_queued.clear();
         self.gate_queued.resize(self.gate_ops.len(), false);
         self.gate_queue.clear();
+        self.refresh_gate_routes();
         self.gate_lane_valid = true;
     }
 
@@ -1560,7 +1626,6 @@ impl Simulator {
             && !self.profile_report
             && !self.trace_comb_paths
             && self.proc_depth == 0;
-        let gate_lane = std::mem::take(&mut self.gate_lane);
         let mut gate_queue = std::mem::take(&mut self.gate_queue);
         let mut gate_queued = std::mem::take(&mut self.gate_queued);
 
@@ -1709,7 +1774,6 @@ impl Simulator {
             self.is_clock_tree_entry = tree_entry;
             self.settle_triggered = triggered;
             self.settle_triggered_list = next_list;
-            self.gate_lane = gate_lane;
             if self.profile_report {
                 self.prof_cur.store(
                     crate::compiler::prof_sampler::KIND_OTHER,
@@ -1818,12 +1882,15 @@ impl Simulator {
             if word != 0 {
                 return (w << 6) + word.trailing_zeros() as usize;
             }
-            // Next non-empty word after `w`, via the summary.
-            let mut sw = (w + 1) >> 6;
+            next_injected_word(bits, sum, w + 1)
+        }
+        #[inline]
+        fn next_injected_word(bits: &[u64], sum: &[u64], first: usize) -> usize {
+            let mut sw = first >> 6;
             if sw >= sum.len() {
                 return usize::MAX;
             }
-            let mut sword = sum[sw] & (u64::MAX << ((w + 1) & 63));
+            let mut sword = sum[sw] & (u64::MAX << (first & 63));
             loop {
                 if sword != 0 {
                     let nw = (sw << 6) + sword.trailing_zeros() as usize;
@@ -1841,7 +1908,9 @@ impl Simulator {
                 sword = sum[sw];
             }
         }
+        let pop_word = self.settle_pop_word;
         let mut n_evals = 0u64;
+        let mut mux_skipped = 0u64;
         let mut n_dc = 0u64;
         let mut n_ab = 0u64;
         let mut n_repass = 0u64;
@@ -1926,16 +1995,13 @@ impl Simulator {
                         {
                             continue;
                         }
-                        if lane_on {
-                            let __g = unsafe { *gate_lane.get_unchecked(__dep) };
-                            if __g != u32::MAX {
-                                let __g = __g as usize;
-                                if !gate_queued[__g] {
-                                    gate_queued[__g] = true;
-                                    gate_queue.push(__g as u32);
-                                }
-                                continue;
+                        if lane_on && __e.gate_slot != 0 {
+                            let gate = (__e.gate_slot - 1) as usize;
+                            if !gate_queued[gate] {
+                                gate_queued[gate] = true;
+                                gate_queue.push(gate as u32);
                             }
+                            continue;
                         }
                         debug_assert!(__dep < triggered.len());
                         if !unsafe { *triggered.get_unchecked(__dep) } {
@@ -1980,9 +2046,11 @@ impl Simulator {
 
             // Take the current worklist and sort by eidx (topo order).
             std::mem::swap(&mut cur_list, &mut next_list);
-            if cur_list.len() > 1 && !cur_list.windows(2).all(|w| w[0] <= w[1]) {
-                cur_list.sort_unstable();
-            }
+            sort_settle_batch(
+                &mut cur_list,
+                &mut inject_bits[..words],
+                &mut inject_sum[..sum_words],
+            );
 
             // Hot loop: >90% of iterations hit DC / CompiledContAssign /
             // CompiledAlwaysBlock — avoid scope_hint.clone() and Instant::now()
@@ -2001,11 +2069,23 @@ impl Simulator {
                     && (cur_pos >= cur_list.len() || next_inject < cur_list[cur_pos])
                 {
                     let e = next_inject;
-                    inject_bits[e >> 6] &= !(1u64 << (e & 63));
-                    if inject_bits[e >> 6] == 0 {
+                    let word_index = e >> 6;
+                    let remaining = inject_bits[word_index] & !(1u64 << (e & 63));
+                    inject_bits[word_index] = remaining;
+                    if remaining == 0 {
                         inject_sum[e >> 12] &= !(1u64 << ((e >> 6) & 63));
                     }
-                    next_inject = next_set_bit(&inject_bits, &inject_sum, e + 1);
+                    next_inject = if pop_word {
+                        // e is the smallest pending index. The word we
+                        // just updated already excludes every earlier bit.
+                        if remaining != 0 {
+                            (word_index << 6) + remaining.trailing_zeros() as usize
+                        } else {
+                            next_injected_word(&inject_bits, &inject_sum, word_index + 1)
+                        }
+                    } else {
+                        next_set_bit(&inject_bits, &inject_sum, e + 1)
+                    };
                     // One-ahead prefetch of the NEXT injected entry's packed
                     // two-state header. The distance-8 prefetch below walks
                     // `cur_list` only; entries injected during the pass (the
@@ -2208,6 +2288,12 @@ impl Simulator {
                     continue;
                 }
                 evaluated_any = true;
+                if let Some(Some(slot)) = self.mux_guard_by_entry.get(eidx)
+                    && self.mux_body_unchanged(slot.get() - 1)
+                {
+                    mux_skipped += 1;
+                    continue;
+                }
                 let dirty_before = self.dirty_list.len();
 
                 n_evals += 1;
@@ -2995,6 +3081,7 @@ impl Simulator {
         self.prof_settle_dc_count += n_dc;
         self.prof_settle_ab_count += n_ab;
         self.prof_settle_repass_evals += n_repass;
+        self.prof_mux_skipped += mux_skipped;
         self.prof_settle_writes += n_writes;
         self.prof_settle_dep_edges += n_dep_edges;
         self.settle_entries_view = (std::ptr::null(), 0);
@@ -3008,7 +3095,6 @@ impl Simulator {
         self.settle_inject_sum = inject_sum;
         self.settle_triggered = triggered;
         self.settle_triggered_list = next_list;
-        self.gate_lane = gate_lane;
         if self.profile_report {
             self.prof_cur.store(
                 crate::compiler::prof_sampler::KIND_OTHER,

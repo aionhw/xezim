@@ -421,7 +421,7 @@ impl Simulator {
             && self.sdf_delays.is_empty()
             // Region fusion (XEZIM_REGIONS) rewrites the entry list; a cache
             // written under one setting must not be replayed under the other.
-            && !matches!(std::env::var("XEZIM_REGIONS").as_deref(), Ok("1"))
+            && !matches!(std::env::var("XEZIM_REGIONS").as_deref(), Ok("1" | "shared"))
             // Vector coalescing also rewrites the entry list and remains an
             // opt-in experiment, so keep its prepared form out of the shared
             // cache until the mode becomes part of the cache key.
@@ -4730,7 +4730,19 @@ impl Simulator {
         //    BRANCH TARGETS are block-relative and DO get offset;
         //  - members whose body contains fallback/NBA/process-local/jump-
         //    table insns stay out (targets or side effects we can't carry).
-        if matches!(std::env::var("XEZIM_REGIONS").as_deref(), Ok("1")) {
+        // Preserve the established shared-read batches. The selective pass
+        // only groups eligible entries still scheduled individually.
+        let region_mode = std::env::var("XEZIM_REGIONS").unwrap_or_default();
+        let shared_inputs = region_mode == "shared"
+            && self.bit_sens_on
+            && self.sdf_delays.is_empty()
+            && self.module.timing_checks.is_empty()
+            && self.code_cov.is_none()
+            && self.vcd_file.is_none()
+            && self.fst_file.is_none()
+            && self.xtrace_file.is_none()
+            && !foreign_libraries_configured();
+        if region_mode == "1" || shared_inputs {
             use super::bytecode::Insn as RIns;
             let max_members: usize = std::env::var("XEZIM_REGION_MAX")
                 .ok()
@@ -4773,7 +4785,53 @@ impl Simulator {
             // deferral stay uniform across the fused entry — a region of
             // plain-always members keeps defer_at_time0 = true.
             let mut class: Vec<Option<u8>> = Vec::with_capacity(n);
+            // The selective mode groups adjacent continuous assigns only when their
+            // complete activation predicates match. A change outside the shared
+            // read mask leaves the entire group asleep. No internal signal writes
+            // are removed, and a consumer between producers breaks the group.
+            let mut shared_masks = Vec::new();
             for e in entries.iter() {
+                if shared_inputs {
+                    let mask = (|| {
+                        let CombItem::CompiledContAssign { compiled } = &e.item else {
+                            return None;
+                        };
+                        let &[source] = e.cold.read_signal_ids.as_slice() else {
+                            return None;
+                        };
+                        let &[dest] = e.cold.write_signal_ids.as_slice() else {
+                            return None;
+                        };
+                        if source == dest
+                            || writer_count.get(&dest) != Some(&1)
+                            || e.has_unresolved_reads
+                            || e.defer_at_time0
+                            || e.cold.time0_effects
+                            || compiled.has_fallback
+                            || !insn_ok(compiled)
+                            || !self.block_signals_fit_u64(compiled)
+                        {
+                            return None;
+                        }
+                        let lowered = super::bytecode::lower_two_state(
+                            compiled,
+                            &self.signal_widths,
+                            &self.signal_signed,
+                            &self.signal_real,
+                            &self.array_first_id,
+                        )?;
+                        let (reads, writes) =
+                            super::bytecode::ts_read_masks(&lowered.insns, &self.signal_widths)?;
+                        let &[(sig, mask)] = reads.as_slice() else {
+                            return None;
+                        };
+                        (sig as usize == source && writes.as_slice() == [dest as u32])
+                            .then_some((sig, mask))
+                    })();
+                    shared_masks.push(mask);
+                    class.push(mask.map(|_| 0u8));
+                    continue;
+                }
                 // A member that is not individually width-safe would poison
                 // its WHOLE fused region out of native compilation (the
                 // fused block inherits every member's signals, and the
@@ -4904,6 +4962,12 @@ impl Simulator {
                 if class[i].is_none() {
                     continue;
                 }
+                if shared_inputs {
+                    if i > 0 && shared_masks[i] == shared_masks[i - 1] {
+                        uf[i] = uf[i - 1];
+                    }
+                    continue;
+                }
                 // Borrow dance: collect the producer links first.
                 let links: Vec<usize> = entries[i]
                     .cold
@@ -4948,7 +5012,9 @@ impl Simulator {
                 // producer→consumer edges (idx as the deterministic
                 // tie-break); a cycle falls back to idx order for its
                 // remainder, which the kept feedback reads still converge.
-                let order: Vec<usize> = {
+                let order: Vec<usize> = if shared_inputs {
+                    members
+                } else {
                     let pos: HashMap<usize, usize> =
                         members.iter().enumerate().map(|(k, &m)| (m, k)).collect();
                     let mut indeg = vec![0usize; members.len()];

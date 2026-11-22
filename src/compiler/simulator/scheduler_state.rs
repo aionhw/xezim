@@ -284,6 +284,10 @@ pub(super) struct Sensitivity {
 pub(super) struct EdgeFanout {
     pub(super) posedge: Vec<usize>,
     pub(super) negedge: Vec<usize>,
+    #[serde(skip)]
+    pub(super) posedge_batches: Vec<edges::EdgeBatch>,
+    #[serde(skip)]
+    pub(super) negedge_batches: Vec<edges::EdgeBatch>,
     pub(super) anyedge: Vec<usize>,
     /// `@(edge x)` blocks — §9.4.2 LSB edge (posedge OR negedge of bit 0),
     /// NOT the whole-vector change that `anyedge` (`@(x)` level) fires on.

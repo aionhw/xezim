@@ -1487,11 +1487,46 @@ impl Simulator {
                 }
             }
         }
+        let batch_armed_edges =
+            std::env::var("XEZIM_ARMED_EDGE_BATCH").ok().as_deref() == Some("1");
+        let edge_block_count = self.edge_blocks.len();
         self.edge_blocks_by_sig = self
             .edge_signal_ids
             .iter()
-            .map(|sid| by_sid.remove(sid).unwrap_or_default())
+            .map(|sid| {
+                let mut fanout = by_sid.remove(sid).unwrap_or_default();
+                if batch_armed_edges {
+                    fanout.posedge_batches =
+                        edges::EdgeBatch::build(&fanout.posedge, edge_block_count);
+                    fanout.negedge_batches =
+                        edges::EdgeBatch::build(&fanout.negedge, edge_block_count);
+                }
+                fanout
+            })
             .collect();
+        if batch_armed_edges {
+            let mut fanouts = 0;
+            let mut members = 0;
+            let mut windows = 0;
+            for fanout in &self.edge_blocks_by_sig {
+                for (blocks, batches) in [
+                    (&fanout.posedge, &fanout.posedge_batches),
+                    (&fanout.negedge, &fanout.negedge_batches),
+                ] {
+                    if !batches.is_empty() {
+                        fanouts += 1;
+                        members += blocks.len();
+                        windows += batches.len();
+                    }
+                }
+            }
+            chatter!(
+                "[EVENT-EDGE] Batch plan: {} fanouts, {} members, {} windows",
+                fanouts,
+                members,
+                windows
+            );
+        }
         // Record which edge blocks carry an `iff` guard so check_edges can
         // evaluate it (LRM §9.4.2.3) without scanning every block each tick.
         self.edge_blocks_with_iff = self

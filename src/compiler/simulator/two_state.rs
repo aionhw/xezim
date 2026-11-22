@@ -5,6 +5,43 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// Allow the guarded executor to handle eligible blocks without paying for
+    /// a second compilation. Its usual four-state fallback handles guard bails.
+    pub(super) fn filter_aot_candidates(
+        &self,
+        blocks: &[Option<super::bytecode::CompiledBlock>],
+        candidates: &mut [bool],
+        kind: &str,
+    ) {
+        if std::env::var("XEZIM_AOT_SKIP_TWO_STATE").as_deref() != Ok("1")
+            || std::env::var("XEZIM_TWO_STATE").as_deref() == Ok("0")
+        {
+            return;
+        }
+        let mut skipped = 0;
+        for (candidate, block) in candidates.iter_mut().zip(blocks) {
+            if !*candidate {
+                continue;
+            }
+            if block.as_ref().is_some_and(|block| {
+                super::bytecode::lower_two_state(
+                    block,
+                    &self.signal_widths,
+                    &self.signal_signed,
+                    &self.signal_real,
+                    &self.array_first_id,
+                )
+                .is_some()
+            }) {
+                *candidate = false;
+                skipped += 1;
+            }
+        }
+        if std::env::var_os("XEZIM_JIT_VERBOSE").is_some() {
+            eprintln!("[AOT] skipped {skipped} {kind} entries handled by the two-state executor");
+        }
+    }
+
     /// Execute a comb entry through its cached dispatch plan. Returns true
     /// when the evaluation ran natively (two-state island or JIT); false
     /// means the caller must interpret this evaluation. Semantics are the
@@ -762,6 +799,125 @@ impl Simulator {
         }
     }
 
+    pub(super) const TS_SLICE_TRANSFER: u8 = 5;
+    pub(super) const TS_MUX_STREAM: u8 = 6;
+
+    /// A lowered conditional whose inputs and one partial write can be
+    /// evaluated without filling a VM register file. The stream starts with
+    /// the existing fused load of the selector and the true arm.
+    pub(super) fn is_mux_stream(insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        matches!(insns, [
+            LoadSigSigRange { dl, d: yes, .. },
+            SigRange { d: no, .. } | SigRangeW { d: no, .. },
+            Sel { d, c, a, b, .. },
+            RangeStore { s, .. } | RangeStoreW { s, .. },
+        ] if dl == c && yes == a && no == b && d == s
+            && dl != yes && dl != no && yes != no)
+    }
+
+    /// Preserve the ordinary stream's X-read bails and range write hooks.
+    /// A bail happens before the only store, so the X-plane fallback can
+    /// execute the unmodified stream.
+    fn exec_mux_stream(&mut self, insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        let [
+            LoadSigSigRange {
+                sig,
+                sig2,
+                lo,
+                mask,
+                ..
+            },
+            no,
+            Sel { m, .. },
+            store,
+        ] = insns
+        else {
+            unreachable!("lowered mux stream");
+        };
+        let planes = |id: u32| {
+            self.signal_inline_bits.get(id as usize).map_or_else(
+                || self.signal_table[id as usize].raw_bits(),
+                |bits| (bits[0], bits[1]),
+            )
+        };
+        let (selector, sx) = planes(*sig);
+        let (yes, yx) = planes(*sig2);
+        let yes = (yes >> lo) & mask;
+        let (no, nx) = match *no {
+            SigRange { sig, lo, mask, .. } => {
+                let (value, unknown) = planes(sig);
+                ((value >> lo) & mask, unknown)
+            }
+            SigRangeW { sig, lo, w, .. } => {
+                Self::raw_bits_slice(&self.signal_table[sig as usize], lo, w)
+            }
+            _ => unreachable!("lowered mux false arm"),
+        };
+        if sx | yx | nx != 0 {
+            self.ts_xread_bail = true;
+            return false;
+        }
+        let value = (if selector != 0 { yes } else { no }) & m;
+        match *store {
+            RangeStore {
+                sig, hi, lo, mask, ..
+            } => {
+                self.ts_range_store(sig as usize, value & mask, lo, hi);
+            }
+            RangeStoreW {
+                sig, hi, lo, mask, ..
+            } => {
+                self.ts_wide_range_store(sig as usize, lo, hi, value & mask, 0);
+            }
+            _ => unreachable!("lowered mux destination"),
+        }
+        true
+    }
+
+    /// A complete blocking transfer needs no VM registers. Both variants
+    /// of the load and store must refer to the same temporary.
+    pub(super) fn is_slice_transfer(insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        matches!(insns,
+            [SigRange { d, .. } | SigRangeW { d, .. },
+             RangeStore { s, .. } | RangeStoreW { s, .. }] if d == s)
+    }
+
+    fn exec_slice_transfer(&mut self, insns: &[super::bytecode::TsInsn]) -> bool {
+        use super::bytecode::TsInsn::*;
+        let (value, unknown) = match insns[0] {
+            SigRange { sig, lo, mask, .. } => {
+                let (v, x) = self.signal_table[sig as usize].raw_bits();
+                ((v >> lo) & mask, (x >> lo) & mask)
+            }
+            SigRangeW { sig, lo, w, .. } => {
+                Self::raw_bits_slice(&self.signal_table[sig as usize], lo, w)
+            }
+            _ => unreachable!("slice-transfer source"),
+        };
+        if unknown != 0 {
+            // Use the same X-plane or four-state fallback as a stream load.
+            self.ts_xread_bail = true;
+            return false;
+        }
+        match insns[1] {
+            RangeStore {
+                sig, hi, lo, mask, ..
+            } => {
+                self.ts_range_store(sig as usize, value & mask, lo, hi);
+            }
+            RangeStoreW {
+                sig, hi, lo, mask, ..
+            } => {
+                self.ts_wide_range_store(sig as usize, lo, hi, value & mask, 0);
+            }
+            _ => unreachable!("slice-transfer destination"),
+        }
+        true
+    }
+
     /// `ts_guard_and_exec` for a comb entry whose lowered stream lives in the
     /// arena (`ts_arena` / `ts_hdr`): one dense header load and a contiguous
     /// instruction slice instead of an `Arc` deref plus a per-block heap
@@ -790,7 +946,12 @@ impl Simulator {
         };
         let save_base = self.ts_save_list.len();
         self.ts_cur_eidx = eidx as u32;
-        if !self.exec_two_state_parts(insns, h.num_regs as u32, h.kind()) {
+        let ok = match h.kind() {
+            Self::TS_SLICE_TRANSFER => self.exec_slice_transfer(insns),
+            Self::TS_MUX_STREAM if self.ts_mux_stream_on => self.exec_mux_stream(insns),
+            kind => self.exec_two_state_parts(insns, h.num_regs as u32, kind),
+        };
+        if !ok {
             self.ts_restore_saved(save_base);
             if std::mem::take(&mut self.ts_xread_bail) {
                 if self.tsx_on
@@ -865,7 +1026,7 @@ impl Simulator {
             self.dirty_any = true;
         }
         self.table_modified = true;
-        self.after_signal_write(id);
+        self.after_signal_write_premirrored(id);
     }
 
     /// Non-blocking twin of `ts_wide_range_store2`.
@@ -2755,12 +2916,24 @@ impl Simulator {
         let (v, x) = self.ts_scrub_two_state(id, v, x);
         let entry: &mut Value = unsafe { self.signal_table.get_unchecked_mut(id) };
         let (base_v, base_x) = entry.raw_bits();
-        let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, v, x, lo, hi);
-        if new_v == base_v && new_x == base_x {
+        let (new_v, new_x, mut chg) = if self.ts_range_delta {
+            if hi < lo {
+                return;
+            }
+            // Apply the changed bits directly, keeping every other bit of
+            // both planes, including unused inline storage, unchanged.
+            let width = hi - lo + 1;
+            let mask = (u64::MAX >> 64u32.saturating_sub(width)) << lo;
+            let dv = (base_v ^ (v << lo)) & mask;
+            let dx = (base_x ^ (x << lo)) & mask;
+            (base_v ^ dv, base_x ^ dx, dv | dx)
+        } else {
+            let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, v, x, lo, hi);
+            (new_v, new_x, (new_v ^ base_v) | (new_x ^ base_x))
+        };
+        if chg == 0 {
             return;
         }
-        // An inline (<= 64-bit) destination changed exactly these bits.
-        let mut chg = (new_v ^ base_v) | (new_x ^ base_x);
         if !entry.set_inline_bits(new_v, new_x) {
             let mut val = Value::from_inline(new_v, new_x, self.signal_widths[id]);
             val.is_signed = self.signal_signed[id];
@@ -2843,7 +3016,7 @@ impl Simulator {
             self.dirty_any = true;
         }
         self.table_modified = true;
-        self.after_signal_write(id);
+        self.after_signal_write_premirrored(id);
     }
 
     pub(super) fn ts_restore_saved(&mut self, base: usize) {
@@ -2882,7 +3055,7 @@ impl Simulator {
                         self.dirty_any = true;
                     }
                     self.table_modified = true;
-                    self.after_signal_write(id);
+                    self.after_signal_write_premirrored(id);
                 }
                 continue;
             }
@@ -2905,7 +3078,7 @@ impl Simulator {
                 self.dirty_any = true;
             }
             self.table_modified = true;
-            self.after_signal_write(id);
+            self.after_signal_write_premirrored(id);
         }
     }
 
@@ -3046,18 +3219,35 @@ impl Simulator {
         if let Some(i) = self.nba_fast_index.get(id) {
             self.nba_fast[i].value.splice_bits64(lo as usize, v, 0, n);
         } else {
-            let mut nv = self.signal_table[id].clone();
-            if !nv.splice_bits64(lo as usize, v, 0, n) {
+            // A quiet NBA needs no owned copy of the wide destination. Read
+            // just the addressed planes, including X/Z clears. A prior queued
+            // write must instead be merged above to preserve NBA ordering.
+            let current = &self.signal_table[id];
+            let width = n
+                .min(64)
+                .min((current.width as usize).saturating_sub(lo as usize));
+            if width == 0
+                || current.slice_bits_swar(lo as usize, width)
+                    == (v & (u64::MAX >> (64 - width)), 0)
+            {
                 self.prof_nba_elided += 1;
-            } else {
-                nv.is_signed = self.signal_signed[id];
-                self.nba_fast_index.insert(id, self.nba_fast.len());
-                self.nba_fast.push(NbaFast {
-                    block_index: 0,
-                    signal_id: id,
-                    value: nv,
-                });
+                if self.profile_report {
+                    self.prof_wide_nba_quiet += 1;
+                }
+                return;
             }
+            if self.profile_report {
+                self.prof_wide_nba_cloned += 1;
+            }
+            let mut nv = current.clone();
+            nv.splice_bits64(lo as usize, v, 0, n);
+            nv.is_signed = self.signal_signed[id];
+            self.nba_fast_index.insert(id, self.nba_fast.len());
+            self.nba_fast.push(NbaFast {
+                block_index: 0,
+                signal_id: id,
+                value: nv,
+            });
         }
     }
 
@@ -3088,7 +3278,7 @@ impl Simulator {
             self.dirty_any = true;
         }
         self.table_modified = true;
-        self.after_signal_write(id);
+        self.after_signal_write_premirrored(id);
     }
 
     /// Non-blocking twin of `ts_wide_range_fill`: fill the window in the
@@ -5657,7 +5847,7 @@ impl Simulator {
         // signals as u64 and silently truncate wider values; refuse to
         // JIT those blocks so the interpreter (which preserves full
         // Value width) handles them.
-        let block_jit_safe: Vec<bool> = if enable_jit {
+        let mut block_jit_safe: Vec<bool> = if enable_jit {
             self.compiled_edge_blocks
                 .iter()
                 .map(|cb_opt| match cb_opt {
@@ -5681,6 +5871,9 @@ impl Simulator {
                     }
                 }
             }
+        }
+        if enable_jit && std::env::var("XEZIM_AOT").as_deref() == Ok("1") {
+            self.filter_aot_candidates(&self.compiled_edge_blocks, &mut block_jit_safe, "edge");
         }
         if enable_jit {
             // Single backend: cranelift. (An LLVM backend once existed

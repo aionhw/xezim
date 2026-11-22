@@ -32,12 +32,20 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "AOT: rustc opt-level for the generated crate (0-3, default 2)",
     ),
     (
+        "XEZIM_AOT_SKIP_TWO_STATE",
+        "AOT: omit native comb and edge bodies eligible for the guarded two-state executor (1 enables)",
+    ),
+    (
         "XEZIM_AOT_TEMPLATE",
         "AOT: dedup structurally identical blocks into shared template bodies (1 enables)",
     ),
     (
         "XEZIM_ARMED_EDGE",
         "Edge engine: force ARMED edge-detection mode on/off (0/1)",
+    ),
+    (
+        "XEZIM_ARMED_EDGE_BATCH",
+        "Edge engine: filter dense posedge/negedge fanout in batches of eight armed flags (1 enables)",
     ),
     (
         "XEZIM_ARMED_EDGE_MASKS",
@@ -262,6 +270,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_CTL_MASK",
         "Scheduling: an AND/OR gate whose other input holds the controlling value skips its high-fanout (clock) input; 0 disables",
+    ),
+    (
+        "XEZIM_CTL_MUX",
+        "Scheduling: omit eligible continuous mux evaluations whose selected value already matches the output (1 enables)",
     ),
     (
         "XEZIM_CYCLE_CENSUS",
@@ -797,7 +809,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_REGIONS",
-        "Comb settle: fuse dependency-connected compiled comb entries into region blocks (1 enables)",
+        "Comb settle: fuse dependency-connected entries (1) or adjacent continuous assignments with identical input bits (shared)",
     ),
     (
         "XEZIM_REGION_GATES",
@@ -868,6 +880,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_SETTLE_LEVELS",
         "Settle: print levelization depth of the comb graph",
+    ),
+    (
+        "XEZIM_SETTLE_POP_WORD",
+        "Scheduling: select the next injected entry from the bitmap word already read (1 enables)",
     ),
     (
         "XEZIM_SPLIT_CENSUS",
@@ -956,6 +972,14 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_TS_JIT_RESERVE_MB",
         "Two-state native code: size of the reserved code region (default 256)",
+    ),
+    (
+        "XEZIM_TS_MUX_STREAM",
+        "Two-state: execute an eligible arena mux without VM temporaries (1 enables)",
+    ),
+    (
+        "XEZIM_TS_RANGE_DELTA",
+        "Two-state: compute packed range changes directly from XOR deltas (1 enables)",
     ),
     (
         "XEZIM_TS_WIDE512",

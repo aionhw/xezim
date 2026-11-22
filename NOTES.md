@@ -12,6 +12,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 - Experimental `XEZIM_ARMED_EDGE_MASKS=1` lets a write to a shared bus
   skip arming clocked blocks that only read unaffected slices.
+- Experimental switches for the two-state mux evaluator
+  (`XEZIM_TS_MUX_STREAM`), the injected worklist bitmap
+  (`XEZIM_SETTLE_POP_WORD`), and partial-range write masks
+  (`XEZIM_TS_RANGE_DELTA`).
+- Experimental `XEZIM_CTL_MUX=1` skips a compiled continuous mux body when
+  its known selector picks data already present in its output slice.
+- Experimental `XEZIM_ARMED_EDGE_BATCH=1` checks groups of armed blocks at
+  dense clock fanouts and queues only the blocks that need to run.
 
 **Command line**
 

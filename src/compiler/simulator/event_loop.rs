@@ -3000,6 +3000,12 @@ impl Simulator {
             self.prof_clocks_only_detect,
             self.prof_nba_elided
         );
+        if self.profile_report {
+            eprintln!(
+                "[PROF] wide_partial_nba quiet={} cloned={}",
+                self.prof_wide_nba_quiet, self.prof_wide_nba_cloned
+            );
+        }
         if self.prof_par_ticks > 0 {
             chatter!(
                 "[PROF] parallel_dispatch ticks={} blocks={} (their insns are NOT counted in insns= below — isolated dispatch)",
@@ -3015,6 +3021,9 @@ impl Simulator {
         self.dump_cycle_census();
         self.dump_chain_census();
         self.dump_coact_census();
+        if self.mux_guard_on {
+            chatter!("[CTL-MUX] skipped evaluations={}", self.prof_mux_skipped);
+        }
         chatter!(
             "[PROF] edge_detect={:.1}ms edge_exec={:.1}ms edges_fired={} insns={} ns_per_insn={:.1} fallbacks={}",
             self.prof_edge_detect as f64 / 1e6,
@@ -3366,12 +3375,40 @@ impl Simulator {
                 "other",
             ];
             let mut hist = [0u64; 12];
+            let mut transfer_entries = 0usize;
+            let mut transfer_evals = 0u64;
+            let mut mux_entries = 0usize;
+            let mut mux_evals = 0u64;
             for (e, &c) in self.prof_entry_counts.iter().enumerate() {
                 if c != 0 {
+                    if self
+                        .ts_hdr
+                        .get(e)
+                        .is_some_and(|h| h.kind() == Self::TS_SLICE_TRANSFER)
+                    {
+                        transfer_entries += 1;
+                        transfer_evals += c;
+                    }
+                    if self
+                        .ts_hdr
+                        .get(e)
+                        .is_some_and(|h| h.kind() == Self::TS_MUX_STREAM)
+                    {
+                        mux_entries += 1;
+                        mux_evals += c;
+                    }
                     if let Some(ent) = self.comb_entries.get(e) {
                         hist[Self::entry_hist_kind(&ent.item)] += c;
                     }
                 }
+            }
+            if transfer_entries != 0 {
+                eprintln!(
+                    "[PROF] slice-transfer entries={transfer_entries} entry_evals={transfer_evals}"
+                );
+            }
+            if mux_entries != 0 {
+                eprintln!("[PROF] mux-stream entries={mux_entries} entry_evals={mux_evals}");
             }
             self.prof_entry_hist = hist;
             let tot: u64 = self.prof_entry_hist.iter().sum();

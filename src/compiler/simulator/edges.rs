@@ -4,6 +4,106 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// A clock fanout's membership in an eight-byte window of armed flags.
+/// One low bit per byte denotes a member. Windows and members follow the
+/// original block order, including when the last window overlaps its neighbor.
+#[derive(Debug, Clone)]
+pub(super) struct EdgeBatch {
+    start: usize,
+    members: u64,
+}
+
+impl EdgeBatch {
+    pub(super) fn build(blocks: &[usize], block_count: usize) -> Vec<Self> {
+        // Preserve scalar accounting for duplicate sensitivity terms and keep
+        // short fanouts on the cheaper per-member path.
+        if blocks.len() < 32 || !blocks.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Vec::new();
+        }
+        let mut batches: Vec<Self> = Vec::new();
+        for &block in blocks {
+            let start = (block & !7).min(block_count - 8);
+            if batches.last().is_none_or(|batch| batch.start != start) {
+                batches.push(Self { start, members: 0 });
+            }
+            batches.last_mut().unwrap().members |= 1 << ((block - start) * 8);
+        }
+        // A sparse list wastes the word loads and mask iteration.
+        if batches.len() <= blocks.len() / 4 {
+            batches
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[inline]
+    fn enqueue(
+        batches: &[Self],
+        fanout_len: usize,
+        armed: &[u8],
+        triggered_bitmap: &mut [bool],
+        triggered: &mut Vec<usize>,
+    ) -> u64 {
+        let mut eligible = 0;
+        for batch in batches {
+            let flags = u64::from_le_bytes(armed[batch.start..][..8].try_into().unwrap());
+            // Either EDGE_ARMED or EDGE_HOLD keeps a lane eligible. Fold the
+            // two bits into its low bit, then visit only eligible members.
+            let mut active = (flags | (flags >> 1)) & batch.members;
+            while active != 0 {
+                let block = batch.start + active.trailing_zeros() as usize / 8;
+                active &= active - 1;
+                eligible += 1;
+                if !triggered_bitmap[block] {
+                    triggered_bitmap[block] = true;
+                    triggered.push(block);
+                }
+            }
+        }
+        // Count eligibility before trigger dedup, as the scalar scan does.
+        (fanout_len - eligible) as u64
+    }
+}
+
+#[cfg(test)]
+mod edge_batch_tests {
+    use super::*;
+
+    #[test]
+    fn dense_fanout_preserves_scalar_order_and_skip_count() {
+        let blocks: Vec<_> = (0..16).chain(19..43).collect();
+        let batches = EdgeBatch::build(&blocks, 43);
+        assert!(!batches.is_empty());
+        let mut flags = [0; 43];
+        for (block, flag) in [
+            (0, EDGE_ARMED),
+            (5, EDGE_HOLD),
+            (8, EDGE_ARMED),
+            (17, EDGE_ARMED), // Outside the fanout.
+            (19, EDGE_ARMED | EDGE_HOLD),
+            (40, EDGE_HOLD),
+            (42, EDGE_ARMED),
+        ] {
+            flags[block] = flag;
+        }
+        let mut triggered = vec![8];
+        let mut bitmap = [false; 43];
+        bitmap[8] = true;
+        let skipped = EdgeBatch::enqueue(&batches, blocks.len(), &flags, &mut bitmap, &mut triggered);
+        assert_eq!(triggered, [8, 0, 5, 19, 40, 42]);
+        assert_eq!(skipped, 34);
+    }
+
+    #[test]
+    fn sparse_and_duplicate_fanouts_use_scalar_path() {
+        let sparse: Vec<_> = (0..32).map(|block| block * 8).collect();
+        assert!(EdgeBatch::build(&sparse, 256).is_empty());
+        let mut duplicate: Vec<_> = (0..32).collect();
+        duplicate.insert(8, 7);
+        assert!(EdgeBatch::build(&duplicate, 32).is_empty());
+    }
+}
+
 impl Simulator {
     /// Group edge-sensitive signals that are exact copies of the same driver.
     ///
@@ -1868,6 +1968,7 @@ impl Simulator {
         let stats_on = self.edge_block_stats_enabled;
         let scan_stats = self.edge_scan_stats;
         let clktree_probe = self.clktree_probe;
+        let batch_prefilter = armed_prefilter && !stats_on && !iff_active;
         // Accumulated in registers and folded back after the loop — a `self`
         // counter incremented in the body is another store LLVM has to order
         // against the table loads.
@@ -2141,13 +2242,33 @@ impl Simulator {
                 }};
             }
             if fires_pos {
-                for &block_idx in &fanout.posedge {
-                    dispatch_block!(block_idx, EdgeKind::Posedge);
+                if batch_prefilter && !fanout.posedge_batches.is_empty() {
+                    prefiltered += EdgeBatch::enqueue(
+                        &fanout.posedge_batches,
+                        fanout.posedge.len(),
+                        blk_armed,
+                        triggered_bitmap,
+                        &mut triggered,
+                    );
+                } else {
+                    for &block_idx in &fanout.posedge {
+                        dispatch_block!(block_idx, EdgeKind::Posedge);
+                    }
                 }
             }
             if fires_neg {
-                for &block_idx in &fanout.negedge {
-                    dispatch_block!(block_idx, EdgeKind::Negedge);
+                if batch_prefilter && !fanout.negedge_batches.is_empty() {
+                    prefiltered += EdgeBatch::enqueue(
+                        &fanout.negedge_batches,
+                        fanout.negedge.len(),
+                        blk_armed,
+                        triggered_bitmap,
+                        &mut triggered,
+                    );
+                } else {
+                    for &block_idx in &fanout.negedge {
+                        dispatch_block!(block_idx, EdgeKind::Negedge);
+                    }
                 }
             }
             if fires_any {
