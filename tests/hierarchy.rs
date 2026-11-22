@@ -567,3 +567,5 @@ mod deferred_callable_paths_193;
 mod two_state_scalar_targets;
 #[path = "hierarchy/top_ansi_packed_ports.rs"]
 mod top_ansi_packed_ports;
+#[path = "hierarchy/signed_port_unsigned_actual.rs"]
+mod signed_port_unsigned_actual;
