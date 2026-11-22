@@ -28,7 +28,6 @@ endmodule
 }
 
 #[test]
-#[ignore = "open: an interpreted foreach over a class-property queue of fixed rows reads 0, also on main (§7.4.5, #1468)"]
 fn whole_row_update_is_visible_inside_the_owning_method() {
     let result = xezim::simulate(
         r#"module top;
