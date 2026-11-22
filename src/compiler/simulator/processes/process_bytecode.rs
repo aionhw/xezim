@@ -94,7 +94,7 @@ impl Simulator {
                 }
                 let name = self.constant_selected_storage(base)?;
                 let (scope, _) = name.rsplit_once('.')?;
-                if !self.module.instances.iter().any(|i| i.path == scope) {
+                if !self.instance_by_path(&*scope).is_some() {
                     return None;
                 }
                 (name, path.first()?.name.name.clone())

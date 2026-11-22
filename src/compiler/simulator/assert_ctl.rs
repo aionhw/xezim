@@ -484,7 +484,7 @@ impl Simulator {
             return None;
         }
         let known = |p: &str| -> bool {
-            self.module.instances.iter().any(|i| i.path == p)
+            self.instance_by_path(&*p).is_some()
                 || self.sva_sites.iter().any(|s| {
                     let id = &s.ctl.ident;
                     id.scope == p
@@ -504,7 +504,7 @@ impl Simulator {
                     return Some(rest.to_string());
                 }
             }
-        } else if self.module.instances.iter().any(|i| i.path == segs[0]) {
+        } else if self.instance_by_path(&*segs[0]).is_some() {
             return Some(path);
         }
         // Upward from the calling scope.

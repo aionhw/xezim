@@ -889,7 +889,7 @@ pub(super) fn vpi_scope_path(sim: &Simulator, h: &VpiHandle) -> String {
 /// (a 1-bit placeholder so validation recognises the name). Those must not
 /// appear as VPI signal objects — they are module instances.
 fn vpi_is_instance_name(sim: &Simulator, name: &str) -> bool {
-    sim.module.instances.iter().any(|i| i.path == name)
+    sim.instance_by_path(&*name).is_some()
 }
 
 /// Resolve a packed-struct member path (`pixel_data.r`) to its bit range.
@@ -2112,7 +2112,7 @@ fn dpi_scope_timescale(sim: &Simulator, scope: *mut libc::c_void) -> (i32, i32) 
     let rel = vpi_strip_top(sim, &name);
     let def = if rel.is_empty() || name == sim.module.name {
         sim.module.name.clone()
-    } else if let Some(inst) = sim.module.instances.iter().find(|i| i.path == rel) {
+    } else if let Some(inst) = sim.instance_by_path(&*rel) {
         inst.def_name.clone()
     } else if sim.module.module_timescale_exp.contains_key(name.as_str()) {
         name
