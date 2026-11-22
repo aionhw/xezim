@@ -43,8 +43,10 @@ how to use them together, see the [user guide](user-guide.md).
 | `--no-cache` | Disable the automatic elaborated-design cache |
 | `-l`, `--log <file>` | Redirect all stdout/stderr — including DPI/VPI C output — to a log file |
 | `--tee <file>` | Copy stdout/stderr, including DPI/VPI C output, to a log file while retaining each stream on the console |
-| `-v <file>` | Library file: modules compiled only to resolve unresolved instantiations. A library file is preprocessed with the macros of the design files and of the library files read before it, and the macros it defines stay defined for the library files read after it (§22.5.1). Bytes that are not UTF-8 (a Latin-1 comment) are replaced, not a reason to drop the file |
+| `-v <file>` | Library file: modules compiled only to resolve unresolved instantiations. A library file is preprocessed with the command-line defines (`+define+`, `-D`) only: no macro of a source file or of another library file reaches it, as in the reference simulator (§22.5.1, §3.12.1). Bytes that are not UTF-8 (a Latin-1 comment) are replaced, not a reason to drop the file |
 | `-y <dir>` | Library directory: `<module>.<ext>` loaded on demand, preprocessed like a `-v` file |
+| `--carry-src-macros` | A `-v`/`-y` library file also starts from the macros the source files left defined |
+| `--carry-lib-macros` | As `--carry-src-macros`, and the macros a library file defines (itself or through an `` `include ``) stay defined for the library files read after it: `-v` files in command-line order, `-y` files in the order their modules are resolved. With both switches, this one applies |
 | `+libext+<ext>+…` | Extension list for `-y` search (replaces the default `.v`/`.sv`/`.V`) |
 | `+nospecify` | Suppress specify-block path delays and timing checks — zero-delay gate simulation (`-nospecify` also accepted) |
 | `+notimingcheck` | Disable the specify-block timing checks (`$setup`, `$hold`, `$width`, …; also `+notimingchecks`/`-notimingchecks`). A violation otherwise prints one `** Error:` line (counted by `--error-exit`) and toggles the check's notifier |

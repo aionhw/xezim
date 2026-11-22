@@ -412,9 +412,9 @@ Note `--parse` above: the dump is produced before elaboration, so a design whose
 elaboration takes minutes still dumps in seconds. Only the step that appends
 adopted `-v`/`-y` library files needs `--compile` or `--simulate`. The appended
 text of a library file is the text the build read: it is preprocessed with the
-macros of the design files and of the library files read before it, and the
-macros it defines stay defined for the library files read after it
-(§22.5.1).
+command-line defines only, or with `--carry-src-macros` also with the macros
+of the design files, or with `--carry-lib-macros` also with those of the
+library files read before it (§22.5.1).
 
 ## Module-timescale extension
 
