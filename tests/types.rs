@@ -388,6 +388,8 @@ mod unpacked_array_slices_867;
 mod unpacked_indexed_slice_size_869;
 #[path = "types/unpacked_struct_array_continuous_copy.rs"]
 mod unpacked_struct_array_continuous_copy;
+#[path = "types/review_struct_array_whole_copies.rs"]
+mod review_struct_array_whole_copies;
 #[path = "types/unpacked_struct_array_members.rs"]
 mod unpacked_struct_array_members;
 #[path = "types/unpacked_struct_func_arg.rs"]
