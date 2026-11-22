@@ -3600,7 +3600,11 @@ impl Simulator {
                 return self.instantiate_covergroup(&cg_def, args);
             }
             // DPI import call — through an instance path (`u_a.c_fn()`), the
-            // call runs in that instance's scope (§35.5.3).
+            // call runs in that instance's scope (§35.5.3). The prefix is
+            // looked up in the sorted instance index: every dotted call that
+            // gets this far comes here, a package call `p::f()` among them,
+            // and scanning every instance per call was a measurable part of
+            // a run on a design with thousands.
             let via: Option<String> = (hier.path.len() > 1)
                 .then(|| {
                     hier.path[..hier.path.len() - 1]
@@ -3609,7 +3613,7 @@ impl Simulator {
                         .collect::<Vec<_>>()
                         .join(".")
                 })
-                .filter(|p| self.module.instances.iter().any(|i| &i.path == p));
+                .filter(|p| self.instance_by_path(p).is_some());
             if let Some(v) = self.exec_dpi_import_call_in(name, args, via.as_deref()) {
                 return v;
             }

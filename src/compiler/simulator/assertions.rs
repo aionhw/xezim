@@ -3872,7 +3872,7 @@ impl Simulator {
                 .strip_prefix(top)
                 .map(|r| r.trim_start_matches('.'))
                 .unwrap_or(cur);
-            if rel.is_empty() || self.module.instances.iter().any(|i| i.path == rel) {
+            if rel.is_empty() || self.instance_by_path(&*rel).is_some() {
                 return None;
             }
             match cur.rfind('.') {

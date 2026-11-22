@@ -208,7 +208,7 @@ impl Simulator {
             .map(|s| s.name.name.as_str())
             .collect::<Vec<_>>()
             .join(".");
-        if !self.module.instances.iter().any(|i| i.path == prefix) {
+        if !self.instance_by_path(&*prefix).is_some() {
             return None;
         }
         let name = self

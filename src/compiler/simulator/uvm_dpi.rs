@@ -1013,7 +1013,7 @@ impl Simulator {
         if name.is_empty() {
             return HdlLookup::Missing;
         }
-        if self.module.instances.iter().any(|i| i.path == name) {
+        if self.instance_by_path(&*name).is_some() {
             return HdlLookup::Scope;
         }
         if let Some(obj) = self.uvm_hdl_whole(name) {
