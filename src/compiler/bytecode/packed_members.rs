@@ -152,22 +152,46 @@ impl<'a> BytecodeCompiler<'a> {
     /// left to the interpreter. So is a local of the running frame (§23.9: a
     /// function's `int I` hides a module's `parameter I`), unless it is an
     /// unrolled loop's index, bound to a constant for this iteration.
+    ///
+    /// A literal or parameter is read at its own value (§11.5.1: an index
+    /// keeps its full width; `eval_const_bound` narrows to 32 bits, so
+    /// `e[64'h1_0000_0001]` was `e[1]`). One with an x or z bit, or one wider
+    /// than 64 bits, is left to the interpreter like any other index this
+    /// path cannot place.
     fn plain_const_index(&self, e: &Expression) -> Option<i64> {
         match &e.kind {
             ExprKind::Paren(inner) => self.plain_const_index(inner),
             ExprKind::Unary {
                 op: UnaryOp::Minus,
                 operand,
-            } if matches!(operand.kind, ExprKind::Number(_)) => self.eval_const_bound(e),
-            ExprKind::Number(_) => self.eval_const_bound(e),
+            } if matches!(operand.kind, ExprKind::Number(_)) => {
+                self.plain_const_index(operand)?.checked_neg()
+            }
+            ExprKind::Number(n) => Self::exact_index_value(&self.eval_number_static(n)?),
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
                 let name = h.path[0].name.name.as_str();
-                if !self.const_var_binds.contains_key(name) && self.frame_bound_target(e) {
+                if let Some(&v) = self.const_var_binds.get(name) {
+                    return Some(v as i64);
+                }
+                if self.frame_bound_target(e) {
                     return None;
                 }
-                self.eval_const_bound(e)
+                Self::exact_index_value(&self.lookup_param_value(h)?)
             }
             _ => None,
+        }
+    }
+
+    /// The value of a constant index of at most 64 bits with no x or z bit,
+    /// signed or unsigned as declared, when it fits in an `i64`.
+    fn exact_index_value(v: &Value) -> Option<i64> {
+        if v.has_xz() || v.width > 64 {
+            return None;
+        }
+        if v.is_signed {
+            v.to_i64()
+        } else {
+            v.to_u64().and_then(|u| i64::try_from(u).ok())
         }
     }
 
@@ -1287,9 +1311,10 @@ impl<'a> BytecodeCompiler<'a> {
             return true;
         };
         let leaf = var.rsplit_once('.').map_or(var, |(_, leaf)| leaf);
-        decls.get(var).or_else(|| decls.get(leaf)).is_none_or(|dt| {
-            !crate::compiler::elaborate::is_type_two_state_resolved(dt, types)
-        })
+        decls
+            .get(var)
+            .or_else(|| decls.get(leaf))
+            .is_none_or(|dt| !crate::compiler::elaborate::is_type_two_state_resolved(dt, types))
     }
 
     /// §7.2.1, §6.11.3: the signedness of `member` (a dotted path) of the
