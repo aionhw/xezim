@@ -162,6 +162,8 @@ mod queue_concat_index_prefilled_prefix;
 mod std_randomize_multidim;
 #[path = "collections/queue_struct_pop.rs"]
 mod queue_struct_pop;
+#[path = "collections/queue_of_fixed_rows_pop.rs"]
+mod queue_of_fixed_rows_pop;
 #[path = "collections/deferred_retsnap_slow_path.rs"]
 mod deferred_retsnap_slow_path;
 #[path = "collections/assoc_locator_methods.rs"]
