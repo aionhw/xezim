@@ -910,3 +910,5 @@ mod negative_packed_element_read;
 
 #[path = "types/nested_two_state_packed_member.rs"]
 mod nested_two_state_packed_member;
+#[path = "types/unit_member_vs_unimported_package.rs"]
+mod unit_member_vs_unimported_package;
