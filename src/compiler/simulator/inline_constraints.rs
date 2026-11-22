@@ -2072,14 +2072,14 @@ impl Simulator {
             ranges.to_vec()
         };
         for _ in 0..64 {
-            let (lo, hi) = full[self.rng.gen_range(0..full.len())];
+            let (lo, hi) = full[self.cur_rng().gen_range(0..full.len())];
             if hi < lo {
                 continue;
             }
             let v = if lo == hi {
                 lo
             } else {
-                self.rng.gen_range(lo..=hi)
+                self.cur_rng().gen_range(lo..=hi)
             };
             if !used.contains(&v) {
                 return Some(v);
