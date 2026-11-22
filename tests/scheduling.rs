@@ -577,3 +577,5 @@ mod indexed_member_event;
 
 #[path = "scheduling/variable_assign_delay.rs"]
 mod variable_assign_delay;
+#[path = "scheduling/level_always_waits_for_writer.rs"]
+mod level_always_waits_for_writer;

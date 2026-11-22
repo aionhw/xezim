@@ -256,9 +256,13 @@ module top;
     north_bus[1] = 8'h22;
     north_bus[2] = 8'h33;
     north_bus[3] = 8'h44;
-
-    // The first write changes active_slots from four to two. A mutable bound
-    // must remain element-wise so only slots zero and one are written.
+    // active_slots is another process's output (§9.2.2.2): it stays four
+    // until this block suspends, although the first write would make it two.
+    // The fill reads a signal as its bound, so it must still stay element-wise;
+    // all four slots are written. The `#1` lets always_comb's time-0 run
+    // (§9.2.2.2.2) set the bound first; §9.2.2.2.2 does not order that run
+    // against this block's first writes.
+    #1;
     adaptive_bus = '0;
     for (int slot = 0; slot < active_slots; slot++)
       adaptive_bus[slot] = 8'hff;
@@ -266,7 +270,7 @@ module top;
     #4;
     check = (south_bus === 32'h4433_2211)
          && (ordered_bus === base_bus)
-         && (adaptive_bus === 32'h0000_ffff);
+         && (adaptive_bus === 32'hffff_ffff);
     $display("CHECK=%0d", check);
     $finish;
   end
