@@ -8,6 +8,25 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+**Command line**
+
+* A `-v`/`-y` library file is preprocessed with the command-line defines
+  (`+define+`, `-D`) only, as in the reference simulator, so library files no
+  longer see source-file macros unless `--carry-src-macros` is given.
+  `--carry-lib-macros` also keeps a library file's macros defined for the
+  library files read after it, which was the default in 0.11.7. A library
+  file that uses such a macro gets a note naming the switch (§22.5.1, §3.12.1,
+  aionhw/xezim-core#279).
+
+**Maintenance**
+
+* The largest sources are split into modules by pure moves, so every file
+  can be read on GitHub: core `elaborate.rs` (2.9 MB) into `src/elaborate/`,
+  the parser's `parse/items.rs`, and the simulator's `bytecode.rs`,
+  `simulator.rs`, `rand_csp.rs`, `expressions.rs`, `statements.rs`,
+  `assignments.rs` and `processes.rs`. Public paths, behavior and the cache
+  formats are unchanged (#961, raised by philipaxer).
+
 ### 0.11.7 — lower elaboration memory, faster event waits and queues, DPI C sources and memory files, array and real-number correctness (November 2026)
 
 Large designs elaborate in much less memory: compilation-unit declarations,
