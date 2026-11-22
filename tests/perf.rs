@@ -90,3 +90,5 @@ mod local_select_width_chain;
 mod fallback_hotspots;
 #[path = "perf/process_memory_paths.rs"]
 mod process_memory_paths;
+#[path = "perf/packed_member_path_read.rs"]
+mod packed_member_path_read;
