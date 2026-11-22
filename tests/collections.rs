@@ -421,3 +421,5 @@ mod queue_pop_drain_loop_1210;
 mod unpacked_concat_targets;
 #[path = "collections/concat_operand_effects.rs"]
 mod concat_operand_effects;
+#[path = "collections/review_queue_rows_dollar_pop.rs"]
+mod review_queue_rows_dollar_pop;
