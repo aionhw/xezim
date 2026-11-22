@@ -23,6 +23,8 @@ mod front_end_levers;
 mod loop_block_counters;
 #[path = "perf/packed_record_edge_loop.rs"]
 mod packed_record_edge_loop;
+#[path = "perf/packed_member_path_store.rs"]
+mod packed_member_path_store;
 #[path = "perf/wide_block_counters.rs"]
 mod wide_block_counters;
 #[path = "perf/x_plane_executor.rs"]
