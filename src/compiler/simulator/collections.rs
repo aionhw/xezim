@@ -3776,11 +3776,20 @@ impl Simulator {
         {
             return self.obj_rng.get_mut(&h).unwrap();
         }
+        // No private stream — fall through to the calling process's stream.
         let pid = self.current_pid;
         if self.proc_rng.contains_key(&pid) {
             return self.proc_rng.get_mut(&pid).unwrap();
         }
         &mut self.rng
+    }
+
+    /// §18.5.4, §18.13: the `dist` schedules of an object are dealt from its
+    /// stream, so they start over whenever the stream is seeded, captured or
+    /// restored. The draws that follow are then a function of that stream
+    /// state alone, and a reseed or `set_randstate` repeats them.
+    fn restart_dist_schedules(&mut self, handle: usize) {
+        self.dist_decks.retain(|(h, _), _| *h != handle);
     }
 
     /// §18.14 `srandom` / `get_randstate` / `set_randstate` on a *process*
@@ -3816,6 +3825,7 @@ impl Simulator {
                     self.proc_rng.insert(key, s);
                 } else {
                     self.obj_rng.insert(key, s);
+                    self.restart_dist_schedules(key);
                 }
                 Some(Value::zero(32))
             }
@@ -3840,6 +3850,9 @@ impl Simulator {
                         fresh
                     }
                 };
+                if !is_process {
+                    self.restart_dist_schedules(key);
+                }
                 Some(Value::from_string(&s.to_state_string()))
             }
             // §18.14.2: restore a previously captured state — the stream then
@@ -3854,6 +3867,7 @@ impl Simulator {
                     self.proc_rng.insert(key, s);
                 } else {
                     self.obj_rng.insert(key, s);
+                    self.restart_dist_schedules(key);
                 }
                 Some(Value::zero(32))
             }
