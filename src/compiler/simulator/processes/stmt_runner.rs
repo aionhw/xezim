@@ -1854,6 +1854,16 @@ impl Simulator {
                 if self.wait_condition_true(condition) {
                     self.vc_release(condition);
                     self.cond_progress = self.cond_progress.wrapping_add(1);
+                    // §9.7.4: in `wait (c) @(posedge clk);` the statement
+                    // the condition guards is an event control. Run through
+                    // the synchronous `exec_statement` it could not park the
+                    // process, which was never resumed. It runs here as the
+                    // next statement, ahead of the rest.
+                    if self.stmt_is_blocking(body) {
+                        let cont = pc.pushed_body(body, pc.start + i + 1);
+                        self.continue_stmts_or_trampoline(pid, cont);
+                        return;
+                    }
                     self.exec_statement(body);
                     i += 1;
                     continue;
