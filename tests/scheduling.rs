@@ -562,6 +562,8 @@ mod parked_waiter_signal_index;
 mod replication_pattern_capture;
 #[path = "scheduling/nettype_relay_chain_1239.rs"]
 mod nettype_relay_chain_1239;
+#[path = "scheduling/sva_whole_array_sampled.rs"]
+mod sva_whole_array_sampled;
 #[path = "scheduling/time_literal_exact_1299.rs"]
 mod time_literal_exact_1299;
 #[path = "scheduling/intra_delay_array_items.rs"]
