@@ -1107,6 +1107,20 @@ impl Simulator {
             entry.fail_count += 1;
         }
     }
+    /// The pending `#0` reports alone (Observed region), counted before any
+    /// of their actions run; the `final` ones wait for the Postponed region.
+    pub(super) fn mature_deferred_observed(&mut self) {
+        let (zero, finals): (Vec<_>, Vec<_>) = std::mem::take(&mut self.deferred_asserts)
+            .into_iter()
+            .partition(|d| d.kind != crate::ast::stmt::DeferredAssertion::Final);
+        self.deferred_asserts = finals;
+        if !self.finished {
+            for d in &zero {
+                self.count_deferred_report(d);
+            }
+        }
+        self.run_deferred_actions(zero);
+    }
 
     /// The actions of matured deferred reports (see `mature_deferred_asserts`).
     fn run_deferred_actions(&mut self, group: Vec<DeferredReport>) {
