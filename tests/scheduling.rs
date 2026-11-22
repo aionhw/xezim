@@ -605,3 +605,5 @@ mod fork_children_before_nba;
 mod settle_edges_before_nba;
 #[path = "scheduling/level_always_waits_for_writer.rs"]
 mod level_always_waits_for_writer;
+#[path = "scheduling/review_sva_whole_array_shapes.rs"]
+mod review_sva_whole_array_shapes;
