@@ -609,3 +609,5 @@ mod level_always_waits_for_writer;
 mod review_sva_whole_array_shapes;
 #[path = "scheduling/review_foreach_hides_static.rs"]
 mod review_foreach_hides_static;
+#[path = "scheduling/forced_partial_stores.rs"]
+mod forced_partial_stores;
