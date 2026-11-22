@@ -518,6 +518,8 @@ mod bind_instance_lists_core_200;
 mod bind_instance_names_core_201;
 #[path = "hierarchy/instance_struct_members_root_1046.rs"]
 mod instance_struct_members_root_1046;
+#[path = "hierarchy/root_member_after_element_select.rs"]
+mod root_member_after_element_select;
 #[path = "hierarchy/shared_net_initializer_targets.rs"]
 mod shared_net_initializer_targets;
 #[path = "hierarchy/negative_genvar_cached.rs"]
