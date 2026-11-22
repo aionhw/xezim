@@ -9,7 +9,10 @@ impl Simulator {
     /// block or instance-array element (`$root.top.g[1].x`) is a scope whose
     /// constant index is part of that key, and keeps the name resolver's path.
     /// Nothing is evaluated or built.
-    pub(in crate::compiler::simulator) fn root_member_select_shape(&self, h: &HierarchicalIdentifier) -> bool {
+    pub(in crate::compiler::simulator) fn root_member_select_shape(
+        &self,
+        h: &HierarchicalIdentifier,
+    ) -> bool {
         h.path.len() >= 3
             && h.path[0].name.name == "$root"
             && h.path[..h.path.len() - 1]
@@ -19,7 +22,9 @@ impl Simulator {
     }
 
     /// Whether any select of `h` has a side effect (`i++`, a call).
-    pub(in crate::compiler::simulator) fn hier_has_effect_select(h: &HierarchicalIdentifier) -> bool {
+    pub(in crate::compiler::simulator) fn hier_has_effect_select(
+        h: &HierarchicalIdentifier,
+    ) -> bool {
         h.path.iter().any(|s| {
             s.selects
                 .iter()
@@ -168,7 +173,10 @@ impl Simulator {
     /// live object, when its elements are class handles: the element the
     /// width probes read for a select they must not evaluate. `None` when
     /// there is none, or the elements are not handles.
-    pub(in crate::compiler::simulator) fn root_member_probe_index(&self, base: &HierarchicalIdentifier) -> Option<i64> {
+    pub(in crate::compiler::simulator) fn root_member_probe_index(
+        &self,
+        base: &HierarchicalIdentifier,
+    ) -> Option<i64> {
         let name = self.resolve_hier_name(base);
         let name = name.as_ref();
         let holds_objects = self.module.var_decl_types.get(name).is_some_and(|dt| {
@@ -269,7 +277,6 @@ impl Simulator {
         let w = super::elaborate::resolve_type_width(&dt, params, Some(&self.module.typedefs));
         (w > 0).then_some(w)
     }
-
 
     /// Read fast path for a select-free single-segment identifier: the frame
     /// local of that name, else the plain property of `this`. Everything the
