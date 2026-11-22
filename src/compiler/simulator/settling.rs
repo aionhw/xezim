@@ -1712,6 +1712,22 @@ impl Simulator {
                 }
             };
         }
+        // A deferring settle lists the signals that change in it: first its
+        // seeds (the signals the process wrote), noted before seeding
+        // consumes their dirty marks, then each output an eager entry
+        // changes (`trigger_deps!`). `defer_listed` of them are in
+        // `deferred_proc_entries` already.
+        let defer_mode = self.proc_settle_defer;
+        let mut defer_changed = std::mem::take(&mut self.defer_changed);
+        defer_changed.clear();
+        let mut defer_listed = 0usize;
+        if defer_mode {
+            for &id in &self.dirty_list[..seed_dirty_len] {
+                if self.dirty_signals.get(id).copied().unwrap_or(false) {
+                    defer_changed.push(id);
+                }
+            }
+        }
         if self.ctl_sig.is_empty() {
             seed_dirty!(|_id: usize| false);
         } else {
@@ -1754,6 +1770,9 @@ impl Simulator {
         // such as `assign a[i][v][j] = '0;` — never evaluated at all, leaving
         // its net x for the whole run. UVM's parameterized-class registry
         // makes that early static-init settle happen in any UVM testbench.
+        // Nothing re-seeds the time-0 entries at the yield: one this settle
+        // seeds lists its reads if deferred.
+        let t0_seeded = self.time == 0 && !self.comb_time0_fired && num_entries > 0;
         if self.time == 0 && !self.comb_time0_fired && num_entries > 0 {
             for &eidx in self.comb_time0_idx.iter() {
                 if eidx < num_entries && !triggered[eidx] {
@@ -1774,6 +1793,7 @@ impl Simulator {
             self.is_clock_tree_entry = tree_entry;
             self.settle_triggered = triggered;
             self.settle_triggered_list = next_list;
+            self.defer_changed = defer_changed;
             if self.profile_report {
                 self.prof_cur.store(
                     crate::compiler::prof_sampler::KIND_OTHER,
@@ -1932,6 +1952,9 @@ impl Simulator {
                 let __tid: usize = $id;
                 let __chg: u64 = $chg;
                 n_writes += 1;
+                if defer_mode && __chg != 0 {
+                    defer_changed.push(__tid);
+                }
                 if __tid + 1 < dep_offsets.len() {
                     // SAFETY: `__tid + 1 < dep_offsets.len()` was just tested;
                     // offsets are a CSR prefix sum into `dep_entries` and every
@@ -2253,8 +2276,8 @@ impl Simulator {
                 // #35 §5.5/§10.3: while a PROCESS's post-write settle runs,
                 // cont-assign re-evaluation is a SEPARATE active-region event
                 // the process must not observe before yielding — defer these
-                // entries to the next full settle. UDP/gate/always entries
-                // (a synthesized netlist's cells) stay eager, which is the
+                // entries to the next full settle. UDP/gate entries (a
+                // synthesized netlist's cells) stay eager, which is the
                 // reference-measured split (c1b lazy vs dep eager).
                 // #t0-comb-defer: the optimizer lowers `assign p = a` (and
                 // port connects) to gate-shaped entries, which the variant
@@ -2264,6 +2287,14 @@ impl Simulator {
                 // `gate_entry_is_assign_origin` recovers the assign origin
                 // from `signal_gate_driven` so those entries defer too while
                 // true gate primitives stay eager.
+                // §4.5, §9.2.2.2: a level-sensitive `always` (always_comb,
+                // always @*, always @(a or b)) is a process of its own, not a
+                // cell: the writer's change only schedules it, and it runs
+                // once the writer suspends, after the continuous assignments
+                // it reads have been updated (the settle walks entries in
+                // dependency order). Run inline, it saw each blocking write
+                // separately and before the assignments, so an immediate
+                // assertion in it failed on values that never coexist.
                 if self.proc_settle_defer
                     && (matches!(
                         entries[eidx].item,
@@ -2274,8 +2305,29 @@ impl Simulator {
                             | CombItem::FastDirectFanout { .. }
                             | CombItem::FusedBufFanout { .. }
                             | CombItem::FusedAndFanout { .. }
+                            | CombItem::AlwaysBlock { .. }
+                            | CombItem::CompiledAlwaysBlock { .. }
                     ) || self.gate_entry_is_assign_origin(&entries[eidx]))
                 {
+                    // An `always` entry lists the signals that changed in this
+                    // settle, each once: re-dirtied at the yield, they wake
+                    // exactly the blocks they woke here. Its other reads did
+                    // not change, and would also wake blocks sensitive to them
+                    // alone. With nothing changed (an entry woken by an
+                    // unresolved read, which every settle re-seeds) or at the
+                    // time-0 seeding, it lists its reads as before.
+                    if matches!(
+                        entries[eidx].item,
+                        CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
+                    ) && !t0_seeded
+                        && !defer_changed.is_empty()
+                    {
+                        if defer_listed < defer_changed.len() {
+                            self.defer_proc_reads(&defer_changed[defer_listed..], false);
+                            defer_listed = defer_changed.len();
+                        }
+                        continue;
+                    }
                     // An entry with no resolvable read (one reading only
                     // memory cells without element names) has no id to
                     // re-dirty: an out-of-range marker still makes the next
@@ -3095,6 +3147,7 @@ impl Simulator {
         self.settle_inject_sum = inject_sum;
         self.settle_triggered = triggered;
         self.settle_triggered_list = next_list;
+        self.defer_changed = defer_changed;
         if self.profile_report {
             self.prof_cur.store(
                 crate::compiler::prof_sampler::KIND_OTHER,
