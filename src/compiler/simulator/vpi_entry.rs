@@ -889,7 +889,7 @@ pub(super) fn vpi_scope_path(sim: &Simulator, h: &VpiHandle) -> String {
 /// (a 1-bit placeholder so validation recognises the name). Those must not
 /// appear as VPI signal objects — they are module instances.
 fn vpi_is_instance_name(sim: &Simulator, name: &str) -> bool {
-    sim.instance_by_path(&*name).is_some()
+    sim.instance_by_path(name).is_some()
 }
 
 /// Resolve a packed-struct member path (`pixel_data.r`) to its bit range.
@@ -989,7 +989,7 @@ pub extern "C" fn vpi_handle_by_name(
         if rel.is_empty() {
             return vpi_module_handle(sim, -1);
         }
-        if let Some(i) = sim.module.instances.iter().position(|i| i.path == rel) {
+        if let Some(i) = sim.instance_index_by_path(&rel) {
             return vpi_module_handle(sim, i as isize);
         }
 
@@ -1154,7 +1154,7 @@ pub extern "C" fn vpi_handle(type_: libc::c_int, refh: *mut libc::c_void) -> *mu
                 } else if parent.is_empty() {
                     vpi_module_handle(sim, -1)
                 } else {
-                    match sim.module.instances.iter().position(|i| i.path == parent) {
+                    match sim.instance_index_by_path(&parent) {
                         Some(i) => vpi_module_handle(sim, i as isize),
                         None => std::ptr::null_mut(),
                     }
@@ -1164,12 +1164,10 @@ pub extern "C" fn vpi_handle(type_: libc::c_int, refh: *mut libc::c_void) -> *mu
             _ => {
                 let rel = vpi_strip_top(sim, &h.full_name).to_string();
                 match rel.rsplit_once('.') {
-                    Some((scope, _)) => {
-                        match sim.module.instances.iter().position(|i| i.path == scope) {
-                            Some(i) => vpi_module_handle(sim, i as isize),
-                            None => vpi_module_handle(sim, -1),
-                        }
-                    }
+                    Some((scope, _)) => match sim.instance_index_by_path(scope) {
+                        Some(i) => vpi_module_handle(sim, i as isize),
+                        None => vpi_module_handle(sim, -1),
+                    },
                     None => vpi_module_handle(sim, -1),
                 }
             }
@@ -2112,7 +2110,7 @@ fn dpi_scope_timescale(sim: &Simulator, scope: *mut libc::c_void) -> (i32, i32) 
     let rel = vpi_strip_top(sim, &name);
     let def = if rel.is_empty() || name == sim.module.name {
         sim.module.name.clone()
-    } else if let Some(inst) = sim.instance_by_path(&*rel) {
+    } else if let Some(inst) = sim.instance_by_path(&rel) {
         inst.def_name.clone()
     } else if sim.module.module_timescale_exp.contains_key(name.as_str()) {
         name

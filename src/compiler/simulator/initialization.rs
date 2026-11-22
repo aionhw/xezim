@@ -4045,8 +4045,12 @@ impl Simulator {
             .cloned()
             .collect();
         let mut instance_path_order: Vec<usize> = (0..module.instances.len()).collect();
-        instance_path_order
-            .sort_unstable_by(|&a, &b| module.instances[a].path.cmp(&module.instances[b].path));
+        instance_path_order.sort_unstable_by(|&a, &b| {
+            module.instances[a]
+                .path
+                .cmp(&module.instances[b].path)
+                .then(a.cmp(&b))
+        });
         // Sized up front: this ends up with one entry per DISTINCT leaf, and on
         // c906 nearly every one of the 1.56 M names has its own (array elements
         // carry `[idx]` in the leaf). Growing from empty rehashes the table a

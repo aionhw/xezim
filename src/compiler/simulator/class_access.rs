@@ -760,10 +760,22 @@ impl Simulator {
 
     #[inline]
     pub(super) fn instance_by_path(&self, path: &str) -> Option<&crate::elaborate::ElabInstance> {
-        self.instance_path_order
-            .binary_search_by(|&idx| self.module.instances[idx].path.as_str().cmp(path))
-            .ok()
-            .map(|pos| &self.module.instances[self.instance_path_order[pos]])
+        self.instance_index_by_path(path)
+            .map(|idx| &self.module.instances[idx])
+    }
+
+    /// The index in `module.instances` of the first instance whose path is
+    /// `path`, as a scan in declaration order finds it: `instance_path_order`
+    /// is sorted by path and then by index, so the first entry not below
+    /// `path` is that instance.
+    #[inline]
+    pub(super) fn instance_index_by_path(&self, path: &str) -> Option<usize> {
+        let order = &self.instance_path_order;
+        let pos = order.partition_point(|&idx| self.module.instances[idx].path.as_str() < path);
+        order
+            .get(pos)
+            .copied()
+            .filter(|&idx| self.module.instances[idx].path == path)
     }
 
     /// §25.5: a modport-qualified hierarchical reference (`inst.mp.var`)
