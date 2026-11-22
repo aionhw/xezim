@@ -186,3 +186,5 @@ mod format_backslash_literal;
 mod scan_zero_width;
 #[path = "strings/review_vpi_scoped_callee_deposit.rs"]
 mod review_vpi_scoped_callee_deposit;
+#[path = "strings/vpi_deferred_rw_writes.rs"]
+mod vpi_deferred_rw_writes;
