@@ -62,3 +62,63 @@ endmodule
     assert_eq!(plain.len(), 3, "expected 3 result lines: {:?}", plain);
     assert_eq!(fused, plain, "fused values must match the unfused run");
 }
+
+#[test]
+fn shared_region_follows_its_input_through_unknowns_and_known_values() {
+    let dir = std::env::temp_dir().join(format!("xezim_shared_region_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shared.sv");
+    std::fs::write(
+        &path,
+        r#"
+module tb;
+  reg [7:0] a;
+  wire [7:0] plus, minus, other;
+  assign plus = a + 8'd7;
+  assign minus = a - 8'd3;
+  assign other = {4'b0, a[7:4]};
+  initial begin
+    a = 8'h20; #1; $display("R %b %b %b", plus, minus, other);
+    a = 8'b0101xz01; #1; $display("R %b %b %b", plus, minus, other);
+    a = 8'h51; #1; $display("R %b %b %b", plus, minus, other);
+    $finish;
+  end
+endmodule
+"#,
+    )
+    .unwrap();
+    let run = |mode| {
+        let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+            .args(["--no-cache", "-s", "tb"])
+            .arg(&path)
+            .env("XEZIM_REGIONS", mode)
+            .env("XEZIM_REGION_STATS", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        if mode == "shared" {
+            assert!(
+                stderr.contains("fused 2 members into 1 regions"),
+                "{stderr}"
+            );
+        }
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("R "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let plain = run("0");
+    assert_eq!(
+        plain,
+        [
+            "R 00100111 00011101 00000010",
+            "R xxxxxxxx xxxxxxxx 00000101",
+            "R 01011000 01001110 00000101",
+        ]
+    );
+    assert_eq!(run("shared"), plain);
+    std::fs::remove_dir_all(dir).unwrap();
+}

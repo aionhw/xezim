@@ -391,3 +391,34 @@ endmodule
 "#;
     both("plain_always_other_writer", src, 29);
 }
+
+/// §11.5.1 and §10.4.1: a part-select transfer observes only its source
+/// window and preserves all destination bits outside the written slice.
+#[test]
+fn slice_transfer_across_a_host_word() {
+    let src = r#"
+module tb;
+  reg [127:0] a;
+  reg [31:0] b;
+  wire [127:0] wide;
+  wire [31:0] small_bus;
+  assign wide[73:58] = b[23:8];
+  assign small_bus[14:7] = a[70:55];
+  task check;
+    #1;
+    if (wide[74:57] !== {1'bz,b[23:8],1'bz} ||
+        small_bus[15:6] !== {1'bz,a[62:55],1'bz})
+      $display("MISMATCH %b %b",wide[74:57],small_bus[15:6]);
+    $display("OK %0t", $time);
+  endtask
+  initial begin
+    a = {4{32'h1234cdef}}; b = 32'h5acd7654; check;
+    a[120] = 1'bz; b[31] = 1'bx; check;
+    a[61:58] = 4'bx01z; b[14:11] = 4'b1zx0; check;
+    a = 0; b = 0; check;
+    $finish;
+  end
+endmodule
+"#;
+    both("cross_word_transfer", src, 4);
+}

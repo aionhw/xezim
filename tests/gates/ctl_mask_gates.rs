@@ -86,6 +86,39 @@ fn check(name: &str, src: &str, expected: &[&str], gates: Option<usize>) {
     assert_eq!(got, expected, "{name}: differs from the reference values");
 }
 
+/// §10.3, §11.4.11: a pure mux with a known selector can reuse an
+/// unchanged output slice. An unknown selector still merges both arms.
+#[test]
+fn compiled_mux_guard_preserves_values_and_observed_edges() {
+    let design = include_str!("compiled_mux_pruning.sv");
+    let (baseline, off) = run(
+        "compiled_mux_off",
+        design,
+        &[("XEZIM_CTL_MUX", "0")],
+        &["--verbose"],
+    );
+    let (guarded, on) = run(
+        "compiled_mux_on",
+        design,
+        &[("XEZIM_CTL_MUX", "1")],
+        &["--verbose"],
+    );
+    assert_eq!(baseline, guarded);
+    assert!(
+        on.contains("[CTL-MUX] eligible continuous assignments=1\n"),
+        "{on}"
+    );
+    let evaluations = |log: &str| {
+        log.lines()
+            .find_map(|line| line.strip_prefix("[PROF] settle_calls="))
+            .and_then(|line| line.split_once(" entry_evals="))
+            .and_then(|(_, tail)| tail.split_whitespace().next())
+            .and_then(|count| count.parse::<u64>().ok())
+            .expect("settle evaluation count")
+    };
+    assert!(evaluations(&on) < evaluations(&off), "{on}");
+}
+
 const T_VALS: &str = r#"
 module tb;
   localparam N = 64;
@@ -483,4 +516,35 @@ fn controlled_gate_output_overrides() {
     assert_fired("t_deposit", T_DEPOSIT, None);
     let lines = same_in_all_modes("t_deposit", T_DEPOSIT);
     assert_eq!(lines.last().map(String::as_str), Some("done"));
+}
+
+#[test]
+fn mux_only_masks_the_inactive_arm_while_its_select_is_known() {
+    let design = include_str!("ctl_mask_mux.sv");
+    let name = "ctl_mux_four_state";
+    assert_fired(name, design, None);
+    let got = same_in_all_modes(name, design);
+    // Independent simulator output, compressed by the fixture's four-bit period.
+    let expected: Vec<String> = [
+        ["1111", "0000", "0000"],
+        ["1111", "1111", "0000"],
+        ["01xz", "1111", "zx10"],
+        ["zzzz", "01xz", "01xz"],
+        ["xxxx", "01xz", "01xz"],
+        ["0xxx", "x1xz", "z11z"],
+        ["01xx", "11xx", "z1xx"],
+        ["0000", "1111", "zx10"],
+        ["0000", "0000", "0000"],
+        ["0000", "1111", "zx10"],
+        ["1111", "1111", "xx1x"],
+        ["xxxx", "xxxx", "xxx0"],
+        ["zzzz", "0000", "0000"],
+        ["xxxx", "xxxx", "xxxx"],
+    ]
+    .iter()
+    .map(|row| row.map(|nibble| nibble.repeat(16)).join(" "))
+    .collect();
+    assert_eq!(got, expected);
+    let (vector, _) = run(name, design, &[("XEZIM_VEC_COALESCE", "1")], &[]);
+    assert_eq!(vector, expected);
 }

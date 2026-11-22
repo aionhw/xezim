@@ -281,3 +281,64 @@ endmodule
         second
     );
 }
+
+#[cfg(feature = "jit")]
+#[test]
+fn selective_aot_preserves_unknowns_and_respects_disabled_two_state() {
+    let dir = std::env::temp_dir().join(format!("xezim_selective_aot_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("tb.sv");
+    std::fs::write(
+        &src,
+        r#"
+module tb;
+  reg [7:0] a, b;
+  wire [7:0] result = a + b;
+  reg clk, sampled;
+  always @(posedge clk) sampled <= result[3];
+  initial begin
+    clk=0; a=8'd7; b=8'd5; #1; clk=1; #1; $display("RESULT %b %b", result, sampled); clk=0;
+    b=8'b0xz00001; #1; clk=1; #1; $display("RESULT %b %b", result, sampled); clk=0;
+    a=8'hff; b=8'd3; #1; clk=1; #1; $display("RESULT %b %b", result, sampled); clk=0;
+    $finish;
+  end
+endmodule
+"#,
+    )
+    .unwrap();
+    for tier in ["1", "0"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+            .args(["--no-cache", "--verbose", "-s", "tb"])
+            .arg(&src)
+            .env("XEZIM_JIT", "1")
+            .env("XEZIM_AOT", "1")
+            .env("XEZIM_AOT_SKIP_TWO_STATE", "1")
+            .env("XEZIM_TWO_STATE", tier)
+            .env("XEZIM_JIT_VERBOSE", "1")
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{log}");
+        if tier == "1" {
+            let skipped = log
+                .lines()
+                .filter(|line| line.contains(" comb entries"))
+                .find_map(|line| line.strip_prefix("[AOT] skipped "))
+                .and_then(|line| line.split_whitespace().next())
+                .and_then(|n| n.parse::<usize>().ok());
+            assert!(skipped.is_some_and(|n| n > 0), "{log}");
+        } else {
+            assert!(!log.contains("[AOT] skipped"), "{log}");
+        }
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let results: Vec<_> = stdout
+            .lines()
+            .filter(|line| line.starts_with("RESULT "))
+            .collect();
+        assert_eq!(
+            results,
+            ["RESULT 00001100 1", "RESULT xxxxxxxx x", "RESULT 00000010 0"]
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

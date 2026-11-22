@@ -172,3 +172,22 @@ endmodule
         ]
     );
 }
+
+/// §10.4.2: a quiet partial NBA can be elided only against the pending value
+/// when another write has already been queued for this destination.
+#[test]
+fn wide_overlapping_slices_merge_across_word_boundaries() {
+    assert_eq!(
+        lines(include_str!("wide_partial_nba.sv")),
+        [
+            "NBA 00000000000000 z x",
+            "NBA 00000101001010 z x",
+            "NBA 00000101001010 z x",
+            "NBA 01011110001010 z x",
+            "NBA 00000000001010 z x",
+            "NBA 0001xz0z1xx000 z x",
+            "NBA 00000000000000 z x",
+            "NBA 00000000000000 z x",
+        ]
+    );
+}
