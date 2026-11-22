@@ -78,6 +78,17 @@ impl Simulator {
                     let rewritten = Expression::new(ExprKind::Ident(abs), expr.span);
                     return self.eval_expr_ctx_inner(&rewritten, ctx_width, unsigned_context);
                 }
+                // §23.6: a member after an element select
+                // (`$root.top.objs[1].v`, `$root.top.qs[i].a`) reads as the
+                // relative name's select chain.
+                if h.path.len() >= 3
+                    && h.path[0].name.name == "$root"
+                    && let Some(chain) = self.root_member_select_chain(h, expr.span, true, 0)
+                {
+                    return self.eval_expr_ctx_inner(&chain, ctx_width, unsigned_context);
+                }
+                // A queue element's member that the rewrite above does not cover
+                // reads through the queue's storage.
                 if h.path.len() >= 4 && h.path[0].name.name == "$root" {
                     for i in 2..h.path.len() - 1 {
                         if h.path[i].selects.is_empty() {
