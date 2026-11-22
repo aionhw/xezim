@@ -498,20 +498,37 @@ mod design_cache_tests {
             semantic_salt: String::new(),
             dependency_files: vec![lib],
         };
+        // With `--carry-src-macros` the library sees the header's macro; by
+        // default it does not, and the key does not follow the header.
+        use xezim_core::LibraryMacroCarry as Carry;
         let keys = || {
             let pre = xezim_core::preprocess_design(&sources, &paths, &[], &[]);
-            [None, Some(&pre)].map(|prepared| {
-                design_cache_key(&config, &sources, &paths, Some("top"), &[], &[], prepared).0
+            [Carry::Source, Carry::None].map(|carry| {
+                [None, Some(&pre)].map(|prepared| {
+                    design_cache_key_for(
+                        &config,
+                        &sources,
+                        &paths,
+                        Some("top"),
+                        &[],
+                        &[],
+                        prepared,
+                        carry,
+                    )
+                    .0
+                })
             })
         };
         std::fs::write(&header, "`define SIZE(x) ((x) + 4)\n").unwrap();
-        let before = keys();
+        let [before, before_none] = keys();
         std::fs::write(&header, "`define SIZE(x) ((x) + 8)\n").unwrap();
-        let after = keys();
+        let [after, after_none] = keys();
         std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(before[0], before[1]);
         assert_eq!(after[0], after[1]);
         assert_ne!(before[0], after[0]);
+        assert_eq!(before_none, after_none);
+        assert_ne!(before_none[0], before[0]);
     }
 
     #[test]
