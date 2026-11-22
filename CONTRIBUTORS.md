@@ -204,7 +204,7 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   delays and negative struct array indices (#1151, #1141), modport subroutine
   prototypes (core PR #241), and the reports behind many of this release's
   array, real-number and timing fixes.
-- **[git-hevangel](https://github.com/git-hevangel)** — shared statement-list
+- **[Horace Chan](https://github.com/git-hevangel)** — shared statement-list
   numbering when restoring checkpoints of processes that have forked,
   including suspended class tasks and condition or event waiters.
 - **[Philip Axer](https://github.com/philipaxer)** — nested collections typed

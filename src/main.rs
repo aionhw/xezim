@@ -355,6 +355,9 @@ fn print_usage() {
   -v <file>        Library file: modules compiled only to resolve instantiations
   --primitive-verbose  Show parse/adoption diagnostics for explicit -v files
   -y <dir>         Library directory: <module>.<ext> loaded on demand
+                   A library file sees only the command-line defines (+define+, -D)
+  --carry-src-macros  Also the macros the source files leave defined
+  --carry-lib-macros  Also those and the macros of the library files read before it
   +libext+<ext>+.. Extension list for -y search (replaces default .v/.sv/.V)
   +nospecify       Suppress specify-block path delays and timing checks (zero-delay gate sim)
   +delay_mode_zero Force all structural (specify/SDF) delays to 0 (fast functional GLS)
@@ -951,6 +954,19 @@ fn split_filelist_line(line: &str) -> Vec<String> {
     out
 }
 
+/// `--carry-src-macros` / `--carry-lib-macros`: the macros a `-v`/`-y`
+/// library file starts from besides the command-line defines. Either order
+/// of both gives `--carry-lib-macros`, which includes the other.
+fn raise_lib_macro_carry(flag: &str, carry: &mut xezim::LibraryMacroCarry) -> bool {
+    let mode = match flag {
+        "--carry-src-macros" => xezim::LibraryMacroCarry::Source,
+        "--carry-lib-macros" => xezim::LibraryMacroCarry::Library,
+        _ => return false,
+    };
+    *carry = (*carry).max(mode);
+    true
+}
+
 fn process_command_file(
     path: &str,
     source_files: &mut Vec<String>,
@@ -963,6 +979,7 @@ fn process_command_file(
     lib_exts: &mut Option<Vec<String>>,
     nospecify: &mut bool,
     primitive_verbose: &mut bool,
+    lib_macro_carry: &mut xezim::LibraryMacroCarry,
     module_timescale_args: &mut Vec<String>,
     compat: &mut cli_compat::CompatArgs,
     incdir_rel: bool,
@@ -1122,6 +1139,7 @@ fn process_command_file(
                             lib_exts,
                             nospecify,
                             primitive_verbose,
+                            lib_macro_carry,
                             module_timescale_args,
                             compat,
                             nested_rel,
@@ -1153,6 +1171,7 @@ fn process_command_file(
                         lib_exts,
                         nospecify,
                         primitive_verbose,
+                        lib_macro_carry,
                         module_timescale_args,
                         compat,
                         false,
@@ -1170,6 +1189,7 @@ fn process_command_file(
                 "--primitive-verbose" => {
                     *primitive_verbose = true;
                 }
+                _ if raise_lib_macro_carry(t, lib_macro_carry) => {}
                 "-xenowarn" => {
                     xezim::set_implicit_net_warn(false);
                 }
@@ -2302,6 +2322,7 @@ fn run_main() -> i32 {
     let mut lib_files: Vec<String> = Vec::new();
     let mut lib_exts: Option<Vec<String>> = None;
     let mut primitive_verbose = false;
+    let mut lib_macro_carry = xezim::LibraryMacroCarry::None;
     let mut nospecify = false;
     let mut log_file: Option<String> = None;
     let mut log_tee = false;
@@ -2543,6 +2564,7 @@ fn run_main() -> i32 {
                         &mut lib_exts,
                         &mut nospecify,
                         &mut primitive_verbose,
+                        &mut lib_macro_carry,
                         &mut module_timescale_args,
                         &mut compat,
                         incdir_rel,
@@ -2568,6 +2590,7 @@ fn run_main() -> i32 {
                     &mut lib_exts,
                     &mut nospecify,
                     &mut primitive_verbose,
+                    &mut lib_macro_carry,
                     &mut module_timescale_args,
                     &mut compat,
                     false,
@@ -2714,6 +2737,7 @@ fn run_main() -> i32 {
             "--primitive-verbose" => {
                 primitive_verbose = true;
             }
+            _ if raise_lib_macro_carry(arg, &mut lib_macro_carry) => {}
             // Suppress §6.10 implicit 1-bit net warnings (gate-level designs
             // with unresolved vendor cells can emit thousands).
             "-xenowarn" => {
@@ -3632,6 +3656,7 @@ suppressed but the explicit SDF annotation still applies."
             lib_dirs: lib_dirs.clone(),
             lib_exts: lib_exts.clone(),
             primitive_verbose,
+            macro_carry: lib_macro_carry,
         });
     }
 
