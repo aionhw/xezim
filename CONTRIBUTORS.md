@@ -18,7 +18,18 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   waking a parked parent, scalar `bit` DPI formals that carry one bit, and
   DPI regression tests for real actuals and returns, scalar `svLogic` cells
   and enum prototypes, qualified enum-cast identity, recursive assertion
-  nonvacuity, and sampled array elements and indices in assertion actions.
+  nonvacuity, and sampled array elements and indices in assertion actions;
+  compact tokens that borrow the preprocessed source and are released as
+  parsing goes (core #190), one shared body for the instance copies of a
+  module function or task (core #193), nested binds elaborated incrementally
+  (core #194), assignment-pattern type keys at every array dimension and in
+  nettype drivers, parameters and class scopes (#1290), aliased nets of a
+  user-defined nettype resolved as one net (#1302), per-driver nettype delays
+  and declaration-initializer drivers (#1204), stream operands with an array
+  range (#1197), edges moved by the final settle of a cascade (#1239),
+  class-member event controls, string-keyed associative arrays and element
+  signedness in compiled methods (#1157), and net-alias, cross-scope driver
+  and parameter-overlay fixes (PR #1179).
 - **[Akash Levy](https://github.com/akashlevy)** — expression-context and
   exponent signedness fixes, nonblocking assignment widths, assertion operand
   widths, callback-driven assertion clocks, cocotb runner arguments, VPI array
@@ -26,7 +37,24 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   assertion `or` beside a pending nonvacuous operand, patches for
   `always_comb` sensitivity, `super` call argument widths and empty
   `foreach` constraints, and extensive self-checking reports covering
-  scheduling, types, interfaces and hierarchical access.
+  scheduling, types, interfaces and hierarchical access; C and C++ DPI
+  sources compiled from the file list (#1443), DPI imports bound to C
+  functions already loaded (#1411), `$readmem*` and `$writemem*` on
+  associative and multidimensional arrays and the §21.5.3 dump layout
+  (#1409, #1410, #1444), the 128 + signal exit status of an interrupted run
+  (#1407), zero-delay task recursion reported instead of a stack overflow
+  (#1408), VPI ranges of unpacked-array elements (#1406), `.*` connections to
+  implicit nets (#1405), `always @(*)` woken by nonblocking updates (#1430),
+  deferred assertion outcomes counted when they mature (#1431), `$clog2`
+  select bounds in compiled code (#1429), parameter-sized input actuals
+  (#1412), 1-bit operator results, struct-parameter casts, packed port and
+  part-select placement and packed-struct member event controls
+  (#1369–#1373), faster parameter overlays and driver lookups during
+  elaboration (#1445–#1447, #1449, #1452), and parser and elaboration fixes in the
+  core for cycle delays, subroutine port types, port-actual implicit nets,
+  port-connection widths, `gated_clk_cell`, unpacked port slices, type
+  parameters, package-parameter generate conditions and library-file macros
+  (core #260–#279).
 - **[Dave Keeshan](https://github.com/davekeeshan)** — nested member selections
   in unpacked parameter arrays, instance-dependent array queries in local
   declaration widths, packed-struct parameter override layouts and
@@ -34,13 +62,20 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   part-select actuals, declared index order of instance arrays, packed
   typedef array dimensions, package-scoped typed assignment patterns and
   package arrays of structs indexed at run time, with simulator and core
-  regression tests, and wildcard connections to non-ANSI module ports.
+  regression tests, and wildcard connections to non-ANSI module ports;
+  struct-member bounds of an inlined localparam type (core PR #240).
 - **[Chuanseng Ng](https://github.com/chuanseng-ng)** — array parameter shapes
   in generate scopes and compiled stores to multidimensional unpacked array
   elements, with regressions for packed widths and branch-dependent indices;
   bare scope randomization, constant net drivers after release and root UPF
   power-domain paths; nonblocking aggregate assignment-pattern reports and
-  regression cases (PR #1200).
+  regression cases (PR #1200); the abort properties `accept_on` and
+  `reject_on` and the `implies`, `nexttime`, ranged `always` and `eventually`
+  and property `case` operators (#1155, core #220, #223), a typedef's
+  unpacked dimensions after a declarator's own (#1140), and assignment
+  patterns, replications and unpacked array items captured by intra-assignment
+  delays and nonblocking assignments (#1162, #1233, #1247, #1263, #1291), with
+  a self-referencing pattern regression (#1274).
 - **Vrajesh Prakhya** — real-number modelling: Verilog-AMS `wreal` nets
   resolved by summing, user-defined nettypes across the hierarchy and in
   packages (§6.6.7, §6.6.8), real-ness of members projected from call results,
@@ -75,7 +110,9 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   the callee's formal, the time-zero port handshake between instances, wide
   `rand` draws and `sum()` targets at full width (§18.4, §7.12.3), packed-struct
   patterns laid out into class properties and array elements (§10.9.2), and
-  detailed self-checking bug reports for struct and class member access.
+  detailed self-checking bug reports for struct and class member access;
+  indexed `$dumpvars` scope arguments (#1103) and waveform exclusion with
+  `--wave-suppress` (#1104).
 - **eenky** — declared defaults for parameters a class leaves out when it
   extends a parameterized class, and virtual-interface reads through
   class-handle chains (`cfg.vif.data`).
@@ -96,7 +133,16 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   value (§8.25); per-element clocking input history for unpacked arrays with
   an explicit positive skew (§14.4, PR #1138); scope-aware destinations for
   `$fread` and `$readmem*`, and sizing and element writes for dynamic arrays
-  of dynamic arrays, with regression tests (PRs #1208, #1209).
+  of dynamic arrays, with regression tests (PRs #1208, #1209); covergroup bin
+  filters that read class parameters (#1135), masked-bit rand draws (#1133),
+  class-property events compared by object (#1265), whole clocking drives
+  after select drives (#1267), class-parameter formals sized at their
+  specialization's width without copying the parameter table (#1271, #1276),
+  compiled-method stores, calls and package scopes (#1285, #1287, #1293),
+  collection literal actuals (#1257, #1258), empty UVM regexes on BSD libc
+  (#1306), parenless enumeration methods (#1422), bare clocking-block waits on
+  the declared edge (#1332), and package-parameter fixes in the core (core
+  #243, #246, #253, #254).
 - **Taichi Ishitani** — constrained-random fixes (members of rand object array
   elements, `pre_randomize` before the rand and constraint modes are read,
   `this.` member paths in the joint solver, and `XEZIM_RAND_DIAG` reports of
@@ -147,7 +193,17 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   locals and compilation-unit parameter shadowing; top-level combinational
   blocks evaluated in their own time unit (PR #1203), waveform scope-list
   regressions (PR #1196), and detailed alias, interconnect and generated
-  real-structure reports and regression cases.
+  real-structure reports and regression cases; literal and 2-state input
+  conversion with pull resolution (#1324), simulation time kept exact above
+  2^53 ticks (#1329), selected fixed-array rows in unpacked concatenations
+  (#1322), real `inside`, fill-literal and relational operands (#1278, #1281,
+  core PR #242), real and realtime pattern type keys (#1290), typedef'd real
+  struct members (#1304), event controls on unpacked struct arguments
+  (#1317), VPI deposits on package-resolved nets (#1300), replicated and keyed
+  structure patterns (#1144, #1164), real array defaults (#1153), enum-net
+  delays and negative struct array indices (#1151, #1141), modport subroutine
+  prototypes (core PR #241), and the reports behind many of this release's
+  array, real-number and timing fixes.
 - **[git-hevangel](https://github.com/git-hevangel)** — shared statement-list
   numbering when restoring checkpoints of processes that have forked,
   including suspended class tasks and condition or event waiters.
@@ -173,7 +229,14 @@ Thank you to everyone who has improved xezim and xezim-core through pull request
   from its congruence class (§18.5.8.1); cocotb 2.1 runner compatibility
   (PR #1189), undeclared-type diagnostics and duplicate-class detection
   (PR #1187, core PR #230), and the VPI assertion object model, callbacks,
-  controls, coverage queries and regression tests (PR #1191).
+  controls, coverage queries and regression tests (PR #1191); dynamic-array
+  sizes solved jointly with sub-object fields (#1259), struct patterns
+  returned from functions (#1170), constraints through back-reference handles
+  (#1184), method names resolved in frame and class scope, class-member
+  arrays as DPI open-array actuals, literal backslashes in format strings,
+  unbounded and suppressed `$fscanf` fields, and checks for duplicate
+  packages, typedefs, interfaces, programs and primitives (PRs #1220,
+  #1222, #1224, #1226, #1228, #1230 and #1232, core PRs #234, #236 and #238).
 
 ## Bug reports
 
@@ -194,8 +257,10 @@ work. Thank you in particular to
 [git-hevangel](https://github.com/git-hevangel),
 [hernloh](https://github.com/hernloh),
 [jjts](https://github.com/jjts),
+[KelvinChung2000](https://github.com/KelvinChung2000),
 [Lramseyer](https://github.com/Lramseyer),
 [lwflwf1](https://github.com/lwflwf1),
+[marcobrambilla99](https://github.com/marcobrambilla99),
 [overcookedlobster](https://github.com/overcookedlobster),
 [philipaxer](https://github.com/philipaxer),
 [rharikrishna25](https://github.com/rharikrishna25),
@@ -211,6 +276,13 @@ uses synthetic reproducers, allocation profiles, controlled type-context
 comparisons and anonymized memory traces supplied by
 [amal-khailtash](https://github.com/amal-khailtash). Their net-initializer
 reproducer and sharing experiment identified the retained target-expression
-cost addressed by sharing declaration targets across child instances.
+cost addressed by sharing declaration targets across child instances. In
+0.11.7 their reproducers for compilation-unit declarations, package
+constants, constant functions, port expressions, declared types and
+parameter environments drove the elaboration-memory work; the released
+parameter-environment bodies, the shared typed-parameter types, constraint
+blocks, coverage scope strings and scope-tree paths follow their
+suggestions; and they contributed the change that holds a named property or
+sequence body identical in every instance once.
 
 New contributors are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).

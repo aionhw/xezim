@@ -778,7 +778,9 @@ characters for a string), `vpiSigned`, `vpiScalar`/`vpiVector`, `vpiArray`,
 parameter — the relations
 `vpiLeftRange`/`vpiRightRange` (constants: the outermost packed range, or
 the outermost unpacked range of an array — for a dynamic array or queue its
-current bounds `[0:size-1]`, for an associative array none), `vpiRange`
+current bounds `[0:size-1]`, for an associative array none; an element of an
+unpacked array, `top.ids[0]` of `logic [31:0] ids [4]`, has the range of its
+own type, the next unpacked range for a subarray, and a bit has none), `vpiRange`
 (every packed range, or every unpacked range of an array), and
 `vpiTypespec`. A typespec
 (`vpiLogicTypespec`, `vpiIntTypespec`, `vpiEnumTypespec`, `vpiStructTypespec`,

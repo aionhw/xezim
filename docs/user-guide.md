@@ -11,6 +11,7 @@ of options and environment variables is in the
 * [Cocotb Python testbenches](#cocotb-python-testbenches)
 * [VPI assertion integration](#vpi-assertion-integration)
 * [Random seeds and weighted distributions](#random-seeds-and-weighted-distributions)
+* [Memory files](#memory-files)
 * [Waveforms](#waveforms)
 * [Checkpoints](#checkpoints)
 * [Warm design cache](#warm-design-cache)
@@ -58,22 +59,31 @@ The exit status is 1 for parse and elaboration errors (among them a
 hierarchical name that does not resolve, §23.8), `$fatal`, a run-time error
 that ends the run (a read or call through a null handle in a process, a wait
 on a mailbox that was never constructed, a loop or delta cycle that can never
-let time advance, an SDF file `$sdf_annotate` cannot read), a
-`--dpi-lib` library that cannot be loaded, and an `-s` that names no module
-(`--no-strict-top` falls back to finding tops automatically). `$error` exits 0
-unless `--error-exit` is given. A run that Ctrl-C or SIGTERM stopped exits 130
-or 143.
+let time advance, such as a task that calls itself without waiting, an SDF
+file `$sdf_annotate` cannot read), a `--dpi-lib` library that cannot be
+loaded, and an `-s` that names no module (`--no-strict-top` falls back to
+finding tops automatically). `$error` exits 0 unless `--error-exit` is given.
+A run that Ctrl-C or SIGTERM stopped exits 130 or 143.
 
-Current `main` also diagnoses undeclared type names and duplicate class
-definitions. Declare or import the intended type before using it, and keep
-one class definition per name in a scope. A forward class typedef is not a
-second class definition.
+Since 0.11.7, a type name that is neither declared nor imported is an error,
+and so are two class definitions of one name in a scope (a forward class
+typedef is not a second definition), two packages of one name, and two
+typedefs of one name with different text. A typedef repeated with identical
+text in another file, and a second definition of an interface, program or
+primitive, are warnings (§3.13).
+
+C and C++ DPI sources can be named with the SystemVerilog files, on the
+command line or in a `-f` file (`xezim add.c t.sv`): xezim compiles them,
+links them into one cached library and loads it like `--dpi-lib`. A compiled
+artifact (`--compile -o design.xzc`) holds the elaborated design only, so name
+the C files again when running it (`xezim design.xzc add.c`); `--compile`
+warns when it leaves them out. See the
+[DPI and VPI guide](dpi-guide.md#c-and-c-sources-in-the-file-list).
 
 ## Cocotb Python testbenches
 
-The runner in `contrib/cocotb/xezim_runner.py` supports cocotb 2.0.x and 2.1.0;
-its integration tests cover 2.0.1 and 2.1.0. The 2.1 compatibility changes are
-available on `main` after 0.11.6.
+The runner in `contrib/cocotb/xezim_runner.py` supports cocotb 2.0.x and, since
+xezim 0.11.7, 2.1.0; its integration tests cover 2.0.1 and 2.1.0.
 
 From the repository root, make the runner importable and select your binary:
 
@@ -107,7 +117,7 @@ for option and parameter-rebuild behavior.
 
 ## VPI assertion integration
 
-On `main` after 0.11.6, VPI clients can discover concurrent assertion objects,
+Since 0.11.7, VPI clients can discover concurrent assertion objects,
 register callbacks with `vpi_register_assertion_cb`, query assertion coverage,
 and control assertions through `vpi_control`. Build the client against
 `include/vpi_user.h` and `include/sv_vpi_user.h`, then load its shared library:
@@ -155,6 +165,29 @@ constraint can therefore change both the sequence and its histogram.
 Values within a range item are sampled, so balanced item counts do not imply
 exact counts for each value inside the range. Do not rely on a particular
 sequence or solver strategy remaining unchanged across releases.
+
+## Memory files
+
+`$readmemh` and `$readmemb` load a memory from a text file, and `$writememh`
+and `$writememb` write one (§21.4, §21.5). The memory can be a fixed-size or
+dynamic unpacked array, a multidimensional array or the subarray a partial
+index leaves (`ram[1]`), an associative array with an integral index type,
+or a class property.
+
+The words of a multidimensional array are in row-major order: the rightmost
+dimension varies fastest, and each dimension runs from its low index to its
+high one, whichever way it is declared. Start and finish addresses and the
+`@` addresses in a file count words in that order, from the low index of the
+leftmost dimension.
+
+`$writemem*` writes one word per line with no `@` address for a fixed-size,
+dynamic or multidimensional array, also when the start address is not the
+lowest one (§21.5.3), so `$writememh("m.hex", m, 2, 3)` writes the two words
+`m[2]` and `m[3]`; read such a file back with the same start address. A
+dynamic array writes the elements its size counts, and an empty one writes an
+empty file. An associative array writes the elements that exist, in index
+order, each as `@<address> <word>`; loading one makes each address in the
+file a key and keeps the keys the file does not name.
 
 ## Waveforms
 
@@ -377,7 +410,11 @@ Two properties are worth knowing before relying on it:
 
 Note `--parse` above: the dump is produced before elaboration, so a design whose
 elaboration takes minutes still dumps in seconds. Only the step that appends
-adopted `-v`/`-y` library files needs `--compile` or `--simulate`.
+adopted `-v`/`-y` library files needs `--compile` or `--simulate`. The appended
+text of a library file is the text the build read: it is preprocessed with the
+macros of the design files and of the library files read before it, and the
+macros it defines stay defined for the library files read after it
+(§22.5.1).
 
 ## Module-timescale extension
 
