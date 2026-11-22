@@ -1402,7 +1402,7 @@ impl Simulator {
                 if total == 0 {
                     break;
                 }
-                let mut draw = self.rng.gen_range(0..total);
+                let mut draw = self.cur_rng().gen_range(0..total);
                 let Some(&(l, h, _)) = items.iter().find(|&&(_, _, m)| {
                     let hit = draw < m;
                     draw = draw.saturating_sub(m);
@@ -1410,19 +1410,27 @@ impl Simulator {
                 }) else {
                     break;
                 };
-                let n = if h > l { self.rng.gen_range(l..=h) } else { l };
+                let n = if h > l {
+                    self.cur_rng().gen_range(l..=h)
+                } else {
+                    l
+                };
                 if admits(n) {
                     return PickedSize::Size(n.min(Self::MAX_TRIAL_EQ_SIZE));
                 }
             }
         }
         if !ranges.is_empty() {
-            let (l, h) = ranges[self.rng.gen_range(0..ranges.len())];
-            return PickedSize::Size(if h > l { self.rng.gen_range(l..=h) } else { l });
+            let (l, h) = ranges[self.cur_rng().gen_range(0..ranges.len())];
+            return PickedSize::Size(if h > l {
+                self.cur_rng().gen_range(l..=h)
+            } else {
+                l
+            });
         }
         if bounded && lo_b <= hi_b {
             return PickedSize::Size(if hi_b > lo_b {
-                self.rng.gen_range(lo_b..=hi_b)
+                self.cur_rng().gen_range(lo_b..=hi_b)
             } else {
                 lo_b
             });
@@ -1762,13 +1770,13 @@ impl Simulator {
         } else {
             (1u64 << width) - 1
         };
-        let mut v = self.rng.r#gen::<u64>() & mask;
+        let mut v = self.cur_rng().r#gen::<u64>() & mask;
         if mask > 0 {
             for _ in 0..8 {
                 if Some(v) != prev {
                     break;
                 }
-                v = self.rng.r#gen::<u64>() & mask;
+                v = self.cur_rng().r#gen::<u64>() & mask;
             }
         }
         if width <= 64 {
@@ -1783,7 +1791,7 @@ impl Simulator {
         let mut acc = Value::from_u64(v, width);
         let mut bit = 64u32;
         while bit < width {
-            let chunk: u64 = self.rng.r#gen();
+            let chunk: u64 = self.cur_rng().r#gen();
             let n = (width - bit).min(64);
             for k in 0..n {
                 if (chunk >> k) & 1 == 1 {
@@ -2080,8 +2088,12 @@ impl Simulator {
                 self.draw_elem(width, None)
             } else {
                 use rand::Rng;
-                let (l, h) = allowed[self.rng.gen_range(0..allowed.len())];
-                let v = if h > l { self.rng.gen_range(l..=h) } else { l };
+                let (l, h) = allowed[self.cur_rng().gen_range(0..allowed.len())];
+                let v = if h > l {
+                    self.cur_rng().gen_range(l..=h)
+                } else {
+                    l
+                };
                 Value::from_u64(v, width)
             };
             self.write_coll_elem(elem_key, cand);
@@ -2305,7 +2317,7 @@ impl Simulator {
                             let p = if lo == hi {
                                 lo
                             } else {
-                                self.rng.gen_range(lo..=hi)
+                                self.cur_rng().gen_range(lo..=hi)
                             };
                             self.write_coll_elem(elem_key, Value::from_u64(p as u64, width));
                             false
@@ -3236,8 +3248,12 @@ impl Simulator {
             // sweep so a tight domain still converges.
             let mut pick: Option<u64> = None;
             for _ in 0..256 {
-                let (l, h) = domain[self.rng.gen_range(0..domain.len())];
-                let v = if h > l { self.rng.gen_range(l..=h) } else { l };
+                let (l, h) = domain[self.cur_rng().gen_range(0..domain.len())];
+                let v = if h > l {
+                    self.cur_rng().gen_range(l..=h)
+                } else {
+                    l
+                };
                 if !used.contains(&v) {
                     pick = Some(v);
                     break;

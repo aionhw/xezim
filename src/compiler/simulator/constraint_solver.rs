@@ -1349,6 +1349,8 @@ impl Simulator {
                     backup.insert(n.clone(), v.clone());
                 }
             }
+            // §18.13.3, §18.15: draw from `cur_rng()`, the object's own
+            // stream once it is seeded, so `srandom()` repeats the sequence.
             for _ in 0..256 {
                 if !self.take_randomize_budget(handle, &class_name, &constraints, &rand_colls) {
                     break;
@@ -1364,11 +1366,11 @@ impl Simulator {
                         if members.is_empty() {
                             Value::zero(*width)
                         } else {
-                            let i = self.rng.gen_range(0..members.len());
+                            let i = self.cur_rng().gen_range(0..members.len());
                             Value::from_u64(members[i].1, *width)
                         }
                     } else if *width <= 64 {
-                        Value::from_u64(self.rng.r#gen(), *width)
+                        Value::from_u64(self.cur_rng().r#gen(), *width)
                     } else {
                         // A `rand` property wider than 64 bits (a packed
                         // multi-dimensional array such as `u7_t [4:0][1:0]`)
@@ -1377,7 +1379,7 @@ impl Simulator {
                         let mut acc = Value::zero(*width);
                         let mut bit = 0u32;
                         while bit < *width {
-                            let chunk: u64 = self.rng.r#gen();
+                            let chunk: u64 = self.cur_rng().r#gen();
                             let n = (*width - bit).min(64);
                             for k in 0..n {
                                 if (chunk >> k) & 1 == 1 {
@@ -1800,24 +1802,26 @@ impl Simulator {
                     let v = if *is_randc {
                         let domain = self.randc_domain(&key, *w, et.as_deref(), None);
                         if domain.is_empty() {
-                            Value::from_u64(self.rng.r#gen::<u64>(), *w)
+                            Value::from_u64(self.cur_rng().r#gen::<u64>(), *w)
                         } else {
                             let pick = self.pick_randc(handle, &key, &domain);
                             Value::from_u64(pick, *w)
                         }
-                    } else if let Some(members) = et
+                    } else if let Some(n) = et
                         .as_ref()
                         .and_then(|t| self.module.enum_members.get(t.as_str()))
+                        .map(|members| members.len())
                     {
-                        let n = members.len();
                         if n == 0 {
                             Value::zero(*w)
                         } else {
-                            let mv = members[self.rng.gen_range(0..n)].1;
-                            Value::from_u64(mv, *w)
+                            // §18.15: draw from the object's own stream.
+                            let i = self.cur_rng().gen_range(0..n);
+                            let t = et.as_deref().unwrap_or_default();
+                            Value::from_u64(self.module.enum_members[t][i].1, *w)
                         }
                     } else if *w <= 64 {
-                        Value::from_u64(self.rng.r#gen::<u64>(), *w)
+                        Value::from_u64(self.cur_rng().r#gen::<u64>(), *w)
                     } else {
                         Value::zero(*w)
                     };

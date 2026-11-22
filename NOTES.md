@@ -8,6 +8,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+**Correctness**
+
+* Reseeding an object with `srandom()` repeats its `randomize()` sequence
+  for small scalar classes with a conditional constraint, unpacked-struct
+  members and sized or `unique` dynamic arrays. These paths drew from the
+  simulator-wide stream instead of the object's own (§18.13.3, §18.14.3,
+  §18.15).
+
 ### 0.11.7 — lower elaboration memory, faster event waits and queues, DPI C sources and memory files, array and real-number correctness (November 2026)
 
 Large designs elaborate in much less memory: compilation-unit declarations,
