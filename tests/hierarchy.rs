@@ -308,6 +308,8 @@ mod explicit_dollar_root_read_1124;
 mod interface_task_lexical_scope;
 #[path = "hierarchy/library_dir_on_demand.rs"]
 mod library_dir_on_demand;
+#[path = "hierarchy/library_file_macro_carry.rs"]
+mod library_file_macro_carry;
 #[path = "hierarchy/library_file_macros.rs"]
 mod library_file_macros;
 #[path = "hierarchy/library_file_latin1.rs"]

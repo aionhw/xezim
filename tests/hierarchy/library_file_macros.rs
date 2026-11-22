@@ -1,10 +1,9 @@
-//! §22.5.1, §3.12.1: a text macro defined in one `-y`/`-v`
-//! library file, directly or through an `include`, is visible in the library
-//! files read after it. Library files resolved for the design are read as
-//! part of the same compilation, in the order they are resolved; each one
-//! used to start from the source files' macros only, so a library module
-//! that included the design's headers did not share them with the library
-//! modules it instantiates, and those failed to parse.
+//! §22.5.1, §3.12.1: with `--carry-lib-macros`, a text macro defined in one
+//! `-y`/`-v` library file, directly or through an `include`, is visible in
+//! the library files read after it, in the order they are resolved, so a
+//! library module that includes the design's headers shares them with the
+//! library modules it instantiates. Without the switch each library file
+//! starts from the command-line defines only (library_file_macro_carry.rs).
 
 use std::path::Path;
 use std::process::Command;
@@ -22,7 +21,7 @@ fn write(dir: &Path, name: &str, text: &str) {
 fn run(dir: &Path, lib: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .current_dir(dir)
-        .args(["--no-cache", "top2.v"])
+        .args(["--no-cache", "--carry-lib-macros", "top2.v"])
         .args(lib)
         .args(["+libext+.v", "+incdir+.", "-s", "top"])
         .output()
@@ -85,9 +84,10 @@ fn xezim(dir: &Path, args: &[&str]) -> String {
 }
 
 /// With `--relax-library-packages`, a `-v` file's packages are compiled in a
-/// pass of their own, which reads the files as the module pass does: the
-/// module a macro of an earlier library file selects imports the package
-/// compiled beside it. And `--dump-merged-sv` keeps a library file named
+/// pass of their own, which reads the files as the module pass does: under
+/// `--carry-lib-macros` the module a macro of an earlier library file selects
+/// imports the package compiled beside it, and by default both passes take
+/// the other branch. And `--dump-merged-sv` keeps a library file named
 /// twice behind an include guard: its text is that of the read its module
 /// came from, not of the second read, which the guard leaves empty.
 #[test]
@@ -108,8 +108,10 @@ fn library_file_macros_reach_packages_and_the_merged_dump() {
     );
     write(&dir, "top3.v", "module top;\n  leaf u();\n  initial #1 $finish;\nendmodule\n");
     let args = ["--relax-library-packages", "top3.v", "-v", "feature.v", "-v", "leaf.v", "-s", "top"];
-    let text = xezim(&dir, &args);
+    let text = xezim(&dir, &[&["--carry-lib-macros"][..], &args].concat());
     assert!(text.contains("V=7"), "{text}");
+    let text = xezim(&dir, &args);
+    assert!(text.contains("V=3"), "{text}");
 
     write(
         &dir,
