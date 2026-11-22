@@ -27,6 +27,12 @@ impl Simulator {
         (self.aggregate_type_work[0].get(), self.aggregate_type_work[1].get())
     }
 
+    /// Deterministic §23.10 work: the parameter-table rows read or copied to
+    /// size declarations in their instance scopes.
+    pub fn decl_param_rows(&self) -> u64 {
+        self.decl_param_rows.get()
+    }
+
     pub fn get_signal(&self, name: &str) -> Option<&Value> {
         if let Some(&id) = self.signal_name_to_id.get(name) {
             return Some(&self.signal_table[id]);
