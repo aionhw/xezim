@@ -3475,11 +3475,20 @@ impl Simulator {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
                         let name = self.multidim_array_store(hier, inner_expr, |s, n| s.module.arrays_2d.contains_key(n));
                         if self.module.arrays_2d.contains_key(&*name) {
+                            // §7.10.1: in the row select of a queue of
+                            // fixed-size rows (`q[$][1]`), `$` is the queue's
+                            // last index.
+                            let queue_rows = self.module.dynamic_arrays.contains(&*name);
+                            if queue_rows {
+                                self.dollar_bound
+                                    .push(self.get_queue_size(&name) as i64 - 1);
+                            }
+                            let row = self.eval_expr(inner_idx).to_index();
+                            if queue_rows {
+                                self.dollar_bound.pop();
+                            }
                             // §11.5.1: an x/z index reads an all-x element.
-                            let (Some(i), Some(j)) = (
-                                self.eval_expr(inner_idx).to_index(),
-                                self.eval_expr(index).to_index(),
-                            ) else {
+                            let (Some(i), Some(j)) = (row, self.eval_expr(index).to_index()) else {
                                 let ew = self
                                     .module
                                     .arrays_2d

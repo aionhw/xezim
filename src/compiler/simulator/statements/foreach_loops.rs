@@ -640,8 +640,15 @@ impl Simulator {
                 // single-var fallbacks below sized it wrong (one
                 // iteration on a 2-D fixed array).
                 if vars.len() == 1 {
-                    if let Some(dims) = self.foreach_dims(&an) {
+                    if let Some(mut dims) = self.foreach_dims(&an) {
                         if dims.len() >= 2 {
+                            // §12.7.3: a dynamic outer dimension (`T q[$][N]`
+                            // of an object) iterates its current size, as in
+                            // the multi-variable loop above, not the 64-slot
+                            // buffer.
+                            if self.module.dynamic_arrays.contains(&an) {
+                                dims[0] = (0, self.get_queue_size(&an) as i64 - 1);
+                            }
                             let descs = self.foreach_unpacked_descs(&an, 1);
                             self.exec_foreach_nested_dir(
                                 &dims[..1],
