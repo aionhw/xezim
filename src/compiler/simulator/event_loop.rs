@@ -307,6 +307,65 @@ impl Simulator {
         // recorded.
         self.drain_edge_exec_rescan();
     }
+    /// §9.3.2, §4.4.2: run the processes queued for the current time slot
+    /// INLINE, before the caller commits the NBA region. A process an edge
+    /// resumed inline queues the children it forks here; they start in the
+    /// Active region, so a child that waits for an edge this slot's NBAs make
+    /// is already waiting when they commit.
+    pub(super) fn drain_active_pre_nba(&mut self) {
+        if !self.active_pre_nba_allowed() || self.event_queue.next_time() != Some(self.time) {
+            return;
+        }
+        // Their writes come after this slot's edge detection: record them for
+        // the rescan drain, as `drain_inactive_pre_nba` does.
+        let prev = self.in_edge_cont;
+        self.in_edge_cont = true;
+        while self.event_queue.next_time() == Some(self.time)
+            && !self.finished
+            && !self.zero_delay_defer_pending
+        {
+            let Some((pid, cont)) = self.event_queue.pop_front(self.time) else {
+                break;
+            };
+            self.run_scheduled_process(pid, &cont);
+            if !self.is_pid_suspended(pid) {
+                self.child_finished(pid);
+            }
+        }
+        if self.dirty_any {
+            self.settle_combinatorial();
+        }
+        self.in_edge_cont = prev;
+        self.drain_edge_exec_rescan();
+    }
+
+    /// Only the top-level scheduler runs Active work inline before the NBAs.
+    /// A nested scheduler (`run_nested_until`, under a process that waits on
+    /// its own stack) and a run with imported DPI tasks parked on their own
+    /// stacks leave it to their loops: running those processes here nested
+    /// them inside the waiting activation.
+    fn active_pre_nba_allowed(&self) -> bool {
+        self.stmts_depth == 0 && self.dpi_tasks.is_empty()
+    }
+
+    /// §4.5: the Active and Inactive regions alternate until both are empty,
+    /// and only then does the NBA region run. A `#0` continuation the
+    /// Inactive drain resumes may fork, which queues Active work again.
+    pub(super) fn drain_pre_nba_regions(&mut self) {
+        if !self.active_pre_nba_allowed() {
+            self.drain_inactive_pre_nba();
+            return;
+        }
+        let mut fuel = 1000u32;
+        loop {
+            self.drain_active_pre_nba();
+            self.drain_inactive_pre_nba();
+            fuel -= 1;
+            if fuel == 0 || self.finished || self.event_queue.next_time() != Some(self.time) {
+                break;
+            }
+        }
+    }
 
     pub(super) fn drain_edge_cascade(&mut self, cascade_limit: u32) -> (u64, u64, u64, u64) {
         let (mut t_snap, mut t_nba, mut t_settle, mut t_edges) = (0u64, 0u64, 0u64, 0u64);
@@ -337,7 +396,9 @@ impl Simulator {
             // Inactive region precedes the NBA region (§4.5): `#0`
             // continuations parked by this round's active-region work run
             // before its NBAs commit.
-            self.drain_inactive_pre_nba();
+            // So do the processes it queued for this time (fork children), and
+            // the Active work those `#0` continuations queue in turn.
+            self.drain_pre_nba_regions();
             // §9.7.4: `wait(expr)` is a same-delta, same-timestep handoff. A
             // waiter whose condition an ACTIVE-region continuation just made
             // true (an inline edge resume above — e.g. a grant handshake
@@ -1871,7 +1932,9 @@ impl Simulator {
 
         let _t = profile_timing.then(std::time::Instant::now);
         // §4.5: inactive (`#0`) continuations run before this slot's NBAs.
-        self.drain_inactive_pre_nba();
+        // So do the fork children of a process an edge woke before the NBAs
+        // (the edge pass above), and the Active work `#0` continuations queue.
+        self.drain_pre_nba_regions();
         if self.finished {
             return;
         }
