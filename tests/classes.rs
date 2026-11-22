@@ -1369,3 +1369,5 @@ mod queue_row_name_collision;
 mod rand_srandom_reseed_repeats;
 #[path = "classes/review_rand_srandom_streams.rs"]
 mod review_rand_srandom_streams;
+#[path = "classes/class_row_replication_once.rs"]
+mod class_row_replication_once;
