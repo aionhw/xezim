@@ -288,3 +288,34 @@ endmodule
         .collect();
     assert_eq!(lines, ["R st=00000000"]);
 }
+
+/// §11.4.3, §11.8.2: a negated sized literal index is negated at its own
+/// width, so `-4'sd8` is -8, outside `[8:0]`, and the write changes nothing.
+/// The compiled path negated the value after widening it and wrote `e[8]`.
+#[test]
+fn a_negated_sized_literal_index_keeps_its_width() {
+    let src = r#"
+module top;
+  typedef struct packed { logic [3:0] value; } el_t;
+  typedef struct packed { el_t [8:0] e; } s_t;
+  s_t s;
+  logic clk = 0;
+  logic [3:0] d = 4'h5;
+  always @(posedge clk) s.e[-4'sd8].value <= d;
+  initial begin
+    s = '0;
+    #1 clk = 1;
+    #1 $display("R s=%h", s);
+    $finish;
+  end
+endmodule
+"#;
+    let sim = xezim::simulate(src, 100).expect("simulate");
+    let lines: Vec<_> = sim
+        .output
+        .iter()
+        .map(|l| l.message.as_str())
+        .filter(|l| l.starts_with("R "))
+        .collect();
+    assert_eq!(lines, ["R s=000000000"]);
+}
