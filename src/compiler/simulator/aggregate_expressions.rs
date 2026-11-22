@@ -8,6 +8,82 @@ use crate::{log_eprintln as eprintln, log_println as println};
 /// dropped and rebuilt.
 pub(super) const CLASS_PROP_MEMO_CAP: usize = 1 << 16;
 
+/// §23.10: the parameters a declaration in an instance scope sees, read
+/// through the design-wide table: a name `X` is the innermost enclosing
+/// scope's `<scope>.X`, else the table's own `X`. These are the bindings the
+/// table has with every enclosing scope's parameters laid on it, outermost
+/// first, under their names relative to that scope (`u.g.L` is `g.L` for
+/// `u`, `L` for `u.g`), without a copy of the table per instance.
+pub(super) struct DeclScopeParams<'a> {
+    table: &'a HashMap<String, Value>,
+    scope: &'a DeclScope,
+    /// The `<scope>.<name>` probe, reused across lookups.
+    key: std::cell::RefCell<String>,
+    /// `Simulator::decl_param_rows`.
+    rows: &'a std::cell::Cell<u64>,
+}
+
+impl DeclScopeParams<'_> {
+    #[inline]
+    fn count(&self, rows: usize) {
+        self.rows.set(self.rows.get().saturating_add(rows as u64));
+    }
+
+    /// The bindings as one table, for a caller that reads the whole table.
+    fn flat(&self) -> &HashMap<String, Value> {
+        self.scope.flat.get_or_init(|| {
+            self.count(self.table.len() * (1 + self.scope.owners.len()));
+            let mut flat = self.table.clone();
+            for &end in self.scope.owners.iter().rev() {
+                let scope = &self.scope.prefix[..end];
+                for (k, v) in self.table {
+                    if let Some(rest) = k.strip_prefix(scope).and_then(|r| r.strip_prefix('.')) {
+                        flat.insert(rest.to_string(), v.clone());
+                    }
+                }
+            }
+            flat
+        })
+    }
+}
+
+impl super::elaborate::ParamLookup for DeclScopeParams<'_> {
+    fn get(&self, key: &str) -> Option<&Value> {
+        if let Some(flat) = self.scope.flat.get() {
+            return flat.get(key);
+        }
+        let mut probe = self.key.borrow_mut();
+        for &end in self.scope.owners.iter() {
+            probe.clear();
+            probe.push_str(&self.scope.prefix[..end]);
+            probe.push('.');
+            probe.push_str(key);
+            self.count(1);
+            if let Some(v) = self.table.get(probe.as_str()) {
+                return Some(v);
+            }
+        }
+        self.count(1);
+        self.table.get(key)
+    }
+
+    fn keys(&self) -> HashSet<&str> {
+        self.flat().keys().map(String::as_str).collect()
+    }
+
+    fn rows(&self) -> Vec<(&str, &Value)> {
+        self.flat().iter().map(|(k, v)| (k.as_str(), v)).collect()
+    }
+
+    fn as_hashmap_base(&self) -> Option<&HashMap<String, Value>> {
+        self.scope.flat.get()
+    }
+
+    fn to_hashmap(&self) -> std::borrow::Cow<'_, HashMap<String, Value>> {
+        std::borrow::Cow::Borrowed(self.flat())
+    }
+}
+
 impl Simulator {
     /// §7.4.1: bit offset of ELEMENT `idx` of the packed multi-D signal
     /// `name`, normalized against the declared outer dimension — a descending
@@ -1481,130 +1557,64 @@ impl Simulator {
         self.declared_packed_type_in(dt, &self.module.parameters)
     }
 
-    /// §23.10: the parameter table a declaration stored under `name` is sized
-    /// against. A declaration inside an instantiated module names ITS
-    /// parameters bare (`s_t [N-1:0] par`), while the design-wide table keys
-    /// them by instance (`u.N`); evaluating the declaration against that table
-    /// misses `N` (or hits an unrelated top-level `N`). Overlay every
-    /// parameter of the signal's instance path — outer scopes first, so a
-    /// generate block's or the instance's own binding wins — on the table.
-    /// `None` for a top-scope name or a prefix that owns no parameters.
-    pub(super) fn decl_param_scope(
-        &self,
-        name: &str,
-    ) -> Option<std::rc::Rc<HashMap<String, Value>>> {
+    /// §23.10: the scope a declaration stored under `name` is sized in. A
+    /// declaration inside an instantiated module names ITS parameters bare
+    /// (`s_t [N-1:0] par`), while the design-wide table keys them by instance
+    /// (`u.N`); evaluating the declaration against that table misses `N` (or
+    /// hits an unrelated top-level `N`). `decl_scope_params` reads the
+    /// declaration's names in this scope. `None` for a top-scope name or a
+    /// prefix none of whose scopes has a parameter.
+    pub(super) fn decl_param_scope(&self, name: &str) -> Option<DeclScope> {
         let (prefix, _) = name.rsplit_once('.')?;
         let mut cache = self.decl_param_scope_cache.borrow_mut();
         let cache = &mut *cache;
-        if let Some((last, owns)) = &cache.last
+        if let Some((last, scope)) = &cache.last
             && last == prefix
         {
-            return if *owns {
-                cache.tables.last().map(|t| t.table.clone())
-            } else {
-                None
-            };
+            return scope.clone();
         }
-        // Every enclosing scope of the prefix, outermost first: `u.g.par`
-        // sees `u.N` as `N` and a generate-block constant `u.g.L` as `L`.
-        // Their groups go on in that order, so the innermost binding of a
-        // name wins over an outer same-named one.
-        let scopes: Vec<&str> = prefix
-            .match_indices('.')
-            .map(|(i, _)| &prefix[..i])
-            .chain(std::iter::once(prefix))
-            .collect();
-        let mut groups = Vec::with_capacity(scopes.len());
-        for scope in &scopes {
-            let group = match cache.groups.get(*scope) {
-                Some(group) => group.clone(),
-                None => {
-                    let group = self.decl_param_group(scope);
-                    cache.groups.insert(scope.to_string(), group.clone());
-                    group
-                }
-            };
-            groups.push(group);
-        }
-        if groups.iter().all(|g| g.is_empty()) {
-            cache.last = Some((prefix.to_string(), false));
-            return None;
-        }
-        // An overlaid table is moved between prefixes: the groups of the
-        // scopes the old and new prefix share stay on, the old prefix's
-        // other groups come off and the new prefix's go on. Of the tables
-        // nothing else holds, the one sharing the most outer scopes with the
-        // new prefix is moved; a prefix that shares none with any of them
-        // gets a fresh copy while there is room, else the least recently
-        // used one. A caller that still holds a table (a select whose index
-        // reads another instance's signal) keeps it untouched.
-        let shared = |t: &DeclParamTable| {
-            t.applied
-                .iter()
-                .zip(&scopes)
-                .take_while(|((applied, _), scope)| applied == *scope)
-                .count()
-        };
-        let unshared = |t: &DeclParamTable| std::rc::Rc::strong_count(&t.table) == 1;
-        let best = cache
-            .tables
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| unshared(t))
-            .map(|(i, t)| (shared(t), i))
-            .filter(|&(keep, _)| keep > 0)
-            .max_by_key(|&(keep, i)| (keep, i));
-        let fresh = || {
+        // One pass over the table, once: a scope is looked up for every
+        // evaluation of a select into an instance's packed declaration, and
+        // a scan of the table per scope was quadratic in the design's size.
+        let owners = cache.owners.get_or_insert_with(|| {
             self.count_decl_param_rows(self.module.parameters.len());
-            DeclParamTable {
-                table: std::rc::Rc::new(self.module.parameters.clone()),
-                applied: Vec::new(),
-                undo: Vec::new(),
-            }
-        };
-        let pick = if let Some((_, i)) = best {
-            i
-        } else if cache.tables.len() < DECL_PARAM_TABLES {
-            cache.tables.push(fresh());
-            cache.tables.len() - 1
-        } else if let Some(i) = cache.tables.iter().position(|t| unshared(t)) {
-            i
-        } else {
-            // Every table is held by a caller: replace the least recently
-            // used one; its holder keeps its own copy.
-            cache.tables[0] = fresh();
-            0
-        };
-        let mut t = cache.tables.remove(pick);
-        let keep = shared(&t);
-        // Nothing else holds `t.table` here, so this never copies it.
-        let table = std::rc::Rc::make_mut(&mut t.table);
-        if let Some(&(_, mark)) = t.applied.get(keep) {
-            self.count_decl_param_rows(t.undo.len() - mark);
-            for (k, prev) in t.undo.drain(mark..).rev() {
-                match prev {
-                    Some(v) => {
-                        table.insert(k, v);
-                    }
-                    None => {
-                        table.remove(&k);
+            let mut owners: HashSet<String> = HashSet::default();
+            for key in self.module.parameters.keys() {
+                for (i, _) in key.match_indices('.') {
+                    if !owners.contains(&key[..i]) {
+                        owners.insert(key[..i].to_string());
                     }
                 }
             }
-            t.applied.truncate(keep);
+            owners
+        });
+        // The enclosing scopes of the prefix that have parameters, innermost
+        // first: `u.g.par` sees a generate-block constant `u.g.L` as `L` and
+        // `u.N` as `N`, and the innermost binding of a name wins.
+        let found: Vec<usize> = prefix
+            .match_indices('.')
+            .map(|(i, _)| i)
+            .chain(std::iter::once(prefix.len()))
+            .rev()
+            .filter(|&end| owners.contains(&prefix[..end]))
+            .collect();
+        let scope = (!found.is_empty()).then(|| DeclScope {
+            prefix: prefix.into(),
+            owners: found.into(),
+            flat: Default::default(),
+        });
+        cache.last = Some((prefix.to_string(), scope.clone()));
+        scope
+    }
+
+    /// §23.10: the parameters a declaration in `scope` is sized against.
+    pub(super) fn decl_scope_params<'a>(&'a self, scope: &'a DeclScope) -> DeclScopeParams<'a> {
+        DeclScopeParams {
+            table: &self.module.parameters,
+            scope,
+            key: std::cell::RefCell::new(String::new()),
+            rows: &self.decl_param_rows,
         }
-        for (scope, group) in scopes[keep..].iter().zip(&groups[keep..]) {
-            t.applied.push((scope.to_string(), t.undo.len()));
-            self.count_decl_param_rows(group.len());
-            for (rest, v) in group.iter() {
-                let prev = table.insert(rest.clone(), v.clone());
-                t.undo.push((rest.clone(), prev));
-            }
-        }
-        let handed = t.table.clone();
-        cache.tables.push(t);
-        cache.last = Some((prefix.to_string(), true));
-        Some(handed)
     }
 
     /// Add `rows` parameter-table rows to the `decl_param_rows` work count.
@@ -1614,27 +1624,13 @@ impl Simulator {
             .set(self.decl_param_rows.get().saturating_add(rows as u64));
     }
 
-    /// The parameters named `<scope>.<rest>` in the design-wide table, as
-    /// `(rest, value)` in table order.
-    fn decl_param_group(&self, scope: &str) -> std::rc::Rc<[(String, Value)]> {
-        self.count_decl_param_rows(self.module.parameters.len());
-        self.module
-            .parameters
-            .iter()
-            .filter_map(|(k, v)| {
-                let rest = k.strip_prefix(scope)?.strip_prefix('.')?;
-                Some((rest.to_string(), v.clone()))
-            })
-            .collect()
-    }
-
-    pub(super) fn declared_packed_type_in(
+    pub(super) fn declared_packed_type_in<P: super::elaborate::ParamLookup>(
         &self,
         dt: &DataType,
-        params: &HashMap<String, Value>,
+        params: &P,
     ) -> Option<(DataType, Vec<(i64, i64)>, u32)> {
         let width =
-            super::elaborate::resolve_type_width(dt, Some(params), Some(&self.module.typedefs));
+            super::elaborate::resolve_type_width_env(dt, Some(params), Some(&self.module.typedefs));
         if width == 0 {
             return None;
         }
@@ -1654,8 +1650,8 @@ impl Simulator {
                         return None;
                     };
                     dimensions.push((
-                        super::elaborate::const_eval_i64_with_params(left, Some(params))?,
-                        super::elaborate::const_eval_i64_with_params(right, Some(params))?,
+                        super::elaborate::const_eval_i64_with_params_env(left, Some(params))?,
+                        super::elaborate::const_eval_i64_with_params_env(right, Some(params))?,
                     ));
                 }
                 su.dimensions.clear();
@@ -1902,7 +1898,9 @@ impl Simulator {
                 // the array (#816). Size the declaration in its own scope.
                 let scope = self.decl_param_scope(&name);
                 let (element_type, mut dimensions, mut width) = match &scope {
-                    Some(params) => self.declared_packed_type_in(dt, params)?,
+                    Some(scope) => {
+                        self.declared_packed_type_in(dt, &self.decl_scope_params(scope))?
+                    }
                     None => self.declared_packed_type(dt)?,
                 };
                 // Elaboration recorded a vector's dimensions per instance;
@@ -2115,7 +2113,10 @@ impl Simulator {
                 for m in &su.members {
                     // A member sized by the instance's parameters too.
                     let (element, dimensions, width) = match &access.params {
-                        Some(params) => self.declared_packed_type_in(&m.data_type, params)?,
+                        Some(scope) => self.declared_packed_type_in(
+                            &m.data_type,
+                            &self.decl_scope_params(scope),
+                        )?,
                         None => self.declared_packed_type(&m.data_type)?,
                     };
                     for d in &m.declarators {
