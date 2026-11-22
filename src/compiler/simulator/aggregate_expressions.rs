@@ -2420,6 +2420,34 @@ impl Simulator {
         let crate::ast::types::DataType::Struct(su) = resolved else {
             return false;
         };
+        // §7.2.1: a nested member keeps its own declared type's sign. Walk the
+        // path through each member's type, typedefs included (`ti.m.a.v` with
+        // `mid_t m; leaf_t a;`), before the leaf-name search below, which only
+        // looks inside members declared as inline structs.
+        let mut cur = dt;
+        let mut walked = true;
+        for seg in field.split('.') {
+            let crate::ast::types::DataType::Struct(s) =
+                super::elaborate::resolve_typedef_chain(cur, &self.module.typedef_types)
+            else {
+                walked = false;
+                break;
+            };
+            match s
+                .members
+                .iter()
+                .find(|m| m.declarators.iter().any(|d| d.name.name == seg))
+            {
+                Some(m) => cur = &m.data_type,
+                None => {
+                    walked = false;
+                    break;
+                }
+            }
+        }
+        if walked {
+            return super::elaborate::is_type_signed_resolved(cur, &self.module.typedef_types);
+        }
         let leaf = field.rsplit('.').next().unwrap_or(field);
         fn find_signed(
             su: &crate::ast::types::StructUnionType,
