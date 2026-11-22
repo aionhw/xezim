@@ -20,6 +20,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   its known selector picks data already present in its output slice.
 - Experimental `XEZIM_ARMED_EDGE_BATCH=1` checks groups of armed blocks at
   dense clock fanouts and queues only the blocks that need to run.
+- The interpreter skips reference resolution for numeric literals and
+  unary and binary operators while resolving any referenced operands normally.
 
 **Command line**
 

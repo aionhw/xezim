@@ -166,266 +166,274 @@ impl Simulator {
             }
             _ => {}
         }
-        if let Some(v) = self.assoc_size_member(expr) {
-            return v;
-        }
-        // `pkg::arr[i]` / `pkg::v[h:l]` as an rvalue: the indexed arms resolve
-        // their base by name and only for a plain identifier, so under a
-        // task/function frame a package-qualified base read 0. Strip the
-        // prefix and re-enter, as the identifier spelling does below. Scalar
-        // `pkg::x` reads keep their own arm (parameters of two packages must
-        // not collide through the bare name).
-        //
-        // §6.20.2/§26.3 (issue #425): an UNPACKED-ARRAY package localparam
-        // keeps its QUALIFIED registration only (`pkg::LIM` plus per-element
-        // `pkg::LIM[i]`); stripping the head here resolved the element select
-        // to a bare `LIM` that exists nowhere and read 0. Keep the qualified
-        // spelling when it names a collection — the indexed arms below
-        // resolve the base through `resolve_hier_name`, which returns the
-        // qualified key (package variables still hoist bare as before).
-        let pkg_qual_collection = match &expr.kind {
-            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
-                // §26.3 / §7.4: every select belongs to the qualified
-                // collection, including the outer select of a nested index.
-                let mut base = base.as_ref();
-                while let ExprKind::Index { expr, .. }
-                | ExprKind::RangeSelect { expr, .. }
-                | ExprKind::Paren(expr) = &base.kind
-                {
-                    base = expr;
-                }
-                match &base.kind {
-                    ExprKind::Ident(h)
-                        if h.path.len() == 2
-                            && h.path[0].selects.is_empty()
-                            && self.module.packages.contains(&h.path[0].name.name) =>
-                    {
-                        self.pkg_qual_collection_key(&h.path[0].name.name, &h.path[1].name.name)
-                            .is_some()
-                    }
-                    _ => false,
-                }
-            }
-            _ => false,
-        };
-        if !self.module.packages.is_empty()
-            && matches!(
-                expr.kind,
-                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
-            )
-            && !pkg_qual_collection
-        {
-            if let Some(stripped) = self.strip_package_lvalue(expr) {
-                return self.eval_expr_ctx(&stripped, ctx_width);
-            }
-        }
-        // §6.20.2/§26.3 (issue #425): `(pkg::LIM)[3]` — the Paren wrapper is
-        // semantically transparent, but it defeats every base-shape probe
-        // above and below (including the package strip), so the select fell
-        // through to a bit-select of the whole-array read and returned 0.
-        // Unwrap the wrapper for the package-collection shape and re-enter.
-        if let ExprKind::Index { expr: base, index } = &expr.kind
-            && let ExprKind::Paren(inner) = &base.kind
-            && let ExprKind::Ident(h) = &inner.kind
-            && h.path.len() == 2
-            && h.path[0].selects.is_empty()
-            && self.module.packages.contains(&h.path[0].name.name)
-            && self
-                .pkg_qual_collection_key(&h.path[0].name.name, &h.path[1].name.name)
-                .is_some()
-        {
-            let rewritten = Expression::new(
-                ExprKind::Index {
-                    expr: inner.clone(),
-                    index: index.clone(),
-                },
-                expr.span,
-            );
-            return self.eval_expr_ctx(&rewritten, ctx_width);
-        }
-        // §13.5.2: an indexed / part-selected read through a `ref` formal
-        // reads the caller's actual (see `ref_formal_redirect_hier`).
-        if matches!(
+        // Reference rewrites apply to names, calls and selection chains. A
+        // scalar operator evaluates its operands recursively, where each
+        // operand still receives its own reference resolution.
+        if !matches!(
             expr.kind,
-            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
-        ) && self.ref_redirect_possible()
-        {
-            if let Some(rewritten) = self.ref_formal_redirect_inner(expr, false) {
+            ExprKind::Number(_) | ExprKind::Binary { .. } | ExprKind::Unary { .. }
+        ) {
+            if let Some(v) = self.assoc_size_member(expr) {
+                return v;
+            }
+            // `pkg::arr[i]` / `pkg::v[h:l]` as an rvalue: the indexed arms resolve
+            // their base by name and only for a plain identifier, so under a
+            // task/function frame a package-qualified base read 0. Strip the
+            // prefix and re-enter, as the identifier spelling does below. Scalar
+            // `pkg::x` reads keep their own arm (parameters of two packages must
+            // not collide through the bare name).
+            //
+            // §6.20.2/§26.3 (issue #425): an UNPACKED-ARRAY package localparam
+            // keeps its QUALIFIED registration only (`pkg::LIM` plus per-element
+            // `pkg::LIM[i]`); stripping the head here resolved the element select
+            // to a bare `LIM` that exists nowhere and read 0. Keep the qualified
+            // spelling when it names a collection — the indexed arms below
+            // resolve the base through `resolve_hier_name`, which returns the
+            // qualified key (package variables still hoist bare as before).
+            let pkg_qual_collection = match &expr.kind {
+                ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
+                    // §26.3 / §7.4: every select belongs to the qualified
+                    // collection, including the outer select of a nested index.
+                    let mut base = base.as_ref();
+                    while let ExprKind::Index { expr, .. }
+                    | ExprKind::RangeSelect { expr, .. }
+                    | ExprKind::Paren(expr) = &base.kind
+                    {
+                        base = expr;
+                    }
+                    match &base.kind {
+                        ExprKind::Ident(h)
+                            if h.path.len() == 2
+                                && h.path[0].selects.is_empty()
+                                && self.module.packages.contains(&h.path[0].name.name) =>
+                        {
+                            self.pkg_qual_collection_key(&h.path[0].name.name, &h.path[1].name.name)
+                                .is_some()
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            if !self.module.packages.is_empty()
+                && matches!(
+                    expr.kind,
+                    ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+                )
+                && !pkg_qual_collection
+            {
+                if let Some(stripped) = self.strip_package_lvalue(expr) {
+                    return self.eval_expr_ctx(&stripped, ctx_width);
+                }
+            }
+            // §6.20.2/§26.3 (issue #425): `(pkg::LIM)[3]` — the Paren wrapper is
+            // semantically transparent, but it defeats every base-shape probe
+            // above and below (including the package strip), so the select fell
+            // through to a bit-select of the whole-array read and returned 0.
+            // Unwrap the wrapper for the package-collection shape and re-enter.
+            if let ExprKind::Index { expr: base, index } = &expr.kind
+                && let ExprKind::Paren(inner) = &base.kind
+                && let ExprKind::Ident(h) = &inner.kind
+                && h.path.len() == 2
+                && h.path[0].selects.is_empty()
+                && self.module.packages.contains(&h.path[0].name.name)
+                && self
+                    .pkg_qual_collection_key(&h.path[0].name.name, &h.path[1].name.name)
+                    .is_some()
+            {
+                let rewritten = Expression::new(
+                    ExprKind::Index {
+                        expr: inner.clone(),
+                        index: index.clone(),
+                    },
+                    expr.span,
+                );
                 return self.eval_expr_ctx(&rewritten, ctx_width);
             }
-        }
-        // §7.2/§13.4.2: a leaf of an unpacked struct the innermost call frame
-        // OWNS — `s.a`, `s.inner.x`, `s.arr[2]`. Read it from the frame, as the
-        // write path does; otherwise the lookups below reach module scope and
-        // return an unrelated same-named variable's member.
-        if let Some(rewritten) = self.super_rewrite(expr) {
-            return self.eval_expr_ctx(&rewritten, ctx_width);
-        }
-        // §25.8/§25.9: any chain rooted at a bound virtual interface reads as
-        // a direct access to the bound instance.
-        if let Some(rewritten) = self.vif_rebase_expr(expr) {
-            return self.eval_expr_ctx(&rewritten, ctx_width);
-        }
-        if !self.local_stack.is_empty() {
-            if let Some(key) = self.frame_leaf_key_of(expr) {
-                if let Some(v) = self.frame_get(&key) {
-                    return v.clone();
+            // §13.5.2: an indexed / part-selected read through a `ref` formal
+            // reads the caller's actual (see `ref_formal_redirect_hier`).
+            if matches!(
+                expr.kind,
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+            ) && self.ref_redirect_possible()
+            {
+                if let Some(rewritten) = self.ref_formal_redirect_inner(expr, false) {
+                    return self.eval_expr_ctx(&rewritten, ctx_width);
                 }
             }
-            // §7.4.1/§11.5.1: a nested select of a packed variable the frame
-            // owns, placed as its write is (`frame_packed_select_write`).
-            if Self::select_of_select(expr)
-                && let Some(v) = self.formal_collection_packed_read(expr)
-            {
-                return v;
+            // §7.2/§13.4.2: a leaf of an unpacked struct the innermost call frame
+            // OWNS — `s.a`, `s.inner.x`, `s.arr[2]`. Read it from the frame, as the
+            // write path does; otherwise the lookups below reach module scope and
+            // return an unrelated same-named variable's member.
+            if let Some(rewritten) = self.super_rewrite(expr) {
+                return self.eval_expr_ctx(&rewritten, ctx_width);
             }
-            if Self::select_of_select(expr)
-                && let Some(v) = self.frame_packed_select_read(expr)
-            {
-                return v;
+            // §25.8/§25.9: any chain rooted at a bound virtual interface reads as
+            // a direct access to the bound instance.
+            if let Some(rewritten) = self.vif_rebase_expr(expr) {
+                return self.eval_expr_ctx(&rewritten, ctx_width);
             }
-        }
-        // §6.21: a `static` subroutine local is a LIVE cell shared across ALL
-        // simultaneous activations — including re-entrant/recursive ones. Read
-        // the committed value from `static_local_vars` rather than this
-        // recursion window's snapshot frame, so mutations inside an inner
-        // activation are instantly visible to the caller's frames (otherwise a
-        // recursive phase re-entry / method would reset the static to its
-        // per-window initialiser and livelock). Skipped during elaboration-time
-        // constant-function evaluation, where §13.4.3 makes each such call
-        // independent.
-        if !self.in_const_param_eval && !self.static_local_names.is_empty() {
-            if let ExprKind::Ident(h) = &expr.kind {
-                if h.path.len() == 1 && h.path[0].selects.is_empty() {
-                    let n = &h.path[0].name.name;
-                    if n.as_bytes()
-                        .first()
-                        .is_some_and(|&b| self.static_local_first[b as usize])
-                        && self.static_local_names.contains(n.as_str())
-                        && let Some(k) = self.static_local_key_for(n)
-                    {
-                        if self.static_local_keys.contains(&k)
-                            && let Some(v) = self.static_local_vars.get(&k).cloned()
+            if !self.local_stack.is_empty() {
+                if let Some(key) = self.frame_leaf_key_of(expr) {
+                    if let Some(v) = self.frame_get(&key) {
+                        return v.clone();
+                    }
+                }
+                // §7.4.1/§11.5.1: a nested select of a packed variable the frame
+                // owns, placed as its write is (`frame_packed_select_write`).
+                if Self::select_of_select(expr)
+                    && let Some(v) = self.formal_collection_packed_read(expr)
+                {
+                    return v;
+                }
+                if Self::select_of_select(expr)
+                    && let Some(v) = self.frame_packed_select_read(expr)
+                {
+                    return v;
+                }
+            }
+            // §6.21: a `static` subroutine local is a LIVE cell shared across ALL
+            // simultaneous activations — including re-entrant/recursive ones. Read
+            // the committed value from `static_local_vars` rather than this
+            // recursion window's snapshot frame, so mutations inside an inner
+            // activation are instantly visible to the caller's frames (otherwise a
+            // recursive phase re-entry / method would reset the static to its
+            // per-window initialiser and livelock). Skipped during elaboration-time
+            // constant-function evaluation, where §13.4.3 makes each such call
+            // independent.
+            if !self.in_const_param_eval && !self.static_local_names.is_empty() {
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                        let n = &h.path[0].name.name;
+                        if n.as_bytes()
+                            .first()
+                            .is_some_and(|&b| self.static_local_first[b as usize])
+                            && self.static_local_names.contains(n.as_str())
+                            && let Some(k) = self.static_local_key_for(n)
                         {
-                            return v;
+                            if self.static_local_keys.contains(&k)
+                                && let Some(v) = self.static_local_vars.get(&k).cloned()
+                            {
+                                return v;
+                            }
                         }
                     }
                 }
             }
-        }
-        // §8.9/§7.2.1: a member of a class STATIC property whose type is a
-        // packed struct (`Cls::sp.m`, `h.sp.m`, `sp.m` in the class) slices
-        // the shared static cell by the struct layout. It is not a class
-        // aggregate (no object holds it): the aggregate arm below read the
-        // object's own cell, and the later arms a 32-bit 0.
-        // No object need exist: a static is reachable through its class.
-        if let Some(v) = self.static_packed_member_value(expr) {
-            return v;
-        }
-        // §7.2/§18.4: a leaf of an unpacked-struct CLASS PROPERTY at any
-        // depth — `o.n.inner.a`, `o.s.arr[1]`, `o.arr[0].a`. The member-access
-        // read arm resolves only ONE level below the property, and the ident
-        // arm sees just the base of an index, so anything deeper fell through
-        // to a bit-select or a stale module-scope leaf. A part-select
-        // (`o.pkt.mem[1][255:248]`) rides along: the same select-aware walk
-        // resolves the element first.
-        if matches!(
-            expr.kind,
-            ExprKind::Index { .. } | ExprKind::MemberAccess { .. } | ExprKind::RangeSelect { .. }
-        ) && !self.no_class_objects()
-            && Self::chain_maybe_class_agg(
-                expr,
-                self.this_stack.last().copied().flatten().is_some(),
-            )
-        {
-            if let Some(r) = self.class_agg_member(expr) {
-                return self.read_class_agg(&r);
+            // §8.9/§7.2.1: a member of a class STATIC property whose type is a
+            // packed struct (`Cls::sp.m`, `h.sp.m`, `sp.m` in the class) slices
+            // the shared static cell by the struct layout. It is not a class
+            // aggregate (no object holds it): the aggregate arm below read the
+            // object's own cell, and the later arms a 32-bit 0.
+            // No object need exist: a static is reachable through its class.
+            if let Some(v) = self.static_packed_member_value(expr) {
+                return v;
             }
-        }
-        // §7.2/§18.4: a WHOLE unpacked-struct class property read as a value —
-        // `return s;` from a method, `v = obj.s;`. Its members are per-instance
-        // cells with no container, so the lookups further down returned the
-        // property's unused scalar cell (zero) instead of the members.
-        if !self.no_class_objects() {
-            if let ExprKind::Ident(h) = &expr.kind {
-                if (h.path.len() >= 2 || self.this_stack.last().copied().flatten().is_some())
-                    && h.path.iter().all(|p| p.selects.is_empty())
-                    && h.path
-                        .last()
-                        .is_some_and(|p| self.struct_prop_name_possible(&p.name.name))
-                {
-                    if let Some((handle, prop)) = self.class_prop_receiver(expr) {
-                        if let Some(su) = self.class_prop_struct(handle, &prop) {
-                            if Self::spreads_member_wise(&su) {
-                                if let Some(v) = self.pack_class_unpacked(handle, &prop, &su) {
-                                    return v;
+            // §7.2/§18.4: a leaf of an unpacked-struct CLASS PROPERTY at any
+            // depth — `o.n.inner.a`, `o.s.arr[1]`, `o.arr[0].a`. The member-access
+            // read arm resolves only ONE level below the property, and the ident
+            // arm sees just the base of an index, so anything deeper fell through
+            // to a bit-select or a stale module-scope leaf. A part-select
+            // (`o.pkt.mem[1][255:248]`) rides along: the same select-aware walk
+            // resolves the element first.
+            if matches!(
+                expr.kind,
+                ExprKind::Index { .. } | ExprKind::MemberAccess { .. } | ExprKind::RangeSelect { .. }
+            ) && !self.no_class_objects()
+                && Self::chain_maybe_class_agg(
+                    expr,
+                    self.this_stack.last().copied().flatten().is_some(),
+                )
+            {
+                if let Some(r) = self.class_agg_member(expr) {
+                    return self.read_class_agg(&r);
+                }
+            }
+            // §7.2/§18.4: a WHOLE unpacked-struct class property read as a value —
+            // `return s;` from a method, `v = obj.s;`. Its members are per-instance
+            // cells with no container, so the lookups further down returned the
+            // property's unused scalar cell (zero) instead of the members.
+            if !self.no_class_objects() {
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if (h.path.len() >= 2 || self.this_stack.last().copied().flatten().is_some())
+                        && h.path.iter().all(|p| p.selects.is_empty())
+                        && h.path
+                            .last()
+                            .is_some_and(|p| self.struct_prop_name_possible(&p.name.name))
+                    {
+                        if let Some((handle, prop)) = self.class_prop_receiver(expr) {
+                            if let Some(su) = self.class_prop_struct(handle, &prop) {
+                                if Self::spreads_member_wise(&su) {
+                                    if let Some(v) = self.pack_class_unpacked(handle, &prop, &su) {
+                                        return v;
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-        // §13.4.1: a member of a call result whose return type is an unpacked
-        // struct. Gated on the chain actually ending in a call, so nothing else
-        // pays for the walk.
-        if matches!(
-            expr.kind,
-            ExprKind::MemberAccess { .. } | ExprKind::Index { .. }
-        ) && Self::chain_has_call_base(expr)
-        {
-            if let Some(v) = self.eval_unpacked_call_member(expr) {
+            // §13.4.1: a member of a call result whose return type is an unpacked
+            // struct. Gated on the chain actually ending in a call, so nothing else
+            // pays for the walk.
+            if matches!(
+                expr.kind,
+                ExprKind::MemberAccess { .. } | ExprKind::Index { .. }
+            ) && Self::chain_has_call_base(expr)
+            {
+                if let Some(v) = self.eval_unpacked_call_member(expr) {
+                    return v;
+                }
+            }
+            // §13.4.1: a nested class's bare static function uses exactly the
+            // same dispatch as its parenthesized call, retaining the full scope
+            // and specialization before the value-read path strips wrappers.
+            if let ExprKind::MemberAccess { expr: recv, member } = &expr.kind
+                && !matches!(&recv.kind, ExprKind::Ident(h) if h.path.len() == 1)
+                && self
+                    .class_member_names()
+                    .static_methods
+                    .contains(&member.name)
+                && let Some(root) = Self::class_scope_root(recv)
+                && (self.module.classes.contains_key(root) || self.module.packages.contains(root))
+                && !self
+                    .local_stack
+                    .last()
+                    .is_some_and(|f| f.contains_key(root))
+                && !self.signal_name_to_id.contains_key(root)
+                && let Some(scope) = Self::class_scope_chain(recv)
+                && let Some((base, _)) = self.resolve_class_scope_prefix(&scope)
+                && self.is_static_method(&base, &member.name)
+                && self.class_parameterless_function(&base, &member.name)
+            {
+                return self.eval_call(expr, &[]);
+            }
+            // A parameterized-class specialization (`C#(...)`) in value context
+            // evaluates as its base reference — strip the `Specialization`
+            // wrapper(s) from the member/ident chain so resolution sees the same
+            // shape as the pre-`Specialization` AST. The `#(...)` text only matters
+            // for per-spec static keying (handled at the static-dispatch sites).
+            // Keeps behavior identical to before.
+            if Self::expr_has_specialization(expr) {
+                // Set the active specialization (for per-spec static keying) while
+                // resolving the stripped shape, e.g. `C#(params)::prop` reads the
+                // per-spec static cell. Restore afterward.
+                //
+                // Keep `current_spec` set to the enclosing spec while resolving
+                // the call's specialization: `resolve_call_spec_params` resolves
+                // class-local typedef args (e.g. `special_comp_type`) through
+                // `resolve_typedef_spec`, which reads `self.current_spec`.
+                let saved = self.current_spec.clone();
+                let lexical = self.lexical_spec();
+                let extracted = self.resolve_call_spec_params(Self::extract_call_spec(expr), &lexical);
+                if let Some((ref base, ref sig)) = extracted {
+                    self.ensure_spec_statics(base, sig);
+                }
+                self.current_spec = extracted.or(saved.clone());
+                let v = self.eval_expr_ctx(&Self::strip_spec_shape(expr), ctx_width);
+                self.current_spec = saved;
                 return v;
             }
-        }
-        // §13.4.1: a nested class's bare static function uses exactly the
-        // same dispatch as its parenthesized call, retaining the full scope
-        // and specialization before the value-read path strips wrappers.
-        if let ExprKind::MemberAccess { expr: recv, member } = &expr.kind
-            && !matches!(&recv.kind, ExprKind::Ident(h) if h.path.len() == 1)
-            && self
-                .class_member_names()
-                .static_methods
-                .contains(&member.name)
-            && let Some(root) = Self::class_scope_root(recv)
-            && (self.module.classes.contains_key(root) || self.module.packages.contains(root))
-            && !self
-                .local_stack
-                .last()
-                .is_some_and(|f| f.contains_key(root))
-            && !self.signal_name_to_id.contains_key(root)
-            && let Some(scope) = Self::class_scope_chain(recv)
-            && let Some((base, _)) = self.resolve_class_scope_prefix(&scope)
-            && self.is_static_method(&base, &member.name)
-            && self.class_parameterless_function(&base, &member.name)
-        {
-            return self.eval_call(expr, &[]);
-        }
-        // A parameterized-class specialization (`C#(...)`) in value context
-        // evaluates as its base reference — strip the `Specialization`
-        // wrapper(s) from the member/ident chain so resolution sees the same
-        // shape as the pre-`Specialization` AST. The `#(...)` text only matters
-        // for per-spec static keying (handled at the static-dispatch sites).
-        // Keeps behavior identical to before.
-        if Self::expr_has_specialization(expr) {
-            // Set the active specialization (for per-spec static keying) while
-            // resolving the stripped shape, e.g. `C#(params)::prop` reads the
-            // per-spec static cell. Restore afterward.
-            //
-            // Keep `current_spec` set to the enclosing spec while resolving
-            // the call's specialization: `resolve_call_spec_params` resolves
-            // class-local typedef args (e.g. `special_comp_type`) through
-            // `resolve_typedef_spec`, which reads `self.current_spec`.
-            let saved = self.current_spec.clone();
-            let lexical = self.lexical_spec();
-            let extracted = self.resolve_call_spec_params(Self::extract_call_spec(expr), &lexical);
-            if let Some((ref base, ref sig)) = extracted {
-                self.ensure_spec_statics(base, sig);
-            }
-            self.current_spec = extracted.or(saved.clone());
-            let v = self.eval_expr_ctx(&Self::strip_spec_shape(expr), ctx_width);
-            self.current_spec = saved;
-            return v;
         }
         match &expr.kind {
             ExprKind::Number(num) => {
