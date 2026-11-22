@@ -4305,9 +4305,11 @@ impl Simulator {
     pub(super) fn expr_reads_frame_local(&self, e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Ident(h) => self.frame_bound_bare_name(h).is_some(),
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
-                self.expr_reads_frame_local(x)
-            }
+            // §9.4.2: a member of a selected element (`sa[k].a`) reads the
+            // index `k` like the select does.
+            ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. }
+            | ExprKind::MemberAccess { expr: x, .. } => self.expr_reads_frame_local(x),
             ExprKind::Index { expr, index } => {
                 self.expr_reads_frame_local(expr) || self.expr_reads_frame_local(index)
             }
@@ -4355,7 +4357,9 @@ impl Simulator {
             return;
         }
         match &mut e.kind {
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => self.freeze_frame_locals(x),
+            ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. }
+            | ExprKind::MemberAccess { expr: x, .. } => self.freeze_frame_locals(x),
             ExprKind::Index { expr, index } => {
                 self.freeze_frame_locals(expr);
                 self.freeze_frame_locals(index);
