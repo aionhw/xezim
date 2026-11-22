@@ -2224,6 +2224,8 @@ impl Simulator {
                     if owns_loop_frame {
                         self.push_loop_frame();
                     }
+                    // Shown again when the loop's scope closes (`block_scope_exit`).
+                    let mut static_hidden = None;
                     for fi in init {
                         match fi {
                             ForInit::VarDecl {
@@ -2234,6 +2236,7 @@ impl Simulator {
                                 let rv = self.declare_for_init_var(data_type, &name.name, e);
                                 if let Some(frame) = self.local_stack.last_mut() {
                                     frame.insert(name.name.clone(), rv);
+                                    self.hide_loop_static(&name.name, &mut static_hidden);
                                 } else {
                                     // §12.7.1: a variable declared in the for-init
                                     // has AUTOMATIC lifetime — it is local to the
@@ -2298,12 +2301,13 @@ impl Simulator {
                             .insert(for_key, (Arc::clone(&pc.stmts), f.clone()));
                         f
                     };
-                    if !saved.is_empty() {
+                    if !saved.is_empty() || static_hidden.is_some() {
                         self.block_scope_saves.push(BlockScopeSave {
                             frame_key: Self::frame_key(&frame),
                             frame_gen: self.local_gen_stack.last().copied().unwrap_or(0),
                             loop_vars: saved,
                             owns_loop_frame,
+                            static_hidden,
                             ..Default::default()
                         });
                     }
