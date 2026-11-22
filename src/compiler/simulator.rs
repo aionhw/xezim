@@ -180,7 +180,8 @@ thread_local! {}
 // §6.24.1: an integer atom cast of an integral operand copies the operand before it is fitted.
 // §7.2, §7.4.2: a member select through constant element selects of a packed struct compiles.
 // §23.9: a frame local that hides a parameter is not a constant element select.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317a;
+// §7.2: reads of nested packed-struct members (`s.inner.f`) compile to a range select.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317b;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
@@ -531,7 +532,8 @@ macro_rules! write_sig {
 // §7.2, §7.4.2: a member select through constant element selects of a packed
 // struct is a compiled store.
 // §23.9: an index naming a frame local that hides a parameter is not constant.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB080";
+// §7.2: a read of a nested packed-struct member (`s.inner.f`) compiles to a range select.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB081";
 
 mod aggregate_assignments;
 mod pattern_array_items;
