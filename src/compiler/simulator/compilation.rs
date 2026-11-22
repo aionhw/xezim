@@ -1546,6 +1546,9 @@ impl Simulator {
         // continuously assigned variable. The procedural watches read theirs
         // when they register.
         self.capture_sampled_defaults();
+        // §16.14.6: the clocks whose time-step start a procedural concurrent
+        // assertion's registration reads.
+        self.collect_sva_clock_watch();
         // §16.9.3: pre-register sampled-value watches BEFORE the initial
         // blocks are consumed into scheduled processes, so clock-edge
         // history accumulates from the first edge.

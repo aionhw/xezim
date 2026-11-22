@@ -1017,6 +1017,163 @@ impl Simulator {
         }
     }
 
+    /// §16.14.6: the leaf names of the explicit clocks of the concurrent
+    /// assertions in `st` (`clk` of `assert property (@(posedge clk) p)`),
+    /// and `""` for one without an explicit clock (a named property's, the
+    /// inferred or the default clock).
+    pub(super) fn sva_stmt_clocks(st: &Statement, out: &mut HashSet<String>) {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::Assertion(a) if a.is_property || a.is_sequence => {
+                if !Self::sva_expr_clocks(&a.expr, out) {
+                    out.insert(String::new());
+                }
+            }
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                stmts.iter().for_each(|s| Self::sva_stmt_clocks(s, out))
+            }
+            SK::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::sva_stmt_clocks(then_stmt, out);
+                if let Some(e) = else_stmt {
+                    Self::sva_stmt_clocks(e, out);
+                }
+            }
+            SK::Case { items, .. } => items
+                .iter()
+                .for_each(|it| Self::sva_stmt_clocks(&it.stmt, out)),
+            SK::RandCase { items } => items
+                .iter()
+                .for_each(|(_, s)| Self::sva_stmt_clocks(s, out)),
+            SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => {
+                Self::sva_stmt_clocks(stmt, out)
+            }
+            SK::WaitOrder { pass, fail, .. } => {
+                for s in [pass, fail].into_iter().flatten() {
+                    Self::sva_stmt_clocks(s, out);
+                }
+            }
+            SK::For { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body }
+            | SK::ForeverTail { body }
+            | SK::Foreach { body, .. }
+            | SK::ForeachTail { body, .. }
+            | SK::RsAction { body } => Self::sva_stmt_clocks(body, out),
+            _ => {}
+        }
+    }
+
+    /// The leaf names of the clock events `e` spells as plain names; true
+    /// when it has a clocked body.
+    pub(super) fn sva_expr_clocks(e: &Expression, out: &mut HashSet<String>) -> bool {
+        let mut clocked = false;
+        Self::walk_operands(e, &mut |x| {
+            if let ExprKind::SvaClocked { events, body } = &x.kind {
+                clocked = true;
+                Self::sva_expr_clocks(body, out);
+                for event in events {
+                    if let ExprKind::Ident(h) = &event.expr.kind
+                        && let Some(seg) = h.path.last()
+                    {
+                        out.insert(seg.name.name.clone());
+                    }
+                }
+            }
+        });
+        clocked
+    }
+
+    /// §16.14.6: the signals whose time-step start value tells whether a
+    /// procedural concurrent assertion registered later in the time step is
+    /// at a tick of its clock: every signal named like the clock of such an
+    /// assertion (or of a named property, or the default clocking's, when
+    /// one has no explicit clock). An extra match costs only its sample.
+    pub(super) fn collect_sva_clock_watch(&mut self) {
+        let mut leaves = std::mem::take(&mut self.always_sva_clocks);
+        for b in &self.module.initial_blocks {
+            Self::sva_stmt_clocks(&b.stmt, &mut leaves);
+        }
+        for p in &self.module.pending_initial {
+            Self::sva_stmt_clocks(&p.source, &mut leaves);
+        }
+        if leaves.is_empty() {
+            return;
+        }
+        if leaves.remove("") {
+            for body in self.module.property_decls.values() {
+                Self::sva_expr_clocks(body, &mut leaves);
+            }
+            if let Some((clk, _)) = self.clocking_meta.get("__xz_default_clocking") {
+                let leaf = clk.rsplit(['.', ':']).next().unwrap_or_default();
+                leaves.insert(leaf.to_string());
+            }
+        }
+        let mut watch: Vec<(usize, LogicBit)> = self
+            .signal_name_to_id
+            .iter()
+            .filter(|(name, id)| {
+                !name.contains('[')
+                    && **id < self.signal_table.len()
+                    && leaves.contains(name.rsplit(['.', ':']).next().unwrap_or_default())
+            })
+            .map(|(_, &id)| (id, LogicBit::X))
+            .collect();
+        watch.sort_unstable_by_key(|w| w.0);
+        watch.dedup_by_key(|w| w.0);
+        self.sva_clock_watch = watch;
+    }
+
+    /// Sample the watched clocks at the start of the time step, once.
+    #[inline(never)]
+    pub(super) fn refresh_sva_clock_slot(&mut self) {
+        if self.sva_clock_slot_time == Some(self.time) {
+            return;
+        }
+        self.sva_clock_slot_time = Some(self.time);
+        let mut watch = std::mem::take(&mut self.sva_clock_watch);
+        for (id, bit) in &mut watch {
+            *bit = self
+                .signal_table
+                .get(*id)
+                .map_or(LogicBit::X, |v| v.get_bit(0));
+        }
+        self.sva_clock_watch = watch;
+    }
+
+    /// The bit 0 at the start of the current time step of the clock that
+    /// the resolved event expression `e` reads, if that signal is watched
+    /// and was sampled in this time step.
+    pub(super) fn sva_clock_slot_start(&self, e: &Expression) -> Option<LogicBit> {
+        if self.sva_clock_slot_time != Some(self.time) {
+            return None;
+        }
+        let id = match &e.kind {
+            ExprKind::SystemCall { name, args } if name == SVA_SIG_MARKER && args.len() == 1 => {
+                match &args[0].kind {
+                    ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+                        value.parse::<usize>().ok()?
+                    }
+                    _ => return None,
+                }
+            }
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => *self
+                .signal_name_to_id
+                .get(self.resolve_hier_name(h).as_ref())?,
+            _ => return None,
+        };
+        let k = self
+            .sva_clock_watch
+            .binary_search_by_key(&id, |w| w.0)
+            .ok()?;
+        Some(self.sva_clock_watch[k].1)
+    }
+
     /// Every name segment `e` spells, clocked bodies included.
     pub(super) fn sva_expr_names(e: &Expression, out: &mut HashSet<String>) {
         Self::walk_operands(e, &mut |x| match &x.kind {

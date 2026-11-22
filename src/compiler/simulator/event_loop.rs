@@ -1740,6 +1740,9 @@ impl Simulator {
         // cbReadWriteSynch, or one a later delta raises) samples pre-edge
         // values rather than values written earlier in the slot.
         self.refresh_sva_preponed();
+        if !self.sva_clock_watch.is_empty() {
+            self.refresh_sva_clock_slot();
+        }
         // §38.36 cbAfterDelay (cocotb's `Timer`) fires HERE: after this slot's
         // edge snapshot and before `check_edges`, so a clock the callback
         // drives registers as a real transition. Firing it before the snapshot

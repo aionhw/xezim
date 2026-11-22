@@ -2121,7 +2121,8 @@ impl Simulator {
         // for an edge-triggered procedure is at the tick that starts its
         // first attempt: take that edge as seen (§16.14.6).
         // One reached after a delay is not at a tick: its first attempt
-        // waits for the clock's next event.
+        // waits for the clock's next event. A clock sampled at the start of
+        // the time step (`sva_clock_watch`) tells exactly instead.
         let at_tick =
             procedural && (self.settling || !self.delay_resumed.contains(&self.current_pid));
         let mut clock_events = Vec::with_capacity(events.len());
@@ -2143,7 +2144,17 @@ impl Simulator {
                 previous: Value::all_x(1),
             };
             clock_event.previous = self.sva_event_value(&clock_event);
-            if at_tick {
+            // A watched clock had its event in this time step only if it
+            // moved since the step began, whatever woke the procedure (a
+            // `go` that rises while `clk` is high is no tick of `clk`).
+            let slot_start = if procedural {
+                self.sva_clock_slot_start(&clock_event.event.expr)
+            } else {
+                None
+            };
+            if let Some(bit) = slot_start {
+                clock_event.previous.set_bit(0, bit);
+            } else if at_tick {
                 let bit = clock_event.previous.get_bit(0);
                 let opposite = match (clock_event.event.edge, bit) {
                     (Some(Edge::Posedge), LogicBit::One) => Some(LogicBit::Zero),

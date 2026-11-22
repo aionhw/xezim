@@ -1744,6 +1744,7 @@ impl Simulator {
         // each `continue` rewritten as `return None` and each `remaining.push`
         // rewritten as `return Some(...)`.)
         Self::sva_stmt_names(&ab.stmt, false, &mut self.always_sva_names);
+        Self::sva_stmt_clocks(&ab.stmt, &mut self.always_sva_clocks);
         // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a MULTI-WAIT always body
         // (an event/delay head plus at least one more wait inside) is served
         // by the edge path only through per-fire AST continuations — compile

@@ -4712,6 +4712,18 @@ pub struct Simulator {
     /// process is in no list `capture_sampled_defaults` reads.
     #[serde(skip)]
     always_sva_names: HashSet<String>,
+    /// The leaf names of the clocks the concurrent assertions in every
+    /// always block spell, taken as the blocks are classified.
+    #[serde(skip)]
+    always_sva_clocks: HashSet<String>,
+    /// §16.14.6: the signals that may clock a procedural concurrent
+    /// assertion, sorted by id, each with its bit 0 at the start of the
+    /// time step `sva_clock_slot_time`. A site registered later in that time
+    /// step had its clock's event in it only if the clock moved since.
+    #[serde(skip)]
+    sva_clock_watch: Vec<(usize, LogicBit)>,
+    #[serde(skip)]
+    sva_clock_slot_time: Option<u64>,
     /// True while `register_sampled_watches` pre-registers the sites.
     sampled_registering: bool,
 }
