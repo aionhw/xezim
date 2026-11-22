@@ -607,3 +607,5 @@ mod settle_edges_before_nba;
 mod level_always_waits_for_writer;
 #[path = "scheduling/review_sva_whole_array_shapes.rs"]
 mod review_sva_whole_array_shapes;
+#[path = "scheduling/review_foreach_hides_static.rs"]
+mod review_foreach_hides_static;
