@@ -583,3 +583,5 @@ mod packed_struct_elem_member_event;
 mod clocking_overlapping_drives;
 #[path = "scheduling/frame_local_event_selects.rs"]
 mod frame_local_event_selects;
+#[path = "scheduling/clocking_select_drive_bits.rs"]
+mod clocking_select_drive_bits;
