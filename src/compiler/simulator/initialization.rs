@@ -4457,6 +4457,7 @@ impl Simulator {
             deferred_proc_entries: Vec::new(),
             deferred_proc_seen: Vec::new(),
             deferred_proc_unres: false,
+            defer_changed: Vec::new(),
             t0_starts_remaining: 0,
             rand_scope_nd: HashMap::default(),
             rand_scope_nd_dyn: HashMap::default(),
