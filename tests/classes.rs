@@ -1365,3 +1365,5 @@ mod static_string_queue_percent_p;
 mod typename_specialized_property;
 #[path = "classes/queue_row_name_collision.rs"]
 mod queue_row_name_collision;
+#[path = "classes/rand_srandom_reseed_repeats.rs"]
+mod rand_srandom_reseed_repeats;
