@@ -73,6 +73,8 @@ mod tolerance_ranges;
 mod cast_class_member_enum_range;
 #[path = "types/cast_operand_context.rs"]
 mod cast_operand_context;
+#[path = "types/cast_real_constant_rounding.rs"]
+mod cast_real_constant_rounding;
 #[path = "types/cast_typeparam.rs"]
 mod cast_typeparam;
 #[path = "types/cast_valparam_typeparam_static.rs"]
