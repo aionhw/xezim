@@ -312,6 +312,8 @@ mod library_dir_on_demand;
 mod library_file_macro_carry;
 #[path = "hierarchy/library_file_macros.rs"]
 mod library_file_macros;
+#[path = "hierarchy/library_file_shared_guarded_header.rs"]
+mod library_file_shared_guarded_header;
 #[path = "hierarchy/library_file_latin1.rs"]
 mod library_file_latin1;
 #[path = "hierarchy/lrm_package_variable_scoping.rs"]
