@@ -188,6 +188,34 @@ fn design_cache_key(
     Vec<String>,
     Vec<Option<sv_parser::source_map::LineMap>>,
 ) {
+    design_cache_key_for(
+        config,
+        sources,
+        source_paths,
+        top_module_name,
+        include_dirs,
+        defines,
+        pre,
+        xezim_core::library_macro_carry(),
+    )
+}
+
+/// `design_cache_key` under the library macro mode `macro_carry`.
+#[allow(clippy::too_many_arguments)]
+fn design_cache_key_for(
+    config: &DesignCacheConfig,
+    sources: &[String],
+    source_paths: &[String],
+    top_module_name: Option<&str>,
+    include_dirs: &[String],
+    defines: &[(String, Option<String>)],
+    pre: Option<&xezim_core::PreprocessedSources>,
+    macro_carry: xezim_core::LibraryMacroCarry,
+) -> (
+    String,
+    Vec<String>,
+    Vec<Option<sv_parser::source_map::LineMap>>,
+) {
     let mut hash = CacheHash::new();
     hash.bytes(XEZIM_BYTECODE_MAGIC);
     // Re-elaborate designs validated before duplicate package/typedef/interface
@@ -223,7 +251,6 @@ fn design_cache_key(
     hash.bytes(&[sv_parser::lexer::scanner::default_keywords_key()]);
     // The macros a `-v`/`-y` library file starts from select its `ifdef`
     // branches and expand its macro uses.
-    let macro_carry = xezim_core::library_macro_carry();
     hash.bytes(&[macro_carry as u8]);
 
     // Invalidate after a local rebuild even when the package version did not
