@@ -178,7 +178,9 @@ thread_local! {}
 // Packed word selects inherit the declared dimensions of their bank.
 // §7.4.5: member collection reads that yield unpacked rows use their row storage.
 // §6.24.1: an integer atom cast of an integral operand copies the operand before it is fitted.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3179;
+// §7.2, §7.4.2: a member select through constant element selects of a packed struct compiles,
+// and a nested packed-struct member read compiles to one range select.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317a;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
@@ -550,7 +552,9 @@ macro_rules! write_sig {
 // §9.4.2: a selected member can require a value waiter instead of a comb block.
 // §6.24.1, §9.4.2: integer atom casts keep their operand, and a packed-struct member event
 // tries every scope spelling for its alias net.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB079";
+// §7.2, §7.4.2: a member select through constant element selects of a packed struct, and a
+// nested packed-struct member read, compile to range stores and selects.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB080";
 
 mod aggregate_assignments;
 mod pattern_array_items;
