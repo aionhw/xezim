@@ -2695,6 +2695,32 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(r);
                     }
                 }
+                // §7.2, §7.4.2: `s.e[1].dw[0].value` with constant indices
+                // is one static range of `s`, as `compile_packed_member_read`
+                // reads a plain member path.
+                // §7.2.1: the member keeps its declared type's sign (the
+                // element selects on the way only pick the element), so the
+                // read compiles only when that type is known.
+                if let Some((base_id, key, path, off, w)) =
+                    self.packed_const_member_path_target(expr)
+                    && let Some(signed) = self.packed_member_signed(
+                        &key,
+                        &path
+                            .split('.')
+                            .map(|seg| seg.split('[').next().unwrap_or(seg))
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    )
+                {
+                    let root = self.alloc_reg();
+                    self.emit(Insn::LoadSignal(root, as_sig_id(base_id)));
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::RangeSelectConst(dest, root, off + w - 1, off));
+                    if signed {
+                        self.emit(Insn::SetSigned(dest));
+                    }
+                    return Some(dest);
+                }
                 if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "Expr_MemberAccess") {
                     return Some(r);
                 }

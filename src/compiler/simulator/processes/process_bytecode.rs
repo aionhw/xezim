@@ -352,6 +352,7 @@ impl Simulator {
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
             compiler.set_signal_real(&self.signal_real);
+            compiler.set_signal_two_state(&self.signal_two_state);
             compiler.top_module_name = Some(self.module.name.clone());
             if let Some(frame) = self.local_stack.last() {
                 compiler.set_process_locals(frame);
@@ -604,6 +605,7 @@ impl Simulator {
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
             compiler.set_signal_real(&self.signal_real);
+            compiler.set_signal_two_state(&self.signal_two_state);
             compiler.top_module_name = Some(self.module.name.clone());
             if let Some(frame) = self.local_stack.last() {
                 compiler.set_process_locals(frame);

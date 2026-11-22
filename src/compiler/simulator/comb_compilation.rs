@@ -1376,6 +1376,7 @@ impl Simulator {
                         .unwrap_or(&self.module.packed_struct_fields),
                 );
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                compiler.set_signal_two_state(&self.signal_two_state);
                 compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                 compiler.set_typedef_types(&self.module.typedef_types);
                 compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
@@ -1472,6 +1473,7 @@ impl Simulator {
                         .unwrap_or(&self.module.packed_struct_fields),
                 );
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
+                compiler.set_signal_two_state(&self.signal_two_state);
                 compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                 compiler.set_typedef_types(&self.module.typedef_types);
                 compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
@@ -2340,6 +2342,7 @@ impl Simulator {
                     compiler.set_array_first_id(&self.array_first_id);
                     compiler.set_string_signals(&self.module.string_signals);
                     compiler.set_signal_real(&self.signal_real);
+                    compiler.set_signal_two_state(&self.signal_two_state);
                     compiler.top_module_name = Some(self.module.name.clone());
                     // Enable AST fallback so partially-unsupported constructs
                     // compile to StmtFallback insns instead of failing the

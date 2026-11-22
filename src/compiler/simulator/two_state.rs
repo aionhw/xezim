@@ -5292,6 +5292,7 @@ impl Simulator {
             compiler.set_array_first_id(&self.array_first_id);
             compiler.set_string_signals(&self.module.string_signals);
             compiler.set_signal_real(&self.signal_real);
+            compiler.set_signal_two_state(&self.signal_two_state);
             compiler.top_module_name = Some(self.module.name.clone());
             let ok = compiler.compile_stmt(body);
             if !ok && std::env::var_os("XEZIM_EDGE_BLOCK_STATS").is_some() {
@@ -5711,6 +5712,7 @@ impl Simulator {
                 compiler.set_array_first_id(&self.array_first_id);
                 compiler.set_string_signals(&self.module.string_signals);
                 compiler.set_signal_real(&self.signal_real);
+                compiler.set_signal_two_state(&self.signal_two_state);
                 compiler.top_module_name = Some(self.module.name.clone());
                 // §13.4: the body runs once per wakeup, so a call of a
                 // function with side effects keeps it compiled.
@@ -5762,6 +5764,7 @@ impl Simulator {
                 delay_compiler.set_array_first_id(&self.array_first_id);
                 delay_compiler.set_string_signals(&self.module.string_signals);
                 delay_compiler.set_signal_real(&self.signal_real);
+                delay_compiler.set_signal_two_state(&self.signal_two_state);
                 delay_compiler.top_module_name = Some(self.module.name.clone());
                 let delay = delay_compiler
                     .compile_root_expr(&fast.delay)

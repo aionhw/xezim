@@ -51,6 +51,166 @@ impl<'a> BytecodeCompiler<'a> {
         None
     }
 
+    /// §7.2, §7.4.2: a member select through constant element selects of a
+    /// packed struct (`s.e[1].dw[0].value`). Elaboration flattens a member that
+    /// is a packed array of structs into one entry per element (`e[1]`,
+    /// `e[1].dw[0].value`, ...), so with constant indices the whole select is
+    /// one static bit range of the container signal. Returns
+    /// `(container_signal_id, layout key, member path, lsb_offset, width)`, or
+    /// `None` for anything else (a dynamic or x/z index, an index outside the
+    /// declared range, an unpacked root), which keeps its existing path.
+    pub(super) fn packed_const_member_path_target(
+        &self,
+        lhs: &Expression,
+    ) -> Option<(usize, String, String, u32, u32)> {
+        let fields_map = self.packed_struct_fields?;
+        // A local of the frame (a function's own struct) shadows a module
+        // signal of the same name; it is not this signal's layout.
+        if self.frame_bound_target(lhs) {
+            return None;
+        }
+        // The selects below the root, innermost (leaf) first.
+        let mut tail: Vec<String> = Vec::new();
+        let mut has_index = false;
+        let mut cur = lhs;
+        let hier = loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    tail.push(format!(".{}", member.name));
+                    cur = expr;
+                }
+                ExprKind::Index { expr, index } => {
+                    if self.is_xz_literal(index) {
+                        return None;
+                    }
+                    tail.push(format!("[{}]", self.plain_const_index(index)?));
+                    has_index = true;
+                    cur = expr;
+                }
+                ExprKind::Paren(inner) => cur = inner,
+                ExprKind::Ident(h) => break h,
+                _ => return None,
+            }
+        };
+        if !has_index {
+            return None;
+        }
+        if hier.root.is_some() || hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        if self.lookup_array_name(hier).is_some() || self.is_multi_dim_array(hier) {
+            return None;
+        }
+        tail.reverse();
+        let suffix: String = tail.concat();
+        let seg = |i: usize| hier.path[i].name.name.as_str();
+        // As `packed_struct_member_target`: the longest base that is a
+        // container signal with a layout wins. Elaboration may already have
+        // folded the leading members into the identifier (`s.e` then `[1]`).
+        // The container must be entered through a member (`s.e[1]`), not an
+        // element (`a[1].f`, an array of structs, which has its own stores).
+        for k in (1..=hier.path.len()).rev() {
+            let base: String = (0..k).map(seg).collect::<Vec<_>>().join(".");
+            let mut member: String = (k..hier.path.len()).map(seg).collect::<Vec<_>>().join(".");
+            if !member.is_empty() {
+                member.push_str(&suffix);
+            } else if let Some(rest) = suffix.strip_prefix('.') {
+                member = rest.to_string();
+            } else {
+                continue;
+            }
+            // The instance's own variable first, as `compile_packed_member_read`
+            // resolves a base: a bare key may belong to the top module or to
+            // another instance.
+            let scoped = self
+                .scope_hint
+                .as_ref()
+                .filter(|sc| !sc.is_empty() && !base.contains('.'))
+                .map(|sc| format!("{}.{}", sc, base));
+            let Some((base_id, key)) = scoped
+                .and_then(|s| Some((self.lookup_signal_id_by_name(&s)?, s)))
+                .or_else(|| Some((self.lookup_signal_id_by_name(&base)?, base.clone())))
+            else {
+                continue;
+            };
+            let Some(fields) = fields_map.get(key.as_str()) else {
+                continue;
+            };
+            if let Some(&(_, off, w)) = fields.iter().find(|(m, _, _)| *m == member)
+                && w > 0
+            {
+                return Some((base_id, key, member, off, w));
+            }
+        }
+        None
+    }
+
+    /// §11.6.1: an index whose value does not depend on expression width: a
+    /// literal, a parameter or a bound constant, optionally negated or in
+    /// parentheses. An expression such as `1'b1 + 1'b1` is self-determined
+    /// (it wraps to 0) and `eval_const_bound` does not model that, so it is
+    /// left to the interpreter. So is a local of the running frame (§23.9: a
+    /// function's `int I` hides a module's `parameter I`), unless it is an
+    /// unrolled loop's index, bound to a constant for this iteration.
+    ///
+    /// A literal or parameter is read at its own value (§11.5.1: an index
+    /// keeps its full width; `eval_const_bound` narrows to 32 bits, so
+    /// `e[64'h1_0000_0001]` was `e[1]`). One with an x or z bit, or one wider
+    /// than 64 bits, is left to the interpreter like any other index this
+    /// path cannot place.
+    fn plain_const_index(&self, e: &Expression) -> Option<i64> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.plain_const_index(inner),
+            // §11.4.3, §11.8.2: the negation is at the literal's own width
+            // and signedness, so it wraps there: `-4'sd8` is -8, `-4'd3` is
+            // 13, `-1` is -1.
+            ExprKind::Unary {
+                op: UnaryOp::Minus,
+                operand,
+            } if matches!(operand.kind, ExprKind::Number(_)) => {
+                let ExprKind::Number(n) = &operand.kind else {
+                    return None;
+                };
+                let v = self.eval_number_static(n)?;
+                let x = Self::exact_index_value(&v)?;
+                if v.width == 0 || v.width > 63 {
+                    return None;
+                }
+                let m = 1i128 << v.width;
+                let mut r = (-i128::from(x)).rem_euclid(m);
+                if v.is_signed && r >= m / 2 {
+                    r -= m;
+                }
+                i64::try_from(r).ok()
+            }
+            ExprKind::Number(n) => Self::exact_index_value(&self.eval_number_static(n)?),
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let name = h.path[0].name.name.as_str();
+                if let Some(&v) = self.const_var_binds.get(name) {
+                    return Some(v as i64);
+                }
+                if self.frame_bound_target(e) {
+                    return None;
+                }
+                Self::exact_index_value(&self.lookup_param_value(h)?)
+            }
+            _ => None,
+        }
+    }
+
+    /// The value of a constant index of at most 64 bits with no x or z bit,
+    /// signed or unsigned as declared, when it fits in an `i64`.
+    fn exact_index_value(v: &Value) -> Option<i64> {
+        if v.has_xz() || v.width > 64 {
+            return None;
+        }
+        if v.is_signed {
+            v.to_i64()
+        } else {
+            v.to_u64().and_then(|u| i64::try_from(u).ok())
+        }
+    }
+
     /// Resolve a packed-struct container and clone its flattened field layout.
     /// The clone keeps later instruction emission free to mutably borrow the
     /// compiler without retaining a borrow into elaboration metadata.
@@ -1148,6 +1308,29 @@ impl<'a> BytecodeCompiler<'a> {
             .and_then(|dt| signed_named_packed_elem_depth(dt, types));
         self.named_elem_depth.insert(raw, depth);
         depth == Some(selects)
+    }
+
+    /// §6.11.2: can a range store into the packed container `var` (signal
+    /// `id`) skip the 2-state conversion? A 2-state variable stores x/z as 0
+    /// across its whole value on the interpreter's path, which a range store
+    /// does not do, so the compiled store is taken only when neither the
+    /// runtime's mark for the signal nor its declared type is 2-state. Without
+    /// the runtime table the answer is no, which keeps the interpreter.
+    pub(super) fn packed_container_four_state(&self, id: usize, var: &str) -> bool {
+        let Some(marks) = self.signal_two_state else {
+            return false;
+        };
+        if marks.get(id).copied().unwrap_or(true) {
+            return false;
+        }
+        let (Some(decls), Some(types)) = (self.var_decl_types, self.typedef_types) else {
+            return true;
+        };
+        let leaf = var.rsplit_once('.').map_or(var, |(_, leaf)| leaf);
+        decls
+            .get(var)
+            .or_else(|| decls.get(leaf))
+            .is_none_or(|dt| !crate::compiler::elaborate::is_type_two_state_resolved(dt, types))
     }
 
     /// §7.2.1, §6.11.3: the signedness of `member` (a dotted path) of the
