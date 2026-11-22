@@ -1018,7 +1018,7 @@ impl Simulator {
         self.comb_writer_index = None;
         // Caches keyed by an address in the run that wrote the checkpoint.
         self.recv_call_memo.clear();
-        // §23.10: the parameter overlays are built from the restored table.
+        // §23.10: the scopes that have parameters come from the restored table.
         *self.decl_param_scope_cache.get_mut() = Default::default();
         // A checkpoint is taken at the end of a time slot, so every initial
         // block of the saving run had started; the bodies this build queued

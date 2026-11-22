@@ -171,42 +171,49 @@ pub(super) struct DeclShadow {
 /// `Simulator::decl_param_scope`'s state (§23.10).
 #[derive(Default)]
 pub(super) struct DeclParamScopeCache {
-    /// The prefix asked for last, and whether it owns parameters (when it
-    /// does, the last of `tables` holds its overlay).
-    pub(super) last: Option<(String, bool)>,
-    /// Per scope: the parameters declared in it or below it, by their name
-    /// relative to the scope (`u.g.L` is `g.L` for `u`), in table order.
-    pub(super) groups: HashMap<String, std::rc::Rc<[(String, Value)]>>,
-    /// Overlaid copies of the design-wide table, least recently used first,
-    /// at most `DECL_PARAM_TABLES`. Lookups that alternate between hierarchies
-    /// with different outermost scopes (a testbench component and the design
-    /// under test) each keep a copy, instead of taking one hierarchy's groups
-    /// off a single copy and putting the other's on at every move.
-    pub(super) tables: Vec<DeclParamTable>,
+    /// Every scope that has a parameter at or below it: each dot-prefix of
+    /// a key of the design-wide table (`u` and `u.g` for `u.g.L`). Built on
+    /// first use, in one pass over the table.
+    pub(super) owners: Option<HashSet<String>>,
+    /// The prefix asked for last, and its scope.
+    pub(super) last: Option<(String, Option<DeclScope>)>,
 }
 
-/// How many overlaid parameter tables `decl_param_scope` keeps.
-pub(super) const DECL_PARAM_TABLES: usize = 4;
+impl DeclParamScopeCache {
+    /// Note a key added to the design-wide table after `owners` was built.
+    pub(super) fn note_param(&mut self, key: &str) {
+        if let Some(owners) = &mut self.owners {
+            for (i, _) in key.match_indices('.') {
+                if !owners.contains(&key[..i]) {
+                    owners.insert(key[..i].to_string());
+                }
+            }
+        }
+        self.last = None;
+    }
+}
 
-/// One overlaid copy of the design-wide parameter table (§23.10).
-pub(super) struct DeclParamTable {
-    /// The design-wide parameter table with the groups of `applied` on it.
-    pub(super) table: std::rc::Rc<HashMap<String, Value>>,
-    /// The scopes whose groups `table` holds, outermost first, each with the
-    /// length `undo` had before its group went on.
-    pub(super) applied: Vec<(String, usize)>,
-    /// What each group write replaced in `table`, in write order, so a group
-    /// comes off again in reverse.
-    pub(super) undo: Vec<(String, Option<Value>)>,
+/// §23.10: the instance scope a declaration stored under `<prefix>.<name>`
+/// is sized in (see `DeclScopeParams`). Cheap to clone.
+#[derive(Clone)]
+pub(super) struct DeclScope {
+    /// The declaration's instance path (`u.g` for `u.g.par`).
+    pub(super) prefix: std::rc::Rc<str>,
+    /// The lengths of the enclosing scopes of `prefix` (`u`, `u.g`) that
+    /// have parameters, innermost first.
+    pub(super) owners: std::rc::Rc<[usize]>,
+    /// The bindings as one table, for the rare whole-table reads
+    /// (`ParamLookup::rows`), built on the first.
+    pub(super) flat: std::rc::Rc<std::cell::OnceCell<HashMap<String, Value>>>,
 }
 
 /// One selected region of a declared packed value (§7.4.1 / §11.5.1).
 pub(super) struct DeclaredPackedAccess {
     pub(super) storage: String,
-    /// §23.10: the parameter table the declaration is sized against — the
-    /// instance's own parameters overlaid on the design-wide table when the
-    /// storage lives in an instantiated module; `None` for the top scope.
-    pub(super) params: Option<std::rc::Rc<HashMap<String, Value>>>,
+    /// §23.10: the instance scope the declaration is sized in when the
+    /// storage lives in an instantiated module whose scopes have parameters;
+    /// `None` for the top scope (the design-wide table).
+    pub(super) params: Option<DeclScope>,
     pub(super) is_signed: bool,
     pub(super) static_target: Option<(String, Option<(String, String)>, String)>,
     pub(super) offset: u32,

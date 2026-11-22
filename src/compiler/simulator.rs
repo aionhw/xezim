@@ -3008,11 +3008,8 @@ pub struct Simulator {
     method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
     /// Reused buffer for the `<hint>.<name>` probe in `get_signal_value_by_name` (a `&self` path).
     hint_key_scratch: std::cell::RefCell<String>,
-    /// `decl_param_scope`'s state: the parameters under each scope, and the
-    /// overlaid parameter tables it hands out. A select loop over one
-    /// instance's signal rebuilds nothing, and a move to another instance
-    /// changes only the scopes the two do not share instead of copying the
-    /// table.
+    /// `decl_param_scope`'s state: which scopes have parameters, and the
+    /// scope asked for last.
     #[serde(skip)]
     decl_param_scope_cache: std::cell::RefCell<DeclParamScopeCache>,
     /// §8.25: specialization-argument texts already folded to their value
