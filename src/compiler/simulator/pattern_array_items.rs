@@ -127,6 +127,29 @@ impl Simulator {
         out.filter(|v| !v.is_empty() && v.iter().all(|(s, _)| s.starts_with('[')))
     }
 
+    /// §11.4.2: whether reading the operand chain `e` runs no side effect.
+    /// Each select in it is checked with `cond_expr_is_effect_free`; `this`
+    /// at the root of the chain (`this.rows`) names the handle and runs
+    /// nothing.
+    fn operand_chain_effect_free(e: &Expression) -> bool {
+        match &Self::unparen(e).kind {
+            ExprKind::This => true,
+            ExprKind::MemberAccess { expr, .. } => Self::operand_chain_effect_free(expr),
+            ExprKind::Index { expr, index } => {
+                Self::cond_expr_is_effect_free(index, false)
+                    && Self::operand_chain_effect_free(expr)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::cond_expr_is_effect_free(left, false)
+                    && Self::cond_expr_is_effect_free(right, false)
+                    && Self::operand_chain_effect_free(expr)
+            }
+            _ => Self::cond_expr_is_effect_free(e, false),
+        }
+    }
+
     /// §7.6, §7.4.6: the leaves of the unpacked array `e`, a whole fixed
     /// array, a subarray (`m[1]`, `m3[1][0]`) or a slice (`a[1:2]`,
     /// `m[1][0+:2]`) of a design variable, a local, a formal or a class
@@ -141,7 +164,7 @@ impl Simulator {
         // A select with a side effect anywhere in the chain (`m[i++]`, or
         // `objs[i++].v` below a member, §11.4.2) is left to the caller's
         // single evaluation: resolving the operand here would run it first.
-        if !Self::cond_expr_is_effect_free(e, false) {
+        if !Self::operand_chain_effect_free(e) {
             return None;
         }
         let mut cur = e;

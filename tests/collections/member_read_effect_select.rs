@@ -355,3 +355,46 @@ endmodule
         ]
     );
 }
+
+#[test]
+fn a_row_read_through_this_is_still_copied() {
+    // `this` at the root of the operand runs nothing, so the check for a
+    // side-effect select must not turn `this.m[1]` away: the row was then
+    // stored as one scalar and read 0 0.
+    let lines = run(r#"
+module tb;
+  class C;
+    int m[2][2];
+    int m3[2][2][2];
+    int r[2];
+    task automatic in_task();
+      r = this.m[1];     $display("R task row %0d %0d", r[0], r[1]);
+      r = this.m3[1][0]; $display("R task row3 %0d %0d", r[0], r[1]);
+    endtask
+    function void in_function();
+      r = this.m[0];     $display("R function row %0d %0d", r[0], r[1]);
+      r = this.m3[0][1]; $display("R function row3 %0d %0d", r[0], r[1]);
+    endfunction
+  endclass
+  C c;
+  initial begin
+    c = new;
+    c.m = '{'{1, 2}, '{3, 4}};
+    c.m3[0][1] = '{7, 8};
+    c.m3[1][0] = '{5, 6};
+    c.in_task();
+    c.in_function();
+    $finish;
+  end
+endmodule
+"#);
+    assert_eq!(
+        lines,
+        [
+            "R task row 3 4",
+            "R task row3 5 6",
+            "R function row 1 2",
+            "R function row3 7 8",
+        ]
+    );
+}
