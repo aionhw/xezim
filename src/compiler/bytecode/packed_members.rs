@@ -1131,41 +1131,66 @@ impl<'a> BytecodeCompiler<'a> {
         &mut self,
         hier: &HierarchicalIdentifier,
     ) -> Option<RegId> {
-        let fields_tbl = self.packed_struct_fields?;
-        if hier.root.is_some() || hier.path.iter().any(|s| !s.selects.is_empty()) {
-            return None;
-        }
-        let raw = Self::hier_raw_name(hier);
-        let (base, member) = raw.rsplit_once('.')?;
-        // Resolve the BASE like a plain identifier: scope-qualified first,
-        // then flat.
-        let mut resolved: Option<(usize, String)> = None;
-        if let Some(scope) = &self.scope_hint {
-            let q = format!("{}.{}", scope, base);
-            if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
-                resolved = Some((id, q));
-            }
-        }
-        if resolved.is_none() {
-            if let Some(&id) = self.signal_name_to_id.get(base) {
-                resolved = Some((id, base.to_string()));
-            }
-        }
-        let (base_id, key) = resolved?;
-        let layout = fields_tbl.get(&key).or_else(|| fields_tbl.get(base))?;
-        let &(_, off, w) = layout.iter().find(|(m, _, _)| m == member)?;
-        if w == 0 {
-            return None;
-        }
+        let (base_id, key, member, off, w) = self.packed_member_split(hier)?;
         let root = self.alloc_reg();
         self.emit(Insn::LoadSignal(root, as_sig_id(base_id)));
         let dest = self.alloc_reg();
         self.emit(Insn::RangeSelectConst(dest, root, off + w - 1, off));
         // §7.2.1: the member keeps its declared type's sign.
-        if self.packed_member_signed(&key, member) == Some(true) {
+        if self.packed_member_signed(&key, &member) == Some(true) {
             self.emit(Insn::SetSigned(dest));
         }
         Some(dest)
+    }
+
+    /// §7.2, §7.2.1: the packed-structure variable a dotted identifier reads
+    /// a member of, as `(signal id, layout key, member path, lsb, width)`.
+    /// Elaboration lists a nested member (`s.inner.f`) under the ROOT
+    /// variable as one dotted path (`inner.f`), so the split point is walked
+    /// from the longest base down, as `packed_struct_member_target` does for
+    /// a write: a base that is itself a signal (`top.dut.s`) wins over
+    /// reading part of it as a member path. At each split the base is
+    /// resolved scope-qualified first, then flat. A register block's
+    /// `hwif_out.<reg>.<field>.value` read through more than one member used
+    /// to go to the interpreter (`ident_lookup`).
+    pub(super) fn packed_member_split(
+        &self,
+        hier: &HierarchicalIdentifier,
+    ) -> Option<(usize, String, String, u32, u32)> {
+        let fields_tbl = self.packed_struct_fields?;
+        if hier.root.is_some() || hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let raw = Self::hier_raw_name(hier);
+        let splits: Vec<usize> = raw.match_indices('.').map(|(i, _)| i).collect();
+        for &dot in splits.iter().rev() {
+            let (base, member) = (&raw[..dot], &raw[dot + 1..]);
+            let scoped = self
+                .scope_hint
+                .as_ref()
+                .map(|scope| format!("{}.{}", scope, base))
+                .and_then(|q| Some((*self.signal_name_to_id.get(q.as_str())?, q)));
+            let Some((base_id, key)) = scoped.or_else(|| {
+                let id = *self.signal_name_to_id.get(base)?;
+                Some((id, base.to_string()))
+            }) else {
+                continue;
+            };
+            let Some(layout) = fields_tbl.get(&key).or_else(|| fields_tbl.get(base)) else {
+                continue;
+            };
+            if let Some(&(_, off, w)) = layout.iter().find(|(m, _, _)| m == member) {
+                // A nested member is compiled only when its declared sign is
+                // known (§7.2.1); otherwise it keeps the interpreter's path.
+                if w == 0
+                    || (member.contains('.') && self.packed_member_signed(&key, member).is_none())
+                {
+                    return None;
+                }
+                return Some((base_id, key, member.to_string(), off, w));
+            }
+        }
+        None
     }
 
     /// §7.4.3: the width of one element of the outer packed dimension of the
@@ -1370,27 +1395,7 @@ impl<'a> BytecodeCompiler<'a> {
         &self,
         hier: &HierarchicalIdentifier,
     ) -> Option<(String, String)> {
-        let fields_tbl = self.packed_struct_fields?;
-        if hier.root.is_some() || hier.path.iter().any(|s| !s.selects.is_empty()) {
-            return None;
-        }
-        let raw = Self::hier_raw_name(hier);
-        let (base, member) = raw.rsplit_once('.')?;
-        let key = self
-            .scope_hint
-            .as_ref()
-            .map(|scope| format!("{}.{}", scope, base))
-            .filter(|q| self.signal_name_to_id.get(q.as_str()).is_some())
-            .or_else(|| {
-                self.signal_name_to_id
-                    .get(base)
-                    .is_some()
-                    .then(|| base.to_string())
-            })?;
-        let layout = fields_tbl.get(&key).or_else(|| fields_tbl.get(base))?;
-        layout
-            .iter()
-            .any(|(m, _, w)| m == member && *w > 0)
-            .then(|| (key, member.to_string()))
+        self.packed_member_split(hier)
+            .map(|(_, key, member, _, _)| (key, member))
     }
 }
