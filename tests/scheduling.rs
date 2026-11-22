@@ -579,3 +579,5 @@ mod indexed_member_event;
 mod variable_assign_delay;
 #[path = "scheduling/packed_struct_elem_member_event.rs"]
 mod packed_struct_elem_member_event;
+#[path = "scheduling/clocking_overlapping_drives.rs"]
+mod clocking_overlapping_drives;
