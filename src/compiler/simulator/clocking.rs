@@ -123,7 +123,7 @@ impl Simulator {
         if earlier.is_empty() {
             return;
         }
-        let Some((last_id, last_lo, last_w)) = self.queued_drive_range(last) else {
+        let Some((last_id, last_lo, last_w, last_bits)) = self.queued_drive_range(last) else {
             return;
         };
         if last_id != id {
@@ -132,11 +132,22 @@ impl Simulator {
         let last_value = self.nba_slot_value(last).resize(last_w);
         let last_hi = last_lo + last_w;
         for &slot in earlier {
-            let Some((eid, lo, w)) = self.queued_drive_range(slot) else {
+            let Some((eid, lo, w, bits)) = self.queued_drive_range(slot) else {
                 continue;
             };
+            if eid != id {
+                continue;
+            }
+            // A select whose bits are not known (an element of a packed array,
+            // say) is superseded only by a drive of the same select, whole.
+            if !(bits && last_bits) {
+                if (lo, w) == (last_lo, last_w) {
+                    *self.nba_slot_value(slot) = last_value.clone();
+                }
+                continue;
+            }
             let (from, to) = (lo.max(last_lo), (lo + w).min(last_hi));
-            if eid != id || from >= to {
+            if from >= to {
                 continue;
             }
             let value = self.nba_slot_value(slot);
@@ -149,6 +160,57 @@ impl Simulator {
             }
             *value = merged;
         }
+    }
+
+    /// §7.4.1, §11.5.1: the physical bits a constant bit- or part-select of
+    /// a plain vector drives, as `(signal, low bit, width, true)`. A select's
+    /// value has its least significant bit at the lowest physical bit it
+    /// covers, so `w[0:1]` of `logic [0:3] w` covers bits 2 and 3, and bit 0
+    /// of its value is `w[1]`. Any other select (an element of a packed
+    /// array) gives its raw index range (`delayed_lhs_select_range`) with
+    /// `false`, which only an identical select supersedes.
+    fn clocking_drive_bits(&mut self, lhs: &Expression) -> Option<(usize, u32, u32, bool)> {
+        let (base, a, b) = match &lhs.kind {
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+            } => {
+                let l = self.eval_expr(left).to_i64()?;
+                let r = self.eval_expr(right).to_i64()?;
+                match kind {
+                    RangeKind::Constant => (expr, l, r),
+                    RangeKind::IndexedUp if r > 0 => (expr, l, l + r - 1),
+                    RangeKind::IndexedDown if r > 0 => (expr, l, l - r + 1),
+                    _ => return None,
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                let i = self.eval_expr(index).to_i64()?;
+                (expr, i, i)
+            }
+            _ => return None,
+        };
+        if let ExprKind::Ident(h) = &base.kind
+            && h.path.iter().all(|s| s.selects.is_empty())
+            && let Some(id) = self.get_lhs_signal_id(base)
+        {
+            let width = self.signal_widths[id];
+            if let Some(dim) =
+                super::event_bits::vector_decl_dim(&self.module, self.name_for_id(id), width)
+            {
+                let pa = super::event_bits::label_to_phys(dim, a);
+                let pb = super::event_bits::label_to_phys(dim, b);
+                let (lo, hi) = (pa.min(pb), pa.max(pb));
+                if lo < 0 || hi >= width as i64 {
+                    return None;
+                }
+                return Some((id, lo as u32, (hi - lo + 1) as u32, true));
+            }
+        }
+        let (id, lo, w) = self.delayed_lhs_select_range(lhs)?;
+        Some((id, lo, w, false))
     }
 
     /// The value queued update `slot` writes.
@@ -182,11 +244,11 @@ impl Simulator {
     }
 
     /// The signal, low bit and width that queued update `slot` writes: its
-    /// select's (`delayed_lhs_select_range`), or the whole signal's. The
-    /// target is read in place: it is taken out of the entry for the call
-    /// and put back.
-    fn queued_drive_range(&mut self, slot: NbaSlot) -> Option<(usize, u32, u32)> {
-        let whole = |sim: &Self, id: usize| Some((id, 0, sim.signal_widths[id] as u32));
+    /// select's (`clocking_drive_bits`), or the whole signal's, and whether
+    /// those are physical bits. The target is read in place: it is taken out
+    /// of the entry for the call and put back.
+    fn queued_drive_range(&mut self, slot: NbaSlot) -> Option<(usize, u32, u32, bool)> {
+        let whole = |sim: &Self, id: usize| Some((id, 0, sim.signal_widths[id] as u32, true));
         let entry = match slot {
             NbaSlot::Fast(i) => {
                 let id = self.nba_fast[i].signal_id;
@@ -198,10 +260,13 @@ impl Simulator {
         let (lhs, resolved) = (entry.lhs.take(), entry.resolved_id);
         let range = match &lhs {
             None => resolved.and_then(|id| whole(self, id)),
-            Some(l) if matches!(l.kind, ExprKind::Ident(_)) => {
-                self.get_lhs_signal_id(l).and_then(|id| whole(self, id))
-            }
-            Some(l) => self.delayed_lhs_select_range(l),
+            Some(l) => match &l.kind {
+                ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                    self.get_lhs_signal_id(l).and_then(|id| whole(self, id))
+                }
+                ExprKind::Ident(_) => None,
+                _ => self.clocking_drive_bits(l),
+            },
         };
         match slot {
             NbaSlot::Queue(i) => self.nba_queue[i].lhs = lhs,
