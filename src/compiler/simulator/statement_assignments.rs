@@ -2051,11 +2051,17 @@ impl Simulator {
                 }
             }
         }
-        // §10.9.1, §7.6: a pattern written to a row of a multi-dimensional
-        // unpacked array spreads over the row's elements. Ahead of the
-        // packed-target store below, which took the row for one value.
-        if let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(rvalue).kind
-            && self.assign_unpacked_row_pattern(lvalue, items)
+        // §10.9.1, §10.10, §7.6: a pattern or an unpacked array
+        // concatenation written to a row of a multi-dimensional unpacked
+        // array, or to an element of a collection of fixed-size arrays,
+        // spreads over the row's elements. Ahead of the packed-target store
+        // below, which took the row for one value.
+        if matches!(lvalue.kind, ExprKind::Index { .. })
+            && matches!(
+                self.unpacked_pattern(rvalue).kind,
+                ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
+            )
+            && self.assign_unpacked_row(lvalue, rvalue)
         {
             self.settle_after_proc_write();
             return;

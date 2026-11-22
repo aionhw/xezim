@@ -2471,6 +2471,17 @@ impl Simulator {
                     self.eval_target_rhs(&Self::append_leaf_path(lvalue, sfx), e)
                 });
             }
+        } else if let ExprKind::Concatenation(parts) = &rvalue.kind {
+            // §10.10: an unpacked array concatenation over a row of one
+            // dimension (`q[1] <= {a, b}`): every operand is read now, and
+            // one that is an unpacked array contributes each of its elements.
+            if parts.is_empty() || targets.first()?.matches('[').count() != 1 {
+                return None;
+            }
+            values = self.unpacked_concat_operand_values(parts.iter().collect(), true, None);
+            if values.len() != targets.len() {
+                return None;
+            }
         } else {
             // A row or whole multi-dimensional array, or a plain 1-D unpacked
             // array of the same element count (`q[1] <= in_i`).
@@ -5495,7 +5506,10 @@ impl Simulator {
                 } else if let Some(k) = self.array_pattern_key(item) {
                     let kv = self.eval_expr(&k);
                     let key = self.assoc_key_str(base, &kv);
-                    self.assign_pattern_or_leaf(&format!("{}[{}]", base, key), &dt, item.expr());
+                    let elem = format!("{}[{}]", base, key);
+                    if !self.assign_coll_row_item(base, &elem, &dt, item.expr()) {
+                        self.assign_pattern_or_leaf(&elem, &dt, item.expr());
+                    }
                     wrote = true;
                 }
             }
@@ -5510,7 +5524,10 @@ impl Simulator {
                 return false;
             }
             for (i, e) in exprs.iter().enumerate() {
-                self.assign_pattern_or_leaf(&format!("{}[{}]", base, i), &dt, e);
+                let elem = format!("{}[{}]", base, i);
+                if !self.assign_coll_row_item(base, &elem, &dt, e) {
+                    self.assign_pattern_or_leaf(&elem, &dt, e);
+                }
             }
             self.set_queue_size(base, exprs.len() as u64);
             return true;
@@ -5604,23 +5621,27 @@ impl Simulator {
         false
     }
 
-    /// §10.9.1, §10.10, §7.6: a pattern written to a ROW of a fixed
-    /// multi-dimensional unpacked array (`c[0] = '{V, V}` on
-    /// `logic [39:0] c [2][2]`, `d[1] = '{'{..}, '{..}}` on `d [2][2][2]`).
-    /// Each element is its own signal, so the pattern spreads over the
-    /// dimensions left below the selected indices, as a whole-array pattern
-    /// does. Without this the row was stored as one packed value under a name
-    /// with no storage, and every element read x. False when the target is
-    /// not such a row or an index is not a known in-range value, leaving the
-    /// other paths to it.
-    pub(super) fn assign_unpacked_row_pattern(
-        &mut self,
-        lvalue: &Expression,
-        items: &[AssignmentPatternItem],
-    ) -> bool {
-        if items.is_empty() {
-            return false;
-        }
+    /// §10.9.1, §10.10, §7.6: a row value written to a ROW of an unpacked
+    /// array: a row of a fixed multi-dimensional array (`c[0] = '{V, V}` on
+    /// `logic [39:0] c [2][2]`, `d[1] = '{'{..}, '{..}}` on `d [2][2][2]`,
+    /// `m[1] = {3, 4}` on `int m[3][2]`), or an element of a queue, dynamic
+    /// array or associative array whose elements are fixed-size arrays
+    /// (`q[0] = '{1, 2}` on `int q[$][2]`, `aa["k"] = p` on `pair_t
+    /// aa[string]`). Each element is its own signal, so the value spreads
+    /// over the dimensions left below the selected indices, as a whole-array
+    /// pattern does. Without this the row was stored as one packed value under
+    /// a name with no storage, and every element read x or 0. The value is an
+    /// assignment pattern or an unpacked array concatenation and, for an
+    /// element of a collection, also an array of the row's shape (see
+    /// `assign_fixed_row`). False when the target is not such a row or an
+    /// index is not a known in-range value, leaving the other paths to it.
+    pub(super) fn assign_unpacked_row(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        let rvalue = self.unpacked_pattern(rvalue);
+        let row_value = match &rvalue.kind {
+            ExprKind::AssignmentPattern(items) => !items.is_empty(),
+            ExprKind::Concatenation(parts) => !parts.is_empty(),
+            _ => false,
+        };
         let mut idx_exprs: Vec<&Expression> = Vec::new();
         let mut cur = lvalue;
         while let ExprKind::Index { expr, index } = &cur.kind {
@@ -5638,12 +5659,15 @@ impl Simulator {
         }
         idx_exprs.reverse();
         let name = self.resolve_hier_name(h).into_owned();
+        if self.module.dynamic_arrays.contains(&name) || self.is_associative_array(&name) {
+            return self.assign_coll_fixed_row(&name, &idx_exprs, rvalue, row_value);
+        }
+        if !row_value {
+            return false;
+        }
         // Any fixed element type, unpacked structs included: the spread
         // below takes a struct element's pattern member-wise, as the
         // whole-array spread does.
-        if self.module.dynamic_arrays.contains(&name) || self.is_associative_array(&name) {
-            return false;
-        }
         let Some(dims) = self.foreach_dims(&name) else {
             return false;
         };
@@ -5683,8 +5707,346 @@ impl Simulator {
             None => vec![false; dims.len() - k],
         };
         let base = Self::elem_name(&name, &idx);
-        self.assign_pattern_array(&base, &dims[k..], &dt, items, &descending);
+        self.assign_fixed_row(&base, &dims[k..], &descending, &dt, rvalue)
+    }
+
+    /// §7.4.5: the dimensions of one element of the collection `name` (a
+    /// queue, dynamic array or associative array) when that element is a
+    /// fixed-size unpacked array (`int q[$][2]`, or `pair_t aa[string]` with
+    /// `typedef int pair_t[2]`): each dimension's `(lo, hi)` bounds, outermost
+    /// first, and whether it is declared descending (`[2:1]`). `None` for any
+    /// other collection.
+    pub(super) fn coll_fixed_row_dims(&self, name: &str) -> Option<(Vec<(i64, i64)>, Vec<bool>)> {
+        let Some((shape, 0)) = self.coll_shape_at(name) else {
+            return None;
+        };
+        let (outer, row) = shape.dims.split_first()?;
+        if matches!(outer, Dim::Fixed(_)) || row.is_empty() {
+            return None;
+        }
+        let dims: Vec<(i64, i64)> = row
+            .iter()
+            .map(|d| match d {
+                Dim::Fixed(Some(b)) => Some(*b),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let descending = match self.unpacked_decl_dims_of(name) {
+            Some(d) if d.len() == shape.dims.len() => d[1..].iter().map(|&(l, r)| l > r).collect(),
+            _ => vec![false; dims.len()],
+        };
+        Some((dims, descending))
+    }
+
+    /// §7.4.5, §10.9.1: one item of a pattern written to a whole queue,
+    /// dynamic array or associative array `coll` whose elements are
+    /// fixed-size arrays (`q = '{'{1, 2}, p}`) is a whole row: spread it over
+    /// the row `elem` (`assign_fixed_row`). False when `coll` has no such
+    /// rows or the item is no row value, for the element-wise path.
+    fn assign_coll_row_item(
+        &mut self,
+        coll: &str,
+        elem: &str,
+        dt: &DataType,
+        item: &Expression,
+    ) -> bool {
+        let Some((dims, descending)) = self.coll_fixed_row_dims(coll) else {
+            return false;
+        };
+        let dt = self.leaf_elem_type(dt);
+        self.assign_fixed_row(elem, &dims, &descending, &dt, item)
+    }
+
+    /// The index lists of each dimension of a fixed-size row, from its
+    /// declared left bound to its right one (`descending` per dimension).
+    fn fixed_row_lists(dims: &[(i64, i64)], descending: &[bool]) -> Vec<Vec<i64>> {
+        dims.iter()
+            .enumerate()
+            .map(|(k, &(lo, hi))| {
+                if descending.get(k).copied().unwrap_or(false) {
+                    (lo..=hi).rev().collect()
+                } else {
+                    (lo..=hi).collect()
+                }
+            })
+            .collect()
+    }
+
+    /// The element suffixes (`[i][j]`) of a fixed-size row in declared
+    /// order, the order in which §7.6 pairs it with another array.
+    pub(super) fn fixed_row_suffixes(dims: &[(i64, i64)], descending: &[bool]) -> Vec<String> {
+        let mut out = vec![String::new()];
+        for list in Self::fixed_row_lists(dims, descending) {
+            out = out
+                .iter()
+                .flat_map(|p| list.iter().map(move |i| format!("{p}[{i}]")))
+                .collect();
+        }
+        out
+    }
+
+    /// The collection half of [`assign_unpacked_row`]: `idx` selects one
+    /// element of the queue, dynamic array or associative array `name`
+    /// whose elements are fixed-size arrays, and possibly a row inside it.
+    /// §7.10.1, §7.8.6, §7.4.6: a write with an unknown index or one past the
+    /// end of a queue or dynamic array writes nothing, except `q[$+1]`,
+    /// which appends to a queue.
+    fn assign_coll_fixed_row(
+        &mut self,
+        name: &str,
+        idx: &[&Expression],
+        rvalue: &Expression,
+        row_value: bool,
+    ) -> bool {
+        let Some((dims, descending)) = self.coll_fixed_row_dims(name) else {
+            return false;
+        };
+        let k = idx.len() - 1;
+        if k >= dims.len()
+            || idx
+                .iter()
+                .any(|ie| !Self::cond_expr_is_effect_free(ie, false))
+        {
+            return false;
+        }
+        let Some(dt) = self.module.var_decl_types.get(name).cloned() else {
+            return false;
+        };
+        let assoc = self.is_associative_array(name);
+        let size = if assoc { 0 } else { self.get_queue_size(name) };
+        let first = if assoc {
+            self.eval_expr(idx[0])
+        } else {
+            self.dollar_bound.push(size as i64 - 1);
+            let v = self.eval_expr(idx[0]);
+            self.dollar_bound.pop();
+            v
+        };
+        // §7.10.5: a bounded queue (`[$:N]`) that is full takes no append.
+        let append = !assoc
+            && matches!(self.declared_dim(name), Some(Dim::Queue))
+            && self
+                .module
+                .queue_max_sizes
+                .get(name)
+                .is_none_or(|&m| size < m as u64);
+        let mut base = match first.to_i64() {
+            _ if first.has_xz() => None,
+            _ if assoc => Some(format!("{}[{}]", name, self.assoc_key_str(name, &first))),
+            Some(i) if i >= 0 && ((i as u64) < size || (append && i as u64 == size)) => {
+                Some(format!("{}[{}]", name, i))
+            }
+            _ => None,
+        };
+        for (ie, &(lo, hi)) in idx[1..].iter().zip(&dims) {
+            let v = self.eval_expr(ie);
+            base = match (base, v.to_i64()) {
+                (Some(b), Some(i)) if !v.has_xz() && (lo..=hi).contains(&i) => {
+                    Some(format!("{}[{}]", b, i))
+                }
+                _ => None,
+            };
+        }
+        let Some(base) = base else {
+            // The write is ignored, but the right-hand side is still
+            // evaluated, so its calls run (§10.4.1). Only a row value is known
+            // to be one; any other right-hand side is left to the other paths.
+            if row_value {
+                self.eval_row_value_for_effects(rvalue);
+            }
+            return row_value;
+        };
+        let dt = self.leaf_elem_type(&dt);
+        if !self.assign_fixed_row(&base, &dims[k..], &descending[k..], &dt, rvalue) {
+            return false;
+        }
+        if assoc {
+            return true;
+        }
+        if first.to_i64() == Some(size as i64) {
+            self.set_queue_size(name, size + 1);
+        }
+        // Comb readers of `q[i]` depend on the collection's `.size` proxy.
+        self.touch_queue(name);
         true
+    }
+
+    /// Evaluate the items of the row value `e` (a pattern or a concatenation)
+    /// whose store is discarded, for their side effects only.
+    fn eval_row_value_for_effects(&mut self, e: &Expression) {
+        match &self.unpacked_pattern(e).kind {
+            ExprKind::AssignmentPattern(items) => {
+                for item in items {
+                    let _ = self.eval_expr(item.expr());
+                }
+            }
+            ExprKind::Concatenation(parts) => {
+                let _ = self.unpacked_concat_operand_values(parts.iter().collect(), true, None);
+            }
+            _ => {}
+        }
+    }
+
+    /// §7.8.6: the value an element of a nonexistent row of an associative
+    /// array of fixed-size arrays reads (`row` is `aa[k]`): the element
+    /// type's default, x for a 4-state integral type, 0 for a 2-state one and
+    /// 0.0 for a real one. `None` when `row` is no such row.
+    pub(super) fn assoc_row_missing_value(&self, row: &str) -> Option<Value> {
+        let (coll, _) = row.strip_suffix(']')?.rsplit_once('[')?;
+        if !self.is_associative_array(coll) {
+            return None;
+        }
+        self.coll_fixed_row_dims(coll)?;
+        let leaf = self.leaf_elem_type(self.module.var_decl_types.get(coll)?);
+        if matches!(self.resolve_dt(&leaf), DataType::Real { .. }) {
+            return Some(Value::from_f64(0.0));
+        }
+        let w = super::elaborate::resolve_type_width(
+            &leaf,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        if w == 0 {
+            return None;
+        }
+        Some(
+            if super::elaborate::is_type_two_state_resolved(&leaf, &self.module.typedef_types) {
+                Value::zero(w)
+            } else {
+                Value::new(w)
+            },
+        )
+    }
+
+    /// §7.6, §10.9.1, §10.10: assign the row value `e` to the fixed-size
+    /// unpacked array stored under `base` (`m[1]`, `q[0]`, `aa[k]`), with
+    /// dimensions `dims` (`descending` gives each one's direction) and
+    /// elements of type `dt`. `e` is an assignment pattern, an unpacked
+    /// array concatenation (`concat_row_items`) or an array of the row's
+    /// shape, copied element by element in declared order. False, with
+    /// nothing written, for any other expression.
+    fn assign_fixed_row(
+        &mut self,
+        base: &str,
+        dims: &[(i64, i64)],
+        descending: &[bool],
+        dt: &DataType,
+        e: &Expression,
+    ) -> bool {
+        let e = self.unpacked_pattern(e);
+        match &e.kind {
+            ExprKind::AssignmentPattern(items) if !items.is_empty() => {
+                self.assign_pattern_array(base, dims, dt, items, descending);
+                true
+            }
+            ExprKind::Concatenation(parts) => match self.concat_row_items(parts, dims.len()) {
+                Some(items) => {
+                    self.assign_pattern_array(base, dims, dt, &items, descending);
+                    true
+                }
+                None => false,
+            },
+            ExprKind::Ident(_) | ExprKind::Index { .. } | ExprKind::MemberAccess { .. } => {
+                // §7.2: an unpacked-struct element is its member leaves; the
+                // struct copy paths own it.
+                if self.unpacked_struct_of(dt).is_some() {
+                    return false;
+                }
+                let Some((src, sfx, _)) = self.nd_array_operand(e) else {
+                    return false;
+                };
+                let dst = Self::fixed_row_suffixes(dims, descending);
+                if dst.len() != sfx.len()
+                    || format!("{src}{}", sfx[0]) == format!("{base}{}", dst[0])
+                {
+                    return false;
+                }
+                let vals: Vec<Value> = sfx
+                    .iter()
+                    .map(|s| {
+                        self.get_signal_value_by_name(&format!("{src}{s}"))
+                            .unwrap_or_else(|| Value::zero(32))
+                    })
+                    .collect();
+                for (d, v) in dst.iter().zip(vals) {
+                    self.write_pattern_leaf(&format!("{base}{d}"), v);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// §10.10: an unpacked array concatenation written to a fixed-size row,
+    /// as the items of the equivalent assignment pattern. Over a row of one
+    /// dimension each operand is evaluated now, once and left to right, and
+    /// one that is an unpacked array contributes each of its elements
+    /// (`unpacked_concat_operand_values`); each value is then assigned to its
+    /// element as a pattern item is. Over a row of more dimensions each
+    /// operand is one sub-row, taken only when every operand is a pattern.
+    fn concat_row_items(
+        &mut self,
+        parts: &[Expression],
+        rank: usize,
+    ) -> Option<Vec<AssignmentPatternItem>> {
+        if parts.is_empty() {
+            return None;
+        }
+        if rank > 1 {
+            let all_patterns = parts.iter().all(|p| {
+                matches!(
+                    self.unpacked_pattern(p).kind,
+                    ExprKind::AssignmentPattern(_)
+                )
+            });
+            if !all_patterns {
+                return None;
+            }
+            // §10.10, §11.4.2: every operand is read before any element of
+            // the row is written, so a row that reads the array it is
+            // written to (`m[0] = {'{m[0][1][0], m[0][1][1]}, '{m[0][0][0],
+            // m[0][0][1]}}`, a swap) takes the values from before the store.
+            let mut items = Vec::with_capacity(parts.len());
+            for p in parts {
+                let frozen = self.frozen_row_pattern(p, rank - 1);
+                items.push(AssignmentPatternItem::Ordered(frozen));
+            }
+            return Some(items);
+        }
+        let vals = self.unpacked_concat_operand_values(parts.iter().collect(), true, None);
+        Some(
+            vals.iter()
+                .map(|v| AssignmentPatternItem::Ordered(self.value_method_arg_expr(v)))
+                .collect(),
+        )
+    }
+
+    /// The sub-row pattern `e`, `depth` dimensions above its elements, with
+    /// each element item evaluated now into a literal (see
+    /// `concat_row_items`). An item that is not a pattern above the element
+    /// level (a row variable) is kept as written.
+    fn frozen_row_pattern(&mut self, e: &Expression, depth: usize) -> Expression {
+        let p = self.unpacked_pattern(e).clone();
+        if depth == 0 {
+            if matches!(p.kind, ExprKind::AssignmentPattern(_)) {
+                return p;
+            }
+            let v = self.eval_expr(&p);
+            return self.value_method_arg_expr(&v);
+        }
+        let ExprKind::AssignmentPattern(items) = &p.kind else {
+            return p;
+        };
+        let mut out = Vec::with_capacity(items.len());
+        for it in items {
+            out.push(match it {
+                AssignmentPatternItem::Ordered(x) => {
+                    AssignmentPatternItem::Ordered(self.frozen_row_pattern(x, depth - 1))
+                }
+                other => other.clone(),
+            });
+        }
+        Expression::new(ExprKind::AssignmentPattern(out), p.span)
     }
 
     /// `arr[i] = '{...}` / `assoc[key] = '{...}` where the element is an
@@ -6042,6 +6404,34 @@ impl Simulator {
                 parts.push(self.render_p_dim_lists(&elem, &lists[1..], dt));
             }
         }
+        format!("'{{{}}}", parts.join(", "))
+    }
+
+    /// §21.2.1.7: the fixed-size array stored under `base` (an element of a
+    /// collection), as a nested list over the index lists `lists`; each
+    /// element prints by its type `dt`, or from its value when there is none.
+    fn render_p_fixed_row(
+        &mut self,
+        base: &str,
+        lists: &[Vec<i64>],
+        dt: Option<&DataType>,
+        is_str: bool,
+    ) -> String {
+        let Some((list, rest)) = lists.split_first() else {
+            return match dt {
+                Some(d) => self.render_p_typed(base, d),
+                None => {
+                    let v = self
+                        .get_signal_value_by_name(base)
+                        .unwrap_or_else(|| Value::zero(32));
+                    Self::render_p_value(&v, is_str)
+                }
+            };
+        };
+        let parts: Vec<String> = list
+            .iter()
+            .map(|i| self.render_p_fixed_row(&format!("{base}[{i}]"), rest, dt, is_str))
+            .collect();
         format!("'{{{}}}", parts.join(", "))
     }
 
@@ -6509,19 +6899,30 @@ impl Simulator {
             let keys = self.assoc_top_level_keys_shared(name);
             let string_keyed = self.is_string_keyed_array(name);
             let val_is_str = self.string_signals.contains(name);
+            // §21.2.1.7: an element that is a fixed-size array
+            // (`int aa[string][2]`) prints as a nested list in declared order.
+            let rows = self.coll_fixed_row_dims(name).map(|(dims, desc)| {
+                (
+                    Self::fixed_row_lists(&dims, &desc),
+                    dt.as_ref().map(|d| self.leaf_elem_type(d)),
+                )
+            });
             let parts: Vec<String> = keys
                 .iter()
                 .map(|k| {
                     let elem = format!("{}[{}]", name, k);
-                    let v = match &dt {
+                    let v = match (&dt, &rows) {
                         // §21.2.1.7: an element that is itself a queue,
                         // dynamic or associative array (`int aq[int][$]`,
                         // `int aa[int][int]`) prints as a nested list.
                         _ if self.p_elem_is_collection(&elem) => self
                             .render_p_var(&elem)
                             .unwrap_or_else(|| "'{}".to_string()),
-                        Some(d) => self.render_p_typed(&elem, d),
-                        None => {
+                        (_, Some((lists, leaf))) => {
+                            self.render_p_fixed_row(&elem, lists, leaf.as_deref(), val_is_str)
+                        }
+                        (Some(d), None) => self.render_p_typed(&elem, d),
+                        (None, None) => {
                             let ev = self
                                 .get_signal_value_by_name(&elem)
                                 .unwrap_or_else(|| Value::zero(32));
