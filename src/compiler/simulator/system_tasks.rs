@@ -1635,55 +1635,37 @@ impl Simulator {
                 // comparison where `X == 0` compares equal. When the name is
                 // a property of the current instance's class (and no local
                 // formal shadows it), the class-aware probes below decide.
-                if h.path.len() == 1
-                    && matches!(self.class_context_stack.last(), Some(Some(_)))
-                    && self.string_signals.contains(&*self.resolve_hier_name(h))
-                {
-                    let name = h.path[0].name.name.as_str();
-                    // Only the CURRENT method's frames shadow (§6.21): the
-                    // callers' frames below `method_local_base` are not in
-                    // scope here, and a same-named caller local (`val` in
-                    // `uvm_resource_db#(T)::set` calling `rsrc.write(val, …)`)
-                    // forced the flat-set fallback this branch exists to avoid.
-                    let local_shadows = self
-                        .method_local_base
-                        .last()
-                        .map(|&base| {
-                            self.local_stack
-                                .get(base..)
-                                .unwrap_or(&[])
-                                .iter()
-                                .any(|m| m.contains_key(name))
-                        })
-                        .unwrap_or_else(|| self.local_stack.iter().any(|m| m.contains_key(name)));
-                    let is_class_prop = !local_shadows
-                        && self
-                            .this_stack
-                            .last()
-                            .copied()
-                            .flatten()
-                            .and_then(|hh| self.heap.get(hh).and_then(|c| c.as_ref()))
-                            .is_some_and(|inst| {
-                                self.class_declares_property(&inst.class_name, name)
-                            });
-                    if is_class_prop {
-                        return self.class_member_is_string(expr)
-                            || self.ident_type_is_string(h, expr)
-                            || self.local_struct_member_is_string(h)
-                            || self.member_chain_is_string(expr);
-                    }
-                }
-                // A bare name asks the running task frame first: its non-string
-                // formal overrides a string flag another frame left on the name.
                 let name = self.resolve_hier_name(h);
-                let flagged = if h.path.len() == 1 {
-                    self.frame_name_is_string(&name)
-                } else {
-                    self.string_signals.contains(&*name)
-                };
-                flagged
+                let bare = h.path.len() == 1;
+                let frame = bare.then(|| self.frame_index_in_method(&name)).flatten();
+                let task_string = frame.and_then(|i| self.task_frame_string_flag_at(i, &name));
+                let global_string = self.string_signals.contains(&*name);
+                let class_prop_over_flat = bare
+                    && global_string
+                    && matches!(self.class_context_stack.last(), Some(Some(_)))
+                    && {
+                        // §6.21: only the current method's frames can shadow
+                        // its property. Use the spelling of the property here.
+                        let leaf = h.path[0].name.name.as_str();
+                        let shadowed = if leaf == name.as_ref() {
+                            frame.is_some()
+                        } else {
+                            self.frame_index_in_method(leaf).is_some()
+                        };
+                        !shadowed
+                            && self
+                                .this_stack
+                                .last()
+                                .copied()
+                                .flatten()
+                                .and_then(|hh| self.heap.get(hh).and_then(|c| c.as_ref()))
+                                .is_some_and(|inst| {
+                                    self.class_declares_property(&inst.class_name, leaf)
+                                })
+                    };
+                (!class_prop_over_flat && task_string.unwrap_or(global_string))
                     || self.class_member_is_string(expr)
-                    || self.ident_type_is_string(h, expr)
+                    || self.ident_type_is_string(h, expr, &name, frame.is_some(), task_string)
                     || self.local_struct_member_is_string(h)
                     || self.member_chain_is_string(expr)
             }

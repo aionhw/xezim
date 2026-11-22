@@ -475,13 +475,21 @@ impl Simulator {
         if self.task_string_formals.is_empty() {
             return None;
         }
+        let i = self.frame_index_in_method(name)?;
+        self.task_frame_string_flag_at(i, name)
+    }
+
+    pub(super) fn frame_index_in_method(&self, name: &str) -> Option<usize> {
         let base = self.method_local_base.last().copied().unwrap_or(0);
         let rel = self
             .local_stack
             .get(base..)?
             .iter()
             .rposition(|f| f.contains_key(name))?;
-        let i = base + rel;
+        Some(base + rel)
+    }
+
+    pub(super) fn task_frame_string_flag_at(&self, i: usize, name: &str) -> Option<bool> {
         let fgen = *self.local_gen_stack.get(i)?;
         let entry = self
             .task_string_formals
@@ -759,6 +767,9 @@ impl Simulator {
     }
 
     pub(super) fn instance_assoc_member(&self, name: &str) -> Option<String> {
+        if self.module.classes.is_empty() {
+            return None;
+        }
         // §8.9: `Cls::member` / flattened `Cls.member` spellings of a static
         // fixed array resolve to the declaring class's store BEFORE the
         // dotted-name guard below can reject them.

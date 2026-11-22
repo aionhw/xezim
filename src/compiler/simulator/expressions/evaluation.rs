@@ -1806,6 +1806,42 @@ impl Simulator {
                 }
             }
             ExprKind::Binary { op, left, right } => {
+                if matches!(op, BinaryOp::Add | BinaryOp::Sub)
+                    && let Some(value) =
+                        self.plain_literal_add_sub(*op, left, right, ctx_width, unsigned_context)
+                {
+                    return value;
+                }
+                // Short-circuit evaluation for logical operators (IEEE §11.3.5)
+                // §11.6.1 Table 11-21: the operands of `&&`, `||`, `->` and
+                // `<->` are self-determined, so the surrounding width does
+                // not reach them: `(a << 1) || 1'b0` for `logic [7:0] a =
+                // 8'h80` shifts at 8 bits and is 0 in a 32-bit context too.
+                if matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) {
+                    let l = self.eval_expr(left);
+                    match op {
+                        BinaryOp::LogAnd => {
+                            // §11.3.5: `&&` short-circuits only when the left is a
+                            // KNOWN logic 0. An X/Z left is ambiguous — the right
+                            // (with its side effects) must still be evaluated,
+                            // because `x && 1` is x, not 0. `z.to_u64()` yields
+                            // Some(0), so guard on has_xz too.
+                            if !l.has_xz() && l.to_u64() == Some(0) {
+                                return Value::from_u64(0, 1);
+                            }
+                            let r = self.eval_expr(right);
+                            return l.logic_and(&r);
+                        }
+                        BinaryOp::LogOr => {
+                            if l.to_u64().is_some_and(|v| v != 0) {
+                                return Value::from_u64(1, 1);
+                            }
+                            let r = self.eval_expr(right);
+                            return l.logic_or(&r);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
                 if let Some(v) = self.plain_compare(*op, left, right, ctx_width) {
                     return v;
                 }
@@ -1934,36 +1970,6 @@ impl Simulator {
                     && let Some(c) = self.compare_unpacked_structs(agg_l, agg_r, mode)
                 {
                     return c.value(want_eq);
-                }
-                // Short-circuit evaluation for logical operators (IEEE §11.3.5)
-                // §11.6.1 Table 11-21: the operands of `&&`, `||`, `->` and
-                // `<->` are self-determined, so the surrounding width does
-                // not reach them: `(a << 1) || 1'b0` for `logic [7:0] a =
-                // 8'h80` shifts at 8 bits and is 0 in a 32-bit context too.
-                if matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) {
-                    let l = self.eval_expr(left);
-                    match op {
-                        BinaryOp::LogAnd => {
-                            // §11.3.5: `&&` short-circuits only when the left is a
-                            // KNOWN logic 0. An X/Z left is ambiguous — the right
-                            // (with its side effects) must still be evaluated,
-                            // because `x && 1` is x, not 0. `z.to_u64()` yields
-                            // Some(0), so guard on has_xz too.
-                            if !l.has_xz() && l.to_u64() == Some(0) {
-                                return Value::from_u64(0, 1);
-                            }
-                            let r = self.eval_expr(right);
-                            return l.logic_and(&r);
-                        }
-                        BinaryOp::LogOr => {
-                            if l.to_u64().is_some_and(|v| v != 0) {
-                                return Value::from_u64(1, 1);
-                            }
-                            let r = self.eval_expr(right);
-                            return l.logic_or(&r);
-                        }
-                        _ => unreachable!(),
-                    }
                 }
                 // Logical implication / equivalence (IEEE §11.4.7). The SVA
                 // `iff` (§16.12.8), `property_expr1 iff property_expr2`, is

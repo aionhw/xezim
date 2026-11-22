@@ -11,48 +11,33 @@ impl Simulator {
         &self,
         hier: &HierarchicalIdentifier,
         expr: &Expression,
+        name: &str,
+        in_frame: bool,
+        task_string: Option<bool>,
     ) -> bool {
         if hier.path.len() != 1 {
             return self.get_expr_type_name(expr).is_some_and(|t| t == "string");
         }
-        let name = self.resolve_hier_name(hier);
         let is_string = |t: Option<&String>| t.is_some_and(|t| t == "string");
-        if self.fe_trusted_types.contains(&*name) {
-            if let Some(t) = self.var_typedef_types.get(&*name) {
+        if self.fe_trusted_types.contains(name) {
+            if let Some(t) = self.var_typedef_types.get(name) {
                 return t == "string";
             }
         }
         // The first source that answers decides, in `get_expr_type_name`'s
         // order.
-        let in_any_frame = self
-            .method_local_base
-            .last()
-            .map(|&base| {
-                self.local_stack
-                    .get(base..)
-                    .unwrap_or(&[])
-                    .iter()
-                    .rev()
-                    .any(|m| m.contains_key(&*name))
-            })
-            .unwrap_or_else(|| {
-                self.local_stack
-                    .iter()
-                    .rev()
-                    .any(|m| m.contains_key(&*name))
-            });
-        if in_any_frame {
-            if let Some(flag) = self.task_frame_string_flag(name.as_ref()) {
+        if in_frame {
+            if let Some(flag) = task_string {
                 return flag;
             }
-            if let Some(t) = self.var_class_types.get(&*name) {
+            if let Some(t) = self.var_class_types.get(name) {
                 return t == "string";
             }
-            if let Some(t) = self.var_typedef_types.get(&*name) {
+            if let Some(t) = self.var_typedef_types.get(name) {
                 return t == "string";
             }
             if !self.method_local_base.is_empty() {
-                return self.string_signals.contains(name.as_ref());
+                return self.string_signals.contains(name);
             }
         } else {
             let active_cls = self
@@ -64,25 +49,25 @@ impl Simulator {
                 .map(|i| i.class_name.as_str())
                 .or_else(|| self.class_context_stack.last().and_then(|c| c.as_deref()));
             if let Some(cls) = active_cls {
-                if self.class_declares_property(cls, name.as_ref()) {
+                if self.class_declares_property(cls, name) {
                     return self
                         .class_string_props_of(cls)
                         .iter()
-                        .any(|p| p == name.as_ref());
+                        .any(|p| p == name);
                 }
             }
         }
         if let Some(t) = self
             .signal_name_to_id
-            .get(name.as_ref())
+            .get(name)
             .and_then(|id| self.signal_type_names.get(id))
         {
             return t == "string";
         }
         if self.class_context_stack.last().is_none() {
-            return is_string(self.var_class_types.get(&*name))
-                || (!self.var_class_types.contains_key(&*name)
-                    && is_string(self.var_typedef_types.get(&*name)));
+            return is_string(self.var_class_types.get(name))
+                || (!self.var_class_types.contains_key(name)
+                    && is_string(self.var_typedef_types.get(name)));
         }
         false
     }

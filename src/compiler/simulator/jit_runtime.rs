@@ -603,9 +603,16 @@ impl Simulator {
                 super::bytecode::system_function_result(name).map(|(w, _)| w)
             }
             ExprKind::Number(NumberLiteral::Integer { size: Some(sz), .. }) => Some(*sz),
-            ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
-                Some(super::elaborate::number_literal_width(n))
-            }
+            ExprKind::Number(
+                n @ NumberLiteral::Integer {
+                    size: None,
+                    cached_val,
+                    ..
+                },
+            ) => Some(cached_val.get().map_or_else(
+                || super::elaborate::number_literal_width(n),
+                |(_, _, width)| width,
+            )),
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
             ExprKind::Ident(h) => {
                 let n = self.resolve_hier_name(h);

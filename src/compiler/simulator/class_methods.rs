@@ -405,6 +405,7 @@ impl Simulator {
             }
             ClassMemberNames {
                 ident_slow,
+                ident_slow_first: std::cell::OnceCell::new(),
                 statics,
                 static_first,
                 vif_props,

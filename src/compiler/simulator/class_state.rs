@@ -159,6 +159,9 @@ pub(super) struct ClassMemberNames {
     /// Names `plain_ident_read` leaves to the full path: static, vif and
     /// struct-capable properties, and the UVM activity constants.
     pub(super) ident_slow: HashSet<String>,
+    /// Derived from `ident_slow` on first use, including after checkpoint restore.
+    #[serde(skip)]
+    pub(super) ident_slow_first: std::cell::OnceCell<[bool; 256]>,
 }
 
 /// A foreach index variable's outer state, restored when the loop exits:

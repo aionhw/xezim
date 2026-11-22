@@ -23,7 +23,19 @@ impl Simulator {
             return None;
         }
         let name = seg.name.name.as_str();
-        if self.class_member_names().ident_slow.contains(name) {
+        let names = self.class_member_names();
+        let slow_first = names.ident_slow_first.get_or_init(|| {
+            let mut first = [false; 256];
+            for name in &names.ident_slow {
+                if let Some(&byte) = name.as_bytes().first() {
+                    first[byte as usize] = true;
+                }
+            }
+            first
+        });
+        if name.as_bytes().first().is_none_or(|&b| slow_first[b as usize])
+            && names.ident_slow.contains(name)
+        {
             return None;
         }
         if !self.in_const_param_eval
@@ -51,6 +63,65 @@ impl Simulator {
             .properties
             .get(name)
             .cloned()
+    }
+
+    fn cached_known_integer(expr: &Expression) -> Option<Value> {
+        let ExprKind::Number(NumberLiteral::Integer {
+            size,
+            signed,
+            cached_val,
+            ..
+        }) = &expr.kind
+        else {
+            return None;
+        };
+        let (bits, 0, width) = cached_val.get()? else {
+            return None;
+        };
+        if size.is_some_and(|size| size != width) {
+            return None;
+        }
+        let mut value = Value::from_inline(bits, 0, width);
+        value.is_signed = *signed;
+        Some(value)
+    }
+
+    /// §11.6.1/§11.8.2: a plain integer read and a known integer literal
+    /// need only their inferred widths and joint signedness for + or -.
+    pub(in crate::compiler::simulator) fn plain_literal_add_sub(
+        &mut self,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+        ctx_width: u32,
+        unsigned_context: bool,
+    ) -> Option<Value> {
+        let ExprKind::Ident(h) = &left.kind else {
+            return None;
+        };
+        let mut r = Self::cached_known_integer(right)?;
+        let mut l = self.plain_ident_read(h)?;
+        if l.is_real || l.is_fill {
+            return None;
+        }
+        let lw = self.infer_width(left);
+        let rw = right.cached_width.get().unwrap_or(r.width);
+        // The general arithmetic path checks declared real types at width 64.
+        if lw == 64 || rw == 64 {
+            return None;
+        }
+        let signed = !unsigned_context && l.is_signed && r.is_signed;
+        l.is_signed = signed;
+        r.is_signed = signed;
+        let width = lw.max(rw).max(l.width).max(r.width).max(ctx_width);
+        if l.width < width {
+            l = l.resize(width);
+        }
+        if r.width < width {
+            r = r.resize(width);
+        }
+        self.shift_free_operand = 0;
+        Some(if op == BinaryOp::Add { l.add(&r) } else { l.sub(&r) })
     }
 
     /// Read fast path for `h.p`: `h` a name `plain_ident_read` resolves to a
@@ -503,15 +574,24 @@ impl Simulator {
                 }
             }
         }
-        let sw = match (self.lrm_self_width(left), self.lrm_self_width(right)) {
-            (Some(lw), Some(rw)) => lw.max(rw),
-            _ => ctx_width,
+        // §11.6.1: these two reads produce their own widths even when the
+        // evaluator supplies a comparison context. Reuse the normal value
+        // comparison below, including its real and X/Z behavior.
+        let (l, r) = if let ExprKind::Ident(h) = &left.kind
+            && let Some(r) = Self::cached_known_integer(right)
+            && let Some(l) = self.plain_ident_read(h)
+        {
+            (l, r)
+        } else {
+            let sw = match (self.lrm_self_width(left), self.lrm_self_width(right)) {
+                (Some(lw), Some(rw)) => lw.max(rw),
+                _ => ctx_width,
+            };
+            (self.eval_expr_ctx(left, sw), self.eval_expr_ctx(right, sw))
         };
         // §11.8.2: against a real operand the plain name or literal on the
         // other side is converted from its own value — the comparison
         // operators below convert it.
-        let l = self.eval_expr_ctx(left, sw);
-        let r = self.eval_expr_ctx(right, sw);
         Some(match op {
             BinaryOp::Eq => l.is_equal(&r),
             BinaryOp::Neq => l.is_not_equal(&r),

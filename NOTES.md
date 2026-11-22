@@ -22,6 +22,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   dense clock fanouts and queues only the blocks that need to run.
 - The interpreter skips reference resolution for numeric literals and
   unary and binary operators while resolving any referenced operands normally.
+- The interpreter reaches logical short-circuit evaluation sooner, skips class
+  collection lookups in class-free designs and reuses the name buffer for
+  indexed nonblocking writes.
+- Interpreted addition and subtraction use a shorter path for plain integer
+  reads paired with known literals, preserving width, signedness and X/Z
+  behavior. Identifier lookup uses a first-byte filter for special names.
+- Interpreted comparisons reuse task-frame type lookups and skip width
+  queries for plain reads compared with known integer literals.
 
 **Command line**
 

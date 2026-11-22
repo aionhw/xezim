@@ -4088,8 +4088,14 @@ impl Simulator {
                             self.dollar_bound.pop();
                         }
                         let idx = idx?;
-                        // Use a small buffer to avoid allocation for common array names
-                        let elem = format!("{}[{}]", name, idx);
+                        // Reuse the name buffer across indexed writes and keep
+                        // the same lookup for aliases and virtual element names.
+                        let mut elem = self.hint_key_scratch.borrow_mut();
+                        elem.clear();
+                        elem.push_str(&name);
+                        elem.push('[');
+                        Self::push_i64(&mut elem, idx);
+                        elem.push(']');
                         return self.signal_name_to_id.get(elem.as_str()).copied();
                     }
                 }
