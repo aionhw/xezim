@@ -716,6 +716,23 @@ impl Simulator {
             self.edge_dispatch_phase = saved;
             let _ = self.drain_edge_cascade(self.cascade_limit);
         }
+        // §4.5: the Observed region, where the slot's `#0` reports mature,
+        // comes before the Reactive one. In the delta a slot-end callback
+        // opened they mature once its Active region set is empty, before a
+        // program or clocking waiter its clock woke runs (and may `$finish`).
+        // A callback the routine registered for this slot runs first: its
+        // writes may still flush a report.
+        if self.vpi_slot_maturing
+            && !self.deferred_asserts.is_empty()
+            && !self.vpi_synch_due()
+            && !self.dirty_any
+            && self.event_queue.next_time() != Some(self.time)
+            && self.nba_fast.is_empty()
+            && self.nba_queue.is_empty()
+            && self.inactive_queue.is_empty()
+        {
+            self.mature_deferred_observed();
+        }
         // The Reactive work waits while `sva_post_nba` finishes the slot
         // before an assertion clock event (§4.4.2).
         if !self.sva_post_nba_busy {
@@ -950,6 +967,25 @@ impl Simulator {
         {
             self.vpi_open_delta();
         }
+    }
+    /// The Post-NBA part of `vpi_slot_end`: the slot's leftover cbNBASynch and
+    /// cbReadWriteSynch routines. True when one ran.
+    pub(super) fn vpi_slot_post_nba(&mut self) -> bool {
+        if self.vpi_cb_mask & MASK_SLOT_END == 0 {
+            return false;
+        }
+        let mut fired = self.vpi_checkpoint();
+        self.vpi_slot_maturing = true;
+        for set in [TimedSet::Nba, TimedSet::Rw] {
+            if self.vpi_fire_due(set) {
+                fired = true;
+                if self.vpi_open_delta() {
+                    break;
+                }
+            }
+        }
+        self.vpi_slot_maturing = false;
+        fired
     }
 
     /// End of the current time slot: leftover cbNBASynch / cbReadWriteSynch,

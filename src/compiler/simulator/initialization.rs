@@ -4387,6 +4387,7 @@ impl Simulator {
             sva_owed: false,
             sva_abort_step: false,
             sva_post_nba_busy: false,
+            vpi_slot_maturing: false,
             clocking_snapshots: HashMap::default(),
             clocking_array_leaves: HashSet::default(),
             clocking_meta: HashMap::default(),

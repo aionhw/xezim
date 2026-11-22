@@ -1219,6 +1219,11 @@ pub struct Simulator {
     sva_abort_step: bool,
     /// `sva_post_nba` is running the slot's due cbReadWriteSynch batches.
     sva_post_nba_busy: bool,
+    /// `vpi_slot_post_nba` is running the slot's leftover cbNBASynch and
+    /// cbReadWriteSynch routines: the delta one opens matures the `#0`
+    /// deferred reports before its Reactive work.
+    #[serde(skip)]
+    vpi_slot_maturing: bool,
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
     /// is `cb_name → (signal_name → pre-edge value)`. Updated in
     /// `tick_clocking_blocks` just before the clock signal's posedge

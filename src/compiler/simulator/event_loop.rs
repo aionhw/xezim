@@ -2689,6 +2689,19 @@ impl Simulator {
                 self.drain_deferred_proc_settle();
                 continue;
             }
+            // §4.5, §16.4.1: a report matures in the Observed region (or
+            // Postponed), which the slot reaches only once every region
+            // through Post-NBA is empty. A cbNBASynch or cbReadWriteSynch
+            // still due belongs before it: cocotb applies its queued writes
+            // there, and a block they re-run flushes the report it queued
+            // on the old values (an `always_comb`'s time-0 run on x inputs).
+            if next_time > self.time
+                && !self.deferred_asserts.is_empty()
+                && self.vpi_cb_mask != 0
+                && self.vpi_slot_post_nba()
+            {
+                continue;
+            }
             // §16.4: the time slot is over — deferred assertion reports
             // mature. Their actions may schedule same-time work, so look
             // again before advancing.
