@@ -2994,6 +2994,22 @@ impl Simulator {
                             || self.module.arrays_nd.contains_key(&n)
                         {
                             n
+                        } else if self.is_associative_array(&n)
+                            && let Some((dims, desc)) = self.coll_fixed_row_dims(&n)
+                        {
+                            // §7.8, §7.6: an element of an associative array
+                            // of fixed-size arrays (`aa["k"]` of `int
+                            // aa[string][2]`) is a row, in declared order.
+                            let kv = self.eval_expr(index);
+                            if kv.has_xz() {
+                                return None;
+                            }
+                            let key = self.assoc_key_str(&n, &kv);
+                            return Some((
+                                format!("{n}[{key}]"),
+                                Self::fixed_row_suffixes(&dims, &desc),
+                                true,
+                            ));
                         } else {
                             self.class_nd_store(expr, &n)?
                         }
@@ -3047,7 +3063,12 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) -> bool {
-        if self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty() {
+        // An associative array of fixed-size rows has a declared shape and no
+        // 2-D table entry.
+        if self.module.arrays_2d.is_empty()
+            && self.module.arrays_nd.is_empty()
+            && self.module.coll_shapes.is_empty()
+        {
             return false;
         }
         let Some((lbase, lsfx, l_nd)) = self.nd_array_operand(lvalue) else {
@@ -3067,6 +3088,9 @@ impl Simulator {
                 self.p_elem_type(&rbase)
                     .and_then(|dt| self.unpacked_struct_of(&dt))
             });
+        // §7.8.6: an element of a row an associative array does not hold
+        // reads the element type's default.
+        let missing = self.assoc_row_missing_value(&rbase);
         for (ls, rs) in lsfx.iter().zip(rsfx.iter()) {
             if let Some(su) = &elem_su {
                 let (d, s) = (format!("{}{}", lbase, ls), format!("{}{}", rbase, rs));
@@ -3075,6 +3099,7 @@ impl Simulator {
             }
             let v = self
                 .get_signal_value_by_name(&format!("{}{}", rbase, rs))
+                .or_else(|| missing.clone())
                 .unwrap_or_else(|| Value::zero(32));
             self.set_signal_value_by_name(&format!("{}{}", lbase, ls), v);
         }
