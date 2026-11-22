@@ -555,7 +555,10 @@ impl Simulator {
     /// per try and the read returned another element's member. As for a
     /// method call's receiver (`eval_call_inner`), each such index becomes the
     /// literal of its value, evaluated once, left to right.
-    pub(in crate::compiler::simulator) fn freeze_member_read_selects(&mut self, e: &Expression) -> Option<Expression> {
+    pub(in crate::compiler::simulator) fn freeze_member_read_selects(
+        &mut self,
+        e: &Expression,
+    ) -> Option<Expression> {
         if !Self::is_effect_member_read(e) {
             return None;
         }
@@ -570,7 +573,10 @@ impl Simulator {
     /// evaluates no side effect. Sized by evaluating the read itself, an
     /// operand of a comparison or of an arithmetic operator ran its index
     /// once more for each probe.
-    pub(in crate::compiler::simulator) fn member_read_width_probe(&mut self, e: &Expression) -> Expression {
+    pub(in crate::compiler::simulator) fn member_read_width_probe(
+        &mut self,
+        e: &Expression,
+    ) -> Expression {
         let kind = match &e.kind {
             ExprKind::Index { expr, index } => {
                 let base = self.member_read_width_probe(expr);
