@@ -75,10 +75,10 @@ use xezim_core::elaborate;
 
 // Re-export xezim-core surface so existing `xezim::...` paths keep working.
 pub use xezim_core::{
-    LibraryCli, ModuleTimescaleCli, ParseResult, SourceDefinition, XEZIM_BYTECODE_MAGIC,
-    adopted_lib_files, ast, diagnostics, lexer, log_eprintln, log_println, parse,
-    parse_and_elaborate_multi, parse_str, preprocess_adopted_lib, preprocessor, progress_clear,
-    progress_status, read_compiled, render_parse_diagnostics, set_compile_verbose,
+    LibraryCli, LibraryMacroCarry, ModuleTimescaleCli, ParseResult, SourceDefinition,
+    XEZIM_BYTECODE_MAGIC, adopted_lib_files, ast, diagnostics, lexer, log_eprintln, log_println,
+    parse, parse_and_elaborate_multi, parse_str, preprocess_adopted_lib, preprocessor,
+    progress_clear, progress_status, read_compiled, render_parse_diagnostics, set_compile_verbose,
     set_implicit_net_warn, set_library_cli, set_module_timescale_cli, set_strict_top, sv_parser,
     tokenize_file, write_compiled,
 };
@@ -221,6 +221,10 @@ fn design_cache_key(
         hash.bytes(&[f.get() as u8]);
     }
     hash.bytes(&[sv_parser::lexer::scanner::default_keywords_key()]);
+    // The macros a `-v`/`-y` library file starts from select its `ifdef`
+    // branches and expand its macro uses.
+    let macro_carry = xezim_core::library_macro_carry();
+    hash.bytes(&[macro_carry as u8]);
 
     // Invalidate after a local rebuild even when the package version did not
     // change, since the executable may contain elaboration fixes.
@@ -287,11 +291,29 @@ fn design_cache_key(
     if dependencies.is_empty() {
         return (hash.finish(), preprocessed_texts, line_maps);
     }
-    // A library can use macros that emitted no text in the primary files,
-    // including macros from a primary header and function-like definitions.
-    let inherited = pre
-        .map(|source| std::borrow::Cow::Borrowed(&source.macro_defines))
-        .unwrap_or_else(|| std::borrow::Cow::Owned(pp.snapshot_defines()));
+    // A library file starts from the command-line defines, or with
+    // `--carry-src-macros`/`--carry-lib-macros` from the primary files'
+    // macros, which may have emitted no text there (a primary header's,
+    // function-like definitions). Under `--carry-lib-macros` it also starts
+    // from the macros of the library files read before it, in an order only
+    // elaboration knows; this text leaves those out.
+    let inherited = if macro_carry == xezim_core::LibraryMacroCarry::None {
+        let mut cli_pp = preprocessor::Preprocessor::new();
+        for (name, value) in defines {
+            cli_pp.define(
+                name.clone(),
+                preprocessor::MacroDef {
+                    name: name.clone(),
+                    params: None,
+                    body: value.clone().unwrap_or_default(),
+                },
+            );
+        }
+        std::borrow::Cow::Owned(cli_pp.snapshot_defines())
+    } else {
+        pre.map(|source| std::borrow::Cow::Borrowed(&source.macro_defines))
+            .unwrap_or_else(|| std::borrow::Cow::Owned(pp.snapshot_defines()))
+    };
     for path in dependencies {
         hash.text(&path.to_string_lossy());
         match std::fs::read(&path) {
