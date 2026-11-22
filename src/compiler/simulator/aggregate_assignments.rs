@@ -4175,6 +4175,155 @@ impl Simulator {
             .unwrap_or_else(|| Value::zero(32))
     }
 
+    /// §7.10.2.4, §7.10.2.5: `q.pop_front()` / `q.pop_back()` on a queue whose
+    /// elements are fixed-size arrays (`int q[$][2]`, `pair_t q[$]`) returns
+    /// the removed row. A row has no packed cell of its own, only its
+    /// elements, so it travels as a call returning an unpacked array does:
+    /// copied in declared order to the return store, which the caller reads
+    /// by name (`%p`, a whole-array assignment, an unpacked concatenation).
+    /// An empty queue returns a row of the element type's default (§7.10.2).
+    /// The call is evaluated once. `None`, with nothing evaluated, when `e`
+    /// is no such pop.
+    pub(super) fn pop_row_operand(&mut self, e: &Expression) -> Option<String> {
+        const RET_SNAP: &str = "__xz_ret_coll__";
+        let (obj, pop) = self.queue_pop_call(e)?;
+        let &(_, (jlo, jhi), w) = self.module.arrays_2d.get(&obj)?;
+        let dt = self.module.var_decl_types.get(&obj).cloned()?;
+        let order: Vec<i64> = match self
+            .unpacked_decl_dims_of(&obj)
+            .and_then(|d| d.get(1).copied())
+        {
+            Some((l, r)) if l > r => (r..=l).rev().collect(),
+            _ => (jlo..=jhi).collect(),
+        };
+        let size = self.get_queue_size(&obj);
+        let idx = if pop == "pop_front" {
+            0
+        } else {
+            size.saturating_sub(1)
+        };
+        let default =
+            if super::elaborate::is_type_two_state_resolved(&dt, &self.module.typedef_types) {
+                Value::zero(w)
+            } else {
+                Value::new(w)
+            };
+        let row: Vec<Value> = order
+            .iter()
+            .map(|j| {
+                (size > 0)
+                    .then(|| self.get_signal_value_by_name(&format!("{obj}[{idx}][{j}]")))
+                    .flatten()
+                    .unwrap_or_else(|| default.clone())
+            })
+            .collect();
+        self.eval_builtin_method(&obj, &pop, &[]);
+        for (pos, v) in row.iter().enumerate() {
+            self.set_signal_value_by_name(&format!("{RET_SNAP}[{pos}]"), v.clone());
+        }
+        self.set_queue_size(RET_SNAP, row.len() as u64);
+        self.module.arrays.insert(RET_SNAP.to_string(), (0, -1, w));
+        self.module.dynamic_arrays.insert(RET_SNAP.to_string());
+        self.module.var_decl_types.insert(RET_SNAP.to_string(), dt);
+        Some(RET_SNAP.to_string())
+    }
+
+    /// §7.6, §7.4.6: copy the row in the return store `src` (zero-based) to a
+    /// part of an unpacked array that `assign_pending_ret_collection` does not
+    /// take: a slice (`d[1:2]`) or a row of a fixed multi-dimensional array
+    /// (`m[1]`), pairing elements left to right. False, with nothing
+    /// written, when `lvalue` is neither or the element counts differ.
+    pub(super) fn copy_ret_row_to_part(&mut self, lvalue: &Expression, src: &str) -> bool {
+        // The selects are read once, before any element is written: a write
+        // may change what an index reads (`m[m[0][0]] = q.pop_front()`).
+        let lvalue = &self.freeze_index_chain(lvalue);
+        let targets: Vec<Expression> = match &lvalue.kind {
+            ExprKind::RangeSelect {
+                expr,
+                kind: crate::ast::expr::RangeKind::Constant,
+                left,
+                right,
+            } if self.fixed_array_operand(expr).is_some() => {
+                let (l, r) = (self.eval_expr(left), self.eval_expr(right));
+                let (Some(l), Some(r)) = (
+                    l.to_i64().filter(|_| !l.has_xz()),
+                    r.to_i64().filter(|_| !r.has_xz()),
+                ) else {
+                    return false;
+                };
+                let idx: Vec<i64> = if l <= r {
+                    (l..=r).collect()
+                } else {
+                    (r..=l).rev().collect()
+                };
+                idx.into_iter()
+                    .map(|i| {
+                        Expression::new(
+                            ExprKind::Index {
+                                expr: expr.clone(),
+                                index: Box::new(
+                                    self.value_method_arg_expr(&Self::signed_loop_val(i)),
+                                ),
+                            },
+                            lvalue.span,
+                        )
+                    })
+                    .collect()
+            }
+            ExprKind::Index { .. } => match self.unpacked_row_suffixes(lvalue) {
+                Some(sfx) => sfx
+                    .iter()
+                    .map(|s| Self::append_leaf_path(lvalue, s))
+                    .collect(),
+                None => return false,
+            },
+            _ => return false,
+        };
+        if targets.len() as u64 != self.get_queue_size(src) {
+            return false;
+        }
+        for (k, t) in targets.iter().enumerate() {
+            let v = self
+                .get_signal_value_by_name(&format!("{src}[{k}]"))
+                .unwrap_or_else(|| Value::zero(32));
+            self.assign_value(t, &v);
+        }
+        true
+    }
+
+    /// `e` with the index of each element select along its chain, and the
+    /// base of a slice, replaced by a literal of its value now, so writes
+    /// through it select the same elements however they change what an
+    /// index reads.
+    fn freeze_index_chain(&mut self, e: &Expression) -> Expression {
+        let kind = match &e.kind {
+            ExprKind::Index { expr, index } => ExprKind::Index {
+                expr: Box::new(self.freeze_index_chain(expr)),
+                index: Box::new(self.capture_index_literal(index, expr)),
+            },
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => ExprKind::RangeSelect {
+                expr: Box::new(self.freeze_index_chain(expr)),
+                kind: *kind,
+                left: left.clone(),
+                right: right.clone(),
+            },
+            _ => return e.clone(),
+        };
+        Expression::new(kind, e.span)
+    }
+
+    /// Whether `e` is a pop that [`Self::pop_row_operand`] returns a row for.
+    /// Nothing is evaluated.
+    pub(super) fn is_pop_row_call(&mut self, e: &Expression) -> bool {
+        self.queue_pop_call(e)
+            .is_some_and(|(obj, _)| self.module.arrays_2d.contains_key(&obj))
+    }
+
     /// `q.pop_front()` / `q.pop_back()` — the queue name and which end.
     pub(super) fn queue_pop_call(&mut self, e: &Expression) -> Option<(String, String)> {
         let ExprKind::Call { func, .. } = &e.kind else {
@@ -4201,10 +4350,15 @@ impl Simulator {
             return None;
         }
         if self.module.dynamic_arrays.contains(&obj) {
-            Some((obj, mname))
-        } else {
-            None
+            return Some((obj, mname));
         }
+        // A subroutine-local queue named in the two-segment form is stored
+        // under its per-call key (`@q#3`), which the pop itself resolves to.
+        let local = self.dyn_name_lookup(&obj)?;
+        self.module
+            .dynamic_arrays
+            .contains(local)
+            .then(|| (local.to_string(), mname))
     }
 
     /// Whether `name` is a row of a declared collection whose row kind is a

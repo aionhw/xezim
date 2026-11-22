@@ -673,6 +673,10 @@ impl Simulator {
         let ExprKind::Call { func, .. } = &arg.kind else {
             return None;
         };
+        // §7.10.2.4, §7.10.2.5: a pop of a queue of fixed-size rows.
+        if let Some(src) = self.pop_row_operand(arg) {
+            return Some(Some(src));
+        }
         if !self.call_returns_collection(func) {
             return None;
         }
@@ -2302,6 +2306,17 @@ impl Simulator {
         }
         if !l_pure && l_probe_safe {
             lflat = self.flat_member_name(lvalue);
+        }
+        // §7.10.2.4, §7.10.2.5: `r = q.pop_front()` on a queue of fixed-size
+        // rows copies the removed row, as from a call returning an array.
+        if let Some(src) = self.pop_row_operand(rvalue) {
+            self.pending_ret_collection = Some(src.clone());
+            if !self.assign_pending_ret_collection(lvalue) {
+                // A slice or a row of a fixed array takes it element-wise.
+                self.copy_ret_row_to_part(lvalue, &src);
+                self.settle_after_proc_write();
+            }
+            return;
         }
         // `s = q.pop_front()` on a queue of unpacked structs: the popped
         // element's members must reach `s` before the queue shifts — a

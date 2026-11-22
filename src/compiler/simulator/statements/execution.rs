@@ -1750,6 +1750,18 @@ impl Simulator {
                             self.pending_ret_collection = Some(RET_SNAP.to_string());
                         }
                     }
+                    // §7.10.2.4, §7.10.2.5: `return q.pop_front()` on a queue
+                    // of fixed-size rows hands back the removed row.
+                    if self.pending_ret_collection.is_none()
+                        && self
+                            .fn_ret_collection_stack
+                            .last()
+                            .copied()
+                            .unwrap_or(false)
+                        && let Some(src) = self.pop_row_operand(e)
+                    {
+                        self.pending_ret_collection = Some(src);
+                    }
                     // §13.4.1: an unpacked struct that is an ELEMENT of a
                     // class-property collection (`return q[i];`) or a
                     // subroutine local (`return r;`) has no container value;
