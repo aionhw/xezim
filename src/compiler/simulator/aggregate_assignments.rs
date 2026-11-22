@@ -4226,9 +4226,9 @@ impl Simulator {
     /// is no such pop.
     pub(super) fn pop_row_operand(&mut self, e: &Expression) -> Option<String> {
         const RET_SNAP: &str = "__xz_ret_coll__";
-        let (obj, pop) = self.queue_pop_call(e)?;
+        let (obj, pop) = self.row_queue_pop_call(e)?;
         let &(_, (jlo, jhi), w) = self.module.arrays_2d.get(&obj)?;
-        let dt = self.module.var_decl_types.get(&obj).cloned()?;
+        let dt = self.row_queue_elem_type(&obj)?;
         let order: Vec<i64> = match self
             .unpacked_decl_dims_of(&obj)
             .and_then(|d| d.get(1).copied())
@@ -4360,8 +4360,60 @@ impl Simulator {
     /// Whether `e` is a pop that [`Self::pop_row_operand`] returns a row for.
     /// Nothing is evaluated.
     pub(super) fn is_pop_row_call(&mut self, e: &Expression) -> bool {
-        self.queue_pop_call(e)
+        self.row_queue_pop_call(e)
             .is_some_and(|(obj, _)| self.module.arrays_2d.contains_key(&obj))
+    }
+
+    /// `queue_pop_call`, or a pop of an object's queue property
+    /// (`k.q.pop_front()`, `q.pop_back()` in a method of the class), whose
+    /// store is `<handle>#q`. Nothing is evaluated but the receiver's handle.
+    fn row_queue_pop_call(&mut self, e: &Expression) -> Option<(String, String)> {
+        if let Some(found) = self.queue_pop_call(e) {
+            return Some(found);
+        }
+        let ExprKind::Call { func, args } = &e.kind else {
+            return None;
+        };
+        if !args.is_empty() {
+            return None;
+        }
+        let mname = match &func.kind {
+            ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+            ExprKind::Ident(h) if h.path.len() >= 2 => h.path.last()?.name.name.as_str(),
+            _ => return None,
+        };
+        if mname != "pop_front" && mname != "pop_back" {
+            return None;
+        }
+        let mname = mname.to_string();
+        let recv = match &func.kind {
+            ExprKind::MemberAccess { expr, .. } => (**expr).clone(),
+            ExprKind::Ident(h) => {
+                let mut recv = h.clone();
+                recv.path.pop();
+                recv.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                recv.cached_resolved_name = crate::ast::cache::NameCache::new();
+                recv.bound = crate::ast::binding::Bound::UNSET;
+                Expression::new(ExprKind::Ident(recv), func.span)
+            }
+            _ => return None,
+        };
+        let store = self.expr_assoc_name(&recv)?;
+        self.module
+            .dynamic_arrays
+            .contains(&store)
+            .then_some((store, mname))
+    }
+
+    /// The declared element type of the queue of rows stored as `obj`: a
+    /// design variable's, or an object's property's (`<handle>#q`).
+    fn row_queue_elem_type(&self, obj: &str) -> Option<DataType> {
+        if let Some(dt) = self.module.var_decl_types.get(obj) {
+            return Some(dt.clone());
+        }
+        let (h, prop) = obj.split_once('#')?;
+        let cd = self.class_prop_declarer(h.parse().ok()?, prop)?;
+        cd.property_types.get(prop).cloned()
     }
 
     /// `q.pop_front()` / `q.pop_back()` — the queue name and which end.
