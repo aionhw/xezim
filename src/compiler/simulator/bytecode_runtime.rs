@@ -4255,7 +4255,11 @@ impl Simulator {
                     if let Some(idx) = dyn_bit_index(&self.vm_regs[*idx_reg as usize]) {
                         let bit = self.vm_regs[*val_reg as usize].get_bit(0);
                         let id = *sig_id;
-                        if idx < self.signal_widths[id] as usize {
+                        // §10.6.2: a forced signal keeps its forced value
+                        // (this writes the table directly, past `write_sig!`).
+                        let forced = !self.forced_signals.is_empty()
+                            && self.forced_signals.contains_key(&id);
+                        if !forced && idx < self.signal_widths[id] as usize {
                             let cur = self.signal_table[id].get_bit(idx);
                             if cur != bit {
                                 self.signal_table[id].set_bit(idx, bit);
@@ -4386,6 +4390,12 @@ impl Simulator {
                         self.vm_regs[*val_reg as usize].resize(w)
                     };
                     let id = *sig_id;
+                    // §10.6.2: a forced signal keeps its forced value, as in
+                    // `BlockingAssignRange`.
+                    if !self.forced_signals.is_empty() && self.forced_signals.contains_key(&id) {
+                        pc += 1;
+                        continue;
+                    }
                     let sig_w = self.signal_widths[id];
                     let high_eff = high.min(sig_w.saturating_sub(1));
                     let copy_count = high_eff.saturating_add(1).saturating_sub(low) as usize;

@@ -304,6 +304,12 @@ impl Simulator {
         if id >= self.signal_table.len() {
             return;
         }
+        // §10.6.2: a forced signal keeps its forced value. The paths below
+        // write the table directly, past `write_sig!`, so check here as the
+        // VM's `BlockingAssignRange` does.
+        if !self.forced_signals.is_empty() && self.forced_signals.contains_key(&id) {
+            return;
+        }
         let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
         let w = high - low + 1;
         let sig_w = self.signal_widths[id];
