@@ -49,7 +49,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // §19.5: covergroup instances retain the real-valued coverpoint set.
 // Arm fanouts may retain the bit masks of their clocked readers.
 // Wide partial NBA profiling retains separate quiet and cloned counts.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x23";
+// §16.14.6: Simulator::delay_pids and ::delay_resumed, SvaClockedSite::tick_time.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x24";
 
 #[derive(Default)]
 struct Session {
@@ -1304,6 +1305,8 @@ checkpoint_state!(
     deferred_asserts,
     deferred_comb_pool,
     deferred_proc_entries,
+    delay_pids,
+    delay_resumed,
     delayed_nba,
     delayed_nba_queue,
     delayed_slice_chains,

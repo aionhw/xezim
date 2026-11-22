@@ -16,6 +16,7 @@ impl Simulator {
         cont: ProcCont,
     ) {
         if RPS_DEPTH.with(|c| c.get()) > RPS_TRAMPOLINE_DEPTH {
+            self.cont_pids.insert(pid);
             // The context stays live; mark the entry as this pid's own
             // continuation (see `run_scheduled_process_inner`).
             if !self.local_stack.is_empty() || !self.this_stack.is_empty() {

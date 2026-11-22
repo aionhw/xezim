@@ -3249,6 +3249,7 @@ impl Simulator {
                             return;
                         }
                         let cont = self.forever_cont(pid, body, body_stmts, i, 0, tbody);
+                        self.delay_pids.insert(pid, delay > 0);
                         if delay == 0 {
                             // `forever begin ... #0 ... end` — same §4.4.2.3
                             // Inactive-region parking as the run_process_stmts

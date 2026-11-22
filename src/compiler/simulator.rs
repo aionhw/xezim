@@ -1997,6 +1997,22 @@ pub struct Simulator {
     /// Pids whose continuation `continue_stmts_or_trampoline` rescheduled
     /// with their context left live on the simulator.
     trampolined_pids: HashSet<usize>,
+    /// §16.4.2: pids whose next `run_process_stmts_inner` entry continues the
+    /// running activation (`continue_stmts_or_trampoline`), not a resume
+    /// after a suspension: their pending deferred reports and procedural
+    /// assertion instances stay queued.
+    #[serde(skip)]
+    cont_pids: HashSet<usize>,
+    /// Pids parked on a delay (`#d`, `#0`, an intra-assignment delay), each
+    /// with whether the delay moves time on (`#0` does not). Checkpointed,
+    /// with the queued continuations.
+    delay_pids: HashMap<usize, bool>,
+    /// §16.14.6: pids whose running activation went on after a delay that
+    /// moved time on, not at an event control: a procedural concurrent
+    /// assertion they reach first is not at its clock's tick, so its first
+    /// attempt waits for the next one. A `#0` stays in the time step of the
+    /// event that woke the procedure.
+    delay_resumed: HashSet<usize>,
     /// Parallel to `local_stack`: the frame generation each slot was pushed
     /// with (see `ProcessContext::local_gen_stack`). Kept on the active
     /// `Simulator` exactly like `local_stack`, and moved into/out of a
@@ -4679,6 +4695,11 @@ pub struct Simulator {
     /// and call a sampled-value function: (body, scope, edge code, clock id),
     /// consumed by `register_sampled_watches` like the edge blocks.
     proc_sampled_blocks: Vec<(Statement, String, u8, usize)>,
+    /// The name segments the concurrent assertions in every always block
+    /// spell, taken as the blocks are classified: one that runs as a
+    /// process is in no list `capture_sampled_defaults` reads.
+    #[serde(skip)]
+    always_sva_names: HashSet<String>,
     /// True while `register_sampled_watches` pre-registers the sites.
     sampled_registering: bool,
 }

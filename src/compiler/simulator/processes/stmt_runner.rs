@@ -119,7 +119,10 @@ impl Simulator {
     ) {
         let stmts: &[Statement] = pc.frame();
         self.current_pid = pid;
-        self.flush_deferred_asserts(pid);
+        // §16.4.2: the flush happens where the process resumes
+        // (`run_scheduled_process_inner`); every continuation of the running
+        // activation enters here too (a chained frame, an `always` body
+        // looping back to its event control), and is none.
         // Install THIS process's own instance scope as the resolution hint.
         // The hint is transient sibling-scope state: the previous process (or
         // a $display argument it evaluated) may have left its scope behind,
@@ -1334,6 +1337,7 @@ impl Simulator {
                     cont.extend(release);
                     // Chain the caller's tail rather than copying it (ProcCont::pushed).
                     let cont = pc.pushed(cont, pc.start + i + 1);
+                    self.delay_pids.insert(pid, delay > 0);
                     self.event_queue.schedule(self.time + delay, pid, cont);
                     return;
                 }
@@ -1510,6 +1514,7 @@ impl Simulator {
                         }
                         // Chain the caller's tail rather than copying it (ProcCont::pushed_body).
                         let cont = pc.pushed_body(body, pc.start + i + 1);
+                        self.delay_pids.insert(pid, delay > 0);
                         if delay == 0 {
                             // `#0` — IEEE 1800-2017 §4.4.2.3: suspend into the
                             // Inactive region of the SAME time slot, not the

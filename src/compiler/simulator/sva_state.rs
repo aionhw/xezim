@@ -165,6 +165,9 @@ pub(super) struct SvaClockedSite {
     /// §16.14.6.2: matured instances, each the slot values it captured,
     /// waiting for the next tick of the leading clock.
     pub(super) matured: Vec<SvaEnv>,
+    /// The time of the last tick. An instance that matures later in that
+    /// time step starts its attempt at that tick, not the next one.
+    pub(super) tick_time: Option<u64>,
     /// The property has its own `disable iff` (§16.15: the scope's
     /// `default disable iff` does not apply).
     pub(super) explicit_disable: bool,

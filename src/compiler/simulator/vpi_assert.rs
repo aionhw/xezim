@@ -256,13 +256,15 @@ impl Simulator {
 
     /// With stepping enabled at site `i`, report each attempt still in
     /// flight after a tick as a successful step (Clause 39.4.2).
-    pub(super) fn vpi_assert_fire_steps(&mut self, i: usize) {
+    /// `skip`: the leading attempts that took this tick's step already.
+    pub(super) fn vpi_assert_fire_steps(&mut self, i: usize, skip: usize) {
         if !self.vpi_assert.step_any {
             return;
         }
         let starts: Vec<u64> = self.sva_sites[i]
             .attempt_meta
             .iter()
+            .skip(skip)
             .map(|m| m.start_time)
             .collect();
         for start in starts {
