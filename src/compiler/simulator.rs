@@ -191,7 +191,8 @@ thread_local! {}
 // Scoped package calls can now lower to compiled function calls (#1623).
 // Parenthesized unpacked-struct sources can lower to leaf copies (#1627).
 // Class specialization and inherited typedefs change collection and formal layouts.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3187;
+// §6.12.1, §6.24.1: real-to-integral constant rounding changes folded local widths.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3188;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
