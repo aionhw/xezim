@@ -577,3 +577,5 @@ mod indexed_member_event;
 
 #[path = "scheduling/variable_assign_delay.rs"]
 mod variable_assign_delay;
+#[path = "scheduling/fork_children_before_nba.rs"]
+mod fork_children_before_nba;
