@@ -85,6 +85,117 @@ fn both(name: &str, src: &str, ok_lines: usize) -> (Vec<String>, u64, u64) {
     )
 }
 
+/// §9.4.2 / §10.4.2: narrower write arming must preserve sampled slice
+/// values and NBA updates. Exercise disjoint slices, a union of two reads,
+/// whole and dynamic reads, and transitions in each of the two logic planes.
+#[test]
+fn clocked_slice_readers_arm_on_value_and_xz_changes() {
+    let src = r#"
+`timescale 1ns/1ps
+module tb;
+  reg clk = 0;
+  always #5 clk = ~clk;
+  reg [15:0] bus = 0;
+  reg [95:0] wide = 0;
+  reg [3:0] index = 0;
+  reg [3:0] low, high, dyn, wide_low, wide_high;
+  reg [1:0] mix;
+  reg [15:0] all_bits;
+  always @(posedge clk) low <= bus[3:0];
+  always @(posedge clk) high <= bus[11:8];
+  always @(posedge clk) mix <= {bus[8], bus[0]};
+  always @(posedge clk) all_bits <= bus;
+  always @(posedge clk) dyn <= bus[index +: 4];
+  always @(posedge clk) wide_low <= wide[5:2];
+  always @(posedge clk) wide_high <= wide[81:78];
+
+  always @(negedge clk) begin
+    if (low !== bus[3:0] || high !== bus[11:8] ||
+        mix !== {bus[8], bus[0]} || all_bits !== bus ||
+        dyn !== bus[index +: 4] || wide_low !== wide[5:2] ||
+        wide_high !== wide[81:78])
+      $fatal(1, "stale clocked value at %0t", $time);
+    $display("OK %b %b %b %b %b %b %b", low, high, mix, all_bits, dyn, wide_low, wide_high);
+  end
+
+  initial begin
+    for (integer phase = 0; phase < 4; phase++) begin
+      repeat (4) begin
+        @(negedge clk);
+        #1;
+        bus[11:8] <= bus[11:8] + 1'b1;
+        wide[5:2] <= wide[5:2] + 1'b1;
+      end
+      case (phase)
+        0: begin bus[0] = 1'b1; wide[79] = 1'b1; end
+        1: begin bus[0] = 1'bz; wide[79] = 1'bz; end
+        2: begin bus[0] = 1'bx; wide[79] = 1'bx; end
+        3: begin bus[0] = 1'b0; wide[79] = 1'b0; end
+      endcase
+      index = phase[0] ? 8 : 0;
+    end
+    #20 $finish;
+  end
+endmodule
+"#;
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("bit_sensitivity");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sv = dir.join("clocked_slice_readers.sv");
+    std::fs::write(&sv, src).unwrap();
+    let run = |masks, shadow, args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_xezim"));
+        command
+            .env("XEZIM_ARMED_EDGE", "1")
+            .env("XEZIM_EVENT_EDGE", "1")
+            .env("XEZIM_EDGE_MERGE", "0")
+            .env("XEZIM_ARMED_EDGE_MASKS", masks)
+            .env_remove("XEZIM_ARMED_EDGE_SHADOW")
+            .args(["--no-cache", "--error-exit", "--verbose", "-s", "tb"])
+            .args(args)
+            .arg(&sv);
+        if shadow {
+            command.env("XEZIM_ARMED_EDGE_SHADOW", "1");
+        }
+        let out = command.output().unwrap();
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{text}");
+        text
+    };
+    let off = run("0", false, &[]);
+    let on = run("1", false, &[]);
+    let shadow = run("1", true, &[]);
+    assert_eq!(sim_lines(&on).len(), 18, "{on}");
+    assert_eq!(sim_lines(&on), sim_lines(&off));
+    assert_eq!(sim_lines(&shadow), sim_lines(&off));
+    let counter = |text: &str, marker: &str| -> u64 {
+        text.lines()
+            .find_map(|line| line.split_once(marker))
+            .unwrap_or_else(|| panic!("missing {marker}:\n{text}"))
+            .1
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert!(counter(&on, "bit-selective arm fanouts=") >= 2, "{on}");
+    assert!(counter(&on, "armed-fast-skips=") > counter(&off, "armed-fast-skips="));
+
+    // Save with a data write pending for the next posedge. The restored
+    // run needs both the saved arm flags and the filtered fanout for
+    // the writes made after resuming.
+    let checkpoint = dir.join("clocked_slice_readers.ckpt");
+    let save_at = format!("91ns,{}", checkpoint.display());
+    let saved = run("1", false, &["--save-at", &save_at]);
+    assert_eq!(sim_lines(&saved), sim_lines(&off));
+    let restored = run("1", false, &["--restore", checkpoint.to_str().unwrap()]);
+    assert_eq!(sim_lines(&restored), sim_lines(&off)[9..], "{restored}");
+}
+
 /// Field readers of a bus written by a lowered continuous assignment, a
 /// one-bit gate on two of its bits, and a whole-bus reader.
 #[test]
