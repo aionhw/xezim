@@ -1367,3 +1367,5 @@ mod typename_specialized_property;
 mod queue_row_name_collision;
 #[path = "classes/rand_srandom_reseed_repeats.rs"]
 mod rand_srandom_reseed_repeats;
+#[path = "classes/review_rand_srandom_streams.rs"]
+mod review_rand_srandom_streams;
