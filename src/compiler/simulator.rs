@@ -15219,6 +15219,8 @@ mod finished_process_lifetime_tests;
 
 #[cfg(test)]
 mod class_heap_lifetime_tests;
+#[cfg(test)]
+mod clocks_only_scan_tests;
 
 #[cfg(test)]
 mod signal_map_tests;

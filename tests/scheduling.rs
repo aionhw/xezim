@@ -579,3 +579,5 @@ mod indexed_member_event;
 
 #[path = "scheduling/variable_assign_delay.rs"]
 mod variable_assign_delay;
+#[path = "scheduling/settle_edges_before_nba.rs"]
+mod settle_edges_before_nba;
