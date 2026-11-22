@@ -591,3 +591,5 @@ mod clocking_overlapping_drives;
 mod frame_local_event_selects;
 #[path = "scheduling/clocking_select_drive_bits.rs"]
 mod clocking_select_drive_bits;
+#[path = "scheduling/fork_children_before_nba.rs"]
+mod fork_children_before_nba;
