@@ -1554,10 +1554,13 @@ impl Simulator {
             .map(|(i, t)| (shared(t), i))
             .filter(|&(keep, _)| keep > 0)
             .max_by_key(|&(keep, i)| (keep, i));
-        let fresh = || DeclParamTable {
-            table: std::rc::Rc::new(self.module.parameters.clone()),
-            applied: Vec::new(),
-            undo: Vec::new(),
+        let fresh = || {
+            self.count_decl_param_rows(self.module.parameters.len());
+            DeclParamTable {
+                table: std::rc::Rc::new(self.module.parameters.clone()),
+                applied: Vec::new(),
+                undo: Vec::new(),
+            }
         };
         let pick = if let Some((_, i)) = best {
             i
@@ -1577,6 +1580,7 @@ impl Simulator {
         // Nothing else holds `t.table` here, so this never copies it.
         let table = std::rc::Rc::make_mut(&mut t.table);
         if let Some(&(_, mark)) = t.applied.get(keep) {
+            self.count_decl_param_rows(t.undo.len() - mark);
             for (k, prev) in t.undo.drain(mark..).rev() {
                 match prev {
                     Some(v) => {
@@ -1591,6 +1595,7 @@ impl Simulator {
         }
         for (scope, group) in scopes[keep..].iter().zip(&groups[keep..]) {
             t.applied.push((scope.to_string(), t.undo.len()));
+            self.count_decl_param_rows(group.len());
             for (rest, v) in group.iter() {
                 let prev = table.insert(rest.clone(), v.clone());
                 t.undo.push((rest.clone(), prev));
@@ -1602,9 +1607,17 @@ impl Simulator {
         Some(handed)
     }
 
+    /// Add `rows` parameter-table rows to the `decl_param_rows` work count.
+    #[inline]
+    fn count_decl_param_rows(&self, rows: usize) {
+        self.decl_param_rows
+            .set(self.decl_param_rows.get().saturating_add(rows as u64));
+    }
+
     /// The parameters named `<scope>.<rest>` in the design-wide table, as
     /// `(rest, value)` in table order.
     fn decl_param_group(&self, scope: &str) -> std::rc::Rc<[(String, Value)]> {
+        self.count_decl_param_rows(self.module.parameters.len());
         self.module
             .parameters
             .iter()

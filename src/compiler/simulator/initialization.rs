@@ -4296,6 +4296,7 @@ impl Simulator {
             class_prop_struct_cache: std::cell::RefCell::new(HashMap::default()),
             class_packed_layout_cache: std::cell::RefCell::new(HashMap::default()),
             aggregate_type_work: Default::default(),
+            decl_param_rows: Default::default(),
             aggregate_type_generation: Default::default(),
             class_value_param_names: std::cell::RefCell::new(HashMap::default()),
             name_stats: Default::default(),

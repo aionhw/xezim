@@ -810,6 +810,10 @@ pub struct Simulator {
     class_packed_layout_cache: std::cell::RefCell<HashMap<usize, ClassPackedLayouts>>,
     #[serde(skip)]
     aggregate_type_work: [std::cell::Cell<u64>; 2],
+    /// Parameter-table rows `decl_param_scope` and its lookups have read or
+    /// copied (`Simulator::decl_param_rows`).
+    #[serde(skip)]
+    decl_param_rows: std::cell::Cell<u64>,
     #[serde(skip)]
     aggregate_type_generation: std::cell::Cell<u64>,
     /// Immutable class parameter names; values are always read from the object.
