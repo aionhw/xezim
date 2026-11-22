@@ -564,6 +564,8 @@ mod replication_pattern_capture;
 mod nettype_relay_chain_1239;
 #[path = "scheduling/time_literal_exact_1299.rs"]
 mod time_literal_exact_1299;
+#[path = "scheduling/for_init_hides_static.rs"]
+mod for_init_hides_static;
 #[path = "scheduling/intra_delay_array_items.rs"]
 mod intra_delay_array_items;
 #[path = "scheduling/review_intra_delay_array_items.rs"]
