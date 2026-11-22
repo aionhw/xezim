@@ -254,3 +254,37 @@ endmodule
         "missing `{want}` in {got:#?}"
     );
 }
+
+/// §7.4.6, §11.5.1: a write through an index outside the declared range
+/// changes no element. The compiled path read a 64-bit literal index at its
+/// low 32 bits, so `st.e[64'h1_0000_0001]` wrote `e[1]`.
+#[test]
+fn a_wide_constant_index_writes_no_element() {
+    let src = r#"
+module top;
+  typedef struct packed { logic [7:0] value; } dw_t;
+  typedef struct packed { dw_t [1:0] dw; } e_t;
+  typedef struct packed { e_t [1:0] e; } st_t;
+  st_t st;
+  logic clk = 0;
+  logic [7:0] d = 8'h5a;
+  always @(posedge clk) begin
+    st.e[64'h1_0000_0001].dw[0].value <= d;
+  end
+  initial begin
+    st = '0;
+    #1 clk = 1;
+    #1 $display("R st=%h", st);
+    $finish;
+  end
+endmodule
+"#;
+    let sim = xezim::simulate(src, 100).expect("simulate");
+    let lines: Vec<_> = sim
+        .output
+        .iter()
+        .map(|l| l.message.as_str())
+        .filter(|l| l.starts_with("R "))
+        .collect();
+    assert_eq!(lines, ["R st=00000000"]);
+}
