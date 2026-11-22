@@ -387,6 +387,8 @@ mod review_queue_of_queues_push_1086;
 mod assoc_struct_delete_1124;
 #[path = "collections/review_typedef_row_class_properties_216.rs"]
 mod review_typedef_row_class_properties_216;
+#[path = "collections/queue_of_fixed_rows_dollar_foreach.rs"]
+mod queue_of_fixed_rows_dollar_foreach;
 
 #[path = "collections/dyn_array_of_dyn_array_rows.rs"]
 mod dyn_array_of_dyn_array_rows;
