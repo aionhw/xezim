@@ -643,6 +643,57 @@ impl Simulator {
         }
         Some(acc)
     }
+    /// §11.4.5, §16.9.3: a fixed-size unpacked array against `$past` or
+    /// `$sampled` of a whole one (`mem == $past(mem)`). The call's value is
+    /// the concatenation of the cells, the left bound's first
+    /// (`whole_array_cells`), compared with the array's elements in order.
+    /// `None` for any other pair.
+    fn compare_fixed_array_sampled(
+        &mut self,
+        left: &Expression,
+        right: &Expression,
+        mode: PatternCmpMode,
+    ) -> Option<PatCmp> {
+        let sampled = |me: &Self, e: &Expression| match &e.kind {
+            ExprKind::SystemCall { name, args }
+                if matches!(name.as_str(), "$past" | "$sampled") =>
+            {
+                args.first()
+                    .and_then(|a| me.whole_array_cells(a))
+                    .map(|(_, ids)| ids.len())
+            }
+            _ => None,
+        };
+        // The call's side, kept for `==?`/`!=?`: only the right operand's
+        // unknown bits are wildcards.
+        let (arr, call, n, call_left) = match (sampled(self, left), sampled(self, right)) {
+            (_, Some(n)) => (left, right, n, false),
+            (Some(n), None) => (right, left, n, true),
+            (None, None) => return None,
+        };
+        let (name, lo, hi) = self.fixed_array_operand(arr)?;
+        let ew = self.coll_elem_width(&name)?;
+        if ew == 0 || (hi - lo + 1) as usize != n {
+            return (ew != 0).then_some(PatCmp::Unequal);
+        }
+        let v = self.eval_expr(call);
+        let desc = self.module.descending_arrays.contains(&name);
+        let mut acc = PatCmp::Equal;
+        for k in 0..n {
+            let idx = if desc { hi - k as i64 } else { lo + k as i64 };
+            let a = self
+                .get_signal_value_by_name(&format!("{name}[{idx}]"))
+                .unwrap_or_else(|| Value::new(ew));
+            let low = (n - 1 - k) * ew as usize;
+            let b = v.range_select(low + ew as usize - 1, low);
+            let (l, r) = if call_left { (&b, &a) } else { (&a, &b) };
+            acc = acc.and(Self::coll_elem_cmp(l, r, Some(ew), mode));
+            if acc == PatCmp::Unequal {
+                break;
+            }
+        }
+        Some(acc)
+    }
 
     /// The element-wise comparison of two unpacked arrays — fixed,
     /// multi-dimensional, associative, dynamic or queue — under `mode`;
@@ -657,6 +708,9 @@ impl Simulator {
             return Some(c);
         }
         if let Some(c) = self.compare_fixed_arrays(left, right, mode) {
+            return Some(c);
+        }
+        if let Some(c) = self.compare_fixed_array_sampled(left, right, mode) {
             return Some(c);
         }
         if let Some(c) = self.compare_assoc_arrays(left, right, mode) {
