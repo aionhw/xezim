@@ -851,6 +851,9 @@ impl Simulator {
                 }
             }
         }
+        // The watch's operand: a whole array's is the concatenation of its
+        // cells, read the same way off the clock's tick.
+        let operand = self.sampled_watches[widx].expr.clone();
         Some(self.sampled_cur_and_past(widx, &operand, n))
     }
 
@@ -1665,6 +1668,56 @@ impl Simulator {
             }
         }
     }
+    /// §16.9.3: the operand of `$past`, `$stable` or `$changed` may be a
+    /// whole fixed-size unpacked array (`$stable(mem)`), whose name is no
+    /// signal. Its sampled value is the concatenation of its cells, the left
+    /// bound's first, with their signal ids. `None` for any other operand,
+    /// and for an array of the packed arena or with a negative bound.
+    pub(super) fn whole_array_cells(&self, e: &Expression) -> Option<(Expression, Vec<usize>)> {
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let name = self.resolve_hier_name(h);
+        let &(first, lo, hi) = self.array_first_id.get(name.as_ref())?;
+        if is_packed_id(first) || lo < 0 || hi < lo {
+            return None;
+        }
+        let desc = self.module.descending_arrays.contains(name.as_ref());
+        let order: Vec<i64> = if desc {
+            (lo..=hi).rev().collect()
+        } else {
+            (lo..=hi).collect()
+        };
+        let cells = order
+            .iter()
+            .map(|&i| {
+                let index = Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: None,
+                        signed: false,
+                        base: NumberBase::Decimal,
+                        value: i.to_string(),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
+                    }),
+                    e.span,
+                );
+                Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(e.clone()),
+                        index: Box::new(index),
+                    },
+                    e.span,
+                )
+            })
+            .collect();
+        let ids = (first..=first + (hi - lo) as usize)
+            .filter(|&id| id < self.signal_table.len())
+            .collect();
+        Some((Expression::new(ExprKind::Concatenation(cells), e.span), ids))
+    }
 
     /// Get-or-create the sampled watch for a call site. Registers the clock
     /// (and a simple-signal operand) into `edge_signal_ids` so the snapshot
@@ -1689,6 +1742,8 @@ impl Simulator {
             }
             return Some(i);
         }
+        let cells = self.whole_array_cells(operand);
+        let operand = cells.as_ref().map_or(operand, |(e, _)| e);
         let edge = match edge_code {
             1 => EdgeKind::Posedge,
             2 => EdgeKind::Negedge,
@@ -1741,6 +1796,7 @@ impl Simulator {
                 None => {
                     let mut ids = Vec::new();
                     self.collect_sva_signal_ids(operand, &mut ids);
+                    ids.extend(cells.iter().flat_map(|(_, c)| c.iter().copied()));
                     if !self.time0_settled {
                         for &id in &ids {
                             if !self.sampled_defaults.contains_key(&id)
@@ -1789,6 +1845,7 @@ impl Simulator {
         });
         let mut sample_ids = Vec::new();
         self.collect_sva_signal_ids(operand, &mut sample_ids);
+        sample_ids.extend(cells.iter().flat_map(|(_, c)| c.iter().copied()));
         self.add_sampled_watch_ids(i, &sample_ids);
         let scope = self.sampled_scope();
         self.sampled_watch_site

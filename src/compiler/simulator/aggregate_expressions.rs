@@ -5833,10 +5833,15 @@ impl Simulator {
             // live values. Signals with no snapshot fall back to live.
             "$sampled" => {
                 let a = args.first().cloned();
+                // A whole unpacked array is all its cells, as for `$past`
+                // (`whole_array_cells`).
+                let cells = a.as_ref().and_then(|e| self.whole_array_cells(e));
+                let a = cells.as_ref().map(|(e, _)| e.clone()).or(a);
                 match a {
                     Some(e) => {
                         let mut ids = Vec::new();
                         self.collect_sva_signal_ids(&e, &mut ids);
+                        ids.extend(cells.iter().flat_map(|(_, c)| c.iter().copied()));
                         ids.sort_unstable();
                         ids.dedup();
                         let index_saved = self.install_preponed(&ids);
