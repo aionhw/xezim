@@ -8,6 +8,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+**Performance**
+
+- Experimental `XEZIM_ARMED_EDGE_MASKS=1` lets a write to a shared bus
+  skip arming clocked blocks that only read unaffected slices.
+
 ### 0.11.7 — lower elaboration memory, faster event waits and queues, DPI C sources and memory files, array and real-number correctness (November 2026)
 
 Large designs elaborate in much less memory: compilation-unit declarations,

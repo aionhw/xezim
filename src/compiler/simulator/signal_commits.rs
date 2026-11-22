@@ -133,7 +133,7 @@ impl Simulator {
         self.table_modified = true;
         let plan = self.signal_commit_plan.get(id).copied().unwrap_or(3);
         if armed_active && plan & 2 != 0 {
-            self.note_armed_write(id);
+            self.note_armed_write_masked(id, 1);
         }
         if edge_active && plan & 1 != 0 {
             self.note_edge_write(id);
@@ -201,7 +201,7 @@ impl Simulator {
         }
         self.table_modified = true;
         if obs & 1 != 0 {
-            self.note_armed_write(id);
+            self.note_armed_write_masked(id, m);
         }
         if obs & 2 != 0 {
             self.note_edge_write(id);
@@ -239,7 +239,7 @@ impl Simulator {
             self.table_modified = true;
             // sync_mirror just refreshed the mirror — skip the repack
             // `after_signal_write` would redo (367M commits/run on c906).
-            self.after_signal_write_premirrored(id);
+            self.after_signal_write_premirrored_masked(id, self.bit_chg_mask(dst.sig_id, dst.bit));
             true
         } else {
             false
@@ -585,21 +585,76 @@ impl Simulator {
 
     #[inline(always)]
     pub(super) fn note_armed_write(&mut self, id: usize) {
-        if !self.armed_edge || !self.armed_input_set(id) {
-            return;
-        }
-        let (lo, hi) = self.armed_input_ranges[id];
-        if let Some(c) = self.arm_census.as_mut() {
+        self.note_armed_write_masked(id, u64::MAX);
+    }
+
+    #[inline(always)]
+    fn note_armed_write_masked(&mut self, id: usize, changed: u64) {
+        if self.arm_census.is_some()
+            && self.armed_edge
+            && self.armed_input_set(id)
+            && let Some(c) = &mut self.arm_census
+        {
+            let (lo, hi, _) = self.armed_input_ranges[id];
             if c.len() <= id {
                 c.resize(id + 1, (0, 0));
             }
             c[id].0 += 1;
             c[id].1 += (hi - lo) as u64;
         }
-        for k in lo as usize..hi as usize {
-            let bi = self.armed_input_blocks[k] as usize;
-            self.edge_block_armed[bi] |= EDGE_ARMED;
+        arm_edge_readers!(self, id, changed);
+    }
+
+    #[inline]
+    pub(super) fn arm_masked_edge_readers(
+        armed: &mut [u8],
+        blocks: &[u32],
+        masks: &[u64],
+        changed: u64,
+    ) {
+        for (&bi, &mask) in blocks.iter().zip(masks) {
+            if mask & changed != 0 {
+                armed[bi as usize] |= EDGE_ARMED;
+            }
         }
+    }
+
+    /// Change mask in the same bit/chunk coordinates as `sig_span_mask`.
+    /// Both planes contribute, so a transition such as 0 -> X or X -> Z
+    /// arms a reader even if one of the two planes is unchanged.
+    #[inline(always)]
+    pub(super) fn edge_input_delta(old: &Value, new: &Value) -> u64 {
+        if old.width != new.width
+            || old.is_real
+            || new.is_real
+            || old.is_signed != new.is_signed
+            || old.is_fill
+            || new.is_fill
+        {
+            return u64::MAX;
+        }
+        if old.width <= 64
+            && let (Some((ov, ox)), Some((nv, nx))) = (old.inline_planes(), new.inline_planes())
+        {
+            let changed = (ov ^ nv) | (ox ^ nx);
+            return if changed == 0 { u64::MAX } else { changed };
+        }
+        Self::wide_edge_input_delta(old, new)
+    }
+
+    fn wide_edge_input_delta(old: &Value, new: &Value) -> u64 {
+        if !(65..=128).contains(&old.width) {
+            return u64::MAX;
+        }
+        let (ov, ox) = old.bits128();
+        let (nv, nx) = new.bits128();
+        let changed = (ov ^ nv) | (ox ^ nx);
+        if changed == 0 {
+            return u64::MAX;
+        }
+        let lo = changed.trailing_zeros();
+        let hi = 127 - changed.leading_zeros();
+        super::bytecode::sig_span_mask(old.width, lo, hi - lo + 1)
     }
 
     /// Canonical post-write hook for in-place `signal_table[id]` mutations.
@@ -1084,7 +1139,7 @@ impl Simulator {
 
     #[inline(always)]
     pub(super) fn after_signal_write(&mut self, id: usize) {
-        self.after_signal_write_inner(id, false)
+        self.after_signal_write_inner(id, false, u64::MAX)
     }
 
     /// `after_signal_write` for callers that have ALREADY refreshed the
@@ -1092,11 +1147,18 @@ impl Simulator {
     /// (a 64-LogicBit walk on every wide signal).
     #[inline(always)]
     pub(super) fn after_signal_write_premirrored(&mut self, id: usize) {
-        self.after_signal_write_inner(id, true)
+        self.after_signal_write_inner(id, true, u64::MAX)
+    }
+
+    /// The caller has retained the changed bits or a conservative span of
+    /// them, and already refreshed the inline value mirror.
+    #[inline(always)]
+    pub(super) fn after_signal_write_premirrored_masked(&mut self, id: usize, changed: u64) {
+        self.after_signal_write_inner(id, true, changed)
     }
 
     #[inline(always)]
-    pub(super) fn after_signal_write_inner(&mut self, id: usize, premirrored: bool) {
+    fn after_signal_write_inner(&mut self, id: usize, premirrored: bool, changed: u64) {
         if id >= self.signal_table.len() {
             return;
         }
@@ -1138,16 +1200,17 @@ impl Simulator {
             }
             (edge, armed)
         };
-        self.after_signal_write_observed(id, premirrored, edge_sidecar, armed_sidecar);
+        self.after_signal_write_observed(id, premirrored, edge_sidecar, armed_sidecar, changed);
     }
 
     #[inline]
-    pub(super) fn after_signal_write_observed(
+    fn after_signal_write_observed(
         &mut self,
         id: usize,
         premirrored: bool,
         edge_sidecar: bool,
         armed_sidecar: bool,
+        changed: u64,
     ) {
         // XEZIM_VALUE_TRACE: this hook covers the write paths that mutate
         // signal_table in place (bit/part-select, inline-bits, parallel-NBA
@@ -1167,7 +1230,7 @@ impl Simulator {
             }
         }
         if armed_sidecar {
-            self.note_armed_write(id);
+            self.note_armed_write_masked(id, changed);
         }
         if edge_sidecar {
             self.note_edge_write(id);
@@ -1855,49 +1918,78 @@ impl Simulator {
         self.armed_input_bitmap.clear();
         self.armed_input_ranges.clear();
         self.armed_input_blocks.clear();
+        self.armed_input_masks.clear();
         self.edge_block_armed.clear();
         if !self.armed_edge || !self.event_skip {
             return;
         }
 
+        let masks_enabled = std::env::var("XEZIM_ARMED_EDGE_MASKS").as_deref() == Ok("1");
         let nb = self.edge_block_gateable.len();
-        let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(self.edge_block_reads_flat.len());
+        let mut readers = Vec::with_capacity(self.edge_block_reads_flat.len());
         for bi in 0..nb {
             if !self.edge_block_gateable[bi] {
                 continue;
             }
             let lo = self.edge_block_off[bi] as usize;
             let hi = self.edge_block_off[bi + 1] as usize;
-            for &sid in &self.edge_block_reads_flat[lo..hi] {
-                pairs.push((sid, bi as u32));
+            let maskable = masks_enabled
+                && self.compiled_edge_blocks[bi].as_ref().is_some_and(|cb| {
+                    !cb.instructions
+                        .iter()
+                        .any(super::bytecode::BytecodeCompiler::is_opaque_insn)
+                });
+            for k in lo..hi {
+                let sid = self.edge_block_reads_flat[k];
+                let mask = if maskable {
+                    let (lo, width) = self.edge_block_reads_meta[k];
+                    self.edge_input_read_mask(sid as usize, u32::from(lo), u32::from(width))
+                } else {
+                    u64::MAX
+                };
+                readers.push((sid, bi as u32, mask));
             }
             if let Some(extra) = arm_extra.get(bi) {
                 for &eid in extra {
-                    pairs.push((eid, bi as u32));
+                    readers.push((eid, bi as u32, u64::MAX));
                 }
             }
         }
-        pairs.sort_unstable();
-        pairs.dedup();
+        readers.sort_unstable_by_key(|&(sid, bi, _)| (sid, bi));
+        // One block may read multiple disjoint slices of the same signal.
+        readers.dedup_by(|later, first| {
+            if (later.0, later.1) == (first.0, first.1) {
+                first.2 |= later.2;
+                true
+            } else {
+                false
+            }
+        });
 
-        let bitmap_len = pairs.last().map_or(0, |(sid, _)| *sid as usize + 1);
+        let bitmap_len = readers.last().map_or(0, |&(sid, _, _)| sid as usize + 1);
         self.armed_input_bitmap = vec![0u64; bitmap_len.div_ceil(64)];
         self.quiet_valid = false;
         self.gate_lane_valid = false;
-        self.armed_input_ranges = vec![(0, 0); bitmap_len];
-        self.armed_input_blocks.reserve(pairs.len());
-        let mut cursor = 0usize;
+        self.armed_input_ranges = vec![(0, 0, u32::MAX); bitmap_len];
+        self.armed_input_blocks.reserve(readers.len());
         let mut input_count = 0usize;
-        while cursor < pairs.len() {
-            let sid = pairs[cursor].0;
+        let mut masked_inputs = 0usize;
+        for fanout in readers.chunk_by(|a, b| a.0 == b.0) {
+            let sid = fanout[0].0;
             let lo = self.armed_input_blocks.len() as u32;
-            while cursor < pairs.len() && pairs[cursor].0 == sid {
-                self.armed_input_blocks.push(pairs[cursor].1);
-                cursor += 1;
-            }
+            self.armed_input_blocks.extend(fanout.iter().map(|&(_, bi, _)| bi));
             let hi = self.armed_input_blocks.len() as u32;
+            let mask_base = if fanout.len() > 1 && fanout.iter().any(|&(_, _, m)| m != u64::MAX) {
+                let base = self.armed_input_masks.len() as u32;
+                self.armed_input_masks
+                    .extend(fanout.iter().map(|&(_, _, m)| m));
+                masked_inputs += 1;
+                base
+            } else {
+                u32::MAX
+            };
             self.armed_input_bitmap[(sid as usize) >> 6] |= 1u64 << (sid & 63);
-            self.armed_input_ranges[sid as usize] = (lo, hi);
+            self.armed_input_ranges[sid as usize] = (lo, hi, mask_base);
             input_count += 1;
         }
         self.edge_block_armed = self
@@ -1924,6 +2016,21 @@ impl Simulator {
                 ""
             }
         );
+        if masks_enabled {
+            chatter!("[EVENT-EDGE] bit-selective arm fanouts={masked_inputs}");
+        }
+    }
+
+    fn edge_input_read_mask(&self, id: usize, lo: u32, count: u32) -> u64 {
+        let width = self.signal_widths[id];
+        if count == 0
+            || count >= width
+            || lo.saturating_add(count) > width
+            || self.signal_table[id].is_real
+        {
+            return u64::MAX;
+        }
+        super::bytecode::sig_span_mask(width, lo, count)
     }
 
     /// JIT-redesign Stage 1 invariant: walk every sid where

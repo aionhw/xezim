@@ -40,6 +40,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Edge engine: force ARMED edge-detection mode on/off (0/1)",
     ),
     (
+        "XEZIM_ARMED_EDGE_MASKS",
+        "Edge engine: arm clocked blocks by the four-state bits their operands read (1 enables)",
+    ),
+    (
         "XEZIM_ARMED_EDGE_SHADOW",
         "Edge engine: run ARMED mode in shadow-compare mode against the scan path",
     ),

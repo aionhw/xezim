@@ -1767,7 +1767,8 @@ impl Simulator {
         } else {
             ((1u64 << width) - 1) << dst.lo
         };
-        if (base_v ^ new_v) & mask == 0 && (base_x ^ new_x) & mask == 0 {
+        let changed = ((base_v ^ new_v) | (base_x ^ new_x)) & mask;
+        if changed == 0 {
             return false;
         }
         // §10.6.2: a forced net keeps its forced value against its gate driver.
@@ -1785,7 +1786,7 @@ impl Simulator {
         self.signal_table[id].is_signed = self.signal_signed[id];
         self.sync_mirror(id);
         self.table_modified = true;
-        self.after_signal_write_premirrored(id);
+        self.after_signal_write_premirrored_masked(id, changed);
         true
     }
 }

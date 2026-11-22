@@ -2732,17 +2732,17 @@ impl Simulator {
             return;
         }
         self.sync_mirror(id);
+        // Chunked by the declared width, as the readers' masks are.
+        let changed = self.span_chg_mask(id as u32, lo, n as u32);
         if self.ts_direct_writes {
-            // Chunked by the declared width, as the readers' masks are.
-            let m = super::bytecode::sig_span_mask(self.signal_widths[id], lo, n as u32);
-            self.ts_direct_dirty(id, m);
+            self.ts_direct_dirty(id, changed);
         } else if !self.dirty_signals[id] {
             self.dirty_signals[id] = true;
             self.dirty_list.push(id);
             self.dirty_any = true;
         }
         self.table_modified = true;
-        self.after_signal_write(id);
+        self.after_signal_write_premirrored_masked(id, changed);
     }
 
     /// `ts_range_store` with an explicit x/z plane, for a folded 4-state
@@ -2776,7 +2776,7 @@ impl Simulator {
             self.dirty_any = true;
         }
         self.table_modified = true;
-        self.after_signal_write(id);
+        self.after_signal_write_premirrored_masked(id, chg);
     }
 
     /// Whole-signal blocking store of a folded 4-state constant. Mirrors
@@ -2803,7 +2803,7 @@ impl Simulator {
             self.dirty_any = true;
         }
         self.table_modified = true;
-        self.after_signal_write(id);
+        self.after_signal_write_premirrored_masked(id, chg);
     }
 
     // The in-place (`set_inline_bits`) stores above and below keep the
@@ -2965,7 +2965,8 @@ impl Simulator {
         let entry: &mut Value = unsafe { self.signal_table.get_unchecked_mut(id) };
         let (dv, dx) = entry.raw_bits();
         if v != (dv & mask) || (dx & mask) != 0 {
-            let mut chg = ((v ^ dv) | dx) & mask;
+            let mut changed = (v ^ dv) | dx;
+            let mut chg = changed & mask;
             if entry.set_inline_bits(v, 0) {
                 self.sync_mirror(id);
             } else {
@@ -2974,6 +2975,7 @@ impl Simulator {
                 self.signal_table[id] = val;
                 self.sync_mirror(id);
                 chg = u64::MAX;
+                changed = u64::MAX;
             }
             if self.ts_direct_writes {
                 self.ts_direct_dirty(id, chg);
@@ -2983,7 +2985,7 @@ impl Simulator {
                 self.dirty_any = true;
             }
             self.table_modified = true;
-            self.after_signal_write(id);
+            self.after_signal_write_premirrored_masked(id, changed);
         }
     }
 

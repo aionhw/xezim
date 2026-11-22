@@ -5268,6 +5268,7 @@ impl Simulator {
             armed_input_bitmap: Vec::new(),
             armed_input_ranges: Vec::new(),
             armed_input_blocks: Vec::new(),
+            armed_input_masks: Vec::new(),
             edge_block_armed: Vec::new(),
             edge_block_retired: Vec::new(),
             armed_fast_skips: 0,

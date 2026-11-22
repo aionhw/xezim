@@ -3550,6 +3550,7 @@ impl Simulator {
         if id < self.signal_inline_bits.len() {
             self.signal_inline_bits[id] = [v, x];
         }
+        arm_edge_readers!(self, id, self.span_chg_mask(id as u32, lo as u32, piece.width));
         write_sig_done!(self, id, true);
         self.table_modified = true;
         Some(true)

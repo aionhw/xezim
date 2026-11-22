@@ -1041,11 +1041,40 @@ macro_rules! vcd_mark {
     }};
 }
 
+/// Arm the clocked readers of a stored signal. The change mask is evaluated
+/// only for a signal with a bit-selective fanout. Keep the field borrows
+/// disjoint for writes made inside loops over other simulator fields.
+macro_rules! arm_edge_readers {
+    ($self:ident, $id:expr_2021, $change:expr_2021) => {{
+        let arm_id = $id;
+        if $self.armed_edge
+            && (arm_id >> 6) < $self.armed_input_bitmap.len()
+            && ($self.armed_input_bitmap[arm_id >> 6] >> (arm_id & 63)) & 1 != 0
+        {
+            let (lo, hi, mask_base) = $self.armed_input_ranges[arm_id];
+            if mask_base == u32::MAX {
+                for k in lo as usize..hi as usize {
+                    let bi = $self.armed_input_blocks[k] as usize;
+                    $self.edge_block_armed[bi] |= EDGE_ARMED;
+                }
+            } else {
+                let changed = $change;
+                let blocks = &$self.armed_input_blocks[lo as usize..hi as usize];
+                let base = mask_base as usize;
+                $crate::compiler::simulator::Simulator::arm_masked_edge_readers(
+                    &mut $self.edge_block_armed,
+                    blocks,
+                    &$self.armed_input_masks[base..base + blocks.len()],
+                    changed,
+                );
+            }
+        }
+    }};
+}
+
 /// The bookkeeping of a completed store into `signal_table[id]` (`changed`:
-/// whether the stored value differs from the one it replaced): what
-/// `write_sig!` does once the new value is in the table. A store that edits
-/// the table value in place ends with this, so it leaves the same marks as a
-/// whole-value `write_sig!`.
+/// whether the stored value differs from the one it replaced). Clocked
+/// readers are armed separately so a whole-value write can use the old value.
 macro_rules! write_sig_done {
     ($self:ident, $id:expr_2021, $changed:expr_2021) => {{
         let __wsig_id = $id;
@@ -1069,19 +1098,6 @@ macro_rules! write_sig_done {
         // O1 measurement: stamp the signal's last-change phase.
         if $self.event_measure && !$self.armed_edge && __wsig_id < $self.sig_last_change.len() {
             $self.sig_last_change[__wsig_id] = $self.event_phase;
-        }
-        // Arm only gateable edge blocks that actually read this signal.
-        // The dense bitmap keeps unrelated writes a single cheap branch;
-        // positive hits use the sparse CSR fanout built after compile.
-        if $self.armed_edge
-            && ((__wsig_id >> 6) < $self.armed_input_bitmap.len())
-            && ($self.armed_input_bitmap[__wsig_id >> 6] >> (__wsig_id & 63)) & 1 != 0
-        {
-            let (lo, hi) = $self.armed_input_ranges[__wsig_id];
-            for __k in lo as usize..hi as usize {
-                let __bi = $self.armed_input_blocks[__k] as usize;
-                $self.edge_block_armed[__bi] |= EDGE_ARMED;
-            }
         }
         // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
         // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
@@ -1221,6 +1237,14 @@ macro_rules! write_sig {
                     ));
                 }
             }
+            arm_edge_readers!(
+                $self,
+                __wsig_id,
+                $crate::compiler::simulator::Simulator::edge_input_delta(
+                    &$self.signal_table[__wsig_id],
+                    &__wsig_val,
+                )
+            );
             $self.signal_table[__wsig_id] = __wsig_val;
             write_sig_done!($self, __wsig_id, __wsig_changed);
         }
@@ -11151,8 +11175,11 @@ pub struct Simulator {
     /// edge block? A bitset keeps the whole table cache-resident where one
     /// byte per signal (1.4 MB with array elements) did not.
     armed_input_bitmap: Vec<u64>,
-    armed_input_ranges: Vec<(u32, u32)>,
+    /// Start/end in armed_input_blocks and start in armed_input_masks
+    /// (u32::MAX for a fanout that arms every reader).
+    armed_input_ranges: Vec<(u32, u32, u32)>,
     armed_input_blocks: Vec<u32>,
+    armed_input_masks: Vec<u64>,
     edge_block_armed: Vec<u8>,
     /// Edge blocks whose work was folded into a merged block: their
     /// sensitivities are cleared, so they never fire again. The skip census

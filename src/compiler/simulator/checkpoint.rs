@@ -47,7 +47,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // §9.2.2.2: Simulator::comb_time0_held, CombEntryCold::time0_effects.
 // §16.4.2: DeferredReport::stat_key, ::stat_kind and ::stat_loc, counted when the report matures.
 // §19.5: covergroup instances retain the real-valued coverpoint set.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x21";
+// Arm fanouts may retain the bit masks of their clocked readers.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x22";
 
 #[derive(Default)]
 struct Session {
@@ -1202,6 +1203,7 @@ checkpoint_state!(
     armed_fast_skips,
     armed_input_bitmap,
     armed_input_blocks,
+    armed_input_masks,
     armed_input_ranges,
     array_elem_ids,
     array_local_packed_dims,
