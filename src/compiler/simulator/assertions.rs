@@ -2429,9 +2429,21 @@ impl Simulator {
                 sub(left);
                 sub(right);
             }
-            ExprKind::Concatenation(v)
-            | ExprKind::SystemCall { args: v, .. }
-            | ExprKind::Call { args: v, .. } => v.iter().for_each(&mut sub),
+            ExprKind::Concatenation(v) | ExprKind::SystemCall { args: v, .. } => {
+                v.iter().for_each(&mut sub)
+            }
+            // §7.12: an array method (`m.sum()`, `m.and()`, `m[1].min()`)
+            // reads the cells of its receiver.
+            ExprKind::Call { func, args } => {
+                if let Some(recv) = Self::sva_method_receiver(func) {
+                    sub(&recv);
+                }
+                args.iter().for_each(&mut sub);
+            }
+            ExprKind::WithClause { expr, filter } => {
+                sub(expr);
+                sub(filter);
+            }
             ExprKind::Replication { count, exprs } => {
                 sub(count);
                 exprs.iter().for_each(&mut sub);
@@ -2449,6 +2461,47 @@ impl Simulator {
             ExprKind::AssignmentPattern(items) => items.iter().for_each(|it| sub(it.expr())),
             ExprKind::TypedPattern { pattern, .. } => sub(pattern),
             _ => {}
+        }
+    }
+
+    /// The receiver of method call `func` (`m` of `m.sum()`, `m[1]` of
+    /// `m[1].min()`) as an expression `collect_sva_sels` can take: a select
+    /// chain over the array's name. `None` when `func` names no receiver.
+    fn sva_method_receiver(func: &Expression) -> Option<Expression> {
+        match &func.kind {
+            ExprKind::MemberAccess { expr, .. } => Some((**expr).clone()),
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let segs = &h.path[..h.path.len() - 1];
+                // Selects are allowed on the receiver's own segment only.
+                if segs[..segs.len() - 1].iter().any(|s| !s.selects.is_empty()) {
+                    return None;
+                }
+                let mut path = segs.to_vec();
+                let selects = std::mem::take(&mut path.last_mut()?.selects);
+                let base = HierarchicalIdentifier {
+                    root: h.root.clone(),
+                    path,
+                    span: h.span,
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
+                };
+                let mut cur = Expression::new(ExprKind::Ident(base), func.span);
+                for sel in selects {
+                    if matches!(sel.kind, ExprKind::Range(..)) {
+                        return None;
+                    }
+                    cur = Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(cur),
+                            index: Box::new(sel),
+                        },
+                        func.span,
+                    );
+                }
+                Some(cur)
+            }
+            _ => None,
         }
     }
 
@@ -2561,7 +2614,45 @@ impl Simulator {
         if let Some(id) = self.resolve_signal_id(&name) {
             out.push(id);
         }
+        // A row of a multi-dimensional array (`m2[1] == m`, the receiver of
+        // `m2[1].sum()`) reads each of its cells.
+        if !self.module.arrays_2d.is_empty() || !self.module.arrays_nd.is_empty() {
+            out.extend(self.sva_row_cells(&name));
+        }
         Some(name)
+    }
+
+    /// The signal ids of the cells of row `row` (`m2[1]`, `m3[0][1]`) of a
+    /// fixed-size multi-dimensional unpacked array, in no particular order.
+    /// Empty for any other name.
+    fn sva_row_cells(&self, row: &str) -> Vec<usize> {
+        let Some((root, rest)) = row.split_once('[') else {
+            return Vec::new();
+        };
+        if !rest.ends_with(']') || rest.contains('.') {
+            return Vec::new();
+        }
+        if !self.module.arrays_2d.contains_key(root) && !self.module.arrays_nd.contains_key(root) {
+            return Vec::new();
+        }
+        let Some(dims) = self.module.unpacked_decl_dims.get(root) else {
+            return Vec::new();
+        };
+        let fixed = rest.matches('[').count() + 1;
+        if fixed >= dims.len() {
+            return Vec::new();
+        }
+        let mut names = vec![row.to_string()];
+        for &(l, r) in &dims[fixed..] {
+            names = names
+                .iter()
+                .flat_map(|n| (l.min(r)..=l.max(r)).map(move |i| Self::name_with_index(n, i)))
+                .collect();
+        }
+        names
+            .iter()
+            .filter_map(|n| self.resolve_signal_id(n))
+            .collect()
     }
 
     /// The index range of the unpacked array or sub-array `base` (`a`, or
