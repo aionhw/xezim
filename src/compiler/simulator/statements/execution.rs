@@ -902,6 +902,7 @@ impl Simulator {
                 // signal table, so a fork in the body captures the
                 // per-iteration value from the frame copy that
                 // inherit_fork_child_context gives each child (LRM §9.3.2).
+                let mut hidden_statics = None;
                 for fi in init {
                     match fi {
                         ForInit::VarDecl {
@@ -923,6 +924,7 @@ impl Simulator {
                             } else {
                                 self.set_signal_value_by_name(&name.name, rv);
                             }
+                            self.hide_loop_static(&name.name, &mut hidden_statics);
                         }
                         ForInit::Assign { lvalue, rvalue } => {
                             let v = self.eval_expr(rvalue);
@@ -1001,6 +1003,7 @@ impl Simulator {
                 if shadow_frame {
                     self.pop_loop_frame();
                 }
+                self.unhide_statics(hidden_statics);
                 self.restore_loop_vars(&fv_saved);
                 // class-perf loop-heat boost (pass C): one call per loop exit.
                 self.record_ast_loop_heat(iters);
