@@ -99,6 +99,8 @@ mod decl_init_time_literal_scaling;
 mod assertion_control;
 #[path = "scheduling/deferred_immediate_assertions.rs"]
 mod deferred_immediate_assertions;
+#[path = "scheduling/procedural_assert_after_delay.rs"]
+mod procedural_assert_after_delay;
 #[path = "scheduling/delay_lands_on_clock_edge.rs"]
 mod delay_lands_on_clock_edge;
 #[path = "scheduling/delay_spike_warning.rs"]
