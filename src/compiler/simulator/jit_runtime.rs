@@ -759,6 +759,12 @@ impl Simulator {
             ExprKind::Index { .. }
             | ExprKind::RangeSelect { .. }
             | ExprKind::MemberAccess { .. } => {
+                // §11.4.2: a member read through a side-effect select is sized
+                // by a copy that runs none (`member_read_width_probe`).
+                if Self::is_effect_member_read(expr) {
+                    let probe = self.member_read_width_probe(expr);
+                    return self.lrm_self_width(&probe);
+                }
                 if let Some(w) = self.select_width(expr) {
                     return Some(w);
                 }
@@ -1601,6 +1607,13 @@ impl Simulator {
             // A streaming concatenation pads to the CONTEXT width on the
             // right; a value taken here would be extended on the left.
             ExprKind::StreamOp { .. } => false,
+            // §11.4.2: a member read through a side-effect select is sized
+            // without evaluating it, and then evaluated in its operand order:
+            // taken here, `objs[i++].v * 10 + objs[i++].v` read its right
+            // operand first.
+            ExprKind::Index { .. }
+            | ExprKind::RangeSelect { .. }
+            | ExprKind::MemberAccess { .. } => !Self::is_effect_member_read(expr),
             _ => true,
         };
         if evaluates {
@@ -1796,6 +1809,16 @@ impl Simulator {
                 } else {
                     (self.eval_expr(expr).width, false)
                 }
+            }
+            // §11.4.2: a member read through a side-effect select is sized by
+            // a copy that runs none (`member_read_width_probe`).
+            ExprKind::Index { .. }
+            | ExprKind::RangeSelect { .. }
+            | ExprKind::MemberAccess { .. }
+                if Self::is_effect_member_read(expr) =>
+            {
+                let probe = self.member_read_width_probe(expr);
+                (self.infer_width_walk(&probe).0, false)
             }
             // §11.5.1, §11.6.1: a select of a vector is as wide as the select
             // says, never as its value. Sized by evaluating it, a select kept

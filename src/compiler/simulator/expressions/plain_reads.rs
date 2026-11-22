@@ -522,6 +522,207 @@ impl Simulator {
         })
     }
 
+    /// Whether the member/select chain `e` reads a member (`objs[k].v`,
+    /// `objs[k].arr[j]`), not only selects of a variable.
+    fn chain_reads_member(e: &Expression) -> bool {
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { .. } => return true,
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::Paren(expr) => cur = expr,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether `e` reads a member through a select whose index has a side
+    /// effect (`objs[i++].v`, `qs[next()].a`, `objs[i++].arr[j++]`), in a
+    /// chain not rooted at a call. A call-rooted chain (`f().objs[i++].v`)
+    /// keeps its own path: its statement may hold the call's value by node
+    /// (`recv_call_memo`), which a copy of the chain would not find.
+    pub(in crate::compiler::simulator) fn is_effect_member_read(e: &Expression) -> bool {
+        Self::chain_reads_member(e)
+            && Self::lvalue_has_incdec_index(e)
+            && Self::recv_chain_call(e).is_none()
+    }
+
+    /// §11.4.2, §13.4: a member read of `is_effect_member_read`'s shape
+    /// evaluates each side-effect index once. The member and select arms
+    /// resolve the element several times as they try each storage shape (a
+    /// handle, a packed or an unpacked struct element), so the index ran once
+    /// per try and the read returned another element's member. As for a
+    /// method call's receiver (`eval_call_inner`), each such index becomes the
+    /// literal of its value, evaluated once, left to right.
+    pub(in crate::compiler::simulator) fn freeze_member_read_selects(&mut self, e: &Expression) -> Option<Expression> {
+        if !Self::is_effect_member_read(e) {
+            return None;
+        }
+        self.rewrite_lvalue_index_side_effects(e)
+    }
+
+    /// What the width probes size a member read of `is_effect_member_read`'s
+    /// shape by, without running its side effects (§11.4.2, §13.4): a copy in
+    /// which each side-effect index is the literal of an element the select
+    /// may name (`probe_select`). Every element has the collection's
+    /// declared type, so the copy is as wide as the read, and evaluating it
+    /// evaluates no side effect. Sized by evaluating the read itself, an
+    /// operand of a comparison or of an arithmetic operator ran its index
+    /// once more for each probe.
+    pub(in crate::compiler::simulator) fn member_read_width_probe(&mut self, e: &Expression) -> Expression {
+        let kind = match &e.kind {
+            ExprKind::Index { expr, index } => {
+                let base = self.member_read_width_probe(expr);
+                let index = if Self::cond_expr_is_effect_free(index, false) {
+                    (**index).clone()
+                } else {
+                    self.probe_select(&base, index.span)
+                };
+                ExprKind::Index {
+                    expr: Box::new(base),
+                    index: Box::new(index),
+                }
+            }
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+            } => {
+                let base = self.member_read_width_probe(expr);
+                let bound = |me: &mut Self, b: &Expression| {
+                    if Self::cond_expr_is_effect_free(b, false) {
+                        b.clone()
+                    } else {
+                        me.probe_select(&base, b.span)
+                    }
+                };
+                let (left, right) = (bound(self, left), bound(self, right));
+                ExprKind::RangeSelect {
+                    expr: Box::new(base),
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    kind: *kind,
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => ExprKind::MemberAccess {
+                expr: Box::new(self.member_read_width_probe(expr)),
+                member: member.clone(),
+            },
+            ExprKind::Paren(inner) => {
+                ExprKind::Paren(Box::new(self.member_read_width_probe(inner)))
+            }
+            _ => return e.clone(),
+        };
+        Expression::new(kind, e.span)
+    }
+
+    /// A select the width probes may read through `base` in place of a
+    /// side-effect select: the first index or key of the collection `base`
+    /// names. When its elements are class handles, the first that holds an
+    /// object instead, however far back: a null element has no object to
+    /// size a property by, and sized through one a byte property read as 32
+    /// bits. With no object anywhere, the read itself is through a null
+    /// handle. `base` has no side-effect select left, so naming it evaluates
+    /// none.
+    fn probe_select(&mut self, base: &Expression, span: crate::ast::Span) -> Expression {
+        let zero = || Self::probe_index_literal(0, span);
+        // An object's collection property (`h.items`, `items` in a method)
+        // is stored as `<handle>#items`.
+        let Some(name) = self
+            .expr_assoc_name(base)
+            .or_else(|| self.flat_member_name(base))
+        else {
+            return zero();
+        };
+        let handles = self.probe_coll_holds_handles(&name);
+        let live = |me: &Self, elem: &str| {
+            me.get_signal_value_by_name(elem)
+                .and_then(|v| v.to_u64())
+                .is_some_and(|h| h != 0 && me.heap.get(h as usize).is_some_and(|o| o.is_some()))
+        };
+        if self.is_associative_array(&name) {
+            let keys = self.assoc_top_level_keys_shared(&name);
+            let found = handles
+                .then(|| keys.iter().find(|k| live(self, &format!("{name}[{k}]"))))
+                .flatten();
+            let Some(key) = found.or(keys.first()) else {
+                return zero();
+            };
+            if self.is_string_keyed_array(&name) {
+                let key = decode_name_key(key).to_string();
+                return Expression::new(ExprKind::StringLiteral(key), span);
+            }
+            return key
+                .parse::<i64>()
+                .map_or_else(|_| zero(), |k| Self::probe_index_literal(k, span));
+        }
+        // A queue or dynamic array by its live size: the fixed-array table
+        // can hold a placeholder shape for it.
+        let (lo, n) = match self.module.arrays.get(&name) {
+            Some(&(l, r, _)) if !self.module.dynamic_arrays.contains(&name) => {
+                (l.min(r), l.abs_diff(r) + 1)
+            }
+            _ => (0, self.get_queue_size(&name)),
+        };
+        let k = handles
+            .then(|| (lo..lo + n as i64).find(|k| live(self, &format!("{name}[{k}]"))))
+            .flatten()
+            .unwrap_or(lo);
+        Self::probe_index_literal(k, span)
+    }
+
+    /// Whether the elements of the collection stored as `name` are class
+    /// handles: a design collection (`coll_elem_is_class_handle`), or an
+    /// object's property (`<h>#items`) declared with a class element type.
+    fn probe_coll_holds_handles(&self, name: &str) -> bool {
+        if self.coll_elem_is_class_handle(name) {
+            return true;
+        }
+        let Some((h, prop)) = name.split_once('#') else {
+            return false;
+        };
+        let Some(class) = h
+            .parse::<usize>()
+            .ok()
+            .and_then(|h| self.heap.get(h)?.as_ref())
+            .map(|o| o.class_name.clone())
+        else {
+            return false;
+        };
+        let class = class.split('#').next().unwrap_or(&class).trim();
+        let owners = self.prop_owners(class);
+        owners
+            .get(prop)
+            .and_then(|(_, cd)| cd.properties.get(prop))
+            .and_then(|sig| sig.type_name.as_deref())
+            .is_some_and(|t| self.resolve_typeref_class_name_str(t.trim()).is_some())
+    }
+
+    fn probe_index_literal(k: i64, span: crate::ast::Span) -> Expression {
+        let lit = Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: true,
+                base: NumberBase::Decimal,
+                value: k.unsigned_abs().to_string(),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
+            }),
+            span,
+        );
+        if k >= 0 {
+            return lit;
+        }
+        Expression::new(
+            ExprKind::Unary {
+                op: UnaryOp::Minus,
+                operand: Box::new(lit),
+            },
+            span,
+        )
+    }
+
     /// The outermost CALL in receiver position of the member/select chain
     /// `e` — `me()` in `me().o.x`, `q.pop_front()` in `q.pop_front().addr`,
     /// `a().b()` in `a().b().c` — never `e`'s own callee.

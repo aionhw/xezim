@@ -110,6 +110,9 @@ impl Simulator {
                 if let Some(v) = self.plain_member_read(base, member) {
                     return v;
                 }
+                if let Some(frozen) = self.freeze_member_read_selects(expr) {
+                    return self.eval_expr_ctx_inner(&frozen, ctx_width, unsigned_context);
+                }
                 if !self.local_stack.is_empty()
                     && let Some(v) = self.frame_handle_path_read(expr)
                 {
@@ -156,6 +159,9 @@ impl Simulator {
                 ) && let Some(v) = self.recv_call_once_eval(expr, ctx_width)
                 {
                     return v;
+                }
+                if let Some(frozen) = self.freeze_member_read_selects(expr) {
+                    return self.eval_expr_ctx_inner(&frozen, ctx_width, unsigned_context);
                 }
                 if (self.needs_declared_packed_access(expr)
                     || self.needs_static_packed_access(expr))
