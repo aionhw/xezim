@@ -1882,7 +1882,47 @@ impl Simulator {
         {
             self.deliver_time0_port_edges();
         }
-
+        // §4.4.2, §4.5: the NBA region comes once the Active region is empty,
+        // and the processes an Active-region write's edge wakes (a clock
+        // generator's toggle) run in that region. A process that resumed
+        // from a delay at the edge's time and wrote with `<=` (a testbench's
+        // `#20 d <= 1;` landing on a clock edge) must not be seen by the
+        // edge's flops and waiters: detect this region's edges before the
+        // NBAs commit. With no NBA pending the order below is the same.
+        // Time 0 rescans every edge (`check_edges_pass`), so it keeps the
+        // order below.
+        if self.time > 0
+            && (!self.nba_fast.is_empty()
+                || !self.nba_queue.is_empty()
+                || !self.packed_nba.is_empty()
+                || !self.pending_nba_triggers.is_empty()
+                || !self.pending_nba_instance_triggers.is_empty()
+                || self.delayed_nba_due())
+        {
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+            if !non_clock_change && !self.toggled_clock_positions.is_empty() {
+                self.check_edges_clocks_only();
+            } else {
+                self.check_edges();
+            }
+            self.toggled_clock_positions.clear();
+            if self.finished {
+                return;
+            }
+            // §9.7.4: a `wait` the edge's processes made true resumes in this
+            // Active region too, before the NBAs commit (as in the cascade).
+            if !self.ready_condition_waiters.is_empty() {
+                let prev = self.in_edge_cont;
+                self.in_edge_cont = true;
+                self.drain_condition_waiters(true, false);
+                self.in_edge_cont = prev;
+                if self.finished {
+                    return;
+                }
+            }
+        }
         let _t = profile_timing.then(std::time::Instant::now);
         // §4.5: inactive (`#0`) continuations run before this slot's NBAs.
         self.drain_inactive_pre_nba();
