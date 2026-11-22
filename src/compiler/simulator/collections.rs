@@ -3763,11 +3763,18 @@ impl Simulator {
     /// to the thread's seeding, so a seeded object is never perturbed by a
     /// sibling's thread reseed.
     pub(super) fn cur_rng(&mut self) -> &mut SvRng {
-        if let Some(&h) = self.obj_rng_stack.last() {
-            if self.obj_rng.contains_key(&h) {
-                return self.obj_rng.get_mut(&h).unwrap();
-            }
-            // No private stream — fall through to the calling process's stream.
+        // A nested object randomized as part of an enclosing object's
+        // randomize() (§18.4.1) draws from the innermost object on the stack
+        // that owns a stream, so reseeding the outer object repeats the
+        // nested members too, as the reference simulator does.
+        if let Some(h) = self
+            .obj_rng_stack
+            .iter()
+            .rev()
+            .copied()
+            .find(|h| self.obj_rng.contains_key(h))
+        {
+            return self.obj_rng.get_mut(&h).unwrap();
         }
         let pid = self.current_pid;
         if self.proc_rng.contains_key(&pid) {
