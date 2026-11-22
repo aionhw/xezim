@@ -48,6 +48,8 @@ mod condition_waiter_gate;
 mod delay_loop_compiled;
 #[path = "perf/impure_call_delegated.rs"]
 mod impure_call_delegated;
+#[path = "perf/review_impure_call_single_assign.rs"]
+mod review_impure_call_single_assign;
 
 #[path = "perf/eqc_branch.rs"]
 mod eqc_branch;
