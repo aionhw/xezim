@@ -1439,6 +1439,10 @@ impl Simulator {
                         // change itself.
                         self.run_postponed_region();
                         *self.name_resolve_hint.borrow_mut() = saved_hint_nested;
+                        // The activation goes on after a delay, not at an event control.
+                        if !self.settling && delay > 0 {
+                            self.delay_resumed.insert(self.current_pid);
+                        }
                     }
                     // A task entered from C (DPI export) cannot park: register
                     // the waiter on a wake marker and run the scheduler until

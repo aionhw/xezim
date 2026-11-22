@@ -1304,6 +1304,8 @@ checkpoint_state!(
     deferred_asserts,
     deferred_comb_pool,
     deferred_proc_entries,
+    delay_pids,
+    delay_resumed,
     delayed_nba,
     delayed_nba_queue,
     delayed_slice_chains,

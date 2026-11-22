@@ -297,6 +297,24 @@ impl Simulator {
         // Consumed by whichever path runs this entry (see the direct-run
         // branch below).
         let trampolined = !self.trampolined_pids.is_empty() && self.trampolined_pids.remove(&pid);
+        // §16.4.2: a process resuming after a suspension reaches a flush
+        // point and drops its pending deferred reports and procedural
+        // assertion instances; a same-time trampoline entry of the running
+        // activation (`continue_stmts_or_trampoline`) does not.
+        if self.cont_pids.is_empty() || !self.cont_pids.remove(&pid) {
+            self.flush_deferred_asserts(pid);
+            // A `#0` leaves the activation in its time step.
+            match self.delay_pids.remove(&pid) {
+                Some(true) => {
+                    self.delay_resumed.insert(pid);
+                }
+                Some(false) => {}
+                None if !self.delay_resumed.is_empty() => {
+                    self.delay_resumed.remove(&pid);
+                }
+                None => {}
+            }
+        }
         // A process terminated by `disable fork` (LRM §9.6.2) must not run any
         // remaining queued continuation (e.g. the resume of a `#delay` it was
         // parked on when killed). Pids are monotonic and never reused, so it is

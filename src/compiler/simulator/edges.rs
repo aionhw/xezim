@@ -926,6 +926,9 @@ impl Simulator {
         for body in self.module.property_decls.values() {
             Self::sva_expr_names(body, &mut names);
         }
+        // An always block with a delay or a nested wait in its body runs as a
+        // process, which none of the lists above holds.
+        names.extend(std::mem::take(&mut self.always_sva_names));
         if names.is_empty() {
             return;
         }
