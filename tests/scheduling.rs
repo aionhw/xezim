@@ -593,3 +593,5 @@ mod frame_local_event_selects;
 mod clocking_select_drive_bits;
 #[path = "scheduling/fork_children_before_nba.rs"]
 mod fork_children_before_nba;
+#[path = "scheduling/settle_edges_before_nba.rs"]
+mod settle_edges_before_nba;
