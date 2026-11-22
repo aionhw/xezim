@@ -899,3 +899,5 @@ mod review_packed_slice_partial_range;
 mod review_struct_param_cast_in_instance;
 #[path = "types/shortreal_storage_1463.rs"]
 mod shortreal_storage_1463;
+#[path = "types/nested_member_typedef_sign.rs"]
+mod nested_member_typedef_sign;
