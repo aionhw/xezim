@@ -535,6 +535,8 @@ mod review_sva_property_operators_220;
 mod review_sva_abort_first_tick_1155;
 #[path = "scheduling/deferred_assign_reads_1149.rs"]
 mod deferred_assign_reads_1149;
+#[path = "scheduling/edge_before_slot_nba.rs"]
+mod edge_before_slot_nba;
 #[path = "scheduling/function_call_assign_reads_1126.rs"]
 mod function_call_assign_reads_1126;
 #[path = "scheduling/instance_array_member_reads_1108.rs"]
