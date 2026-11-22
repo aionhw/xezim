@@ -595,3 +595,5 @@ mod clocking_select_drive_bits;
 mod fork_children_before_nba;
 #[path = "scheduling/settle_edges_before_nba.rs"]
 mod settle_edges_before_nba;
+#[path = "scheduling/level_always_waits_for_writer.rs"]
+mod level_always_waits_for_writer;
