@@ -3028,7 +3028,18 @@ impl Simulator {
                     } else {
                         return None;
                     };
-                let i = self.eval_expr(index).to_i64()?;
+                // §7.10.1: in the row select of a queue of fixed-size rows
+                // (`r = q[$]`), `$` is the queue's last index.
+                let queue_rows = self.module.dynamic_arrays.contains(&name);
+                if queue_rows {
+                    self.dollar_bound
+                        .push(self.get_queue_size(&name) as i64 - 1);
+                }
+                let i = self.eval_expr(index);
+                if queue_rows {
+                    self.dollar_bound.pop();
+                }
+                let i = i.to_i64()?;
                 Some((
                     format!("{}[{}]", name, i),
                     self.nd_ordered_suffixes(&name, &rest, 1),
