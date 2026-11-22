@@ -161,11 +161,27 @@ impl<'a> BytecodeCompiler<'a> {
     fn plain_const_index(&self, e: &Expression) -> Option<i64> {
         match &e.kind {
             ExprKind::Paren(inner) => self.plain_const_index(inner),
+            // §11.4.3, §11.8.2: the negation is at the literal's own width
+            // and signedness, so it wraps there: `-4'sd8` is -8, `-4'd3` is
+            // 13, `-1` is -1.
             ExprKind::Unary {
                 op: UnaryOp::Minus,
                 operand,
             } if matches!(operand.kind, ExprKind::Number(_)) => {
-                self.plain_const_index(operand)?.checked_neg()
+                let ExprKind::Number(n) = &operand.kind else {
+                    return None;
+                };
+                let v = self.eval_number_static(n)?;
+                let x = Self::exact_index_value(&v)?;
+                if v.width == 0 || v.width > 63 {
+                    return None;
+                }
+                let m = 1i128 << v.width;
+                let mut r = (-i128::from(x)).rem_euclid(m);
+                if v.is_signed && r >= m / 2 {
+                    r -= m;
+                }
+                i64::try_from(r).ok()
             }
             ExprKind::Number(n) => Self::exact_index_value(&self.eval_number_static(n)?),
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
