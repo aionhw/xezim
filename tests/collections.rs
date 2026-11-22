@@ -228,6 +228,8 @@ mod dyn_row_print_order_597;
 
 #[path = "collections/row_of_2d_array_assign.rs"]
 mod row_of_2d_array_assign;
+#[path = "collections/row_value_into_collection_rows.rs"]
+mod row_value_into_collection_rows;
 
 #[path = "collections/conditional_aggregate_659.rs"]
 mod conditional_aggregate_659;
