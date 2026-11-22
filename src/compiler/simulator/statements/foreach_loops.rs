@@ -17,7 +17,17 @@ impl Simulator {
         // #1108: `foreach (lane[0].payload[i])`.
         let folded = self.inst_array_member_canon(array);
         let array = folded.as_ref().unwrap_or(array);
+        // §6.21, §12.7.3: a loop variable is automatic and local to the loop,
+        // so it hides the subroutine's same-named `static` local until the
+        // loop ends, as a for-init variable does (`hide_loop_static`).
+        let mut hidden = None;
+        if !self.static_local_names.is_empty() {
+            for v in vars.iter().flatten() {
+                self.hide_loop_static(&v.name, &mut hidden);
+            }
+        }
         self.exec_stmt_foreach_inner(stmt, array, vars, body, &mut iterations);
+        self.unhide_statics(hidden);
         self.record_ast_loop_heat(iterations);
     }
 

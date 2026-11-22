@@ -2676,6 +2676,15 @@ impl Simulator {
                                 i += 1;
                                 continue;
                             }
+                            // §6.21, §12.7.3: the loop variable hides the
+                            // subroutine's same-named `static` local until the
+                            // loop's scope closes (`block_scope_exit`).
+                            let mut static_hidden = None;
+                            if !self.static_local_names.is_empty() {
+                                for nm in &fe_names {
+                                    self.hide_loop_static(nm, &mut static_hidden);
+                                }
+                            }
                             // run the FIRST iteration now
                             if let Some(vn) = &loop_var {
                                 let kv = if is_str {
@@ -2709,23 +2718,36 @@ impl Simulator {
                                     end: 0,
                                 },
                             ));
-                            let tail = pc.pushed(
-                                vec![Statement::new(
-                                    StatementKind::ForeachTail {
-                                        loop_var,
-                                        var_scope,
-                                        body: marker,
-                                        keys,
-                                        is_str,
-                                        key_type,
-                                        idx: 1,
-                                        fe_auto_len,
-                                        live_size_name,
-                                    },
-                                    stmt.span,
-                                )],
-                                pc.start + i + 1,
-                            );
+                            let mut tail_stmts = vec![Statement::new(
+                                StatementKind::ForeachTail {
+                                    loop_var,
+                                    var_scope,
+                                    body: marker,
+                                    keys,
+                                    is_str,
+                                    key_type,
+                                    idx: 1,
+                                    fe_auto_len,
+                                    live_size_name,
+                                },
+                                stmt.span,
+                            )];
+                            // Each later iteration's tail resumes this frame
+                            // after its first statement, so its trailing
+                            // `Null` runs once, when the loop ends, and shows
+                            // the hidden statics again (`block_scope_sentinel`).
+                            if static_hidden.is_some() {
+                                tail_stmts.push(Statement::new(StatementKind::Null, stmt.span));
+                            }
+                            let tail = pc.pushed(tail_stmts, pc.start + i + 1);
+                            if static_hidden.is_some() {
+                                self.block_scope_saves.push(BlockScopeSave {
+                                    frame_key: Self::frame_key(&tail.stmts),
+                                    frame_gen: self.local_gen_stack.last().copied().unwrap_or(0),
+                                    static_hidden,
+                                    ..Default::default()
+                                });
+                            }
                             let cont = tail.pushed_frame(body_frame, 0);
                             self.continue_stmts_or_trampoline(pid, cont);
                             return;
