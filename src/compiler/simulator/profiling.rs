@@ -877,6 +877,30 @@ impl Simulator {
             .collect();
     }
 
+    /// `comb_observer` for the current `comb_entries`: a level-sensitive
+    /// procedural block no other entry reads a write of (`always @* assert
+    /// (...) else n_err++;`, `always @(y) $display(...)`). Nothing in the
+    /// settle depends on what it does, so it can wait until the rest has
+    /// converged.
+    pub(super) fn build_comb_observer(&mut self) {
+        let offs = &self.comb_dep_offsets;
+        let deps = &self.comb_dep_entries;
+        self.comb_observer = (self.comb_entries.iter().enumerate())
+            .map(|(i, e)| {
+                matches!(
+                    e.item,
+                    CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
+                ) && e.cold.write_signal_ids.iter().all(|&w| {
+                    w + 1 >= offs.len()
+                        || deps[offs[w] as usize..offs[w + 1] as usize]
+                            .iter()
+                            .all(|&d| d as usize == i)
+                })
+            })
+            .collect();
+        self.comb_has_observer = self.comb_observer.iter().any(|&o| o);
+    }
+
     /// Feasibility probe for levelized / bulk-synchronous parallel settle
     /// (XEZIM_SETTLE_LEVELS=1). Assigns each comb entry a static level =
     /// longest producer chain (entries in stored topo order; cyclic back-edges

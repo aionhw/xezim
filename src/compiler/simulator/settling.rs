@@ -1577,6 +1577,9 @@ impl Simulator {
         if self.comb_self_exempt.len() != self.comb_entries.len() {
             self.build_comb_self_exempt();
         }
+        if self.comb_observer.len() != self.comb_entries.len() {
+            self.build_comb_observer();
+        }
         if !self.quiet_valid || self.quiet_bits.len() != self.signal_table.len().div_ceil(64) {
             self.build_quiet_bits();
         }
@@ -1929,6 +1932,18 @@ impl Simulator {
             }
         }
         let pop_word = self.settle_pop_word;
+        // §4.5, §9.2.2.2: an observer entry (`build_comb_observer`) is a
+        // process of its own whose writes nothing in the settle reads. Triggered
+        // while other entries are still settling, it waits in `held_obs`
+        // (still marked triggered) and runs in a pass of its own once they
+        // have converged. Run in its topological slot, an observer that a
+        // cycle of continuous assignments feeds (a carry chain, one vector
+        // written bit by bit while it is read) ran once per carry step, and
+        // an immediate assertion in it failed on values that never coexist.
+        let has_obs = self.comb_has_observer;
+        let observer = std::mem::take(&mut self.comb_observer);
+        let mut held_obs: Vec<usize> = Vec::new();
+        let mut obs_pass_next = false;
         let mut n_evals = 0u64;
         let mut mux_skipped = 0u64;
         let mut n_dc = 0u64;
@@ -2065,6 +2080,7 @@ impl Simulator {
         for _iteration in 0..limit {
             total_iters += 1;
             let mut evaluated_any = false;
+            let obs_pass = std::mem::take(&mut obs_pass_next);
             let capture_churn = _iteration + CHURN_TAIL >= limit;
 
             // Take the current worklist and sort by eidx (topo order).
@@ -2337,6 +2353,11 @@ impl Simulator {
                         reads,
                         entries[eidx].has_unresolved_reads && reads.is_empty(),
                     );
+                    continue;
+                }
+                if has_obs && !obs_pass && observer.get(eidx).copied().unwrap_or(false) {
+                    triggered[eidx] = true;
+                    held_obs.push(eidx);
                     continue;
                 }
                 evaluated_any = true;
@@ -3112,6 +3133,15 @@ impl Simulator {
                 n_dc += gate_queue.len() as u64;
                 gate_queue.clear();
             }
+            // The rest has converged: the held observers run alone.
+            if !held_obs.is_empty() && next_list.is_empty() {
+                next_list.append(&mut held_obs);
+                obs_pass_next = true;
+                self.dirty_list.clear();
+                self.dirty_any = false;
+                cur_list.clear();
+                continue;
+            }
             // After one full topo scan: if no entry was evaluated, fixpoint.
             if !evaluated_any {
                 converged = true;
@@ -3129,6 +3159,10 @@ impl Simulator {
             }
         }
 
+        // An observer still held when the budget ran out stays triggered for
+        // the next settle, as an entry left in `next_list` does.
+        next_list.append(&mut held_obs);
+        self.comb_observer = observer;
         self.entry_evals += n_evals;
         self.prof_settle_dc_count += n_dc;
         self.prof_settle_ab_count += n_ab;

@@ -3751,6 +3751,13 @@ pub struct Simulator {
     /// re-queue it. Other drivers of the vector still do. Rebuilt with the
     /// levels and whenever its length differs from `comb_entries`.
     comb_self_exempt: Vec<bool>,
+    /// Per comb entry: a level-sensitive `always` whose writes no other
+    /// entry reads (an observer, `always @* assert (...)`), which the settle
+    /// runs only once every other entry has converged (`build_comb_observer`).
+    /// `comb_has_observer`: any is set. Rebuilt whenever its length differs
+    /// from `comb_entries`.
+    comb_observer: Vec<bool>,
+    comb_has_observer: bool,
     /// Per comb entry: evaluable by the static isolated path (no `&mut self`,
     /// disjoint writes) — not AST, no NBA, no unsupported insn. Only par_safe
     /// entries run on worker threads in the parallel BSP level dispatch.

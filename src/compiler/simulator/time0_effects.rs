@@ -529,6 +529,8 @@ impl Simulator {
                 idx.push(i);
             }
         }
+        // Held as `Noop`, an always_comb observer was not marked one.
+        self.comb_observer.clear();
         // Evaluated as the settle evaluates them at any later change: in the
         // entry's scope, and with a deferred assertion report owned by the
         // block, not by the process that happens to be current, so that a
