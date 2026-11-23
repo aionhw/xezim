@@ -1744,6 +1744,22 @@ impl Simulator {
                 .rev()
                 .find(|b| b.0 == h.path[0].name.name)
                 .and_then(|b| b.1.to_i64()),
+            // `a[i-1]`, `a[i+1]` beside `a[i]` in a `foreach`.
+            ExprKind::Binary {
+                op: op @ (BinaryOp::Add | BinaryOp::Sub),
+                left,
+                right,
+            } => {
+                let (l, r) = (
+                    Self::nd_const_index(left, env)?,
+                    Self::nd_const_index(right, env)?,
+                );
+                if *op == BinaryOp::Add {
+                    l.checked_add(r)
+                } else {
+                    l.checked_sub(r)
+                }
+            }
             _ => None,
         }
     }
