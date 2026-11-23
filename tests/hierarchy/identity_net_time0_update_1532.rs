@@ -187,3 +187,34 @@ endmodule
         .collect();
     assert_eq!(checks, vec!["CHECK|y1=x y2=0 w2_count=1"]);
 }
+
+#[test]
+fn constant_tied_two_state_input_port_and_literal_events() {
+    let src = r#"
+module k2(input bit clk, output int pe, output int ne);
+  int pc = 0, nc = 0;
+  always @(posedge clk) pc++;
+  always @(negedge clk) nc++;
+  assign pe = pc;
+  assign ne = nc;
+endmodule
+
+module top;
+  int pe0, ne0, pe1, ne1;
+  k2 b0(.clk(1'b0), .pe(pe0), .ne(ne0));
+  k2 b1(.clk(1'b1), .pe(pe1), .ne(ne1));
+  always @(posedge 1'b1) $display("CHECK|LIT_POS1");
+  always @(negedge 1'b0) $display("CHECK|LIT_NEG0");
+  always @(1'b1) $display("CHECK|LIT_ANY1");
+  initial #1 begin
+    $display("CHECK|BIT2 tie0: pe=%0d ne=%0d tie1: pe=%0d ne=%0d", pe0, ne0, pe1, ne1);
+    $finish;
+  end
+endmodule
+"#;
+    let checks: Vec<String> = out_lines(src)
+        .into_iter()
+        .filter(|l| l.starts_with("CHECK|"))
+        .collect();
+    assert_eq!(checks, vec!["CHECK|BIT2 tie0: pe=0 ne=0 tie1: pe=1 ne=0"]);
+}
