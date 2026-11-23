@@ -732,6 +732,12 @@ impl Simulator {
             };
             let signature = self.canonicalize_spec_sig(&cn, "");
             let saved_spec = self.current_spec.replace((cn.clone(), signature));
+            let elem_type = self
+                .module
+                .classes
+                .get(&cn)
+                .and_then(|class| self.class_prop_elem_type(class, &name))
+                .cloned();
             self.class_context_stack.push(Some(cn));
             self.this_stack.push(None);
             let (pattern, assoc_items) = match &self.unpacked_pattern(&init).kind {
@@ -742,7 +748,7 @@ impl Simulator {
             if let Some(items) = assoc_items {
                 self.assign_class_assoc_pattern(&store, width, &items);
             } else if pattern && !is_assoc {
-                self.populate_queue_from_init(&store, &init);
+                self.populate_queue_from_init(&store, &init, elem_type);
             } else {
                 let lhs = super::property_initialization::prop_ident_expr(&name);
                 let stmt = Statement::new(

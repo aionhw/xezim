@@ -3807,7 +3807,17 @@ impl Simulator {
     /// instance context and written to `<queue>[i]`, then the queue size is
     /// set to the number of items. Mirrors the AssignmentPattern assignment
     /// path in `assign_value`.
-    pub(super) fn populate_queue_from_init(&mut self, scoped_q: &str, init: &Expression) {
+    pub(super) fn populate_queue_from_init(
+        &mut self,
+        scoped_q: &str,
+        init: &Expression,
+        elem_type: Option<DataType>,
+    ) {
+        let w = self.module.arrays.get(scoped_q).map_or(32, |a| a.2);
+        let pattern_value = |sim: &mut Self, expr: &Expression| match &elem_type {
+            Some(dt) => sim.eval_pattern_leaf_value(dt, expr, Some(w)),
+            None => sim.eval_expr(expr),
+        };
         // §7.10.1: both the pattern form `'{1,2,3}` and the queue
         // concatenation form `{1,2,3}` initialize element-wise.
         let vals: Vec<Value> = match &self.unpacked_pattern(init).kind {
@@ -3824,14 +3834,14 @@ impl Simulator {
                             ExprKind::Replication { count, exprs } => {
                                 let n = self.eval_expr(count).to_u64().unwrap_or(0) as usize;
                                 let once: Vec<Value> =
-                                    exprs.iter().map(|x| self.eval_expr(x)).collect();
+                                    exprs.iter().map(|x| pattern_value(self, x)).collect();
                                 for _ in 0..n {
                                     vals.extend(once.iter().cloned());
                                 }
                             }
-                            _ => vals.push(self.eval_expr(e)),
+                            _ => vals.push(pattern_value(self, e)),
                         },
-                        _ => vals.push(self.eval_expr(it.expr())),
+                        _ => vals.push(pattern_value(self, it.expr())),
                     }
                 }
                 vals
@@ -3854,12 +3864,6 @@ impl Simulator {
             }
             _ => return,
         };
-        let (_lo, _hi, w) = self
-            .module
-            .arrays
-            .get(scoped_q)
-            .copied()
-            .unwrap_or((0, 63, 32));
         let n = vals.len();
         for (i, mut v) in vals.into_iter().enumerate() {
             // §5.7.1: an unsized fill element takes the element width.
