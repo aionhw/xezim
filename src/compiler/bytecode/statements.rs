@@ -456,6 +456,9 @@ impl<'a> BytecodeCompiler<'a> {
                     for _ in 1..items.len() {
                         self.alloc_reg();
                     }
+                    if self.register_overflow {
+                        return false;
+                    }
                     for (i, item) in items.iter().enumerate() {
                         let crate::ast::expr::AssignmentPatternItem::Ordered(item) = item else {
                             self.bail("Return_collection_named_item");
