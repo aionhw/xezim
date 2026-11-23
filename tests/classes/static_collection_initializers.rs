@@ -152,3 +152,36 @@ endmodule
     expect(&out, "rep 3 5 drep 4 2 made 3 6 calls 1");
     expect(&out, "irep 4 8");
 }
+
+/// IEEE 1800-2023 §11.4.12.1, §10.9.1: a replicated operand is evaluated
+/// exactly once and its value copied, as in a runtime assignment of the same
+/// pattern, so `'{3{next()}}` calls `next` once.
+#[test]
+fn replicated_initializer_operand_runs_once() {
+    let src = r#"
+module t;
+  int n;
+  function automatic int next();
+    n++;
+    return n;
+  endfunction
+  class T;
+    static int sq[$] = '{3{next()}};
+    int        iq[$] = '{2{next()}};
+  endclass
+  int mq[$];
+  initial begin
+    T x;
+    $display("static n=%0d q=%p", n, T::sq);
+    x = new;
+    $display("inst n=%0d q=%p", n, x.iq);
+    mq = '{3{next()}};
+    $display("runtime n=%0d q=%p", n, mq);
+  end
+endmodule
+"#;
+    let out = messages(src);
+    expect(&out, "static n=1 q='{1, 1, 1}");
+    expect(&out, "inst n=2 q='{2, 2}");
+    expect(&out, "runtime n=3 q='{3, 3, 3}");
+}
