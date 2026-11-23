@@ -297,6 +297,7 @@ impl Simulator {
         // the type it names, and so does a class typedef of such a typedef
         // (`typedef vec_t word_t;`, §6.18).
         let local;
+        let is_class_typedef = matches!(dt, DataType::TypeReference { .. });
         let dt = match dt {
             DataType::TypeReference {
                 name, dimensions, ..
@@ -339,9 +340,11 @@ impl Simulator {
             }
             _ => true,
         };
-        // A literal range needs nothing here.
+        // §6.18, §8.13: the class's typedef target can already have its
+        // bounds folded in the declaring class. Falling back to the bare
+        // design typedef loses that width when the bound was a class constant.
         if dims.iter().all(|d| range_ok(d, None)) {
-            return None;
+            return is_class_typedef.then(|| resolve_type_width(dt, None, None));
         }
         let ctx = self.class_context_stack.last().cloned().flatten()?;
         let spec = match &self.current_spec {

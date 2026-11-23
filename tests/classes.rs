@@ -1381,3 +1381,6 @@ mod review_rand_srandom_streams;
 mod class_row_replication_once;
 #[path = "classes/randomize_signed_modulo_elements.rs"]
 mod randomize_signed_modulo_elements;
+
+#[path = "classes/inherited_packed_typedef_width.rs"]
+mod inherited_packed_typedef_width;
