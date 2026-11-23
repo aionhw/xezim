@@ -1859,6 +1859,9 @@ impl Simulator {
                         _ => unreachable!(),
                     }
                 }
+                if let Some(frozen) = self.freeze_binary_effect_selects(expr, *op, left, right) {
+                    return self.eval_expr_ctx_inner(&frozen, ctx_width, unsigned_context);
+                }
                 if let Some(v) = self.plain_compare(*op, left, right, ctx_width) {
                     return v;
                 }

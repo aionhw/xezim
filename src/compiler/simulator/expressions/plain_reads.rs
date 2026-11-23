@@ -919,7 +919,67 @@ impl Simulator {
         self.rewrite_lvalue_index_side_effects(e)
     }
 
-    /// What the width probes size a member read of `is_effect_member_read`'s
+    /// Whether `e` is a select chain with a side-effect select (`a[k++]`,
+    /// `q[next()][1]`, `objs[i++].v`), not rooted at a call (see
+    /// `is_effect_member_read`).
+    pub(in crate::compiler::simulator) fn is_effect_select_read(e: &Expression) -> bool {
+        matches!(
+            e.kind,
+            ExprKind::Index { .. }
+                | ExprKind::RangeSelect { .. }
+                | ExprKind::MemberAccess { .. }
+                | ExprKind::Paren(_)
+        ) && Self::lvalue_has_incdec_index(e)
+            && Self::recv_chain_call(e).is_none()
+    }
+
+    /// §11.3.2, §11.4.2, §13.4: an operand of a binary operator is evaluated
+    /// once. The operator's arm tries an operand several ways before it
+    /// reads its value (the struct, array and pattern comparisons, the width
+    /// probes of `*`), so a side-effect select in an operand (`a[k++] ==
+    /// a[1]`) ran once per try, and the operator read another element. Each
+    /// such select becomes the literal of its value, evaluated once, the left
+    /// operand's first. `None` when no operand has one, or when the right
+    /// one has and the left has some other side effect (a call), whose order
+    /// against the select a frozen copy would change.
+    pub(in crate::compiler::simulator) fn freeze_binary_effect_selects(
+        &mut self,
+        expr: &Expression,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+    ) -> Option<Expression> {
+        let l = Self::is_effect_select_read(left);
+        let r = Self::is_effect_select_read(right);
+        if !l && !r {
+            return None;
+        }
+        if !l && !Self::cond_expr_is_effect_free(left, false) {
+            return None;
+        }
+        let left = if l {
+            self.rewrite_lvalue_index_side_effects(left)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| left.clone());
+        let right = if r {
+            self.rewrite_lvalue_index_side_effects(right)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| right.clone());
+        Some(Expression::new(
+            ExprKind::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            expr.span,
+        ))
+    }
+
+    /// What the width probes size a read of `is_effect_select_read`'s
     /// shape by, without running its side effects (§11.4.2, §13.4): a copy in
     /// which each side-effect index is the literal of an element the select
     /// may name (`probe_select`). Every element has the collection's
