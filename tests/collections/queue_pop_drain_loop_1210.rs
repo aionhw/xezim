@@ -112,3 +112,37 @@ endmodule
         "{trace}"
     );
 }
+
+#[test]
+fn compiled_queue_pop_four_state_value_drops_xz_on_two_state_local() {
+    let source = r#"
+module top;
+  bit clk;
+  logic [7:0] q[$];
+  logic [7:0] four_state_out;
+  bit   [7:0] two_state_out;
+  always @(posedge clk) begin
+    int tmp;
+    tmp = 8'h5a;
+    tmp = q.pop_front() + 8'd1;
+    two_state_out = tmp[7:0];
+    four_state_out = q.pop_front() + 8'd1;
+  end
+  initial begin
+    q.push_back(8'h1x);
+    q.push_back(8'h2z);
+    #1 clk = 1;
+    #1 $display("OUT two=%b four=%b sz=%0d", two_state_out, four_state_out, q.size());
+    $finish;
+  end
+endmodule
+"#;
+    let sim = xezim::simulate(source, 100).expect("simulate");
+    assert!(
+        sim.output
+            .iter()
+            .any(|line| line.message == "OUT two=00000000 four=xxxxxxxx sz=0"),
+        "{:?}",
+        sim.output
+    );
+}
