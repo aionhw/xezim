@@ -615,3 +615,5 @@ mod review_sva_whole_array_shapes;
 mod review_foreach_hides_static;
 #[path = "scheduling/forced_partial_stores.rs"]
 mod forced_partial_stores;
+#[path = "scheduling/array_write_feedback.rs"]
+mod array_write_feedback;
