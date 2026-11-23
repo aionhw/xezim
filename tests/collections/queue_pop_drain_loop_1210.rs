@@ -64,8 +64,7 @@ endmodule
 
 #[test]
 fn compiled_queue_pop_resolves_each_instance_queue() {
-    let sim = xezim::simulate(
-        r#"
+    let source = r#"
 module worker(input bit clk);
   int q[$];
   int result[2];
@@ -86,13 +85,30 @@ module top;
     $finish;
   end
 endmodule
-"#,
-        100,
-    )
-    .expect("simulate");
+"#;
+    let dir = std::env::temp_dir().join(format!("xezim_queue_pop_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temporary directory");
+    let path = dir.join("design.sv");
+    std::fs::write(&path, source).expect("write queue design");
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(["--simulate", "--no-cache"])
+        .arg(&path)
+        .env("XEZIM_BC_DUMP", "1")
+        .env_remove("XEZIM_BC_DUMP_FULL")
+        .output();
+    let _ = std::fs::remove_dir_all(&dir);
+    let run = run.expect("run xezim");
+    let output = String::from_utf8_lossy(&run.stdout);
+    let trace = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{output}\n{trace}");
     assert!(
-        sim.output
-            .iter()
-            .any(|line| line.message == "RESULT 7 9 0 31")
+        output.lines().any(|line| line == "RESULT 7 9 0 31"),
+        "{output}"
+    );
+    assert!(
+        trace
+            .lines()
+            .any(|line| line.starts_with("[BC-DUMP]") && line.contains("QueuePop")),
+        "{trace}"
     );
 }
