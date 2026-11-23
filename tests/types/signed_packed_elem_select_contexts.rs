@@ -187,7 +187,7 @@ endmodule"#,
     .expect("simulate");
     let lines: Vec<_> = sim.output.iter().map(|e| e.message.as_str()).collect();
     assert!(
-        lines.contains(&"lane=-1887 type=reg signed[16:0][0:1]"),
+        lines.contains(&"lane=-1887 type=logic signed[0:1][16:0]"),
         "{lines:?}"
     );
     assert!(lines.contains(&"extended=-1887"), "{lines:?}");

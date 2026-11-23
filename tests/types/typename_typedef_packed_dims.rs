@@ -1,6 +1,6 @@
 //! IEEE 1800-2023 §20.6.1, §7.4.1: `$typename` of a variable declared with
 //! packed dimensions on a typedef name (`lane_t [0:1] a`) names those
-//! dimensions after the typedef's own, innermost first.
+//! dimensions before the typedef's own in the equivalent built-in type.
 
 #[test]
 fn typename_keeps_packed_dimensions_of_a_typedef_name() {
@@ -33,8 +33,8 @@ endmodule
     assert_eq!(
         lines,
         [
-            "T|bit[2:0]|reg signed[16:0][0:1]|reg signed[16:0][2:0][1:0]",
-            "T|bit[3:0][1:0]|reg signed[16:0]",
+            "T|bit[2:0]|logic signed[0:1][16:0]|logic signed[1:0][2:0][16:0]",
+            "T|bit[1:0][3:0]|reg signed[16:0]",
         ]
     );
 }
