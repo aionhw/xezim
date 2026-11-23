@@ -1396,3 +1396,6 @@ mod static_collection_initializers;
 
 #[path = "classes/nested_member_elem_write.rs"]
 mod nested_member_elem_write;
+
+#[path = "classes/imported_enum_over_unit_parameter.rs"]
+mod imported_enum_over_unit_parameter;
