@@ -570,6 +570,18 @@ impl Simulator {
                     // via the bare-name fallbacks; only deeper paths need the
                     // reshape.
                     if hier.path.len() >= 3 {
+                        // §26.3: a qualified struct parameter's layout and
+                        // fields belong to the declaring package.
+                        let key = format!("{}::{}", hier.path[0].name.name, hier.path[1].name.name);
+                        if self.module.packed_struct_fields.contains_key(&key)
+                            && hier.path[1..].iter().all(|seg| seg.selects.is_empty())
+                        {
+                            let members = hier.path[2..].iter().map(|seg| seg.name.name.as_str())
+                                .collect::<Vec<_>>().join(".");
+                            if let Some(field) = self.module.parameters.get(&format!("{key}.{members}")) {
+                                return field.clone();
+                            }
+                        }
                         let mut stripped = hier.clone();
                         stripped.path.remove(0);
                         // §26.3: a contested package variable's own storage.

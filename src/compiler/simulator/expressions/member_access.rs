@@ -134,6 +134,29 @@ impl Simulator {
                 }
             }
         }
+        // §26.3: a struct parameter reached through a package must read
+        // the package's field, including when an aggregate copy synthesizes
+        // the final member access from a `pkg::PARAM` operand.
+        if let Some(pkg) = Self::member_path_head(expr)
+            && self.module.packages.contains(pkg)
+            && !self.signal_name_to_id.contains_key(pkg)
+            && !self.signals.contains_key(pkg)
+            && !self.local_stack.last().is_some_and(|frame| frame.contains_key(pkg))
+            && let Some(path) = Self::flatten_member_path(expr)
+            && path.len() >= 2
+        {
+            let key = format!("{pkg}::{}", path[1]);
+            if self.module.packed_struct_fields.contains_key(&key) {
+                let mut field = key;
+                for part in path[2..].iter().map(String::as_str).chain([member.name.as_str()]) {
+                    field.push('.');
+                    field.push_str(part);
+                }
+                if let Some(value) = self.module.parameters.get(&field) {
+                    return value.clone();
+                }
+            }
+        }
         // §8.25/§26.3: `pkg::Cls::static_prop` (what `pkg::Cls#(..)::prop`
         // reads once its specialization is active): the class package
         // `pkg` holds.
