@@ -910,3 +910,6 @@ mod negative_packed_element_read;
 
 #[path = "types/nested_two_state_packed_member.rs"]
 mod nested_two_state_packed_member;
+
+#[path = "types/packed_package_field_net_width.rs"]
+mod packed_package_field_net_width;
