@@ -291,6 +291,17 @@ impl Simulator {
                     push_var(v, out);
                     return true;
                 }
+                // `a[i]` with `i` known reads that one element, so a relation
+                // left to the evaluator (`(a[i] - a[i-1]) % 16 == 0` on signed
+                // elements) is judged once its own elements are fixed, not
+                // once every element of `a` is.
+                if let Some(i) = Self::nd_const_index(index, env)
+                    && let Some(a) = self.csp_member(csp, expr).and_then(|n| csp.arrays.get(&n))
+                    && let Some(x) = a.elems.iter().find(|x| x.0 == i)
+                {
+                    push_var(x.1, out);
+                    return true;
+                }
                 let x = self.csp_refs(csp, expr, env, out);
                 self.csp_refs(csp, index, env, out) && x
             }
