@@ -525,6 +525,9 @@ impl Simulator {
         &mut self,
         lv: &Expression,
     ) -> Option<(String, Option<usize>)> {
+        if let Some(target) = self.inst_array_member_canon(lv) {
+            return self.force_target(&target);
+        }
         if let ExprKind::Ident(hier) = &lv.kind {
             if hier.path.iter().all(|s| s.selects.is_empty()) {
                 let name = self.resolve_hier_name(hier);

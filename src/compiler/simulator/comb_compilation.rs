@@ -340,11 +340,11 @@ impl Simulator {
             name: member.clone(),
             selects: Vec::new(),
         });
-        if path.len() > 1
-            && !self.module.name.is_empty()
-            && path[0].selects.is_empty()
-            && path[0].name.name == self.module.name
-        {
+        let rooted = path.len() > 1 && path[0].name.name == "$root";
+        if rooted {
+            path.remove(0);
+        }
+        if path.len() > 1 && path[0].selects.is_empty() && path[0].name.name == self.module.name {
             path.remove(0);
         }
         let hier = crate::ast::expr::HierarchicalIdentifier {
@@ -356,15 +356,22 @@ impl Simulator {
             bound: crate::ast::binding::Bound::UNSET,
         };
         let flat = Self::resolve_hier_name_static(&hier, &self.module);
-        let is_array = |n: &str| {
+        // §23.3.2, §7.4: a selected instance can contain a scalar or
+        // packed vector as well as an unpacked array. Use its registered
+        // storage so further selects keep that signal's packed geometry.
+        let has_storage = |n: &str| {
             self.module.arrays.contains_key(n)
                 || self.module.arrays_2d.contains_key(n)
                 || self.module.arrays_nd.contains_key(n)
+                || self.signal_name_to_id.contains_key(n)
         };
-        if is_array(&flat) {
+        if has_storage(&flat) {
             return Some(flat);
         }
-        self.hint_scoped(&flat).filter(|s| is_array(s))
+        if rooted {
+            return None;
+        }
+        self.hint_scoped(&flat).filter(|s| has_storage(s))
     }
 
     /// Flatten `a`, `a.b`, `a[0].b`, `a[0].b[1]` into segments, pushing an
