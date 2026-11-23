@@ -4,8 +4,9 @@
 //! Declared types render as the reference simulator spells them: a 4-state
 //! vector is `reg` (`logic [7:0]` reads `reg[7:0]`), but `logic` once it has
 //! more than one packed or unpacked dimension, or is a member of a packed
-//! aggregate; packed and unpacked ranges follow the keyword with no space and
-//! are listed innermost first; unpacked ones come after a `$` (`int$[0:1]`,
+//! aggregate; packed and unpacked ranges follow the keyword with no space.
+//! Equivalent packed vector types expanded from typedefs list the outer
+//! ranges before the typedef's own ranges. Unpacked ones come after a `$` (`int$[0:1]`,
 //! `int$[]` for a queue or dynamic array, `int$[string]` for an associative
 //! one). An integer atom is named by its keyword alone (`int unsigned` reads
 //! `int`).
@@ -307,15 +308,27 @@ impl Simulator {
                 } else {
                     self.module.typedef_types.get(&name.qualified()).cloned()
                 }?;
+                let expanded_vector = !dimensions.is_empty()
+                    && matches!(self.resolve_dt_ref(&target), DataType::IntegerVector { .. });
                 let mut s = match &target {
                     DataType::Struct(_) | DataType::Enum(_) => {
                         self.tn_named_aggregate(&target, name)
                     }
-                    _ => self.tn_base_text(&target, logic_kw),
+                    _ => self.tn_base_text(&target, logic_kw || expanded_vector),
                 }?;
-                // §20.6.1: the packed dimensions written on the type name
-                // (`lane_t [0:1] a`) follow the typedef's own, innermost
-                // first, as for a vector's dimensions above.
+                // §20.6.1: the equivalent built-in vector has the dimensions
+                // written on the type name outside the typedef's own shape.
+                if expanded_vector {
+                    let tail = s.split_off(s.find('[').unwrap_or(s.len()));
+                    for dim in dimensions {
+                        let PackedDimension::Range { left, right, .. } = dim else {
+                            return None;
+                        };
+                        s.push_str(&format!("[{}:{}]", self.tn_const(left)?, self.tn_const(right)?));
+                    }
+                    s.push_str(&tail);
+                    return Some(s);
+                }
                 for d in dimensions.iter().rev() {
                     if let PackedDimension::Range { left, right, .. } = d
                         && let (Some(l), Some(r)) = (self.tn_const(left), self.tn_const(right))
