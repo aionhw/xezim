@@ -571,3 +571,5 @@ mod two_state_scalar_targets;
 mod top_ansi_packed_ports;
 #[path = "hierarchy/signed_port_unsigned_actual.rs"]
 mod signed_port_unsigned_actual;
+#[path = "hierarchy/generate_nettype_drivers.rs"]
+mod generate_nettype_drivers;
