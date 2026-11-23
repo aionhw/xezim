@@ -1757,6 +1757,21 @@ impl Simulator {
                 return;
             }
         }
+        // §7.6, §11.3.2: parentheses preserve an unpacked row operand.
+        // Resolve the copy before scalar probes can consume its selector.
+        let rvalue = Self::unparen(rvalue);
+        let row_source = (!self.module.arrays_2d.is_empty() || !self.module.arrays_nd.is_empty())
+            && self.is_fixed_row_select(rvalue);
+        let frozen_rhs = if row_source && Self::is_effect_select_read(rvalue) {
+            self.rewrite_lvalue_index_side_effects(rvalue)
+        } else {
+            None
+        };
+        let rvalue = frozen_rhs.as_ref().unwrap_or(rvalue);
+        if row_source && self.copy_multi_dim_array(lvalue, rvalue) {
+            self.settle_after_proc_write();
+            return;
+        }
         if self.assign_class_scalar_row(lvalue, rvalue) {
             self.settle_after_proc_write();
             return;
