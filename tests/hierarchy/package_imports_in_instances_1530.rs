@@ -154,7 +154,7 @@ endpackage
 module t;
   typedef struct packed { logic a; logic b; logic [4:0] c; } s_t;
   s_t K;
-  
+
   initial begin K = '{a: 1'b1, b: 1'b0, c: 5'd3}; #1 $display("T|K.c=%0d K=%b", K.c, K); end
 endmodule
 "#,
