@@ -919,3 +919,6 @@ mod transitive_packed_typedef_width;
 
 #[path = "types/unit_member_vs_unimported_package.rs"]
 mod unit_member_vs_unimported_package;
+
+#[path = "types/unit_parameter_over_hidden_enum.rs"]
+mod unit_parameter_over_hidden_enum;

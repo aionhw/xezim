@@ -1405,3 +1405,9 @@ mod property_pattern_element_context;
 
 #[path = "classes/factory_specialization_in_child.rs"]
 mod factory_specialization_in_child;
+
+#[path = "classes/class_collection_member_index_write.rs"]
+mod class_collection_member_index_write;
+
+#[path = "classes/class_scoped_blocking_task.rs"]
+mod class_scoped_blocking_task;
