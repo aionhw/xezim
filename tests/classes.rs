@@ -1379,3 +1379,5 @@ mod rand_srandom_reseed_repeats;
 mod review_rand_srandom_streams;
 #[path = "classes/class_row_replication_once.rs"]
 mod class_row_replication_once;
+#[path = "classes/imported_enum_over_unit_parameter.rs"]
+mod imported_enum_over_unit_parameter;
