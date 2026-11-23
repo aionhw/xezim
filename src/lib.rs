@@ -246,6 +246,7 @@ fn design_cache_key_for(
     hash.bytes(&[xezim_core::elaborate::relax_driver_conflicts() as u8]);
     // §6.21: the accepted initializer's lifetime changes elaboration.
     hash.bytes(&[xezim_core::elaborate::relax_implicit_static() as u8]);
+    hash.bytes(&[xezim_core::elaborate::verilog_2005_initializers() as u8]);
     // An opt-in parser relaxation or keyword set accepts other source.
     for f in sv_parser::relax_flags() {
         hash.bytes(&[f.get() as u8]);

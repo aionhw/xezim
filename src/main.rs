@@ -246,6 +246,7 @@ fn print_usage() {
         eprintln!("  --relax-{}  Accept, with a warning: {}.", f.name, f.help);
         eprintln!("                   Also enabled by {}=1.", f.env);
     }
+    eprintln!("  --verilog-2005-initializers  Run .v module variable declaration assignments at time zero.");
     eprintln!("  --keywords <ver> Keyword set outside `begin_keywords` regions (§22.14):");
     eprintln!("                   1364-1995 ... 1800-2023, each also with -noconfig.");
     eprintln!("                   Also XEZIM_KEYWORDS=<ver>.");
@@ -722,13 +723,17 @@ fn push_plus_libext(arg: &str, lib_exts: &mut Option<Vec<String>>) {
 }
 
 /// The opt-in parser relaxations (`--relax-<name>`, one per
-/// `sv_parser::RelaxFlag`), `--no-config-keywords` and `--keywords=<ver>`
+/// `sv_parser::RelaxFlag`), keyword settings, and legacy initializers.
 /// (#608, #622-#629). True when `flag` is one of them.
 fn handle_relax_flag(flag: &str) -> bool {
     if let Some(name) = flag.strip_prefix("--relax-")
         && let Some(f) = sv_parser::relax_flags().into_iter().find(|f| f.name == name)
     {
         f.set(true);
+        return true;
+    }
+    if flag == "--verilog-2005-initializers" {
+        xezim_core::elaborate::set_verilog_2005_initializers(true);
         return true;
     }
     if flag == "--no-config-keywords" {

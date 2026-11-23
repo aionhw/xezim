@@ -2308,6 +2308,15 @@ impl Simulator {
                     arrays.as_deref_mut(),
                 );
             }
+            StatementKind::TimingControl { stmt: inner, .. } => {
+                Self::collect_stmt_rw(inner, module, reads, writes, arrays);
+            }
+            StatementKind::Wait { condition, stmt: inner } => {
+                if let Some(r) = reads.as_deref_mut() {
+                    Self::collect_expr_reads(condition, module, r);
+                }
+                Self::collect_stmt_rw(inner, module, reads, writes, arrays);
+            }
             // §9.2.2.2: a function body reached through `collect_function_reads`
             // usually ends in `return <expr>` — dropping it hid every module
             // variable the function reads only there, so an always_comb calling
@@ -2894,13 +2903,17 @@ impl Simulator {
         let mut reads: HashSet<String> = HashSet::default();
         let mut writes: HashSet<String> = HashSet::default();
         // §9.2.2.2: `@*` sensitivity excludes called-function CONTENTS.
-        SKIP_FN_BODY_READS.with(|c| c.set(true));
+        let skip = SKIP_FN_BODY_READS.with(|c| c.replace(true));
         NBA_SEEN.with(|c| c.set(false));
         let whole = Self::collect_stmt_reads_whole(body, &self.module, &mut reads, &mut writes);
-        // Only the variables the body writes other than through nonblocking
-        // assignments leave the list below (`star_excluded_writes`).
-        let (writes, whole) = Self::star_excluded_writes(body, &self.module, &reads, writes, whole);
-        SKIP_FN_BODY_READS.with(|c| c.set(false));
+        // §9.4.2.2: a suspended process may be woken by another writer while
+        // parked at @*. Its own blocking writes happen before it rearms.
+        let (writes, whole) = if self.stmt_is_blocking(body) {
+            (HashSet::default(), whole)
+        } else {
+            Self::star_excluded_writes(body, &self.module, &reads, writes, whole)
+        };
+        SKIP_FN_BODY_READS.with(|c| c.set(skip));
         // Registration usually runs with the hint unset (the process body
         // just executed); the executing instance's own scope is the correct
         // resolution context either way.

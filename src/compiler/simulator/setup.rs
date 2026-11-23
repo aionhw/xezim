@@ -724,7 +724,8 @@ impl Simulator {
     /// a child instance's processes at its instantiation, a bound instance's
     /// after all of its host's own items — except that the `initial` blocks
     /// that cannot suspend all run as one group, at the position of the
-    /// first of them. Static initializers keep running first. Clock
+    /// first of them. Within each root, event-headed always processes arm
+    /// before the ordinary start batch. Static initializers run first. Clock
     /// generators take their slot in the same order (`ClockGen::t0_rank`).
     pub(super) fn order_time0_processes(&mut self) {
         let pids = self.event_queue.slot_pids(0);
@@ -795,24 +796,24 @@ impl Simulator {
                 };
                 placed.push((pid, info));
             }
-            type Key = (u8, usize, Vec<usize>, Vec<usize>, usize);
-            let key_of = |i: usize, info: &Option<(usize, Vec<usize>, bool)>| -> Key {
+            type Key = (u8, usize, bool, Vec<usize>, Vec<usize>, usize);
+            let key_of = |i: usize, pid: usize, info: &Option<(usize, Vec<usize>, bool)>| -> Key {
                 match info {
-                    None => (0, 0, Vec::new(), Vec::new(), i),
+                    None => (0, 0, false, Vec::new(), Vec::new(), i),
                     Some((root, pos, grouped)) => {
                         let at = if *grouped {
                             anchor[root].clone()
                         } else {
                             pos.clone()
                         };
-                        (1, *root, at, pos.clone(), i)
+                        (1, *root, !self.t0_event_heads.contains(&pid), at, pos.clone(), i)
                     }
                 }
             };
             let mut keyed: Vec<(Key, usize)> = placed
                 .iter()
                 .enumerate()
-                .map(|(i, (pid, info))| (key_of(i, info), *pid))
+                .map(|(i, (pid, info))| (key_of(i, *pid, info), *pid))
                 .collect();
             keyed.sort();
             let gen_ranks: Vec<(usize, usize)> = self
@@ -820,7 +821,7 @@ impl Simulator {
                 .iter()
                 .map(|(gi, scope, span)| {
                     let (root, pos) = position(scope, *span);
-                    let k: Key = (1, root, pos.clone(), pos, usize::MAX);
+                    let k: Key = (1, root, true, pos.clone(), pos, usize::MAX);
                     (*gi, keyed.partition_point(|(kk, _)| *kk < k))
                 })
                 .collect();
@@ -839,6 +840,7 @@ impl Simulator {
         }
         self.t0_pid_ord = rank;
         self.t0_timing_free = HashSet::default();
+        self.t0_event_heads = HashSet::default();
     }
 
     /// Account one event popped from the current slot against the FIFO rank
@@ -1735,7 +1737,32 @@ impl Simulator {
         }
     }
 
+    fn leading_event(stmt: &Statement) -> Option<&EventControl> {
+        match &stmt.kind {
+            StatementKind::TimingControl {
+                control: TimingControl::Event(event),
+                ..
+            } => Some(event),
+            StatementKind::SeqBlock { stmts, .. } => stmts.first().and_then(Self::leading_event),
+            _ => None,
+        }
+    }
+
     pub(super) fn classify_one_always_block(
+        &mut self,
+        ab: AlwaysBlock,
+        lazy: Option<LazyAlways>,
+    ) -> Option<AlwaysBlock> {
+        let event_head = ab.kind == AlwaysKind::Always && Self::leading_event(&ab.stmt).is_some();
+        let first_pid = self.next_pid;
+        let remaining = self.classify_always_block(ab, lazy);
+        if event_head {
+            self.t0_event_heads.extend(first_pid..self.next_pid);
+        }
+        remaining
+    }
+
+    fn classify_always_block(
         &mut self,
         ab: AlwaysBlock,
         lazy: Option<LazyAlways>,
@@ -1773,19 +1800,17 @@ impl Simulator {
         let star_reads_own_nba = Self::take_star_kept_own_write();
         // §14.13: a clocking event is delivered after sampling/NBA, rather
         // than as the raw clock edge returned by extract_sensitivity.
-        fn leading_event(stmt: &Statement) -> Option<&EventControl> {
-            match &stmt.kind {
-                StatementKind::TimingControl {
-                    control: TimingControl::Event(event),
-                    ..
-                } => Some(event),
-                StatementKind::SeqBlock { stmts, .. } => stmts.first().and_then(leading_event),
-                _ => None,
-            }
-        }
         let clocking_head =
-            leading_event(&ab.stmt).is_some_and(|event| self.is_clocking_event(event));
+            Self::leading_event(&ab.stmt).is_some_and(|event| self.is_clocking_event(event));
         *self.name_resolve_hint.borrow_mut() = saved_hint;
+        if ab.kind == AlwaysKind::Always
+            && matches!(Self::leading_event(&ab.stmt), Some(EventControl::Star | EventControl::ParenStar))
+            && extracted.as_ref().is_some_and(|(sens, body)| {
+                sens.is_empty() && self.stmt_is_blocking(body)
+            })
+        {
+            return None;
+        }
         if let Some((sens, body)) = extracted {
             if !sens.is_empty() {
                 let all_level = sens.iter().all(|s| s.edge == EdgeKind::AnyEdge);

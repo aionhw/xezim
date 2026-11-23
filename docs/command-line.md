@@ -75,6 +75,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--relax-nul-bytes` | Read a NUL byte in the source as white space (§5.3), with a warning — for sources written against tools that accept it |
 | `--relax-cross-hier-item` | Accept a hierarchical reference as a cross item (`cross vif.mode, cp;`) and in `binsof(hier)` in a cross bin select (§19.6.1), with an implicit coverpoint (§19.6), with a warning — for sources written against tools that accept it |
 | `--relax-use-before-decl` | Accept a reference to module data before its declaration (§6.5), including in call arguments, with a warning naming the module and data |
+| `--verilog-2005-initializers` | Treat module variable declaration assignments in `.v` inputs as time-zero procedures (IEEE 1364-2005 §6.2.1). Without this flag, variable declaration initialization uses SystemVerilog semantics. |
 | `--keywords <ver>` | Keyword set outside `` `begin_keywords `` regions (§22.14): `1364-1995`, `1364-2001`, `1364-2005`, `1800-2005` … `1800-2023`, each also with `-noconfig`; an explicit region still wins |
 | `--no-config-keywords` | Read the ten configuration keywords (`instance`, `cell`, `use`, `library`, …) as names outside `` `begin_keywords `` regions |
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |

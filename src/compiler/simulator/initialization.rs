@@ -4822,6 +4822,7 @@ impl Simulator {
             clock_generators: Vec::new(),
             clock_gen_src: Vec::new(),
             t0_timing_free: HashSet::default(),
+            t0_event_heads: HashSet::default(),
             t0_pid_ord: HashMap::default(),
             fast_delay_always: HashMap::default(),
             lazy_initial: HashMap::default(),

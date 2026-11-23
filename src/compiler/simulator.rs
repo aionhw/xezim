@@ -561,7 +561,8 @@ macro_rules! write_sig {
 // nested packed-struct member read, compile to range stores and selects.
 // §7.4.5: signed constant labels of packed array elements.
 // Indexed packed-struct write regions and delayed unpacked-array drivers.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB084";
+// Timed implicit event controls retain their inferred sensitivity.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB085";
 
 mod aggregate_assignments;
 mod pattern_array_items;
@@ -2769,6 +2770,7 @@ pub struct Simulator {
     /// Pids of `initial` blocks that cannot suspend (no timing control,
     /// no blocking call); see `order_time0_processes`.
     t0_timing_free: HashSet<usize>,
+    t0_event_heads: HashSet<usize>,
     /// Time-0 activation index of each process queued at time 0, consulted
     /// by `clock_rank_on_pop` until the first drain settles the generators.
     t0_pid_ord: HashMap<usize, usize>,

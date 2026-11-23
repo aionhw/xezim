@@ -10,6 +10,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Timed `always @*` blocks wait on inferred inputs, and event-headed
+  `always` blocks arm before time-zero procedural writes (#1539, #1545).
+
 - Class-scoped task calls keep their receiver during waits, and writes to
   selected packed members update the owning class array element (#1570, #1569).
 - Delayed continuous assignments drive each net in an unpacked array (#1584).
@@ -64,6 +67,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   queries for plain reads compared with known integer literals.
 
 **Command line**
+
+- `--verilog-2005-initializers` schedules module variable declaration
+  assignments in `.v` inputs as time-zero procedures (#1545).
 
 * A `-v`/`-y` library file is preprocessed with the command-line defines
   (`+define+`, `-D`) only, as in the reference simulator, so library files no
