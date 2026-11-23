@@ -724,8 +724,9 @@ impl Simulator {
     /// a child instance's processes at its instantiation, a bound instance's
     /// after all of its host's own items — except that the `initial` blocks
     /// that cannot suspend all run as one group, at the position of the
-    /// first of them. Within each root, event-headed always processes arm
-    /// before the ordinary start batch. Static initializers run first. Clock
+    /// first of them. Within each root, unguarded event-headed always
+    /// processes arm before the ordinary start batch. Static initializers
+    /// run first. Clock
     /// generators take their slot in the same order (`ClockGen::t0_rank`).
     pub(super) fn order_time0_processes(&mut self) {
         let pids = self.event_queue.slot_pids(0);
@@ -1753,7 +1754,13 @@ impl Simulator {
         ab: AlwaysBlock,
         lazy: Option<LazyAlways>,
     ) -> Option<AlwaysBlock> {
-        let event_head = ab.kind == AlwaysKind::Always && Self::leading_event(&ab.stmt).is_some();
+        // §4.4.2, §9.2.2: arm simple waits before procedural startup
+        // writes. A wait with an iff guard keeps its source-order start,
+        // matching the guarded direct-write case in #550.
+        let event_head = ab.kind == AlwaysKind::Always
+            && Self::leading_event(&ab.stmt).is_some_and(|event| {
+                !matches!(event, EventControl::EventExpr(terms) if terms.iter().any(|term| term.iff.is_some()))
+            });
         let first_pid = self.next_pid;
         let remaining = self.classify_always_block(ab, lazy);
         if event_head {

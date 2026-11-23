@@ -11,7 +11,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 **Correctness**
 
 - Timed `always @*` blocks wait on inferred inputs, and event-headed
-  `always` blocks arm before time-zero procedural writes (#1539, #1545).
+  `always` blocks with unguarded events arm before time-zero procedural
+  writes (#1539, #1545).
 
 - Class-scoped task calls keep their receiver during waits, and writes to
   selected packed members update the owning class array element (#1570, #1569).
