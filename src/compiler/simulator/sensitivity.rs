@@ -5027,9 +5027,13 @@ impl Simulator {
                     return true;
                 }
                 let head_ok = if method_local(head) {
-                    !self.vif_local_names.contains(head)
+                    !self
+                        .local_vif_frame()
+                        .is_some_and(|f| f.bindings.contains_key(head))
                 } else {
-                    this_member(head) && !self.class_member_names().vif_props.contains(head)
+                    this_member(head)
+                        && !self.class_member_names().vif_props.contains(head)
+                        && !self.this_has_prop_vif(head)
                 };
                 if !head_ok
                     || !h.path.iter().all(|s| {

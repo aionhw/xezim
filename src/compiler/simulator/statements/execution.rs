@@ -921,6 +921,13 @@ impl Simulator {
                             // `for (int hart...)` never iterate).
                             if let Some(frame) = self.local_stack.last_mut() {
                                 frame.insert(name.name.clone(), rv);
+                                if let Some(aliases) = self
+                                    .local_iface_aliases
+                                    .last_mut()
+                                    .and_then(Option::as_deref_mut)
+                                {
+                                    aliases.bindings.remove(&name.name);
+                                }
                             } else {
                                 self.set_signal_value_by_name(&name.name, rv);
                             }
@@ -1614,9 +1621,7 @@ impl Simulator {
                         .then(|| self.resolve_vif_rhs_name_strict(e))
                         .flatten()
                     {
-                        self.signals
-                            .insert("__vif_return__".to_string(), Value::from_string(&nm));
-                        self.vif_return_pending = true;
+                        self.pending_vif_return = Some(nm);
                     }
                     // §13.4: `return <collection>` — record the collection's
                     // storage name so the caller's assign can copy elements

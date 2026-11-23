@@ -195,6 +195,7 @@ impl Simulator {
             pending_struct_coll_wb,
             pending_ret_struct,
             pending_ret_collection,
+            pending_vif_return,
             vm_ret_coll,
             pending_formal_dyn,
             static_vif_bindings,
@@ -578,6 +579,9 @@ impl Simulator {
         }
         self.virtual_iface_bindings
             .retain(|(h, _), _| !dead_handle(*h));
+        if !self.prop_vif_bindings.is_empty() {
+            self.prop_vif_bindings.retain(|h, _| !dead_handle(*h));
+        }
         self.randc_used.retain(|(h, _), _| !dead_handle(*h));
         self.randc_pending.retain(|(h, _), _| !dead_handle(*h));
         self.dist_decks.retain(|(h, _), _| !dead_handle(*h));

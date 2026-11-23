@@ -181,8 +181,7 @@ impl Simulator {
         fd: &FunctionDeclaration,
         args: &[Expression],
     ) -> Value {
-        self.signals.remove("__vif_return__");
-        self.vif_return_pending = false;
+        self.pending_vif_return = None;
         // §26.3: the package this body belongs to. Taken before anything else
         // runs, so a call appearing in an argument (evaluated below, in the
         // CALLER's scope) cannot pick it up. A scoped `pkg::f()` dispatch names
@@ -287,39 +286,6 @@ impl Simulator {
         // return (e.g. `get_int_arg_value(string s, ref int val)`).
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
         let mut default_output_bindings = Vec::new();
-        // §25.9 via the __vif_local__ convention: a virtual-interface ACTUAL
-        // records its interface under the formal's name (cleared otherwise so
-        // a stale same-named formal from an earlier call can't leak).
-        // Only a formal whose declared type can name an interface (`virtual
-        // x_if v`, or a typedef that may resolve to one) can carry a vif;
-        // an `int`/`bit`/`string` formal has no actual to resolve, so the
-        // per-port format + resolve + hash was pure overhead on every call
-        // of every function.
-        let mut vif_formals: Vec<(&str, Option<&Expression>)> = fd
-            .ports
-            .iter()
-            .enumerate()
-            .filter(|(_, port)| Self::formal_may_carry_vif(&port.data_type))
-            .map(|(i, port)| {
-                (
-                    port.name.name.as_str(),
-                    args.get(i).filter(|_| arg_supplied(i)),
-                )
-            })
-            .collect();
-        // §13.5, §25.9: the keys are flat by name, so a caller's formal or
-        // local of the same name may have left one. A plain formal, or a
-        // variable the body declares, is this call's own and names no
-        // interface: it enters with no actual, which clears the key for the
-        // call and puts it back on return.
-        if !self.vif_local_names.is_empty() {
-            self.vif_own_names(&fd.ports, &fd.items, &mut vif_formals);
-        }
-        let vif_saved = if vif_formals.is_empty() {
-            Vec::new()
-        } else {
-            self.vif_formals_enter(&vif_formals)
-        };
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut array_inputs: Vec<(String, String, i64, i64)> = Vec::new();
         let mut assoc_params: Vec<(String, String, bool, Option<bool>)> = Vec::new();
@@ -707,22 +673,33 @@ impl Simulator {
             // so a virtual-interface formal with a default still aliases the
             // interface the default names (a supplied actual wins; the default
             // only fills an omitted slot).
-            let arg = args
-                .get(i)
-                .filter(|_| arg_supplied(i))
-                .or(port.default.as_ref());
-            if arg.is_some() {
-                if let Some((f, b)) =
-                    self.vif_formal_alias(port, args.get(i).filter(|_| arg_supplied(i)), &locals)
-                {
-                    iface_alias_frame.insert(f, b);
-                }
+            let supplied_arg = args.get(i).filter(|_| arg_supplied(i));
+            if let Some((f, b)) = self.vif_formal_alias(port, supplied_arg, &locals) {
+                iface_alias_frame.insert(f, b);
+            } else if !self.vif_collection_formal(port)
+                && !matches!(port.direction, PortDirection::Output)
+                && Self::formal_may_carry_vif(&port.data_type)
+                && matches!(
+                    self.typedef_chain_scoped(&port.data_type),
+                    DataType::TypeReference { .. } | DataType::Implicit { .. }
+                )
+                && self.port_class_ref(port).is_none()
+                && let Some(actual) = supplied_arg
+                && let Some(bound) = self.resolve_vif_rhs_name_strict(actual)
+            {
+                iface_alias_frame.insert(port.name.name.clone(), bound);
             }
         }
-        if !iface_alias_frame.is_empty() {
+        let vif_frame = if iface_alias_frame.is_empty() {
+            None
+        } else {
             self.consume_vif_argument_return();
-        }
-        self.local_iface_aliases.push(iface_alias_frame);
+            Some(Box::new(VifAliasFrame {
+                is_task_frame: false,
+                bindings: iface_alias_frame,
+            }))
+        };
+        self.local_iface_aliases.push(vif_frame);
         self.commit_formal_dyn(formal_dyn);
         self.push_local_frame_typed(locals, frame_types);
         self.open_decl_shadow_frame();
@@ -903,7 +880,7 @@ impl Simulator {
         *self.activation_scope.borrow_mut() = saved_body_activation;
         self.current_scope = saved_body_scope;
         self.apply_default_formal_outputs(&default_output_bindings);
-        let vif_alias_ended = self.local_iface_aliases.pop().unwrap_or_default();
+        let vif_alias_ended = self.local_iface_aliases.pop().flatten();
         self.func_call_stack.pop();
         self.fn_ret_collection_stack.pop();
         self.fn_ret_assoc_stack.pop();
@@ -1028,19 +1005,13 @@ impl Simulator {
         // A vif binding an out/inout formal ended with propagates to the
         // caller's actual — instance prop or another plain name — whatever
         // the actual held on entry.
-        let vif_ended = if vif_saved.is_empty() {
-            HashMap::default()
-        } else {
-            let outs: Vec<&str> = writebacks.iter().map(|(pn, _, _)| pn.as_str()).collect();
-            self.vif_formals_exit(vif_saved, &vif_formals, &outs)
-        };
         for (pn, v, caller) in writebacks {
             self.vif_writeback(
                 &caller,
                 &v,
                 vif_alias_ended
-                    .get(&pn)
-                    .or_else(|| vif_ended.get(&pn))
+                    .as_deref()
+                    .and_then(|f| f.bindings.get(&pn))
                     .map(String::as_str),
             );
         }
@@ -1237,7 +1208,7 @@ impl Simulator {
             .output_bindings
             .iter()
             .filter_map(|(name, actual)| {
-                self.local_iface_aliases.last()?.get(name)?;
+                self.local_vif_frame()?.bindings.get(name)?;
                 Some((
                     actual.clone(),
                     self.iface_alias_for(name).unwrap_or_default(),
@@ -1257,16 +1228,6 @@ impl Simulator {
         self.continue_flag = c.saved_continue;
         self.sync_static_locals();
         let locals = self.pop_local_frame_take().unwrap_or_default();
-        for (key, previous) in c.saved_vif_formals {
-            match previous {
-                Some(v) => {
-                    self.signals.insert(key, v);
-                }
-                None => {
-                    self.signals.remove(&key);
-                }
-            }
-        }
         for (port_name, caller_expr) in &c.output_bindings {
             if let Some(val) = locals.get(port_name) {
                 self.assign_value(caller_expr, val);
@@ -2357,9 +2318,8 @@ impl Simulator {
                     .and_then(|locals| locals.get(name))
                     .cloned();
                 let binding = self
-                    .local_iface_aliases
-                    .last()
-                    .and_then(|frame| frame.get(name))
+                    .local_vif_frame()
+                    .and_then(|frame| frame.bindings.get(name))
                     .cloned();
                 (actual.clone(), value, binding)
             })
@@ -2393,9 +2353,11 @@ impl Simulator {
             .push(receiver.and_then(|(handle, _)| *handle));
         self.class_context_stack
             .push(receiver.map(|(_, class)| class.clone()));
+        self.local_iface_aliases.push(None);
         let saved = std::mem::replace(&mut self.current_spec, spec);
         let result = f(self);
         self.current_spec = saved;
+        self.local_iface_aliases.pop();
         self.class_context_stack.pop();
         self.this_stack.pop();
         result
@@ -2469,23 +2431,7 @@ impl Simulator {
                 let is_vif = if let Some(bound) = bound_types[i].as_deref() {
                     // §8.25: the callee's concrete type takes precedence over
                     // any same-named typedef in the surrounding context.
-                    let explicit = bound.trim_start().starts_with("virtual");
-                    let base = bound
-                        .trim_start_matches("virtual")
-                        .trim()
-                        .split(['#', '.'])
-                        .next()
-                        .unwrap_or("")
-                        .trim();
-                    (self.module.interfaces.contains(base)
-                        && (explicit
-                            || !(self.module.classes.contains_key(base)
-                                || self.module.covergroups.contains_key(base))))
-                        || self
-                            .module
-                            .typedef_types
-                            .get(bound)
-                            .is_some_and(|dt| self.is_virtual_iface_type(dt))
+                    self.bound_type_is_vif(bound)
                 } else {
                     self.is_virtual_iface_type(&port.data_type)
                 };
@@ -2551,64 +2497,6 @@ impl Simulator {
                 }
             })
             .collect();
-        let mut saved_vif_formals: Vec<_> = td
-            .ports
-            .iter()
-            .enumerate()
-            .filter(|(i, port)| {
-                vif_formal_indices.contains(i) || self.vif_local_names.contains(&port.name.name)
-            })
-            .map(|(_, port)| {
-                let key = format!("__vif_local__{}", port.name.name);
-                let prior = self.signals.get(&key).cloned();
-                (key, prior)
-            })
-            .collect();
-        // §13.5, §25.9: a plain formal, or a variable the body declares, is
-        // this call's own and names no interface; a caller's same-named
-        // formal or local may have left a key under its name (the keys are
-        // flat by name). Cleared for the call; the cleanup puts back what was
-        // saved above, and saves the body's variables here.
-        if !self.vif_local_names.is_empty() {
-            let mut own: Vec<(&str, Option<&Expression>)> = Vec::new();
-            self.vif_own_names(&td.ports, &td.items, &mut own);
-            for (name, _) in own {
-                let key = format!("__vif_local__{}", name);
-                let prior = self.signals.remove(&key);
-                if !td.ports.iter().any(|p| p.name.name == name) {
-                    saved_vif_formals.push((key, prior));
-                }
-            }
-        }
-        // §25.9 via the __vif_local__ convention: a virtual-interface ACTUAL
-        // records its interface under the formal's name (cleared otherwise so
-        // a stale same-named formal from an earlier call can't leak).
-        for (i, port) in td.ports.iter().enumerate() {
-            if !Self::formal_may_carry_vif(&port.data_type) {
-                continue;
-            }
-            // A plain class formal cannot be bound to an interface.
-            let nm = bound_vifs
-                .iter()
-                .find(|(index, _)| *index == i)
-                .map(|(_, bound)| bound.clone());
-            match nm {
-                Some(nm) => {
-                    self.vif_local_names.insert(port.name.name.clone());
-                    self.signals.insert(
-                        format!("__vif_local__{}", port.name.name),
-                        Value::from_string(&nm),
-                    );
-                }
-                // No key was ever made under this name, so the removal
-                // would find nothing and nothing is written.
-                None if !self.vif_local_names.contains(&port.name.name) => {}
-                None => {
-                    self.signals
-                        .remove(&format!("__vif_local__{}", port.name.name));
-                }
-            }
-        }
         let mut assoc_params: Vec<(String, String, bool)> = Vec::new(); // (param_name, caller_array_name, is_out)
         let mut array_params: Vec<String> = Vec::new(); // param names with unpacked Range dim
         let mut identity_formals: Vec<String> = Vec::new(); // ref aggregates bound by identity
@@ -2830,9 +2718,11 @@ impl Simulator {
                             default
                         }
                     } else {
+                        let is_vif = vif_formal_indices.contains(&i)
+                            && !self.vif_collection_formal(port);
                         if arg_supplied(i) {
                             let value = self.eval_expr(&args[i]);
-                            self.vif_argument_value(port, &args[i], value)
+                            self.vif_argument_value_resolved(is_vif, false, &args[i], value)
                         } else if let Some(default) = &port.default {
                             self.in_subroutine_default_scope(
                                 default_receiver.as_ref(),
@@ -2841,7 +2731,9 @@ impl Simulator {
                                     sim.push_local_frame_typed(locals.clone(), frame_types.clone());
                                     sim.push_pending_formal_dyn(&formal_dyn);
                                     let value = sim.eval_expr(default);
-                                    let value = sim.vif_argument_value(port, default, value);
+                                    let value = sim.vif_argument_value_resolved(
+                                        is_vif, false, default, value,
+                                    );
                                     sim.pop_pending_formal_dyn();
                                     sim.pop_local_frame();
                                     value
@@ -2897,10 +2789,12 @@ impl Simulator {
                         continue;
                     }
                     let val = if arg_supplied(i) {
+                        let is_vif = vif_formal_indices.contains(&i)
+                            && !self.vif_collection_formal(port);
                         let value = scope_aliases.get(i).and_then(Option::as_deref)
                             .and_then(|key| self.ref_alias_peek(key))
                             .unwrap_or_else(|| self.eval_expr(&args[i]));
-                        self.vif_argument_value(port, &args[i], value)
+                        self.vif_argument_value_resolved(is_vif, false, &args[i], value)
                     } else {
                         Value::zero(32)
                     };
@@ -2910,6 +2804,8 @@ impl Simulator {
                     }
                 }
                 _ => {
+                    let is_vif =
+                        vif_formal_indices.contains(&i) && !self.vif_collection_formal(port);
                     let mut val = if arg_supplied(i) {
                         // §13.5, §11.6.1: as a function's (`exec_function_call`),
                         // a task's input actual is context-determined by its
@@ -2928,7 +2824,7 @@ impl Simulator {
                                 None => self.eval_expr(&args[i]),
                             },
                         };
-                        self.vif_argument_value(port, &args[i], value)
+                        self.vif_argument_value_resolved(is_vif, false, &args[i], value)
                     } else if let Some(def) = &port.default {
                         // Caller omitted this arg → apply the formal's default
                         // value (was incorrectly using 0). E.g.
@@ -2941,7 +2837,8 @@ impl Simulator {
                                 sim.push_local_frame_typed(locals.clone(), frame_types.clone());
                                 sim.push_pending_formal_dyn(&formal_dyn);
                                 let value = sim.eval_formal_default(port, def);
-                                let value = sim.vif_argument_value(port, def, value);
+                                let value =
+                                    sim.vif_argument_value_resolved(is_vif, false, def, value);
                                 sim.pop_pending_formal_dyn();
                                 sim.pop_local_frame();
                                 value
@@ -2971,26 +2868,21 @@ impl Simulator {
             }
         }
         // §13.5.3 / §25.9: defaults have been evaluated once in the
-        // declaration scope. Bind their resulting token, including null, and
-        // keep the task's identity store in step with its dispatch alias.
+        // declaration scope. Record their resolved instance for the task's
+        // per-frame alias table.
         for (i, port) in td.ports.iter().enumerate() {
             if args.get(i).filter(|_| arg_supplied(i)).is_some() || !vif_formal_indices.contains(&i)
             {
                 continue;
             }
-            let bound = locals
+            if let Some(bound) = locals
                 .get(&port.name.name)
                 .and_then(|v| v.to_u64())
                 .filter(|&token| token != 0)
                 .and_then(|token| self.iface_by_token(token))
-                .map(str::to_string);
-            let key = format!("__vif_local__{}", port.name.name);
-            if let Some(bound) = bound {
-                self.vif_local_names.insert(port.name.name.clone());
-                self.signals.insert(key, Value::from_string(&bound));
+                .map(str::to_string)
+            {
                 bound_vifs.push((i, bound));
-            } else {
-                self.signals.remove(&key);
             }
         }
         // The select metadata of this activation's formals (see
@@ -3022,7 +2914,7 @@ impl Simulator {
         // `<bound>.member` for the duration of this call.
         let mut iface_alias_frame: HashMap<String, String> = HashMap::default();
         for (i, port) in td.ports.iter().enumerate() {
-            if port.dimensions.is_empty() && vif_formal_indices.contains(&i) {
+            if !self.vif_collection_formal(port) && vif_formal_indices.contains(&i) {
                 iface_alias_frame.insert(
                     port.name.name.clone(),
                     bound_vifs
@@ -3033,12 +2925,15 @@ impl Simulator {
                 );
             }
         }
-        if !iface_alias_frame.is_empty() {
-            // §13.5/§25.9: task bindings travel with parked process frames;
-            // function bindings use their existing flat-slot writeback path.
-            iface_alias_frame.insert("__xezim_task_vif_frame__".into(), String::new());
-        }
-        self.local_iface_aliases.push(iface_alias_frame);
+        let vif_frame = if iface_alias_frame.is_empty() {
+            None
+        } else {
+            Some(Box::new(VifAliasFrame {
+                is_task_frame: true,
+                bindings: iface_alias_frame,
+            }))
+        };
+        self.local_iface_aliases.push(vif_frame);
         // SV-2023: redirect NBAs targeting a `ref` formal back to the caller's
         // actual variable (IEEE 1800-2023 §13.5.2).
         let mut ref_map: HashMap<String, Expression> = HashMap::default();
@@ -3175,7 +3070,6 @@ impl Simulator {
             queue_writebacks,
             output_bindings,
             default_output_bindings,
-            saved_vif_formals,
             assoc_params,
             array_params,
             pushed_string_formals,

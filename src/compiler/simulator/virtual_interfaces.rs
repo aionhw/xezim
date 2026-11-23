@@ -147,38 +147,38 @@ impl Simulator {
                 if let Some(bound) = self.vif_frame_alias(raw) {
                     return Some(bound);
                 }
-                if !self.vif_name_possible(raw) {
+                let is_vif_prop = self.vif_prop_name_possible(raw);
+                if !is_vif_prop
+                    && !self.this_has_prop_vif(raw)
+                    && !self.is_interface_instance(raw)
+                    && self.static_vif_names.is_empty()
+                    && (self.viface_var_aliases.is_empty()
+                        || (!self.viface_var_aliases.contains_key(raw)
+                            && (self.contested_pkg_vars.is_empty()
+                                || !self
+                                    .viface_var_aliases
+                                    .contains_key(self.vif_variable_name(raw).as_ref()))))
+                {
+                    return None;
+                }
+                if self.local_stack.last().is_some_and(|l| l.contains_key(raw))
+                    || self
+                        .ref_alias_stack
+                        .last()
+                        .is_some_and(|m| m.contains_key(raw))
+                {
                     return None;
                 }
                 if let Some(th) = self.this_stack.last().copied().flatten() {
-                    if let Some((b, _)) = self.virtual_iface_bindings.get(&(th, raw.clone())) {
+                    if is_vif_prop
+                        && let Some((b, _)) = self.virtual_iface_binding_get(th, raw)
+                    {
                         return Some(Some(b.clone()));
                     }
-                    let hit = {
-                        let mut k = self.vif_key_scratch.borrow_mut();
-                        k.clear();
-                        {
-                            use std::fmt::Write as _;
-                            let _ = write!(k, "__vif_local__{}#{}", th, raw);
-                        }
-                        self.signals.get(k.as_str()).map(|v| v.to_sv_string())
-                    };
-                    if let Some(v) = hit {
-                        return Some(Some(v));
-                    }
-                }
-                let hit = {
-                    let mut k = self.vif_key_scratch.borrow_mut();
-                    k.clear();
+                    if !self.prop_vif_bindings.is_empty()
+                        && let Some(v) = self.prop_vif_bindings.get(&th).and_then(|m| m.get(raw))
                     {
-                        use std::fmt::Write as _;
-                        let _ = write!(k, "__vif_local__{}", raw);
-                    }
-                    self.signals.get(k.as_str()).map(|v| v.to_sv_string())
-                };
-                if let Some(v) = hit {
-                    if self.vif_flat_key_applies(raw) {
-                        return Some(Some(v));
+                        return Some(Some(v.clone()));
                     }
                 }
                 if let Some(b) = self.iface_alias_for(raw) {
@@ -197,26 +197,15 @@ impl Simulator {
                 // entirely, so the read went to `class_static_get` and a bound
                 // static vif again compared equal to null (§25.10).
                 if let Some(cls) = self.static_vif_bare_class() {
-                    // §6.21/§8.4: a LOCAL of the executing frame shadows the
-                    // class static, and this lookup answers straight from the
-                    // class cell, so it has to defer to the frame exactly as
-                    // `static_vif_slot_of_bare` below does. Without it a bound
-                    // static leaked through an uninitialised local here.
-                    if !self
-                        .local_stack
-                        .last()
-                        .is_some_and(|l| l.contains_key(raw.as_str()))
+                    // §8.26: inside a static method of a PARAMETERIZED class the
+                    // executing specialization IS the context, and the write
+                    // filed the binding under the spec key. The slot below is
+                    // base-canonical and would miss it, reporting a bound
+                    // static as null.
+                    if let Some(bound) =
+                        self.static_vif_binding_of_scope(&cls, raw, self.current_spec.as_ref())
                     {
-                        // §8.26: inside a static method of a PARAMETERIZED class the
-                        // executing specialization IS the context, and the write
-                        // filed the binding under the spec key. The slot below is
-                        // base-canonical and would miss it, reporting a bound
-                        // static as null.
-                        if let Some(bound) =
-                            self.static_vif_binding_of_scope(&cls, raw, self.current_spec.as_ref())
-                        {
-                            return Some(Some(bound));
-                        }
+                        return Some(Some(bound));
                     }
                 }
                 if self.static_vif_slot_of_bare(raw).is_some()
@@ -476,6 +465,59 @@ impl Simulator {
         self.vif_operand_handle_prop(oh, &prop)
     }
 
+    /// Fast zero-allocation classification for `e == null` / `e != null`:
+    /// `Some(true)` = bound vif, `Some(false)` = unbound vif (`null`),
+    /// `None` = not a vif operand.
+    pub(super) fn vif_operand_is_bound(&mut self, e: &Expression) -> Option<bool> {
+        if let ExprKind::Ident(h) = &e.kind
+            && h.path.len() == 1
+            && (self.module.packages.is_empty() || self.strip_package_lvalue(e).is_none())
+        {
+            let raw = h.path[0].name.name.as_str();
+            if let Some(frame) = self.local_vif_frame()
+                && let Some(bound) = frame.bindings.get(raw)
+            {
+                if frame.is_task_frame
+                    && self.ref_alias_stack.last().is_some_and(|m| m.contains_key(raw))
+                {
+                    return self.vif_frame_alias(raw).map(|o| o.is_some());
+                }
+                if bound.is_empty() {
+                    return Some(false);
+                }
+                return self.is_interface_instance(bound).then_some(true);
+            }
+            let is_vif_prop = self.vif_prop_name_possible(raw);
+            if !is_vif_prop
+                && !self.this_has_prop_vif(raw)
+                && !self.is_interface_instance(raw)
+                && self.static_vif_names.is_empty()
+                && self.viface_var_aliases.is_empty()
+            {
+                return None;
+            }
+            if self.local_stack.last().is_some_and(|l| l.contains_key(raw))
+                || self.ref_alias_stack.last().is_some_and(|m| m.contains_key(raw))
+            {
+                return None;
+            }
+            if let Some(th) = self.this_stack.last().copied().flatten() {
+                if is_vif_prop && self.virtual_iface_binding_get(th, raw).is_some() {
+                    return Some(true);
+                }
+                if !self.prop_vif_bindings.is_empty()
+                    && self
+                        .prop_vif_bindings
+                        .get(&th)
+                        .is_some_and(|m| m.contains_key(raw))
+                {
+                    return Some(true);
+                }
+            }
+        }
+        self.vif_operand_eval(e).map(|o| o.is_some())
+    }
+
     /// `obj.prop` classification for `vif_operand` — engages only when the
     /// receiver's class DECLARES `prop` as a virtual interface.
     pub(super) fn vif_operand_obj_prop(&self, obj: &str, prop: &str) -> Option<Option<String>> {
@@ -583,121 +625,138 @@ impl Simulator {
         )
     }
 
-    /// §13.5, §25.9: append to `formals`, with no actual, the names a
-    /// subroutine declares for itself under which a `__vif_local__` key may
-    /// already exist: its formals that cannot carry an interface and the
-    /// variables declared at the top level of its body. The keys are flat by
-    /// name, so a caller's virtual-interface formal or local `v` leaves one,
-    /// and inside a callee with an `int v` of its own that `v` read as the
-    /// caller's interface (`data = v;` stored a handle token). Entering with
-    /// no actual clears the key for the call; the exit puts it back.
-    pub(super) fn vif_own_names<'a>(
+    /// Borrow the active subroutine's per-frame vif-alias table, if any.
+    #[inline]
+    pub(super) fn local_vif_frame(&self) -> Option<&VifAliasFrame> {
+        self.local_iface_aliases.last().and_then(Option::as_deref)
+    }
+
+    /// Borrow or lazily allocate the active subroutine's per-frame vif-alias table.
+    #[inline]
+    pub(super) fn local_vif_frame_mut(&mut self) -> Option<&mut VifAliasFrame> {
+        self.local_iface_aliases
+            .last_mut()
+            .map(|slot| slot.get_or_insert_with(|| Box::new(VifAliasFrame::default())).as_mut())
+    }
+
+    /// Whether the active `this` object has a type-parameterized vif binding for `raw`.
+    #[inline]
+    pub(super) fn this_has_prop_vif(&self, raw: &str) -> bool {
+        !self.prop_vif_bindings.is_empty()
+            && self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|th| self.prop_vif_bindings.get(&th))
+                .is_some_and(|m| m.contains_key(raw))
+    }
+
+    #[inline]
+    pub(super) fn virtual_iface_binding_get(
         &self,
-        ports: &'a [crate::ast::decl::FunctionPort],
-        items: &'a [crate::ast::stmt::Statement],
-        formals: &mut Vec<(&'a str, Option<&'a Expression>)>,
-    ) {
-        let ports = ports
-            .iter()
-            .filter(|p| !Self::formal_may_carry_vif(&p.data_type))
-            .map(|p| p.name.name.as_str());
-        for name in ports.chain(Self::body_decl_names(items)) {
-            if self.vif_local_names.contains(name) && !formals.iter().any(|f| f.0 == name) {
-                formals.push((name, None));
-            }
+        th: usize,
+        prop: &str,
+    ) -> Option<&(String, Option<String>)> {
+        if self.virtual_iface_bindings.is_empty() {
+            return None;
         }
+        if self.virtual_iface_bindings.capacity() <= 16 {
+            return self
+                .virtual_iface_bindings
+                .iter()
+                .find(|((h, p), _)| *h == th && p == prop)
+                .map(|(_, v)| v);
+        }
+        self.virtual_iface_bindings.get(&(th, prop.to_string()))
     }
 
-    /// The variables declared at the top level of a subroutine body.
-    pub(super) fn body_decl_names(
-        items: &[crate::ast::stmt::Statement],
-    ) -> impl Iterator<Item = &str> {
-        use crate::ast::stmt::StatementKind;
-        items
-            .iter()
-            .filter_map(|s| match &s.kind {
-                StatementKind::VarDecl { declarators, .. }
-                | StatementKind::ParamDecl { declarators, .. } => Some(declarators),
-                _ => None,
+    /// Whether a concrete type-parameter binding string names a virtual interface.
+    pub(super) fn bound_type_is_vif(&self, bound: &str) -> bool {
+        let explicit = bound.trim_start().starts_with("virtual");
+        let base = bound
+            .trim_start_matches("virtual")
+            .trim()
+            .split(['#', '.'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        (self.module.interfaces.contains(base)
+            && (explicit
+                || !(self.module.classes.contains_key(base)
+                    || self.module.covergroups.contains_key(base))))
+            || self
+                .module
+                .typedef_types
+                .get(bound)
+                .is_some_and(|dt| self.is_virtual_iface_type(dt))
+            || bound.split_once("::").is_some_and(|(cls, leaf)| {
+                self.class_local_typedef(cls, leaf)
+                    .is_some_and(|dt| self.is_virtual_iface_type(dt))
             })
-            .flatten()
-            .map(|d| d.name.name.as_str())
     }
 
-    /// §25.9 `__vif_local__` keys on call entry: each formal takes its
-    /// actual's interface binding, or none. The keys are flat by formal
-    /// name, so the caller's values are returned for `vif_formals_exit` to
-    /// restore — a nested call with a same-named formal must not clobber
-    /// them.
-    pub(super) fn vif_formals_enter(
+    /// Classify a formal type `dt` of a method of `(handle, cname)` as:
+    /// `Some(true)` = definitely a virtual interface in that specialization,
+    /// `Some(false)` = definitely not a virtual interface,
+    /// `None` = unresolved type reference / type parameter.
+    pub(super) fn method_formal_vif_kind(
         &mut self,
-        formals: &[(&str, Option<&Expression>)],
-    ) -> Vec<(String, Option<Value>)> {
-        // Resolve every actual before any key changes: an actual may name
-        // a caller formal that shares a key with an earlier callee formal.
-        let bound: Vec<Option<String>> = formals
-            .iter()
-            .map(|(_, a)| a.and_then(|a| self.resolve_vif_rhs_name_strict(a)))
-            .collect();
-        let mut saved = Vec::with_capacity(formals.len());
-        for ((name, _), nm) in formals.iter().zip(bound) {
-            // No key was ever made for this name and none is made now: the
-            // removal would find nothing, so nothing is written. An empty key
-            // marks the slot for the exit.
-            if nm.is_none() && !self.vif_local_names.contains(*name) {
-                saved.push((String::new(), None));
-                continue;
-            }
-            let key = format!("__vif_local__{}", name);
-            let prev = match nm {
-                Some(nm) => {
-                    self.vif_local_names.insert(name.to_string());
-                    self.signals.insert(key.clone(), Value::from_string(&nm))
-                }
-                None => self.signals.remove(&key),
-            };
-            saved.push((key, prev));
+        handle: usize,
+        cname: &str,
+        dt: &DataType,
+    ) -> Option<bool> {
+        let mut cur = self.typedef_chain_scoped(dt);
+        if let DataType::TypeReference { name, .. } = cur
+            && !name.has_scope()
+            && let Some(lt) = self.class_local_typedef(cname, &name.name.name)
+        {
+            cur = self.typedef_chain_scoped(lt);
         }
-        saved
-    }
-
-    /// On call exit: the bindings the `outputs` formals ended with, keyed by
-    /// formal name; then the caller's keys are put back.
-    pub(super) fn vif_formals_exit(
-        &mut self,
-        saved: Vec<(String, Option<Value>)>,
-        formals: &[(&str, Option<&Expression>)],
-        outputs: &[&str],
-    ) -> HashMap<String, String> {
-        let mut ended: HashMap<String, String> = HashMap::default();
-        for pn in outputs {
-            if !self.vif_local_names.contains(*pn) {
-                continue;
+        match cur {
+            DataType::Interface { .. } => Some(true),
+            DataType::TypeReference { name, .. } => {
+                let tn = name.name.name.as_str();
+                if self.module.interfaces.contains(tn) {
+                    return Some(
+                        !(self.module.classes.contains_key(tn)
+                            || self.module.covergroups.contains_key(tn)),
+                    );
+                }
+                if self.module.classes.contains_key(tn)
+                    || self.module.covergroups.contains_key(tn)
+                    || self.module.enum_members.contains_key(tn)
+                    || self.module.typedefs.contains_key(tn)
+                {
+                    return Some(false);
+                }
+                if !self.class_member_names().params.contains(tn) {
+                    return None;
+                }
+                let tn = name.name.name.clone();
+                let cur_owned = cur.clone();
+                let bound = if handle == 0 {
+                    self.resolve_type_param_binding(&tn)
+                        .or_else(|| self.type_param_concrete_in(&cur_owned, cname))
+                } else {
+                    self.this_stack.push(Some(handle));
+                    let saved_spec = self.current_spec.take();
+                    let b = self.type_param_concrete_in(&cur_owned, cname).or_else(|| {
+                        let sp = self
+                            .heap
+                            .get(handle)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|i| i.spec.clone());
+                        self.resolve_type_param_with(&tn, &sp)
+                    });
+                    self.current_spec = saved_spec;
+                    self.this_stack.pop();
+                    b
+                };
+                bound.and_then(|b| self.bound_type_is_vif(&b).then_some(true))
             }
-            if let Some(v) = self.signals.get(&format!("__vif_local__{}", pn)) {
-                ended.insert(pn.to_string(), v.to_sv_string());
-            }
+            _ => Some(false),
         }
-        for ((key, prev), (name, _)) in saved.into_iter().zip(formals.iter()) {
-            // Untouched on entry: the key exists only if the body made one.
-            let key = if key.is_empty() {
-                if !self.vif_local_names.contains(*name) {
-                    continue;
-                }
-                format!("__vif_local__{}", name)
-            } else {
-                key
-            };
-            match prev {
-                Some(v) => {
-                    self.signals.insert(key, v);
-                }
-                None => {
-                    self.signals.remove(&key);
-                }
-            }
-        }
-        ended
     }
 
     /// Bind an out/inout actual to interface instance `inst`.
@@ -1132,7 +1191,20 @@ impl Simulator {
             _ => None,
         };
         if let Some(d) = dotted {
-            if self.signal_name_to_id.contains_key(d.as_str()) || self.signals.contains_key(&d) {
+            if self.signal_name_to_id.contains_key(d.as_str())
+                || self.signals.contains_key(&d)
+                || self.module.arrays.contains_key(&d)
+                || self.module.arrays_2d.contains_key(&d)
+                || self.module.arrays_nd.contains_key(&d)
+                || self.module.dynamic_arrays.contains(&d)
+                || self.module.queue_vars.contains(&d)
+                || self.module.associative_arrays.contains_key(&d)
+                || self
+                    .module
+                    .var_decl_types
+                    .get(&d)
+                    .is_some_and(|dt| !self.is_virtual_iface_type(dt))
+            {
                 return None;
             }
         }
@@ -1368,8 +1440,8 @@ impl Simulator {
                         // value path stores the null handle — keeping a
                         // later `vif == null` true.
                         if frame_local {
-                            if let Some(f) = self.local_iface_aliases.last_mut() {
-                                f.insert(name.to_string(), String::new());
+                            if let Some(f) = self.local_vif_frame_mut() {
+                                f.bindings.insert(name.to_string(), String::new());
                             }
                         } else {
                             self.viface_var_aliases.remove(name);
@@ -1380,23 +1452,25 @@ impl Simulator {
                         // arm). Without this, accessor-style getters returned
                         // only the sentinel and the alias was lost.
                         self.last_vif_return = None;
+                        self.pending_vif_return = None;
                         let v = self.eval_expr(rvalue);
-                        let returned = self.last_vif_return.take().or_else(|| {
+                        let pending = self.pending_vif_return.take();
+                        let returned = self.last_vif_return.take().or(pending).or_else(|| {
                             v.to_u64()
                                 .and_then(|token| self.iface_by_token(token))
                                 .map(str::to_string)
                         });
                         if let Some(bound) = returned {
                             if frame_local {
-                                if let Some(f) = self.local_iface_aliases.last_mut() {
-                                    f.insert(name.to_string(), bound);
+                                if let Some(f) = self.local_vif_frame_mut() {
+                                    f.bindings.insert(name.to_string(), bound);
                                 }
                             } else {
                                 self.viface_var_aliases.insert(name.to_string(), bound);
                             }
                         } else if frame_local {
-                            if let Some(f) = self.local_iface_aliases.last_mut() {
-                                f.insert(name.to_string(), String::new());
+                            if let Some(f) = self.local_vif_frame_mut() {
+                                f.bindings.insert(name.to_string(), String::new());
                             }
                         } else {
                             self.viface_var_aliases.remove(name);
@@ -1413,8 +1487,8 @@ impl Simulator {
                             // existence checks pass.
                             let token = Self::iface_handle_token(&bound);
                             if frame_local {
-                                if let Some(f) = self.local_iface_aliases.last_mut() {
-                                    f.insert(name.clone(), bound);
+                                if let Some(f) = self.local_vif_frame_mut() {
+                                    f.bindings.insert(name, bound);
                                 }
                             } else {
                                 self.viface_var_aliases.insert(name, bound);
@@ -1432,8 +1506,8 @@ impl Simulator {
                             self.eval_expr(rvalue)
                         };
                         if frame_local {
-                            if let Some(f) = self.local_iface_aliases.last_mut() {
-                                f.insert(name.to_string(), String::new());
+                            if let Some(f) = self.local_vif_frame_mut() {
+                                f.bindings.insert(name.to_string(), String::new());
                             }
                         } else {
                             self.viface_var_aliases.remove(name);
@@ -1859,58 +1933,40 @@ impl Simulator {
             // `v` — a bound vif of the current `this`, else a vif
             // formal/local alias (LRM §25.9), else a direct instance.
             ExprKind::Ident(h) if h.path.len() == 1 => {
-                let raw = h.path[0].name.name.clone();
-                if let Some(bound) = self.vif_frame_alias(&raw) {
+                let raw = h.path[0].name.name.as_str();
+                if let Some(bound) = self.vif_frame_alias(raw) {
                     return bound;
                 }
+                if self.local_stack.last().is_some_and(|l| l.contains_key(raw))
+                    || self
+                        .ref_alias_stack
+                        .last()
+                        .is_some_and(|m| m.contains_key(raw))
+                {
+                    return None;
+                }
                 if let Some(th) = self.this_stack.last().copied().flatten() {
-                    if let Some((b, _)) = self.virtual_iface_bindings.get(&(th, raw.clone())) {
+                    if !self.virtual_iface_bindings.is_empty()
+                        && self.vif_prop_name_possible(raw)
+                        && let Some((b, _)) = self.virtual_iface_binding_get(th, raw)
+                    {
                         return Some(b.clone());
                     }
-                }
-                // Check for a recorded local/module-level vif binding: when
-                // config_db GET lands into a variable with no class context, we
-                // record the interface name in signals["__vif_local__<var>"] so a
-                // later `obj.vif_prop = local_var` can propagate the binding.
-                if let Some(th) = self.this_stack.last().copied().flatten() {
-                    let hit = {
-                        let mut k = self.vif_key_scratch.borrow_mut();
-                        k.clear();
-                        {
-                            use std::fmt::Write as _;
-                            let _ = write!(k, "__vif_local__{}#{}", th, raw);
-                        }
-                        self.signals.get(k.as_str()).map(|v| v.to_sv_string())
-                    };
-                    if let Some(s) = hit {
-                        if !s.is_empty() {
-                            return Some(s);
-                        }
-                    }
-                }
-                let hit = {
-                    let mut k = self.vif_key_scratch.borrow_mut();
-                    k.clear();
+                    if !self.prop_vif_bindings.is_empty()
+                        && let Some(s) = self.prop_vif_bindings.get(&th).and_then(|m| m.get(raw))
                     {
-                        use std::fmt::Write as _;
-                        let _ = write!(k, "__vif_local__{}", raw);
-                    }
-                    self.signals.get(k.as_str()).map(|v| v.to_sv_string())
-                };
-                if let Some(s) = hit {
-                    if !s.is_empty() && self.vif_flat_key_applies(&raw) {
-                        return Some(s);
+                        return Some(s.clone());
                     }
                 }
                 // §23.9: a local or a property of `this` hides a same-named
                 // interface instance (or vif alias) of an enclosing scope.
-                if self.data_name_shadows_iface(&raw) {
+                if self.data_name_shadows_iface(raw) {
                     return None;
                 }
-                if let Some(b) = self.iface_alias_for(&raw) {
+                if let Some(b) = self.iface_alias_for(raw) {
                     return Some(b);
                 }
-                Some(raw)
+                Some(raw.to_string())
             }
             // `obj.v` — a bound vif of another object.
             ExprKind::Ident(h) if h.path.len() == 2 => {
@@ -2360,13 +2416,28 @@ impl Simulator {
         expr: &Expression,
         value: Value,
     ) -> Value {
-        if !Self::formal_may_carry_vif(&port.data_type)
-            || !self.is_virtual_iface_type(&port.data_type)
-            || self.vif_collection_formal(port)
-        {
+        let is_vif = Self::formal_may_carry_vif(&port.data_type)
+            && self.is_virtual_iface_type(&port.data_type)
+            && !self.vif_collection_formal(port);
+        self.vif_argument_value_resolved(
+            is_vif,
+            matches!(port.direction, crate::ast::types::PortDirection::Output),
+            expr,
+            value,
+        )
+    }
+
+    pub(super) fn vif_argument_value_resolved(
+        &self,
+        is_vif: bool,
+        is_output: bool,
+        expr: &Expression,
+        value: Value,
+    ) -> Value {
+        if !is_vif {
             return value;
         }
-        if matches!(port.direction, crate::ast::types::PortDirection::Output) {
+        if is_output {
             return Value::zero(32);
         }
         if value
@@ -2384,9 +2455,8 @@ impl Simulator {
     /// §13.5.1/§25.9: is `port` a COLLECTION of virtual interfaces (`virtual
     /// X f[]`, `f[$]`, `f[2]`, a typedef'd `vif_arr_t f`)? Its elements hold
     /// the handle tokens, bound by the collection binders; the scalar alias
-    /// machinery (`__vif_local__`, `local_iface_aliases`, the output
-    /// writeback) must leave it alone — treating it as one scalar vif
-    /// aliased the whole array to null (#925).
+    /// machinery (`local_iface_aliases`, the output writeback) must leave it alone —
+    /// treating it as one scalar vif aliased the whole array to null (#925).
     pub(super) fn vif_collection_formal(&self, port: &crate::ast::decl::FunctionPort) -> bool {
         if !port.dimensions.is_empty() {
             return true;
@@ -2431,10 +2501,7 @@ impl Simulator {
     /// A getter used as an argument has already delivered its token to the
     /// formal. Its return marker must not bind the callee's scalar result.
     pub(super) fn consume_vif_argument_return(&mut self) {
-        if self.vif_return_pending {
-            self.signals.remove("__vif_return__");
-            self.vif_return_pending = false;
-        }
+        self.pending_vif_return = None;
         self.last_vif_return = None;
     }
 
@@ -4186,28 +4253,33 @@ impl Simulator {
     /// a module-level vif variable alias)?
     #[inline]
     pub(super) fn iface_alias_possible(&self) -> bool {
-        self.local_iface_aliases
-            .last()
-            .is_some_and(|m| !m.is_empty())
+        self.local_vif_frame()
+            .is_some_and(|m| !m.bindings.is_empty())
             || !self.viface_var_aliases.is_empty()
     }
 
     /// Could the bare name `raw` resolve through any virtual-interface
-    /// source: an alias, a vif property (binding keys are vif properties),
-    /// a `__vif_local__` key, or an interface instance of that name? When
-    /// false every vif lookup on it misses.
+    /// source: an alias in the active frame or module scope, a vif property,
+    /// a per-object type-parameterized vif binding, or an interface instance
+    /// of that name? When false every vif lookup on it misses.
     pub(super) fn vif_name_possible(&self, raw: &str) -> bool {
-        self.iface_alias_possible()
-            || self.class_member_names().vif_props.contains(raw)
-            || self.vif_local_names.contains(raw)
+        self.local_vif_frame()
+            .is_some_and(|f| f.bindings.contains_key(raw))
+            || (!self.viface_var_aliases.is_empty()
+                && (self.viface_var_aliases.contains_key(raw)
+                    || (!self.contested_pkg_vars.is_empty()
+                        && self
+                            .viface_var_aliases
+                            .contains_key(self.vif_variable_name(raw).as_ref()))))
+            || self.vif_prop_name_possible(raw)
+            || self.this_has_prop_vif(raw)
             || self.is_interface_instance(raw)
     }
 
     /// Could `resolve_vif_rhs_name(e)` come back with an interface-instance
     /// name? Its sources: a vif binding (keyed by a vif property name), a
-    /// `__vif_local__` key, an alias, the name itself, an interface instance
-    /// reached by path (whose last segment is a tail of an instance path),
-    /// or an element `a[i]` of an interface-instance array. When false the
+    /// frame-local alias, an interface instance reached by path (whose last
+    /// segment is a tail of an instance path), or an element `a[i]` of an interface-instance array. When false the
     /// strict resolver returns None and callers filtering on
     /// `is_interface_instance` find nothing; the resolver only reads state.
     pub(super) fn vif_rhs_possible(&self, e: &Expression) -> bool {
@@ -4276,7 +4348,10 @@ impl Simulator {
                         // §25.10: an element of a vif array / collection
                         // (`vq[i]`, `pa[i]`).
                         || self.vif_prop_name_possible(n)
-                        || self.vif_local_names.contains(n)
+                        || self
+                            .local_vif_frame()
+                            .is_some_and(|f| f.bindings.contains_key(n))
+                        || self.this_has_prop_vif(n)
                         || self.module.var_decl_types.get(n)
                             .is_some_and(|dt| self.is_virtual_iface_type(dt))
                         || (self.vif_tokens_stored && self.vif_collection(n))
@@ -4357,48 +4432,34 @@ impl Simulator {
         }
     }
 
-    /// §23.9/§25.9: task formals use their binding frame. Function formals
-    /// retain flat-slot lookup for bound values and an explicit null marker
-    /// for unbound ones. Generic class aliases are not vif variables.
+    /// §23.9/§25.9: per-frame virtual-interface formal and local aliases.
+    /// Returns `Some(Some(inst))` if bound, `Some(None)` if declared vif and
+    /// unbound (`null`), or `None` if `name` is not a vif alias in this frame.
     pub(super) fn vif_frame_alias(&self, name: &str) -> Option<Option<String>> {
-        let frame = self.local_iface_aliases.last()?;
-        if !frame.contains_key("__xezim_task_vif_frame__") {
-            // Function formals also carry an explicit null marker. Bound
-            // function values keep their existing flat-slot lookup order.
-            return (frame.get(name).is_some_and(String::is_empty)
-                && self
-                    .local_stack
-                    .last()
-                    .is_some_and(|f| f.contains_key(name)))
-            .then_some(None);
+        let frame = self.local_vif_frame()?;
+        let bound = frame.bindings.get(name)?;
+        if frame.is_task_frame
+            && let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(name))
+        {
+            let b = self
+                .ref_alias_peek(storage)
+                .and_then(|v| v.to_u64())
+                .and_then(|t| self.iface_by_token(t))
+                .map(str::to_string);
+            return Some(b);
         }
-        let bound = frame.get(name)?;
-        let owned = self
-            .local_stack
-            .last()
-            .is_some_and(|f| f.contains_key(name))
-            || self
-                .ref_alias_stack
-                .last()
-                .is_some_and(|f| f.contains_key(name));
-        if owned && (bound.is_empty() || self.is_interface_instance(bound)) {
-            Some(self.iface_alias_for(name))
-        } else {
-            None
+        if bound.is_empty() {
+            return Some(None);
         }
+        self.is_interface_instance(bound)
+            .then(|| Some(bound.clone()))
     }
 
     pub(super) fn iface_alias_for(&self, name: &str) -> Option<String> {
-        if let Some(b) = self
-            .local_iface_aliases
-            .last()
-            .filter(|frame| !frame.is_empty())
-            .and_then(|frame| frame.get(name))
+        if let Some(frame) = self.local_vif_frame()
+            && let Some(b) = frame.bindings.get(name)
         {
-            if self
-                .local_iface_aliases
-                .last()
-                .is_some_and(|f| f.contains_key("__xezim_task_vif_frame__"))
+            if frame.is_task_frame
                 && let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(name))
             {
                 return self
@@ -4934,23 +4995,7 @@ impl Simulator {
                 // vif passed through config_db arrived as nothing
                 // (issue #113: the driver's vif stayed null).
                 if let Some(resolved) = self.resolve_type_param_binding(n) {
-                    let explicit_virtual = resolved.trim_start().starts_with("virtual");
-                    let base = resolved
-                        .trim_start_matches("virtual")
-                        .trim()
-                        .split(['#', '.'])
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    if self.module.interfaces.contains(&base) {
-                        // §3.13: a bare type argument that also names a class
-                        // (`registry#(mon)` beside `interface mon`) is the
-                        // class; only `virtual mon` denotes the interface.
-                        return explicit_virtual
-                            || !(self.module.classes.contains_key(&base)
-                                || self.module.covergroups.contains_key(&base));
-                    }
+                    return self.bound_type_is_vif(&resolved);
                 }
                 false
             }

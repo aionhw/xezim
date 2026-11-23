@@ -1384,3 +1384,6 @@ mod randomize_signed_modulo_elements;
 
 #[path = "classes/inherited_packed_typedef_width.rs"]
 mod inherited_packed_typedef_width;
+
+#[path = "classes/waiting_vif_formal_name_reuse_1478.rs"]
+mod waiting_vif_formal_name_reuse_1478;

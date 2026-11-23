@@ -164,9 +164,9 @@ pub(super) struct ClassMemberNames {
     pub(super) ident_slow_first: std::cell::OnceCell<[bool; 256]>,
 }
 
-/// A foreach index variable's outer state, restored when the loop exits:
+/// A foreach/for index variable's outer state, restored when the loop exits:
 /// (name, value, lived in a frame, typedef binding, trusted mark, packed
-/// struct layout).
+/// struct layout, (width, signed), shadowed vif frame alias).
 pub(super) type LoopVarSnapshot = (
     String,
     Option<Value>,
@@ -175,6 +175,7 @@ pub(super) type LoopVarSnapshot = (
     bool,
     Option<Vec<(String, u32, u32)>>,
     (Option<u32>, bool),
+    Option<String>,
 );
 
 /// `instance_assoc_member`'s class-only verdict for a bare name inside a

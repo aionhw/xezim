@@ -973,6 +973,7 @@ impl Simulator {
             return Bind::Object;
         }
         if self.local_stack.last().is_some_and(|f| f.contains_key(n))
+            || self.local_vif_frame().is_some_and(|f| f.bindings.contains_key(n))
             || self.dyn_name_lookup_innermost(n).is_some()
             || self.class_chain_declares(cx.caller_class.as_deref(), n)
         {

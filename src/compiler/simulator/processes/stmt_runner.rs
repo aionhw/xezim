@@ -2252,6 +2252,13 @@ impl Simulator {
                                 if let Some(frame) = self.local_stack.last_mut() {
                                     frame.insert(name.name.clone(), rv);
                                     self.hide_loop_static(&name.name, &mut static_hidden);
+                                    if let Some(aliases) = self
+                                        .local_iface_aliases
+                                        .last_mut()
+                                        .and_then(Option::as_deref_mut)
+                                    {
+                                        aliases.bindings.remove(&name.name);
+                                    }
                                 } else {
                                     // §12.7.1: a variable declared in the for-init
                                     // has AUTOMATIC lifetime — it is local to the
@@ -2653,10 +2660,15 @@ impl Simulator {
                                     }
                                 }
                             }
+                            if keys.is_empty() {
+                                i += 1;
+                                continue;
+                            }
                             let fe_names: Vec<String> = vars
                                 .iter()
                                 .filter_map(|v| v.as_ref().map(|id| id.name.clone()))
                                 .collect();
+                            let fe_saved = self.snapshot_loop_vars(&fe_names);
                             let fe_auto_len = self.auto_loop_vars.len();
                             // foreach index vars are automatic (§9.7.3); like
                             // for-init vars, record for fork capture.
@@ -2670,11 +2682,6 @@ impl Simulator {
                                 .and_then(|v| v.as_ref().map(|id| id.name.clone()));
                             if let Some(vn) = &loop_var {
                                 self.widths.insert(vn.clone(), key_type.0);
-                            }
-                            if keys.is_empty() {
-                                self.auto_loop_vars.truncate(fe_auto_len);
-                                i += 1;
-                                continue;
                             }
                             // §6.21, §12.7.3: the loop variable hides the
                             // subroutine's same-named `static` local until the
@@ -2718,36 +2725,37 @@ impl Simulator {
                                     end: 0,
                                 },
                             ));
-                            let mut tail_stmts = vec![Statement::new(
-                                StatementKind::ForeachTail {
-                                    loop_var,
-                                    var_scope,
-                                    body: marker,
-                                    keys,
-                                    is_str,
-                                    key_type,
-                                    idx: 1,
-                                    fe_auto_len,
-                                    live_size_name,
-                                },
-                                stmt.span,
-                            )];
-                            // Each later iteration's tail resumes this frame
-                            // after its first statement, so its trailing
-                            // `Null` runs once, when the loop ends, and shows
-                            // the hidden statics again (`block_scope_sentinel`).
-                            if static_hidden.is_some() {
-                                tail_stmts.push(Statement::new(StatementKind::Null, stmt.span));
-                            }
-                            let tail = pc.pushed(tail_stmts, pc.start + i + 1);
-                            if static_hidden.is_some() {
+                            let wrap_frame: Arc<[Statement]> = Arc::from(vec![
+                                Statement::new(
+                                    StatementKind::ForeachTail {
+                                        loop_var,
+                                        var_scope,
+                                        body: marker,
+                                        keys,
+                                        is_str,
+                                        key_type,
+                                        idx: 1,
+                                        fe_auto_len,
+                                        live_size_name,
+                                    },
+                                    stmt.span,
+                                ),
+                                // Each later iteration's tail resumes this frame
+                                // after its first statement, so its trailing
+                                // `Null` runs once, when the loop ends, and restores
+                                // loop variables and hidden statics (`block_scope_sentinel`).
+                                Statement::new(StatementKind::Null, stmt.span),
+                            ]);
+                            if !fe_saved.is_empty() || static_hidden.is_some() {
                                 self.block_scope_saves.push(BlockScopeSave {
-                                    frame_key: Self::frame_key(&tail.stmts),
+                                    frame_key: Self::frame_key(&wrap_frame),
                                     frame_gen: self.local_gen_stack.last().copied().unwrap_or(0),
+                                    loop_vars: fe_saved,
                                     static_hidden,
                                     ..Default::default()
                                 });
                             }
+                            let tail = pc.pushed_frame(wrap_frame, pc.start + i + 1);
                             let cont = tail.pushed_frame(body_frame, 0);
                             self.continue_stmts_or_trampoline(pid, cont);
                             return;

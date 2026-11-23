@@ -34,6 +34,13 @@ pub(super) struct FormalMetaParts {
     pub(super) typedef_type: Option<String>,
 }
 
+/// Per-frame virtual-interface formal and local aliases (`local_iface_aliases`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(super) struct VifAliasFrame {
+    pub(super) is_task_frame: bool,
+    pub(super) bindings: HashMap<String, String>,
+}
+
 /// Declaration facts of one class method's formals and return value, built
 /// once per method (see `Simulator::method_call_plan`). The facts marked
 /// "type tables" read `typedefs` / `typedef_types` / `parameters` /
@@ -48,9 +55,9 @@ pub(super) struct MethodCallPlan {
     pub(super) type_gen: u64,
     pub(super) ports: Vec<PortPlan>,
     pub(super) ret: Option<RetPlan>,
-    /// Every formal is a plain scalar or plain class: none has an actual to
-    /// resolve as a virtual interface (type tables).
-    pub(super) all_plain: bool,
+    /// Every formal has `never_vif == true` (type tables): no formal can
+    /// carry a virtual-interface alias.
+    pub(super) all_never_vif: bool,
     /// The `formal_meta_name` positions: the names whose metadata a call
     /// saves and restores (declaration only).
     pub(super) meta_ks: Vec<usize>,
@@ -58,9 +65,6 @@ pub(super) struct MethodCallPlan {
     pub(super) meta_bloom: u64,
     /// `meta_key_bits` of each of those names, by position.
     pub(super) meta_bits: Vec<u64>,
-    /// `(vif_local_names.len(), no formal name is in vif_local_names)` at the
-    /// last look; the set only grows, so an equal length is the same set.
-    pub(super) vif_absent: std::cell::Cell<(usize, bool)>,
 }
 
 impl MethodCallPlan {
@@ -259,10 +263,9 @@ pub(super) struct BlockScopeSave {
     pub(super) declarations: Vec<DeclShadow>,
     /// The enclosing frame's string-kind overlay, not the global name table.
     pub(super) string_kinds: Vec<(String, Option<bool>)>,
-    /// Virtual-interface aliases and auxiliary slots hidden by this block.
+    /// Virtual-interface aliases hidden by this block.
     pub(super) vif_aliases: Vec<(String, Option<String>)>,
-    pub(super) vif_slots: Vec<(String, Option<Value>)>,
-    /// A suspend-aware for loop closes its variable scope at the same sentinel.
+    /// A suspend-aware for/foreach loop closes its variable scope at the same sentinel.
     pub(super) loop_vars: Vec<LoopVarSnapshot>,
     pub(super) owns_loop_frame: bool,
     /// Enclosing collection renames (`local_dyn`) the block's collection
@@ -306,8 +309,6 @@ pub(super) struct TaskCleanup {
     pub(super) output_bindings: Vec<(String, crate::ast::expr::Expression)>,
     /// §13.5.3: omitted outputs copy back in the declaration's scope.
     pub(super) default_output_bindings: Vec<(String, crate::ast::expr::Expression)>,
-    /// §25.9: flat binding slots shadowed by this task's formals.
-    pub(super) saved_vif_formals: Vec<(String, Option<Value>)>,
     pub(super) assoc_params: Vec<(String, String, bool)>,
     pub(super) array_params: Vec<String>,
     /// `(formal, actual, lo, hi)` for an `output`/`inout`/`ref` ARRAY formal:
