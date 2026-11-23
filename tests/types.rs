@@ -913,3 +913,6 @@ mod nested_two_state_packed_member;
 
 #[path = "types/packed_package_field_net_width.rs"]
 mod packed_package_field_net_width;
+
+#[path = "types/transitive_packed_typedef_width.rs"]
+mod transitive_packed_typedef_width;
