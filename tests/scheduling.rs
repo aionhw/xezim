@@ -103,6 +103,8 @@ mod deferred_immediate_assertions;
 mod procedural_assert_after_delay;
 #[path = "scheduling/procedural_assert_woken_off_tick.rs"]
 mod procedural_assert_woken_off_tick;
+#[path = "scheduling/wait_released_by_edge_woken_writer.rs"]
+mod wait_released_by_edge_woken_writer;
 #[path = "scheduling/delay_lands_on_clock_edge.rs"]
 mod delay_lands_on_clock_edge;
 #[path = "scheduling/delay_spike_warning.rs"]
