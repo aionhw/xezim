@@ -1,0 +1,187 @@
+//! Initializers of static dynamic arrays, queues and associative arrays.
+//!
+//! A static collection shares one store per declaring class. The store was
+//! registered empty and its initializer never ran, so `Cls::set.size()` read
+//! 0 and a constraint `v inside {set}` had no solution: `randomize()`
+//! returned 0 and left every field at its old value.
+
+use xezim::simulate;
+
+fn messages(src: &str) -> Vec<String> {
+    let sim = simulate(src, 100).expect("simulation failed");
+    sim.output.iter().map(|o| o.message.clone()).collect()
+}
+
+fn expect(out: &[String], line: &str) {
+    assert!(
+        out.iter().any(|m| m == line),
+        "missing {line:?}; output: {out:?}"
+    );
+}
+
+/// IEEE 1800-2023 §8.9, §6.8: a static property's initializer sets its one
+/// copy before any initial procedure runs.
+#[test]
+fn static_dynamic_array_and_queue_initializers() {
+    let src = r#"
+module t;
+  typedef enum logic [2:0] {A = 3'b000, B = 3'b001, C = 3'b010} e_t;
+  class T;
+    static e_t s_e[]  = '{A, B, C};
+    static int s_i[]  = '{4, 5, 6};
+    static bit s_b[]  = '{0, 1};
+    static int s_q[$] = {7, 8};
+  endclass
+  initial begin
+    T x = new;
+    $display("sizes %0d %0d %0d %0d", T::s_e.size(), T::s_i.size(), T::s_b.size(), T::s_q.size());
+    $display("values %s %0d %0d %0d", T::s_e[2].name(), T::s_i[1], T::s_b[1], T::s_q[$]);
+    $display("through handle %0d", x.s_i[2]);
+  end
+endmodule
+"#;
+    let out = messages(src);
+    expect(&out, "sizes 3 3 2 2");
+    expect(&out, "values C 5 1 8");
+    expect(&out, "through handle 6");
+}
+
+/// IEEE 1800-2023 §18.5.5: `inside` over a static array draws from its
+/// elements. This is the constraint shape that failed every `randomize()`.
+#[test]
+fn inside_static_array_constraint_solves() {
+    let src = r#"
+module t;
+  typedef enum logic [2:0] {A = 3'b000, B = 3'b001, C = 3'b010, Z = 3'b111} e_t;
+  class T;
+    static e_t e_set[] = '{A, B, C};
+    static bit m_set[] = '{1};
+    rand e_t   v;
+    rand logic m;
+    constraint c { v inside {e_set}; m inside {m_set}; }
+  endclass
+  initial begin
+    T t = new;
+    int ok = 1;
+    for (int i = 0; i < 20; i++) begin
+      if (!t.randomize() || !(t.v inside {A, B, C}) || t.m !== 1'b1) ok = 0;
+    end
+    $display("inside ok=%0d", ok);
+  end
+endmodule
+"#;
+    expect(&messages(src), "inside ok=1");
+}
+
+/// IEEE 1800-2023 §7.9.11, §8.9: an associative-array pattern, with a
+/// `default:` item, initializes a static associative array.
+#[test]
+fn static_associative_array_initializers() {
+    let src = r#"
+module t;
+  class T;
+    static int s_s[string] = '{"a": 1, "b": 2};
+    static int s_i[int]    = '{3: 30, default: -1};
+  endclass
+  initial begin
+    $display("aa %0d %0d %0d", T::s_s.num(), T::s_s["b"], T::s_i.num());
+    $display("keyed %0d default %0d", T::s_i[3], T::s_i[9]);
+  end
+endmodule
+"#;
+    let out = messages(src);
+    expect(&out, "aa 2 2 1");
+    expect(&out, "keyed 30 default -1");
+}
+
+/// The same initializers for a class declared in a module instantiated
+/// below the top, and for two classes that each declare a static array of
+/// the same name (one store per declaring class, §8.9).
+#[test]
+fn static_collection_initializers_nested_and_per_class() {
+    let src = r#"
+module tb_mod;
+  class P;
+    static int set[] = '{1, 2, 3};
+  endclass
+  class Q;
+    static int set[] = '{10, 20};
+  endclass
+  initial begin
+    $display("P %0d %0d", P::set.size(), P::set[2]);
+    $display("Q %0d %0d", Q::set.size(), Q::set[1]);
+  end
+endmodule
+
+module top;
+  tb_mod u();
+endmodule
+"#;
+    let out = messages(src);
+    expect(&out, "P 3 3");
+    expect(&out, "Q 2 20");
+}
+
+/// IEEE 1800-2023 §10.9.1, §8.9: an `N{...}` item of the initializer's
+/// pattern stands for N copies, for a static and an instance collection,
+/// and a function that returns the whole queue runs, once.
+#[test]
+fn static_collection_initializer_replication_and_call() {
+    let src = r#"
+module t;
+  typedef int q_t[$];
+  int calls;
+  function automatic q_t make_q();
+    calls++;
+    return '{4, 5, 6};
+  endfunction
+  class T;
+    static int rep[$]  = '{3{5}};
+    static int drep[]  = '{2{1, 2}};
+    static q_t made    = make_q();
+    int        irep[$] = '{2{7, 8}};
+  endclass
+  initial begin
+    T x = new;
+    $display("rep %0d %0d drep %0d %0d made %0d %0d calls %0d", T::rep.size(), T::rep[2], T::drep.size(), T::drep[3], T::made.size(), T::made[2], calls);
+    $display("irep %0d %0d", x.irep.size(), x.irep[3]);
+  end
+endmodule
+"#;
+    let out = messages(src);
+    expect(&out, "rep 3 5 drep 4 2 made 3 6 calls 1");
+    expect(&out, "irep 4 8");
+}
+
+/// IEEE 1800-2023 §11.4.12.1, §10.9.1: a replicated operand is evaluated
+/// exactly once and its value copied, as in a runtime assignment of the same
+/// pattern, so `'{3{next()}}` calls `next` once.
+#[test]
+fn replicated_initializer_operand_runs_once() {
+    let src = r#"
+module t;
+  int n;
+  function automatic int next();
+    n++;
+    return n;
+  endfunction
+  class T;
+    static int sq[$] = '{3{next()}};
+    int        iq[$] = '{2{next()}};
+  endclass
+  int mq[$];
+  initial begin
+    T x;
+    $display("static n=%0d q=%p", n, T::sq);
+    x = new;
+    $display("inst n=%0d q=%p", n, x.iq);
+    mq = '{3{next()}};
+    $display("runtime n=%0d q=%p", n, mq);
+  end
+endmodule
+"#;
+    let out = messages(src);
+    expect(&out, "static n=1 q='{1, 1, 1}");
+    expect(&out, "inst n=2 q='{2, 2}");
+    expect(&out, "runtime n=3 q='{3, 3, 3}");
+}
