@@ -1379,3 +1379,5 @@ mod rand_srandom_reseed_repeats;
 mod review_rand_srandom_streams;
 #[path = "classes/class_row_replication_once.rs"]
 mod class_row_replication_once;
+#[path = "classes/inherited_packed_typedef_width.rs"]
+mod inherited_packed_typedef_width;
