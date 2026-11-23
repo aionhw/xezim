@@ -683,6 +683,65 @@ impl Simulator {
             self.initialize_class_fixed_array(&cn, &prop, &init);
         }
 
+        // §8.9, §6.8: a static dynamic array, queue or associative array
+        // with an initializer (`static sew_e set[] = '{SEW8, SEW16};`,
+        // `static int q[$] = {1, 2};`, `static int m[string] = '{"a": 1};`)
+        // has the one store registered empty above, and nothing ran its
+        // initializer: `Cls::set.size()` read 0 and a constraint
+        // `v inside {set}` had no solution. Run each initializer once, in
+        // its declaring class's static context, into that store (the
+        // `Class::name` key when two classes declare the name).
+        // Parameterized classes are skipped, as for the fixed arrays above.
+        let mut seen_coll_inits: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let static_coll_inits: Vec<(String, String, bool, u32, Expression)> = self
+            .module
+            .classes
+            .iter()
+            .filter(|(cn, _)| !self.class_is_parameterized(cn))
+            .flat_map(|(_, cd)| {
+                cd.static_collections
+                    .iter()
+                    .filter_map(|(name, is_assoc, width)| {
+                        cd.property_inits.get(name).map(|init| {
+                            (
+                                cd.name.clone(),
+                                name.clone(),
+                                *is_assoc,
+                                *width,
+                                init.clone(),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            // A module class is listed under its instance-qualified name and
+            // an alias; both are one declaration.
+            .filter(|(cn, name, ..)| seen_coll_inits.insert((cn.clone(), name.clone())))
+            .collect();
+        for (cn, name, is_assoc, width, init) in static_coll_inits {
+            let store = if colliding_names.contains(name.as_str()) {
+                format!("{}::{}", cn, name)
+            } else {
+                name
+            };
+            let signature = self.canonicalize_spec_sig(&cn, "");
+            let saved_spec = self.current_spec.replace((cn.clone(), signature));
+            self.class_context_stack.push(Some(cn));
+            self.this_stack.push(None);
+            if is_assoc {
+                let init = self.unpacked_pattern(&init);
+                if let ExprKind::AssignmentPattern(items) = &init.kind {
+                    self.assign_class_assoc_pattern(&store, width, items);
+                }
+            } else {
+                self.populate_queue_from_init(&store, &init);
+            }
+            self.this_stack.pop();
+            self.class_context_stack.pop();
+            self.current_spec = saved_spec;
+        }
+
         // Run static property initializers that call functions, e.g. riscv-dv's
         // per-instruction `static bit _ = riscv_instr::register(NAME)` (the
         // DEFINE_INSTR registration). The lazy static-init path only stores the
@@ -711,6 +770,9 @@ impl Simulator {
                     .iter()
                     .filter(|(p, e)| {
                         cd.static_properties.contains(*p)
+                            // A static collection's initializer ran above,
+                            // element by element, into its store.
+                            && !cd.static_collections.iter().any(|(n, ..)| n == *p)
                             && (Self::expr_contains_call(e)
                                 // bare `= new` (no parens) parses as an Ident,
                                 // not a Call — `static C inst = new;` must
