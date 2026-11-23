@@ -425,3 +425,5 @@ mod unpacked_concat_targets;
 mod concat_operand_effects;
 #[path = "collections/review_queue_rows_dollar_pop.rs"]
 mod review_queue_rows_dollar_pop;
+#[path = "collections/real_reduction_with.rs"]
+mod real_reduction_with;
