@@ -1393,3 +1393,6 @@ mod blocking_task_super_nested_module;
 
 #[path = "classes/static_collection_initializers.rs"]
 mod static_collection_initializers;
+
+#[path = "classes/nested_member_elem_write.rs"]
+mod nested_member_elem_write;
