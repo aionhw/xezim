@@ -415,8 +415,9 @@ impl Simulator {
         // indexed array (65,536 per testbench memory-load loop on c906), and
         // it only matters once some comb entry is downstream of a write.
         let mut writes: HashSet<String> = HashSet::default();
-        Self::collect_stmt_rw(stmt, &self.module, None, &mut writes, None);
-        if writes.is_empty() {
+        let mut arrays: HashSet<String> = HashSet::default();
+        Self::collect_stmt_rw(stmt, &self.module, None, &mut writes, Some(&mut arrays));
+        if writes.is_empty() && arrays.is_empty() {
             return false;
         }
         // A DYNAMIC array is a collection, not a signal, so its name maps to
@@ -428,7 +429,7 @@ impl Simulator {
         // held the written value. Treat any write to one as feedback so the
         // loop stays interpreted, which notifies correctly. Static arrays and
         // queues resolve through the walk normally and keep compiling.
-        if writes.iter().any(|w| {
+        if arrays.iter().any(|name| self.module.dynamic_arrays.contains(name)) || writes.iter().any(|w| {
             let base = w.split('[').next().unwrap_or(w);
             self.module.dynamic_arrays.contains(base)
         }) {
@@ -438,6 +439,23 @@ impl Simulator {
         // Every signal the writes reach through comb entries.
         let mut reached: HashSet<usize> = HashSet::default();
         let mut frontier: Vec<usize> = writes.iter().filter_map(to_id).collect();
+        // An indexed write may cover a large contiguous fixed memory. The
+        // same per-element dependency ids are already registered together.
+        // Packed arena cells have no entries in the comb dependency table.
+        let deps_end = self.comb_dep_offsets.len().saturating_sub(1);
+        for name in &arrays {
+            if let Some(&(first, lo, hi)) = self.array_first_id.get(name.as_str()) {
+                let count = (hi - lo + 1).max(0) as usize;
+                let end = first.saturating_add(count).min(deps_end);
+                frontier.extend((first..end).filter(|&id| {
+                    self.comb_dep_offsets[id] != self.comb_dep_offsets[id + 1]
+                }));
+            } else if let Some(&(lo, hi, _)) = self.module.arrays.get(name) {
+                frontier.extend((lo..=hi).filter_map(|idx| {
+                    self.signal_name_to_id.get(&format!("{name}[{idx}]")).copied()
+                }));
+            }
+        }
         let mut seen_entries: HashSet<u32> = HashSet::default();
         while let Some(id) = frontier.pop() {
             if id + 1 >= self.comb_dep_offsets.len() {
@@ -461,7 +479,8 @@ impl Simulator {
         }
         let mut reads: HashSet<String> = HashSet::default();
         writes.clear();
-        Self::collect_stmt_reads(stmt, &self.module, &mut reads, &mut writes);
+        arrays.clear();
+        Self::collect_stmt_rw(stmt, &self.module, Some(&mut reads), &mut writes, Some(&mut arrays));
         reads
             .iter()
             .filter_map(to_id)
