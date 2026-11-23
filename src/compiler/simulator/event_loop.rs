@@ -221,7 +221,7 @@ impl Simulator {
     /// `XEZIM_LAZY_PROC_SETTLE=1` opts into the LRM/reference ordering so a
     /// design that depends on it can be run (and diffed) without a rebuild.
     pub(super) fn settle_after_proc_write(&mut self) {
-        if self.in_edge_block {
+        if self.in_edge_block || self.in_pre_time0_init {
             return;
         }
         static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

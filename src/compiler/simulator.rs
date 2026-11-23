@@ -4725,6 +4725,9 @@ pub struct Simulator {
     edge_forced_fire: Vec<usize>,
     /// True while the compile-time (pre-process) time-0 settle runs.
     in_pre_process_settle: bool,
+    /// True while pre-time-0 declaration initializers run (`compile()`),
+    /// suppressing combinational settle triggers (`settle_after_proc_write`).
+    in_pre_time0_init: bool,
     /// A combinational entry is being evaluated outside the settle
     /// (`release_time0_held`): its deferred assertion reports are the
     /// block's, as in the settle (`queue_deferred_assert`).
