@@ -427,3 +427,5 @@ mod concat_operand_effects;
 mod review_queue_rows_dollar_pop;
 #[path = "collections/real_reduction_with.rs"]
 mod real_reduction_with;
+#[path = "collections/local_coll_elem_compare_1497.rs"]
+mod local_coll_elem_compare_1497;
