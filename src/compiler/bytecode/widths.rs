@@ -835,6 +835,33 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Record the element width of local collection `name` declared with
+    /// `dt`; a string or unsized element records none.
+    pub(super) fn note_local_coll_width(&mut self, name: &str, dt: &crate::ast::types::DataType) {
+        let w = if Self::dt_is_string(dt) {
+            0
+        } else {
+            self.decl_width(dt)
+        };
+        if w > 0 {
+            self.local_coll_widths.insert(name.to_string(), w);
+        } else {
+            self.local_coll_widths.remove(name);
+        }
+    }
+
+    /// The element width of the method-local collection `hier` names.
+    fn local_coll_width_of(&self, hier: &HierarchicalIdentifier) -> Option<u32> {
+        if hier.root.is_some() || hier.path.len() != 1 || !hier.path[0].selects.is_empty() {
+            return None;
+        }
+        let name = hier.path[0].name.name.as_str();
+        if !self.local_coll_names.contains(name) {
+            return None;
+        }
+        self.local_coll_widths.get(name).copied()
+    }
+
     pub(super) fn expr_max_width(&self, expr: &Expression) -> u32 {
         if let Some(q) = self.own_pkg_qualified(expr) {
             return self.expr_max_width(&q);
@@ -1035,6 +1062,15 @@ impl<'a> BytecodeCompiler<'a> {
                 // once its enclosing block compiled. The sibling of the
                 // `expr_max_width returned 1 for every index select` bug fixed
                 // in the simulator earlier — same disease, other table.
+                // A method-local queue or dynamic array (`int a[]`, read as
+                // `a[i]`) is in none of the tables below, so its element read
+                // sized at 1 bit, and a compare of two of them (`a[0] ==
+                // a[1]`, a sort's `a[j] > a[j+1]`) resized both to their
+                // LSBs first. Looked up first: the local shadows a module
+                // array of the same name.
+                ExprKind::Ident(hier) if self.local_coll_width_of(hier).is_some() => {
+                    self.local_coll_width_of(hier).unwrap_or(1)
+                }
                 ExprKind::Ident(hier) => self
                     .packed_elem_width_of(hier)
                     .or_else(|| {

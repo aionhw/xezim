@@ -178,7 +178,9 @@ thread_local! {}
 // Packed word selects inherit the declared dimensions of their bank.
 // §7.4.5: member collection reads that yield unpacked rows use their row storage.
 // §6.24.1: an integer atom cast of an integral operand copies the operand before it is fitted.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3179;
+// §11.6.1, §7.10: an element read of a method-local queue or dynamic array has its element's
+// width, so a compare of two of them no longer resizes both to one bit.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317c;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near

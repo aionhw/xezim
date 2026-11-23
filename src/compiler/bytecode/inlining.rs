@@ -1219,6 +1219,7 @@ impl<'a> BytecodeCompiler<'a> {
                     Arc::from("VarDecl_local_coll"),
                 ))));
                 self.local_coll_names.insert(decl.name.name.clone());
+                self.note_local_coll_width(&decl.name.name, data_type);
                 // §6.16: `typedef string q_t[$]` elements are
                 // strings, as a `string q[$]` local's are.
                 if self.typedef_coll_strings.contains(&type_name_key(tn)) {
@@ -1251,6 +1252,7 @@ impl<'a> BytecodeCompiler<'a> {
                     Arc::from("VarDecl_local_coll"),
                 ))));
                 self.local_coll_names.insert(decl.name.name.clone());
+                self.note_local_coll_width(&decl.name.name, data_type);
                 if Self::dt_is_string(data_type) {
                     self.local_coll_strings.insert(decl.name.name.clone());
                 } else {

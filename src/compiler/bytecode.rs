@@ -1125,6 +1125,9 @@ pub struct BytecodeCompiler<'a> {
     /// a string no fixed width, so they are never resized to a context and
     /// compare by text.
     local_coll_strings: HashSet<String>,
+    /// The element width of each `local_coll_names` entry with a fixed-width
+    /// element (`int q[$]`: 32), for sizing an element read as an operand.
+    local_coll_widths: HashMap<String, u32>,
     /// §10.8: the type an untyped assignment pattern takes, installed right
     /// before compiling an assignment-like source (an assignment RHS, an
     /// inlined formal's actual, a return value). `compile_expr_typed` takes
@@ -1417,6 +1420,7 @@ impl<'a> BytecodeCompiler<'a> {
             local_array_regs: HashMap::default(),
             local_coll_names: HashSet::default(),
             local_coll_strings: HashSet::default(),
+            local_coll_widths: HashMap::default(),
             top_module_name: None,
             packed_elem_widths: None,
             assoc_elem_widths: None,
