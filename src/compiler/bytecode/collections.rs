@@ -10,7 +10,10 @@ impl<'a> BytecodeCompiler<'a> {
         func: &Expression,
         args: &[Expression],
     ) -> Option<RegId> {
-        if self.method_mode || !args.is_empty() {
+        // Edge blocks already have explicit sensitivity and can mutate
+        // the collection through the expression fallback. Combinational
+        // compilation cannot infer dependencies from this operation.
+        if !self.allow_expr_fallback || self.method_mode || !args.is_empty() {
             return None;
         }
         let (receiver, method) = match &func.kind {
