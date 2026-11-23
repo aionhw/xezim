@@ -201,7 +201,10 @@ impl Simulator {
             match &cur.kind {
                 ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => cur = expr,
                 ExprKind::MemberAccess { expr, .. } => {
-                    return matches!(expr.kind, ExprKind::Index { .. });
+                    if matches!(expr.kind, ExprKind::Index { .. }) {
+                        return true;
+                    }
+                    cur = expr;
                 }
                 // The same path as one identifier whose scope segment
                 // carries the select (`foreach (lane[0].payload[i])`).
@@ -275,7 +278,9 @@ impl Simulator {
         base: &Expression,
         member: &crate::ast::Identifier,
     ) -> Option<Expression> {
-        if !matches!(base.kind, ExprKind::Index { .. }) || !self.has_indexed_scopes() {
+        if !self.has_indexed_scopes()
+            || !(matches!(base.kind, ExprKind::Index { .. }) || Self::select_entered_member_shape(base))
+        {
             return None;
         }
         let flat = self.select_entered_array_name(base, member)?;
