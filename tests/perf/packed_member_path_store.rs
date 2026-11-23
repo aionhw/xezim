@@ -319,3 +319,30 @@ endmodule
         .collect();
     assert_eq!(lines, ["R s=000000000"]);
 }
+/// §23.9, §12.7.1: a typed loop index shadows the module parameter. Each iteration selects
+/// its own packed substructure, with an independent one-bit and six-bit write.
+#[test]
+fn unrolled_index_selects_each_packed_member() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/perf/packed_loop_check.sv");
+    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(["--simulate", "-s", "packed_loop_check", "--no-cache"])
+        .arg(source)
+        .env("XEZIM_FALLBACK_SITES", "1")
+        .output()
+        .expect("run packed loop");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("first=6b last=66 bank=cc1ec94188616b"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("first=14 last=19 bank=33e136be779e94"),
+        "{stdout}"
+    );
+    assert!(
+        !format!("{stdout}{stderr}").contains("blocking_target_member_access"),
+        "{stdout}\n{stderr}"
+    );
+}
