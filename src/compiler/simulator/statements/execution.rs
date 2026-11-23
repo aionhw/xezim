@@ -1753,7 +1753,21 @@ impl Simulator {
                             ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
                         ) {
                             const RET_SNAP: &str = "__xz_ret_coll__";
-                            self.populate_queue_from_init(RET_SNAP, e);
+                            // The shared snapshot can still describe an earlier call.
+                            // The literal takes the active function's declared return type.
+                            let dt = self.return_frame_type();
+                            let width = dt.as_ref().map_or(32, |dt| {
+                                resolve_type_width(
+                                    dt,
+                                    Some(&self.module.parameters),
+                                    Some(&self.module.typedefs),
+                                )
+                            });
+                            let expand_rows = dt
+                                .as_ref()
+                                .and_then(|dt| self.fn_ret_coll_dims(dt))
+                                .is_none_or(|dims| dims.len() == 1);
+                            self.store_queue_literal(RET_SNAP, e, dt.as_ref(), width, expand_rows);
                             self.pending_ret_collection = Some(RET_SNAP.to_string());
                         }
                     }

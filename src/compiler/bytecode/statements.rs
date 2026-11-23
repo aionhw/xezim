@@ -448,27 +448,40 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("Return_collection_not_literal");
                         return false;
                     };
-                    let mut arg_values: Vec<RegId> = Vec::with_capacity(items.len());
-                    for item in items {
+                    let element = self
+                        .method_return_type
+                        .and_then(|dt| self.local_kind_of(dt, None));
+                    let n = items.len() as u32;
+                    let arg_start = self.alloc_reg();
+                    for _ in 1..items.len() {
+                        self.alloc_reg();
+                    }
+                    for (i, item) in items.iter().enumerate() {
                         let crate::ast::expr::AssignmentPatternItem::Ordered(item) = item else {
                             self.bail("Return_collection_named_item");
                             return false;
                         };
-                        let Some(r) = self.compile_expr(item, 0) else {
+                        // Other element types and replicated pattern items use the interpreter.
+                        let Some(kind @ LocalKind::Int { width, .. }) = element else {
+                            self.bail("Return_collection_element_type");
                             return false;
                         };
-                        arg_values.push(r);
-                    }
-                    let n = arg_values.len() as u32;
-                    let arg_start = self.alloc_reg();
-                    for _ in 1..arg_values.len() {
-                        self.alloc_reg();
-                    }
-                    for (i, &v) in arg_values.iter().enumerate() {
-                        let slot = (arg_start as usize + i) as RegId;
-                        if slot != v {
-                            self.emit(Insn::Move(slot, v));
+                        if matches!(
+                            item.kind,
+                            ExprKind::Replication { .. } | ExprKind::AssignmentPattern(_)
+                        ) {
+                            self.bail("Return_collection_nested_pattern");
+                            return false;
                         }
+                        let Some(value) = self.compile_expr(item, width) else {
+                            return false;
+                        };
+                        let slot = arg_start + i as RegId;
+                        self.emit(Insn::Move(slot, value));
+                        self.emit_real_to_int_fit(slot, item, width);
+                        self.emit(Insn::Resize(slot, width));
+                        self.local_kinds.insert(slot, kind);
+                        self.emit_local_fit(slot);
                     }
                     self.emit(Insn::RetCollection(arg_start as u32, n));
                     let j = self.insns.len();
