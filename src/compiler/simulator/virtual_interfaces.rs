@@ -98,6 +98,9 @@ impl Simulator {
         {
             return self.vif_operand(&stripped);
         }
+        if let Some((bound, _)) = self.vif_member_operand(e) {
+            return Some(bound);
+        }
         match &e.kind {
             ExprKind::Index { expr, index } => {
                 if let ExprKind::Ident(h) = &expr.kind
@@ -1100,6 +1103,11 @@ impl Simulator {
     }
 
     pub(super) fn resolve_vif_rhs_name_strict(&self, rvalue: &Expression) -> Option<String> {
+        if self.vif_tokens_stored
+            && let Some((bound, _)) = self.vif_member_operand(rvalue)
+        {
+            return bound;
+        }
         if !self.vif_rhs_possible(rvalue) {
             return None;
         }
@@ -1149,6 +1157,100 @@ impl Simulator {
             Some(h) => h as usize,
             None => self.eval_ident_handle(obj).unwrap_or(0),
         }
+    }
+
+    fn vif_member_leaf(&self, name: &str) -> bool {
+        !self.module.interfaces.is_empty()
+            && self
+                .vif_member_leaves
+                .get_or_init(|| {
+                    self.module.var_decl_types.as_map().iter()
+                        .filter_map(|(name, dt)| {
+                            let (_, leaf) = name.rsplit_once('.')?;
+                            Self::dt_is_virtual_iface(dt, &self.module).then(|| leaf.to_string())
+                        })
+                        .collect()
+                })
+                .contains(name)
+    }
+
+    // §25.9, §7.2: unpacked struct members are individual signals. Store
+    // the interface token there so a whole-struct copy also copies the handle.
+    fn vif_member_store(&self, e: &Expression) -> Option<(String, Option<String>)> {
+        let leaf = match &e.kind {
+            ExprKind::Ident(h) if h.path.len() > 1 => h.path.last()?.name.name.as_str(),
+            ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+            _ => return None,
+        };
+        if !self.vif_member_leaf(leaf) {
+            return None;
+        }
+        let root = Self::member_path_head(e)?;
+        if self.frame_get(root).is_some() {
+            return None;
+        }
+        let flat;
+        let h = match &e.kind {
+            ExprKind::Ident(h) => h,
+            _ => {
+                flat = Self::member_chain_as_flat_ident(e)?;
+                match &flat.kind {
+                    ExprKind::Ident(h) => h,
+                    _ => return None,
+                }
+            }
+        };
+        let name = self.resolve_hier_name(h).into_owned();
+        if self.frame_get(&name).is_some() {
+            return None;
+        }
+        let dt = self.module.var_decl_types.get(&name)?;
+        if self.module.arrays.contains_key(&name)
+            || self.module.arrays_2d.contains_key(&name)
+            || self.module.arrays_nd.contains_key(&name)
+            || self.module.dynamic_arrays.contains(&name)
+            || self.module.queue_vars.contains(&name)
+            || self.module.associative_arrays.contains_key(&name)
+        {
+            return None;
+        }
+        match self.typedef_chain_scoped(dt) {
+            DataType::Interface { modport, .. } => {
+                Some((name, modport.as_ref().map(|mp| mp.name.clone())))
+            }
+            _ if self.is_virtual_iface_type(dt) => Some((name, None)),
+            _ => None,
+        }
+    }
+
+    fn vif_member_operand(&self, e: &Expression) -> Option<(Option<String>, Option<String>)> {
+        let (name, modport) = self.vif_member_store(e)?;
+        let bound = self.get_signal_value_by_name(&name)
+            .and_then(|v| v.to_u64())
+            .and_then(|token| self.iface_by_token(token))
+            .map(str::to_string);
+        Some((bound, modport))
+    }
+
+    pub(super) fn bind_vif_member(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        let Some((name, _)) = self.vif_member_store(lvalue) else {
+            return false;
+        };
+        let bound = if let ExprKind::Call { .. } = &rvalue.kind {
+            let value = self.eval_expr(rvalue);
+            value
+                .to_u64()
+                .and_then(|token| self.iface_by_token(token))
+                .map(str::to_string)
+        } else if let Some(bound) = self.vif_operand(rvalue) {
+            bound
+        } else {
+            self.resolve_vif_rhs_name_strict(rvalue)
+        };
+        let token = bound.as_deref().map_or(0, Self::iface_handle_token);
+        self.vif_tokens_stored |= bound.is_some();
+        self.set_signal_value_by_name(&name, Value::from_u64(token, 32));
+        true
     }
 
     pub(super) fn try_bind_virtual_iface_inner(
@@ -1731,6 +1833,11 @@ impl Simulator {
         }
         if let Some(local) = self.strip_own_definition_name(rvalue) {
             return self.resolve_vif_rhs_name(&local);
+        }
+        if self.vif_tokens_stored
+            && let Some((bound, _)) = self.vif_member_operand(rvalue)
+        {
+            return bound;
         }
         if let Some(b) = self.static_vif_binding(rvalue) {
             return Some(b);
@@ -3118,6 +3225,12 @@ impl Simulator {
     ) -> Option<(String, Option<String>)> {
         let (last, owner) = segs.split_last()?;
         let name = last.name.name.as_str();
+        if self.vif_tokens_stored && !owner.is_empty() && self.vif_member_leaf(name) {
+            let e = Self::hier_ident_expr(segs.to_vec(), last.name.span);
+            if let Some((bound, modport)) = self.vif_member_operand(&e) {
+                return bound.map(|bound| (bound, modport));
+            }
+        }
         let elem = match last.selects.as_slice() {
             [] => None,
             [sel] => Some(sel),
@@ -3455,6 +3568,11 @@ impl Simulator {
                 expr: owner,
                 member,
             } => {
+                if self.vif_tokens_stored
+                    && let Some((bound, modport)) = self.vif_member_operand(recv)
+                {
+                    return bound.map(|bound| (bound, modport));
+                }
                 // §8.25/§25.9: a static vif of a specialization,
                 // `G#(virtual pif)::one`, binds per specialization.
                 // §26.3: a static vif of a PACKAGE-qualified class,
@@ -3952,7 +4070,8 @@ impl Simulator {
             let seg = &h.path[i];
             let name = seg.name.name.as_str();
             if !(self.vif_prop_name_possible(name)
-                || (i == 0 && (alias_possible || self.vif_tokens_stored)))
+                || (i == 0 && (alias_possible || self.vif_tokens_stored))
+                || (i != 0 && self.vif_tokens_stored && self.vif_member_leaf(name)))
             {
                 continue;
             }

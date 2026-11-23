@@ -1637,6 +1637,9 @@ pub struct Simulator {
     /// before `bind_static_vif` looks at an assignment.
     #[serde(skip)]
     vif_capable_statics: std::cell::OnceCell<HashSet<String>>,
+    /// Virtual-interface member names registered as flattened storage.
+    #[serde(skip)]
+    vif_member_leaves: std::cell::OnceCell<HashSet<String>>,
     /// The leaf names of the unpacked variables declared below a scope
     /// (`arr` of `bus.arr`): the prefilter of `vif_aggregate_canon`.
     #[serde(skip)]

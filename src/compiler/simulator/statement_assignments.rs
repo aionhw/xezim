@@ -1897,6 +1897,10 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
+        if self.bind_vif_member(lvalue, rvalue) {
+            self.settle_after_proc_write();
+            return;
+        }
         if self.simple_blocking_assign(lvalue, rvalue) || self.member_target_assign(lvalue, rvalue)
         {
             return;
