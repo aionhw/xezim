@@ -4888,6 +4888,13 @@ impl Simulator {
                     .unwrap_or(Value::zero(32));
                 Value::from_f64(v.to_i64().unwrap_or(0) as f64)
             }
+            // §11.4.13: a bound of a tolerance range `[A +/- B]`/`[A +%- B]`.
+            n if n == xezim_core::ast::expr::TOLERANCE_BOUND_FN && args.len() == 3 => {
+                let a = self.eval_expr(&args[0]);
+                let b = self.eval_expr(&args[1]);
+                let mode = self.eval_expr(&args[2]).to_u64().unwrap_or(0);
+                Value::tolerance_bound(&a, &b, mode & 2 != 0, mode & 1 != 0)
+            }
             "$rtoi" => {
                 // §20.5: returns `integer` (a SIGNED 32-bit type), so %d
                 // prints e.g. -3, not 4294967293; out of the 64-bit range it
