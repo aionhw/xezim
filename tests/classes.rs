@@ -1387,3 +1387,6 @@ mod inherited_packed_typedef_width;
 
 #[path = "classes/waiting_vif_formal_name_reuse_1478.rs"]
 mod waiting_vif_formal_name_reuse_1478;
+
+#[path = "classes/blocking_task_super_nested_module.rs"]
+mod blocking_task_super_nested_module;

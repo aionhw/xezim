@@ -802,8 +802,26 @@ impl Simulator {
                     };
                     if let Some((rh, mn)) = resolved {
                         if rh != 0 {
-                            let is_super = matches!(&func.kind, ExprKind::MemberAccess { expr: recv, .. }
-                                if matches!(&recv.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "super"));
+                            // §8.15: `super.m(args)` binds statically, from the
+                            // parent of the class that contains the call. It
+                            // parses as a MemberAccess on `super`, but a class
+                            // declared in a module instantiated below the top
+                            // reaches here flattened to an Ident `[super, m]`.
+                            // Taking that shape for a plain receiver resolved
+                            // `m` on the object's own class, so an override
+                            // that calls `super.m()` inlined itself again and
+                            // recursed at one time step without ever waiting.
+                            let is_super = match &func.kind {
+                                ExprKind::MemberAccess { expr: recv, .. } => {
+                                    matches!(&recv.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "super")
+                                }
+                                ExprKind::Ident(h) => {
+                                    h.path.len() == 2
+                                        && h.path[0].name.name == "super"
+                                        && h.path[0].selects.is_empty()
+                                }
+                                _ => false,
+                            };
                             let cls = if is_super {
                                 self.class_context_stack
                                     .last()
