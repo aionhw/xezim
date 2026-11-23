@@ -905,3 +905,5 @@ mod review_struct_param_cast_in_instance;
 mod shortreal_storage_1463;
 #[path = "types/nested_member_typedef_sign.rs"]
 mod nested_member_typedef_sign;
+#[path = "types/negative_packed_element_read.rs"]
+mod negative_packed_element_read;
