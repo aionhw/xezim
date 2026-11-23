@@ -1332,12 +1332,23 @@ impl Simulator {
             StatementKind::Case { items, .. } => items
                 .iter()
                 .any(|it| Self::stmt_contains_delay_control(&it.stmt)),
-            StatementKind::For { body, .. }
-            | StatementKind::While { body, .. }
-            | StatementKind::DoWhile { body, .. }
-            | StatementKind::Repeat { body, .. }
-            | StatementKind::Forever { body }
-            | StatementKind::Foreach { body, .. } => Self::stmt_contains_delay_control(body),
+            StatementKind::RandCase { items } => items
+                .iter()
+                .any(|(_, s)| Self::stmt_contains_delay_control(s)),
+            StatementKind::Wait { stmt: inner, .. }
+            | StatementKind::RsAction { body: inner }
+            | StatementKind::For { body: inner, .. }
+            | StatementKind::While { body: inner, .. }
+            | StatementKind::DoWhile { body: inner, .. }
+            | StatementKind::Repeat { body: inner, .. }
+            | StatementKind::Forever { body: inner }
+            | StatementKind::Foreach { body: inner, .. } => {
+                Self::stmt_contains_delay_control(inner)
+            }
+            StatementKind::WaitOrder { pass, fail, .. } => [pass, fail]
+                .into_iter()
+                .flatten()
+                .any(|b| Self::stmt_contains_delay_control(b)),
             _ => false,
         }
     }
@@ -1383,12 +1394,23 @@ impl Simulator {
             StatementKind::Case { items, .. } => items
                 .iter()
                 .any(|it| Self::stmt_contains_event_control(&it.stmt)),
-            StatementKind::For { body, .. }
-            | StatementKind::While { body, .. }
-            | StatementKind::DoWhile { body, .. }
-            | StatementKind::Repeat { body, .. }
-            | StatementKind::Forever { body }
-            | StatementKind::Foreach { body, .. } => Self::stmt_contains_event_control(body),
+            StatementKind::RandCase { items } => items
+                .iter()
+                .any(|(_, s)| Self::stmt_contains_event_control(s)),
+            StatementKind::Wait { stmt: inner, .. }
+            | StatementKind::RsAction { body: inner }
+            | StatementKind::For { body: inner, .. }
+            | StatementKind::While { body: inner, .. }
+            | StatementKind::DoWhile { body: inner, .. }
+            | StatementKind::Repeat { body: inner, .. }
+            | StatementKind::Forever { body: inner }
+            | StatementKind::Foreach { body: inner, .. } => {
+                Self::stmt_contains_event_control(inner)
+            }
+            StatementKind::WaitOrder { pass, fail, .. } => [pass, fail]
+                .into_iter()
+                .flatten()
+                .any(|b| Self::stmt_contains_event_control(b)),
             _ => false,
         }
     }
@@ -1990,7 +2012,7 @@ impl Simulator {
         }
         Self::take_star_kept_own_write();
         let extracted = self.extract_sensitivity(&ab.stmt);
-        let star_reads_own_nba = Self::take_star_kept_own_write();
+        let star_kept_own_write = Self::take_star_kept_own_write();
         // §14.13: a clocking event is delivered after sampling/NBA, rather
         // than as the raw clock edge returned by extract_sensitivity.
         fn leading_event(stmt: &Statement) -> Option<&EventControl> {
@@ -2080,7 +2102,7 @@ impl Simulator {
                     && !clocking_head
                     && !has_named_event
                     && !self_ref
-                    && !star_reads_own_nba
+                    && !star_kept_own_write
                     && !self.stmt_is_blocking(&body)
                     && !self.stmt_calls_blocking_task(&body, &ab.scope, 3)
                     && !sens.iter().any(|s| self.sens_unnamed_cell(s))
@@ -2202,13 +2224,14 @@ impl Simulator {
                         scope: ab.scope,
                     });
                 }
-                // `star_reads_own_nba`: a process arms `@*` only after the
+                // `star_kept_own_write`: a process arms `@*` only after the
                 // body has run, so the body's own blocking writes (`x[7:4] =
                 // x[7:4] + 1` beside `x[3:0] <= b`) cannot wake it, while the
-                // NBA update does. An edge block re-detects writes made while
-                // it runs and would wake itself on them again and again.
+                // NBA update (or external write after suspension) does. An edge
+                // block re-detects writes made while it runs and would wake
+                // itself on them again and again.
                 if clocking_head
-                    || star_reads_own_nba
+                    || star_kept_own_write
                     || self.event_needs_value_waiter(&sens, &ab.scope)
                 {
                     self.schedule_always_process(&ab.stmt, &ab.scope, pre_arm, true);
@@ -2410,6 +2433,16 @@ impl Simulator {
                     kind: ab.kind,
                     scope: ab.scope,
                 });
+                return None;
+            }
+            // §9.4.2.2: a suspending `@*` whose inferred sensitivity is empty
+            // can never trigger, so do not strip `@*` into a combinational block.
+            if Self::event_list_shape(&ab.stmt) == EventListShape::Implicit
+                && (self.stmt_is_blocking(&body)
+                    || Self::stmt_contains_delay_control(&body)
+                    || Self::stmt_contains_event_control(&body)
+                    || self.stmt_calls_blocking_task(&body, &ab.scope, 3))
+            {
                 return None;
             }
             return Some(AlwaysBlock {

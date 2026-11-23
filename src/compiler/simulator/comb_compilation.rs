@@ -5460,7 +5460,7 @@ impl Simulator {
                 if always_comb && e.cold.read_signal_ids.is_empty() {
                     return None;
                 }
-                if e.cold.read_signal_ids.is_empty() || always_comb {
+                if !e.defer_at_time0 && (e.cold.read_signal_ids.is_empty() || always_comb) {
                     Some(i)
                 } else {
                     None
