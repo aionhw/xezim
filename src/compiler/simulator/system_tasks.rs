@@ -2967,10 +2967,12 @@ impl Simulator {
                                     result.push_str(&s);
                                     continue;
                                 }
-                                // An unpacked-struct ELEMENT of one (`c.sta[1]`)
-                                // renders from the element's instance cells.
+                                // A class collection's row or unpacked-struct
+                                // element renders from its instance cells.
                                 if !self.no_class_objects()
-                                    && let Some(s) = self.render_p_class_struct_elem(arg)
+                                    && let Some(s) = self
+                                        .render_p_class_row(arg)
+                                        .or_else(|| self.render_p_class_struct_elem(arg))
                                 {
                                     result.push_str(&s);
                                     continue;

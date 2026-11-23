@@ -1012,6 +1012,74 @@ impl Simulator {
         self.render_p_var(&key)
     }
 
+    /// §21.2.1.7: a selected row of a class collection prints in its
+    /// declared dimension order, with the same element type as the whole.
+    pub(super) fn render_p_class_row(&mut self, arg: &Expression) -> Option<String> {
+        let arg = Self::unparen(arg);
+        if !matches!(&arg.kind, ExprKind::Index { .. })
+            && !matches!(&arg.kind, ExprKind::Ident(h)
+                if h.path.last().is_some_and(|seg| !seg.selects.is_empty()))
+        {
+            return None;
+        }
+        let (base, indices) = Self::split_row_selects(arg);
+        if indices.is_empty() {
+            return None;
+        }
+        let (handle, property) = self.class_prop_receiver(&base)?;
+        let mut storage = format!("{handle}#{property}");
+        let dt = self.class_member_coll_type(&storage)?.clone();
+        let mut bounds = if let Some(&(a, b, _)) = self.module.arrays_2d.get(&storage) {
+            vec![a, b]
+        } else {
+            self.module.arrays_nd.get(&storage)?.0.clone()
+        };
+        if indices.len() >= bounds.len() {
+            return None;
+        }
+        if let Some(dims) = self.unpacked_decl_dims_of(&storage)
+            && dims.len() <= bounds.len()
+        {
+            let start = bounds.len() - dims.len();
+            bounds[start..].copy_from_slice(&dims);
+        }
+        let dynamic = self.module.dynamic_arrays.contains(&storage);
+        for (depth, index) in indices.iter().enumerate() {
+            let sequence_index = depth == 0 && dynamic;
+            let bounds = if sequence_index {
+                let last = self.get_queue_size(&storage) as i64 - 1;
+                self.dollar_bound.push(last);
+                0..=last
+            } else {
+                let (left, right) = bounds[depth];
+                left.min(right)..=left.max(right)
+            };
+            let value = self.eval_expr(index).to_i64();
+            if sequence_index {
+                self.dollar_bound.pop();
+            }
+            if let Some(i) = value.filter(|i| bounds.contains(i)) {
+                storage.push_str(&format!("[{i}]"));
+            } else {
+                // §7.4.6: an invalid select yields the declared type's
+                // defaults. This key has no cells, so rendering supplies
+                // the defaults without evaluating the operand again.
+                storage.push_str("[?]");
+            }
+        }
+        let lists: Vec<Vec<i64>> = bounds[indices.len()..]
+            .iter()
+            .map(|&(left, right)| {
+                if left <= right {
+                    (left..=right).collect()
+                } else {
+                    (right..=left).rev().collect()
+                }
+            })
+            .collect();
+        Some(self.render_p_dim_lists(&storage, &lists, &dt))
+    }
+
     /// `%p` of an element of a fixed-array class property of unpacked structs
     /// (`c.sta[1]`, `sta[i][j]` in a method): its member cells live in the
     /// instance map under `sta[1].<member>`.

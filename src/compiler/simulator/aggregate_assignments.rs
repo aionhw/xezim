@@ -237,7 +237,7 @@ impl Simulator {
     /// `c.m[1]` / `c.m[1][2]` (either parse shape) as the unselected member
     /// expression and its index selects, outermost first. Range selects and
     /// anything else come back whole, with no selects.
-    fn split_row_selects(e: &Expression) -> (Expression, Vec<Expression>) {
+    pub(super) fn split_row_selects(e: &Expression) -> (Expression, Vec<Expression>) {
         let is_range =
             |x: &Expression| matches!(x.kind, ExprKind::Range(..) | ExprKind::RangeSelect { .. });
         let mut sels: Vec<Expression> = Vec::new();
