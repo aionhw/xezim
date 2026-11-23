@@ -501,6 +501,8 @@ mod multi_dim_unpacked_arrays;
 mod nettype_nested_struct_drivers;
 #[path = "types/nettype_struct_variable_driver.rs"]
 mod nettype_struct_variable_driver;
+#[path = "types/nettype_stateless_resolver.rs"]
+mod nettype_stateless_resolver;
 #[path = "types/nettype_undriven.rs"]
 mod nettype_undriven;
 #[path = "types/package_data_members_in_subroutine.rs"]
