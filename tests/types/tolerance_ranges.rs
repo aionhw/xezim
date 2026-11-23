@@ -74,3 +74,8 @@ fn dist_items_take_absolute_and_relative_tolerances() {
         ["each 1 1 0", "total 1 1 0", "rel 1 1 0", "reltotal 1 1 0"]
     );
 }
+
+#[test]
+fn real_constraint_ranges_randomize_fractional_values() {
+    assert_eq!(run("tolerance_range_real_randomize.sv"), ["near=2 far=6"]);
+}
