@@ -5461,6 +5461,7 @@ impl Simulator {
             edge_t0_pending: Vec::new(),
             edge_forced_fire: Vec::new(),
             in_pre_process_settle: false,
+            in_pre_time0_init: false,
             comb_direct_eval: false,
         };
         sim.unpacked_struct_leaves = sim.build_unpacked_struct_leaves();
