@@ -563,7 +563,7 @@ macro_rules! write_sig {
 // Indexed packed-struct write regions and delayed unpacked-array drivers.
 // Timed implicit event controls retain their inferred sensitivity.
 // Continuous assignments lower nested packed concatenations as array elements.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB086";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB087";
 
 mod aggregate_assignments;
 mod pattern_array_items;
@@ -4703,10 +4703,18 @@ pub struct Simulator {
     /// actual's id, the port's value before the update and the actual's
     /// value after the pre-process settle (raw v, x).
     time0_port_edges: Vec<(String, usize, (u64, u64), (u64, u64))>,
+    /// Wide (`width > 64`) counterpart to `time0_port_edges`.
+    time0_wide_port_edges: Vec<(String, usize, Value, Value)>,
     /// §10.3.3: the ids a collapsed alias name (see `SensitivityId::alias_t0`)
     /// maps to whose value the pre-process settle left alone, with that
     /// value (raw v, x): the alias's time-0 update ends there.
     time0_alias_edges: Vec<(usize, (u64, u64))>,
+    /// Wide (`width > 64`) counterpart to `time0_alias_edges`.
+    time0_wide_alias_edges: Vec<(usize, Value)>,
+    /// Deferred combinational entries (`defer_at_time0`) that already ran in
+    /// the pre-process time-0 settle, so `fire_time0_input_port_blocks` must
+    /// not re-fire them at time 0.
+    t0_deferred_ran: HashSet<usize>,
     /// Edge blocks a time-0 alias or port update woke before any process
     /// ran. One that fires on its own at time 0 leaves the list (it runs
     /// once, as in the reference simulator); the rest run from

@@ -1321,23 +1321,32 @@ impl Simulator {
     /// member's bits — a write to any part of it marks it dirty, which is
     /// exactly the §9.2.2.2 longest-static-prefix sensitivity.
     pub(super) fn resolve_read_name(&self, name: &str, top_prefix: &str) -> Option<usize> {
+        self.resolve_read_name_and_key(name, top_prefix)
+            .map(|(id, _)| id)
+    }
+
+    pub(super) fn resolve_read_name_and_key<'a>(
+        &self,
+        name: &'a str,
+        top_prefix: &str,
+    ) -> Option<(usize, &'a str)> {
         if let Some(&id) = self.signal_name_to_id.get(name) {
-            return Some(id);
+            return Some((id, name));
         }
         if let Some(stripped) = name.strip_prefix(top_prefix) {
             if let Some(&id) = self.signal_name_to_id.get(stripped) {
-                return Some(id);
+                return Some((id, stripped));
             }
         }
         let mut rest = name;
         while let Some(cut) = rest.rfind('.') {
             rest = &rest[..cut];
             if let Some(&id) = self.signal_name_to_id.get(rest) {
-                return Some(id);
+                return Some((id, rest));
             }
             if let Some(stripped) = rest.strip_prefix(top_prefix) {
                 if let Some(&id) = self.signal_name_to_id.get(stripped) {
-                    return Some(id);
+                    return Some((id, stripped));
                 }
             }
         }
