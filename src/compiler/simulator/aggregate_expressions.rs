@@ -2272,6 +2272,14 @@ impl Simulator {
             return None;
         }
         let mut selected = value.range_select((end - 1) as usize, access.offset as usize);
+        if selected.has_xz()
+            && super::elaborate::is_type_two_state_resolved(
+                &access.element_type,
+                &self.module.typedef_types,
+            )
+        {
+            selected = selected.to_two_state();
+        }
         selected.is_signed = access.is_signed;
         Some(selected)
     }

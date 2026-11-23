@@ -1464,6 +1464,11 @@ impl Simulator {
                                     if self.struct_member_signed(obj_name, &sub) {
                                         v.is_signed = true;
                                     }
+                                    if v.has_xz() && self.packed_member_two_state(obj_name, &sub) {
+                                        let signed = v.is_signed;
+                                        v = v.to_two_state();
+                                        v.is_signed = signed;
+                                    }
                                     return v;
                                 }
                             }
