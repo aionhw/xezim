@@ -717,15 +717,13 @@ impl Simulator {
         held
     }
 
-    /// Time-0 activation order of the processes queued at time 0 (§4.4.2
-    /// leaves it unspecified; this is the reference simulator's). Each root
-    /// runs as one block, roots in elaboration order. Within a root the
-    /// processes follow the depth-first source order of the instance tree —
-    /// a child instance's processes at its instantiation, a bound instance's
-    /// after all of its host's own items — except that the `initial` blocks
-    /// that cannot suspend all run as one group, at the position of the
-    /// first of them. Static initializers keep running first. Clock
-    /// generators take their slot in the same order (`ClockGen::t0_rank`).
+    /// Time-0 activation order of the processes queued at time 0 (§4.4.2,
+    /// §9.2 leave it unspecified; this is the reference simulator's). Unconditional
+    /// event-headed `always` processes arm first (tier 1) so they catch time-0
+    /// `initial` writes; each root then runs as one block in elaboration order,
+    /// following depth-first source order except non-suspending `initial` blocks
+    /// grouped at the first of them. Clock generators take their slot in tier 2
+    /// (`ClockGen::t0_rank`).
     pub(super) fn order_time0_processes(&mut self) {
         let pids = self.event_queue.slot_pids(0);
         let (rank, gen_ranks) = {
@@ -773,7 +771,7 @@ impl Simulator {
                 chain.reverse();
                 (root, chain)
             };
-            let mut placed: Vec<(usize, Option<(usize, Vec<usize>, bool)>)> =
+            let mut placed: Vec<(usize, Option<(u8, usize, Vec<usize>, bool)>)> =
                 Vec::with_capacity(pids.len());
             let mut anchor: HashMap<usize, Vec<usize>> = HashMap::default();
             for &pid in &pids {
@@ -781,31 +779,35 @@ impl Simulator {
                     Some((span, kind @ ("initial block" | "always block"))) => {
                         let scope = self.process_scope_hint.get(&pid).map_or("", String::as_str);
                         let (root, pos) = position(scope, span.start);
-                        let grouped =
-                            *kind == "initial block" && self.t0_timing_free.contains(&pid);
-                        if grouped {
-                            let a = anchor.entry(root).or_insert_with(|| pos.clone());
-                            if pos < *a {
-                                *a = pos.clone();
+                        if *kind == "always block" && self.t0_pre_arm_always.contains(&pid) {
+                            Some((1, root, pos, false))
+                        } else {
+                            let grouped =
+                                *kind == "initial block" && self.t0_timing_free.contains(&pid);
+                            if grouped {
+                                let a = anchor.entry(root).or_insert_with(|| pos.clone());
+                                if pos < *a {
+                                    *a = pos.clone();
+                                }
                             }
+                            Some((2, root, pos, grouped))
                         }
-                        Some((root, pos, grouped))
                     }
                     _ => None,
                 };
                 placed.push((pid, info));
             }
             type Key = (u8, usize, Vec<usize>, Vec<usize>, usize);
-            let key_of = |i: usize, info: &Option<(usize, Vec<usize>, bool)>| -> Key {
+            let key_of = |i: usize, info: &Option<(u8, usize, Vec<usize>, bool)>| -> Key {
                 match info {
                     None => (0, 0, Vec::new(), Vec::new(), i),
-                    Some((root, pos, grouped)) => {
+                    Some((tier, root, pos, grouped)) => {
                         let at = if *grouped {
                             anchor[root].clone()
                         } else {
                             pos.clone()
                         };
-                        (1, *root, at, pos.clone(), i)
+                        (*tier, *root, at, pos.clone(), i)
                     }
                 }
             };
@@ -820,7 +822,7 @@ impl Simulator {
                 .iter()
                 .map(|(gi, scope, span)| {
                     let (root, pos) = position(scope, *span);
-                    let k: Key = (1, root, pos.clone(), pos, usize::MAX);
+                    let k: Key = (2, root, pos.clone(), pos, usize::MAX);
                     (*gi, keyed.partition_point(|(kk, _)| *kk < k))
                 })
                 .collect();
@@ -839,6 +841,7 @@ impl Simulator {
         }
         self.t0_pid_ord = rank;
         self.t0_timing_free = HashSet::default();
+        self.t0_pre_arm_always = HashSet::default();
     }
 
     /// Account one event popped from the current slot against the FIFO rank
@@ -1735,6 +1738,218 @@ impl Simulator {
         }
     }
 
+    /// Does `stmt` contain any `@(...)` event control, `wait(...)`, or `wait_order(...)`?
+    fn stmt_contains_wait_or_event(stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::TimingControl {
+                control,
+                stmt: inner,
+            } => {
+                matches!(control, TimingControl::Event(_))
+                    || Self::stmt_contains_wait_or_event(inner)
+            }
+            StatementKind::Wait { .. } | StatementKind::WaitOrder { .. } => true,
+            StatementKind::BlockingAssign { rvalue, .. } => matches!(
+                &rvalue.kind,
+                ExprKind::SystemCall { name, .. }
+                    if name == crate::intra_delay::INTRA_EVENT_MARKER
+            ),
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(Self::stmt_contains_wait_or_event)
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::stmt_contains_wait_or_event(then_stmt)
+                    || else_stmt
+                        .as_ref()
+                        .is_some_and(|e| Self::stmt_contains_wait_or_event(e))
+            }
+            StatementKind::Case { items, .. } => items
+                .iter()
+                .any(|it| Self::stmt_contains_wait_or_event(&it.stmt)),
+            StatementKind::RandCase { items } => items
+                .iter()
+                .any(|(_, s)| Self::stmt_contains_wait_or_event(s)),
+            StatementKind::RsAction { body: inner }
+            | StatementKind::For { body: inner, .. }
+            | StatementKind::While { body: inner, .. }
+            | StatementKind::DoWhile { body: inner, .. }
+            | StatementKind::Repeat { body: inner, .. }
+            | StatementKind::Forever { body: inner }
+            | StatementKind::Foreach { body: inner, .. } => {
+                Self::stmt_contains_wait_or_event(inner)
+            }
+            _ => false,
+        }
+    }
+
+    /// Does `stmt` call a resolvable task whose body contains a `wait`/`@(...)` event control?
+    fn stmt_calls_wait_or_event_task(&self, stmt: &Statement, scope: &str, depth: u8) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let call_waits = |raw: &str| -> bool {
+            let mut cands: Vec<String> = Vec::with_capacity(3);
+            if !scope.is_empty() {
+                cands.push(format!("{}.{}", scope, raw));
+            }
+            cands.push(raw.to_string());
+            if let Some((_, leaf)) = raw.rsplit_once('.')
+                && !scope.is_empty()
+            {
+                cands.push(format!("{}.{}", scope, leaf));
+            }
+            for c in &cands {
+                if let Some(td) = self.module.tasks.get(c.as_str()) {
+                    let items = self.module.resolved_task_items(c, td);
+                    return items.iter().any(Self::stmt_contains_wait_or_event)
+                        || items
+                            .iter()
+                            .any(|st| self.stmt_calls_wait_or_event_task(st, scope, depth - 1));
+                }
+            }
+            false
+        };
+        match &stmt.kind {
+            StatementKind::Expr(e) => match &e.kind {
+                ExprKind::Call { func, .. } => match &func.kind {
+                    ExprKind::Ident(h) => {
+                        let raw: String = h
+                            .path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        call_waits(&raw)
+                    }
+                    _ => false,
+                },
+                ExprKind::Ident(h) => {
+                    let raw: String = h
+                        .path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    call_waits(&raw)
+                }
+                _ => false,
+            },
+            StatementKind::TimingControl { stmt: inner, .. }
+            | StatementKind::RsAction { body: inner }
+            | StatementKind::For { body: inner, .. }
+            | StatementKind::While { body: inner, .. }
+            | StatementKind::DoWhile { body: inner, .. }
+            | StatementKind::Repeat { body: inner, .. }
+            | StatementKind::Forever { body: inner }
+            | StatementKind::Foreach { body: inner, .. } => {
+                self.stmt_calls_wait_or_event_task(inner, scope, depth)
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => stmts
+                .iter()
+                .any(|st| self.stmt_calls_wait_or_event_task(st, scope, depth)),
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.stmt_calls_wait_or_event_task(then_stmt, scope, depth)
+                    || else_stmt
+                        .as_ref()
+                        .is_some_and(|e| self.stmt_calls_wait_or_event_task(e, scope, depth))
+            }
+            StatementKind::Case { items, .. } => items
+                .iter()
+                .any(|it| self.stmt_calls_wait_or_event_task(&it.stmt, scope, depth)),
+            StatementKind::RandCase { items } => items
+                .iter()
+                .any(|(_, s)| self.stmt_calls_wait_or_event_task(s, scope, depth)),
+            _ => false,
+        }
+    }
+
+    /// §9.2: does an `always` body begin directly with an unconditional `@(...)`/`@*`
+    /// control (possibly nested in `begin...end`) with no subsequent `wait` or `@(...)`?
+    fn always_starts_with_uncond_event(&self, mut stmt: &Statement, scope: &str) -> bool {
+        loop {
+            match &stmt.kind {
+                StatementKind::SeqBlock { stmts, .. } => {
+                    let Some((first, rest)) = stmts.split_first() else {
+                        return false;
+                    };
+                    if rest.iter().any(|sib| {
+                        Self::stmt_contains_wait_or_event(sib)
+                            || self.stmt_calls_wait_or_event_task(sib, scope, 3)
+                    }) {
+                        return false;
+                    }
+                    stmt = first;
+                }
+                StatementKind::TimingControl {
+                    control: TimingControl::Event(ev),
+                    stmt: inner,
+                } => {
+                    let saved = self.name_resolve_hint.borrow().clone();
+                    if !scope.is_empty() {
+                        *self.name_resolve_hint.borrow_mut() = Some(scope.to_string());
+                    }
+                    let is_clk = self.is_clocking_event(ev);
+                    *self.name_resolve_hint.borrow_mut() = saved;
+                    if is_clk {
+                        return false;
+                    }
+                    let no_iff = match ev {
+                        EventControl::Star
+                        | EventControl::ParenStar
+                        | EventControl::Identifier(_)
+                        | EventControl::HierIdentifier(_) => true,
+                        EventControl::EventExpr(items) => items.iter().all(|it| it.iff.is_none()),
+                    };
+                    return no_iff
+                        && !Self::stmt_contains_wait_or_event(inner)
+                        && !self.stmt_calls_wait_or_event_task(inner, scope, 3);
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Schedule an `always` process at time 0 (as a compiled FSM or `forever` AST process),
+    /// recording `t0_pre_arm_always` when it begins directly with an unconditional event control.
+    fn schedule_always_process(
+        &mut self,
+        stmt: &Statement,
+        scope: &str,
+        pre_arm: bool,
+        try_fsm: bool,
+    ) {
+        if try_fsm && self.try_register_proc_fsm(stmt, scope, true, "always block") {
+            if pre_arm {
+                self.t0_pre_arm_always.insert(self.next_pid - 1);
+            }
+            return;
+        }
+        let forever_stmt = Statement::new(
+            StatementKind::Forever {
+                body: Box::new(stmt.clone()),
+            },
+            stmt.span,
+        );
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        if pre_arm {
+            self.t0_pre_arm_always.insert(pid);
+        }
+        if !scope.is_empty() {
+            self.process_scope_hint.insert(pid, scope.to_string());
+        }
+        self.process_origin.insert(pid, (stmt.span, "always block"));
+        self.event_queue.schedule(0, pid, vec![forever_stmt].into());
+    }
+
     pub(super) fn classify_one_always_block(
         &mut self,
         ab: AlwaysBlock,
@@ -1745,6 +1960,8 @@ impl Simulator {
         // rewritten as `return Some(...)`.)
         Self::sva_stmt_names(&ab.stmt, false, &mut self.always_sva_names);
         Self::sva_stmt_clocks(&ab.stmt, &mut self.always_sva_clocks);
+        let pre_arm =
+            ab.kind == AlwaysKind::Always && self.always_starts_with_uncond_event(&ab.stmt, &ab.scope);
         // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a MULTI-WAIT always body
         // (an event/delay head plus at least one more wait inside) is served
         // by the edge path only through per-fire AST continuations — compile
@@ -1757,6 +1974,9 @@ impl Simulator {
                 && (tc >= 2 || (tc >= 1 && Self::stmt_contains_call(&ab.stmt)))
                 && self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block")
             {
+                if pre_arm {
+                    self.t0_pre_arm_always.insert(self.next_pid - 1);
+                }
                 return None;
             }
         }
@@ -1991,23 +2211,7 @@ impl Simulator {
                     || star_reads_own_nba
                     || self.event_needs_value_waiter(&sens, &ab.scope)
                 {
-                    if self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
-                        return None;
-                    }
-                    let forever_stmt = Statement::new(
-                        StatementKind::Forever {
-                            body: Box::new(ab.stmt.clone()),
-                        },
-                        ab.stmt.span,
-                    );
-                    let pid = self.next_pid;
-                    self.next_pid += 1;
-                    if !ab.scope.is_empty() {
-                        self.process_scope_hint.insert(pid, ab.scope.clone());
-                    }
-                    self.process_origin
-                        .insert(pid, (ab.stmt.span, "always block"));
-                    self.event_queue.schedule(0, pid, vec![forever_stmt].into());
+                    self.schedule_always_process(&ab.stmt, &ab.scope, pre_arm, true);
                     return None;
                 }
                 let mut dropped_terms: Vec<String> = Vec::new();
@@ -2183,23 +2387,7 @@ impl Simulator {
                     // FSM implements the same semantics without the per-activation AST
                     // walk; use it whenever the body compiles (c906's tb monitors: an
                     // else-chain ending in a rare `#10`, ~9% of the run).
-                    if self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
-                        return None;
-                    }
-                    let forever_stmt = Statement::new(
-                        StatementKind::Forever {
-                            body: Box::new(ab.stmt.clone()),
-                        },
-                        ab.stmt.span,
-                    );
-                    let pid = self.next_pid;
-                    self.next_pid += 1;
-                    if !ab.scope.is_empty() {
-                        self.process_scope_hint.insert(pid, ab.scope.clone());
-                    }
-                    self.process_origin
-                        .insert(pid, (ab.stmt.span, "always block"));
-                    self.event_queue.schedule(0, pid, vec![forever_stmt].into());
+                    self.schedule_always_process(&ab.stmt, &ab.scope, pre_arm, true);
                     return None;
                 }
                 // `collect` leaves room for four terms; an edge block keeps
@@ -2328,36 +2516,9 @@ impl Simulator {
             if self.stmt_is_blocking(&ab.stmt)
                 || self.stmt_calls_blocking_task(&ab.stmt, &ab.scope, 3)
             {
-                // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a blocking always
-                // body whose whole statement tree compiles fallback-free
-                // becomes a bytecode FSM — resumes re-enter at a saved pc
-                // instead of re-walking the AST continuation chain.
-                {
-                    // By default (unset), a body whose only waits are delays
-                    // (`always begin #(d); ... end`) is admitted like the
-                    // delay-headed form above (§9.4.1).
-                    let fsm_on = self.proc_fsm_mode == 1
-                        || (self.proc_fsm_mode == 2 && self.stmt_is_delay_loop(&ab.stmt));
-                    if fsm_on
-                        && self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block")
-                    {
-                        return None;
-                    }
-                }
-                let forever_stmt = Statement::new(
-                    StatementKind::Forever {
-                        body: Box::new(ab.stmt.clone()),
-                    },
-                    ab.stmt.span,
-                );
-                let pid = self.next_pid;
-                self.next_pid += 1;
-                if !ab.scope.is_empty() {
-                    self.process_scope_hint.insert(pid, ab.scope.clone());
-                }
-                self.process_origin
-                    .insert(pid, (ab.stmt.span, "always block"));
-                self.event_queue.schedule(0, pid, vec![forever_stmt].into());
+                let fsm_on = self.proc_fsm_mode == 1
+                    || (self.proc_fsm_mode == 2 && self.stmt_is_delay_loop(&ab.stmt));
+                self.schedule_always_process(&ab.stmt, &ab.scope, pre_arm, fsm_on);
                 return None;
             }
         }

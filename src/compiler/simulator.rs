@@ -2764,6 +2764,9 @@ pub struct Simulator {
     /// Pids of `initial` blocks that cannot suspend (no timing control,
     /// no blocking call); see `order_time0_processes`.
     t0_timing_free: HashSet<usize>,
+    /// Pids of `always` processes starting directly with an unconditional
+    /// event control and no later event/`wait`; see `order_time0_processes`.
+    t0_pre_arm_always: HashSet<usize>,
     /// Time-0 activation index of each process queued at time 0, consulted
     /// by `clock_rank_on_pop` until the first drain settles the generators.
     t0_pid_ord: HashMap<usize, usize>,
