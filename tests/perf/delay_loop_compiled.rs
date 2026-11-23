@@ -116,6 +116,35 @@ fn initial_forever_with_inner_delays_compiles() {
     assert!(text.lines().any(|l| l == want), "want {want}:\n{text}");
 }
 
+#[test]
+fn delayed_nba_captures_value_and_subscript_in_a_compiled_loop() {
+    let text = run(r#"
+`timescale 1ns/1ns
+module top;
+  int n = 0;
+  int src = 10;
+  int idx = 0;
+  int dst[2];
+  always #10 begin
+    n += 1;
+    if (n == 1) begin
+      dst[idx] <= #3 src;
+      idx = 1;
+      src = 99;
+    end
+  end
+  initial begin
+    #12 $display("N|early %0d %0d %0d", n, dst[0], dst[1]);
+    #2 $display("N|late %0d %0d %0d", n, dst[0], dst[1]);
+    $finish;
+  end
+endmodule
+"#);
+    assert_one_fsm(&text);
+    assert!(text.lines().any(|l| l == "N|early 1 0 0"), "{text}");
+    assert!(text.lines().any(|l| l == "N|late 1 10 0"), "{text}");
+}
+
 /// A labeled block is a hierarchical scope (`disable named`, `named.v`) the
 /// FSM does not model, so a labeled `initial forever` keeps the AST path.
 const LABELED: &str = r#"
