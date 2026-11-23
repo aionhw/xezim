@@ -376,6 +376,8 @@ mod covergroup_cross_bins;
 mod covergroup_illegal_bins;
 #[path = "classes/covergroup_implicit_names.rs"]
 mod covergroup_implicit_names;
+#[path = "classes/covergroup_cross_implicit_points.rs"]
+mod covergroup_cross_implicit_points;
 #[path = "classes/covergroup_options.rs"]
 mod covergroup_options;
 #[path = "classes/covergroup_placement.rs"]
