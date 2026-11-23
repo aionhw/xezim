@@ -1186,8 +1186,16 @@ impl Simulator {
     pub(super) fn unwind_task_frame(&mut self, mut c: TaskCleanup) {
         // §13.5.2: the aliased leaves of a `ref` struct formal.
         self.ref_frame_flush();
-        // §13.5.3: a default may name an earlier formal; update it before
-        // capturing supplied outputs or popping the declaration's scope.
+        // A suspended call can resume after another activation updated the
+        // same static output. Copy the current cell back into its frame.
+        for (name, _) in c.output_bindings.iter().chain(&c.default_output_bindings) {
+            if self.static_local_names.contains(name)
+                && let Some(key) = self.static_local_key_for(name)
+            {
+                self.static_cell_sync(name, &key, false);
+            }
+        }
+        // §13.5.3: a default may name an earlier formal.
         self.apply_default_formal_outputs(&c.default_output_bindings);
         if c.frame_scope_hint.is_some() {
             *self.name_resolve_hint.borrow_mut() = c.prev_hint.clone();
@@ -2491,11 +2499,8 @@ impl Simulator {
             .iter()
             .enumerate()
             .filter_map(|(i, port)| {
-                (port.direction == PortDirection::Output
-                    && (method_ctx.is_some()
-                        || matches!(td.lifetime, Some(crate::ast::types::Lifetime::Automatic)))
-                    && self.port_class_ref(port).is_some())
-                .then_some(i)
+                (port.direction == PortDirection::Output && self.port_class_ref(port).is_some())
+                    .then_some(i)
             })
             .collect();
         if let Some(saved) = saved_type_context {
@@ -2611,6 +2616,9 @@ impl Simulator {
         let formal_dyn = self.begin_formal_dyn();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
+        let static_task =
+            method_ctx.is_none() && td.lifetime != Some(crate::ast::types::Lifetime::Automatic);
+        let mut static_outputs = Vec::new();
         let mut leaf_aliases: Vec<(String, String)> = Vec::new();
         for (i, port) in td.ports.iter().enumerate() {
             // A type-parameter formal's bound type: a typedef (an unpacked
@@ -2778,10 +2786,49 @@ impl Simulator {
                     // §13.5.3 (1800-2023): an omitted argument with a default
                     // binds the default as its actual, so `output o = a`
                     // copies `o` back to `a` on return.
-                    let val = if port.direction == PortDirection::Output
-                        && (vif_formal_indices.contains(&i) || output_class_indices.contains(&i))
-                    {
-                        Value::zero(32)
+                    let val = if port.direction == PortDirection::Output {
+                        let name = &port.name.name;
+                        // A class type parameter is bound in the callee. Its
+                        // value set and default can differ even for types of
+                        // the same width (or without an integral width).
+                        let concrete = bound.and_then(|b| self.resolve_type_binding_dt(b));
+                        let dt = concrete.as_ref().unwrap_or(&data_type);
+                        let default = if vif_formal_indices.contains(&i)
+                            || output_class_indices.contains(&i)
+                            || concrete
+                                .as_ref()
+                                .is_some_and(|dt| self.type_ref_is_class_handle(dt))
+                        {
+                            Value::zero(32)
+                        } else {
+                            let width = super::elaborate::resolve_type_width(
+                                dt,
+                                Some(&self.module.parameters),
+                                Some(&self.module.typedefs),
+                            );
+                            self.formal_type_default(dt, width.max(1))
+                        };
+                        // §13.3.2: all invocations of a static task share the
+                        // formal. An NBA to it may mature after the copy-out.
+                        if static_task && !vif_formal_indices.contains(&i) {
+                            let task = &td.name.name.name;
+                            let key = match self.subroutine_decl_scope(task, td.span, true) {
+                                Some(pkg) => format!("{pkg}::{task}::{name}"),
+                                None => format!("{task}::{name}"),
+                            };
+                            self.static_local_first[name.as_bytes()[0] as usize] = true;
+                            self.static_local_names.insert(name.clone());
+                            self.static_local_keys.insert(key.clone());
+                            let value = self
+                                .static_local_vars
+                                .entry(key.clone())
+                                .or_insert(default)
+                                .clone();
+                            static_outputs.push((name.clone(), key));
+                            value
+                        } else {
+                            default
+                        }
                     } else {
                         if arg_supplied(i) {
                             let value = self.eval_expr(&args[i]);
@@ -2966,7 +3013,7 @@ impl Simulator {
         self.push_local_frame_typed(locals, frame_types);
         // §6.21: open a static-local sync frame keyed by this task name.
         let sync_name = self.sync_frame_name(&td.name.name.name);
-        self.static_local_syncs.push((sync_name, Vec::new()));
+        self.static_local_syncs.push((sync_name, static_outputs));
         // LRM §25.9: virtual-interface formals. When a formal's
         // declared data type names a known interface, register an
         // alias from the formal name to the caller's actual ident.

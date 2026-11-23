@@ -2824,7 +2824,10 @@ impl Simulator {
         if !matches!(port.direction, PortDirection::Output) {
             return None;
         }
-        let dt = &port.data_type;
+        Some(self.formal_type_default(&port.data_type, w))
+    }
+
+    pub(super) fn formal_type_default(&self, dt: &DataType, w: u32) -> Value {
         let resolved = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
         if matches!(
             resolved,
@@ -2833,15 +2836,24 @@ impl Simulator {
                 ..
             }
         ) {
-            return Some(Value::from_string(""));
+            return Value::from_string("");
+        }
+        if matches!(
+            resolved,
+            DataType::Simple {
+                kind: crate::ast::types::SimpleType::Chandle,
+                ..
+            }
+        ) {
+            return Value::zero(w);
         }
         if self.dt_is_real(dt) {
-            return Some(Value::from_f64(0.0));
+            return Value::from_f64(0.0);
         }
         if super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types) {
-            Some(Value::zero(w))
+            Value::zero(w)
         } else {
-            Some(Value::new(w))
+            Value::new(w)
         }
     }
 
