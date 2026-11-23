@@ -569,7 +569,7 @@ impl Simulator {
     }
 }
 
-fn prop_ident_expr(name: &str) -> Expression {
+pub(super) fn prop_ident_expr(name: &str) -> Expression {
     Expression::new(
         ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
             root: None,

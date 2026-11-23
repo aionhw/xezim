@@ -690,7 +690,12 @@ impl Simulator {
         // initializer: `Cls::set.size()` read 0 and a constraint
         // `v inside {set}` had no solution. Run each initializer once, in
         // its declaring class's static context, into that store (the
-        // `Class::name` key when two classes declare the name).
+        // `Class::name` key when two classes declare the name): a pattern
+        // or queue concatenation element by element, as the per-instance
+        // path does (`N{expr}` items expanded, §10.9.1), an associative-
+        // array pattern with its `default:` (§7.9.11), and any other
+        // expression, such as a call that returns the whole collection, as
+        // the assignment `name = init;`.
         // Parameterized classes are skipped, as for the fixed arrays above.
         let mut seen_coll_inits: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
@@ -723,19 +728,31 @@ impl Simulator {
             let store = if colliding_names.contains(name.as_str()) {
                 format!("{}::{}", cn, name)
             } else {
-                name
+                name.clone()
             };
             let signature = self.canonicalize_spec_sig(&cn, "");
             let saved_spec = self.current_spec.replace((cn.clone(), signature));
             self.class_context_stack.push(Some(cn));
             self.this_stack.push(None);
-            if is_assoc {
-                let init = self.unpacked_pattern(&init);
-                if let ExprKind::AssignmentPattern(items) = &init.kind {
-                    self.assign_class_assoc_pattern(&store, width, items);
-                }
-            } else {
+            let (pattern, assoc_items) = match &self.unpacked_pattern(&init).kind {
+                ExprKind::AssignmentPattern(items) if is_assoc => (true, Some(items.clone())),
+                ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_) => (true, None),
+                _ => (false, None),
+            };
+            if let Some(items) = assoc_items {
+                self.assign_class_assoc_pattern(&store, width, &items);
+            } else if pattern && !is_assoc {
                 self.populate_queue_from_init(&store, &init);
+            } else {
+                let lhs = super::property_initialization::prop_ident_expr(&name);
+                let stmt = Statement::new(
+                    StatementKind::BlockingAssign {
+                        lvalue: lhs.clone(),
+                        rvalue: init.clone(),
+                    },
+                    init.span,
+                );
+                self.exec_stmt_blocking_assign(&stmt, &lhs, &init);
             }
             self.this_stack.pop();
             self.class_context_stack.pop();

@@ -3771,8 +3771,24 @@ impl Simulator {
         // §7.10.1: both the pattern form `'{1,2,3}` and the queue
         // concatenation form `{1,2,3}` initialize element-wise.
         let vals: Vec<Value> = match &self.unpacked_pattern(init).kind {
+            // §10.9.1: a positional `N{...}` item stands for its items
+            // repeated N times (`'{3{5}}` is three elements), as an
+            // assignment of the same pattern expands it (`pattern_ordered`).
             ExprKind::AssignmentPattern(items) => {
-                items.iter().map(|it| self.eval_expr(it.expr())).collect()
+                let mut vals = Vec::with_capacity(items.len());
+                for it in items {
+                    match it {
+                        AssignmentPatternItem::Ordered(e)
+                            if matches!(e.kind, ExprKind::Replication { .. }) =>
+                        {
+                            for sub in self.pattern_ordered(std::slice::from_ref(it)) {
+                                vals.push(self.eval_expr(sub));
+                            }
+                        }
+                        _ => vals.push(self.eval_expr(it.expr())),
+                    }
+                }
+                vals
             }
             // §10.10: an array operand of the concatenation (`{w, 5}`, a
             // row `m[1]`, a slice `a[0 +: 2]`) contributes all its elements,
