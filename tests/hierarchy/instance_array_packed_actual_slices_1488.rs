@@ -219,3 +219,32 @@ endmodule
         &["T|abs-child 11 22", "T|up-child 31 42", "T|root 51 62"],
     );
 }
+
+#[test]
+fn root_qualified_slice_writes_and_force_use_the_same_storage() {
+    expect(
+        r#"
+module bank;
+  reg [3:0][39:0] mem;
+  reg [39:0] data;
+endmodule
+module top;
+  bank lanes[0:1]();
+  bank named_bank();
+  initial begin
+    lanes[0].mem[3] = '0;
+    $root.top.lanes[0].mem[3][7:0] = 8'h67;
+    lanes[0].data = '0;
+    force $root.top.lanes[0].data = 40'd3153;
+    lanes[0].data = '1;
+    named_bank.mem[3] = '0;
+    for (int i = 0; i < 2; i++) $root.top.named_bank.mem[3][15:8] = 8'h71;
+    #1;
+    $display("T|%h %0d %h", lanes[0].mem[3], lanes[0].data, named_bank.mem[3]);
+    $finish;
+  end
+endmodule
+"#,
+        &["T|0000000067 3153 0000007100"],
+    );
+}
