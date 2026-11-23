@@ -825,11 +825,8 @@ impl Simulator {
                     )
                 })
                 .map(|mut parts| {
-                    if ca.delay_exprs.is_some() {
-                        for part in &mut parts {
-                            part.delay_exprs.clone_from(&ca.delay_exprs);
-                            part.origin.clone_from(&ca.origin);
-                        }
+                    for part in &mut parts {
+                        part.inherit_driver_metadata(&ca);
                     }
                     parts
                 })
@@ -1157,6 +1154,23 @@ impl Simulator {
                 })
                 .collect();
 
+            // An unpacked array element is its own net. Use its cell
+            // name for the delayed write, so it cannot be mistaken for a
+            // packed bit-select of the (nonexistent) array-wide net.
+            if (explicit_delay > 0 || ca.delay_fall.is_some() || ca.delay_off.is_some()
+                || ca.delay_exprs.is_some())
+                && let Some((base, indices)) = Self::const_elem_ref(&ca.lhs, &self.module)
+            {
+                let cell = scope_hint.as_ref().and_then(|scope| {
+                    let scoped = format!("{scope}.{base}");
+                    self.elem_cell(&scoped, &indices)
+                }).or_else(|| self.elem_cell(&base, &indices));
+                if let Some(id) = cell.filter(|&id| !is_packed_id(id)) {
+                    let span = ca.lhs.span;
+                    ca.lhs = super::property_initialization::prop_ident_expr(self.name_for_id(id));
+                    ca.lhs.span = span;
+                }
+            }
             // For bare-identifier LHS, compile the RHS and use BlockingAssign
             // (whole-signal write). For BitSelect/PartSelect/Concat LHS, use
             // compile_cont_assign_lhs which routes through compile_blocking_target

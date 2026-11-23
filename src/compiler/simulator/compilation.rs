@@ -732,7 +732,10 @@ impl Simulator {
             };
             let signature = self.canonicalize_spec_sig(&cn, "");
             let saved_spec = self.current_spec.replace((cn.clone(), signature));
-            let elem_type = self.module.classes.get(&cn)
+            let elem_type = self
+                .module
+                .classes
+                .get(&cn)
                 .and_then(|class| self.class_prop_elem_type(class, &name))
                 .cloned();
             self.class_context_stack.push(Some(cn));

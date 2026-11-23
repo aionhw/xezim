@@ -10,6 +10,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Class-scoped task calls keep their receiver during waits, and writes to
+  selected packed members update the owning class array element (#1570, #1569).
+- Delayed continuous assignments drive each net in an unpacked array (#1584).
+- A compilation-unit parameter keeps precedence over an unimported package
+  enum member when elaborating bounds and generate conditions (#1591).
+- Collection literals use their declared element type, and factory-created
+  objects retain their class specialization inside module instances
+  (#1581, #1582, #1583).
+
 - Real-valued `inside` constraints and weighted `dist` ranges retain
   fractional bounds during randomization (§18.5.3, #1485).
 - `$typename` of a packed vector declared through a typedef lists the outer

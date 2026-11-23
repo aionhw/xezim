@@ -914,13 +914,12 @@ impl Simulator {
                 }
             }
 
-            // Stage 1c: a blocking STATIC method call
+            // Stage 1c: a blocking class-scoped method call
             // `Class::method()` with no receiver handle — Stage 1b skipped it
             // because `path[0]` is a class name, not a handle var. For a static
             // method containing blocking calls (e.g. `forever begin hopper.get(...); fork ... join_none; end`),
             // running synchronously prevents its blocking `get` from suspending.
-            // Inline it (static context = the class, null `this`) so those waits
-            // suspend the process.
+            // Inline the selected body so those waits can suspend the process.
             if let StatementKind::Expr(expr) = &stmt.kind {
                 if let ExprKind::Call { func, args } = &expr.kind {
                     // `Class::method()` reaches here in two parse shapes:
@@ -1062,26 +1061,25 @@ impl Simulator {
                             let crate::ast::decl::ClassMethodKind::Task(td) = &tm.kind else {
                                 unreachable!("resolve_class_task yields tasks only")
                             };
-                            if self.stmts_have_blocking(&td.items) {
-                                let spec = recv_spec.clone().or_else(|| self.current_spec.clone());
+                            let is_static = self.is_static_method(&cls, &mn);
+                            // §8.23: an explicit class scope selects the body
+                            // statically while retaining the current object.
+                            let receiver = self.this_stack.last().copied().flatten().filter(|&h| {
+                                !is_static && self.heap.get(h).and_then(Option::as_ref)
+                                    .is_some_and(|obj| self.class_is_a(&obj.class_name, &cls))
+                            });
+                            if (is_static || receiver.is_some()) && self.stmts_have_blocking(&td.items) {
+                                let spec = self.task_method_spec(receiver, &mclass)
+                                    .or_else(|| recv_spec.clone())
+                                    .or_else(|| self.current_spec.clone());
+                                let saved_spec = self.current_spec.clone();
                                 let mut cleanup = self.bind_task_frame(
                                     td,
                                     args,
-                                    Some((spec, None, mclass.clone())),
+                                    Some((spec, receiver, mclass.clone())),
                                 );
-                                // Static context: push the declaring class for
-                                // member/static resolution, with a null `this`.
-                                self.m_scope_stack.clear();
-                                self.this_stack.push(None);
-                                self.class_context_stack.push(Some(mclass));
-                                self.method_local_base
-                                    .push(self.local_stack.len().saturating_sub(1));
-                                cleanup.pushed_method_this = true;
-                                let saved_spec = self.current_spec.clone();
-                                // The frame's unwind restores the caller's
-                                // specialization (§8.25).
-                                cleanup.saved_spec = saved_spec.clone();
-                                if let Some((sb, ss)) = recv_spec {
+                                self.push_task_method_this(receiver, mclass, &mut cleanup);
+                                if is_static && let Some((sb, ss)) = recv_spec {
                                     self.ensure_spec_statics(&sb, &ss);
                                     self.current_spec = Some((sb, ss));
                                 }
