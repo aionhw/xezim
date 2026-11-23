@@ -67,6 +67,8 @@ mod callback_typedef_static;
 mod callee_local_keeps_caller_type;
 #[path = "types/case_inside_tolerance.rs"]
 mod case_inside_tolerance;
+#[path = "types/tolerance_ranges.rs"]
+mod tolerance_ranges;
 #[path = "types/cast_class_member_enum_range.rs"]
 mod cast_class_member_enum_range;
 #[path = "types/cast_operand_context.rs"]
