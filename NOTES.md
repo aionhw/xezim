@@ -10,6 +10,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- A cross's `iff` no longer gates the implicit coverpoint of a crossed
+  variable, and that coverpoint takes one hit per `sample()` however many
+  crosses name it (§19.6, #1603).
 - Real-valued `inside` constraints and weighted `dist` ranges retain
   fractional bounds during randomization (§18.5.3, #1485).
 - `$typename` of a packed vector declared through a typedef lists the outer
