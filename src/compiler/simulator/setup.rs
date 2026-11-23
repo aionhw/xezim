@@ -2468,21 +2468,73 @@ impl Simulator {
                 });
                 return None;
             }
-            // §9.4.2.2: a suspending `@*` whose inferred sensitivity is empty
-            // can never trigger, so do not strip `@*` into a combinational block.
-            if Self::event_list_shape(&ab.stmt) == EventListShape::Implicit
-                && (self.stmt_is_blocking(&body)
+            if Self::event_list_shape(&ab.stmt) == EventListShape::Implicit {
+                // §9.4.2.2: a suspending `@*` whose inferred sensitivity is empty
+                // can never trigger, so do not strip `@*` into a combinational block.
+                if self.stmt_is_blocking(&body)
                     || Self::stmt_contains_delay_control(&body)
                     || Self::stmt_contains_event_control(&body)
-                    || self.stmt_calls_blocking_task(&body, &ab.scope, 3))
-            {
-                return None;
+                    || self.stmt_calls_blocking_task(&body, &ab.scope, 3)
+                {
+                    return None;
+                }
+                return Some(AlwaysBlock {
+                    kind: ab.kind,
+                    stmt: body,
+                    scope: ab.scope,
+                });
             }
-            return Some(AlwaysBlock {
-                kind: ab.kind,
-                stmt: body,
-                scope: ab.scope,
-            });
+            // §23.3.3: an explicit event control whose expressions have no
+            // signal references (e.g. `always @(posedge clk)` inside a module
+            // where `.clk(1'b0)` / `.clk(1'b1)` was constant-substituted) fires
+            // at time 0 when an actual's value differs from the port's pre-t0
+            // default (`X` for 4-state, `0` for 2-state). Plain literal controls
+            // (`always @(posedge 1'b1)`) never fire.
+            if !ab.scope.is_empty()
+                && !self.module.input_port_actuals.is_empty()
+                && let Some(EventControl::EventExpr(items)) = leading_event(&ab.stmt)
+            {
+                let top_prefix = format!("{}.", self.module.name);
+                let inst = ab.scope.strip_prefix(&top_prefix).unwrap_or(&ab.scope);
+                let matching: Vec<(EdgeKind, Expression, bool)> = items
+                    .iter()
+                    .filter(|ee| ee.iff.is_none() && ee.expr.span != crate::ast::Span::dummy())
+                    .filter_map(|ee| {
+                        let port = self.module.input_port_actuals.iter().find(|port| {
+                            Self::port_formal_inst(port.formal()) == inst
+                                && port.actual().span == ee.expr.span
+                        })?;
+                        let edge = match ee.edge {
+                            Some(Edge::Posedge) => EdgeKind::Posedge,
+                            Some(Edge::Negedge) => EdgeKind::Negedge,
+                            Some(Edge::Edge) => EdgeKind::LsbEdge,
+                            None => EdgeKind::AnyEdge,
+                        };
+                        Some((edge, ee.expr.clone(), port.two_state()))
+                    })
+                    .collect();
+                let fires = matching.into_iter().any(|(edge, expr, two_state)| {
+                    let cur = self.eval_expr(&expr);
+                    let prev = if two_state {
+                        Value::zero(cur.width)
+                    } else {
+                        Value::all_x(cur.width)
+                    };
+                    value_event_fires(edge, &prev, &cur)
+                });
+                if fires {
+                    let stmts = match body.kind {
+                        StatementKind::SeqBlock { stmts, .. } => stmts,
+                        other => vec![Statement::new(other, body.span)].into(),
+                    };
+                    let pid = self.next_pid;
+                    self.next_pid += 1;
+                    self.process_scope_hint.insert(pid, ab.scope.clone());
+                    self.process_origin.insert(pid, (ab.stmt.span, "always block"));
+                    self.event_queue.schedule(0, pid, stmts.into_vec().into());
+                }
+            }
+            return None;
         }
         if ab.kind == AlwaysKind::Always {
             if let StatementKind::TimingControl {
