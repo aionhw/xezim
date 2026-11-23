@@ -2069,6 +2069,18 @@ impl Simulator {
         a.name == b.name && a.enclosing == b.enclosing && a.declaring_module == b.declaring_module
     }
 
+    /// A module instance can register both an unqualified class name and
+    /// its instance-qualified spelling for the same declaration (§8.25).
+    pub(super) fn class_names_alias(&self, a: &str, b: &str) -> bool {
+        a == b
+            || self
+                .module
+                .classes
+                .get(a)
+                .zip(self.module.classes.get(b))
+                .is_some_and(|(left, right)| Self::same_class_declaration(left, right))
+    }
+
     /// §8.25: only parameters in the lexical class scope can shadow a module
     /// constant. An unrelated class declaring the same name has no effect.
     fn class_parameter_owner(&self, name: &str) -> Option<&str> {

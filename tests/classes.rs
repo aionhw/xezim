@@ -1402,3 +1402,6 @@ mod imported_enum_over_unit_parameter;
 
 #[path = "classes/property_pattern_element_context.rs"]
 mod property_pattern_element_context;
+
+#[path = "classes/factory_specialization_in_child.rs"]
+mod factory_specialization_in_child;
