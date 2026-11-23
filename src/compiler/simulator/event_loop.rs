@@ -1926,7 +1926,9 @@ impl Simulator {
             if self.time == 0
                 && (!self.edge_t0_pending.is_empty()
                     || !self.time0_port_edges.is_empty()
-                    || !self.time0_alias_edges.is_empty())
+                    || !self.time0_wide_port_edges.is_empty()
+                    || !self.time0_alias_edges.is_empty()
+                    || !self.time0_wide_alias_edges.is_empty())
             {
                 self.deliver_time0_port_edges();
                 if self.event_queue.next_time() == Some(self.time) {
@@ -2021,7 +2023,9 @@ impl Simulator {
         if self.time == 0
             && (!self.edge_t0_pending.is_empty()
                 || !self.time0_port_edges.is_empty()
-                || !self.time0_alias_edges.is_empty())
+                || !self.time0_wide_port_edges.is_empty()
+                || !self.time0_alias_edges.is_empty()
+                || !self.time0_wide_alias_edges.is_empty())
         {
             self.deliver_time0_port_edges();
         }

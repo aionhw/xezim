@@ -51,7 +51,7 @@ use serde::ser::{SerializeSeq, Serializer};
 // Wide partial NBA profiling retains separate quiet and cloned counts.
 // §16.14.6: Simulator::delay_pids and ::delay_resumed, SvaClockedSite::tick_time.
 // §6.21: BlockScopeSave::static_hidden keeps each hidden static's position.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x24";
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x25";
 
 #[derive(Default)]
 struct Session {

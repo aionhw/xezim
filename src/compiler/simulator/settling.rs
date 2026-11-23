@@ -407,6 +407,13 @@ impl Simulator {
                     }
                     if par_scratch.len() >= self.bsp_par_threshold {
                         self.entry_evals += par_scratch.len() as u64;
+                        if self.in_pre_process_settle {
+                            for &eidx in &par_scratch {
+                                if self.comb_entries[eidx].defer_at_time0 {
+                                    self.t0_deferred_ran.insert(eidx);
+                                }
+                            }
+                        }
                         dirtied.clear();
                         let nthreads = std::thread::available_parallelism()
                             .map(|x| x.get().min(8))
@@ -539,6 +546,9 @@ impl Simulator {
                     }
                     self.settle_triggered[eidx] = false;
                     self.entry_evals += 1;
+                    if self.in_pre_process_settle && self.comb_entries[eidx].defer_at_time0 {
+                        self.t0_deferred_ran.insert(eidx);
+                    }
                     dirtied.clear();
                     let is_ast = matches!(
                         self.comb_entries[eidx].item,
@@ -2361,6 +2371,9 @@ impl Simulator {
                     continue;
                 }
                 evaluated_any = true;
+                if self.in_pre_process_settle && entries[eidx].defer_at_time0 {
+                    self.t0_deferred_ran.insert(eidx);
+                }
                 if let Some(Some(slot)) = self.mux_guard_by_entry.get(eidx)
                     && self.mux_body_unchanged(slot.get() - 1)
                 {

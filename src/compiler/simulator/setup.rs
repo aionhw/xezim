@@ -2205,8 +2205,41 @@ impl Simulator {
                                 // for an unusual shape and follows §9.4.2 exactly.
                                 let sens_covered =
                                     sens_ids.iter().all(|id| read_id_union.contains(id));
+                                let alias_agree = self.collapsed_port_children.is_empty() || {
+                                    let resolve_alias = |name: &str| -> Vec<(usize, u8)> {
+                                        let mut out: Vec<(usize, u8)> = Vec::new();
+                                        if let Some(scope) = &scope_hint {
+                                            let scoped = format!("{}.{}", scope, name);
+                                            if let Some(&id) = name_to_id.get(scoped.as_str()) {
+                                                out.push((id, self.alias_t0_kind(&scoped, id)));
+                                            }
+                                        }
+                                        if let Some(&id) = name_to_id.get(name) {
+                                            out.push((id, self.alias_t0_kind(name, id)));
+                                        } else if let Some(stripped) = name.strip_prefix(&top_prefix)
+                                        {
+                                            if let Some(&id) = name_to_id.get(stripped) {
+                                                out.push((id, self.alias_t0_kind(stripped, id)));
+                                            }
+                                        }
+                                        out
+                                    };
+                                    let mut sens_pairs: HashSet<(usize, u8)> = HashSet::default();
+                                    for s in &sens {
+                                        for pair in resolve_alias(s.signal_name.as_str()) {
+                                            sens_pairs.insert(pair);
+                                        }
+                                    }
+                                    let read_pairs: HashSet<(usize, u8)> = b_reads
+                                        .difference(&b_writes)
+                                        .filter(|r| !is_param(r.as_str()))
+                                        .flat_map(|r| resolve_alias(r.as_str()))
+                                        .collect();
+                                    sens_pairs == read_pairs
+                                };
                                 reads_covered
                                     && sens_covered
+                                    && alias_agree
                                     && (select_masks.is_empty()
                                         || self.body_reads_within_masks(
                                             &body,

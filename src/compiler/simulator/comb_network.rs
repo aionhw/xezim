@@ -614,6 +614,10 @@ pub(super) struct CombEntryCold {
     /// §9.2.2.2: evaluating the entry is observable beyond its outputs
     /// (see `time0_effects`); it waits for the time-0 start batch.
     pub(super) time0_effects: bool,
+    /// Nonzero `alias_t0_kind` tags (`1` = 4-state `X`, `2` = 2-state `0`) for
+    /// read signals accessed through a collapsed identity input port formal,
+    /// for top-scope non-`always_comb` entries checked by `fire_time0_input_port_blocks`.
+    pub(super) alias_t0_reads: Option<Box<Vec<(usize, u8)>>>,
 }
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
