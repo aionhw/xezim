@@ -916,3 +916,6 @@ mod packed_package_field_net_width;
 
 #[path = "types/transitive_packed_typedef_width.rs"]
 mod transitive_packed_typedef_width;
+
+#[path = "types/unit_member_vs_unimported_package.rs"]
+mod unit_member_vs_unimported_package;
