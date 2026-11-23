@@ -121,3 +121,34 @@ endmodule
     expect(&out, "P 3 3");
     expect(&out, "Q 2 20");
 }
+
+/// IEEE 1800-2023 §10.9.1, §8.9: an `N{...}` item of the initializer's
+/// pattern stands for N copies, for a static and an instance collection,
+/// and a function that returns the whole queue runs, once.
+#[test]
+fn static_collection_initializer_replication_and_call() {
+    let src = r#"
+module t;
+  typedef int q_t[$];
+  int calls;
+  function automatic q_t make_q();
+    calls++;
+    return '{4, 5, 6};
+  endfunction
+  class T;
+    static int rep[$]  = '{3{5}};
+    static int drep[]  = '{2{1, 2}};
+    static q_t made    = make_q();
+    int        irep[$] = '{2{7, 8}};
+  endclass
+  initial begin
+    T x = new;
+    $display("rep %0d %0d drep %0d %0d made %0d %0d calls %0d", T::rep.size(), T::rep[2], T::drep.size(), T::drep[3], T::made.size(), T::made[2], calls);
+    $display("irep %0d %0d", x.irep.size(), x.irep[3]);
+  end
+endmodule
+"#;
+    let out = messages(src);
+    expect(&out, "rep 3 5 drep 4 2 made 3 6 calls 1");
+    expect(&out, "irep 4 8");
+}
