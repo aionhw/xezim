@@ -24,6 +24,24 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   their declared sign (§7.4.5, #1568).
 - An unpacked struct field can hold a virtual interface and use it to
   read or write the connected interface's array (§25.9, §7.6, #1311).
+- Unconditional event-controlled `always` procedures pre-arm their initial
+  event control before `initial` procedures start at time 0, so zero-delay
+  `initial` writes wake them reliably (§4.4.2, §9.2.2.1, #1545).
+- Implicit `@*` sensitivity descends through timing, `wait`, `repeat`,
+  `foreach`, guarded `case`, `randcase`, and procedural continuous statements
+  while omitting timing-condition operands and block-local declarations, retains
+  module-scope self-reads for suspending or self-referential procedures, and
+  drops empty-sensitivity suspending `@*` procedures instead of running them
+  once at time 0 (§9.4.2.2, #1539).
+- Collapsed whole-net identity assignments, wide (`>64`-bit) aliases, `1'bz`
+  connections, and constant-tied input ports deliver their pre-time-0 to time-0
+  updates across combinational, explicit-sensitivity, and edge readers while
+  leaving uninitialized 4-state `X` and 2-state `0` aliases quiet (§10.3,
+  §23.3.3, #1532).
+- Static, package-global, hoisted static-local, and synthesized variable
+  declaration initializers execute before time-0 snapshots and process startup
+  so initialized variables hold their values without emitting time-0 events
+  (§6.8, §6.21, §10.5, #1533).
 
 **Performance**
 
@@ -53,6 +71,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   behavior. Identifier lookup uses a first-byte filter for special names.
 - Interpreted comparisons reuse task-frame type lookups and skip width
   queries for plain reads compared with known integer literals.
+- Signal edge-fanout indices use boxed slices (`Box<[u32]>` /
+  `Box<[EdgeBatch]>`) with a single `term_raw_bits` read per fanout check, cold
+  `EventWaiter` buffers (`guard_prev` and `captured_prev_wide`) allocate
+  lazily, cold comb entries shrink-to-fit after compilation, time-0
+  deferred-eval and alias sets release immediately, and compile-time pre-arm
+  AST checks and time-0 alias maps run only when needed. Measured quiescent vs
+  clean `main` (3 runs, identical outputs): `bench_vm_dispatch` MaxRSS
+  62632 -> 55652 KB (-11.1%, median wall 0.25 -> 0.23s, user 0.24 -> 0.21s),
+  `bench_vm_branchy` MaxRSS 67052 -> 57772 KB (-13.8%, median wall 1.14 ->
+  1.03s, user 1.13 -> 1.02s), a 200-waiter synthetic bench MaxRSS 35836 ->
+  35844 KB / median wall 0.05 -> 0.05s (user 0.04 -> 0.04s), and a
+  4,000-alias time-0 bench MaxRSS 90188 -> 77408 KB (-14.2%, user 0.11 ->
+  0.09s, wall 0.12 -> 0.12s).
 
 **Command line**
 
