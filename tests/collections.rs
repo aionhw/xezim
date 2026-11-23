@@ -76,6 +76,8 @@ mod mailbox_handle_named_like_struct;
 mod member_off_handle_collection_elem;
 #[path = "collections/member_read_effect_select.rs"]
 mod member_read_effect_select;
+#[path = "collections/binary_operand_effect_select.rs"]
+mod binary_operand_effect_select;
 #[path = "classes/compiled_method_test_env.rs"]
 mod compiled_method_test_env;
 #[path = "collections/bits_dynamic_operand.rs"]
