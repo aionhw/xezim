@@ -202,3 +202,41 @@ endmodule
         ],
     );
 }
+
+#[test]
+fn whole_array_through_struct_member_handle() {
+    check(
+        r#"
+interface link_if;
+  longint payload[2];
+  modport writer (output payload);
+endinterface
+module top;
+  link_if first(), second();
+  typedef struct { virtual link_if.writer link; int pad; } holder_t;
+  holder_t a, b;
+  task automatic put();
+    longint src[2];
+    src = '{7, 11};
+    b.link.payload = src;
+  endtask
+  initial begin
+    longint dst[2];
+    a.link = first.writer;
+    b = a;
+    a.link = second.writer;
+    put();
+    dst = b.link.payload;
+    $display("T|copy=%0d read=%0d,%0d direct=%0d", b.link != a.link,
+             dst[0], dst[1], first.payload[1]);
+    b.link = a.link;
+    put();
+    a.link = null;
+    $display("T|null=%0d bound=%0d direct=%0d", a.link == null,
+             b.link != null, second.payload[1]);
+  end
+endmodule
+"#,
+        &["T|copy=1 read=7,11 direct=11", "T|null=1 bound=1 direct=11"],
+    );
+}
