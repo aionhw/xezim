@@ -597,6 +597,7 @@ mod constraint_solver;
 mod constraint_targets;
 mod construction;
 mod coverage;
+mod coverage_implicit;
 mod dpi_imports;
 mod edges;
 mod enum_receivers;
