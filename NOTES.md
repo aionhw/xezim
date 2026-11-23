@@ -8,8 +8,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+**Correctness**
+
+- Continuous assignments read negative packed-array element labels with
+  their declared sign (§7.4.5, #1568).
+- An unpacked struct field can hold a virtual interface and use it to
+  read or write the connected interface's array (§25.9, §7.6, #1311).
+
 **Performance**
 
+- A procedural write that changes no signal skips the active-force scan
+  when all force dependencies are known (§10.6.2, #1335).
 - Experimental `XEZIM_ARMED_EDGE_MASKS=1` lets a write to a shared bus
   skip arming clocked blocks that only read unaffected slices.
 - Experimental switches for the two-state mux evaluator
