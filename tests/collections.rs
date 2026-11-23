@@ -429,3 +429,6 @@ mod review_queue_rows_dollar_pop;
 mod real_reduction_with;
 #[path = "collections/local_coll_elem_compare_1497.rs"]
 mod local_coll_elem_compare_1497;
+
+#[path = "collections/row_read_operands.rs"]
+mod row_read_operands;
