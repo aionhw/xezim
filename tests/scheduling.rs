@@ -631,3 +631,6 @@ mod timed_star_and_time_zero;
 
 #[path = "scheduling/runtime_var_init_no_time0_event_1533.rs"]
 mod runtime_var_init_no_time0_event_1533;
+
+#[path = "scheduling/star_timing_and_self_read_1539.rs"]
+mod star_timing_and_self_read_1539;
