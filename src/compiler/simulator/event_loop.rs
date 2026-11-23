@@ -159,6 +159,49 @@ impl Simulator {
         }
     }
 
+    /// §4.5, §9.7.4: after an edge pass, move the parked waiters whose
+    /// condition the woken processes made true to `ready_condition_waiters`,
+    /// so they resume in this Active region, before the NBAs commit. Only an
+    /// ungated waiter (a condition on design variables) is re-checked: a
+    /// gated one is promoted by the write that sets one of its names
+    /// (`check_condition_waiters_for_write`). A blocking write from compiled
+    /// process code to a design variable promotes no waiter, so before this
+    /// a `wait (go)` the edge-woken writer released stayed parked until the
+    /// end-of-tick drain, after the NBA region, and a process woken by one
+    /// of those NBAs ran first. Returns whether a waiter is ready.
+    pub(super) fn promote_true_ungated_waiters(&mut self) -> bool {
+        if self.condition_waiters.is_empty() {
+            return !self.ready_condition_waiters.is_empty();
+        }
+        // §10.3: a condition on a continuously assigned net reads it updated.
+        if self.dirty_any {
+            self.settle_combinatorial();
+        }
+        let mut i = 0;
+        while i < self.condition_waiters.len() {
+            let (pid, _) = self.condition_waiters[i];
+            if matches!(self.cond_waiter_gate.get(&pid), Some(Some(_))) {
+                i += 1;
+                continue;
+            }
+            let Some(cond) = self.cond_waiter_conditions.remove(&pid) else {
+                i += 1;
+                continue;
+            };
+            if self.eval_waiter_condition(pid, &cond) {
+                let (wpid, wcont) = self.condition_waiters.remove(i);
+                self.cond_waiter_gate.remove(&wpid);
+                self.cond_waiter_reads.remove(&wpid);
+                self.cond_read_union_dirty = true;
+                self.ready_condition_waiters.push((wpid, wcont));
+            } else {
+                self.cond_waiter_conditions.insert(pid, cond);
+                i += 1;
+            }
+        }
+        !self.ready_condition_waiters.is_empty()
+    }
+
     /// Settle after a procedural blocking write (outside edge blocks).
     ///
     /// §5.5 + §10.3 say the driven continuous assignments' re-evaluation is a
@@ -412,7 +455,7 @@ impl Simulator {
             // apply_nba below — after the snapshot — so their edges stay
             // detectable; `in_edge_cont` records its blocking signal writes
             // for the §9.2 rescan drain.
-            if !self.ready_condition_waiters.is_empty() {
+            if self.promote_true_ungated_waiters() {
                 let __prev_edge_cont = self.in_edge_cont;
                 self.in_edge_cont = true;
                 self.drain_condition_waiters(true, false);
@@ -2016,7 +2059,7 @@ impl Simulator {
             }
             // §9.7.4: a `wait` the edge's processes made true resumes in this
             // Active region too, before the NBAs commit (as in the cascade).
-            if !self.ready_condition_waiters.is_empty() {
+            if self.promote_true_ungated_waiters() {
                 let prev = self.in_edge_cont;
                 self.in_edge_cont = true;
                 self.drain_condition_waiters(true, false);
