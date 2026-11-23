@@ -617,3 +617,5 @@ mod review_foreach_hides_static;
 mod forced_partial_stores;
 #[path = "scheduling/array_write_feedback.rs"]
 mod array_write_feedback;
+#[path = "scheduling/star_timing_and_self_read_1539.rs"]
+mod star_timing_and_self_read_1539;
