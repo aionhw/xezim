@@ -625,3 +625,6 @@ mod comb_indexed_member_writes;
 
 #[path = "scheduling/delayed_unpacked_array_drive.rs"]
 mod delayed_unpacked_array_drive;
+
+#[path = "scheduling/timed_star_and_time_zero.rs"]
+mod timed_star_and_time_zero;
