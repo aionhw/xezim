@@ -901,3 +901,6 @@ mod review_struct_param_cast_in_instance;
 mod shortreal_storage_1463;
 #[path = "types/nested_member_typedef_sign.rs"]
 mod nested_member_typedef_sign;
+
+#[path = "types/transitive_packed_typedef_width.rs"]
+mod transitive_packed_typedef_width;
