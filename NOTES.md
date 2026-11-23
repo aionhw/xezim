@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Real-valued `inside` constraints and weighted `dist` ranges retain
+  fractional bounds during randomization (§18.5.3, #1485).
+- `$typename` of a packed vector declared through a typedef lists the outer
+  dimensions before the typedef's own dimensions (§20.6.1, #1312).
 - Parenthesized unpacked array rows retain their shape, and their
   side-effecting selectors run once (§7.6, §11.3.2, §11.4.2, #1552, #1555).
 - `%p` formats selected rows of class arrays and queues in declared order
@@ -23,6 +27,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
+- Delay loops with a delayed nonblocking assignment compile their surrounding
+  code and retain the assignment's scheduling semantics (§9.4.5, #1327).
+- Bytecode queue pops call the collection runtime directly for known module
+  queues (§7.10.2, #1210).
 - A procedural write that changes no signal skips the active-force scan
   when all force dependencies are known (§10.6.2, #1335).
 - Experimental `XEZIM_ARMED_EDGE_MASKS=1` lets a write to a shared bus
