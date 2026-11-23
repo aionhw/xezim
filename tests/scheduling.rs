@@ -634,3 +634,5 @@ mod runtime_var_init_no_time0_event_1533;
 
 #[path = "scheduling/star_timing_and_self_read_1539.rs"]
 mod star_timing_and_self_read_1539;
+#[path = "scheduling/time0_always_event_prearm_1545.rs"]
+mod time0_always_event_prearm_1545;
