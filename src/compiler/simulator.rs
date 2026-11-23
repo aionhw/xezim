@@ -182,7 +182,8 @@ thread_local! {}
 // and a nested packed-struct member read compiles to one range select.
 // §7.5, §7.10: compiled local collection reads retain element width and sign.
 // §7.4.5: packed element constant indices keep their declared sign.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317c;
+// §7.10.2: module queue pops call the collection runtime directly.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317d;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near

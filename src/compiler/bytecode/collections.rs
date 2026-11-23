@@ -3,6 +3,68 @@
 use super::*;
 
 impl<'a> BytecodeCompiler<'a> {
+    /// Lower an unselected module queue receiver whose storage is known at
+    /// compile time. Class and subroutine-local queues use their own paths.
+    pub(super) fn compile_module_queue_pop(
+        &mut self,
+        func: &Expression,
+        args: &[Expression],
+    ) -> Option<RegId> {
+        if self.method_mode || !args.is_empty() {
+            return None;
+        }
+        let (receiver, method) = match &func.kind {
+            ExprKind::Ident(h) if h.root.is_none() && h.path.len() >= 2 => {
+                let (last, rest) = h.path.split_last()?;
+                if h.path.iter().any(|part| !part.selects.is_empty()) {
+                    return None;
+                }
+                (rest, last.name.name.as_str())
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let ExprKind::Ident(h) = &expr.kind else {
+                    return None;
+                };
+                if h.root.is_some() || h.path.iter().any(|part| !part.selects.is_empty()) {
+                    return None;
+                }
+                (h.path.as_slice(), member.name.as_str())
+            }
+            _ => return None,
+        };
+        let front = match method {
+            "pop_front" => true,
+            "pop_back" => false,
+            _ => return None,
+        };
+        let head = receiver.first()?.name.name.as_str();
+        if self.local_var_regs.contains_key(head)
+            || self.process_local_names.contains(head)
+            || self.local_coll_names.contains(head)
+        {
+            return None;
+        }
+        let queues = self.queue_vars?;
+        let recv = receiver
+            .iter()
+            .map(|part| part.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        let queue = self
+            .scope_hint
+            .as_ref()
+            .map(|scope| cat_dot(scope, &recv))
+            .filter(|name| queues.contains(name))
+            .or_else(|| queues.contains(&recv).then_some(recv))?;
+        let dest = self.alloc_reg();
+        self.emit(Insn::QueuePop(
+            dest,
+            Box::new(Name(queue.into_boxed_str())),
+            front,
+        ));
+        Some(dest)
+    }
+
     /// Must an element STORE to this name avoid the dense array fast path?
     ///
     /// A dynamic array / queue element carries a signal TWIN, so

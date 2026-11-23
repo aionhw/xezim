@@ -227,7 +227,7 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::StmtFallback(..) => return false,
             // A local-collection declaration has storage side effects.
             Insn::InitLocalColl(..) => return false,
-            Insn::EvalExprFallback(..) => return false,
+            Insn::EvalExprFallback(..) | Insn::QueuePop(..) => return false,
         }
         true
     }
@@ -626,6 +626,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::CallStaticScoped(..)
                 | Insn::CallFreeFunction(..)
                 | Insn::CallCollMethod(..)
+                | Insn::QueuePop(..)
                 | Insn::ConstructObject(..)
                 | Insn::ForeachNext(..)
                 | Insn::Cast(..)
@@ -1978,7 +1979,7 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 // Collection element read: width follows the runtime store —
                 // bare dest store (like LoadClassMember).
-                Insn::LoadCollElem(d, ..) => store(&mut rw, *d, None),
+                Insn::QueuePop(d, ..) | Insn::LoadCollElem(d, ..) => store(&mut rw, *d, None),
                 // Collection element store defines nothing (the storage key
                 // is a flat string in `signals`).
                 Insn::StoreCollElem(..) => {}

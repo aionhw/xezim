@@ -4773,6 +4773,7 @@ impl Simulator {
                             | RIns::CovHit(..)
                             | RIns::EvalExprFallback(..)
                             | RIns::LoadDynElem(..)
+                            | RIns::QueuePop(..)
                             | RIns::LoadProcessLocal(..)
                             | RIns::Format(..)
                             | RIns::CaseJump(..)

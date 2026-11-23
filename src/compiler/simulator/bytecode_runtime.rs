@@ -771,6 +771,7 @@ impl Simulator {
                 Insn::StmtFallback(..)
                 | Insn::EvalExprFallback(..)
                 | Insn::LoadDynElem(..)
+                | Insn::QueuePop(..)
                 | Insn::BlockingAssign(..)
                 | Insn::BlockingAssignString(..)
                 | Insn::BlockingAssignRange(..)
@@ -1705,6 +1706,7 @@ impl Simulator {
                 | Insn::StmtFallback(..)
                 | Insn::EvalExprFallback(..)
                 | Insn::LoadDynElem(..)
+                | Insn::QueuePop(..)
                 | Insn::CovHit(..) => {
                     unsupported = true;
                 }
@@ -4095,6 +4097,12 @@ impl Simulator {
                 Insn::LoadDynElem(dest, op, idx_reg) => {
                     let v = self.load_dyn_elem(op, *idx_reg);
                     self.vm_regs[*dest as usize] = v;
+                }
+                Insn::QueuePop(dest, queue, front) => {
+                    let method = if *front { "pop_front" } else { "pop_back" };
+                    self.vm_regs[*dest as usize] = self
+                        .eval_builtin_method(&queue.0, method, &[])
+                        .unwrap_or_else(|| Value::zero(32));
                 }
                 Insn::EvalExprFallback(payload, r, ctxw) => {
                     // Expression-level AST escape hatch: interpret one

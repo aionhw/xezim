@@ -688,6 +688,8 @@ pub enum Insn {
     /// on and a stale element past `size()`. Main executor only: every other
     /// executor and lowering treats it like `EvalExprFallback`.
     LoadDynElem(RegId, Box<DynElemOp>, RegId),
+    /// Pop one value from a declared module queue (§7.10.2).
+    QueuePop(RegId, Box<Name>, bool), // (dest, queue, from_front)
 }
 
 /// The collection a `LoadDynElem` reads.
@@ -1075,6 +1077,7 @@ impl Insn {
             | ConstructObject(..)
             | CallStaticScoped(..)
             | CallFreeFunction(..)
+            | QueuePop(..)
             | AssignPendingColl(..) => return false,
         }
         true
@@ -1158,6 +1161,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::ForeachNext(..) => "FeNext",
         Insn::RetCollection(..) => "RetColl",
         Insn::AssignPendingColl(..) => "AssignPC",
+        Insn::QueuePop(..) => "QueuePop",
         Insn::Nop => "Nop",
         Insn::Jump(..) => "Jump",
         Insn::BranchIfFalse(..) => "Br",

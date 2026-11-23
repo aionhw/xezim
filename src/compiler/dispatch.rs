@@ -186,7 +186,7 @@ impl Opcode {
             Insn::Move(_, _) => Self::Move,
             Insn::StmtFallback(_) => Self::StmtFallback,
             Insn::InitLocalColl(_) => Self::StmtFallback,
-            Insn::EvalExprFallback(..) => Self::StmtFallback,
+            Insn::EvalExprFallback(..) | Insn::QueuePop(..) => Self::StmtFallback,
             Insn::SetSigned(_) => Self::SetSigned,
             Insn::ClearSigned(_) => Self::ClearSigned,
             Insn::DropXz(_) => Self::DropXz,

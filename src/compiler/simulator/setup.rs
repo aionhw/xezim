@@ -4153,7 +4153,8 @@ impl Simulator {
                         }
                         Insn::StmtFallback(..)
                         | Insn::EvalExprFallback(..)
-                        | Insn::LoadDynElem(..) => ranged = false,
+                        | Insn::LoadDynElem(..)
+                        | Insn::QueuePop(..) => ranged = false,
                         _ => {}
                     }
                 }

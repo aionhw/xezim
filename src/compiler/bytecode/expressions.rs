@@ -2811,6 +2811,9 @@ impl<'a> BytecodeCompiler<'a> {
                 acc
             }
             ExprKind::Call { func, args } => {
+                if let Some(reg) = self.compile_module_queue_pop(func, args) {
+                    return Some(reg);
+                }
                 // §18.8 (#846): mode builtins address a variable/constraint
                 // through its receiver expression. CallMethod carries only
                 // a handle value, losing `sub` versus `this.sub` and bypassing

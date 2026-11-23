@@ -1578,6 +1578,7 @@ impl Simulator {
                     Insn::StmtFallback(..)
                     | Insn::EvalExprFallback(..)
                     | Insn::LoadDynElem(..)
+                    | Insn::QueuePop(..)
                     | Insn::CovHit(..) => opaque = true,
                     // Constant bit/part selects record only the SLICE they
                     // read (see `edge_block_reads_meta`); everything else is
