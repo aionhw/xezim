@@ -573,3 +573,7 @@ mod top_ansi_packed_ports;
 mod signed_port_unsigned_actual;
 #[path = "hierarchy/generate_nettype_drivers.rs"]
 mod generate_nettype_drivers;
+#[path = "hierarchy/instance_array_packed_actual_slices_1488.rs"]
+mod instance_array_packed_actual_slices_1488;
+#[path = "hierarchy/package_imports_in_instances_1530.rs"]
+mod package_imports_in_instances_1530;
