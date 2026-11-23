@@ -10,6 +10,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Parenthesized unpacked array rows retain their shape, and their
+  side-effecting selectors run once (§7.6, §11.3.2, §11.4.2, #1552, #1555).
+- `%p` formats selected rows of class arrays and queues in declared order
+  (§21.2.1.7, #1562).
+- Nested two-state members of packed structs read X and Z as zero
+  (§7.2.1, #1560).
 - Continuous assignments read negative packed-array element labels with
   their declared sign (§7.4.5, #1568).
 - An unpacked struct field can hold a virtual interface and use it to
