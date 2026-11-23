@@ -322,6 +322,14 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     pub(super) fn lookup_param_value(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
+        // §23.9: a loop-local index hides a module parameter of the same name.
+        // Only the typed loop binding may supply its value during unrolling.
+        if hier.root.is_none()
+            && let [seg] = hier.path.as_slice()
+            && self.local_const_vars.contains_key(&seg.name.name)
+        {
+            return None;
+        }
         if let Some(value) = self.method_enum_constant(hier) {
             return Some(value);
         }

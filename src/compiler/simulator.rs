@@ -180,7 +180,8 @@ thread_local! {}
 // §6.24.1: an integer atom cast of an integral operand copies the operand before it is fitted.
 // §7.2, §7.4.2: a member select through constant element selects of a packed struct compiles,
 // and a nested packed-struct member read compiles to one range select.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317a;
+// §12.7.1: typed unrolled indices can select packed members in compiled methods.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3180;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
@@ -554,7 +555,8 @@ macro_rules! write_sig {
 // tries every scope spelling for its alias net.
 // §7.2, §7.4.2: a member select through constant element selects of a packed struct, and a
 // nested packed-struct member read, compile to range stores and selects.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB080";
+// §12.7.1: an unrolled loop index can make member stores static in prepared comb code.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB083";
 
 mod aggregate_assignments;
 mod pattern_array_items;

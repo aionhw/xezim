@@ -186,6 +186,11 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Number(n) => Self::exact_index_value(&self.eval_number_static(n)?),
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
                 let name = h.path[0].name.name.as_str();
+                if h.root.is_none()
+                    && let Some(v) = self.local_const_vars.get(name)
+                {
+                    return Self::exact_index_value(v);
+                }
                 if let Some(&v) = self.const_var_binds.get(name) {
                     return Some(v as i64);
                 }
