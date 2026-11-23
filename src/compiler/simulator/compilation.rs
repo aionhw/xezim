@@ -52,7 +52,7 @@ impl Simulator {
                 })
                 .collect();
             for (k, v) in ret_layouts {
-                self.module.packed_struct_fields.entry(k).or_insert(v);
+                self.module.packed_struct_fields.insert_if_absent(k, || v);
             }
         }
         self.sanitize_class_hierarchy();

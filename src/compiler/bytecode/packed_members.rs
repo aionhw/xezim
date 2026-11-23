@@ -235,7 +235,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
         for candidate in candidates {
             if let Some(fields) = fields_map.get(candidate.as_str()) {
-                return Some((candidate, fields.clone()));
+                return Some((candidate, fields.to_vec()));
             }
         }
         None
@@ -637,7 +637,7 @@ impl<'a> BytecodeCompiler<'a> {
             .packed_member_keys(&root_key, &hier, &member.name)
             .iter()
             .find_map(|k| all_dims.get(k.as_str()))?
-            .clone();
+            .to_vec();
         let counts: Vec<i64> = dims.iter().map(|(l, r)| (l - r).abs() + 1).collect();
         if idx_exprs.len() > dims.len() || counts.iter().product::<i64>() != i64::from(field_w) {
             return None;
@@ -1010,6 +1010,21 @@ impl<'a> BytecodeCompiler<'a> {
         })
     }
 
+    pub(super) fn packed_dims_at<'t>(
+        &self,
+        table: &'t xezim_core::shared_names::SharedSliceMap<(i64, i64)>,
+        name: &str,
+    ) -> Option<&'t [(i64, i64)]> {
+        table.get(name).map(|d| d.as_slice()).or_else(|| {
+            let (base, idx) = name.strip_suffix(']')?.rsplit_once('[')?;
+            let shape = table.get(base)?;
+            let idx = idx.parse::<i64>().ok()?;
+            let &(lo, hi, _) = self.arrays.get(base)?;
+            ((lo.min(hi)..=lo.max(hi)).contains(&idx) && self.signal_name_to_id.contains_key(name))
+                .then_some(shape.as_slice())
+        })
+    }
+
     /// Declared packed dimensions of `hier`: exact name, then the name under
     /// the current instance scope, then — for a SINGLE-segment name only —
     /// the bare leaf. A multi-segment name (a struct member, a hierarchical
@@ -1018,7 +1033,7 @@ impl<'a> BytecodeCompiler<'a> {
     pub(super) fn packed_full_dims_of(
         &self,
         hier: &HierarchicalIdentifier,
-    ) -> Option<&'a Vec<(i64, i64)>> {
+    ) -> Option<&'a [(i64, i64)]> {
         let raw = Self::hier_raw_cow(hier);
         let m = self.packed_full_dims?;
         // §23.6 / §7.4.1: absolute names use the same top-prefix
@@ -1027,18 +1042,20 @@ impl<'a> BytecodeCompiler<'a> {
             .and_then(|top| raw.strip_prefix(top.as_str()).and_then(|s| s.strip_prefix('.')));
         let rooted = hier.root.is_some() || top_rest.is_some();
         let raw = top_rest.unwrap_or(raw.as_ref());
-        self.packed_shape_at(m, raw)
+        self.packed_dims_at(m, raw)
             .or_else(|| {
                 if rooted { return None; }
                 self.scope_hint
                     .as_ref()
-                    .and_then(|sc| with_dotted(sc, &raw, |k| m.get(k)))
+                    .and_then(|sc| with_dotted(sc, &raw, |k| m.get(k).map(|d| d.as_slice())))
             })
             .or_else(|| {
                 if hier.path.len() != 1 {
                     return None;
                 }
-                hier.path.last().and_then(|s| m.get(s.name.name.as_str()))
+                hier.path
+                    .last()
+                    .and_then(|s| m.get(s.name.name.as_str()).map(|d| d.as_slice()))
             })
     }
 
@@ -1233,7 +1250,9 @@ impl<'a> BytecodeCompiler<'a> {
             if self
                 .packed_full_dims
                 .and_then(|m| {
-                    scoped.and_then(|q| self.packed_shape_at(m, q)).or_else(|| self.packed_shape_at(m, raw))
+                    scoped
+                        .and_then(|q| self.packed_dims_at(m, q))
+                        .or_else(|| self.packed_dims_at(m, raw))
                 })
                 .is_some_and(|dims| dims.len() > 1)
             {

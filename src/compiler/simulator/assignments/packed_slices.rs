@@ -275,7 +275,7 @@ impl Simulator {
         let slot = if pre.is_empty() {
             0
         } else {
-            let dims = self.module.packed_full_dims.get(root).map(Vec::as_slice);
+            let dims = self.module.packed_full_dims.get(root).map(|d| d.as_slice());
             Self::flatten_packed_slot_iter(pre.iter().map(|(_, index)| *index), dims)?
         };
         // Render the field path with indices inline, matching the registered key.

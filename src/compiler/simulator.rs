@@ -1423,7 +1423,7 @@ pub struct Simulator {
     static_struct_names: HashSet<String>,
     /// `module.packed_struct_fields` without the `mixed_packed_vars` entries;
     /// `None` when there are none.
-    bc_packed_fields: Option<HashMap<String, Vec<(String, u32, u32)>>>,
+    bc_packed_fields: Option<xezim_core::shared_names::SharedSliceMap<(String, u32, u32)>>,
     pub monitor_prev: HashMap<String, Value>,
     /// Previously-printed values of the active `$monitor`'s non-`$time`
     /// arguments. `$monitor` re-prints only when one of these changes

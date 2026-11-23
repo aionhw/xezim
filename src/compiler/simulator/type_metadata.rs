@@ -274,6 +274,29 @@ impl Simulator {
                     .collect(),
             }
         }
+        fn pick_shared<T: Clone, W>(
+            map: &xezim_core::shared_names::SharedSliceMap<T>,
+            name: &str,
+            pfx: &str,
+            members: bool,
+            known: Option<&[(String, W)]>,
+        ) -> Vec<(String, Vec<T>)> {
+            let bare = map.get(name).map(|v| (name.to_string(), v.to_vec()));
+            match known {
+                _ if !members => bare.into_iter().collect(),
+                Some(keys) => bare
+                    .into_iter()
+                    .chain(keys.iter().filter(|(k, _)| k != name).filter_map(|(k, _)| {
+                        map.get(k.as_str()).map(|v| (k.clone(), v.to_vec()))
+                    }))
+                    .collect(),
+                None => map
+                    .iter()
+                    .filter(|(k, _)| *k == name || k.starts_with(pfx))
+                    .map(|(k, v)| (k.clone(), v.to_vec()))
+                    .collect(),
+            }
+        }
         LocalMeta {
             members,
             typedef: self.var_typedef_types.get(name).cloned(),
@@ -296,14 +319,14 @@ impl Simulator {
                     known.map(|k| &k.decl_types[..]),
                 )
             },
-            struct_members: pick(
+            struct_members: pick_shared(
                 &m.struct_members,
                 name,
                 &pfx,
                 members,
                 known.map(|k| &k.struct_members[..]),
             ),
-            packed_fields: pick(
+            packed_fields: pick_shared(
                 &m.packed_struct_fields,
                 name,
                 &pfx,
@@ -317,7 +340,7 @@ impl Simulator {
                 members,
                 known.map(|k| &k.elem_widths[..]),
             ),
-            full_dims: pick(
+            full_dims: pick_shared(
                 &m.packed_full_dims,
                 name,
                 &pfx,
@@ -383,13 +406,25 @@ impl Simulator {
         for (key, ty) in &meta.decl_types {
             m.var_decl_types.insert_shared(key.clone(), ty.clone());
         }
-        keyed(
+        fn keyed_shared<T: Clone + Eq + std::hash::Hash>(
+            map: &mut xezim_core::shared_names::SharedSliceMap<T>,
+            name: &str,
+            out: &[(String, Vec<T>)],
+            v: &[(String, Vec<T>)],
+        ) {
+            map.remove(name);
+            for (k, _) in out {
+                map.remove(k.as_str());
+            }
+            map.extend(v.iter().cloned());
+        }
+        keyed_shared(
             &mut m.struct_members,
             name,
             &out.struct_members,
             &meta.struct_members,
         );
-        keyed(
+        keyed_shared(
             &mut m.packed_struct_fields,
             name,
             &out.packed_fields,
@@ -401,7 +436,7 @@ impl Simulator {
             &out.elem_widths,
             &meta.elem_widths,
         );
-        keyed(
+        keyed_shared(
             &mut m.packed_full_dims,
             name,
             &out.full_dims,

@@ -779,12 +779,11 @@ impl Simulator {
                     .module
                     .packed_struct_fields
                     .get(&*base_name)
-                    .cloned()
                     .map(|fs| {
-                        fs.into_iter()
+                        fs.iter()
                             .map(|(n, o, w)| {
-                                let fr = *real_fields.get(&n).unwrap_or(&false);
-                                (n, o, w, fr)
+                                let fr = *real_fields.get(n).unwrap_or(&false);
+                                (n.clone(), *o, *w, fr)
                             })
                             .collect()
                     });

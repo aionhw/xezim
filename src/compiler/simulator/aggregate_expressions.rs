@@ -722,7 +722,7 @@ impl Simulator {
         {
             return None;
         }
-        match m.packed_full_dims.get(name).map(Vec::as_slice) {
+        match m.packed_full_dims.get(name).map(|d| d.as_slice()) {
             None => Some((cur.width as i64 - 1, 0)),
             Some(&[(l, r)]) if l.abs_diff(r) + 1 == u64::from(cur.width) => Some((l, r)),
             Some(_) => None,
@@ -1904,7 +1904,7 @@ impl Simulator {
                     for &(l, r) in recorded {
                         total = total.checked_mul(u32::try_from(l.abs_diff(r) + 1).ok()?)?;
                     }
-                    dimensions = recorded.clone();
+                    dimensions = recorded.to_vec();
                     width = total;
                 }
                 let unpacked = if let Some((dims, _)) = self.module.arrays_nd.get(&name) {
@@ -2485,7 +2485,7 @@ impl Simulator {
 
     /// The packed dimensions of the element an index chain `base` lands in,
     /// and which of them a select on `base` addresses.
-    fn select_base_elem_level(&self, base: &Expression) -> Option<(&Vec<(i64, i64)>, usize)> {
+    fn select_base_elem_level(&self, base: &Expression) -> Option<(&[(i64, i64)], usize)> {
         let mut cur = base;
         let mut layers = 0usize;
         while let ExprKind::Index { expr: inner, .. } = &cur.kind {
@@ -2534,7 +2534,7 @@ impl Simulator {
             // An unpacked SLICE (a row of a 2-D array), not a packed element.
             return None;
         }
-        Some((dims, layers - udepth))
+        Some((dims.as_slice(), layers - udepth))
     }
 
     /// `[N-1:0]` maps idx→(idx-lo)·w, an ASCENDING `[0:N-1]` mirrors the slot

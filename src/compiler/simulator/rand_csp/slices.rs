@@ -480,7 +480,7 @@ impl Simulator {
             // its per-call key (`declare_local_dyn`).
             let name = self.dyn_name_lookup(name).unwrap_or(name);
             if let Some(f) = self.module.packed_struct_fields.get(name) {
-                return Some((f.clone(), None));
+                return Some((f.to_vec(), None));
             }
             self.module.var_decl_types.get(name).cloned()
         } else {

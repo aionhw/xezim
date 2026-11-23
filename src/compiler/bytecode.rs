@@ -1190,7 +1190,7 @@ pub struct BytecodeCompiler<'a> {
     /// `(idx - low_bound) * elem_w` for a DESCENDING range — the plain
     /// `idx * elem_w` is only correct for a normalized `[N-1:0]` range and
     /// mis-places (or drops) elements of e.g. `[2:1]` or an ascending `[0:1]`.
-    packed_full_dims: Option<&'a HashMap<String, Vec<(i64, i64)>>>,
+    packed_full_dims: Option<&'a xezim_core::shared_names::SharedSliceMap<(i64, i64)>>,
     /// Declared variable types, for the type a pattern assigned to a
     /// variable takes (§10.8).
     var_decl_types: Option<&'a xezim_core::decl_types::DeclTypeMap>,
@@ -1282,7 +1282,7 @@ pub struct BytecodeCompiler<'a> {
     /// its read dependency would resolve bare-first to the wrong (top-scope)
     /// input and never re-trigger when the real scoped input changes. Set via
     /// `set_packed_struct_fields`.
-    packed_struct_fields: Option<&'a HashMap<String, Vec<(String, u32, u32)>>>,
+    packed_struct_fields: Option<&'a xezim_core::shared_names::SharedSliceMap<(String, u32, u32)>>,
 }
 
 /// Where `packed_path_dyn_range` places a store in its root signal.
@@ -1476,7 +1476,10 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
-    pub fn set_packed_struct_fields(&mut self, f: &'a HashMap<String, Vec<(String, u32, u32)>>) {
+    pub fn set_packed_struct_fields(
+        &mut self,
+        f: &'a xezim_core::shared_names::SharedSliceMap<(String, u32, u32)>,
+    ) {
         self.packed_struct_fields = Some(f);
     }
 
@@ -1573,7 +1576,10 @@ impl<'a> BytecodeCompiler<'a> {
         self.assoc_arrays = Some(a);
     }
 
-    pub fn set_packed_full_dims(&mut self, d: &'a HashMap<String, Vec<(i64, i64)>>) {
+    pub fn set_packed_full_dims(
+        &mut self,
+        d: &'a xezim_core::shared_names::SharedSliceMap<(i64, i64)>,
+    ) {
         self.packed_full_dims = Some(d);
     }
 

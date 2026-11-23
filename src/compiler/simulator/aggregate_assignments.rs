@@ -1945,12 +1945,12 @@ impl Simulator {
                     let mut ts: HashSet<String> = HashSet::default();
                     Self::collect_two_state_leaves(self, &su, "", &mut ts);
                     let mut changed = false;
-                    for (fname, off, w) in fields {
-                        if !ts.contains(&fname) {
+                    for (fname, off, w) in &fields {
+                        if !ts.contains(fname) {
                             continue;
                         }
-                        for i in 0..w {
-                            let idx = (off + i) as usize;
+                        for i in 0..*w {
+                            let idx = (*off + i) as usize;
                             if idx < cur.width as usize
                                 && !matches!(cur.get_bit(idx), LogicBit::Zero | LogicBit::One)
                             {

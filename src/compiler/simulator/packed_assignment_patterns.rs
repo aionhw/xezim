@@ -445,7 +445,7 @@ impl Simulator {
             self.lookup_signal_width(&name)?
         };
         let dims = match self.module.packed_full_dims.get(&name) {
-            Some(d) if !d.is_empty() => d.clone(),
+            Some(d) if !d.is_empty() => d.to_vec(),
             _ => vec![(i64::from(total) - 1, 0)],
         };
         let bits: i64 = dims
@@ -478,7 +478,7 @@ impl Simulator {
                 let prefix = flat.get(split + 1..).unwrap_or("");
                 let full = &self.module.packed_full_dims;
                 return packed_assignment_pattern_plan::layout_struct_type(layout, prefix, &|p| {
-                    full.get(&format!("{base}.{p}")).cloned()
+                    full.get(&format!("{base}.{p}")).map(|d| d.to_vec())
                 });
             }
             split = flat[..split].rfind('.')?;

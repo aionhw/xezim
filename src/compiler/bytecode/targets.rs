@@ -124,7 +124,7 @@ impl<'a> BytecodeCompiler<'a> {
                 (base_id, off, Some(mw))
             }
         };
-        let dims: Vec<(i64, i64)> = self.packed_full_dims_of(hier)?.clone();
+        let dims: Vec<(i64, i64)> = self.packed_full_dims_of(hier)?.to_vec();
         if dims.is_empty() || dims.len() < idx_nodes.len() {
             return None;
         }

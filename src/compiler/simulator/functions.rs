@@ -1616,8 +1616,18 @@ impl Simulator {
         let frames = std::mem::take(&mut self.task_cleanup);
         for c in &frames {
             for (name, own) in &c.struct_formal_meta {
-                let same = self.module.packed_struct_fields.get(name) == own.packed_fields.as_ref()
-                    && self.module.packed_full_dims.get(name) == own.packed_dimensions.as_ref()
+                let same = self
+                    .module
+                    .packed_struct_fields
+                    .get(name)
+                    .map(|f| f.as_slice())
+                    == own.packed_fields.as_deref()
+                    && self
+                        .module
+                        .packed_full_dims
+                        .get(name)
+                        .map(|d| d.as_slice())
+                        == own.packed_dimensions.as_deref()
                     && self.module.packed_signal_elem_widths.get(name).copied()
                         == own
                             .packed_element_widths
@@ -1737,9 +1747,13 @@ impl Simulator {
         };
         FormalMetaParts {
             declared_type: self.module.var_decl_types.get_shared(name).cloned(),
-            packed_fields: self.module.packed_struct_fields.get(name).cloned(),
+            packed_fields: self
+                .module
+                .packed_struct_fields
+                .get(name)
+                .map(|f| f.to_vec()),
             packed_element_widths,
-            packed_dimensions: self.module.packed_full_dims.get(name).cloned(),
+            packed_dimensions: self.module.packed_full_dims.get(name).map(|d| d.to_vec()),
             class_type: self.var_class_types.get(name).cloned(),
             typedef_type: self.var_typedef_types.get(name).cloned(),
         }
@@ -1928,9 +1942,13 @@ impl Simulator {
             name: name.to_string(),
             parts: FormalMetaParts {
                 declared_type: self.module.var_decl_types.remove(name),
-                packed_fields: self.module.packed_struct_fields.remove(name),
+                packed_fields: self
+                    .module
+                    .packed_struct_fields
+                    .remove(name)
+                    .map(|f| f.to_vec()),
                 packed_element_widths,
-                packed_dimensions: self.module.packed_full_dims.remove(name),
+                packed_dimensions: self.module.packed_full_dims.remove(name).map(|d| d.to_vec()),
                 class_type: self.var_class_types.remove(name),
                 typedef_type: self.var_typedef_types.remove(name),
             },
@@ -2077,7 +2095,21 @@ impl Simulator {
                 self.module.var_decl_types.remove(name);
             }
         }
-        put(
+        fn put_shared<T: Eq + std::hash::Hash>(
+            map: &mut xezim_core::shared_names::SharedSliceMap<T>,
+            name: &str,
+            v: Option<Vec<T>>,
+        ) {
+            match v {
+                Some(v) => {
+                    map.insert(name.to_string(), v);
+                }
+                None => {
+                    map.remove(name);
+                }
+            }
+        }
+        put_shared(
             &mut self.module.packed_struct_fields,
             name,
             saved.packed_fields,
@@ -2103,7 +2135,7 @@ impl Simulator {
                 self.module.packed_signal_elem_widths.insert(key, width);
             }
         }
-        put(
+        put_shared(
             &mut self.module.packed_full_dims,
             name,
             saved.packed_dimensions,
@@ -2128,7 +2160,7 @@ impl Simulator {
             _ => None,
         };
         match dims {
-            Some(d) if self.module.packed_full_dims.get(name) != Some(&d) => {
+            Some(d) if self.module.packed_full_dims.get(name).map(|x| x.as_slice()) != Some(d.as_slice()) => {
                 self.meta_note(name);
                 self.module.packed_full_dims.insert(name.to_string(), d);
             }

@@ -1184,7 +1184,7 @@ fn packed_dims(sim: &Simulator, decl: &str, w: u32) -> Vec<(i64, i64)> {
     use xezim_core::ast::types::{DataType, PackedDimension};
     if let Some(d) = sim.module.packed_full_dims.get(decl) {
         if d.iter().map(|&x| dim_len(x)).product::<usize>() == w as usize {
-            return d.clone();
+            return d.to_vec();
         }
     }
     if let Some(&(lo, hi)) = sim.module.ascending_packed.get(decl) {

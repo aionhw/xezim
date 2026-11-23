@@ -1399,8 +1399,8 @@ impl Simulator {
                     };
                     if dims.len() < vars.len() {
                         if let Some(pdims) = prop_packed_dims
-                            .as_ref()
-                            .or_else(|| self.module.packed_full_dims.get(&*name))
+                            .as_deref()
+                            .or_else(|| self.module.packed_full_dims.get(&*name).map(|d| d.as_slice()))
                         {
                             for &(l, r) in pdims.iter() {
                                 if dims.len() >= vars.len() {

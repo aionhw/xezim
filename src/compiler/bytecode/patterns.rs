@@ -44,7 +44,7 @@ impl<'a> BytecodeCompiler<'a> {
         {
             return None;
         }
-        Some((named, layout.clone()))
+        Some((named, layout.to_vec()))
     }
 
     /// The declared type of the variable `lv` names, or of an element
@@ -120,7 +120,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
         let full_dims = self.packed_full_dims;
         let member_dims = |root: &str, path: &str| {
-            full_dims.and_then(|t| t.get(&format!("{root}.{path}")).cloned())
+            full_dims.and_then(|t| t.get(&format!("{root}.{path}")).map(|d| d.to_vec()))
         };
         if let Some((root, layout)) = self.lvalue_struct_layout(lv) {
             return pp::layout_struct_type(&layout, "", &|p| member_dims(&root, p));

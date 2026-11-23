@@ -612,7 +612,7 @@ impl Simulator {
             )
         };
         let fields = if let Some(f) = self.module.packed_struct_fields.get(arr) {
-            Some(f.clone())
+            Some(f.to_vec())
         } else if let Some((h, prop)) = arr.split_once('#')
             && let Ok(handle) = h.parse::<usize>()
         {
@@ -4333,7 +4333,7 @@ impl Simulator {
                     has_frame,
                     self.var_typedef_types.get(n).cloned(),
                     self.fe_trusted_types.contains(n),
-                    self.module.packed_struct_fields.get(n).cloned(),
+                    self.module.packed_struct_fields.get(n).map(|f| f.to_vec()),
                     (self.widths.get(n).copied(), self.signed_signals.contains(n)),
                 )
             })
@@ -4356,7 +4356,9 @@ impl Simulator {
             } else {
                 self.fe_trusted_types.remove(n);
             }
-            if self.module.packed_struct_fields.get(n) != prior_ps.as_ref() {
+            if self.module.packed_struct_fields.get(n).map(|f| f.as_slice())
+                != prior_ps.as_deref()
+            {
                 match prior_ps {
                     Some(f) => {
                         self.module

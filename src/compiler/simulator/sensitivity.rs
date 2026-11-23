@@ -202,7 +202,7 @@ impl Simulator {
                 let mut dims = module
                     .packed_full_dims
                     .get(&name)
-                    .cloned()
+                    .map(|d| d.to_vec())
                     .or_else(|| Self::instance_vector_bounds(&name, module))
                     .unwrap_or_default();
                 let width = if !dims.is_empty() {

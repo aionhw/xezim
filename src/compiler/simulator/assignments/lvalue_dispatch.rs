@@ -1314,7 +1314,12 @@ impl Simulator {
                         };
                         let name = self.resolve_hier_name(h);
                         self.is_associative_array(&name)
-                            .then(|| self.module.packed_full_dims.get(&*name).cloned())
+                            .then(|| {
+                                self.module
+                                    .packed_full_dims
+                                    .get(&*name)
+                                    .map(|d| d.to_vec())
+                            })
                             .flatten()
                     })
                     .filter(|d| d.len() > 1);

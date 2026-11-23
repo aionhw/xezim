@@ -88,7 +88,7 @@ impl<'a> BytecodeCompiler<'a> {
 
     /// Declared dimensions of a chain's root, if registered.
     fn chain_root_dims(&self, hier: &HierarchicalIdentifier) -> Option<Vec<(i64, i64)>> {
-        self.packed_full_dims_of(hier).cloned()
+        self.packed_full_dims_of(hier).map(|d| d.to_vec())
     }
 
     /// Emit a chained packed element select whose indices are NOT all
@@ -331,7 +331,7 @@ impl<'a> BytecodeCompiler<'a> {
         elem_w: Option<u32>,
     ) -> Option<ElemPackedDims> {
         let (mut dims, labelled) = match self.packed_full_dims_of(hier) {
-            Some(d) => (d.clone(), true),
+            Some(d) => (d.to_vec(), true),
             None => {
                 let (ew, w) = (self.packed_elem_width_of(hier)?, elem_w?);
                 if ew <= 1 || w <= ew || !w.is_multiple_of(ew) {

@@ -874,7 +874,8 @@ impl Simulator {
                     let prev = self
                         .module
                         .packed_struct_fields
-                        .insert(d.name.name.clone(), fields.clone());
+                        .insert(d.name.name.clone(), fields.clone())
+                        .map(|f| f.to_vec());
                     // An array local to an automatic task lives under a
                     // per-call key (`declare_local_dyn`).
                     self.local_elem_layout = Some((fields, d.name.name.clone(), prev));
