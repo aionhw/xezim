@@ -181,7 +181,8 @@ thread_local! {}
 // §7.2, §7.4.2: a member select through constant element selects of a packed struct compiles,
 // and a nested packed-struct member read compiles to one range select.
 // §7.5, §7.10: compiled local collection reads retain element width and sign.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317b;
+// §7.4.5: packed element constant indices keep their declared sign.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317c;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
@@ -555,7 +556,8 @@ macro_rules! write_sig {
 // tries every scope spelling for its alias net.
 // §7.2, §7.4.2: a member select through constant element selects of a packed struct, and a
 // nested packed-struct member read, compile to range stores and selects.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB080";
+// §7.4.5: signed constant labels of packed array elements.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB081";
 
 mod aggregate_assignments;
 mod pattern_array_items;
@@ -869,6 +871,9 @@ pub struct Simulator {
     /// scope hint at arm time). One-shot snapshots diverged: `force n =
     /// src + 1` held the arm-time value forever.
     active_force_exprs: Vec<ActiveForceExpr>,
+    /// Number of armed forces that need conservative refreshes.
+    #[serde(skip)]
+    unresolved_force_count: usize,
     /// Per-signal write generation used by `active_force_exprs`. Allocated
     /// alongside the signal table and touched only while an expression-backed
     /// override is active.

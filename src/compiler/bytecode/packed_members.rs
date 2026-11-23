@@ -158,7 +158,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// `e[64'h1_0000_0001]` was `e[1]`). One with an x or z bit, or one wider
     /// than 64 bits, is left to the interpreter like any other index this
     /// path cannot place.
-    fn plain_const_index(&self, e: &Expression) -> Option<i64> {
+    pub(super) fn plain_const_index(&self, e: &Expression) -> Option<i64> {
         match &e.kind {
             ExprKind::Paren(inner) => self.plain_const_index(inner),
             // §11.4.3, §11.8.2: the negation is at the literal's own width
@@ -200,7 +200,7 @@ impl<'a> BytecodeCompiler<'a> {
 
     /// The value of a constant index of at most 64 bits with no x or z bit,
     /// signed or unsigned as declared, when it fits in an `i64`.
-    fn exact_index_value(v: &Value) -> Option<i64> {
+    pub(super) fn exact_index_value(v: &Value) -> Option<i64> {
         if v.has_xz() || v.width > 64 {
             return None;
         }

@@ -1448,24 +1448,25 @@ impl<'a> BytecodeCompiler<'a> {
                         // §11.5.1: an x/z literal index reads x; it folds to
                         // 0 here, so the run-time path below takes it.
                         if !self.is_xz_literal(index)
-                            && let Some(idx) = self.eval_const_expr(index)
+                            && let Some(idx) = self.plain_const_index(index).or_else(|| {
+                                self.fold_const(index).as_ref().and_then(Self::exact_index_value)
+                            })
                         {
                             let base = self.compile_expr(expr, 0)?;
                             // §11.5.1: a constant index outside the declared
-                            // range reads x. `eval_const_expr` folds in u32, so
-                            // a `-1` (`conf_addr_i[i-1]` at genvar 0) arrived as
-                            // 4294967295 and `lo + elem_w` overflowed.
+                            // range reads x. Keep signed labels so `-1`
+                            // can select an element of `[1:-1]`.
                             let dim = self.packed_outer_dim(hier);
                             let in_range = match dim {
-                                Some((l, r)) => (idx as i64) >= l.min(r) && (idx as i64) <= l.max(r),
-                                None => (idx as u64).saturating_mul(elem_w as u64) < u32::MAX as u64,
+                                Some((l, r)) => (l.min(r)..=l.max(r)).contains(&idx),
+                                None => idx >= 0 && (idx as u64).saturating_mul(elem_w as u64) < u32::MAX as u64,
                             };
                             if !in_range {
                                 let dest = self.alloc_reg();
                                 self.emit(Insn::LoadConst(dest, Box::new(Value::new(elem_w))));
                                 return Some(dest);
                             }
-                            let lo = Self::packed_elem_lsb(dim, idx as i64, elem_w).max(0) as u32;
+                            let lo = Self::packed_elem_lsb(dim, idx, elem_w).max(0) as u32;
                             let hi = lo + elem_w - 1;
                             let dest = self.alloc_reg();
                             self.emit(Insn::RangeSelectConst(dest, base, hi, lo));

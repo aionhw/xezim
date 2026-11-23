@@ -3,6 +3,21 @@
 use super::*;
 
 impl Simulator {
+    pub(in crate::compiler::simulator) fn remove_active_force_expr(&mut self, key: &str) {
+        self.active_force_exprs.retain(|entry| {
+            if entry.key != key {
+                return true;
+            }
+            self.unresolved_force_count -= usize::from(entry.has_unresolved_reads);
+            false
+        });
+    }
+
+    fn push_active_force_expr(&mut self, entry: ActiveForceExpr) {
+        self.unresolved_force_count += usize::from(entry.has_unresolved_reads);
+        self.active_force_exprs.push(entry);
+    }
+
     /// Resolve a `force`/`release`/`assign`/`deassign` lvalue (LRM §10.6,
     /// §10.6.1) to its override-tracking key: the flattened signal name plus
     /// the compact-table id (`None` when the value lives only in the runtime
@@ -17,7 +32,7 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) {
-        self.active_force_exprs.retain(|entry| entry.key != key);
+        self.remove_active_force_expr(&key);
         // A constant RHS never changes — no need to track it.
         let mut reads: HashSet<String> = HashSet::default();
         Self::collect_expr_reads(rvalue, &self.module, &mut reads);
@@ -68,7 +83,7 @@ impl Simulator {
                     .unwrap_or(0)
             })
             .collect();
-        self.active_force_exprs.push(ActiveForceExpr {
+        self.push_active_force_expr(ActiveForceExpr {
             key,
             lvalue: lvalue.clone(),
             rvalue: rvalue.clone(),
@@ -94,11 +109,7 @@ impl Simulator {
         // — skip the whole scan. Arming a new force (arm_force_expr) always
         // evaluates the expression at arm time, so a freshly armed override
         // is already current.
-        if self.force_epoch_gen == self.force_refresh_done_gen
-            && !self
-                .active_force_exprs
-                .iter()
-                .any(|e| e.has_unresolved_reads)
+        if self.force_epoch_gen == self.force_refresh_done_gen && self.unresolved_force_count == 0
         {
             return;
         }
@@ -231,7 +242,7 @@ impl Simulator {
                 self.partial_forces.remove(&id);
             }
             self.forced_names.remove(name);
-            self.active_force_exprs.retain(|entry| entry.key != name);
+            self.remove_active_force_expr(name);
             if let Some(id) = id.filter(|&id| is_packed_id(id)) {
                 // A packed-arena cell is always a variable: it keeps the
                 // forced value and takes ordinary stores again (§10.6.2).
@@ -412,7 +423,7 @@ impl Simulator {
         let Some((key, _)) = self.force_target(base) else {
             return;
         };
-        self.active_force_exprs.retain(|entry| entry.key != key);
+        self.remove_active_force_expr(&key);
         // §10.6.2: the net's drivers from the writers index, as the release
         // paths find them; a scan of every entry here ran on each force of
         // part of the net.
@@ -457,7 +468,7 @@ impl Simulator {
             .iter()
             .map(|&r| self.active_force_signal_epochs.get(r).copied().unwrap_or(0))
             .collect();
-        self.active_force_exprs.push(ActiveForceExpr {
+        self.push_active_force_expr(ActiveForceExpr {
             key,
             lvalue: base.clone(),
             rvalue: Expression::new(ExprKind::Empty, base.span),

@@ -1263,8 +1263,7 @@ impl Simulator {
                 self.unforce_cell(id);
             }
             self.forced_names.remove(&t.key);
-            let key = t.key.clone();
-            self.active_force_exprs.retain(|entry| entry.key != key);
+            self.remove_active_force_expr(&t.key);
         }
         self.uvm_hdl_store(&t.obj, &v);
         if force {
