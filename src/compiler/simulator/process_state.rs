@@ -1063,7 +1063,7 @@ pub(super) struct ProcessContext {
     // Carried so a task that suspends mid-body keeps its full call context
     // (needed once blocking task/method calls are inlined into the process
     // statement stream — see `task_cleanup` and `StatementKind::ScopePop`).
-    pub(super) local_iface_aliases: Vec<HashMap<String, String>>,
+    pub(super) local_iface_aliases: Vec<Option<Box<VifAliasFrame>>>,
     pub(super) ref_binding_stack: Vec<HashMap<String, Expression>>,
     pub(super) ref_alias_stack: Vec<HashMap<String, String>>,
     /// §13.5.2 `ref` formals bound by IDENTITY (aggregates with no storage of

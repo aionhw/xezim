@@ -30,9 +30,8 @@ impl Simulator {
             || self.module.packages.contains(root)
             || self.lookup_typedef_target(root).is_some()
             || self
-                .local_iface_aliases
-                .last()
-                .is_some_and(|f| f.contains_key(root))
+                .local_vif_frame()
+                .is_some_and(|f| f.bindings.contains_key(root))
             || self.iface_alias_for(root).is_some()
         {
             return None;

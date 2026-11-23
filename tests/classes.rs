@@ -1379,3 +1379,5 @@ mod rand_srandom_reseed_repeats;
 mod review_rand_srandom_streams;
 #[path = "classes/class_row_replication_once.rs"]
 mod class_row_replication_once;
+#[path = "classes/waiting_vif_formal_name_reuse_1478.rs"]
+mod waiting_vif_formal_name_reuse_1478;

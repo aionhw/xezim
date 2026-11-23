@@ -1671,13 +1671,15 @@ pub struct Simulator {
     /// The wait-free analysis that gates compiling a class task (see
     /// `task_suspend`).
     ts: task_suspend::TsState,
-    /// LRM §25.9: stack of per-call virtual-interface formal-arg
-    /// aliases. When a task or function takes `virtual <iface> <name>`,
-    /// the call hooks add a frame mapping `<name>` to the caller's
-    /// interface-instance identifier (e.g. `bus`). `resolve_hier_name`
-    /// consults the top frame so `vif.member` resolves to `bus.member`.
-    /// Popped at task return.
-    local_iface_aliases: Vec<HashMap<String, String>>,
+    /// LRM §25.9: stack of per-call virtual-interface formal-arg and local
+    /// aliases. None when a call has no vif formals/locals (zero allocation).
+    /// Popped at subroutine return and carried across task suspension in
+    /// `ProcessContext`.
+    local_iface_aliases: Vec<Option<Box<VifAliasFrame>>>,
+    /// Per-object virtual-interface bindings for type-parameterized class
+    /// properties (`T prop` when `T` is bound to `virtual <iface>`), keyed by
+    /// `(object_handle) -> prop -> instance_name`. Swept in `heap_gc`.
+    prop_vif_bindings: HashMap<usize, HashMap<String, String>>,
     /// LRM §25.9: name aliases for PLAIN variables declared `virtual
     /// <iface>` (block-local or module-scope, not class properties and
     /// not subroutine formals). `vif = bus;` records `vif -> bus` here;
@@ -3000,8 +3002,6 @@ pub struct Simulator {
     /// table.
     #[serde(skip)]
     decl_param_scope_cache: std::cell::RefCell<DeclParamScopeCache>,
-    /// Reused buffer for the `__vif_local__` key probes (`&self` paths).
-    vif_key_scratch: std::cell::RefCell<String>,
     /// §8.25: specialization-argument texts already folded to their value
     /// (`2 + 2` -> `4`, `'h4` -> `4`), or None when the text is not a
     /// constant integer expression (see `fold_const_spec_frag`).
@@ -3081,9 +3081,6 @@ pub struct Simulator {
     /// See `class_member_names`.
     #[serde(skip)]
     class_member_names_cell: std::cell::OnceCell<ClassMemberNames>,
-    /// Every bare name a `__vif_local__` key was ever created for (never
-    /// shrinks): a name outside it has no such key.
-    vif_local_names: HashSet<String>,
     /// See `nonvirtual_target_class`.
     #[allow(clippy::type_complexity)]
     nonvirtual_target_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
@@ -4359,8 +4356,8 @@ pub struct Simulator {
     /// entry count like the bitset itself. A fixed 32-word array here
     /// overflowed on c910 (218k entries).
     settle_inject_sum: Vec<u64>,
-    /// A `return <virtual interface>` left `__vif_return__` for the next assignment.
-    vif_return_pending: bool,
+    /// A `return <virtual interface>` left this bound instance name for the next assignment.
+    pending_vif_return: Option<String>,
     /// Static lvalue widths of bare-leaf identifiers, per identifier span (see infer_lhs_width).
     lhs_leaf_width_cache: HashMap<(usize, usize), u32>,
     /// See `blocking_cont_frame`. Keyed by `(node_addr, kind)` and retains
