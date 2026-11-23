@@ -3807,10 +3807,15 @@ impl Simulator {
     /// instance context and written to `<queue>[i]`, then the queue size is
     /// set to the number of items. Mirrors the AssignmentPattern assignment
     /// path in `assign_value`.
-    pub(super) fn populate_queue_from_init(&mut self, scoped_q: &str, init: &Expression) {
+    pub(super) fn populate_queue_from_init(
+        &mut self,
+        scoped_q: &str,
+        init: &Expression,
+        elem_type: Option<DataType>,
+    ) {
         let width = self.module.arrays.get(scoped_q).map_or(32, |a| a.2);
         let expand_rows = self.concat_has_non_array_elements(scoped_q);
-        self.store_queue_literal(scoped_q, init, None, width, expand_rows);
+        self.store_queue_literal(scoped_q, init, elem_type.as_ref(), width, expand_rows);
     }
 
     pub(super) fn store_queue_literal(
