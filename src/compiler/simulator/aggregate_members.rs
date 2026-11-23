@@ -1632,6 +1632,49 @@ impl Simulator {
         )
     }
 
+    /// §7.2.1: the bit offset and width, inside the packed struct or union
+    /// `su`, of the member the member-access chain `chain` names below its
+    /// receiver (`e.vl`, or `e.arch.vl` through a packed struct nested in
+    /// `su`), and the width of `su`. Each level adds its member's offset in
+    /// its own layout. `None` when a name is not a member, or a member on
+    /// the way down is not a packed aggregate without dimensions.
+    pub(super) fn packed_member_chain_slice(
+        &self,
+        su: &crate::ast::types::StructUnionType,
+        chain: &Expression,
+    ) -> Option<(u32, u32, u32)> {
+        let mut names: Vec<&str> = Vec::new();
+        let mut cur = chain;
+        while let ExprKind::MemberAccess { expr, member } = &cur.kind {
+            names.push(member.name.as_str());
+            cur = expr;
+        }
+        let mut level = std::borrow::Cow::Borrowed(su);
+        let (mut off, mut w, mut total) = (0u32, 0u32, 0u32);
+        for (k, name) in names.iter().rev().enumerate() {
+            let (fields, level_w) = self.packed_agg_layout(&level);
+            if k == 0 {
+                total = level_w;
+            }
+            let &(_, moff, mw) = fields.iter().find(|f| f.0 == *name)?;
+            off += moff;
+            w = mw;
+            if k + 1 < names.len() {
+                let (dt, dims) = Self::struct_member_decl_ref(&level, name)?;
+                let inner = self.packed_struct_with_dims(dt)?;
+                if !dims.is_empty()
+                    || !inner.dimensions.is_empty()
+                    || Self::spreads_member_wise(&inner)
+                {
+                    return None;
+                }
+                let inner = inner.into_owned();
+                level = std::borrow::Cow::Owned(inner);
+            }
+        }
+        (total > 0).then_some((off, w, total))
+    }
+
     /// §18.4: resolve `e` — `<agg_prop>.<member>` on a class object, in either
     /// Append a member segment to an expression: `obj.prop` -> `obj.prop.m`
     /// (pushes a path segment for an `Ident`, wraps in `MemberAccess`
