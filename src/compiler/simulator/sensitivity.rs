@@ -2202,6 +2202,11 @@ impl Simulator {
                             Self::collect_expr_reads(pat, module, r)
                         };
                     }
+                    if let Some(guard) = &item.guard
+                        && let Some(r) = reads.as_deref_mut()
+                    {
+                        Self::collect_expr_reads(guard, module, r);
+                    }
                     Self::collect_stmt_rw(
                         &item.stmt,
                         module,
@@ -2306,9 +2311,7 @@ impl Simulator {
                     arrays.as_deref_mut(),
                 );
             }
-            StatementKind::Forever { body }
-            | StatementKind::Repeat { body, .. }
-            | StatementKind::Foreach { body, .. } => {
+            StatementKind::Forever { body } => {
                 Self::collect_stmt_rw(
                     body,
                     module,
@@ -2317,14 +2320,82 @@ impl Simulator {
                     arrays.as_deref_mut(),
                 );
             }
-            StatementKind::TimingControl { stmt: inner, .. } => {
-                Self::collect_stmt_rw(inner, module, reads, writes, arrays);
-            }
-            StatementKind::Wait { condition, stmt: inner } => {
+            StatementKind::Repeat { count, body } => {
                 if let Some(r) = reads.as_deref_mut() {
-                    Self::collect_expr_reads(condition, module, r);
+                    Self::collect_expr_reads(count, module, r);
                 }
-                Self::collect_stmt_rw(inner, module, reads, writes, arrays);
+                Self::collect_stmt_rw(
+                    body,
+                    module,
+                    reads.as_deref_mut(),
+                    writes,
+                    arrays.as_deref_mut(),
+                );
+            }
+            StatementKind::Foreach { vars, body, .. } => {
+                for v in vars.iter().flatten() {
+                    writes.insert(v.name.clone());
+                }
+                Self::collect_stmt_rw(
+                    body,
+                    module,
+                    reads.as_deref_mut(),
+                    writes,
+                    arrays.as_deref_mut(),
+                );
+            }
+            // §9.4.2.2: `@*` descends through timing controls (`#d stmt`,
+            // `@(ev) stmt`, `wait (cond) stmt`) to collect reads/writes of the
+            // guarded statement itself, NOT the delay/event/wait condition.
+            StatementKind::TimingControl { stmt: inner, .. }
+            | StatementKind::Wait { stmt: inner, .. }
+            | StatementKind::RsAction { body: inner } => {
+                Self::collect_stmt_rw(
+                    inner,
+                    module,
+                    reads.as_deref_mut(),
+                    writes,
+                    arrays.as_deref_mut(),
+                );
+            }
+            StatementKind::RandCase { items } => {
+                for (weight, s) in items {
+                    if let Some(r) = reads.as_deref_mut() {
+                        Self::collect_expr_reads(weight, module, r);
+                    }
+                    Self::collect_stmt_rw(
+                        s,
+                        module,
+                        reads.as_deref_mut(),
+                        writes,
+                        arrays.as_deref_mut(),
+                    );
+                }
+            }
+            StatementKind::WaitOrder { pass, fail, .. } => {
+                for branch in [pass, fail].into_iter().flatten() {
+                    Self::collect_stmt_rw(
+                        branch,
+                        module,
+                        reads.as_deref_mut(),
+                        writes,
+                        arrays.as_deref_mut(),
+                    );
+                }
+            }
+            StatementKind::ProceduralContinuous(pc) => {
+                use crate::ast::stmt::ProceduralContinuous as PC;
+                if let Some(r) = reads.as_deref_mut() {
+                    match pc {
+                        PC::Assign { lvalue, rvalue } | PC::Force { lvalue, rvalue } => {
+                            Self::collect_expr_reads(rvalue, module, r);
+                            Self::collect_lhs_index_reads(lvalue, module, r);
+                        }
+                        PC::Deassign(lvalue) | PC::Release(lvalue) => {
+                            Self::collect_lhs_index_reads(lvalue, module, r);
+                        }
+                    }
+                }
             }
             // §9.2.2.2: a function body reached through `collect_function_reads`
             // usually ends in `return <expr>` — dropping it hid every module
@@ -2911,18 +2982,6 @@ impl Simulator {
     pub(super) fn star_sens_from_body(&self, body: &Statement) -> Vec<Sensitivity> {
         let mut reads: HashSet<String> = HashSet::default();
         let mut writes: HashSet<String> = HashSet::default();
-        // §9.2.2.2: `@*` sensitivity excludes called-function CONTENTS.
-        let skip = SKIP_FN_BODY_READS.with(|c| c.replace(true));
-        NBA_SEEN.with(|c| c.set(false));
-        let whole = Self::collect_stmt_reads_whole(body, &self.module, &mut reads, &mut writes);
-        // §9.4.2.2: a suspended process may be woken by another writer while
-        // parked at @*. Its own blocking writes happen before it rearms.
-        let (writes, whole) = if self.stmt_is_blocking(body) {
-            (HashSet::default(), whole)
-        } else {
-            Self::star_excluded_writes(body, &self.module, &reads, writes, whole)
-        };
-        SKIP_FN_BODY_READS.with(|c| c.set(skip));
         // Registration usually runs with the hint unset (the process body
         // just executed); the executing instance's own scope is the correct
         // resolution context either way.
@@ -2930,6 +2989,25 @@ impl Simulator {
             let sc = self.active_instance_scope();
             (!sc.is_empty()).then_some(sc)
         });
+        // §9.2.2.2: `@*` sensitivity excludes called-function CONTENTS.
+        SKIP_FN_BODY_READS.with(|c| c.set(true));
+        NBA_SEEN.with(|c| c.set(false));
+        let whole = Self::collect_stmt_reads_whole(body, &self.module, &mut reads, &mut writes);
+        let body_suspends = self.stmt_is_blocking(body)
+            || Self::stmt_contains_delay_control(body)
+            || Self::stmt_contains_event_control(body)
+            || self.stmt_calls_blocking_task(body, hint.as_deref().unwrap_or(""), 3);
+        // Only the variables the body writes that cannot wake it at `@*`
+        // leave the list below (`star_excluded_writes`).
+        let (writes, whole) = Self::star_excluded_writes(
+            body,
+            &self.module,
+            &reads,
+            writes,
+            whole,
+            body_suspends,
+        );
+        SKIP_FN_BODY_READS.with(|c| c.set(false));
         let mut out: Vec<Sensitivity> = Vec::new();
         let mut seen: HashSet<String> = HashSet::default();
         for r in reads.iter() {
@@ -2944,25 +3022,20 @@ impl Simulator {
             // MEMBER read ("req.vld") that resolves to no signal falls back
             // to its '.'-base prefixes — without this, a block whose only
             // reads of a struct are member-granular had no sensitivity to it.
-            let mut cand: Vec<String> = vec![r.clone()];
-            {
-                let mut base: &str = r.as_str();
-                while let Some(pos) = base.rfind('.') {
-                    base = &base[..pos];
-                    cand.push(base.to_string());
-                }
-            }
             let mut matched = false;
-            for c in cand {
+            let mut base: &str = r.as_str();
+            loop {
                 let resolved = hint
                     .as_ref()
-                    .map(|sc| format!("{}.{}", sc, c))
-                    .filter(|q| self.signal_name_to_id.contains_key(q.as_str()))
-                    .unwrap_or_else(|| c.clone());
-                if self.signal_name_to_id.contains_key(resolved.as_str()) {
-                    if seen.insert(resolved.clone()) {
+                    .map(|sc| format!("{}.{}", sc, base))
+                    .filter(|q| self.signal_name_to_id.contains_key(q.as_str()));
+                let key = resolved.as_deref().unwrap_or(base);
+                if self.signal_name_to_id.contains_key(key) {
+                    if !seen.contains(key) {
+                        let s = key.to_string();
+                        seen.insert(s.clone());
                         out.push(Sensitivity {
-                            signal_name: resolved,
+                            signal_name: s,
                             edge: EdgeKind::AnyEdge,
                             iff: None,
                             value_of: None,
@@ -2971,6 +3044,10 @@ impl Simulator {
                     matched = true;
                     break;
                 }
+                let Some(pos) = base.rfind('.') else {
+                    break;
+                };
+                base = &base[..pos];
             }
             // §23.8 / §23.10.1: a dotted read neither scope-local nor global
             // may be an UPWARD reference (a bound module reading its host
@@ -3014,6 +3091,69 @@ impl Simulator {
         out
     }
 
+    /// Collect all declaration names introduced inside `st` (`VarDecl`,
+    /// `ParamDecl`, `for` init var decls, `foreach` loop variables) so
+    /// `@*` never adds block-local variables to its sensitivity list.
+    fn collect_local_decl_names(st: &Statement, out: &mut HashSet<String>) {
+        match &st.kind {
+            StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } => {
+                out.extend(declarators.iter().map(|d| d.name.name.clone()));
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                for s in stmts {
+                    Self::collect_local_decl_names(s, out);
+                }
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::collect_local_decl_names(then_stmt, out);
+                if let Some(e) = else_stmt {
+                    Self::collect_local_decl_names(e, out);
+                }
+            }
+            StatementKind::Case { items, .. } => {
+                for it in items {
+                    Self::collect_local_decl_names(&it.stmt, out);
+                }
+            }
+            StatementKind::For { init, body, .. } => {
+                for i in init {
+                    if let ForInit::VarDecl { name, .. } = i {
+                        out.insert(name.name.clone());
+                    }
+                }
+                Self::collect_local_decl_names(body, out);
+            }
+            StatementKind::Foreach { vars, body, .. } => {
+                out.extend(vars.iter().flatten().map(|v| v.name.clone()));
+                Self::collect_local_decl_names(body, out);
+            }
+            StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::RsAction { body } => Self::collect_local_decl_names(body, out),
+            StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+                Self::collect_local_decl_names(stmt, out);
+            }
+            StatementKind::RandCase { items } => {
+                for (_, s) in items {
+                    Self::collect_local_decl_names(s, out);
+                }
+            }
+            StatementKind::WaitOrder { pass, fail, .. } => {
+                for b in [pass, fail].into_iter().flatten() {
+                    Self::collect_local_decl_names(b, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// §9.4.2.2: the writes that take a read of an `@*` body out of its
     /// inferred sensitivity (`self_written_read`), given the body's reads,
     /// writes and origins collected with function bodies skipped. `@*` adds
@@ -3028,39 +3168,66 @@ impl Simulator {
     /// dot;` must run again on the new `dot`, so a variable the body writes
     /// with `<=` stays, even when a blocking assignment writes it as well
     /// (`if (rst) d = 0; else d <= b;`): only variables written by blocking
-    /// assignments alone count here. `take_star_kept_own_write` then reports
-    /// that the list keeps one of the block's own writes. (`always_comb`
-    /// leaves out every variable it writes, §9.2.2.2.1(b), and does not come
-    /// here.)
+    /// assignments alone count here. Likewise, a body that suspends (`#d`,
+    /// `@(e)`, `wait`) or has no non-written external reads at all keeps its
+    /// own module-scope writes in the sensitivity list: it parks at `@*`
+    /// between activations, so an external write (or NBA update) to that
+    /// variable must wake it. `take_star_kept_own_write` then reports that
+    /// the list keeps one of the block's own writes. (`always_comb` leaves out
+    /// every variable it writes, §9.2.2.2.1(b), and does not come here.)
     fn star_excluded_writes(
         body: &Statement,
         module: &ElaboratedModule,
         reads: &HashSet<String>,
         writes: HashSet<String>,
         whole: ImplicitReadOrigins,
+        body_suspends: bool,
     ) -> (HashSet<String>, ImplicitReadOrigins) {
         STAR_KEPT_OWN_WRITE.with(|c| c.set(false));
+        if body_suspends {
+            let mut locals = HashSet::default();
+            Self::collect_local_decl_names(body, &mut locals);
+            let kept = reads
+                .iter()
+                .any(|r| Self::self_written_read(r, reads, &writes, &whole) && !locals.contains(r));
+            STAR_KEPT_OWN_WRITE.with(|c| c.set(kept));
+            return (locals, ImplicitReadOrigins::default());
+        }
         // Collect again only when the body has a nonblocking write and reads
-        // one of its own writes; otherwise the two sets are the same.
-        if !NBA_SEEN.with(|c| c.get())
-            || !reads
+        // one of its own writes; otherwise check whether blocking-write
+        // exclusion leaves any surviving read.
+        let (w2, o2, kept) = if NBA_SEEN.with(|c| c.get())
+            && reads
                 .iter()
                 .any(|r| Self::self_written_read(r, reads, &writes, &whole))
         {
-            return (writes, whole);
+            let mut r2: HashSet<String> = HashSet::default();
+            let mut w2: HashSet<String> = HashSet::default();
+            NBA_TARGETS.with(|c| *c.borrow_mut() = Some(HashSet::default()));
+            let o2 = Self::collect_stmt_reads_whole(body, module, &mut r2, &mut w2);
+            let nba = NBA_TARGETS
+                .with(|c| c.borrow_mut().take())
+                .unwrap_or_default();
+            w2.retain(|w| !nba.contains(w));
+            let kept = reads.iter().any(|r| {
+                Self::self_written_read(r, reads, &writes, &whole)
+                    && !Self::self_written_read(r, reads, &w2, &o2)
+            });
+            (w2, o2, kept)
+        } else {
+            (writes, whole, false)
+        };
+        if !reads
+            .iter()
+            .any(|r| !Self::self_written_read(r, reads, &w2, &o2))
+        {
+            let mut locals = HashSet::default();
+            Self::collect_local_decl_names(body, &mut locals);
+            if reads.iter().any(|r| !locals.contains(r)) {
+                STAR_KEPT_OWN_WRITE.with(|c| c.set(true));
+                return (locals, ImplicitReadOrigins::default());
+            }
         }
-        let mut r2: HashSet<String> = HashSet::default();
-        let mut w2: HashSet<String> = HashSet::default();
-        NBA_TARGETS.with(|c| *c.borrow_mut() = Some(HashSet::default()));
-        let o2 = Self::collect_stmt_reads_whole(body, module, &mut r2, &mut w2);
-        let nba = NBA_TARGETS
-            .with(|c| c.borrow_mut().take())
-            .unwrap_or_default();
-        w2.retain(|w| !nba.contains(w));
-        let kept = reads.iter().any(|r| {
-            Self::self_written_read(r, reads, &writes, &whole)
-                && !Self::self_written_read(r, reads, &w2, &o2)
-        });
         STAR_KEPT_OWN_WRITE.with(|c| c.set(kept));
         (w2, o2)
     }
