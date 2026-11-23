@@ -1560,15 +1560,23 @@ impl Simulator {
         // only a few thousand edge-sensitive ones, the dense layout wasted
         // ~14 MB on empty Vec stubs. Walk blocks once into a temp HashMap,
         // then materialize in edge_signal_ids order.
-        let mut by_sid: HashMap<usize, EdgeFanout> = HashMap::default();
+        #[derive(Default)]
+        struct EdgeFanoutBuild {
+            posedge: Vec<u32>,
+            negedge: Vec<u32>,
+            anyedge: Vec<u32>,
+            lsbedge: Vec<u32>,
+        }
+        let mut by_sid: HashMap<usize, EdgeFanoutBuild> = HashMap::default();
         for (block_idx, block) in self.edge_blocks.iter().enumerate() {
+            let b = block_idx as u32;
             for sid in &block.resolved_sensitivities {
                 let fanout = by_sid.entry(sid.signal_id).or_default();
                 match sid.edge {
-                    EdgeKind::Posedge => fanout.posedge.push(block_idx),
-                    EdgeKind::Negedge => fanout.negedge.push(block_idx),
-                    EdgeKind::AnyEdge => fanout.anyedge.push(block_idx),
-                    EdgeKind::LsbEdge => fanout.lsbedge.push(block_idx),
+                    EdgeKind::Posedge => fanout.posedge.push(b),
+                    EdgeKind::Negedge => fanout.negedge.push(b),
+                    EdgeKind::AnyEdge => fanout.anyedge.push(b),
+                    EdgeKind::LsbEdge => fanout.lsbedge.push(b),
                 }
             }
         }
@@ -1579,14 +1587,23 @@ impl Simulator {
             .edge_signal_ids
             .iter()
             .map(|sid| {
-                let mut fanout = by_sid.remove(sid).unwrap_or_default();
-                if batch_armed_edges {
-                    fanout.posedge_batches =
-                        edges::EdgeBatch::build(&fanout.posedge, edge_block_count);
-                    fanout.negedge_batches =
-                        edges::EdgeBatch::build(&fanout.negedge, edge_block_count);
+                let b = by_sid.remove(sid).unwrap_or_default();
+                let (posedge_batches, negedge_batches) = if batch_armed_edges {
+                    (
+                        edges::EdgeBatch::build(&b.posedge, edge_block_count),
+                        edges::EdgeBatch::build(&b.negedge, edge_block_count),
+                    )
+                } else {
+                    (Box::default(), Box::default())
+                };
+                EdgeFanout {
+                    posedge: b.posedge.into_boxed_slice(),
+                    negedge: b.negedge.into_boxed_slice(),
+                    posedge_batches,
+                    negedge_batches,
+                    anyedge: b.anyedge.into_boxed_slice(),
+                    lsbedge: b.lsbedge.into_boxed_slice(),
                 }
-                fanout
             })
             .collect();
         if batch_armed_edges {

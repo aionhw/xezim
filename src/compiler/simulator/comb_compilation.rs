@@ -2021,6 +2021,10 @@ impl Simulator {
                 None
             };
             let cov = cov_counter.filter(|_| matches!(&item, CombItem::ContAssign { .. }));
+            let mut rids = rids;
+            let mut wids = wids;
+            rids.shrink_to_fit();
+            wids.shrink_to_fit();
             entries.push(CombEntry {
                 item,
                 cold: Box::new(CombEntryCold {
@@ -2402,6 +2406,11 @@ impl Simulator {
                         &super::time0_effects::T0Frame::block(&ab.stmt),
                         &mut t0_effects,
                     );
+                let mut rids = rids;
+                let mut wids = wids;
+                rids.shrink_to_fit();
+                wids.shrink_to_fit();
+                alias_t0_reads.shrink_to_fit();
                 entries.push(CombEntry {
                     item,
                     cold: Box::new(CombEntryCold {
