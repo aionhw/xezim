@@ -6372,7 +6372,9 @@ impl Simulator {
                 for insn in &cb.instructions {
                     let c = match insn {
                         Insn::StmtFallback(..) => 0,
-                        Insn::EvalExprFallback(..) | Insn::LoadDynElem(..) => 0,
+                        Insn::EvalExprFallback(..) | Insn::LoadDynElem(..) | Insn::QueuePop(..) => {
+                            0
+                        }
                         Insn::BlockingAssign(..) => 1,
                         Insn::BlockingAssignRange(..)
                         | Insn::BlockingAssignRangeDyn(..)

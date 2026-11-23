@@ -185,7 +185,10 @@ impl<'a> BytecodeCompiler<'a> {
                     Insn::LoadConst(d, v) if *d == r => Some(!v.has_xz() && !v.is_real),
                     i if Self::dest_reg(i) == Some(r)
                         || Self::in_place_reg(i) == Some(r)
-                        || matches!(i, Insn::EvalExprFallback(_, d, _) if *d == r)
+                        || matches!(
+                            i,
+                            Insn::EvalExprFallback(_, d, _) | Insn::QueuePop(d, ..) if *d == r
+                        )
                         || matches!(i, Insn::StmtFallback(..))
                         || matches!(i, Insn::InitLocalColl(..)) =>
                     {

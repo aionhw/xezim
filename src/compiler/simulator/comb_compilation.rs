@@ -3082,7 +3082,10 @@ impl Simulator {
                     i.is_branch()
                         || matches!(
                             i,
-                            I::StmtFallback(..) | I::EvalExprFallback(..) | I::LoadDynElem(..)
+                            I::StmtFallback(..)
+                                | I::EvalExprFallback(..)
+                                | I::LoadDynElem(..)
+                                | I::QueuePop(..)
                         )
                 }) {
                     continue;

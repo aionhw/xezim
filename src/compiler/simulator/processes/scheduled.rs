@@ -87,9 +87,9 @@ impl Simulator {
                 | Insn::BlockingAssignArray(..)
                 | Insn::NbaAssignArrayRange(..)
                 | Insn::BlockingAssignArrayRange(..) => return None,
-                // A delegated function runs on the interpreter and may write
-                // any module variable (§13.4): the write set is unknown.
-                Insn::CallFreeFunction(..) => return None,
+                // A delegated function or queue pop runs on the interpreter and
+                // may mutate runtime state outside fixed signal ids.
+                Insn::CallFreeFunction(..) | Insn::QueuePop(..) => return None,
                 _ => {}
             }
         }

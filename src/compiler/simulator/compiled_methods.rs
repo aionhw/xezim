@@ -3486,6 +3486,7 @@ impl Simulator {
                             | I::StmtFallback(..)
                             | I::EvalExprFallback(..)
                             | I::LoadDynElem(..)
+                            | I::QueuePop(..)
                     )
                 };
                 let reentrant_static =

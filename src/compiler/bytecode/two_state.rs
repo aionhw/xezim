@@ -1987,6 +1987,7 @@ fn ts_for_each_reg_def(ins: &Insn, mut f: impl FnMut(RegId)) {
         }
         Insn::EvalExprFallback(_, d, _)
         | Insn::LoadDynElem(d, _, _)
+        | Insn::QueuePop(d, ..)
         | Insn::Format(d, _)
         | Insn::StrOp(d, _, _) => f(*d),
         _ => {}

@@ -1364,6 +1364,7 @@ impl Simulator {
                         }
                         Insn::StmtFallback(..)
                         | Insn::EvalExprFallback(..)
+                        | Insn::QueuePop(..)
                         | Insn::NbaAssignArray(..)
                         | Insn::BlockingAssignArray(..)
                         | Insn::NbaAssignArrayRange(..)
