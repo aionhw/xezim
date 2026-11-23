@@ -47,7 +47,6 @@ impl<'a> BytecodeCompiler<'a> {
         {
             return None;
         }
-        let queues = self.queue_vars?;
         let recv = receiver
             .iter()
             .map(|part| part.name.name.as_str())
@@ -57,8 +56,10 @@ impl<'a> BytecodeCompiler<'a> {
             .scope_hint
             .as_ref()
             .map(|scope| cat_dot(scope, &recv))
-            .filter(|name| queues.contains(name))
-            .or_else(|| queues.contains(&recv).then_some(recv))?;
+            // Inlined queues are registered as dynamic collections even
+            // when the elaborator has no separate queue entry for them.
+            .filter(|name| self.is_dynamic_collection(name))
+            .or_else(|| self.is_dynamic_collection(&recv).then_some(recv))?;
         let dest = self.alloc_reg();
         self.emit(Insn::QueuePop(
             dest,
