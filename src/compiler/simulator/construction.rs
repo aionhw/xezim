@@ -2417,6 +2417,10 @@ impl Simulator {
             },
         };
         let class_name_owned = class_def.name.clone();
+        let active_targets_leaf = self
+            .current_spec
+            .as_ref()
+            .is_some_and(|(base, _)| self.class_names_alias(base, &class_name_owned));
         let mut computed_spec = None;
         if self.class_is_parameterized(&class_name_owned) {
             // §8.25.1: two specializations are the SAME when their parameter
@@ -2454,32 +2458,15 @@ impl Simulator {
                 // `test.reg_agent` vs bare `reg_agent` spellings behind
                 // `same_class_declaration`).
                 _ => {
-                    let mut inherited: Option<String> = None;
-                    if let Some((cb, cs)) = &self.current_spec {
-                        let same = if *cb == class_name_owned {
-                            true
-                        } else {
-                            (|| {
-                                let cb2 = cb.split('#').next().unwrap_or(cb);
-                                let cn2 = class_name_owned.split('#').next().unwrap_or(&class_name_owned);
-                                if cb2 == cn2 {
-                                    return true;
-                                }
-                                match (self.module.classes.get(cb2), self.module.classes.get(cn2)) {
-                                    (Some(a), Some(b)) => {
-                                        a.name == b.name
-                                            && a.enclosing == b.enclosing
-                                            && a.declaring_module == b.declaring_module
-                                    }
-                                    _ => false,
-                                }
-                            })()
-                        };
-                        if same && !cs.trim().is_empty() {
-                            inherited = Some(cs.clone());
-                        }
-                    }
-                    inherited.or_else(|| Some(String::new()))
+                    let leaf = class_name_owned
+                        .split('#')
+                        .next()
+                        .unwrap_or(&class_name_owned);
+                    let inherited = self.current_spec.as_ref().filter(|(base, sig)| {
+                        !sig.trim().is_empty()
+                            && self.class_names_alias(base.split('#').next().unwrap_or(base), leaf)
+                    });
+                    Some(inherited.map(|(_, sig)| sig.clone()).unwrap_or_default())
                 }
             };
             if let Some(raw_sig) = raw_sig {
@@ -2532,7 +2519,7 @@ impl Simulator {
             let active = self
                 .current_spec
                 .clone()
-                .filter(|(b, _)| *b == class_name_owned)
+                .filter(|_| active_targets_leaf)
                 .or_else(|| computed_spec.clone());
             active.and_then(|(b, sig)| self.ensure_param_vif_class(&b, &sig))
         };
@@ -2868,17 +2855,13 @@ impl Simulator {
                 // (`AliasT::get()` where `AliasT` is
                 // `typedef Common#(int,"alpha") AliasT;`): the bare `new()`
                 // carries no type_args, but current_spec holds the bindings.
-                if is_leaf && arg_map.get(pname).is_none() {
-                    let spec_matches = self
-                        .current_spec
-                        .as_ref()
-                        .is_some_and(|(b, _)| *b == class_name_owned);
-                    if spec_matches {
-                        if let Some(v) = self.resolve_value_param_from_spec(pname) {
-                            instance.properties.insert(pname.clone(), v);
-                            continue;
-                        }
-                    }
+                if is_leaf
+                    && active_targets_leaf
+                    && arg_map.get(pname).is_none()
+                    && let Some(v) = self.resolve_value_param_from_spec(pname)
+                {
+                    instance.properties.insert(pname.clone(), v);
+                    continue;
                 }
                 // An ancestor's parameter supplied by the `extends B#(..)`
                 // clause wins over its declared default.
@@ -3170,10 +3153,6 @@ impl Simulator {
         // (e.g. `component_registry#(type T, string Tname)` — type first),
         // so look each type param up by NAME in `arg_map` (which maps args by
         // `param_order` slot, or by kind for the recovered named form §8.26).
-        let spec_targets_this = self
-            .current_spec
-            .as_ref()
-            .is_some_and(|(b, _)| *b == class_name_owned);
         for tp_name in class_def.type_param_names.iter() {
             let mut bound: Option<String> = None;
             if let Some(ta) = arg_map.get(tp_name) {
@@ -3222,7 +3201,7 @@ impl Simulator {
                             .unwrap_or(concrete),
                     );
                 }
-            } else if spec_targets_this {
+            } else if active_targets_leaf {
                 // No explicit type_args carried this param, but the active
                 // specialization (`current_spec`) targets THIS class —
                 // resolve the type param from it. This covers
@@ -3293,8 +3272,8 @@ impl Simulator {
                 .split('#')
                 .next()
                 .unwrap_or(&class_name_owned);
-            if b == c_base {
-                instance.spec = Some((b.clone(), sig.clone()));
+            if active_targets_leaf || b == c_base {
+                instance.spec = Some((c_base.to_string(), sig.clone()));
             } else if self.class_extends(b, c_base) {
                 if let Some(anc_sig) = self.ancestor_spec(b, sig, c_base) {
                     let anc_sig = self.canonicalize_spec_sig(c_base, &anc_sig);
