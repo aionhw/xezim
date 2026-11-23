@@ -507,7 +507,8 @@ impl Simulator {
             return false;
         }
         if !is_packed_id(id) && self.signal_widths[id] > 64 {
-            return w.captured_prev_wide[i].as_ref() == Some(&self.signal_table[id]);
+            return w.captured_prev_wide.get(i).and_then(|o| o.as_ref())
+                == Some(&self.signal_table[id]);
         }
         true
     }

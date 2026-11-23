@@ -941,6 +941,11 @@ impl Simulator {
                 for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
                     waiter.captured_prev[i] = self.term_raw_bits(sid.signal_id);
                     if let Some(v) = self.term_wide_value(sid.signal_id) {
+                        if waiter.captured_prev_wide.len() < waiter.resolved_sensitivities.len() {
+                            waiter
+                                .captured_prev_wide
+                                .resize(waiter.resolved_sensitivities.len(), None);
+                        }
                         waiter.captured_prev_wide[i] = Some(v);
                     }
                 }

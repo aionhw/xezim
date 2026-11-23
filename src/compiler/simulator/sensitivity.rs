@@ -4383,51 +4383,56 @@ impl Simulator {
         } else {
             None
         };
-        // §9.4.2 value guard: capture each non-trivial term's value at arm.
-        let mut last: Option<(crate::ast::Span, Value)> = None;
-        let mut earlier = HashMap::default();
-        let cells = value_ctx.as_ref().is_some_and(|c| c.cells);
-        let guard_prev = resolved
-            .iter()
-            .map(|sid| {
-                let e = sid.value_of.as_deref()?;
-                // Dynamically resolved cells are appended after the fixed
-                // terms, so their expression group can recur at the end.
-                if cells
-                    && let Some((span, value)) = &last
-                    && *span != e.span
-                {
-                    earlier.insert((span.start, span.end), value.clone());
-                    if let Some(value) = earlier.remove(&(e.span.start, e.span.end)) {
-                        last = Some((e.span, value));
+        // §9.4.2 value guard: capture each non-trivial term's value at arm,
+        // leaving `guard_prev` empty on the common expression-free waiter.
+        let guard_prev = if value_ctx.is_some() {
+            let mut last: Option<(crate::ast::Span, Value)> = None;
+            let mut earlier = HashMap::default();
+            let cells = value_ctx.as_ref().is_some_and(|c| c.cells);
+            resolved
+                .iter()
+                .map(|sid| {
+                    let e = sid.value_of.as_deref()?;
+                    // Dynamically resolved cells are appended after the fixed
+                    // terms, so their expression group can recur at the end.
+                    if cells
+                        && let Some((span, value)) = &last
+                        && *span != e.span
+                    {
+                        earlier.insert((span.start, span.end), value.clone());
+                        if let Some(value) = earlier.remove(&(e.span.start, e.span.end)) {
+                            last = Some((e.span, value));
+                        }
                     }
-                }
-                Some(self.event_value_snapshot(e, &mut last))
-            })
-            .collect();
-        // Capture each sensitivity signal's value AT ARM TIME, parallel to
-        // `resolved`. A waiter registered within the current snapshot
-        // generation is checked against these (not the tick-start snapshot),
-        // so only a change made AFTER it armed counts as an edge — see the
-        // firing loop in `check_edges_inner`.
-        let arm_bits: Vec<(u64, u64)> = resolved
-            .iter()
-            .map(|sid| self.term_raw_bits(sid.signal_id))
-            .collect();
+                    Some(self.event_value_snapshot(e, &mut last))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // `sens` (Vec<Sensitivity>) is consumed for resolution and dropped;
         // EventWaiter only carries the resolved IDs from here on.
         //
         // Capture each sensitivity signal's current value at registration
-        // so the waiter fires on a change relative to THIS point (see the
-        // `captured_prev` field doc for the NBA reasoning).
+        // once and reuse it for `arm_bits` (see the `captured_prev` field
+        // doc for the NBA reasoning).
         let captured_prev: Vec<(u64, u64)> = resolved
             .iter()
             .map(|s| self.term_raw_bits(s.signal_id))
             .collect();
-        let captured_prev_wide: Vec<Option<Value>> = resolved
-            .iter()
-            .map(|s| self.term_wide_value(s.signal_id))
-            .collect();
+        let arm_bits = captured_prev.clone();
+        let has_wide = resolved.iter().any(|s| {
+            !is_packed_id(s.signal_id)
+                && self.signal_widths.get(s.signal_id).copied().unwrap_or(0) > 64
+        });
+        let captured_prev_wide: Vec<Option<Value>> = if has_wide {
+            resolved
+                .iter()
+                .map(|s| self.term_wide_value(s.signal_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
         EventWaiter {
             pid,
             parked_time: self.time,

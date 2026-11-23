@@ -282,16 +282,16 @@ pub(super) struct Sensitivity {
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct EdgeFanout {
-    pub(super) posedge: Vec<usize>,
-    pub(super) negedge: Vec<usize>,
+    pub(super) posedge: Box<[u32]>,
+    pub(super) negedge: Box<[u32]>,
     #[serde(skip)]
-    pub(super) posedge_batches: Vec<edges::EdgeBatch>,
+    pub(super) posedge_batches: Box<[edges::EdgeBatch]>,
     #[serde(skip)]
-    pub(super) negedge_batches: Vec<edges::EdgeBatch>,
-    pub(super) anyedge: Vec<usize>,
+    pub(super) negedge_batches: Box<[edges::EdgeBatch]>,
+    pub(super) anyedge: Box<[u32]>,
     /// `@(edge x)` blocks — §9.4.2 LSB edge (posedge OR negedge of bit 0),
     /// NOT the whole-vector change that `anyedge` (`@(x)` level) fires on.
-    pub(super) lsbedge: Vec<usize>,
+    pub(super) lsbedge: Box<[u32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
