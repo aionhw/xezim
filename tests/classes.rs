@@ -1355,6 +1355,8 @@ mod vif_formal_name_clash_1297;
 mod review_writeback_actual_forms;
 #[path = "classes/class_constraint_sharing_721.rs"]
 mod class_constraint_sharing_721;
+#[path = "classes/compiled_method_local_coll_compare.rs"]
+mod compiled_method_local_coll_compare;
 #[path = "classes/class_struct_array_member_patterns.rs"]
 mod class_struct_array_member_patterns;
 #[path = "classes/multidim_property_pattern_init.rs"]
