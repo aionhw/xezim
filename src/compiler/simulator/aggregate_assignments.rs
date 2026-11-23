@@ -3772,19 +3772,25 @@ impl Simulator {
         // concatenation form `{1,2,3}` initialize element-wise.
         let vals: Vec<Value> = match &self.unpacked_pattern(init).kind {
             // §10.9.1: a positional `N{...}` item stands for its items
-            // repeated N times (`'{3{5}}` is three elements), as an
-            // assignment of the same pattern expands it (`pattern_ordered`).
+            // repeated N times (`'{3{5}}` is three elements). §11.4.12.1:
+            // each operand is evaluated exactly once, even for N = 0, and
+            // its value is copied, as a runtime assignment of the pattern
+            // does (`'{3{f()}}` calls `f` once).
             ExprKind::AssignmentPattern(items) => {
                 let mut vals = Vec::with_capacity(items.len());
                 for it in items {
                     match it {
-                        AssignmentPatternItem::Ordered(e)
-                            if matches!(e.kind, ExprKind::Replication { .. }) =>
-                        {
-                            for sub in self.pattern_ordered(std::slice::from_ref(it)) {
-                                vals.push(self.eval_expr(sub));
+                        AssignmentPatternItem::Ordered(e) => match &e.kind {
+                            ExprKind::Replication { count, exprs } => {
+                                let n = self.eval_expr(count).to_u64().unwrap_or(0) as usize;
+                                let once: Vec<Value> =
+                                    exprs.iter().map(|x| self.eval_expr(x)).collect();
+                                for _ in 0..n {
+                                    vals.extend(once.iter().cloned());
+                                }
                             }
-                        }
+                            _ => vals.push(self.eval_expr(e)),
+                        },
                         _ => vals.push(self.eval_expr(it.expr())),
                     }
                 }
