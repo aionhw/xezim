@@ -1233,8 +1233,16 @@ impl<'a> BytecodeCompiler<'a> {
                 // strings, as a `string q[$]` local's are.
                 if self.typedef_coll_strings.contains(&type_name_key(tn)) {
                     self.local_coll_strings.insert(decl.name.name.clone());
+                    self.local_coll_elems.remove(&decl.name.name);
                 } else {
                     self.local_coll_strings.remove(&decl.name.name);
+                    // §7.5, §7.10: the typedef's width and sign are its
+                    // element type's; its unpacked dimension adds neither.
+                    let elem = (
+                        self.decl_width(data_type),
+                        self.decl_signedness(data_type, None),
+                    );
+                    self.local_coll_elems.insert(decl.name.name.clone(), elem);
                 }
                 return true;
             }
@@ -1263,8 +1271,15 @@ impl<'a> BytecodeCompiler<'a> {
                 self.local_coll_names.insert(decl.name.name.clone());
                 if Self::dt_is_string(data_type) {
                     self.local_coll_strings.insert(decl.name.name.clone());
+                    self.local_coll_elems.remove(&decl.name.name);
                 } else {
                     self.local_coll_strings.remove(&decl.name.name);
+                    // §7.5, §7.10: the element type is the declared type.
+                    let elem = (
+                        self.decl_width(data_type),
+                        self.decl_signedness(data_type, None),
+                    );
+                    self.local_coll_elems.insert(decl.name.name.clone(), elem);
                 }
                 return true;
             }

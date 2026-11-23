@@ -1131,6 +1131,26 @@ impl<'a> BytecodeCompiler<'a> {
         self.coll_elem_widths.get(name).copied().filter(|&w| w > 0)
     }
 
+    /// §7.5, §7.10: the declared element width and signedness of a LOCAL
+    /// queue / dynamic array (`int a[]` in this body) named by a bare,
+    /// unshadowed Ident base of an element select.
+    pub(super) fn local_coll_elem_of(
+        &self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<(u32, Option<bool>)> {
+        if hier.root.is_some() || hier.path.len() != 1 || !hier.path[0].selects.is_empty() {
+            return None;
+        }
+        let name = hier.path[0].name.name.as_str();
+        if self.local_var_regs.contains_key(name) || !self.local_coll_names.contains(name) {
+            return None;
+        }
+        self.local_coll_elems
+            .get(name)
+            .copied()
+            .filter(|&(w, _)| w > 0)
+    }
+
     /// `member_elem_plan_width` for a bare or `this.`-prefixed Ident base
     /// of an element select.
     pub(super) fn member_elem_plan_width_of(

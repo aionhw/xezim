@@ -469,6 +469,11 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     return Some(signed);
                 }
+                if let ExprKind::Ident(h) = &expr.kind
+                    && let Some((_, signed)) = self.local_coll_elem_of(h)
+                {
+                    return signed;
+                }
                 if let Some(id) = self.const_multi_dim_array_elem_signal_id(e) {
                     return self.signal_signed.get(id).copied();
                 }
@@ -586,7 +591,7 @@ impl<'a> BytecodeCompiler<'a> {
 
     /// §6.11.3: the signedness a declared integral type gives its values;
     /// None for a real, string or unresolved type.
-    fn decl_signedness(
+    pub(super) fn decl_signedness(
         &self,
         dt: &crate::ast::types::DataType,
         scope: Option<&str>,
@@ -1042,7 +1047,9 @@ impl<'a> BytecodeCompiler<'a> {
                 // `expr_max_width returned 1 for every index select` bug fixed
                 // in the simulator earlier — same disease, other table.
                 ExprKind::Ident(hier) => self
-                    .packed_elem_width_of(hier)
+                    .local_coll_elem_of(hier)
+                    .map(|(w, _)| w)
+                    .or_else(|| self.packed_elem_width_of(hier))
                     .or_else(|| {
                         self.lookup_array_name(hier)
                             .and_then(|n| self.arrays.get(&n).map(|&(_, _, w)| w))
