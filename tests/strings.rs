@@ -190,3 +190,6 @@ mod scan_zero_width;
 mod review_vpi_scoped_callee_deposit;
 #[path = "strings/vpi_deferred_rw_writes.rs"]
 mod vpi_deferred_rw_writes;
+
+#[path = "strings/class_collection_row_format.rs"]
+mod class_collection_row_format;
