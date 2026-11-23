@@ -4712,20 +4712,19 @@ impl Simulator {
         // §4.9.4: commit matured future-time NBAs first — they were scheduled
         // in an earlier slot, so they precede this slot's freshly queued NBAs.
         if !self.delayed_nba.is_empty() {
-            let mut i = 0;
-            while i < self.delayed_nba.len() {
-                if self.delayed_nba[i].0 <= self.time {
-                    let (_, id, mut val) = self.delayed_nba.swap_remove(i);
-                    val.is_signed = self.signal_signed[id];
-                    if self.signal_table[id] != val {
-                        write_sig!(self, id, val);
-                        self.mark_dirty_id(id);
-                        self.table_modified = true;
-                    }
-                } else {
-                    i += 1;
+            // §4.6: nonblocking writes from one process take effect in execution
+            // order. Keep that order for both the due writes and the future ones.
+            let mut pending = std::mem::take(&mut self.delayed_nba);
+            let now = self.time;
+            for (_, id, mut val) in pending.extract_if(.., |(due, _, _)| *due <= now) {
+                val.is_signed = self.signal_signed[id];
+                if self.signal_table[id] != val {
+                    write_sig!(self, id, val);
+                    self.mark_dirty_id(id);
+                    self.table_modified = true;
                 }
             }
+            self.delayed_nba = pending;
         }
         // JIT Stage 4 Path C1: drain any JIT-emitted inline NBA writes
         // into nba_fast BEFORE clearing the per-window index, so

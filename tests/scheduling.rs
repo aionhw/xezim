@@ -22,6 +22,8 @@ mod named_branch_frames;
 
 #[path = "scheduling/loop_frame_bail_rollback.rs"]
 mod loop_frame_bail_rollback;
+#[path = "scheduling/delayed_nba_order.rs"]
+mod delayed_nba_order;
 #[path = "scheduling/nba_region_waiter_order.rs"]
 mod nba_region_waiter_order;
 #[path = "scheduling/property_wait_shapes.rs"]
