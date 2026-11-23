@@ -619,3 +619,5 @@ mod forced_partial_stores;
 mod array_write_feedback;
 #[path = "scheduling/star_timing_and_self_read_1539.rs"]
 mod star_timing_and_self_read_1539;
+#[path = "scheduling/time0_always_event_prearm_1545.rs"]
+mod time0_always_event_prearm_1545;
