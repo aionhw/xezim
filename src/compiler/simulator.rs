@@ -180,7 +180,8 @@ thread_local! {}
 // §6.24.1: an integer atom cast of an integral operand copies the operand before it is fitted.
 // §7.2, §7.4.2: a member select through constant element selects of a packed struct compiles,
 // and a nested packed-struct member read compiles to one range select.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317a;
+// §7.5, §7.10: compiled local collection reads retain element width and sign.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317b;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
