@@ -1945,9 +1945,10 @@ impl Simulator {
         &mut self,
         stmt: &Statement,
         scope: &str,
-        pre_arm: bool,
+        is_plain_always: bool,
         try_fsm: bool,
     ) {
+        let pre_arm = is_plain_always && self.always_starts_with_uncond_event(stmt, scope);
         if try_fsm && self.try_register_proc_fsm(stmt, scope, true, "always block") {
             if pre_arm {
                 self.t0_pre_arm_always.insert(self.next_pid - 1);
@@ -1982,8 +1983,6 @@ impl Simulator {
         // rewritten as `return Some(...)`.)
         Self::sva_stmt_names(&ab.stmt, false, &mut self.always_sva_names);
         Self::sva_stmt_clocks(&ab.stmt, &mut self.always_sva_clocks);
-        let pre_arm =
-            ab.kind == AlwaysKind::Always && self.always_starts_with_uncond_event(&ab.stmt, &ab.scope);
         // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a MULTI-WAIT always body
         // (an event/delay head plus at least one more wait inside) is served
         // by the edge path only through per-fire AST continuations — compile
@@ -1996,7 +1995,9 @@ impl Simulator {
                 && (tc >= 2 || (tc >= 1 && Self::stmt_contains_call(&ab.stmt)))
                 && self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block")
             {
-                if pre_arm {
+                if ab.kind == AlwaysKind::Always
+                    && self.always_starts_with_uncond_event(&ab.stmt, &ab.scope)
+                {
                     self.t0_pre_arm_always.insert(self.next_pid - 1);
                 }
                 return None;
@@ -2267,7 +2268,12 @@ impl Simulator {
                     || star_kept_own_write
                     || self.event_needs_value_waiter(&sens, &ab.scope)
                 {
-                    self.schedule_always_process(&ab.stmt, &ab.scope, pre_arm, true);
+                    self.schedule_always_process(
+                        &ab.stmt,
+                        &ab.scope,
+                        ab.kind == AlwaysKind::Always,
+                        true,
+                    );
                     return None;
                 }
                 let mut dropped_terms: Vec<String> = Vec::new();
@@ -2443,7 +2449,12 @@ impl Simulator {
                     // FSM implements the same semantics without the per-activation AST
                     // walk; use it whenever the body compiles (c906's tb monitors: an
                     // else-chain ending in a rare `#10`, ~9% of the run).
-                    self.schedule_always_process(&ab.stmt, &ab.scope, pre_arm, true);
+                    self.schedule_always_process(
+                        &ab.stmt,
+                        &ab.scope,
+                        ab.kind == AlwaysKind::Always,
+                        true,
+                    );
                     return None;
                 }
                 // `collect` leaves room for four terms; an edge block keeps
@@ -2636,7 +2647,7 @@ impl Simulator {
             {
                 let fsm_on = self.proc_fsm_mode == 1
                     || (self.proc_fsm_mode == 2 && self.stmt_is_delay_loop(&ab.stmt));
-                self.schedule_always_process(&ab.stmt, &ab.scope, pre_arm, fsm_on);
+                self.schedule_always_process(&ab.stmt, &ab.scope, true, fsm_on);
                 return None;
             }
         }

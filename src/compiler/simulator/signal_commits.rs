@@ -2133,6 +2133,7 @@ impl Simulator {
     /// `input_port_actuals`. An actual still all x/z (0 for 2-state) made no
     /// change.
     pub(super) fn fire_time0_input_port_blocks(&mut self) {
+        let t0_deferred_ran = std::mem::take(&mut self.t0_deferred_ran);
         if (self.module.input_port_actuals.is_empty() && self.collapsed_port_children.is_empty())
             || self.comb_entries.is_empty()
         {
@@ -2147,7 +2148,7 @@ impl Simulator {
             .enumerate()
             .filter(|(i, e)| {
                 e.defer_at_time0
-                    && !self.t0_deferred_ran.contains(i)
+                    && !t0_deferred_ran.contains(i)
                     && matches!(
                         e.item,
                         CombItem::AlwaysBlock {
@@ -2333,6 +2334,9 @@ impl Simulator {
     /// (§6.8). A source the settle changed already delivers its own edge
     /// to every reader.
     pub(super) fn record_time0_port_edges(&mut self) {
+        if self.module.input_port_actuals.is_empty() && self.collapsed_port_children.is_empty() {
+            return;
+        }
         let top = format!("{}.", self.module.name);
         let narrow_settled = |sim: &Self, id: usize, w: u32| -> Option<(u64, u64)> {
             if w == 0 || w > 64 {
@@ -2421,52 +2425,59 @@ impl Simulator {
         {
             return;
         }
-        let settled_alias_ids: HashSet<usize> = aliases
-            .iter()
-            .map(|&(id, _)| id)
-            .chain(wide_aliases.iter().map(|&(id, _)| id))
-            .collect();
-        let mut narrow_port_prev: HashMap<(usize, &str), (u64, u64)> = HashMap::default();
-        for (inst, id, prev, _) in &ports {
-            narrow_port_prev.entry((*id, inst.as_str())).or_insert(*prev);
-        }
-        let mut wide_port_prev: HashMap<(usize, &str), &Value> = HashMap::default();
-        for (inst, id, prev_w, _) in &wide_ports {
-            wide_port_prev
-                .entry((*id, inst.as_str()))
-                .or_insert(prev_w);
-        }
-        // The edge blocks the updates wake, found now against the settled
-        // values: a process that writes the source at time 0 moves them
-        // before `deliver_time0_port_edges` runs.
-        let blocks = Arc::clone(&self.edge_blocks);
         let mut pending = Vec::new();
-        for (bi, b) in blocks.iter().enumerate() {
-            let scope = b.scope.strip_prefix(top.as_str()).unwrap_or(&b.scope);
-            if b.resolved_sensitivities.iter().any(|s| {
-                if s.iff.is_some() || s.value_of.is_some() {
-                    return false;
-                }
-                let w = self.signal_widths.get(s.signal_id).copied().unwrap_or(0);
-                if s.alias_t0 != 0 && settled_alias_ids.contains(&s.signal_id) {
-                    if w <= 64 {
-                        let (pv, px) = Self::alias_t0_prev(s.alias_t0, w);
+        if !self.edge_blocks.is_empty() {
+            let settled_alias_ids: HashSet<usize> =
+                if aliases.len() + wide_aliases.len() == seen_alias_ids.len() {
+                    seen_alias_ids
+                } else {
+                    aliases
+                        .iter()
+                        .map(|&(id, _)| id)
+                        .chain(wide_aliases.iter().map(|&(id, _)| id))
+                        .collect()
+                };
+            let mut narrow_port_prev: HashMap<(usize, &str), (u64, u64)> = HashMap::default();
+            for (inst, id, prev, _) in &ports {
+                narrow_port_prev.entry((*id, inst.as_str())).or_insert(*prev);
+            }
+            let mut wide_port_prev: HashMap<(usize, &str), &Value> = HashMap::default();
+            for (inst, id, prev_w, _) in &wide_ports {
+                wide_port_prev
+                    .entry((*id, inst.as_str()))
+                    .or_insert(prev_w);
+            }
+            // The edge blocks the updates wake, found now against the settled
+            // values: a process that writes the source at time 0 moves them
+            // before `deliver_time0_port_edges` runs.
+            let blocks = Arc::clone(&self.edge_blocks);
+            for (bi, b) in blocks.iter().enumerate() {
+                let scope = b.scope.strip_prefix(top.as_str()).unwrap_or(&b.scope);
+                if b.resolved_sensitivities.iter().any(|s| {
+                    if s.iff.is_some() || s.value_of.is_some() {
+                        return false;
+                    }
+                    let w = self.signal_widths.get(s.signal_id).copied().unwrap_or(0);
+                    if s.alias_t0 != 0 && settled_alias_ids.contains(&s.signal_id) {
+                        if w <= 64 {
+                            let (pv, px) = Self::alias_t0_prev(s.alias_t0, w);
+                            return self.term_fires(s, pv, px, None);
+                        }
+                        let pw = Self::alias_t0_prev_wide(s.alias_t0, w);
+                        let (pv, px) = pw.raw_bits();
+                        return self.term_fires(s, pv, px, Some(&pw));
+                    }
+                    if let Some(&(pv, px)) = narrow_port_prev.get(&(s.signal_id, scope)) {
                         return self.term_fires(s, pv, px, None);
                     }
-                    let pw = Self::alias_t0_prev_wide(s.alias_t0, w);
-                    let (pv, px) = pw.raw_bits();
-                    return self.term_fires(s, pv, px, Some(&pw));
+                    if let Some(&pw) = wide_port_prev.get(&(s.signal_id, scope)) {
+                        let (pv, px) = pw.raw_bits();
+                        return self.term_fires(s, pv, px, Some(pw));
+                    }
+                    false
+                }) {
+                    pending.push(bi);
                 }
-                if let Some(&(pv, px)) = narrow_port_prev.get(&(s.signal_id, scope)) {
-                    return self.term_fires(s, pv, px, None);
-                }
-                if let Some(&pw) = wide_port_prev.get(&(s.signal_id, scope)) {
-                    let (pv, px) = pw.raw_bits();
-                    return self.term_fires(s, pv, px, Some(pw));
-                }
-                false
-            }) {
-                pending.push(bi);
             }
         }
         if std::env::var("XEZIM_DEBUG").is_ok() {
@@ -2501,75 +2512,87 @@ impl Simulator {
         let wide_ports = std::mem::take(&mut self.time0_wide_port_edges);
         let aliases = std::mem::take(&mut self.time0_alias_edges);
         let wide_aliases = std::mem::take(&mut self.time0_wide_alias_edges);
-        let top = format!("{}.", self.module.name);
-
-        let narrow_alias_cur: HashMap<usize, (u64, u64)> = aliases.iter().copied().collect();
-        let wide_alias_cur: HashMap<usize, &Value> =
-            wide_aliases.iter().map(|(id, v)| (*id, v)).collect();
-        let mut narrow_port_prev: HashMap<(usize, &str), (u64, u64)> = HashMap::default();
-        let mut narrow_port_cur_by_id: HashMap<usize, (u64, u64)> = HashMap::default();
-        for (inst, id, prev, cur) in &ports {
-            narrow_port_prev.entry((*id, inst.as_str())).or_insert(*prev);
-            narrow_port_cur_by_id.entry(*id).or_insert(*cur);
-        }
-        let mut wide_port_prev: HashMap<(usize, &str), &Value> = HashMap::default();
-        let mut wide_port_cur_by_id: HashMap<usize, &Value> = HashMap::default();
-        for (inst, id, prev_w, cur_w) in &wide_ports {
-            wide_port_prev
-                .entry((*id, inst.as_str()))
-                .or_insert(prev_w);
-            wide_port_cur_by_id.entry(*id).or_insert(cur_w);
-        }
 
         let mut rearm: Vec<(u64, usize, (u64, u64))> = Vec::new();
         let mut rearm_wide: Vec<(u64, usize, Value)> = Vec::new();
-        for (wi, w) in self.event_waiters.iter_seq() {
-            if w.is_clocking || self.process_origin.get(&w.pid).map(|o| o.1) != Some("always block")
-            {
-                continue;
+        let has_updates = !ports.is_empty()
+            || !wide_ports.is_empty()
+            || !aliases.is_empty()
+            || !wide_aliases.is_empty();
+        let has_always_waiter = has_updates
+            && self.event_waiters.iter_seq().any(|(_, w)| {
+                !w.is_clocking && self.process_origin.get(&w.pid).map(|o| o.1) == Some("always block")
+            });
+        if has_always_waiter {
+            let top = format!("{}.", self.module.name);
+
+            let narrow_alias_cur: HashMap<usize, (u64, u64)> = aliases.iter().copied().collect();
+            let wide_alias_cur: HashMap<usize, &Value> =
+                wide_aliases.iter().map(|(id, v)| (*id, v)).collect();
+            let mut narrow_port_prev: HashMap<(usize, &str), (u64, u64)> = HashMap::default();
+            let mut narrow_port_cur_by_id: HashMap<usize, (u64, u64)> = HashMap::default();
+            for (inst, id, prev, cur) in &ports {
+                narrow_port_prev.entry((*id, inst.as_str())).or_insert(*prev);
+                narrow_port_cur_by_id.entry(*id).or_insert(*cur);
             }
-            let scope = self
-                .process_scope_hint
-                .get(&w.pid)
-                .map(|s| s.strip_prefix(top.as_str()).unwrap_or(s))
-                .unwrap_or("");
-            for (k, s) in w.resolved_sensitivities.iter().enumerate() {
-                if s.iff.is_some() || s.value_of.is_some() {
+            let mut wide_port_prev: HashMap<(usize, &str), &Value> = HashMap::default();
+            let mut wide_port_cur_by_id: HashMap<usize, &Value> = HashMap::default();
+            for (inst, id, prev_w, cur_w) in &wide_ports {
+                wide_port_prev
+                    .entry((*id, inst.as_str()))
+                    .or_insert(prev_w);
+                wide_port_cur_by_id.entry(*id).or_insert(cur_w);
+            }
+
+            for (wi, w) in self.event_waiters.iter_seq() {
+                if w.is_clocking
+                    || self.process_origin.get(&w.pid).map(|o| o.1) != Some("always block")
+                {
                     continue;
                 }
-                let id = s.signal_id;
-                let width = self.signal_widths.get(id).copied().unwrap_or(0);
-                if width > 64 {
-                    let prev_w = if s.alias_t0 != 0 && wide_alias_cur.contains_key(&id) {
-                        Some(Self::alias_t0_prev_wide(s.alias_t0, width))
-                    } else {
-                        wide_port_prev.get(&(id, scope)).map(|&v| v.clone())
-                    };
-                    let Some(prev_w) = prev_w else {
+                let scope = self
+                    .process_scope_hint
+                    .get(&w.pid)
+                    .map(|s| s.strip_prefix(top.as_str()).unwrap_or(s))
+                    .unwrap_or("");
+                for (k, s) in w.resolved_sensitivities.iter().enumerate() {
+                    if s.iff.is_some() || s.value_of.is_some() {
                         continue;
-                    };
-                    let cur_w = wide_alias_cur
-                        .get(&id)
-                        .copied()
-                        .or_else(|| wide_port_cur_by_id.get(&id).copied());
-                    if id < self.signal_table.len() && cur_w == Some(&self.signal_table[id]) {
-                        rearm_wide.push((wi, k, prev_w));
                     }
-                } else {
-                    let prev = if s.alias_t0 != 0 && narrow_alias_cur.contains_key(&id) {
-                        Some(Self::alias_t0_prev(s.alias_t0, width))
+                    let id = s.signal_id;
+                    let width = self.signal_widths.get(id).copied().unwrap_or(0);
+                    if width > 64 {
+                        let prev_w = if s.alias_t0 != 0 && wide_alias_cur.contains_key(&id) {
+                            Some(Self::alias_t0_prev_wide(s.alias_t0, width))
+                        } else {
+                            wide_port_prev.get(&(id, scope)).map(|&v| v.clone())
+                        };
+                        let Some(prev_w) = prev_w else {
+                            continue;
+                        };
+                        let cur_w = wide_alias_cur
+                            .get(&id)
+                            .copied()
+                            .or_else(|| wide_port_cur_by_id.get(&id).copied());
+                        if id < self.signal_table.len() && cur_w == Some(&self.signal_table[id]) {
+                            rearm_wide.push((wi, k, prev_w));
+                        }
                     } else {
-                        narrow_port_prev.get(&(id, scope)).copied()
-                    };
-                    let Some(prev) = prev else {
-                        continue;
-                    };
-                    let cur = narrow_alias_cur
-                        .get(&id)
-                        .copied()
-                        .or_else(|| narrow_port_cur_by_id.get(&id).copied());
-                    if cur == Some(self.term_raw_bits(id)) {
-                        rearm.push((wi, k, prev));
+                        let prev = if s.alias_t0 != 0 && narrow_alias_cur.contains_key(&id) {
+                            Some(Self::alias_t0_prev(s.alias_t0, width))
+                        } else {
+                            narrow_port_prev.get(&(id, scope)).copied()
+                        };
+                        let Some(prev) = prev else {
+                            continue;
+                        };
+                        let cur = narrow_alias_cur
+                            .get(&id)
+                            .copied()
+                            .or_else(|| narrow_port_cur_by_id.get(&id).copied());
+                        if cur == Some(self.term_raw_bits(id)) {
+                            rearm.push((wi, k, prev));
+                        }
                     }
                 }
             }
