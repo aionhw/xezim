@@ -2509,17 +2509,28 @@ impl Simulator {
             }
         }
         let cb = cb;
-        // Gate: fallback-free, at least one wait (else it belongs on the
-        // comb/edge paths), and no process-local frame reads (the FSM has
-        // no AST call frames).
+        // The FSM needs a wait and cannot read an AST process-local frame.
         // A system task from an inlined function body arrives wrapped in the
         // function's name for `%m` and carries its formals with it; it is
         // still only a system task.
-        let non_systask_fallback = cb.instructions.iter().any(|i| match i {
-            Insn::StmtFallback(payload) => Self::fallback_system_task(&payload.0).is_none(),
-            _ => false,
+        let mut delayed_nba = false;
+        let unsupported_fallback = cb.instructions.iter().any(|i| {
+            let Insn::StmtFallback(payload) = i else {
+                return false;
+            };
+            // A delayed NBA captures its operands and enqueues an update
+            // without suspending. Keep that operation on the AST scheduler
+            // path while compiling the surrounding process (§9.4.5).
+            if let StatementKind::NonblockingAssign { rvalue, .. } = &payload.0.kind
+                && Self::intra_delay_marker(rvalue).is_some()
+                && payload.2.is_empty()
+            {
+                delayed_nba = true;
+                return false;
+            }
+            Self::fallback_system_task(&payload.0).is_none()
         });
-        if non_systask_fallback
+        if unsupported_fallback
             || cb
                 .instructions
                 .iter()
@@ -2567,7 +2578,11 @@ impl Simulator {
             pid,
             Box::new(ProcFsm {
                 writes: Self::compiled_block_write_ids(&cb).map(Arc::from),
-                ts: self.lower_proc_fsm_ts(&cb),
+                ts: if delayed_nba {
+                    None
+                } else {
+                    self.lower_proc_fsm_ts(&cb)
+                },
                 compiled: cb,
                 waits,
                 wait_is_clocking,
