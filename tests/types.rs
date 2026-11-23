@@ -907,3 +907,6 @@ mod shortreal_storage_1463;
 mod nested_member_typedef_sign;
 #[path = "types/negative_packed_element_read.rs"]
 mod negative_packed_element_read;
+
+#[path = "types/nested_two_state_packed_member.rs"]
+mod nested_two_state_packed_member;
