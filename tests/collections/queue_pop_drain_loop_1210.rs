@@ -61,3 +61,38 @@ endmodule
         ]
     );
 }
+
+#[test]
+fn compiled_queue_pop_resolves_each_instance_queue() {
+    let sim = xezim::simulate(
+        r#"
+module worker(input bit clk);
+  int q[$];
+  int result[2];
+  always @(posedge clk) begin
+    q.push_back(7);
+    q.push_back(9);
+    for (int i = 0; i < 2; i++) result[i] = q.pop_front();
+  end
+endmodule
+module top;
+  bit clk;
+  int q[$];
+  worker w(clk);
+  initial begin
+    q.push_back(31);
+    #1 clk = 1;
+    #1 $display("RESULT %0d %0d %0d %0d", w.result[0], w.result[1], w.q.size(), q[0]);
+    $finish;
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate");
+    assert!(
+        sim.output
+            .iter()
+            .any(|line| line.message == "RESULT 7 9 0 31")
+    );
+}
