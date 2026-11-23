@@ -628,3 +628,6 @@ mod delayed_unpacked_array_drive;
 
 #[path = "scheduling/timed_star_and_time_zero.rs"]
 mod timed_star_and_time_zero;
+
+#[path = "scheduling/runtime_var_init_no_time0_event_1533.rs"]
+mod runtime_var_init_no_time0_event_1533;
