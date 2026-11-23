@@ -1348,6 +1348,13 @@ impl Simulator {
 
     /// Exact-signed membership test used by every `inside`/`dist` solve path.
     pub(super) fn value_in_ranges(&mut self, val: &Value, ranges: &[ConstraintRange]) -> bool {
+        if val.is_real {
+            let value = val.to_f64();
+            return ranges.iter().any(|range| {
+                self.eval_real_constraint_range(range)
+                    .is_some_and(|(lo, hi)| (lo..=hi).contains(&value))
+            });
+        }
         let (rs, items_ws) = self.cons_ranges_i128_typed(ranges, val.width, val.is_signed);
         let Some(raw) = val.to_u64() else {
             return false;
@@ -1389,6 +1396,52 @@ impl Simulator {
     ) -> Option<Value> {
         let choices = self.cons_ranges_for_target(ranges, width, signed);
         self.pick_i128_range(&choices, width, signed)
+    }
+
+    fn eval_real_constraint_range(&mut self, range: &ConstraintRange) -> Option<(f64, f64)> {
+        match range {
+            ConstraintRange::Value(expr) => {
+                let value = self.eval_expr(expr);
+                Self::real_span_bounds(&value, &value)
+            }
+            ConstraintRange::Range { lo, hi } => {
+                let lo = self.eval_expr(lo);
+                let hi = self.eval_expr(hi);
+                Self::real_span_bounds(&lo, &hi)
+            }
+        }
+    }
+
+    fn pick_constraint_range(&mut self, ranges: &[ConstraintRange], target: &Value) -> Option<Value> {
+        if !target.is_real {
+            return self.pick_from_ranges(ranges, target.width.max(1), target.is_signed);
+        }
+        let spans: Vec<_> = ranges
+            .iter()
+            .filter_map(|r| self.eval_real_constraint_range(r))
+            .collect();
+        if spans.is_empty() {
+            return None;
+        }
+        let (lo, hi) = spans[rand::Rng::gen_range(self.cur_rng(), 0..spans.len())];
+        Some(self.draw_real_span(lo, hi))
+    }
+
+    fn pick_weighted_constraint_range(
+        &mut self,
+        key: (usize, String),
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+        target: &Value,
+    ) -> Option<Value> {
+        if target.is_real {
+            return self.pick_real_dist_value(Some(key), ranges, weights);
+        }
+        let mut pick = self
+            .pick_dist_value(Some(key), ranges, weights)?
+            .resize(target.width.max(1));
+        pick.is_signed = target.is_signed;
+        Some(pick)
     }
 
     /// Uniformly pick a value from one of `choices` (an exact `[lo:hi]` list).
@@ -2866,8 +2919,7 @@ impl Simulator {
                         if self.value_in_ranges(&cur, &cr) {
                             return false;
                         }
-                        let width = cur.width.max(1);
-                        if let Some(picked) = self.pick_from_ranges(&cr, width, cur.is_signed) {
+                        if let Some(picked) = self.pick_constraint_range(&cr, &cur) {
                             return self.set_prop_if_changed(handle, &v, picked);
                         }
                     } else if let Some(t) = self.rand_agg_member_target(inner, rand_set) {
@@ -2880,8 +2932,7 @@ impl Simulator {
                         if self.value_in_ranges(&cur, &cr) {
                             return false;
                         }
-                        let width = cur.width.max(1);
-                        if let Some(picked) = self.pick_from_ranges(&cr, width, cur.is_signed) {
+                        if let Some(picked) = self.pick_constraint_range(&cr, &cur) {
                             return self.set_rand_member(&t, picked);
                         }
                     }
@@ -2913,7 +2964,6 @@ impl Simulator {
                         if self.dist_picked_once.contains(&key) {
                             return false;
                         }
-                        let width = cur.width.max(1);
                         // §18.5.4/§5.7.1: a dist item's value comes from an
                         // unsized decimal literal, which is SIGNED. Narrowed to
                         // the target's width that flipped an MSB-set value
@@ -2922,14 +2972,12 @@ impl Simulator {
                         // retried until a low value was drawn — so a `dist`
                         // never produced its upper values. The pick takes the
                         // TARGET's signedness, not the literal's.
-                        let signed = cur.is_signed;
-                        let picked = self
-                            .pick_dist_value(Some(key.clone()), range, dist_weights)
-                            .map(|p| {
-                                let mut p = p.resize(width);
-                                p.is_signed = signed;
-                                p
-                            });
+                        let picked = self.pick_weighted_constraint_range(
+                            key.clone(),
+                            range,
+                            dist_weights,
+                            &cur,
+                        );
                         if let Some(p) = picked {
                             self.dist_picked_once.insert(key);
                             self.note_dist_dealt(expr, range, &p);
@@ -2940,8 +2988,7 @@ impl Simulator {
                     if self.value_in_ranges(&cur, range) {
                         return false;
                     }
-                    let width = cur.width.max(1);
-                    let picked = self.pick_from_ranges(range, width, cur.is_signed);
+                    let picked = self.pick_constraint_range(range, &cur);
                     if let Some(p) = picked {
                         return self.set_prop_if_changed(handle, &v, p);
                     }
@@ -2954,19 +3001,17 @@ impl Simulator {
                     let Some(cur) = self.read_rand_member(&t) else {
                         return false;
                     };
-                    let width = cur.width.max(1);
                     if *is_dist && !dist_weights.is_empty() {
                         let key = (handle, Self::rand_member_key(expr));
                         if self.dist_picked_once.contains(&key) {
                             return false;
                         }
-                        let picked = self
-                            .pick_dist_value(Some(key.clone()), range, dist_weights)
-                            .map(|p| {
-                                let mut p = p.resize(width);
-                                p.is_signed = cur.is_signed;
-                                p
-                            });
+                        let picked = self.pick_weighted_constraint_range(
+                            key.clone(),
+                            range,
+                            dist_weights,
+                            &cur,
+                        );
                         if let Some(p) = picked {
                             self.dist_picked_once.insert(key);
                             self.note_dist_dealt(expr, range, &p);
@@ -2977,7 +3022,7 @@ impl Simulator {
                     if self.value_in_ranges(&cur, range) {
                         return false;
                     }
-                    if let Some(p) = self.pick_from_ranges(range, width, cur.is_signed) {
+                    if let Some(p) = self.pick_constraint_range(range, &cur) {
                         return self.set_rand_member(&t, p);
                     }
                 }

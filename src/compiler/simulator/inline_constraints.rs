@@ -12,6 +12,7 @@ pub(super) enum DistItem {
     One(Value),
     /// lo, hi, width
     Span(i64, i64, u32),
+    RealSpan(f64, f64),
 }
 
 /// A fully resolved `dist`: its items with masses, the mass vector, and the
@@ -25,6 +26,24 @@ pub(super) struct ResolvedDist {
 }
 
 impl Simulator {
+    pub(super) fn real_span_bounds(lo: &Value, hi: &Value) -> Option<(f64, f64)> {
+        if lo.has_xz() || hi.has_xz() {
+            return None;
+        }
+        let (lo, hi) = (lo.to_f64(), hi.to_f64());
+        (lo.is_finite() && hi.is_finite() && lo <= hi).then_some((lo, hi))
+    }
+
+    pub(super) fn draw_real_span(&mut self, lo: f64, hi: f64) -> Value {
+        use rand::Rng;
+        if lo == hi {
+            return Value::from_f64(lo);
+        }
+        // The difference can overflow for finite endpoints of opposite sign.
+        let u = self.cur_rng().r#gen::<f64>();
+        Value::from_f64((lo * (1.0 - u) + hi * u).clamp(lo, hi))
+    }
+
     pub(super) fn randomize_check_items(
         &mut self,
         handle: usize,
@@ -3690,6 +3709,16 @@ impl Simulator {
         self.pick_dist_draw(key, &g)
     }
 
+    pub(super) fn pick_real_dist_value(
+        &mut self,
+        key: Option<(usize, String)>,
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+    ) -> Option<Value> {
+        let geometry = self.resolve_dist_geometry_typed(ranges, weights, true)?;
+        self.pick_dist_draw(key, &geometry)
+    }
+
     /// Memoized twin of `pick_dist_value` for hot foreach fast paths where
     /// the scalar bounds/weights are loop-invariant. `item_ptr` identifies the
     /// constraint site; the resolved geometry is cached per solve (cleared at
@@ -3765,6 +3794,7 @@ impl Simulator {
                 };
                 Some(Value::from_u64(v as u64, bw))
             }
+            DistItem::RealSpan(lo, hi) => Some(self.draw_real_span(lo, hi)),
         }
     }
 
@@ -3776,6 +3806,15 @@ impl Simulator {
         &mut self,
         ranges: &[ConstraintRange],
         weights: &[Option<crate::ast::decl::DistWeight>],
+    ) -> Option<ResolvedDist> {
+        self.resolve_dist_geometry_typed(ranges, weights, false)
+    }
+
+    fn resolve_dist_geometry_typed(
+        &mut self,
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+        real_target: bool,
     ) -> Option<ResolvedDist> {
         use crate::ast::decl::DistWeight;
         // Fixed-point scaler: keeps `Total(w)` masses exact for small w.
@@ -3791,12 +3830,28 @@ impl Simulator {
             };
             match r {
                 ConstraintRange::Value(e) => {
-                    let v = self.eval_expr(e);
+                    let mut v = self.eval_expr(e);
+                    if real_target {
+                        if v.has_xz() || !v.to_f64().is_finite() {
+                            continue;
+                        }
+                        v = Value::from_f64(v.to_f64());
+                    }
                     items.push((DistItem::One(v), w as u128 * SCALER));
                 }
                 ConstraintRange::Range { lo, hi } => {
                     let lov = self.eval_expr(lo);
                     let hiv = self.eval_expr(hi);
+                    // §18.5.3: a real span has one weight for the entire
+                    // range, and the draw retains its fractional endpoints.
+                    if real_target || lov.is_real || hiv.is_real {
+                        if matches!(w_kind, Some(DistWeight::Total(_)))
+                            && let Some((lo, hi)) = Self::real_span_bounds(&lov, &hiv)
+                        {
+                            items.push((DistItem::RealSpan(lo, hi), w as u128 * SCALER));
+                        }
+                        continue;
+                    }
                     // An item must be as wide as its bounds: `[64'h1_0000_0000 :
                     // 64'h1_0000_00FF]` truncated to 32 bits and produced 0.
                     let bw = lov.width.max(hiv.width).max(32);
@@ -4001,6 +4056,12 @@ impl Simulator {
                 ExprKind::Range(lo, hi) => {
                     let lov = self.eval_expr(lo);
                     let hiv = self.eval_expr(hi);
+                    if target.is_real {
+                        if let Some((lo, hi)) = Self::real_span_bounds(&lov, &hiv) {
+                            candidates.push(self.draw_real_span(lo, hi));
+                        }
+                        continue;
+                    }
                     let l = lov.to_i64().unwrap_or(0);
                     let h = hiv.to_i64().unwrap_or(l);
                     if h >= l {
