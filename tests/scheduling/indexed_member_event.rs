@@ -87,3 +87,28 @@ endmodule"#,
     );
     assert_eq!(lines, ["DELTA 2"]);
 }
+
+/// Both edges in a combined event control must be observed (§9.4.2).
+#[test]
+fn indexed_class_property_and_signal_share_an_event_list() {
+    let lines = delta(
+        r#"
+module tb;
+  class C; int v; endclass
+  C first = new, second = new;
+  C ca[2] = '{first, second};
+  int idx, edges;
+  logic flag = 0;
+  always @(posedge ca[idx].v or posedge flag) edges++;
+  initial begin
+    #1 second.v = 1;
+    #1 idx = 1;
+    #1 first.v = 1;
+    #1 flag = 1;
+    #1 $display("DELTA %0d", edges);
+    $finish;
+  end
+endmodule"#,
+    );
+    assert_eq!(lines, ["DELTA 2"]);
+}
