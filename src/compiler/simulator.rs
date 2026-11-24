@@ -185,7 +185,8 @@ thread_local! {}
 // §7.10.2: module queue pops call the collection runtime directly.
 // Compiled collection return types, inherited packed typedef widths, and
 // constant-loop stores through packed members.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3181;
+// §20.8.1: fold wide operands of `$clog2` without truncating.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3182;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
@@ -563,7 +564,7 @@ macro_rules! write_sig {
 // Indexed packed-struct write regions and delayed unpacked-array drivers.
 // Timed implicit event controls retain their inferred sensitivity.
 // Continuous assignments lower nested packed concatenations as array elements.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB087";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB088";
 
 mod aggregate_assignments;
 mod pattern_array_items;
@@ -1533,6 +1534,7 @@ pub struct Simulator {
     /// SDF delay annotation (None if no SDF loaded).
     #[serde(skip)]
     pub sdf_annotation: Option<super::sdf::SdfAnnotation>,
+    preserve_sdf_wiring: bool,
     /// min/typ/max selection from the CLI (--sdf-min/typ/max or the
     /// +mindelays/+typdelays/+maxdelays plusargs). A runtime `$sdf_annotate`
     /// honors this; `None` means Typ (the CLI default).

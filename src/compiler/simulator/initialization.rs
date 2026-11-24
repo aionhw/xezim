@@ -1870,7 +1870,19 @@ impl Simulator {
         }
     }
 
-    pub fn new(mut module: ElaboratedModule, max_time: u64) -> Self {
+    pub fn new(module: ElaboratedModule, max_time: u64) -> Self {
+        Self::new_for_sdf(module, max_time, false)
+    }
+
+    pub(crate) fn new_for_sdf(mut module: ElaboratedModule, max_time: u64, cli_sdf: bool) -> Self {
+        // §32.4.4: wire delay belongs to the receiver terminal, which
+        // must keep its own id even when an identity port connects it.
+        let preserve_sdf_wiring = cli_sdf
+            || module
+                .source_texts
+                .iter()
+                .any(|s| s.contains("$sdf_annotate"));
+
         let _oom_scope = xezim_core::oom_trace::scope("construct simulator", "", &module.name, "");
         let phase_total = std::time::Instant::now();
         let checkpoint_requested =
@@ -4457,6 +4469,7 @@ impl Simulator {
             sdf_annotation: None,
             sdf_select: None,
             sdf_delays: Vec::new(),
+            preserve_sdf_wiring,
             delayed_updates: Vec::new(),
             delayed_slice_chains: false,
             delayed_nba: Vec::new(),

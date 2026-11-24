@@ -146,19 +146,7 @@ impl Simulator {
         }
         // Gate read masks assume no delays (`comb_entry_read_masks`).
         self.comb_dep_edges.clear();
-        let Some(ann) = self.sdf_annotation.take() else {
-            return;
-        };
-        let mut count = 0usize;
-        for (sig_name, &delay) in &ann.signal_delays {
-            if let Some(&id) = self.signal_name_to_id.get(sig_name.as_str()) {
-                self.sdf_delays[id] = delay;
-                self.drop_module_paths_of(id);
-                count += 1;
-            }
-        }
-        self.sdf_annotation = Some(ann);
-        eprintln!("[SDF] annotated {} signals with delays", count);
+        self.apply_sdf_path_delays();
         self.apply_sdf_timing_limits();
         for e in self.comb_entries.iter_mut() {
             if let CombItem::FastDirectCopy { dst_id, src_id } = e.item {
@@ -795,25 +783,44 @@ impl Simulator {
             "$writememb" | "$writememh" | "$writememd" => {
                 let _ = self.write_memory_file(args, name);
             }
-            // §20.16 `$sdf_annotate("file" [, instance])` — runtime SDF
-            // annotation routed through the SAME xezim_core::sdf machinery as
-            // the --sdf CLI flag, honoring the CLI-selected min/typ/max
-            // (--sdf-min/typ/max or +mindelays/+typdelays/+maxdelays; default
-            // Typ). The instance argument is approximated: annotation is
-            // applied globally (SDF cell INSTANCE paths are design-absolute
-            // in xezim's model). A missing/unparsable file is fatal, matching
-            // the CLI path's hard failure.
+            // §20.16 and §32.9: annotate relative to the requested instance.
             "$sdf_annotate" => {
                 let path = args
                     .first()
                     .map(|a| self.system_string_arg(a))
                     .unwrap_or_default();
-                if args.len() >= 2 {
-                    self.warn_system_task_once(
-                        "$sdf_annotate(instance)",
-                        "Note: $sdf_annotate instance argument is approximated — annotation applies globally",
-                    );
+                let mut scope = self.active_instance_scope();
+                if let Some(arg) = args.get(1)
+                    && let ExprKind::Ident(h) = &arg.kind
+                {
+                    let name = Self::resolve_hier_name_static(h, &self.module);
+                    let relative = self.instance_relative_scope(&name);
+                    let local = if scope.is_empty() {
+                        relative.clone()
+                    } else {
+                        format!("{scope}.{relative}")
+                    };
+                    if self.instance_by_path(&local).is_some() {
+                        scope = local;
+                    } else if name == self.module.name || self.instance_by_path(&relative).is_some()
+                    {
+                        scope = relative;
+                    } else {
+                        eprintln!("[SDF] annotation scope '{name}' was not found");
+                        return;
+                    }
                 }
+                let select = args
+                    .get(4)
+                    .map(|a| self.system_string_arg(a))
+                    .and_then(|s| match s.to_ascii_uppercase().as_str() {
+                        "MINIMUM" => Some(super::sdf::DelaySelect::Min),
+                        "TYPICAL" => Some(super::sdf::DelaySelect::Typ),
+                        "MAXIMUM" => Some(super::sdf::DelaySelect::Max),
+                        _ => None,
+                    })
+                    .or(self.sdf_select)
+                    .unwrap_or(super::sdf::DelaySelect::Typ);
                 match std::fs::read_to_string(&path) {
                     Err(e) => {
                         eprintln!(
@@ -831,11 +838,11 @@ impl Simulator {
                             self.abort_run();
                         }
                         Ok(sdf) => {
-                            let select = self.sdf_select.unwrap_or(super::sdf::DelaySelect::Typ);
-                            // Scaled to the simulation tick, as the CLI's --sdf.
-                            let ann = super::sdf::annotate_sdf(&sdf, self.tick_s, select);
-                            self.sdf_annotation = Some(ann);
-                            self.apply_sdf_annotation_late();
+                            if delay_mode() != 1 {
+                                self.sdf_annotation =
+                                    Some(self.resolve_sdf(sdf, select, Some(&scope)));
+                                self.apply_sdf_annotation_late();
+                            }
                         }
                     },
                 }

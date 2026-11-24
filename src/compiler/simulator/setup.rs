@@ -2415,7 +2415,13 @@ impl Simulator {
                 stmt: body,
             } = &ab.stmt.kind
             {
+                // §3.14.1: quantize an extracted clock at the declaring
+                // module's precision, including roots under the multi-top wrapper.
+                let saved_scope = self.timescale_scope_override.replace(ab.scope.clone());
+                let saved_hint = self.name_resolve_hint.replace(Some(ab.scope.clone()));
                 let delay_val = self.eval_delay_ticks(d);
+                self.timescale_scope_override = saved_scope;
+                self.name_resolve_hint.replace(saved_hint);
                 // A delay that reads a runtime variable (`#(half)` reconfigured
                 // at runtime — the PLL refclk/vco reprogramming pattern) must
                 // re-evaluate every toggle; never freeze it into a fixed

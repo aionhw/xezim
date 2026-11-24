@@ -3857,19 +3857,12 @@ impl Simulator {
                 Value::zero(n.max(1))
             }
             "$clog2" => {
-                let v = args
+                let log = args
                     .first()
-                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(0))
-                    .unwrap_or(0);
-                // §20.8.1: $clog2(0) and $clog2(1) are both 0.
-                Value::from_u64(
-                    if v <= 1 {
-                        0
-                    } else {
-                        64 - (v - 1).leading_zeros()
-                    } as u64,
-                    32,
-                )
+                    .map_or(0, |a| self.eval_expr(a).clog2_unsigned());
+                let mut result = Value::from_u64(u64::from(log), 32);
+                result.is_signed = true;
+                result
             }
             "$bits" => {
                 if let Some(arg) = args.first() {

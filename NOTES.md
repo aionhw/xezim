@@ -10,6 +10,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- SDF back-annotation matches individual specify paths, selects rise/fall
+  and transition values, and preserves separate interconnect delays. Scoped
+  annotations resolve relative paths, slash dividers, and wildcard instances
+  (§32, #1607–#1611, #1615).
+- Module path delays survive design-cache builds and apply to outputs driven
+  directly by sequential UDPs (§30.5, #1607, #1614).
+- `$clog2` reads the full operand in port bounds and at run time (§20.8.1,
+  #1606). UDP transitions accept binary wildcard endpoints (§29, #1612).
+- Extracted clocks use their own root's precision in multi-root designs, and
+  `timescale` expands text macros before reading its time unit and precision
+  (§3.14, §22.7, #1613, #1616).
+
 - Time-zero changes on collapsed nets and tied input ports reach their
   event and combinational readers (§10.3, §23.3.3, #1532).
 - Runtime SystemVerilog declaration initializers execute before time zero

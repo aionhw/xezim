@@ -55,7 +55,15 @@ impl Simulator {
         // those aliases so UDPs clocked through separate wrapper-port nets can
         // share one upstream event dispatch, as net/functor simulators do.
         let mut event_aliases: HashMap<BitRef, BitRef> = HashMap::default();
-        for entry in entries.iter() {
+        // A timing-enabled cell must sample at its own pin. Dispatching its
+        // UDP from an upstream copy can run before the path watch has seen
+        // the input edge, or before an annotated wire delay has elapsed.
+        let alias_entries = if self.sdf_delays.is_empty() && !self.preserve_sdf_wiring {
+            entries.as_slice()
+        } else {
+            &[]
+        };
+        for entry in alias_entries {
             match &entry.item {
                 CombItem::FastDirectCopy { dst_id, src_id }
                     if self.signal_widths.get(*dst_id) == Some(&1)
@@ -810,6 +818,19 @@ impl Simulator {
                 sel.set_bit_code(0, new_code);
                 self.schedule_delayed_slice(id, bit as u32, 1, &sel, delay);
             }
+        } else if self.time > 0 && self.sdf_delays.get(id).is_some_and(|&delay| delay > 0) {
+            // §30.4/§30.5: a UDP that directly drives a module output is
+            // subject to its specify (or back-annotated) path delay.
+            let mut value = self
+                .delayed_updates
+                .iter()
+                .find(|(_, sid, _, _)| *sid == id)
+                .map(|(_, _, v, _)| v)
+                .unwrap_or(&self.signal_table[id])
+                .clone();
+            if value.set_bit_code(bit, new_code) {
+                self.schedule_delayed(id, value);
+            }
         } else if is_seq {
             // A SEQUENTIAL UDP is a flip-flop/latch: its output must update with
             // non-blocking semantics so that other sequential UDPs sampling the
@@ -1005,7 +1026,8 @@ impl Simulator {
             }
         };
         let (pc, cc) = (lc(p), lc(c));
-        let ml = |s: char, a: char| s == '?' || s == a;
+        // Table 29-1: either endpoint may use b for a known binary level.
+        let ml = |s: char, a: char| s == '?' || s == a || (s == 'b' && a != 'x');
         match sym {
             UdpSym::Edge { from, to } => ml(*from, pc) && ml(*to, cc),
             UdpSym::EdgeShort('r') => pc == '0' && cc == '1',

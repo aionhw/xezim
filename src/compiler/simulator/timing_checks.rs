@@ -549,6 +549,15 @@ impl Simulator {
         }
     }
 
+    pub(super) fn timing_watch_transition(&self, w: usize, sig: usize) -> u16 {
+        let watch = &self.timing_watches[w];
+        let old = watch.wide.as_ref().map_or_else(
+            || level(watch.prev_v, watch.prev_x, 0),
+            |value| value.get_bit_code(0).min(2),
+        );
+        timing_edge_bit(old, self.signal_table[sig].get_bit_code(0).min(2))
+    }
+
     /// VPI `vpiTchk` objects: the number of timing checks.
     pub(super) fn vpi_tchk_count(&self) -> usize {
         self.timing_checks.len()
@@ -791,16 +800,6 @@ impl Simulator {
             self.timing_watches[w].prev_v = cv;
             self.timing_watches[w].prev_x = cx;
         }
-        for k in 0..self.timing_watches[w].path_srcs.len() {
-            let slot = self.timing_watches[w].path_srcs[k];
-            let now = self.time;
-            if let Some(mp) = self.module_paths.as_mut() {
-                mp.stamp(slot, now);
-            }
-        }
-        if self.time == 0 {
-            return;
-        }
         let bit_levels = |sim: &Self, b: u32| -> (u8, u8) {
             match &old_wide {
                 Some(old) => (
@@ -811,6 +810,16 @@ impl Simulator {
             }
         };
         let (from, to) = bit_levels(self, 0);
+        for k in 0..self.timing_watches[w].path_srcs.len() {
+            let slot = self.timing_watches[w].path_srcs[k];
+            let now = self.time;
+            if let Some(mp) = self.module_paths.as_mut() {
+                mp.stamp(slot, now, timing_edge_bit(from, to));
+            }
+        }
+        if self.time == 0 {
+            return;
+        }
         if from != to {
             let t = (from * 3 + to) as usize;
             for k in 0..self.timing_watches[w].by_tr[t].len() {

@@ -4418,6 +4418,7 @@ impl Simulator {
             }
         }
         let buf_collapse_on = !matches!(std::env::var("XEZIM_BUF_COLLAPSE").as_deref(), Ok("0"))
+            && !self.preserve_sdf_wiring
             && self.sdf_delays.is_empty()
             && self.module.dpi_imports.is_empty()
             && configured_vpi_libs().is_empty()
@@ -4561,7 +4562,8 @@ impl Simulator {
         let mut port_links: Vec<(usize, usize)> = Vec::new();
         for (lhs_name, rhs_name) in &port_candidates {
             let (child, parent): (&str, &str) = (lhs_name, rhs_name);
-            if self.module.sampled_input_ports.contains(child)
+            if self.preserve_sdf_wiring
+                || self.module.sampled_input_ports.contains(child)
                 || self.module.port_aliases.get(child).map(|s| s.as_str()) != Some(parent)
                 || ca_driver_counts.get(child).copied().unwrap_or(0) != 1
                 || self.module.events.contains(child)
@@ -4695,6 +4697,9 @@ impl Simulator {
                     }
                     let (ln, rn) = (flat_name(lh, &self.module), flat_name(rh, &self.module));
                     if self.module.sampled_input_ports.contains(ln.as_ref())
+                        // Cached designs materialize assigns before this pass.
+                        // Keep storage for each specify destination (§30.5).
+                        || self.module.specify_delays.contains_key(ln.as_ref())
                         || alias_members.contains(ln.as_ref())
                         || alias_members.contains(rn.as_ref())
                     {

@@ -1256,35 +1256,15 @@ impl Simulator {
             // Gate read masks assume no delays (`comb_entry_read_masks`).
             self.comb_dep_edges.clear();
         }
-        // Signals whose delay came from SDF back-annotation. SDF is
-        // authoritative: it REPLACES the specify path delay (SDF standard, and
-        // it keeps this CLI path consistent with the runtime `$sdf_annotate`
-        // path, which clobbers). Without this set a specify delay could `.max()`
-        // upward over a smaller annotated value — the two paths would disagree.
-        let mut sdf_annotated: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        if let Some(ref ann) = self.sdf_annotation {
-            let mut count = 0;
-            for (sig_name, &delay) in &ann.signal_delays {
-                if let Some(&id) = self.signal_name_to_id.get(sig_name.as_str()) {
-                    self.sdf_delays[id] = apply_delay_mode(delay);
-                    sdf_annotated.insert(id);
-                    count += 1;
-                }
-            }
-            eprintln!("[SDF] annotated {} signals with delays", count);
-        }
         if use_specify {
             for (sig_name, &delay) in &self.module.specify_delays {
                 if let Some(&id) = self.signal_name_to_id.get(sig_name.as_str()) {
-                    if sdf_annotated.contains(&id) {
-                        continue; // SDF back-annotation overrides the specify delay
-                    }
                     self.sdf_delays[id] = self.sdf_delays[id].max(apply_delay_mode(delay));
                 }
             }
-            // The per-transition, per-condition choice between them.
-            self.build_module_paths(&sdf_annotated, apply_delay_mode);
+            self.build_module_paths(apply_delay_mode);
         }
+        self.apply_sdf_path_delays();
         // §28.11 gate fall delays: resolve names to ids once. Honours the same
         // delay-mode overrides as the rise delay (`+delay_mode_zero` etc.), so
         // a zero-delay GLS run stays zero-delay on both edges.

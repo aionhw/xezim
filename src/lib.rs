@@ -1646,7 +1646,7 @@ fn simulate_multi_inner(
         elab
     };
 
-    let mut sim = compiler::Simulator::new(elab, max_time);
+    let mut sim = compiler::Simulator::new_for_sdf(elab, max_time, sdf_file.is_some());
     rss_trace("simulator constructed");
     if let Some((config, key)) = cache.as_ref().zip(cache_key.as_deref()) {
         sim.set_prepared_comb_cache_path(Some(config.directory.join(format!("{}.xezcomb", key))));
@@ -1682,7 +1682,7 @@ fn simulate_multi_inner(
         let select = sdf_select.unwrap_or(xezim_core::sdf::DelaySelect::Typ);
         // SDF values scale to the simulation tick (the finest precision in
         // the design), like every other delay.
-        let annotation = xezim_core::sdf::annotate_sdf(&sdf, sim.tick_s, select);
+        let annotation = sim.resolve_sdf(sdf, select, None);
         sim.sdf_annotation = Some(annotation);
     }
     sim.compile();

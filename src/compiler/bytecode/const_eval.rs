@@ -67,8 +67,8 @@ impl<'a> BytecodeCompiler<'a> {
             // §20.8.1: as the interpreter computes it, a 32-bit result, signed
             // as `system_function_result` types it (`$clog2(1) - 1 < 0`).
             ExprKind::SystemCall { name, args } if name == "$clog2" && args.len() == 1 => {
-                let v = self.clog2_const_operand(&args[0])?;
-                let mut r = Value::from_u64(u64::from(clog2_u64(v)), 32);
+                let log = self.fold_clog2(&args[0])?;
+                let mut r = Value::from_u64(u64::from(log), 32);
                 r.is_signed = true;
                 r
             }
@@ -181,24 +181,23 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // §20.8.1: `$clog2` of a constant is a constant (`a[$clog2(N)-1:3]`).
             ExprKind::SystemCall { name, args } if name == "$clog2" && args.len() == 1 => {
-                Some(i64::from(clog2_u64(self.clog2_const_operand(&args[0])?)))
+                Some(i64::from(self.fold_clog2(&args[0])?))
             }
             _ => self.eval_const_expr(e).map(|v| v as i64),
         }
     }
 
     /// §20.8.1: the operand of a `$clog2` that folds, as the unsigned value
-    /// the interpreter's `$clog2` reads: a literal at its full value up to 64
-    /// bits (`64'h1_0000_0000`, which `eval_const_expr` would narrow to 32), a
-    /// parameter, or an unrolled loop's index, optionally in parentheses.
+    /// the interpreter's `$clog2` reads: a full-width literal, a parameter,
+    /// or an unrolled loop's index, optionally in parentheses.
     /// An operator expression is self-determined (§11.6.1: `8'hff + 8'h01` is
     /// 0, `64'd1 << 33` keeps bit 33), which neither `eval_const_bound`
     /// (64-bit integers) nor `eval_const_expr` (32 bits) models, so it keeps
     /// the interpreter's call. So does a frame local that hides a parameter
-    /// (§23.9), and an x/z or wider than 64-bit value.
-    fn clog2_const_operand(&self, e: &Expression) -> Option<u64> {
+    /// (§23.9), and an x/z value.
+    fn fold_clog2(&self, e: &Expression) -> Option<u32> {
         let v = match &e.kind {
-            ExprKind::Paren(inner) => return self.clog2_const_operand(inner),
+            ExprKind::Paren(inner) => return self.fold_clog2(inner),
             ExprKind::Number(n) => self.eval_number_static(n)?,
             ExprKind::Ident(h)
                 if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
@@ -206,7 +205,7 @@ impl<'a> BytecodeCompiler<'a> {
                 let name = h.path[0].name.name.as_str();
                 // A `foreach` index is an `int` (§12.7.3).
                 if let Some(&k) = self.const_var_binds.get(name) {
-                    return Some(u64::from(k as u32));
+                    return Some(Value::from_u64(u64::from(k as u32), 32).clog2_unsigned());
                 }
                 match self.local_const_vars.get(name) {
                     Some(v) => v.clone(),
@@ -216,10 +215,10 @@ impl<'a> BytecodeCompiler<'a> {
             }
             _ => return None,
         };
-        if v.has_xz() || v.is_real || v.width > 64 {
+        if v.has_xz() || v.is_real {
             return None;
         }
-        v.to_u64()
+        Some(v.clog2_unsigned())
     }
 
     pub(super) fn eval_const_expr(&self, e: &Expression) -> Option<u32> {

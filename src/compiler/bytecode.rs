@@ -2260,13 +2260,3 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
         None
     }
 }
-
-/// §20.8.1: the ceiling of the base-2 logarithm, with `$clog2(0)` and
-/// `$clog2(1)` both 0 (the interpreter's `$clog2`).
-fn clog2_u64(v: u64) -> u32 {
-    if v <= 1 {
-        0
-    } else {
-        64 - (v - 1).leading_zeros()
-    }
-}

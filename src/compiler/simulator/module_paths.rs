@@ -20,9 +20,8 @@
 //! run, so an input whose value still differs from its watch's last-seen
 //! value counts as changing now.
 //!
-//! Not modelled: the edge of an edge-sensitive path (the path applies on
-//! any change of its input) and PATHPULSE$ limits — the reference simulator
-//! also rejects every pulse narrower than the path delay by default.
+//! PATHPULSE$ limits are unmodeled. The default inertial behavior rejects
+//! pulses narrower than the path delay.
 use super::*;
 
 /// The design's module paths, resolved to signal ids.
@@ -51,6 +50,8 @@ struct PathRt {
     /// Indices into `ModulePaths::srcs`.
     srcs: Vec<u32>,
     cond: Option<Arc<Expression>>,
+    cond_text: Option<String>,
+    edge: Option<String>,
     ifnone: bool,
 }
 
@@ -61,6 +62,7 @@ struct PathSrc {
     sig: usize,
     watch: usize,
     last: u64,
+    transition: u16,
 }
 
 impl ModulePaths {
@@ -73,8 +75,10 @@ impl ModulePaths {
     }
 
     /// Input `slot` changed at `now`.
-    pub(super) fn stamp(&mut self, slot: u32, now: u64) {
-        self.srcs[slot as usize].last = now;
+    pub(super) fn stamp(&mut self, slot: u32, now: u64, transition: u16) {
+        let src = &mut self.srcs[slot as usize];
+        src.last = now;
+        src.transition = transition;
     }
 
     /// VPI `vpiModPath` objects: every path-delayed net with the number of
@@ -134,15 +138,55 @@ fn path_enable_expr(cond: Expression) -> Arc<Expression> {
     ))
 }
 
+fn normalize_sdf_condition(expr: &str) -> String {
+    let term: String = expr.chars().filter(|c| !c.is_whitespace()).collect();
+    term.replace("1'b", "")
+        .replace("1'B", "")
+        .trim_matches(['(', ')'])
+        .to_owned()
+}
+
+fn annotate_path_delays(current: [u64; 12], arc: &crate::compiler::sdf::PinDelay) -> [u64; 12] {
+    let values = &arc.values;
+    let get = |i: usize| values.get(i).copied().flatten();
+    let min = |a: Option<i64>, b: Option<i64>| Some(a?.min(b?));
+    let max = |a: Option<i64>, b: Option<i64>| Some(a?.max(b?));
+    let (a, b, c, d, e, f) = match values.len() {
+        1 => (get(0), get(0), get(0), get(0), get(0), get(0)),
+        2 => (get(0), get(1), get(0), get(0), get(1), get(1)),
+        3 => (get(0), get(1), get(2), get(0), get(2), get(1)),
+        _ => (get(0), get(1), get(2), get(3), get(4), get(5)),
+    };
+    let patch = if values.len() == 12 {
+        std::array::from_fn(get)
+    } else {
+        [
+            a,
+            b,
+            c,
+            d,
+            e,
+            f,
+            min(a, c),
+            max(a, d),
+            min(b, e),
+            max(b, f),
+            max(c, e),
+            min(d, f),
+        ]
+    };
+    std::array::from_fn(|i| {
+        apply_delay_mode(match patch[i] {
+            None => current[i],
+            Some(d) if arc.increment => current[i].saturating_add_signed(d),
+            Some(d) => d.max(0) as u64,
+        })
+    })
+}
+
 impl Simulator {
-    /// Resolve `ElaboratedModule::module_paths` to signal ids. Nets whose
-    /// delay SDF back-annotated keep the SDF value (it replaces the path
-    /// delays), so they get no path table.
-    pub(super) fn build_module_paths(
-        &mut self,
-        skip: &std::collections::HashSet<usize>,
-        map_delay: impl Fn(u64) -> u64,
-    ) {
+    /// Resolve specify module paths to their runtime nets and watches.
+    pub(super) fn build_module_paths(&mut self, map_delay: impl Fn(u64) -> u64) {
         let paths = std::mem::take(&mut self.module.module_paths);
         let mut names: Vec<&String> = paths.keys().collect();
         names.sort();
@@ -159,9 +203,6 @@ impl Simulator {
             let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
                 continue;
             };
-            if skip.contains(&id) {
-                continue;
-            }
             let mut rts = Vec::new();
             for p in &paths[name] {
                 let mut srcs = Vec::new();
@@ -178,6 +219,7 @@ impl Simulator {
                                 sig,
                                 watch,
                                 last: 0,
+                                transition: 0,
                             });
                             src_of.insert(sig, k as usize);
                             k
@@ -189,6 +231,8 @@ impl Simulator {
                     delays: p.delays.map(&map_delay),
                     srcs,
                     cond: p.cond.clone().map(path_enable_expr),
+                    cond_text: p.cond_text.clone(),
+                    edge: p.edge.clone(),
                     ifnone: p.ifnone,
                 });
             }
@@ -200,27 +244,208 @@ impl Simulator {
         }
     }
 
-    /// Runtime SDF back-annotation replaces the path delays of the nets it
-    /// annotates.
-    pub(super) fn drop_module_paths_of(&mut self, id: usize) {
-        if let Some(mp) = self.module_paths.as_mut() {
-            mp.dst.remove(&id);
+    /// Resolve SDF cell paths below the annotation scope (§32.9).
+    pub(crate) fn resolve_sdf(
+        &self,
+        mut sdf: crate::compiler::sdf::SdfFile,
+        select: crate::compiler::sdf::DelaySelect,
+        scope: Option<&str>,
+    ) -> crate::compiler::sdf::SdfAnnotation {
+        let base = scope
+            .map(|s| self.instance_relative_scope(s))
+            .unwrap_or_else(|| {
+                if self.root_is_multi_top() && self.instance_by_path(&sdf.design).is_some() {
+                    sdf.design.clone()
+                } else {
+                    String::new()
+                }
+            });
+        let prefix = if base.is_empty() {
+            String::new()
+        } else {
+            format!("{base}.")
+        };
+        let mut unmatched = 0;
+        sdf.cells = sdf
+            .cells
+            .into_iter()
+            .flat_map(|mut cell| {
+                if cell.instance == "*" {
+                    let paths: Vec<_> = self
+                        .module
+                        .instances
+                        .iter()
+                        .filter(|i| i.def_name == cell.cell_type && i.path.starts_with(&prefix))
+                        .map(|i| i.path.as_str())
+                        .chain(
+                            self.instance_by_path(&base)
+                                .map_or(
+                                    base.is_empty() && self.module.name == cell.cell_type,
+                                    |i| i.def_name == cell.cell_type,
+                                )
+                                .then_some(base.as_str()),
+                        )
+                        .collect();
+                    unmatched += usize::from(paths.is_empty());
+                    paths
+                        .into_iter()
+                        .map(|path| {
+                            let mut entry = cell.clone();
+                            entry.instance = path.to_owned();
+                            entry
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    let path = if cell.instance.is_empty() {
+                        base.clone()
+                    } else if scope.is_none()
+                        && self.root_is_multi_top()
+                        && self.instance_by_path(&cell.instance).is_some()
+                    {
+                        cell.instance.clone()
+                    } else {
+                        format!("{prefix}{}", self.instance_relative_scope(&cell.instance))
+                    };
+                    let matches = if path.is_empty() {
+                        cell.cell_type == self.module.name
+                    } else {
+                        self.instance_by_path(&path)
+                            .is_some_and(|inst| inst.def_name == cell.cell_type)
+                    };
+                    if matches {
+                        cell.instance = path;
+                        vec![cell]
+                    } else {
+                        unmatched += 1;
+                        Vec::new()
+                    }
+                }
+            })
+            .collect();
+        if unmatched != 0 {
+            eprintln!("[SDF] {unmatched} CELL entries matched no instance");
+        }
+        crate::compiler::sdf::annotate_sdf(&sdf, self.tick_s, select)
+    }
+
+    /// Apply annotations to individual specify arcs. A missing selected value
+    /// leaves that transition alone. Increment entries add to the current path
+    /// delay so successive annotation calls compose in file order.
+    pub(super) fn apply_sdf_path_delays(&mut self) {
+        let Some(ann) = &self.sdf_annotation else {
+            return;
+        };
+        let mut matched = 0;
+        let mut unmatched = 0;
+        for (name, arcs) in &ann.pin_delays {
+            let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
+                unmatched += arcs.len();
+                continue;
+            };
+            if let Some(mp) = &mut self.module_paths
+                && let Some(table) = mp.table_of(id)
+            {
+                for arc in arcs {
+                    let src = self.signal_name_to_id.get(arc.input.port.as_str()).copied();
+                    let mut hit = false;
+                    for path in &mut mp.tables[table] {
+                        if src.is_none_or(|src| {
+                            !path.srcs.iter().any(|&i| mp.srcs[i as usize].sig == src)
+                        }) || arc
+                            .input
+                            .edge
+                            .as_deref()
+                            .is_some_and(|e| path.edge.as_deref() != Some(e))
+                            || path.ifnone != arc.ifnone
+                            || arc.input.cond.as_ref().is_some_and(|c| {
+                                path.cond_text.as_ref().is_none_or(|p| {
+                                    normalize_sdf_condition(c) != normalize_sdf_condition(p)
+                                })
+                            })
+                        {
+                            continue;
+                        }
+                        hit = true;
+                        path.delays = annotate_path_delays(path.delays, arc);
+                    }
+                    unmatched += usize::from(!hit);
+                }
+                self.sdf_delays[id] = mp.tables[table]
+                    .iter()
+                    .flat_map(|p| p.delays)
+                    .max()
+                    .unwrap_or(0);
+            } else {
+                // Xezim also accepts annotations on designs with no specify
+                // paths. Retain that destination-level compatibility path.
+                for arc in arcs {
+                    self.sdf_delays[id] = annotate_path_delays([self.sdf_delays[id]; 12], arc)
+                        .into_iter()
+                        .max()
+                        .unwrap_or(0);
+                }
+            }
+            matched += 1;
+        }
+        for (name, arcs) in &ann.interconnect_delays {
+            let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
+                unmatched += arcs.len();
+                continue;
+            };
+            for arc in arcs {
+                let src = self.signal_name_to_id.get(arc.input.port.as_str());
+                if src.is_none() || src == Some(&id) {
+                    unmatched += 1;
+                    continue;
+                }
+                let delays = annotate_path_delays([self.sdf_delays[id]; 12], arc);
+                self.sdf_delays[id] = delays.into_iter().max().unwrap_or(0);
+                self.gate_fall_delay_by_id.insert(id, delays[1]);
+            }
+            matched += 1;
+        }
+        eprintln!("[SDF] annotated {matched} signals with delays");
+        if unmatched != 0 {
+            eprintln!("[SDF] {unmatched} delay entries matched no path");
         }
     }
 
-    /// When the path's inputs last changed.
-    fn path_input_time(&self, mp: &ModulePaths, srcs: &[u32]) -> u64 {
-        srcs.iter()
-            .map(|&s| {
+    /// When the path's inputs last changed on a qualifying edge.
+    fn path_input_time(&self, mp: &ModulePaths, path: &PathRt) -> Option<u64> {
+        use crate::ast::decl::{TIMING_NEGEDGE, TIMING_POSEDGE};
+        let mask = match path.edge.as_deref() {
+            Some("posedge") => TIMING_POSEDGE,
+            Some("negedge") => TIMING_NEGEDGE,
+            Some("edge") => TIMING_POSEDGE | TIMING_NEGEDGE,
+            _ => {
+                return Some(
+                    path.srcs
+                        .iter()
+                        .map(|&s| {
+                            let src = &mp.srcs[s as usize];
+                            if self.timing_watch_stale(src.watch, src.sig) {
+                                self.time
+                            } else {
+                                src.last
+                            }
+                        })
+                        .max()
+                        .unwrap_or(0),
+                );
+            }
+        };
+        path.srcs
+            .iter()
+            .filter_map(|&s| {
                 let src = &mp.srcs[s as usize];
-                if self.timing_watch_stale(src.watch, src.sig) {
-                    self.time
+                let (at, transition) = if self.timing_watch_stale(src.watch, src.sig) {
+                    (self.time, self.timing_watch_transition(src.watch, src.sig))
                 } else {
-                    src.last
-                }
+                    (src.last, src.transition)
+                };
+                (mask & transition != 0).then_some(at)
             })
             .max()
-            .unwrap_or(0)
     }
 
     /// The per-transition delays that apply to the next change of the net
@@ -252,18 +477,16 @@ impl Simulator {
                 });
             }
         }
-        let times: Vec<u64> = (0..n)
+        let times: Vec<Option<u64>> = (0..n)
             .map(|i| {
-                if enabled[i] {
-                    self.path_input_time(mp, &paths[i].srcs)
-                } else {
-                    0
-                }
+                enabled[i]
+                    .then(|| self.path_input_time(mp, &paths[i]))
+                    .flatten()
             })
             .collect();
-        let latest = (0..n).filter(|&i| enabled[i]).map(|i| times[i]).max()?;
+        let latest = times.iter().copied().flatten().max()?;
         let mut out = [u64::MAX; 12];
-        for i in (0..n).filter(|&i| enabled[i] && times[i] == latest) {
+        for i in (0..n).filter(|&i| times[i] == Some(latest)) {
             for (o, d) in out.iter_mut().zip(paths[i].delays) {
                 *o = (*o).min(d);
             }
