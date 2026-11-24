@@ -442,13 +442,16 @@ impl Simulator {
                     self.formal_type_default(&port.data_type, width.max(1))
                 };
                 // §13.4.2: all invocations of a static function share the
-                // formal. The sync frame stores it back on return.
-                if static_fn {
+                // formal, including writes made before a recursive call.
+                if static_fn && !self.is_virtual_iface_type(&port.data_type) {
                     let (func, name) = (&fd.name.name.name, &port.name.name);
                     let key = match self.subroutine_decl_scope(func, fd.span, false) {
                         Some(pkg) => format!("{pkg}::{func}::{name}"),
                         None => format!("{func}::{name}"),
                     };
+                    self.static_local_first[name.as_bytes()[0] as usize] = true;
+                    self.static_local_names.insert(name.clone());
+                    self.static_local_keys.insert(key.clone());
                     let value = self
                         .static_local_vars
                         .entry(key.clone())
@@ -847,6 +850,7 @@ impl Simulator {
         let saved_m_scope_fn = std::mem::replace(&mut self.m_scope_stack, m_fn_entry);
         // §6.21: open a static-local sync frame keyed by this subroutine name.
         let sync_name = self.sync_frame_name(&fd.name.name.name);
+        let has_live_outputs = !static_outputs.is_empty();
         self.static_local_syncs.push((sync_name, static_outputs));
         // class-perf free-function tier: a package/module-scope function may
         // run as bytecode exactly like a class method. `this` is null here
@@ -857,7 +861,8 @@ impl Simulator {
         // degrades to the free-function rules. A compiled body hands its
         // result over as `return_value` and the epilogue below runs
         // unchanged, exactly as after an interpreted `return`.
-        let compiled = if compiled_methods_enabled() {
+        // Register-backed formals cannot expose writes during a recursive call.
+        let compiled = if !has_live_outputs && compiled_methods_enabled() {
             self.try_run_compiled_free_function(fd, pkg_scope.as_deref())
         } else {
             None
@@ -908,6 +913,13 @@ impl Simulator {
         if let Some(removed) = self.string_signals_removed.pop() {
             for n in removed {
                 self.string_signals.insert(n);
+            }
+        }
+        for (name, _) in output_bindings.iter().chain(&default_output_bindings) {
+            if self.static_local_names.contains(name)
+                && let Some(key) = self.static_local_key_for(name)
+            {
+                self.static_cell_sync(name, &key, false);
             }
         }
         self.sync_static_locals();

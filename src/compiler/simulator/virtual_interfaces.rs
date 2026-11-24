@@ -3861,6 +3861,9 @@ impl Simulator {
     /// segment names a modport of the interface instance the preceding
     /// prefix resolves to.
     fn modport_strip_chain(&self, e: &Expression) -> Option<Expression> {
+        if let Some(member) = self.indexed_modport_member(e) {
+            return Some(member);
+        }
         // Only a pure `.name` chain (or a flat multi-segment ident) has a
         // well-defined dotted spelling to strip; selects, calls and indices
         // keep their shape and stay with the machinery that owns them. An

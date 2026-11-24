@@ -47,6 +47,20 @@ impl Simulator {
     }
 
     pub(super) fn constant_selected_storage(&self, expr: &Expression) -> Option<String> {
+        self.selected_path_storage(expr, false)
+    }
+
+    /// §25.5: normalize an indexed interface instance's modport member
+    /// before building the dependency of a port connection (#1602 H09).
+    pub(super) fn indexed_modport_member(&self, expr: &Expression) -> Option<Expression> {
+        if self.modport_names.is_empty() || !Self::select_entered_member_shape(expr) {
+            return None;
+        }
+        let name = self.selected_path_storage(expr, true)?;
+        Some(Self::flat_name_ident(name, expr.span))
+    }
+
+    fn selected_path_storage(&self, expr: &Expression, modport: bool) -> Option<String> {
         fn append(
             e: &Expression,
             module: &ElaboratedModule,
@@ -99,6 +113,17 @@ impl Simulator {
         }
         let rooted = path.strip_prefix("$root.");
         let name = rooted.unwrap_or(&path);
+        if modport {
+            let name = name
+                .strip_prefix(&self.module.name)
+                .and_then(|tail| tail.strip_prefix('.'))
+                .unwrap_or(name);
+            let stored = self.strip_modport_segments(name)?;
+            return self
+                .signal_name_to_id
+                .contains_key(&stored)
+                .then_some(stored);
+        }
         let stored = if rooted.is_none() && self.signal_name_to_id.contains_key(name) {
             name
         } else {
@@ -936,6 +961,9 @@ impl Simulator {
             // SELECT (`tb.gl[0].u.sig`). See `fold_indexed_hier_path`.
             if let Some(folded) = self.fold_indexed_hier_path(&ca.lhs) {
                 ca.lhs = folded;
+            }
+            if let Some(folded) = self.indexed_modport_member(&ca.rhs) {
+                ca.rhs = folded;
             }
             let explicit_delay = ca.delay;
             // Captured before `ca.lhs` may be moved into the CombItem below.

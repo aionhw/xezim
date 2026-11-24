@@ -1840,19 +1840,6 @@ impl Simulator {
         // its elements left to right with the other side's (#867).
         if matches!(rvalue.kind, ExprKind::RangeSelect { .. })
             && let Some(dst) = self.expr_assoc_name(lvalue).or_else(|| self.pending_coll_dst(lvalue))
-            && (self.module.dynamic_arrays.contains(&dst) || self.class_queue_prop(&dst))
-            && let Some((values, _)) = self.collection_slice_values(rvalue)
-        {
-            self.set_queue_size(&dst, values.len() as u64);
-            for (index, value) in values.into_iter().enumerate() {
-                let value = self.fit_queue_push_elem(&dst, value);
-                self.set_signal_value_by_name(&Self::name_with_index(&dst, index as i64), value);
-            }
-            self.settle_after_proc_write();
-            return;
-        }
-        if matches!(rvalue.kind, ExprKind::RangeSelect { .. })
-            && let Some(dst) = self.expr_assoc_name(lvalue).or_else(|| self.pending_coll_dst(lvalue))
         {
             let dst_is_dyn =
                 self.module.dynamic_arrays.contains(&dst) || self.class_queue_prop(&dst);
@@ -1860,8 +1847,25 @@ impl Simulator {
                 .then(|| self.module.arrays.get(&dst).copied())
                 .flatten();
             if (dst_is_dyn || (dst_fixed.is_some() && self.queue_elem_struct(&dst).is_some()))
-                && let Some((src, idx, su)) = self.collection_struct_slice(rvalue)
+                && let Some((src, idx, width)) = self.collection_slice_indices(rvalue)
+                && let src_struct = self.queue_elem_struct(&src)
+                && (dst_is_dyn || src_struct.is_some())
             {
+                // Resolve the source and evaluate its bounds once, before
+                // choosing scalar or member-wise copying.
+                let Some(su) = src_struct else {
+                    let values = self.collection_values_at(&src, &idx, width);
+                    self.set_queue_size(&dst, values.len() as u64);
+                    for (position, value) in values.into_iter().enumerate() {
+                        let value = self.fit_queue_push_elem(&dst, value);
+                        self.set_signal_value_by_name(
+                            &Self::name_with_index(&dst, position as i64),
+                            value,
+                        );
+                    }
+                    self.settle_after_proc_write();
+                    return;
+                };
                 let (copy_src, staged) = if dst == src {
                     let saved = self.pending_ret_collection.take();
                     self.snapshot_ret_structs(&src, &idx, &su);

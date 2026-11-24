@@ -188,7 +188,8 @@ thread_local! {}
 // §20.8.1: fold wide operands of `$clog2` without truncating.
 // §7.4.6, §11.5.1, §20.6.2: bound packed stores and size declarations from locals.
 // §6.11.2: compile 2-state and mixed constant packed member stores with DropXz.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3184;
+// Scoped package calls can now lower to compiled function calls (#1623).
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3185;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near

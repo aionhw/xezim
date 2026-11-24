@@ -3023,24 +3023,15 @@ impl Simulator {
         if self.queue_elem_struct(&name).is_some() {
             return None;
         }
-        let vals = idx
-            .into_iter()
-            .map(|i| {
-                self.get_signal_value_by_name(&Self::name_with_index(&name, i))
-                    .or_else(|| self.coll_missing_elem_value(&name))
-                    .unwrap_or_else(|| Value::zero(w))
-            })
-            .collect();
-        Some((vals, w))
+        Some((self.collection_values_at(&name, &idx, w), w))
     }
 
-    pub(super) fn collection_struct_slice(
-        &mut self,
-        arg: &Expression,
-    ) -> Option<(String, Vec<i64>, crate::ast::types::StructUnionType)> {
-        let (name, idx, _) = self.collection_slice_indices(arg)?;
-        let su = self.queue_elem_struct(&name)?;
-        Some((name, idx, su))
+    pub(super) fn collection_values_at(&self, name: &str, indices: &[i64], width: u32) -> Vec<Value> {
+        indices.iter().map(|&i| {
+            self.get_signal_value_by_name(&Self::name_with_index(name, i))
+                .or_else(|| self.coll_missing_elem_value(name))
+                .unwrap_or_else(|| Value::zero(width))
+        }).collect()
     }
 
     /// §13.5.2: stage a queue FORMAL's contents under a fresh temporary

@@ -19,8 +19,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 - Ambiguous wildcard imports name their candidate packages and the scope.
   Procedurally assigned untyped ANSI output ports explain their implicit net
   kind (§26.3, §23.2.2.3, #1542, #1543).
-- `cg.option.<name>` reads an option that the covergroup sets from a
-  constructor argument as its value, not `x` (§19.7, #1617).
+- Covergroup options set from constructor arguments preserve their values,
+  including string names and comments (§19.7, #1617).
+- Bound inputs connected through an indexed interface modport follow signal
+  changes in the source interface (§23.11, §25.5, #1602).
+- Recursive calls to a static function share its output formal storage
+  (§13.4.2, PR #1621).
+- Collection slices evaluate their bounds once when assigned or returned
+  (§7.4.6, PR #1624).
 - Compiled packed stores ignore out-of-range indices and clip part-selects to
   their own dimension (§7.4.6, §11.5.1, #1534).
 - Packed declarations can use `$bits` of an earlier local. Parameter overrides

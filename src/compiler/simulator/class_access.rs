@@ -331,14 +331,26 @@ impl Simulator {
         });
         if let Some(e) = body {
             let scope = Self::cg_bin_scope(inst);
-            if !scope.is_empty()
-                && let Some(n) = self.cg_const_i64(&e, &scope)
-            {
-                let mut v = Value::from_u64(n as u64, 32);
-                v.is_signed = true;
-                return Some(v);
+            if scope.is_empty() {
+                return Some(self.eval_expr(&e));
             }
-            return Some(self.eval_expr(&e));
+            let frame = scope.iter().cloned().collect();
+            let owner = inst.owner;
+            let scope_hint = inst
+                .cg_name
+                .rsplit_once('.')
+                .filter(|_| !inst.cg_name.contains("::"))
+                .map(|(scope, _)| scope.to_string());
+            let saved_hint = scope_hint.map(|scope| self.name_resolve_hint.replace(Some(scope)));
+            self.push_local_frame(frame);
+            self.this_stack.push(owner);
+            let value = self.eval_expr(&e);
+            self.this_stack.pop();
+            self.pop_local_frame();
+            if let Some(saved_hint) = saved_hint {
+                self.name_resolve_hint.replace(saved_hint);
+            }
+            return Some(value);
         }
         let n = match field {
             "weight" | "at_least" => 1,
