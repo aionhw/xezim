@@ -4,6 +4,40 @@
 
 use xezim::simulate;
 
+/// §7.10.1 and §11.3.2: resolve the slice bounds once before copying
+/// either scalar elements or unpacked struct members.
+#[test]
+fn collection_slice_bounds_are_evaluated_once() {
+    let out = line(
+        r#"
+module top;
+  typedef struct { int x; } item_t;
+  typedef int ints_t[$];
+  item_t q[$], dst[$];
+  int ints[$], copy[$], calls;
+  function automatic int lo(); calls++; return calls-1; endfunction
+  function automatic ints_t tail(); return ints[lo():$]; endfunction
+  initial begin
+    q = '{'{1}, '{2}, '{3}};
+    dst = q[lo():$];
+    $display("STRUCT calls=%0d size=%0d first=%0d", calls, dst.size(), dst[0].x);
+    calls = 0;
+    ints = {4, 5, 6};
+    copy = tail();
+    $display("SCALAR calls=%0d size=%0d first=%0d", calls, copy.size(), copy[0]);
+  end
+endmodule
+"#,
+    );
+    assert_eq!(
+        out,
+        [
+            "STRUCT calls=1 size=3 first=1",
+            "SCALAR calls=1 size=3 first=4"
+        ]
+    );
+}
+
 fn line(src: &str) -> Vec<String> {
     simulate(src, 100)
         .expect("sim")

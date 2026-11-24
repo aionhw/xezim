@@ -38,6 +38,42 @@ fn check(source: &str, expected: &[&str]) {
     assert_eq!(lines, expected);
 }
 
+/// §23.11 and §25.5: a bound input follows a sibling's indexed modport.
+#[test]
+fn bound_port_reads_a_siblings_indexed_modport() {
+    check(
+        r#"
+interface bus;
+  logic valid;
+  modport source(output valid);
+endinterface
+module monitor;
+  bus b[1:0]();
+  initial begin
+    b[0].valid = 1'b0;
+    b[1].valid = 1'b0;
+    #1 b[0].valid = 1'b1;
+    #2 b[0].valid = 1'b0;
+  end
+endmodule
+module sink(input logic valid);
+  initial begin
+    #2 $display("T|first %b", valid);
+    #2 $display("T|second %b", valid);
+  end
+endmodule
+module host; endmodule
+bind top.h monitor u_mon();
+bind top.h sink u_sink(.valid(u_mon.b[0].source.valid));
+module top;
+  host h();
+  initial #5 $finish;
+endmodule
+"#,
+        &["T|first 1", "T|second 0"],
+    );
+}
+
 #[test]
 fn bind_defparam() {
     check(

@@ -140,3 +140,26 @@ endmodule
     assert_line(&l, "lit 90 par 3");
     assert_line(&l, "set 9");
 }
+
+/// §19.7: string-valued options retain the constructor argument's type.
+#[test]
+fn string_option_from_constructor_preserves_its_full_value() {
+    let output = lines(
+        r#"
+module top;
+  bit b;
+  covergroup cg(string label_text);
+    option.name = label_text;
+    option.comment = {label_text, " comment"};
+    coverpoint b;
+  endgroup
+  cg c = new("long option name");
+  initial $display("NAME=%s COMMENT=%s", c.option.name, c.option.comment);
+endmodule
+"#,
+    );
+    assert_line(
+        &output,
+        "NAME=long option name COMMENT=long option name comment",
+    );
+}

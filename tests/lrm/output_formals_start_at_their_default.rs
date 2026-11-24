@@ -4,6 +4,34 @@
 
 use xezim::simulate;
 
+/// §13.4.2: overlapping invocations observe the same static output cell.
+#[test]
+fn recursive_static_function_shares_its_output_during_the_call() {
+    assert_eq!(
+        lines(
+            r#"
+module top;
+  int outer_value, inner_value, seen;
+  function static void f(input bit inner, output int value);
+    if (inner) begin
+      seen = value;
+      value = 9;
+    end else begin
+      value = 7;
+      f(1, inner_value);
+    end
+  endfunction
+  initial begin
+    f(0, outer_value);
+    $display("seen=%0d outer=%0d inner=%0d", seen, outer_value, inner_value);
+  end
+endmodule
+"#
+        ),
+        ["seen=7 outer=9 inner=9"]
+    );
+}
+
 fn lines(src: &str) -> Vec<String> {
     let sim = simulate(src, 1000).expect("simulate failed");
     sim.output.iter().map(|o| o.message.clone()).collect()
