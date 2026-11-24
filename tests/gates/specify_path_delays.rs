@@ -24,7 +24,7 @@ fn run(case: &str, src: &str, side: &[(&str, &str)], args: &[&str]) -> String {
     }
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .current_dir(&dir)
-        .arg("--no-cache")
+        .args((!args.contains(&"--cache-dir")).then_some("--no-cache"))
         .args(args)
         .arg("t.sv")
         .output()
@@ -758,4 +758,145 @@ fn sdf_iopath_replaces_scaled_path_delays() {
     let cli_tb = SDF_TB.replace("    $sdf_annotate(\"d.sdf\", t);\n", "");
     let out = run("sdf_cli", &cli_tb, &[("d.sdf", SDF)], &["--sdf", "d.sdf"]);
     check("--sdf", &out, &want);
+}
+
+/// §30.5 (#1614): building or loading a prepared cache must not collapse a
+/// timed identity cell onto its input.
+#[test]
+fn identity_paths_keep_every_delay_through_the_design_cache() {
+    let src = r#"`timescale 1ps/1ps
+module link(input a, output y);
+  assign y = a;
+  specify (a => y) = 5; endspecify
+endmodule
+module tb;
+  reg a;
+  wire n, y;
+  link u0(a,n), u1(n,y);
+  initial begin a = 0; #100 a = 1; #100 $finish; end
+  always @(posedge y) $display("%0d ps y=%b", $time, y);
+endmodule
+"#;
+    for _ in 0..2 {
+        let out = run("cache_identity_paths", src, &[], &["--cache-dir", "cache"]);
+        check("cached path chain", &out, &["110 y=1"]);
+    }
+}
+
+/// §32.4.4, §32.9 (#1608, #1611): a scoped annotation can use a slash
+/// divider, and a wire delay applies at the receiver rather than the driver.
+#[test]
+fn scoped_sdf_keeps_interconnect_after_the_driving_path() {
+    let src = r#"`timescale 1ps/1ps
+module link(input a, output y);
+  assign y = a;
+  specify (a => y) = 1; endspecify
+endmodule
+module sub(input a, output n, y);
+  link u0(a,n), u1(n,y);
+endmodule
+module tb;
+  reg a;
+  wire n, y;
+  sub u(a,n,y);
+  initial begin $sdf_annotate("d.sdf", tb.u); a=0; #100 a=1; #100 $finish; end
+  always @(posedge n) $display("%0d ps n=%b", $time, n);
+  always @(posedge y) $display("%0d ps y=%b", $time, y);
+endmodule
+"#;
+    let sdf = r#"(DELAYFILE (DIVIDER /) (TIMESCALE 1ps)
+      (CELL (CELLTYPE "sub") (INSTANCE)
+        (DELAY (ABSOLUTE (INTERCONNECT u0/y u1/a (8)))))
+      (CELL (CELLTYPE "link") (INSTANCE *)
+        (DELAY (ABSOLUTE (IOPATH a y (20))))))"#;
+    let out = run("scoped_sdf_interconnect", src, &[("d.sdf", sdf)], &[]);
+    check(
+        "scoped IOPATH and INTERCONNECT",
+        &out,
+        &["120 n=1", "148 y=1"],
+    );
+}
+
+/// §32.4.1, §32.5, §32.8 (#1609, #1610, #1615): identity of the
+/// path and all transition values survive back-annotation.
+#[test]
+fn sdf_delays_select_the_conditional_arc_and_transition() {
+    let src = r#"`timescale 1ps/1ps
+module gate2(input a,b, output y);
+  and (y,a,b);
+  specify
+    if (b) (a => y) = (2,3);
+    (b => y) = (5,6);
+  endspecify
+endmodule
+module tb;
+  reg a,b;
+  wire y;
+  gate2 u(a,b,y);
+  initial begin
+    $sdf_annotate("d.sdf", tb, , , "MAXIMUM");
+    a=0; b=1;
+    #100 a=1; #100 a=0; #100 a=1; #100 b=0; #100 $finish;
+  end
+  always @(y) if ($time > 20) $display("%0d ps y=%b", $time, y);
+endmodule
+"#;
+    let sdf = r#"(DELAYFILE (TIMESCALE 1ps)
+      (CELL (CELLTYPE "gate2") (INSTANCE u)
+        (DELAY (ABSOLUTE
+          (COND b (IOPATH a y (1::11) (2::12) (3::13)))
+          (IOPATH b y (1:2:) (1:2:)))
+        (INCREMENT (COND b (IOPATH a y (2) (3)))))))"#;
+    let out = run("sdf_path_values", src, &[("d.sdf", sdf)], &[]);
+    check(
+        "conditional IOPATH",
+        &out,
+        &["113 y=1", "215 y=0", "313 y=1", "406 y=0"],
+    );
+}
+
+/// §30.4 (#1607): a UDP that directly drives a module output has the
+/// same path delay as an output driven through a buffer.
+#[test]
+fn sequential_udp_output_uses_the_annotated_clock_path() {
+    let src = r#"`timescale 1ps/1ps
+primitive ff(q,d,clk);
+  output q; reg q;
+  input d,clk;
+  table
+    0 (01) : ? : 0;
+    1 (01) : ? : 1;
+    ? (1?) : ? : -;
+    ? (?0) : ? : -;
+    * ? : ? : -;
+  endtable
+endprimitive
+module flop(input d,clk, output q);
+  ff u(q,d,clk);
+  specify (posedge clk => (q +: d)) = (2,3); endspecify
+endmodule
+module tb;
+  reg d,clk;
+  wire q;
+  flop u(d,clk,q);
+  initial begin
+    $sdf_annotate("d.sdf");
+    clk=0; d=0; #50 clk=1; #10 clk=0; #10 d=1;
+    #30 clk=1; #50 clk=0; #10 d=0; #40 clk=1; #100 $finish;
+  end
+  always @(q) if ($time >= 90) $display("%0d ps q=%b", $time, q);
+endmodule
+"#;
+    let sdf = r#"(DELAYFILE (TIMESCALE 1ps)
+      (CELL (CELLTYPE "flop") (INSTANCE u)
+        (DELAY (ABSOLUTE (IOPATH (posedge clk) q (20) (24))))))"#;
+    let out = run(
+        "udp_specify",
+        &src.replace("    $sdf_annotate(\"d.sdf\");", ""),
+        &[],
+        &[],
+    );
+    check("UDP specify delay", &out, &["102 q=1", "203 q=0"]);
+    let out = run("udp_sdf", src, &[("d.sdf", sdf)], &[]);
+    check("UDP annotated delay", &out, &["120 q=1", "224 q=0"]);
 }

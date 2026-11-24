@@ -53,3 +53,36 @@ fn c29_udps() {
         &[],
     );
 }
+
+/// Table 29-1 (#1612): a binary-wildcard edge matches both known values
+/// as an endpoint, including with an unnamed UDP instance.
+#[test]
+fn binary_wildcards_in_parenthesized_udp_edges() {
+    let sim = xezim::simulate(
+        r#"
+primitive ff(q, clk);
+  output q; reg q;
+  input clk;
+  table
+    (01) : ? : 1;
+    (bx) : ? : 0;
+    (xB) : ? : 1;
+    (bb) : ? : -;
+  endtable
+endprimitive
+module tb;
+  reg clk;
+  wire q;
+  ff (q,clk);
+  initial begin
+    clk=0; #10 clk=1; #10 clk=1'bx; #5 $display("edge bx=%b",q);
+    #5 clk=0; #5 $display("edge xb=%b",q);
+  end
+endmodule
+"#,
+        100,
+    )
+    .unwrap();
+    let out: Vec<_> = sim.output.iter().map(|l| l.message.as_str()).collect();
+    assert_eq!(out, ["edge bx=0", "edge xb=1"]);
+}

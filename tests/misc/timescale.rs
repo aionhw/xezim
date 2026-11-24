@@ -311,3 +311,25 @@ module inherits_it; initial $printtimescale; endmodule
         o
     );
 }
+
+/// §22.5.1, §22.7 (#1616): expand the entire directive before parsing it.
+#[test]
+fn timescale_directive_expands_nested_macros() {
+    let sim = xezim::simulate(
+        r#"
+`define UNIT 1ps
+`define PREC 1fs
+`define SCALE `UNIT/`PREC
+`timescale `SCALE
+module tb;
+  initial begin
+    #1.5;
+    $display("realtime=%0.3f time=%0d", $realtime, $time);
+  end
+endmodule
+"#,
+        100,
+    )
+    .unwrap();
+    assert_eq!(sim.output[0].message, "realtime=1.500 time=2");
+}

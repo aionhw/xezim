@@ -207,3 +207,26 @@ endmodule
         &["pmd: q0=0000567b q1=00123456 i0=0000567b i1=00123456"],
     );
 }
+
+/// §20.8.1 (#1606): both the operand width and any high set bits survive.
+#[test]
+fn clog2_wide_operands_in_port_bounds_and_runtime() {
+    assert_has(
+        r#"
+module leaf #(parameter bit [63:0] WIDTH = 128)
+    (input logic [$clog2({1'b0, WIDTH}+1)-1:0] sel);
+  initial $display("port width=%0d", $bits(sel));
+endmodule
+module tb;
+  localparam logic [128:0] HIGH = 129'd1 << 117;
+  logic [128:0] a;
+  leaf u (8'd0);
+  initial begin
+    a = HIGH + 1;
+    $display("logs=%0d,%0d,%0d", $clog2(HIGH), $clog2(a), $clog2(a - 1));
+  end
+endmodule
+"#,
+        &["port width=8", "logs=117,118,117"],
+    );
+}

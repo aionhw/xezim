@@ -78,3 +78,22 @@ endmodule",
         assert!(msgs.iter().any(|m| m == want), "missing {want}: {msgs:?}");
     }
 }
+
+/// §3.14, §9.4.1 (#1613): an extracted clock uses its own root's precision.
+#[test]
+fn delay_headed_clock_uses_its_root_precision_in_a_multi_root_design() {
+    let out = messages(
+        r#"
+`timescale 1ps/1ps
+module a;
+  reg clk = 0;
+  always #500 clk = !clk;
+  always @(posedge clk) $display("clock %0d", $time);
+  initial #3000 $finish;
+endmodule
+`timescale 1ns/1ns
+module another_root; endmodule
+"#,
+    );
+    assert_eq!(out, ["clock 500", "clock 1500", "clock 2500"]);
+}
