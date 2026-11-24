@@ -19,6 +19,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 - Ambiguous wildcard imports name their candidate packages and the scope.
   Procedurally assigned untyped ANSI output ports explain their implicit net
   kind (§26.3, §23.2.2.3, #1542, #1543).
+- `cg.option.<name>` reads an option that the covergroup sets from a
+  constructor argument as its value, not `x` (§19.7, #1617).
 - Compiled packed stores ignore out-of-range indices and clip part-selects to
   their own dimension (§7.4.6, §11.5.1, #1534).
 - Packed declarations can use `$bits` of an earlier local. Parameter overrides
