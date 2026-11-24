@@ -3301,6 +3301,9 @@ impl Simulator {
                         let cached = self.forever_sens_cache.get(&key).cloned();
                         let (resolved, is_clk_ev) = match cached {
                             Some(c) => c,
+                            None if self.event_needs_indexed_class_waiter(event) => {
+                                (Vec::new(), false)
+                            }
                             None => {
                                 let sens = if is_star {
                                     self.star_sens_from_body(tbody)

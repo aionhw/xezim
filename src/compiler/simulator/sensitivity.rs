@@ -3285,6 +3285,21 @@ impl Simulator {
             .is_some_and(|class| self.module.classes.contains_key(&class))
     }
 
+    /// §9.4.2: a signal-only waiter cannot follow a selected handle's property.
+    pub(super) fn event_needs_indexed_class_waiter(&self, event: &EventControl) -> bool {
+        if self.module.classes.is_empty() {
+            return false;
+        }
+        let selected = |expr: &Expression| {
+            Self::event_expr_needs_value_wait(expr) && self.event_member_of_class_handle(expr)
+        };
+        match event {
+            EventControl::EventExpr(terms) => terms.iter().any(|term| selected(&term.expr)),
+            EventControl::HierIdentifier(expr) => selected(expr),
+            _ => false,
+        }
+    }
+
     pub(super) fn event_expr_needs_value_wait(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Index { .. } | ExprKind::RangeSelect { .. } => true,

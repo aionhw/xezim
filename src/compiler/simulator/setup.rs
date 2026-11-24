@@ -1857,14 +1857,7 @@ impl Simulator {
             if !ab.scope.is_empty() {
                 *self.name_resolve_hint.borrow_mut() = Some(ab.scope.clone());
             }
-            let selected = |expr: &Expression| {
-                Self::event_expr_needs_value_wait(expr) && self.event_member_of_class_handle(expr)
-            };
-            let found = match event {
-                EventControl::EventExpr(terms) => terms.iter().any(|term| selected(&term.expr)),
-                EventControl::HierIdentifier(expr) => selected(expr),
-                _ => false,
-            };
+            let found = self.event_needs_indexed_class_waiter(event);
             *self.name_resolve_hint.borrow_mut() = saved_hint;
             found
         } else {
@@ -2661,6 +2654,19 @@ impl Simulator {
             .into_iter()
             .map(|ev| (ev, None, None))
             .collect();
+        if !self.module.classes.is_empty() && !waits.is_empty() {
+            let saved_hint = self.name_resolve_hint.borrow().clone();
+            if !scope.is_empty() {
+                *self.name_resolve_hint.borrow_mut() = Some(scope.to_string());
+            }
+            let needs_class_waiter = waits
+                .iter()
+                .any(|(event, _, _)| self.event_needs_indexed_class_waiter(event));
+            *self.name_resolve_hint.borrow_mut() = saved_hint;
+            if needs_class_waiter {
+                return false;
+            }
+        }
         let wait_is_clocking: Vec<bool> = if self.clocking_meta.is_empty() {
             vec![false; waits.len()]
         } else {
