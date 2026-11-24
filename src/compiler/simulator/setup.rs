@@ -1771,17 +1771,46 @@ impl Simulator {
         }
     }
 
+    fn early_event_head<'a>(&self, mut stmt: &'a Statement) -> Option<&'a EventControl> {
+        loop {
+            match &stmt.kind {
+                StatementKind::SeqBlock { stmts, .. } => {
+                    let (first, rest) = stmts.split_first()?;
+                    if rest.iter().any(|s| self.stmt_needs_process_context(s, 0)) {
+                        return None;
+                    }
+                    stmt = first;
+                }
+                StatementKind::TimingControl {
+                    control: TimingControl::Event(event),
+                    stmt: body,
+                } if !self.stmt_needs_process_context(body, 0)
+                    && !matches!(event, EventControl::EventExpr(terms) if terms.iter().any(|t| t.iff.is_some())) =>
+                {
+                    return Some(event);
+                }
+                _ => return None,
+            }
+        }
+    }
+
     pub(super) fn classify_one_always_block(
         &mut self,
         ab: AlwaysBlock,
         lazy: Option<LazyAlways>,
     ) -> Option<AlwaysBlock> {
-        // §4.4.2, §9.2.2: arm simple waits before procedural startup
-        // writes. A wait with an iff guard keeps its source-order start,
-        // matching the guarded direct-write case in #550.
+        // §4.4.2, §9.2.2: arm simple event heads before startup writes.
+        // Guarded events and bodies that perform another wait keep their
+        // source-order starts.
         let event_head = ab.kind == AlwaysKind::Always
-            && Self::leading_event(&ab.stmt).is_some_and(|event| {
-                !matches!(event, EventControl::EventExpr(terms) if terms.iter().any(|term| term.iff.is_some()))
+            && self.early_event_head(&ab.stmt).is_some_and(|event| {
+                let saved = self.name_resolve_hint.borrow().clone();
+                if !ab.scope.is_empty() {
+                    *self.name_resolve_hint.borrow_mut() = Some(ab.scope.clone());
+                }
+                let clocking = self.is_clocking_event(event);
+                *self.name_resolve_hint.borrow_mut() = saved;
+                !clocking
             });
         let first_pid = self.next_pid;
         let remaining = self.classify_always_block(ab, lazy);

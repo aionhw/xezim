@@ -10,6 +10,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Time-zero changes on collapsed nets and tied input ports reach their
+  event and combinational readers (§10.3, §23.3.3, #1532).
+- Runtime SystemVerilog declaration initializers execute before time zero
+  (§6.8, #1533).
+
 - Nested braces in unpacked array concatenations contribute one packed or
   string element. Outer array and queue operands still contribute their
   elements (§10.10.3, #1544).
@@ -46,6 +51,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   read or write the connected interface's array (§25.9, §7.6, #1311).
 
 **Performance**
+
+- Edge fanouts use compact entries and event waiters allocate wide-value
+  storage only when needed.
 
 - Delay loops with a delayed nonblocking assignment compile their surrounding
   code and retain the assignment's scheduling semantics (§9.4.5, #1327).

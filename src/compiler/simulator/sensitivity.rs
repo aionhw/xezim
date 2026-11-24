@@ -2990,7 +2990,7 @@ impl Simulator {
             (!sc.is_empty()).then_some(sc)
         });
         // §9.2.2.2: `@*` sensitivity excludes called-function CONTENTS.
-        SKIP_FN_BODY_READS.with(|c| c.set(true));
+        let skip = SKIP_FN_BODY_READS.with(|c| c.replace(true));
         NBA_SEEN.with(|c| c.set(false));
         let whole = Self::collect_stmt_reads_whole(body, &self.module, &mut reads, &mut writes);
         let body_suspends = self.stmt_is_blocking(body)
@@ -3007,7 +3007,7 @@ impl Simulator {
             whole,
             body_suspends,
         );
-        SKIP_FN_BODY_READS.with(|c| c.set(false));
+        SKIP_FN_BODY_READS.with(|c| c.set(skip));
         let mut out: Vec<Sensitivity> = Vec::new();
         let mut seen: HashSet<String> = HashSet::default();
         for r in reads.iter() {
