@@ -13,12 +13,14 @@ class C;
 endclass
 module tb;
   int rows[][];
+  int cube[][][];
   queue_t queues[$];
   C obj;
   initial begin
     obj = new();
     obj.fill();
     rows = '{'{4, 5}, '{6}};
+    cube = '{'{'{1, 2}, '{3}}, '{'{4}}};
     queues = '{ {1}, queue_t'{2, 3, 4}, {5, 6} };
     $display("class %0d %0d %0d %0d %0d %0d",
              obj.rows.size(), obj.rows[0].size(), obj.rows[1].size(),
@@ -26,6 +28,8 @@ module tb;
     $display("module %0d %0d %0d %0d %0d %0d",
              rows.size(), rows[0].size(), rows[1].size(),
              rows[0][0], rows[0][1], rows[1][0]);
+    $display("cube %0d %0d %0d %0d",
+             cube.size(), cube[0].size(), cube[0][0].size(), cube[0][0][1]);
     $display("queue %0d %0d %0d %0d %0d %0d %0d",
              queues.size(), queues[0].size(), queues[1].size(),
              queues[2].size(), queues[1][0], queues[1][2], queues[2][1]);
@@ -44,6 +48,7 @@ endmodule"#,
         [
             "class 2 2 1 1 2 3",
             "module 2 2 1 4 5 6",
+            "cube 2 2 2 2",
             "queue 3 1 3 2 2 4 6"
         ]
     );
