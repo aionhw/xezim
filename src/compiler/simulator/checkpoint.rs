@@ -190,12 +190,12 @@ fn rewrite_markers(list: &mut Arc<[Statement]>) {
         return;
     };
     for st in stmts.iter_mut() {
-        if let StatementKind::ForeachTail { body, .. } = &mut st.kind
-            && matches!(body.kind, StatementKind::Null)
+        if let StatementKind::ForeachTail(ft) = &mut st.kind
+            && matches!(ft.body.kind, StatementKind::Null)
         {
-            let old = decode_foreach_body_id(body.span);
+            let old = decode_foreach_body_id(ft.body.span);
             match with(|s| s.remap.get(&old).copied()) {
-                Some(new) => body.span = encode_foreach_body_id(new),
+                Some(new) => ft.body.span = encode_foreach_body_id(new),
                 None => with(|s| s.unresolved += 1),
             }
         }
@@ -1014,6 +1014,12 @@ impl Simulator {
         self.reopen_files(file.files)?;
         self.unresolved_force_count = self.active_force_exprs.iter()
             .filter(|entry| entry.has_unresolved_reads).count();
+        if !self.active_force_exprs.is_empty()
+            && self.active_force_signal_epochs.len() < self.signal_table.len()
+        {
+            self.active_force_signal_epochs
+                .resize(self.signal_table.len(), 0);
+        }
         // §10.6.2: the writers index is built from the restored entry table.
         self.comb_writer_index = None;
         // Caches keyed by an address in the run that wrote the checkpoint.

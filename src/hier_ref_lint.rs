@@ -817,10 +817,10 @@ impl Walker {
                 self.expr(count);
                 self.stmt(body);
             }
+            StatementKind::ForeachTail(ft) => self.stmt(&ft.body),
             StatementKind::Forever { body }
             | StatementKind::ForeverTail { body }
-            | StatementKind::RsAction { body }
-            | StatementKind::ForeachTail { body, .. } => self.stmt(body),
+            | StatementKind::RsAction { body } => self.stmt(body),
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                 self.block(HashSet::new(), |w| stmts.iter().for_each(|x| w.stmt(x)));
             }

@@ -2116,6 +2116,9 @@ impl Simulator {
         mark_compile_phase("schedule initial blocks", &mut compile_phase_start);
         self.init_value_trace();
         self.rebuild_signal_commit_plans();
+        // `scope_parents_by_leaf` is only consulted while compiling comb/process
+        // sensitivity; release the full-namespace index once compilation ends.
+        self.scope_parents_by_leaf = HashMap::default();
         self.compiled = true;
     }
 

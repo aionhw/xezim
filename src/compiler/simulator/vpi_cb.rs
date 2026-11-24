@@ -1292,7 +1292,7 @@ impl Simulator {
             StatementKind::Null
                 | StatementKind::ScopePop
                 | StatementKind::LoopStep
-                | StatementKind::ForeachTail { .. }
+                | StatementKind::ForeachTail(_)
                 | StatementKind::ForeverTail { .. }
         ) {
             return;

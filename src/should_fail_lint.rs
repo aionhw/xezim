@@ -6140,8 +6140,8 @@ impl<'a> UndeclaredTypeFinder<'a> {
                 }
                 self.stmt(body);
             }
+            StatementKind::ForeachTail(ft) => self.stmt(&ft.body),
             StatementKind::Foreach { body, .. }
-            | StatementKind::ForeachTail { body, .. }
             | StatementKind::While { body, .. }
             | StatementKind::DoWhile { body, .. }
             | StatementKind::Repeat { body, .. }

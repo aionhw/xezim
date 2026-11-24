@@ -396,12 +396,12 @@ pub(super) mod edgesel_writers {
                     proc_cont_targets(&it.stmt, out);
                 }
             }
+            StatementKind::ForeachTail(ft) => proc_cont_targets(&ft.body, out),
             StatementKind::For { body, .. }
             | StatementKind::Foreach { body, .. }
             | StatementKind::While { body, .. }
             | StatementKind::DoWhile { body, .. }
             | StatementKind::Repeat { body, .. }
-            | StatementKind::ForeachTail { body, .. }
             | StatementKind::Forever { body }
             | StatementKind::ForeverTail { body }
             | StatementKind::RsAction { body } => proc_cont_targets(body, out),

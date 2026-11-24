@@ -250,8 +250,8 @@ impl Simulator {
                             self.return_flag = false;
                         }
                     }
-                    StatementKind::ForeachTail { fe_auto_len, .. } => {
-                        self.auto_loop_vars.truncate(*fe_auto_len);
+                    StatementKind::ForeachTail(ft) => {
+                        self.auto_loop_vars.truncate(ft.fe_auto_len);
                     }
                     _ => {}
                 }
@@ -331,7 +331,7 @@ impl Simulator {
                 let is_flag_consumer = matches!(
                     &stmt.kind,
                     StatementKind::ScopePop
-                        | StatementKind::ForeachTail { .. }
+                        | StatementKind::ForeachTail(_)
                         | StatementKind::ForeverTail { .. }
                 ) || (pc.loop_tail_at == Some(pc.start + i)
                     && matches!(
@@ -2529,18 +2529,18 @@ impl Simulator {
                 // next iteration (or exit) of a blocking-body `foreach`.
                 // §9.4.3: a process blocked inside the loop body resumes HERE,
                 // at the next iteration, not by restarting the whole foreach.
-                if let StatementKind::ForeachTail {
-                    loop_var,
-                    var_scope,
-                    body,
-                    keys,
-                    is_str,
-                    key_type,
-                    idx,
-                    fe_auto_len,
-                    live_size_name,
-                } = &stmt.kind
-                {
+                if let StatementKind::ForeachTail(ft) = &stmt.kind {
+                    let crate::ast::stmt::ForeachTailData {
+                        loop_var,
+                        var_scope,
+                        body,
+                        keys,
+                        is_str,
+                        key_type,
+                        idx,
+                        fe_auto_len,
+                        live_size_name,
+                    } = ft.as_ref();
                     // A `return` from an inlined task body propagates to the
                     // task's ScopePop (handled by the top-of-loop return_flag
                     // skip). Just exit this foreach without consuming flags.
@@ -2622,17 +2622,19 @@ impl Simulator {
                         .unwrap_or_else(|| self.spliced_body_frame(&pc.stmts, body));
                     let tail = pc.pushed(
                         vec![Statement::new(
-                            StatementKind::ForeachTail {
-                                loop_var: loop_var.clone(),
-                                var_scope: var_scope.clone(),
-                                body: body.clone(),
-                                keys: keys.clone(),
-                                is_str: *is_str,
-                                key_type: *key_type,
-                                idx: idx + 1,
-                                fe_auto_len: *fe_auto_len,
-                                live_size_name: live_size_name.clone(),
-                            },
+                            StatementKind::ForeachTail(Box::new(
+                                crate::ast::stmt::ForeachTailData {
+                                    loop_var: loop_var.clone(),
+                                    var_scope: var_scope.clone(),
+                                    body: body.clone(),
+                                    keys: keys.clone(),
+                                    is_str: *is_str,
+                                    key_type: *key_type,
+                                    idx: idx + 1,
+                                    fe_auto_len: *fe_auto_len,
+                                    live_size_name: live_size_name.clone(),
+                                },
+                            )),
                             stmt.span,
                         )],
                         pc.start + i + 1,
@@ -2743,17 +2745,19 @@ impl Simulator {
                             ));
                             let wrap_frame: Arc<[Statement]> = Arc::from(vec![
                                 Statement::new(
-                                    StatementKind::ForeachTail {
-                                        loop_var,
-                                        var_scope,
-                                        body: marker,
-                                        keys,
-                                        is_str,
-                                        key_type,
-                                        idx: 1,
-                                        fe_auto_len,
-                                        live_size_name,
-                                    },
+                                    StatementKind::ForeachTail(Box::new(
+                                        crate::ast::stmt::ForeachTailData {
+                                            loop_var,
+                                            var_scope,
+                                            body: marker,
+                                            keys,
+                                            is_str,
+                                            key_type,
+                                            idx: 1,
+                                            fe_auto_len,
+                                            live_size_name,
+                                        },
+                                    )),
                                     stmt.span,
                                 ),
                                 // Each later iteration's tail resumes this frame

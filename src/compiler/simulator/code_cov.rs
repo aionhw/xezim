@@ -507,7 +507,7 @@ impl Instr<'_> {
             | StatementKind::Cross { .. }
             | StatementKind::ScopePop
             | StatementKind::LoopStep
-            | StatementKind::ForeachTail { .. }
+            | StatementKind::ForeachTail(_)
             | StatementKind::ForeverTail { .. }
             | StatementKind::RsAction { .. }
             | StatementKind::RsReturn) => out.push(rebuilt(kind)),

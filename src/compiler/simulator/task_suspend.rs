@@ -314,9 +314,9 @@ impl Simulator {
                 }
             }
             StatementKind::Case { items, .. } => out.extend(items.iter().map(|it| &it.stmt)),
+            StatementKind::ForeachTail(ft) => out.push(&ft.body),
             StatementKind::For { body, .. }
             | StatementKind::Foreach { body, .. }
-            | StatementKind::ForeachTail { body, .. }
             | StatementKind::While { body, .. }
             | StatementKind::DoWhile { body, .. }
             | StatementKind::Repeat { body, .. }

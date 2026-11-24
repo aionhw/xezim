@@ -14,6 +14,10 @@ impl Simulator {
     }
 
     fn push_active_force_expr(&mut self, entry: ActiveForceExpr) {
+        if self.active_force_signal_epochs.len() < self.signal_table.len() {
+            self.active_force_signal_epochs
+                .resize(self.signal_table.len(), 0);
+        }
         self.unresolved_force_count += usize::from(entry.has_unresolved_reads);
         self.active_force_exprs.push(entry);
     }

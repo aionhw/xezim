@@ -72,7 +72,7 @@ impl Simulator {
             // INTERNAL continuation sentinel — only meaningful in the
             // suspend-aware `run_process_stmts` stream. If reached here
             // (synchronous exec), it is a no-op.
-            StatementKind::ForeachTail { .. } => {}
+            StatementKind::ForeachTail(_) => {}
             StatementKind::ForeverTail { .. } => {}
             // Same: the synchronous `for` runs its own step, so the barrier
             // has nothing to do here. (It cannot even be reached with a

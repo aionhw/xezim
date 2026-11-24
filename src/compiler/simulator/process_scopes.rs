@@ -3059,9 +3059,9 @@ impl Simulator {
             } => contains(then_stmt) || else_stmt.as_deref().is_some_and(contains),
             Case { items, .. } => items.iter().any(|item| contains(&item.stmt)),
             RandCase { items } => items.iter().any(|(_, stmt)| contains(stmt)),
+            ForeachTail(ft) => contains(&ft.body),
             For { body, .. }
             | Foreach { body, .. }
-            | ForeachTail { body, .. }
             | While { body, .. }
             | DoWhile { body, .. }
             | Repeat { body, .. }

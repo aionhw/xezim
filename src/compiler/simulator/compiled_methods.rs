@@ -758,9 +758,9 @@ impl Simulator {
                 }
             }
             SK::Case { items, .. } => out.extend(items.iter().map(|it| &it.stmt)),
+            SK::ForeachTail(ft) => out.push(&ft.body),
             SK::For { body, .. }
             | SK::Foreach { body, .. }
-            | SK::ForeachTail { body, .. }
             | SK::While { body, .. }
             | SK::DoWhile { body, .. }
             | SK::Repeat { body, .. }
@@ -789,7 +789,7 @@ impl Simulator {
             match &st.kind {
                 SK::For { .. }
                 | SK::Foreach { .. }
-                | SK::ForeachTail { .. }
+                | SK::ForeachTail(_)
                 | SK::While { .. }
                 | SK::DoWhile { .. }
                 | SK::Repeat { .. }
@@ -844,9 +844,9 @@ impl Simulator {
                         walk(&it.stmt, sim, out);
                     }
                 }
+                SK::ForeachTail(ft) => walk(&ft.body, sim, out),
                 SK::For { body, .. }
                 | SK::Foreach { body, .. }
-                | SK::ForeachTail { body, .. }
                 | SK::While { body, .. }
                 | SK::DoWhile { body, .. }
                 | SK::Repeat { body, .. }
@@ -909,9 +909,9 @@ impl Simulator {
                     Self::walk_type_param_locals(&it.stmt, cd, out);
                 }
             }
+            SK::ForeachTail(ft) => Self::walk_type_param_locals(&ft.body, cd, out),
             SK::For { body, .. }
             | SK::Foreach { body, .. }
-            | SK::ForeachTail { body, .. }
             | SK::While { body, .. }
             | SK::DoWhile { body, .. }
             | SK::Repeat { body, .. }

@@ -1037,6 +1037,7 @@ impl Simulator {
                     Self::sva_stmt_names(s, all, out);
                 }
             }
+            SK::ForeachTail(ft) => Self::sva_stmt_names(&ft.body, all, out),
             SK::For { body, .. }
             | SK::While { body, .. }
             | SK::DoWhile { body, .. }
@@ -1044,7 +1045,6 @@ impl Simulator {
             | SK::Forever { body }
             | SK::ForeverTail { body }
             | SK::Foreach { body, .. }
-            | SK::ForeachTail { body, .. }
             | SK::RsAction { body } => Self::sva_stmt_names(body, all, out),
             _ => {}
         }
@@ -1089,6 +1089,7 @@ impl Simulator {
                     Self::sva_stmt_clocks(s, out);
                 }
             }
+            SK::ForeachTail(ft) => Self::sva_stmt_clocks(&ft.body, out),
             SK::For { body, .. }
             | SK::While { body, .. }
             | SK::DoWhile { body, .. }
@@ -1096,7 +1097,6 @@ impl Simulator {
             | SK::Forever { body }
             | SK::ForeverTail { body }
             | SK::Foreach { body, .. }
-            | SK::ForeachTail { body, .. }
             | SK::RsAction { body } => Self::sva_stmt_clocks(body, out),
             _ => {}
         }

@@ -4304,7 +4304,7 @@ impl Simulator {
             static_fn_ret: HashMap::default(),
             active_force_exprs: Vec::new(),
             unresolved_force_count: 0,
-            active_force_signal_epochs: vec![0; signal_table.len()],
+            active_force_signal_epochs: Vec::new(),
             active_force_evals: 0,
             active_force_skips: 0,
             signal_has_xz: signal_has_xz_init,

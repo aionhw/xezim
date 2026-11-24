@@ -38,13 +38,14 @@ fn scan_sources(module: &ElaboratedModule, walk: &mut Walk) -> Result<(), Stop> 
         walk.expression(&block.lhs_source)?;
         walk.expression(&block.rhs_source)?;
         for delay in [
-            &block.delay_source,
-            &block.delay_fall_source,
-            &block.delay_off_source,
-        ] {
-            if let Some(delay) = delay {
-                walk.expression(delay)?;
-            }
+            block.delay_source(),
+            block.delay_fall_source(),
+            block.delay_off_source(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            walk.expression(delay)?;
         }
     }
     for assignment in &module.continuous_assigns {
