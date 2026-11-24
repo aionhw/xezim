@@ -10,6 +10,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Wide products use hard bounds when a conflicting soft constraint is
+  discarded (§18.5.14).
+
 - SDF back-annotation matches individual specify paths, selects rise/fall
   and transition values, and preserves separate interconnect delays. Scoped
   annotations resolve relative paths, slash dividers, and wildcard instances

@@ -23,6 +23,7 @@ impl Simulator {
             nd_dyn: HashMap::default(),
             srcs: Vec::new(),
             nodes: Vec::new(),
+            soft_node_indices: Vec::new(),
             soft_enabled: None,
             soft_priority: Vec::new(),
             soft_rank: (0, 0),
@@ -245,6 +246,7 @@ impl Simulator {
             nd_dyn: HashMap::default(),
             srcs: Vec::new(),
             nodes: Vec::new(),
+            soft_node_indices: Vec::new(),
             soft_enabled: None,
             soft_priority: Vec::new(),
             soft_rank: (0, 0),
@@ -471,6 +473,7 @@ impl Simulator {
     ) -> Option<()> {
         csp.srcs.clear();
         csp.nodes.clear();
+        csp.soft_node_indices.clear();
         csp.dists.clear();
         csp.order.clear();
         csp.soft_priority.clear();
@@ -532,6 +535,7 @@ impl Simulator {
                 )
             };
             let dist_start = csp.dists.len();
+            let node_start = csp.nodes.len();
             let Some(n) = self.csp_item(csp, it, &env) else {
                 if std::env::var_os("XEZIM_RAND_DBG").is_some() {
                     eprintln!("[rand-dbg] joint solve does not model: {:?}", it);
@@ -542,7 +546,11 @@ impl Simulator {
             if !matches!(n, Node::True) {
                 csp.nodes.push(n);
             }
+            if matches!(it, ConstraintItem::Soft(_)) {
+                csp.soft_node_indices.extend(node_start..csp.nodes.len());
+            }
         }
+        csp.soft_node_indices.clear();
         // Sampling uses the first active distribution. Keep its original
         // registration order even when its hard membership bound moved first.
         let mut dists: Vec<_> = dist_order

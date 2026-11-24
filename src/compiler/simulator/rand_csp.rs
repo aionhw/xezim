@@ -527,6 +527,9 @@ pub(crate) struct Csp {
     nd_dyn: HashMap<String, usize>,
     srcs: Vec<Src>,
     nodes: Vec<Node>,
+    /// Nodes added by top-level soft preferences while translating. Their
+    /// bounds do not hold if a preference is later dropped (§18.5.14).
+    soft_node_indices: Vec<usize>,
     /// None enables all preferences; otherwise only the selected instances.
     soft_enabled: Option<HashSet<usize>>,
     soft_priority: Vec<(usize, usize, usize)>,
@@ -723,6 +726,7 @@ const PROD_MAX: i128 = 1 << 80;
 struct LinCx<'a> {
     dom0: &'a [Dom],
     nodes: &'a [Node],
+    soft_node_indices: &'a [usize],
     base: usize,
     /// The next free variable number.
     next: usize,
@@ -741,6 +745,7 @@ impl<'a> LinCx<'a> {
         LinCx {
             dom0: &csp.dom0,
             nodes: &csp.nodes,
+            soft_node_indices: &csp.soft_node_indices,
             base: csp.vars.len(),
             next: csp.vars.len(),
             carries: Vec::new(),
@@ -899,8 +904,11 @@ impl<'a> LinCx<'a> {
                 _ => {}
             }
         }
-        for n in self.nodes {
-            visit(self, v, n, &mut range);
+        let mut soft = self.soft_node_indices.iter().copied().peekable();
+        for (i, n) in self.nodes.iter().enumerate() {
+            if soft.next_if_eq(&i).is_none() {
+                visit(self, v, n, &mut range);
+            }
         }
         (range.0 <= range.1).then_some(range)
     }
