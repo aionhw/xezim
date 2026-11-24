@@ -8,8 +8,8 @@ use xezim_core::{Value, elaborate, hasher::HashMap};
 
 /// Only range expressions can need array metadata. Scalar declarations return
 /// without allocating or scanning the design's array table.
-pub(crate) fn query_operands(dt: &DataType) -> Vec<&Expression> {
-    fn dimensions<'a>(dims: &'a [PackedDimension], out: &mut Vec<&'a Expression>) {
+pub(crate) fn query_operands(dt: &DataType) -> Vec<(&str, &Expression)> {
+    fn dimensions<'a>(dims: &'a [PackedDimension], out: &mut Vec<(&'a str, &'a Expression)>) {
         for d in dims {
             if let PackedDimension::Range { left, right, .. } = d {
                 for e in [left, right] {
@@ -29,14 +29,14 @@ pub(crate) fn query_operands(dt: &DataType) -> Vec<&Expression> {
                             )
                             && let Some(arg) = args.first()
                         {
-                            out.push(arg);
+                            out.push((name.as_str(), arg));
                         }
                     });
                 }
             }
         }
     }
-    fn walk<'a>(dt: &'a DataType, out: &mut Vec<&'a Expression>) {
+    fn walk<'a>(dt: &'a DataType, out: &mut Vec<(&'a str, &'a Expression)>) {
         match dt {
             DataType::IntegerVector { dimensions: d, .. }
             | DataType::Implicit { dimensions: d, .. }
@@ -87,8 +87,16 @@ pub(crate) fn resolve_type_width(
     params: Option<&HashMap<String, Value>>,
     typedefs: Option<&HashMap<String, u32>>,
     arrays: &HashMap<String, (i64, i64, u32)>,
+    widths: HashMap<String, u32>,
 ) -> u32 {
-    let run = || elaborate::resolve_type_width(dt, params, typedefs);
+    let run = || {
+        let resolve = || elaborate::resolve_type_width(dt, params, typedefs);
+        if widths.is_empty() {
+            resolve()
+        } else {
+            elaborate::with_query_widths(widths, resolve)
+        }
+    };
     if arrays.is_empty() {
         run()
     } else {

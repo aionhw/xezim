@@ -2065,6 +2065,12 @@ impl Simulator {
                 Some(access)
             }
             ExprKind::MemberAccess { expr: base, member } => {
+                // §23.6, §27.4: an indexed generate scope can be part of
+                // the backing signal's name. Resolve the declared signal
+                // before treating this step as a packed member.
+                if let Some(root) = self.fold_indexed_hier_path(expr) {
+                    return self.declared_packed_access(&root);
+                }
                 if !self.class_member_names().statics.is_empty()
                     && let Some(access) = self.declared_static_packed_root(expr)
                 {

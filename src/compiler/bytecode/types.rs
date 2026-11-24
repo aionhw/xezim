@@ -456,7 +456,8 @@ impl<'a> BytecodeCompiler<'a> {
     fn decl_width_with_arrays(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> u32 {
         use crate::compiler::scoped_arrays;
         let mut view = HashMap::default();
-        for arg in scoped_arrays::query_operands(dt) {
+        let mut widths = HashMap::default();
+        for (query, arg) in scoped_arrays::query_operands(dt) {
             let Some(name) = scoped_arrays::operand_name(arg) else {
                 continue;
             };
@@ -477,11 +478,22 @@ impl<'a> BytecodeCompiler<'a> {
                     .or_else(|| self.arrays.get(&name.replace('.', "::")))
                     .copied()
             };
+            if query == "$bits" {
+                if let Some((lo, hi, width)) = shape {
+                    if let Ok(count) = u32::try_from(lo.abs_diff(hi) + 1)
+                        && let Some(total) = width.checked_mul(count)
+                    {
+                        widths.insert(name.clone(), total);
+                    }
+                } else if let Some(&(_, width)) = self.local_var_regs.get(&name) {
+                    widths.insert(name.clone(), width);
+                }
+            }
             if let Some(shape) = shape {
                 view.insert(name, shape);
             }
         }
-        scoped_arrays::resolve_type_width(dt, self.params, self.typedefs, &view)
+        scoped_arrays::resolve_type_width(dt, self.params, self.typedefs, &view, widths)
     }
 
     /// §7.4.1: is the outermost packed dimension of `dt` other than the

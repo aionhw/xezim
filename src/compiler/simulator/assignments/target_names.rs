@@ -97,7 +97,8 @@ impl Simulator {
     ) -> u32 {
         use crate::compiler::scoped_arrays;
         let mut view = HashMap::default();
-        for arg in scoped_arrays::query_operands(dt) {
+        let mut widths = HashMap::default();
+        for (query, arg) in scoped_arrays::query_operands(dt) {
             let Some(name) = scoped_arrays::operand_name(arg) else {
                 continue;
             };
@@ -107,7 +108,7 @@ impl Simulator {
                 .borrow()
                 .clone()
                 .or_else(|| self.process_scope_hint.get(&self.current_pid).cloned());
-            let canonical = lexical
+            let canonical = lexical.clone()
                 .or_else(|| {
                     scope.as_ref().and_then(|scope| {
                         let key = format!("{scope}.{name}");
@@ -127,8 +128,40 @@ impl Simulator {
                     .copied()
                     .map(|shape| (key, shape))
             }) {
+                if query == "$bits" && !self.module.dynamic_arrays.contains(&key)
+                    && !self.module.associative_arrays.contains_key(&key)
+                    && let Ok(count) = u32::try_from(shape.0.abs_diff(shape.1) + 1)
+                    && let Some(total) = shape.2.checked_mul(count)
+                {
+                    widths.insert(name.clone(), total);
+                }
                 view.insert(name, shape);
                 view.insert(key, shape);
+            } else if query == "$bits" {
+                let width = if let Some(key) = lexical {
+                    self.widths.get(&key).copied()
+                        .or_else(|| self.get_signal_value_by_name(&key).map(|v| v.width))
+                } else if let ExprKind::Ident(h) = &arg.kind {
+                    self.frame_bound_bare_name(h)
+                        .and_then(|key| self.widths.get(key).copied())
+                        .or_else(|| {
+                            self.local_stack
+                                .iter()
+                                .rev()
+                                .find_map(|frame| frame.get(&name))
+                                .map(|value| value.width)
+                        })
+                        .or_else(|| {
+                            let stored = self.resolve_hier_name(h);
+                            self.widths.get(stored.as_ref()).copied()
+                                .or_else(|| self.get_signal_value_by_name(&stored).map(|v| v.width))
+                        })
+                } else {
+                    None
+                };
+                if let Some(width) = width {
+                    widths.insert(name, width);
+                }
             }
         }
         scoped_arrays::resolve_type_width(
@@ -136,6 +169,7 @@ impl Simulator {
             Some(&self.module.parameters),
             Some(&self.module.typedefs),
             &view,
+            widths,
         )
     }
 
