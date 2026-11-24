@@ -4519,7 +4519,10 @@ impl Simulator {
         // §7.4.5: a queue of FIXED arrays (`int q[$][4]`) stores each row's
         // elements at `q[i][j]` — evaluating the row to one packed value
         // would land in a phantom scalar `q[i]` that no read ever visits.
-        if let Some(&(_, (jlo, jhi), _)) = self.module.arrays_2d.get(obj_name) {
+        // Dynamic dimensions can have backing bounds in arrays_2d too.
+        if let Some(&(_, (jlo, jhi), _)) = self.module.arrays_2d.get(obj_name)
+            && !self.is_queue_or_dyn_row(elem)
+        {
             // §10.9.1 / §7.6: the row pairs by position from its declared
             // left bound (`int q[$][3:1]` takes `'{1,2,3}` as q[i][3] = 1).
             let order = |me: &Self, name: &str, lo: i64, hi: i64, nth: usize| -> Vec<i64> {
