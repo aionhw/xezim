@@ -910,3 +910,15 @@ mod negative_packed_element_read;
 
 #[path = "types/nested_two_state_packed_member.rs"]
 mod nested_two_state_packed_member;
+
+#[path = "types/packed_package_field_net_width.rs"]
+mod packed_package_field_net_width;
+
+#[path = "types/transitive_packed_typedef_width.rs"]
+mod transitive_packed_typedef_width;
+
+#[path = "types/unit_member_vs_unimported_package.rs"]
+mod unit_member_vs_unimported_package;
+
+#[path = "types/unit_parameter_over_hidden_enum.rs"]
+mod unit_parameter_over_hidden_enum;

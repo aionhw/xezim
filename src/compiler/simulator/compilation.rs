@@ -683,6 +683,88 @@ impl Simulator {
             self.initialize_class_fixed_array(&cn, &prop, &init);
         }
 
+        // §8.9, §6.8: a static dynamic array, queue or associative array
+        // with an initializer (`static sew_e set[] = '{SEW8, SEW16};`,
+        // `static int q[$] = {1, 2};`, `static int m[string] = '{"a": 1};`)
+        // has the one store registered empty above, and nothing ran its
+        // initializer: `Cls::set.size()` read 0 and a constraint
+        // `v inside {set}` had no solution. Run each initializer once, in
+        // its declaring class's static context, into that store (the
+        // `Class::name` key when two classes declare the name): a pattern
+        // or queue concatenation element by element, as the per-instance
+        // path does (`N{expr}` items expanded, §10.9.1), an associative-
+        // array pattern with its `default:` (§7.9.11), and any other
+        // expression, such as a call that returns the whole collection, as
+        // the assignment `name = init;`.
+        // Parameterized classes are skipped, as for the fixed arrays above.
+        let mut seen_coll_inits: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let static_coll_inits: Vec<(String, String, bool, u32, Expression)> = self
+            .module
+            .classes
+            .iter()
+            .filter(|(cn, _)| !self.class_is_parameterized(cn))
+            .flat_map(|(_, cd)| {
+                cd.static_collections
+                    .iter()
+                    .filter_map(|(name, is_assoc, width)| {
+                        cd.property_inits.get(name).map(|init| {
+                            (
+                                cd.name.clone(),
+                                name.clone(),
+                                *is_assoc,
+                                *width,
+                                init.clone(),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            // A module class is listed under its instance-qualified name and
+            // an alias; both are one declaration.
+            .filter(|(cn, name, ..)| seen_coll_inits.insert((cn.clone(), name.clone())))
+            .collect();
+        for (cn, name, is_assoc, width, init) in static_coll_inits {
+            let store = if colliding_names.contains(name.as_str()) {
+                format!("{}::{}", cn, name)
+            } else {
+                name.clone()
+            };
+            let signature = self.canonicalize_spec_sig(&cn, "");
+            let saved_spec = self.current_spec.replace((cn.clone(), signature));
+            let elem_type = self
+                .module
+                .classes
+                .get(&cn)
+                .and_then(|class| self.class_prop_elem_type(class, &name))
+                .cloned();
+            self.class_context_stack.push(Some(cn));
+            self.this_stack.push(None);
+            let (pattern, assoc_items) = match &self.unpacked_pattern(&init).kind {
+                ExprKind::AssignmentPattern(items) if is_assoc => (true, Some(items.clone())),
+                ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_) => (true, None),
+                _ => (false, None),
+            };
+            if let Some(items) = assoc_items {
+                self.assign_class_assoc_pattern(&store, width, &items);
+            } else if pattern && !is_assoc {
+                self.populate_queue_from_init(&store, &init, elem_type);
+            } else {
+                let lhs = super::property_initialization::prop_ident_expr(&name);
+                let stmt = Statement::new(
+                    StatementKind::BlockingAssign {
+                        lvalue: lhs.clone(),
+                        rvalue: init.clone(),
+                    },
+                    init.span,
+                );
+                self.exec_stmt_blocking_assign(&stmt, &lhs, &init);
+            }
+            self.this_stack.pop();
+            self.class_context_stack.pop();
+            self.current_spec = saved_spec;
+        }
+
         // Run static property initializers that call functions, e.g. riscv-dv's
         // per-instruction `static bit _ = riscv_instr::register(NAME)` (the
         // DEFINE_INSTR registration). The lazy static-init path only stores the
@@ -711,6 +793,9 @@ impl Simulator {
                     .iter()
                     .filter(|(p, e)| {
                         cd.static_properties.contains(*p)
+                            // A static collection's initializer ran above,
+                            // element by element, into its store.
+                            && !cd.static_collections.iter().any(|(n, ..)| n == *p)
                             && (Self::expr_contains_call(e)
                                 // bare `= new` (no parens) parses as an Ident,
                                 // not a Call — `static C inst = new;` must
@@ -1480,15 +1565,23 @@ impl Simulator {
         // only a few thousand edge-sensitive ones, the dense layout wasted
         // ~14 MB on empty Vec stubs. Walk blocks once into a temp HashMap,
         // then materialize in edge_signal_ids order.
-        let mut by_sid: HashMap<usize, EdgeFanout> = HashMap::default();
+        #[derive(Default)]
+        struct EdgeFanoutBuild {
+            posedge: Vec<u32>,
+            negedge: Vec<u32>,
+            anyedge: Vec<u32>,
+            lsbedge: Vec<u32>,
+        }
+        let mut by_sid: HashMap<usize, EdgeFanoutBuild> = HashMap::default();
         for (block_idx, block) in self.edge_blocks.iter().enumerate() {
+            let b = block_idx as u32;
             for sid in &block.resolved_sensitivities {
                 let fanout = by_sid.entry(sid.signal_id).or_default();
                 match sid.edge {
-                    EdgeKind::Posedge => fanout.posedge.push(block_idx),
-                    EdgeKind::Negedge => fanout.negedge.push(block_idx),
-                    EdgeKind::AnyEdge => fanout.anyedge.push(block_idx),
-                    EdgeKind::LsbEdge => fanout.lsbedge.push(block_idx),
+                    EdgeKind::Posedge => fanout.posedge.push(b),
+                    EdgeKind::Negedge => fanout.negedge.push(b),
+                    EdgeKind::AnyEdge => fanout.anyedge.push(b),
+                    EdgeKind::LsbEdge => fanout.lsbedge.push(b),
                 }
             }
         }
@@ -1499,14 +1592,23 @@ impl Simulator {
             .edge_signal_ids
             .iter()
             .map(|sid| {
-                let mut fanout = by_sid.remove(sid).unwrap_or_default();
-                if batch_armed_edges {
-                    fanout.posedge_batches =
-                        edges::EdgeBatch::build(&fanout.posedge, edge_block_count);
-                    fanout.negedge_batches =
-                        edges::EdgeBatch::build(&fanout.negedge, edge_block_count);
+                let b = by_sid.remove(sid).unwrap_or_default();
+                let (posedge_batches, negedge_batches) = if batch_armed_edges {
+                    (
+                        edges::EdgeBatch::build(&b.posedge, edge_block_count),
+                        edges::EdgeBatch::build(&b.negedge, edge_block_count),
+                    )
+                } else {
+                    (Box::default(), Box::default())
+                };
+                EdgeFanout {
+                    posedge: b.posedge.into_boxed_slice(),
+                    negedge: b.negedge.into_boxed_slice(),
+                    posedge_batches,
+                    negedge_batches,
+                    anyedge: b.anyedge.into_boxed_slice(),
+                    lsbedge: b.lsbedge.into_boxed_slice(),
                 }
-                fanout
             })
             .collect();
         if batch_armed_edges {
@@ -1545,6 +1647,32 @@ impl Simulator {
             "build edge and dependency indexes",
             &mut compile_phase_start,
         );
+        // §6.18: reject assigning a non-class value (an enum member or integer
+        // literal) to a class-handle variable before any initializer executes.
+        // Must stay side-effect free (no `resolve_hier_name` cache pollution).
+        self.check_class_handle_assignment_type();
+        if !self.compile_errors.is_empty() {
+            return;
+        }
+        // §6.8, §6.21, §10.5: execute static / package-global initializers and
+        // synthesized top-level runtime declaration initializers BEFORE time 0
+        // (`capture_sampled_defaults`, edge snapshots, and process start) so
+        // variables hold their initialized values before any `always` process
+        // observes or snapshots them, generating no time-0 event.
+        {
+            let init_blocks = std::mem::take(&mut self.module.initial_blocks);
+            for ib in &init_blocks {
+                self.hoist_static_decls(&ib.stmt, &ib.scope);
+            }
+            self.module.initial_blocks = init_blocks;
+        }
+        let mut pre_inits = std::mem::take(&mut self.module.static_init_blocks);
+        pre_inits.extend(
+            self.module
+                .initial_blocks
+                .extract_if(.., |ib| Self::is_synthesized_decl_init(ib)),
+        );
+        self.exec_pre_time0_init_blocks(pre_inits, false);
         // §16.5.1: a sampled-value function's default sampled values are the
         // values before time 0 — declaration initializers, else type
         // defaults — so take them before the time-0 settle drives any net or
@@ -1653,18 +1781,6 @@ impl Simulator {
         // #7 lazy-prefix path: also drain `pending_initial` one-at-a-time.
         // A pending block is materialized just before scheduling and dropped
         // after, so peak memory is at most one materialized InitialBlock.
-        // §6.18: reject assigning a non-class value (an enum member or integer
-        // literal) to a class-handle variable. The reference elaborator flags
-        // this at compile time; surface a compile error so simulation never
-        // runs. Deliberately conservative and side-effect free (it only reads
-        // declared types and enum-member tables — it must NOT call
-        // resolve_hier_name, which would pre-populate the shared per-AST-node
-        // name cache with process-scope-free resolutions that later corrupt
-        // name resolution at simulation time).
-        self.check_class_handle_assignment_type();
-        if !self.compile_errors.is_empty() {
-            return;
-        }
         let pending_initial = std::mem::take(&mut self.module.pending_initial);
         let initial_blocks = std::mem::take(&mut self.module.initial_blocks);
         if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
@@ -1744,31 +1860,12 @@ impl Simulator {
         } else {
             pending_initial
         };
-        for ib in early.iter().chain(initial_blocks.iter()) {
+        for ib in early.iter() {
             self.hoist_static_decls(&ib.stmt, &ib.scope);
         }
-        // Static/package-global initializers must run before any `initial`
-        // block (and the lazy-prefix pending ones) so package globals are
-        // populated before user code reads them. Schedule them first so they
-        // receive the lowest pids (the time-0 queue runs lower pids first).
-        for ib in std::mem::take(&mut self.module.static_init_blocks) {
-            let span = ib.stmt.span;
-            let stmts = match ib.stmt.kind {
-                StatementKind::SeqBlock { stmts, .. } => stmts,
-                other => vec![Statement::new(other, span)].into(),
-            };
-            let pid = self.next_pid;
-            self.next_pid += 1;
-            // §6.21: an instance-scoped static initializer (deferred by
-            // `defer_static_syscall_inits`) needs the same name-resolution
-            // hint initial blocks get, so bare names, module-level function
-            // calls and `%m` resolve in the DECLARING instance's scope.
-            if !ib.scope.is_empty() {
-                self.process_scope_hint.insert(pid, ib.scope);
-            }
-            self.process_origin
-                .insert(pid, (span, "static initializer"));
-            self.event_queue.schedule(0, pid, stmts.into_vec().into());
+        let late_statics = std::mem::take(&mut self.module.static_init_blocks);
+        if !late_statics.is_empty() {
+            self.exec_pre_time0_init_blocks(late_statics, true);
         }
         // §16.5/§16.14: declarative concurrent assertions exist before
         // Active processes run, including an initial clock's time-zero edge.
@@ -2040,5 +2137,123 @@ impl Simulator {
         self.init_value_trace();
         self.rebuild_signal_commit_plans();
         self.compiled = true;
+    }
+
+    /// True if `ib` is an elaborator-synthesized variable declaration
+    /// initializer (`Span::dummy()` on either the statement or its blocking
+    /// assignment lvalue, containing only blocking assignments).
+    fn is_synthesized_decl_init(ib: &super::elaborate::InitialBlock) -> bool {
+        let dummy = |sp: crate::ast::Span| sp.start == 0 && sp.end == 0;
+        let s = &ib.stmt;
+        let synth_span = dummy(s.span)
+            || matches!(&s.kind, StatementKind::BlockingAssign { lvalue, .. } if dummy(lvalue.span));
+        if !synth_span {
+            return false;
+        }
+        fn all_blocking(st: &Statement) -> bool {
+            match &st.kind {
+                StatementKind::BlockingAssign { .. } => true,
+                StatementKind::SeqBlock { name: None, stmts } => {
+                    !stmts.is_empty() && stmts.iter().all(all_blocking)
+                }
+                _ => false,
+            }
+        }
+        all_blocking(s)
+    }
+
+    /// Execute static and synthesized declaration initializer blocks before
+    /// time 0 (`compile()`), cleaning up transient process state and dirty
+    /// tracking so initialization generates no time-0 change events (§6.8).
+    fn exec_pre_time0_init_blocks(
+        &mut self,
+        blocks: Vec<super::elaborate::InitialBlock>,
+        refresh_edge_snap: bool,
+    ) {
+        if blocks.is_empty() {
+            return;
+        }
+        let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
+        let self_ptr = self as *mut Simulator;
+        ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
+        let prev_global =
+            GLOBAL_ACTIVE_SIMULATOR.swap(self_ptr, std::sync::atomic::Ordering::AcqRel);
+        self.vpi_self_ptr = self_ptr;
+
+        let saved_pid = self.current_pid;
+        let saved_scope = self.current_scope.clone();
+        let saved_hint = self.name_resolve_hint.borrow_mut().take();
+        let saved_activation = self.activation_scope.borrow_mut().take();
+        let saved_block_scope = std::mem::take(&mut self.m_block_scope);
+        let saved_block_scope_id = std::mem::replace(&mut self.m_block_scope_id, u32::MAX);
+        let saved_block_active = std::mem::replace(&mut self.m_block_active, false);
+        self.in_pre_time0_init = true;
+
+        for ib in blocks {
+            if self.finished {
+                break;
+            }
+            let tmp_pid = self.next_pid;
+            self.next_pid += 1;
+            self.current_pid = tmp_pid;
+            self.current_scope.clone_from(&ib.scope);
+            *self.name_resolve_hint.borrow_mut() =
+                (!ib.scope.is_empty()).then(|| ib.scope.clone());
+            *self.activation_scope.borrow_mut() =
+                (!ib.scope.is_empty()).then(|| ib.scope.clone());
+            self.m_block_scope.clear();
+            self.m_block_scope_id = u32::MAX;
+            self.m_block_active = false;
+            if !ib.scope.is_empty() {
+                self.process_scope_hint.insert(tmp_pid, ib.scope);
+            }
+            self.exec_statement(&ib.stmt);
+            if !self.process_parents.values().any(|&p| p == tmp_pid) {
+                self.process_scope_hint.remove(&tmp_pid);
+                self.process_m_scope.remove(&tmp_pid);
+                self.process_m_label.remove(&tmp_pid);
+                self.process_origin.remove(&tmp_pid);
+                self.pid_src_file.remove(&tmp_pid);
+                self.process_contexts.remove(&tmp_pid);
+                self.finished_pids.remove(&tmp_pid);
+                self.killed_pids.remove(&tmp_pid);
+            }
+        }
+
+        self.in_pre_time0_init = false;
+        self.current_pid = saved_pid;
+        self.current_scope = saved_scope;
+        *self.name_resolve_hint.borrow_mut() = saved_hint;
+        *self.activation_scope.borrow_mut() = saved_activation;
+        self.m_block_scope = saved_block_scope;
+        self.m_block_scope_id = saved_block_scope_id;
+        self.m_block_active = saved_block_active;
+        ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
+        GLOBAL_ACTIVE_SIMULATOR.store(prev_global, std::sync::atomic::Ordering::Release);
+
+        if refresh_edge_snap {
+            for &id in &self.dirty_list {
+                if id < self.prev_val.len() && id < self.signal_table.len() {
+                    let (v, x) = self.signal_table[id].raw_bits();
+                    self.prev_val[id] = v;
+                    self.prev_xz[id] = x;
+                    if self.signal_widths.get(id).copied().unwrap_or(0) > 64 {
+                        self.prev_wide.insert(id, self.signal_table[id].clone());
+                    }
+                }
+            }
+        }
+        for id in self.dirty_list.drain(..) {
+            if id < self.dirty_signals.len() {
+                self.dirty_signals[id] = false;
+            }
+        }
+        self.dirty_any = false;
+        self.table_modified = false;
+        for p in self.changed_edge_pos.drain(..) {
+            if p < self.edge_pos_seen.len() {
+                self.edge_pos_seen[p] = false;
+            }
+        }
     }
 }

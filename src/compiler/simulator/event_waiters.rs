@@ -315,6 +315,17 @@ impl EventWaiters {
         }
     }
 
+    pub(super) fn set_captured_prev_wide(&mut self, seq: u64, k: usize, prev: Value) {
+        if let Some(p) = self.entries.get_mut(&seq) {
+            let n = p.w.resolved_sensitivities.len();
+            if p.w.captured_prev_wide.len() < n {
+                p.w.captured_prev_wide.resize(n, None);
+            }
+            p.w.captured_prev_wide[k] = Some(prev);
+            self.scan_all = true;
+        }
+    }
+
     /// Start a drain: re-arm the signals written since the last one and
     /// push their waiters onto `cand`.
     fn take_dirty(&mut self, cand: &mut Vec<u64>) {
@@ -496,7 +507,8 @@ impl Simulator {
             return false;
         }
         if !is_packed_id(id) && self.signal_widths[id] > 64 {
-            return w.captured_prev_wide[i].as_ref() == Some(&self.signal_table[id]);
+            return w.captured_prev_wide.get(i).and_then(|o| o.as_ref())
+                == Some(&self.signal_table[id]);
         }
         true
     }

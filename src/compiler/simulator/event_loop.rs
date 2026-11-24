@@ -221,7 +221,7 @@ impl Simulator {
     /// `XEZIM_LAZY_PROC_SETTLE=1` opts into the LRM/reference ordering so a
     /// design that depends on it can be run (and diffed) without a rebuild.
     pub(super) fn settle_after_proc_write(&mut self) {
-        if self.in_edge_block {
+        if self.in_edge_block || self.in_pre_time0_init {
             return;
         }
         static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1926,7 +1926,9 @@ impl Simulator {
             if self.time == 0
                 && (!self.edge_t0_pending.is_empty()
                     || !self.time0_port_edges.is_empty()
-                    || !self.time0_alias_edges.is_empty())
+                    || !self.time0_wide_port_edges.is_empty()
+                    || !self.time0_alias_edges.is_empty()
+                    || !self.time0_wide_alias_edges.is_empty())
             {
                 self.deliver_time0_port_edges();
                 if self.event_queue.next_time() == Some(self.time) {
@@ -2021,7 +2023,9 @@ impl Simulator {
         if self.time == 0
             && (!self.edge_t0_pending.is_empty()
                 || !self.time0_port_edges.is_empty()
-                || !self.time0_alias_edges.is_empty())
+                || !self.time0_wide_port_edges.is_empty()
+                || !self.time0_alias_edges.is_empty()
+                || !self.time0_wide_alias_edges.is_empty())
         {
             self.deliver_time0_port_edges();
         }

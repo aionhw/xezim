@@ -825,11 +825,8 @@ impl Simulator {
                     )
                 })
                 .map(|mut parts| {
-                    if ca.delay_exprs().is_some() {
-                        for part in &mut parts {
-                            part.set_delay_exprs(ca.delay_exprs().cloned());
-                            part.set_origin(ca.origin().cloned());
-                        }
+                    for part in &mut parts {
+                        part.inherit_driver_metadata(&ca);
                     }
                     parts
                 })
@@ -1159,6 +1156,23 @@ impl Simulator {
                 })
                 .collect();
 
+            // An unpacked array element is its own net. Use its cell
+            // name for the delayed write, so it cannot be mistaken for a
+            // packed bit-select of the (nonexistent) array-wide net.
+            if (explicit_delay > 0 || ca.delay_fall().is_some() || ca.delay_off().is_some()
+                || ca.delay_exprs().is_some())
+                && let Some((base, indices)) = Self::const_elem_ref(&ca.lhs, &self.module)
+            {
+                let cell = scope_hint.as_ref().and_then(|scope| {
+                    let scoped = format!("{scope}.{base}");
+                    self.elem_cell(&scoped, &indices)
+                }).or_else(|| self.elem_cell(&base, &indices));
+                if let Some(id) = cell.filter(|&id| !is_packed_id(id)) {
+                    let span = ca.lhs.span;
+                    ca.lhs = super::property_initialization::prop_ident_expr(self.name_for_id(id));
+                    ca.lhs.span = span;
+                }
+            }
             // For bare-identifier LHS, compile the RHS and use BlockingAssign
             // (whole-signal write). For BitSelect/PartSelect/Concat LHS, use
             // compile_cont_assign_lhs which routes through compile_blocking_target
@@ -2013,6 +2027,10 @@ impl Simulator {
                 None
             };
             let cov = cov_counter.filter(|_| matches!(&item, CombItem::ContAssign { .. }));
+            let mut rids = rids;
+            let mut wids = wids;
+            rids.shrink_to_fit();
+            wids.shrink_to_fit();
             entries.push(CombEntry {
                 item,
                 cold: Box::new(CombEntryCold {
@@ -2023,6 +2041,7 @@ impl Simulator {
                     span: ca_span,
                     cov,
                     time0_effects: ca_time0_effects,
+                    alias_t0_reads: None,
                 }),
                 has_unresolved_reads,
                 defer_at_time0: false,
@@ -2139,15 +2158,31 @@ impl Simulator {
                 // input (fed by the port's continuous assign) settles later.
                 // Register BOTH: a superset sensitivity is always safe.
                 let mut rids: Vec<usize> = Vec::new();
+                // Nonzero `alias_t0_kind` for collapsed input-port / identity
+                // net reads of non-`always_comb` blocks (fire_time0_input_port_blocks).
+                let collect_alias = !is_always_comb && !self.collapsed_port_children.is_empty();
+                let mut alias_t0_reads: Vec<(usize, u8)> = Vec::new();
+                let mut record_rid = |id: usize, key: &str, rids: &mut Vec<usize>| {
+                    if !rids.contains(&id) {
+                        rids.push(id);
+                    }
+                    if collect_alias {
+                        let k = self.alias_t0_kind(key, id);
+                        if k != 0 {
+                            let pair = (id, k);
+                            if !alias_t0_reads.contains(&pair) {
+                                alias_t0_reads.push(pair);
+                            }
+                        }
+                    }
+                };
                 // A whole read of an array of the packed arena (see below).
                 let mut packed_array_read = false;
                 for r in sens_reads.iter() {
                     if let Some(scope) = &scope_hint {
                         let q = format!("{}.{}", scope, r);
                         if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
-                            if !rids.contains(&id) {
-                                rids.push(id);
-                            }
+                            record_rid(id, q.as_str(), &mut rids);
                         }
                     }
                     // The block's own INSTANCE scope is authoritative even
@@ -2162,9 +2197,7 @@ impl Simulator {
                     if !ab.scope.is_empty() && Some(&ab.scope) != scope_hint.as_ref() {
                         let q = format!("{}.{}", ab.scope, r);
                         if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
-                            if !rids.contains(&id) {
-                                rids.push(id);
-                            }
+                            record_rid(id, q.as_str(), &mut rids);
                         }
                     }
                     let before = rids.len();
@@ -2188,10 +2221,9 @@ impl Simulator {
                             None => {}
                         }
                     }
-                    if let Some(id) = resolve_one(r.as_str()) {
-                        if !rids.contains(&id) {
-                            rids.push(id);
-                        }
+                    if let Some((id, key)) = self.resolve_read_name_and_key(r.as_str(), &top_prefix)
+                    {
+                        record_rid(id, key, &mut rids);
                     }
                     // §23.8 / §23.10.1: a dotted read that resolved nowhere
                     // may be an UPWARD reference (a bound module reading its
@@ -2222,9 +2254,7 @@ impl Simulator {
                         *self.name_resolve_hint.borrow_mut() = saved;
                         if resolved != *r {
                             if let Some(&id) = self.signal_name_to_id.get(resolved.as_ref()) {
-                                if !rids.contains(&id) {
-                                    rids.push(id);
-                                }
+                                record_rid(id, resolved.as_ref(), &mut rids);
                             }
                         }
                     }
@@ -2244,25 +2274,21 @@ impl Simulator {
                             if let Some(scope) = &scope_hint {
                                 let q = format!("{}.{}", scope, base);
                                 if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
-                                    if !rids.contains(&id) {
-                                        rids.push(id);
-                                    }
+                                    record_rid(id, q.as_str(), &mut rids);
                                     found = true;
                                 }
                             }
                             if !ab.scope.is_empty() && Some(&ab.scope) != scope_hint.as_ref() {
                                 let q = format!("{}.{}", ab.scope, base);
                                 if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
-                                    if !rids.contains(&id) {
-                                        rids.push(id);
-                                    }
+                                    record_rid(id, q.as_str(), &mut rids);
                                     found = true;
                                 }
                             }
-                            if let Some(id) = resolve_one(base) {
-                                if !rids.contains(&id) {
-                                    rids.push(id);
-                                }
+                            if let Some((id, key)) =
+                                self.resolve_read_name_and_key(base, &top_prefix)
+                            {
+                                record_rid(id, key, &mut rids);
                                 found = true;
                             }
                             if found {
@@ -2286,9 +2312,7 @@ impl Simulator {
                     ];
                     for name in scoped.iter().flatten() {
                         for &lid in self.unpacked_struct_sens.get(name).into_iter().flatten() {
-                            if !rids.contains(&lid) {
-                                rids.push(lid);
-                            }
+                            record_rid(lid, name.as_str(), &mut rids);
                         }
                     }
                 }
@@ -2388,6 +2412,11 @@ impl Simulator {
                         &super::time0_effects::T0Frame::block(&ab.stmt),
                         &mut t0_effects,
                     );
+                let mut rids = rids;
+                let mut wids = wids;
+                rids.shrink_to_fit();
+                wids.shrink_to_fit();
+                alias_t0_reads.shrink_to_fit();
                 entries.push(CombEntry {
                     item,
                     cold: Box::new(CombEntryCold {
@@ -2398,6 +2427,8 @@ impl Simulator {
                         span: ab.stmt.span,
                         cov: None,
                         time0_effects: ab_time0_effects,
+                        alias_t0_reads: (!alias_t0_reads.is_empty())
+                            .then(|| Box::new(alias_t0_reads)),
                     }),
                     has_unresolved_reads,
                     // §9.2.2.1: a level-only `always @(sensitivity)` block
@@ -5469,7 +5500,7 @@ impl Simulator {
                 if always_comb && e.cold.read_signal_ids.is_empty() {
                     return None;
                 }
-                if e.cold.read_signal_ids.is_empty() || always_comb {
+                if !e.defer_at_time0 && (e.cold.read_signal_ids.is_empty() || always_comb) {
                     Some(i)
                 } else {
                     None

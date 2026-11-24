@@ -41,16 +41,7 @@ impl Simulator {
         // the FIRST assignment target after the call — `value = r.read(c)`
         // in uvm_config_db::get (issue #113). One-shot; also cleared at the
         // next function-call entry so it cannot leak further than that.
-        // The marker is probed only when a `return <vif>` left one: the
-        // signal-map lookup was a string hash on EVERY assignment.
-        if self.vif_return_pending
-            && let Some(nm) = self
-                .signals
-                .remove("__vif_return__")
-                .map(|x| x.to_sv_string())
-                .filter(|s| !s.is_empty())
-        {
-            self.vif_return_pending = false;
+        if let Some(nm) = self.pending_vif_return.take().filter(|s| !s.is_empty()) {
             let synth = Expression::new(
                 ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
                     root: None,
@@ -2325,24 +2316,28 @@ impl Simulator {
                 // packed structs (`beats[i].last = 1`, `o.beats[i].mask =
                 // m`) is a slice of the element: write the element with
                 // the field's bits replaced. The read side
-                // (`packed_struct_elem_type`) already slices it.
-                if let ExprKind::Index { .. } = &expr.kind
-                    && let Some(su) = self.packed_struct_elem_type(expr)
+                // (`packed_struct_elem_type`) already slices it. So is a
+                // member of a packed struct nested in the element
+                // (`inst[i].arch.vl = v`, §7.2.1): only a member of the
+                // element itself was looked up, and the nested write was
+                // dropped.
+                let mut elem_expr = expr.as_ref();
+                while let ExprKind::MemberAccess { expr: inner, .. } = &elem_expr.kind {
+                    elem_expr = inner;
+                }
+                if let ExprKind::Index { .. } = &elem_expr.kind
+                    && let Some(su) = self.packed_struct_elem_type(elem_expr)
+                    && let Some((off, w, total)) = self.packed_member_chain_slice(&su, lhs)
                 {
-                    let (fields, total) = self.packed_agg_layout(&su);
-                    if let Some(&(_, off, w)) = fields.iter().find(|f| f.0 == member.name)
-                        && total > 0
-                    {
-                        let mut elem = self.eval_expr(expr);
-                        if elem.width != total {
-                            elem = elem.resize(total);
-                        }
-                        let fv = val.resize_for_assign(w);
-                        for i in 0..w {
-                            elem.set_bit((off + i) as usize, fv.get_bit(i as usize));
-                        }
-                        return self.assign_value(expr, &elem);
+                    let mut elem = self.eval_expr(elem_expr);
+                    if elem.width != total {
+                        elem = elem.resize(total);
                     }
+                    let fv = val.resize_for_assign(w);
+                    for i in 0..w {
+                        elem.set_bit((off + i) as usize, fv.get_bit(i as usize));
+                    }
+                    return self.assign_value(elem_expr, &elem);
                 }
                 // §13.4.2: a member of a subroutine-local / formal unpacked
                 // struct is owned by the call frame. Inside a subroutine body

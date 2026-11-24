@@ -2101,29 +2101,18 @@ impl Simulator {
                 sv.declared_names.push(nm.to_string());
                 // §13.5 / §25.9: a variable of any type hides a key left under
                 // its name by an enclosing or a caller's binding too.
-                if (d.dimensions.is_empty() && self.is_virtual_iface_type(data_type))
-                    || self.vif_local_names.contains(nm)
+                let alias_hit = self
+                    .local_iface_aliases
+                    .last_mut()
+                    .and_then(Option::as_deref_mut)
+                    .and_then(|f| f.bindings.remove(nm));
+                if alias_hit.is_some()
+                    || (d.dimensions.is_empty() && self.is_virtual_iface_type(data_type))
                 {
                     // §6.21 / §25.9: hiding a variable also hides its binding.
                     // Values alone cannot restore the enclosing vif after a
                     // nested block has rebound or cleared the same bare name.
-                    if let Some(aliases) = self.local_iface_aliases.last_mut() {
-                        sv.vif_aliases.push((nm.to_string(), aliases.remove(nm)));
-                    }
-                    let mut keys = vec![format!("__vif_local__{nm}")];
-                    if let Some(th) = self
-                        .this_stack
-                        .last()
-                        .copied()
-                        .flatten()
-                        .filter(|&h| h != 0)
-                    {
-                        keys.push(format!("__vif_local__{th}#{nm}"));
-                    }
-                    for key in keys {
-                        let saved = self.signals.remove(&key);
-                        sv.vif_slots.push((key, saved));
-                    }
+                    sv.vif_aliases.push((nm.to_string(), alias_hit));
                 }
                 let type_changes = match self.module.var_decl_types.get(nm) {
                     Some(old) => !Self::dt_trivially_equal(old, data_type),
@@ -2255,25 +2244,21 @@ impl Simulator {
                 ld.extend(sv.dyn_shadowed);
             }
         }
-        if let Some(aliases) = self.local_iface_aliases.last_mut() {
-            for (name, previous) in sv.vif_aliases {
-                match previous {
-                    Some(bound) => {
-                        aliases.insert(name, bound);
-                    }
-                    None => {
-                        aliases.remove(&name);
-                    }
-                }
-            }
-        }
-        for (key, previous) in sv.vif_slots {
+        for (name, previous) in sv.vif_aliases {
             match previous {
-                Some(value) => {
-                    self.signals.insert(key, value);
+                Some(bound) => {
+                    if let Some(aliases) = self.local_vif_frame_mut() {
+                        aliases.bindings.insert(name, bound);
+                    }
                 }
                 None => {
-                    self.signals.remove(&key);
+                    if let Some(aliases) = self
+                        .local_iface_aliases
+                        .last_mut()
+                        .and_then(Option::as_deref_mut)
+                    {
+                        aliases.bindings.remove(&name);
+                    }
                 }
             }
         }
@@ -3964,11 +3949,16 @@ impl Simulator {
             _ => return None,
         };
         if let Some(bound) = self
-            .local_iface_aliases
-            .last()
-            .and_then(|frame| frame.get(prop))
+            .local_vif_frame()
+            .and_then(|frame| frame.bindings.get(prop))
         {
+            if bound.is_empty() {
+                return None;
+            }
             return Some(format!("{}.{}", bound, member.name));
+        }
+        if self.local_stack.last().is_some_and(|l| l.contains_key(prop)) {
+            return None;
         }
         let this_h = self.this_stack.last().copied().flatten()?;
         let cls_name = self
@@ -4176,14 +4166,20 @@ impl Simulator {
                 };
                 if let Some(prop) = vif_prop_name {
                     {
-                        // Check `local_iface_aliases` first (task formal arg vif).
-                        if let Some(frame) = self.local_iface_aliases.last() {
-                            if let Some(bound) = frame.get(prop).cloned() {
-                                let target = format!("{}.{}", bound, member.name);
-                                if let Some(&id) = self.signal_name_to_id.get(target.as_str()) {
-                                    return Some(id);
-                                }
+                        // Check `local_vif_frame` first (formal/local vif shadows `this`).
+                        if let Some(bound) = self
+                            .local_vif_frame()
+                            .and_then(|frame| frame.bindings.get(prop))
+                            .cloned()
+                        {
+                            if bound.is_empty() {
+                                return None;
                             }
+                            let target = format!("{}.{}", bound, member.name);
+                            return self.signal_name_to_id.get(target.as_str()).copied();
+                        }
+                        if self.local_stack.last().is_some_and(|l| l.contains_key(prop)) {
+                            return None;
                         }
                         // Check `virtual_iface_bindings` via `this_stack`.
                         if let Some(Some(this_h)) = self.this_stack.last().copied() {
@@ -4633,10 +4629,14 @@ impl Simulator {
     /// a task formal (`local_iface_aliases`) or a class property of the
     /// running method's `this` (`virtual_iface_bindings`).
     fn nba_vif_bound_instance(&self, head: &str) -> Option<String> {
-        if let Some(frame) = self.local_iface_aliases.last() {
-            if let Some(bound) = frame.get(head) {
-                return Some(bound.clone());
-            }
+        if let Some(bound) = self
+            .local_vif_frame()
+            .and_then(|frame| frame.bindings.get(head))
+        {
+            return (!bound.is_empty()).then(|| bound.clone());
+        }
+        if self.local_stack.last().is_some_and(|l| l.contains_key(head)) {
+            return None;
         }
         if let Some(Some(this_h)) = self.this_stack.last().copied() {
             let cls_name = self
@@ -4716,20 +4716,19 @@ impl Simulator {
         // §4.9.4: commit matured future-time NBAs first — they were scheduled
         // in an earlier slot, so they precede this slot's freshly queued NBAs.
         if !self.delayed_nba.is_empty() {
-            let mut i = 0;
-            while i < self.delayed_nba.len() {
-                if self.delayed_nba[i].0 <= self.time {
-                    let (_, id, mut val) = self.delayed_nba.swap_remove(i);
-                    val.is_signed = self.signal_signed[id];
-                    if self.signal_table[id] != val {
-                        write_sig!(self, id, val);
-                        self.mark_dirty_id(id);
-                        self.table_modified = true;
-                    }
-                } else {
-                    i += 1;
+            // §4.6: nonblocking writes from one process take effect in execution
+            // order. Keep that order for both the due writes and the future ones.
+            let mut pending = std::mem::take(&mut self.delayed_nba);
+            let now = self.time;
+            for (_, id, mut val) in pending.extract_if(.., |(due, _, _)| *due <= now) {
+                val.is_signed = self.signal_signed[id];
+                if self.signal_table[id] != val {
+                    write_sig!(self, id, val);
+                    self.mark_dirty_id(id);
+                    self.table_modified = true;
                 }
             }
+            self.delayed_nba = pending;
         }
         // JIT Stage 4 Path C1: drain any JIT-emitted inline NBA writes
         // into nba_fast BEFORE clearing the per-window index, so

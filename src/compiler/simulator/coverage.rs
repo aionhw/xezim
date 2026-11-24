@@ -2293,6 +2293,7 @@ impl Simulator {
             .and_then(|x| x.as_ref())
             .map(|i| i.stopped_items.clone())
             .unwrap_or_default();
+        self.cg_sample_implicit_points(handle, &def, &stopped_items);
         for item in &def.items {
             if !stopped_items.is_empty() {
                 let item_name = match item {
@@ -2457,7 +2458,6 @@ impl Simulator {
                     // to its coverpoint's expression in this covergroup and
                     // eval, so the tuple captures the actual sampled values.
                     let mut tuple = Vec::new();
-                    let mut implicit_points: Vec<(String, Value)> = Vec::new();
                     for id in &cr.items {
                         let mut val = None;
                         for it in &def.items {
@@ -2469,43 +2469,12 @@ impl Simulator {
                                 }
                             }
                         }
-                        // §19.6: a crossed VARIABLE with no coverpoint of its
-                        // own gets an implicit coverpoint over it. It used to
-                        // be recorded as a constant 0. A dotted item is a
-                        // hierarchical reference (XEZIM_RELAX_CROSS_HIER_ITEM).
+                        // §19.6: a crossed variable with no coverpoint of its
+                        // own is an implicit coverpoint, sampled for the whole
+                        // covergroup (`cg_sample_implicit_points`), not here.
                         let val = match val {
                             Some(v) => v,
-                            None => {
-                                let e = Expression::new(
-                                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                                        root: None,
-                                        // An escaped name (`\a.b`) keeps its dot
-                                        // unless the switch made it a path.
-                                        path: (if sv_parser::RELAX_CROSS_HIER_ITEM.get() {
-                                            id.name.split('.').collect::<Vec<_>>()
-                                        } else {
-                                            vec![id.name.as_str()]
-                                        })
-                                        .into_iter()
-                                        .map(|n| crate::ast::expr::HierPathSegment {
-                                            name: crate::ast::Identifier {
-                                                name: n.to_string(),
-                                                span: id.span,
-                                            },
-                                            selects: Vec::new(),
-                                        })
-                                        .collect(),
-                                        span: id.span,
-                                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                                        cached_resolved_name: crate::ast::cache::NameCache::new(),
-                                        bound: crate::ast::binding::Bound::UNSET,
-                                    }),
-                                    id.span,
-                                );
-                                let v = self.eval_expr(&e);
-                                implicit_points.push((id.name.clone(), v.clone()));
-                                v
-                            }
+                            None => self.eval_expr(&Self::cg_implicit_point_expr(id)),
                         };
                         tuple.push(val);
                     }
@@ -2596,14 +2565,6 @@ impl Simulator {
                             .or_insert(0) += 1;
                         for k in bin_increments {
                             *inst.cross_bin_hits.entry(k).or_insert(0) += 1;
-                        }
-                        for (name, v) in implicit_points {
-                            *inst
-                                .point_hits
-                                .entry(name)
-                                .or_default()
-                                .entry(v)
-                                .or_insert(0) += 1;
                         }
                     }
                 }

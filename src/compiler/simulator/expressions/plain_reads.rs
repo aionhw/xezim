@@ -700,11 +700,17 @@ impl Simulator {
                     return false;
                 }
                 let n = h.path[0].name.name.as_str();
-                if self.class_member_names().vif_props.contains(n)
-                    || self.vif_local_names.contains(n)
-                    || self.is_interface_instance(n)
-                    || self.iface_alias_for(n).is_some()
+                if self
+                    .local_vif_frame()
+                    .is_some_and(|f| f.bindings.contains_key(n))
                 {
+                    return false;
+                }
+                let outer_vif = self.vif_prop_name_possible(n)
+                    || self.this_has_prop_vif(n)
+                    || self.is_interface_instance(n)
+                    || self.iface_alias_for(n).is_some();
+                if outer_vif && !self.local_stack.last().is_some_and(|l| l.contains_key(n)) {
                     return false;
                 }
                 // `ev == null` compares event identities.

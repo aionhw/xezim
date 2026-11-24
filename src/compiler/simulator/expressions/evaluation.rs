@@ -1890,30 +1890,42 @@ impl Simulator {
                 // never `iface.signal` selects) so ordinary comparisons keep
                 // their value semantics.
                 if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
-                    let lv = self.vif_operand_eval(left);
-                    let rv = self.vif_operand_eval(right);
-                    let engaged = lv.is_some() || rv.is_some();
-                    if engaged {
-                        // A bare `null` on the other side of a vif operand is
-                        // the unbound value.
-                        let l = lv.or_else(|| matches!(&left.kind, ExprKind::Null).then_some(None));
-                        let r =
-                            rv.or_else(|| matches!(&right.kind, ExprKind::Null).then_some(None));
-                        match (l, r) {
-                            (Some(l), Some(r)) => {
-                                let eq = l == r;
-                                let bit = if matches!(op, BinaryOp::Eq) { eq } else { !eq };
-                                return Value::from_u64(bit as u64, 1);
+                    let l_null = matches!(&left.kind, ExprKind::Null);
+                    let r_null = matches!(&right.kind, ExprKind::Null);
+                    if l_null ^ r_null {
+                        let other = if r_null { left } else { right };
+                        if let Some(is_bound) = self.vif_operand_is_bound(other) {
+                            let eq = !is_bound;
+                            let bit = if matches!(op, BinaryOp::Eq) { eq } else { !eq };
+                            return Value::from_u64(bit as u64, 1);
+                        }
+                    } else if !l_null {
+                        let lv = self.vif_operand_eval(left);
+                        let rv = self.vif_operand_eval(right);
+                        let engaged = lv.is_some() || rv.is_some();
+                        if engaged {
+                            // A bare `null` on the other side of a vif operand is
+                            // the unbound value.
+                            let l =
+                                lv.or_else(|| matches!(&left.kind, ExprKind::Null).then_some(None));
+                            let r = rv
+                                .or_else(|| matches!(&right.kind, ExprKind::Null).then_some(None));
+                            match (l, r) {
+                                (Some(l), Some(r)) => {
+                                    let eq = l == r;
+                                    let bit = if matches!(op, BinaryOp::Eq) { eq } else { !eq };
+                                    return Value::from_u64(bit as u64, 1);
+                                }
+                                // A BOUND vif never equals an operand that is not
+                                // itself vif-classifiable (its untracked storage
+                                // reads x/0 — `val == t` in uvm_resource::write).
+                                (Some(Some(_)), None) | (None, Some(Some(_))) => {
+                                    let bit = if matches!(op, BinaryOp::Eq) { 0 } else { 1 };
+                                    return Value::from_u64(bit, 1);
+                                }
+                                // Unbound vs unclassifiable: keep value semantics.
+                                _ => {}
                             }
-                            // A BOUND vif never equals an operand that is not
-                            // itself vif-classifiable (its untracked storage
-                            // reads x/0 — `val == t` in uvm_resource::write).
-                            (Some(Some(_)), None) | (None, Some(Some(_))) => {
-                                let bit = if matches!(op, BinaryOp::Eq) { 0 } else { 1 };
-                                return Value::from_u64(bit, 1);
-                            }
-                            // Unbound vs unclassifiable: keep value semantics.
-                            _ => {}
                         }
                     }
                 }

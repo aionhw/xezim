@@ -124,10 +124,8 @@ pub(super) fn note_event_trigger() {
 /// `12#m_q[3]`, `Cls::count`), so a write to a module variable does not
 /// re-check every gated waiter. A key with another compiler-generated part
 /// or an escaped identifier names no source spelling the waiters could
-/// share, so it notes every bit. A virtual-interface binding key
-/// (`__vif_local__x`, `__vif_return__`) notes its own spelling only: no
-/// gated condition reads one (`cond_operand_gated` declines vif-bound
-/// names), so a call binding a vif formal need not re-check them all.
+/// compiler-generated part or an escaped identifier names no source spelling
+/// the waiters could share, so it notes every bit.
 pub(super) fn signal_key_bits(k: &str) -> u64 {
     if k.contains('\\') {
         return u64::MAX;
@@ -150,10 +148,7 @@ pub(super) fn signal_key_bits(k: &str) -> u64 {
                 i += 1;
             }
             let run = &k[start..i];
-            if run.starts_with("__")
-                && !run.starts_with("__vif_local__")
-                && !run.starts_with("__vif_return__")
-            {
+            if run.starts_with("__") {
                 return u64::MAX;
             }
             bits |= name_bit(run);

@@ -4926,7 +4926,7 @@ impl Simulator {
         }
         self.push_local_frame(locals);
         self.method_local_base.push(self.local_stack.len() - 1);
-        self.local_iface_aliases.push(HashMap::default());
+        self.local_iface_aliases.push(None);
         let saved_m_scope = std::mem::take(&mut self.m_scope_stack);
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;

@@ -577,3 +577,5 @@ mod generate_nettype_drivers;
 mod instance_array_packed_actual_slices_1488;
 #[path = "hierarchy/package_imports_in_instances_1530.rs"]
 mod package_imports_in_instances_1530;
+#[path = "hierarchy/identity_net_time0_update_1532.rs"]
+mod identity_net_time0_update_1532;

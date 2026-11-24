@@ -8,6 +8,7 @@ impl Simulator {
     /// object member, a struct member reached through any selects, an
     /// associative element that is itself a collection) or a slice contributes
     /// its elements. Expand a fixed row only for a non-array element type.
+    /// Under §10.10.3 nested braces form one self-determined vector or string.
     #[inline(never)]
     pub(in crate::compiler::simulator) fn unpacked_concat_operand_values<'e>(
         &mut self,
@@ -78,35 +79,17 @@ impl Simulator {
                 ..
             } = &expr.kind
             {
-                let rname = match &rbase.kind {
-                    ExprKind::Ident(rhier) => {
-                        let mut rname = self.resolve_hier_name(rhier);
-                        // Instance-scope a member-queue slice
-                        // operand inside a concat (`{q[0:i], …}`).
-                        if let Some(s) = self.instance_assoc_member(&rname) {
-                            rname = std::borrow::Cow::Owned(s);
-                        }
-                        Some(rname)
-                    }
-                    _ => None,
-                };
-                // §7.4.5, §10.10: a slice of a fixed array or of one of its
-                // rows; a queue or dynamic-array slice takes the path below.
-                let collection = rname.as_deref().is_some_and(|n| {
-                    self.module.dynamic_arrays.contains(n) || self.class_queue_prop(n)
-                });
-                if !collection && self.append_fixed_slice_concat_values(expr, &mut all_vals) {
+                let rname = self.array_operand_name(rbase);
+                // Fixed slices retain their declared direction. A live
+                // queue/dynamic array, including an object property, takes
+                // its upper bound from its current length.
+                let live_size = rname.as_deref().and_then(|n| self.live_coll_size(n));
+                if live_size.is_none() && self.append_fixed_slice_concat_values(expr, &mut all_vals) {
                     continue;
                 }
                 if let Some(rname) = rname {
-                    if self.module.arrays.contains_key(&*rname) {
-                        let (r_lo_a, r_hi_a, _) = self.module.arrays[&*rname];
-                        let r_is_dyn = self.module.dynamic_arrays.contains(&*rname);
-                        let r_upper: i64 = if r_is_dyn {
-                            (self.get_queue_size(&rname) as i64) - 1
-                        } else {
-                            r_hi_a
-                        };
+                    if let Some(&(r_lo_a, r_hi_a, _)) = self.module.arrays.get(&rname) {
+                        let r_upper = live_size.map_or(r_hi_a, |size| r_lo_a + size as i64 - 1);
                         self.dollar_bound.push(r_upper);
                         let l = self.eval_expr(left).to_i64().unwrap_or(0);
                         let r = self.eval_expr(right).to_i64().unwrap_or(0);

@@ -376,6 +376,8 @@ mod covergroup_cross_bins;
 mod covergroup_illegal_bins;
 #[path = "classes/covergroup_implicit_names.rs"]
 mod covergroup_implicit_names;
+#[path = "classes/covergroup_cross_implicit_points.rs"]
+mod covergroup_cross_implicit_points;
 #[path = "classes/covergroup_options.rs"]
 mod covergroup_options;
 #[path = "classes/covergroup_placement.rs"]
@@ -1379,3 +1381,35 @@ mod rand_srandom_reseed_repeats;
 mod review_rand_srandom_streams;
 #[path = "classes/class_row_replication_once.rs"]
 mod class_row_replication_once;
+#[path = "classes/randomize_signed_modulo_elements.rs"]
+mod randomize_signed_modulo_elements;
+
+#[path = "classes/inherited_packed_typedef_width.rs"]
+mod inherited_packed_typedef_width;
+
+#[path = "classes/waiting_vif_formal_name_reuse_1478.rs"]
+mod waiting_vif_formal_name_reuse_1478;
+
+#[path = "classes/blocking_task_super_nested_module.rs"]
+mod blocking_task_super_nested_module;
+
+#[path = "classes/static_collection_initializers.rs"]
+mod static_collection_initializers;
+
+#[path = "classes/nested_member_elem_write.rs"]
+mod nested_member_elem_write;
+
+#[path = "classes/imported_enum_over_unit_parameter.rs"]
+mod imported_enum_over_unit_parameter;
+
+#[path = "classes/property_pattern_element_context.rs"]
+mod property_pattern_element_context;
+
+#[path = "classes/factory_specialization_in_child.rs"]
+mod factory_specialization_in_child;
+
+#[path = "classes/class_collection_member_index_write.rs"]
+mod class_collection_member_index_write;
+
+#[path = "classes/class_scoped_blocking_task.rs"]
+mod class_scoped_blocking_task;

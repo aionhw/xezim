@@ -51,7 +51,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // Wide partial NBA profiling retains separate quiet and cloned counts.
 // §16.14.6: Simulator::delay_pids and ::delay_resumed, SvaClockedSite::tick_time.
 // §6.21: BlockScopeSave::static_hidden keeps each hidden static's position.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x24";
+// Per-frame VifAliasFrame, prop_vif_bindings, pending_vif_return, and LoopVarSnapshot replace flat vif keys.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x26";
 
 #[derive(Default)]
 struct Session {
@@ -1577,6 +1578,7 @@ checkpoint_state!(
     program_pid_scope,
     program_pids,
     prop_raw_ty_cache,
+    prop_vif_bindings,
     prop_width_memo,
     queue_elem_moves,
     queue_frame_saves,
@@ -1718,9 +1720,7 @@ checkpoint_state!(
     var_type_args,
     var_typedef_types,
     vc_saved,
-    vif_key_scratch,
-    vif_local_names,
-    vif_return_pending,
+    pending_vif_return,
     vif_tokens_stored,
     viface_var_aliases,
     virtual_iface_bindings,

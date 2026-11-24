@@ -183,7 +183,9 @@ thread_local! {}
 // §7.5, §7.10: compiled local collection reads retain element width and sign.
 // §7.4.5: packed element constant indices keep their declared sign.
 // §7.10.2: module queue pops call the collection runtime directly.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317d;
+// Compiled collection return types, inherited packed typedef widths, and
+// constant-loop stores through packed members.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3181;
 
 /// Depth at which `run_process_stmts` loop handlers switch from recursing to
 /// trampolining via the event queue. ~2.9KB/frame overflows an 8MB stack near
@@ -558,7 +560,10 @@ macro_rules! write_sig {
 // §7.2, §7.4.2: a member select through constant element selects of a packed struct, and a
 // nested packed-struct member read, compile to range stores and selects.
 // §7.4.5: signed constant labels of packed array elements.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB081";
+// Indexed packed-struct write regions and delayed unpacked-array drivers.
+// Timed implicit event controls retain their inferred sensitivity.
+// Continuous assignments lower nested packed concatenations as array elements.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB087";
 
 mod aggregate_assignments;
 mod pattern_array_items;
@@ -592,6 +597,7 @@ mod constraint_solver;
 mod constraint_targets;
 mod construction;
 mod coverage;
+mod coverage_implicit;
 mod dpi_imports;
 mod edges;
 mod enum_receivers;
@@ -1671,13 +1677,15 @@ pub struct Simulator {
     /// The wait-free analysis that gates compiling a class task (see
     /// `task_suspend`).
     ts: task_suspend::TsState,
-    /// LRM §25.9: stack of per-call virtual-interface formal-arg
-    /// aliases. When a task or function takes `virtual <iface> <name>`,
-    /// the call hooks add a frame mapping `<name>` to the caller's
-    /// interface-instance identifier (e.g. `bus`). `resolve_hier_name`
-    /// consults the top frame so `vif.member` resolves to `bus.member`.
-    /// Popped at task return.
-    local_iface_aliases: Vec<HashMap<String, String>>,
+    /// LRM §25.9: stack of per-call virtual-interface formal-arg and local
+    /// aliases. None when a call has no vif formals/locals (zero allocation).
+    /// Popped at subroutine return and carried across task suspension in
+    /// `ProcessContext`.
+    local_iface_aliases: Vec<Option<Box<VifAliasFrame>>>,
+    /// Per-object virtual-interface bindings for type-parameterized class
+    /// properties (`T prop` when `T` is bound to `virtual <iface>`), keyed by
+    /// `(object_handle) -> prop -> instance_name`. Swept in `heap_gc`.
+    prop_vif_bindings: HashMap<usize, HashMap<String, String>>,
     /// LRM §25.9: name aliases for PLAIN variables declared `virtual
     /// <iface>` (block-local or module-scope, not class properties and
     /// not subroutine formals). `vif = bus;` records `vif -> bus` here;
@@ -2764,6 +2772,7 @@ pub struct Simulator {
     /// Pids of `initial` blocks that cannot suspend (no timing control,
     /// no blocking call); see `order_time0_processes`.
     t0_timing_free: HashSet<usize>,
+    t0_event_heads: HashSet<usize>,
     /// Time-0 activation index of each process queued at time 0, consulted
     /// by `clock_rank_on_pop` until the first drain settles the generators.
     t0_pid_ord: HashMap<usize, usize>,
@@ -3000,8 +3009,6 @@ pub struct Simulator {
     /// table.
     #[serde(skip)]
     decl_param_scope_cache: std::cell::RefCell<DeclParamScopeCache>,
-    /// Reused buffer for the `__vif_local__` key probes (`&self` paths).
-    vif_key_scratch: std::cell::RefCell<String>,
     /// §8.25: specialization-argument texts already folded to their value
     /// (`2 + 2` -> `4`, `'h4` -> `4`), or None when the text is not a
     /// constant integer expression (see `fold_const_spec_frag`).
@@ -3081,9 +3088,6 @@ pub struct Simulator {
     /// See `class_member_names`.
     #[serde(skip)]
     class_member_names_cell: std::cell::OnceCell<ClassMemberNames>,
-    /// Every bare name a `__vif_local__` key was ever created for (never
-    /// shrinks): a name outside it has no such key.
-    vif_local_names: HashSet<String>,
     /// See `nonvirtual_target_class`.
     #[allow(clippy::type_complexity)]
     nonvirtual_target_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
@@ -4359,8 +4363,8 @@ pub struct Simulator {
     /// entry count like the bitset itself. A fixed 32-word array here
     /// overflowed on c910 (218k entries).
     settle_inject_sum: Vec<u64>,
-    /// A `return <virtual interface>` left `__vif_return__` for the next assignment.
-    vif_return_pending: bool,
+    /// A `return <virtual interface>` left this bound instance name for the next assignment.
+    pending_vif_return: Option<String>,
     /// Static lvalue widths of bare-leaf identifiers, per identifier span (see infer_lhs_width).
     lhs_leaf_width_cache: HashMap<(usize, usize), u32>,
     /// See `blocking_cont_frame`. Keyed by `(node_addr, kind)` and retains
@@ -4699,10 +4703,18 @@ pub struct Simulator {
     /// actual's id, the port's value before the update and the actual's
     /// value after the pre-process settle (raw v, x).
     time0_port_edges: Vec<(String, usize, (u64, u64), (u64, u64))>,
+    /// Wide (`width > 64`) counterpart to `time0_port_edges`.
+    time0_wide_port_edges: Vec<(String, usize, Value, Value)>,
     /// §10.3.3: the ids a collapsed alias name (see `SensitivityId::alias_t0`)
     /// maps to whose value the pre-process settle left alone, with that
     /// value (raw v, x): the alias's time-0 update ends there.
     time0_alias_edges: Vec<(usize, (u64, u64))>,
+    /// Wide (`width > 64`) counterpart to `time0_alias_edges`.
+    time0_wide_alias_edges: Vec<(usize, Value)>,
+    /// Deferred combinational entries (`defer_at_time0`) that already ran in
+    /// the pre-process time-0 settle, so `fire_time0_input_port_blocks` must
+    /// not re-fire them at time 0.
+    t0_deferred_ran: HashSet<usize>,
     /// Edge blocks a time-0 alias or port update woke before any process
     /// ran. One that fires on its own at time 0 leaves the list (it runs
     /// once, as in the reference simulator); the rest run from
@@ -4713,6 +4725,9 @@ pub struct Simulator {
     edge_forced_fire: Vec<usize>,
     /// True while the compile-time (pre-process) time-0 settle runs.
     in_pre_process_settle: bool,
+    /// True while pre-time-0 declaration initializers run (`compile()`),
+    /// suppressing combinational settle triggers (`settle_after_proc_write`).
+    in_pre_time0_init: bool,
     /// A combinational entry is being evaluated outside the settle
     /// (`release_time0_held`): its deferred assertion reports are the
     /// block's, as in the settle (`queue_deferred_assert`).

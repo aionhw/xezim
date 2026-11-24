@@ -712,17 +712,7 @@ impl Simulator {
         if self.get_signal_value_by_name(first).is_none() {
             return false;
         }
-        fn flatten<'a>(parts: &'a [Expression], out: &mut Vec<&'a Expression>) {
-            for e in parts {
-                match &e.kind {
-                    ExprKind::Concatenation(inner) => flatten(inner, out),
-                    _ => out.push(e),
-                }
-            }
-        }
-        let mut items = Vec::with_capacity(parts.len());
-        flatten(parts, &mut items);
-        let values = self.unpacked_concat_operand_values(items, true, None);
+        let values = self.unpacked_concat_operand_values(parts.iter().collect(), true, None);
         for (name, v) in dst.names.iter().zip(values) {
             if let Some(name) = name {
                 self.set_signal_value_by_name(name, v);

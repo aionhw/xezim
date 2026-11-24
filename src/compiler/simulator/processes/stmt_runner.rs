@@ -802,8 +802,26 @@ impl Simulator {
                     };
                     if let Some((rh, mn)) = resolved {
                         if rh != 0 {
-                            let is_super = matches!(&func.kind, ExprKind::MemberAccess { expr: recv, .. }
-                                if matches!(&recv.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "super"));
+                            // §8.15: `super.m(args)` binds statically, from the
+                            // parent of the class that contains the call. It
+                            // parses as a MemberAccess on `super`, but a class
+                            // declared in a module instantiated below the top
+                            // reaches here flattened to an Ident `[super, m]`.
+                            // Taking that shape for a plain receiver resolved
+                            // `m` on the object's own class, so an override
+                            // that calls `super.m()` inlined itself again and
+                            // recursed at one time step without ever waiting.
+                            let is_super = match &func.kind {
+                                ExprKind::MemberAccess { expr: recv, .. } => {
+                                    matches!(&recv.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "super")
+                                }
+                                ExprKind::Ident(h) => {
+                                    h.path.len() == 2
+                                        && h.path[0].name.name == "super"
+                                        && h.path[0].selects.is_empty()
+                                }
+                                _ => false,
+                            };
                             let cls = if is_super {
                                 self.class_context_stack
                                     .last()
@@ -896,13 +914,12 @@ impl Simulator {
                 }
             }
 
-            // Stage 1c: a blocking STATIC method call
+            // Stage 1c: a blocking class-scoped method call
             // `Class::method()` with no receiver handle — Stage 1b skipped it
             // because `path[0]` is a class name, not a handle var. For a static
             // method containing blocking calls (e.g. `forever begin hopper.get(...); fork ... join_none; end`),
             // running synchronously prevents its blocking `get` from suspending.
-            // Inline it (static context = the class, null `this`) so those waits
-            // suspend the process.
+            // Inline the selected body so those waits can suspend the process.
             if let StatementKind::Expr(expr) = &stmt.kind {
                 if let ExprKind::Call { func, args } = &expr.kind {
                     // `Class::method()` reaches here in two parse shapes:
@@ -1044,26 +1061,25 @@ impl Simulator {
                             let crate::ast::decl::ClassMethodKind::Task(td) = &tm.kind else {
                                 unreachable!("resolve_class_task yields tasks only")
                             };
-                            if self.stmts_have_blocking(&td.items) {
-                                let spec = recv_spec.clone().or_else(|| self.current_spec.clone());
+                            let is_static = self.is_static_method(&cls, &mn);
+                            // §8.23: an explicit class scope selects the body
+                            // statically while retaining the current object.
+                            let receiver = self.this_stack.last().copied().flatten().filter(|&h| {
+                                !is_static && self.heap.get(h).and_then(Option::as_ref)
+                                    .is_some_and(|obj| self.class_is_a(&obj.class_name, &cls))
+                            });
+                            if (is_static || receiver.is_some()) && self.stmts_have_blocking(&td.items) {
+                                let spec = self.task_method_spec(receiver, &mclass)
+                                    .or_else(|| recv_spec.clone())
+                                    .or_else(|| self.current_spec.clone());
+                                let saved_spec = self.current_spec.clone();
                                 let mut cleanup = self.bind_task_frame(
                                     td,
                                     args,
-                                    Some((spec, None, mclass.clone())),
+                                    Some((spec, receiver, mclass.clone())),
                                 );
-                                // Static context: push the declaring class for
-                                // member/static resolution, with a null `this`.
-                                self.m_scope_stack.clear();
-                                self.this_stack.push(None);
-                                self.class_context_stack.push(Some(mclass));
-                                self.method_local_base
-                                    .push(self.local_stack.len().saturating_sub(1));
-                                cleanup.pushed_method_this = true;
-                                let saved_spec = self.current_spec.clone();
-                                // The frame's unwind restores the caller's
-                                // specialization (§8.25).
-                                cleanup.saved_spec = saved_spec.clone();
-                                if let Some((sb, ss)) = recv_spec {
+                                self.push_task_method_this(receiver, mclass, &mut cleanup);
+                                if is_static && let Some((sb, ss)) = recv_spec {
                                     self.ensure_spec_statics(&sb, &ss);
                                     self.current_spec = Some((sb, ss));
                                 }
@@ -2252,6 +2268,13 @@ impl Simulator {
                                 if let Some(frame) = self.local_stack.last_mut() {
                                     frame.insert(name.name.clone(), rv);
                                     self.hide_loop_static(&name.name, &mut static_hidden);
+                                    if let Some(aliases) = self
+                                        .local_iface_aliases
+                                        .last_mut()
+                                        .and_then(Option::as_deref_mut)
+                                    {
+                                        aliases.bindings.remove(&name.name);
+                                    }
                                 } else {
                                     // §12.7.1: a variable declared in the for-init
                                     // has AUTOMATIC lifetime — it is local to the
@@ -2654,10 +2677,15 @@ impl Simulator {
                                     }
                                 }
                             }
+                            if keys.is_empty() {
+                                i += 1;
+                                continue;
+                            }
                             let fe_names: Vec<String> = vars
                                 .iter()
                                 .filter_map(|v| v.as_ref().map(|id| id.name.clone()))
                                 .collect();
+                            let fe_saved = self.snapshot_loop_vars(&fe_names);
                             let fe_auto_len = self.auto_loop_vars.len();
                             // foreach index vars are automatic (§9.7.3); like
                             // for-init vars, record for fork capture.
@@ -2671,11 +2699,6 @@ impl Simulator {
                                 .and_then(|v| v.as_ref().map(|id| id.name.clone()));
                             if let Some(vn) = &loop_var {
                                 self.widths.insert(vn.clone(), key_type.0);
-                            }
-                            if keys.is_empty() {
-                                self.auto_loop_vars.truncate(fe_auto_len);
-                                i += 1;
-                                continue;
                             }
                             // §6.21, §12.7.3: the loop variable hides the
                             // subroutine's same-named `static` local until the
@@ -2718,36 +2741,37 @@ impl Simulator {
                                     body_id,
                                 ),
                             ));
-                            let mut tail_stmts = vec![Statement::new(
-                                StatementKind::ForeachTail {
-                                    loop_var,
-                                    var_scope,
-                                    body: marker,
-                                    keys,
-                                    is_str,
-                                    key_type,
-                                    idx: 1,
-                                    fe_auto_len,
-                                    live_size_name,
-                                },
-                                stmt.span,
-                            )];
-                            // Each later iteration's tail resumes this frame
-                            // after its first statement, so its trailing
-                            // `Null` runs once, when the loop ends, and shows
-                            // the hidden statics again (`block_scope_sentinel`).
-                            if static_hidden.is_some() {
-                                tail_stmts.push(Statement::new(StatementKind::Null, stmt.span));
-                            }
-                            let tail = pc.pushed(tail_stmts, pc.start + i + 1);
-                            if static_hidden.is_some() {
+                            let wrap_frame: Arc<[Statement]> = Arc::from(vec![
+                                Statement::new(
+                                    StatementKind::ForeachTail {
+                                        loop_var,
+                                        var_scope,
+                                        body: marker,
+                                        keys,
+                                        is_str,
+                                        key_type,
+                                        idx: 1,
+                                        fe_auto_len,
+                                        live_size_name,
+                                    },
+                                    stmt.span,
+                                ),
+                                // Each later iteration's tail resumes this frame
+                                // after its first statement, so its trailing
+                                // `Null` runs once, when the loop ends, and restores
+                                // loop variables and hidden statics (`block_scope_sentinel`).
+                                Statement::new(StatementKind::Null, stmt.span),
+                            ]);
+                            if !fe_saved.is_empty() || static_hidden.is_some() {
                                 self.block_scope_saves.push(BlockScopeSave {
-                                    frame_key: Self::frame_key(&tail.stmts),
+                                    frame_key: Self::frame_key(&wrap_frame),
                                     frame_gen: self.local_gen_stack.last().copied().unwrap_or(0),
+                                    loop_vars: fe_saved,
                                     static_hidden,
                                     ..Default::default()
                                 });
                             }
+                            let tail = pc.pushed_frame(wrap_frame, pc.start + i + 1);
                             let cont = tail.pushed_frame(body_frame, 0);
                             self.continue_stmts_or_trampoline(pid, cont);
                             return;

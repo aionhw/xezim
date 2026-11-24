@@ -14,14 +14,15 @@ pub(super) struct EdgeBatch {
 }
 
 impl EdgeBatch {
-    pub(super) fn build(blocks: &[usize], block_count: usize) -> Vec<Self> {
+    pub(super) fn build(blocks: &[u32], block_count: usize) -> Box<[Self]> {
         // Preserve scalar accounting for duplicate sensitivity terms and keep
         // short fanouts on the cheaper per-member path.
         if blocks.len() < 32 || !blocks.windows(2).all(|pair| pair[0] < pair[1]) {
-            return Vec::new();
+            return Box::default();
         }
         let mut batches: Vec<Self> = Vec::new();
         for &block in blocks {
+            let block = block as usize;
             let start = (block & !7).min(block_count - 8);
             if batches.last().is_none_or(|batch| batch.start != start) {
                 batches.push(Self { start, members: 0 });
@@ -30,9 +31,9 @@ impl EdgeBatch {
         }
         // A sparse list wastes the word loads and mask iteration.
         if batches.len() <= blocks.len() / 4 {
-            batches
+            batches.into_boxed_slice()
         } else {
-            Vec::new()
+            Box::default()
         }
     }
 
@@ -71,7 +72,7 @@ mod edge_batch_tests {
 
     #[test]
     fn dense_fanout_preserves_scalar_order_and_skip_count() {
-        let blocks: Vec<_> = (0..16).chain(19..43).collect();
+        let blocks: Vec<u32> = (0..16).chain(19..43).collect();
         let batches = EdgeBatch::build(&blocks, 43);
         assert!(!batches.is_empty());
         let mut flags = [0; 43];
@@ -96,9 +97,9 @@ mod edge_batch_tests {
 
     #[test]
     fn sparse_and_duplicate_fanouts_use_scalar_path() {
-        let sparse: Vec<_> = (0..32).map(|block| block * 8).collect();
+        let sparse: Vec<u32> = (0..32).map(|block| block * 8).collect();
         assert!(EdgeBatch::build(&sparse, 256).is_empty());
-        let mut duplicate: Vec<_> = (0..32).collect();
+        let mut duplicate: Vec<u32> = (0..32).collect();
         duplicate.insert(8, 7);
         assert!(EdgeBatch::build(&duplicate, 32).is_empty());
     }
@@ -516,7 +517,7 @@ impl Simulator {
             .map(|c| self.name_resolve_hint.replace(c.scope.clone()));
         for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
             let (pv, px) = waiter.captured_prev[i];
-            let pw = waiter.captured_prev_wide[i].as_ref();
+            let pw = waiter.captured_prev_wide.get(i).and_then(|o| o.as_ref());
             if !self.term_fires(sid, pv, px, pw) {
                 continue;
             }
@@ -636,6 +637,11 @@ impl Simulator {
             for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
                 waiter.captured_prev[i] = self.term_raw_bits(sid.signal_id);
                 if let Some(v) = self.term_wide_value(sid.signal_id) {
+                    if waiter.captured_prev_wide.len() < waiter.resolved_sensitivities.len() {
+                        waiter
+                            .captured_prev_wide
+                            .resize(waiter.resolved_sensitivities.len(), None);
+                    }
                     waiter.captured_prev_wide[i] = Some(v);
                 }
             }
@@ -667,15 +673,28 @@ impl Simulator {
             let fixed = terms.iter().take_while(|t| !t.cell).count();
             self.resolve_cell_terms(&mut terms);
             w.captured_prev.truncate(fixed);
-            w.captured_prev_wide.truncate(fixed);
             w.arm_bits.truncate(fixed);
-            w.guard_prev.truncate(fixed);
+            if !w.captured_prev_wide.is_empty() {
+                w.captured_prev_wide.truncate(fixed);
+            }
+            if !w.guard_prev.is_empty() {
+                w.guard_prev.truncate(fixed);
+            }
             for t in &terms[fixed..] {
                 let bits = self.term_raw_bits(t.signal_id);
                 w.captured_prev.push(bits);
                 w.arm_bits.push(bits);
-                w.captured_prev_wide.push(self.term_wide_value(t.signal_id));
-                w.guard_prev.push(None);
+                let wide = self.term_wide_value(t.signal_id);
+                if wide.is_some() || !w.captured_prev_wide.is_empty() {
+                    if w.captured_prev_wide.is_empty() {
+                        w.captured_prev_wide
+                            .resize(w.captured_prev.len() - 1, None);
+                    }
+                    w.captured_prev_wide.push(wide);
+                }
+                if !w.guard_prev.is_empty() {
+                    w.guard_prev.push(None);
+                }
             }
             w.resolved_sensitivities = terms;
         }
@@ -684,6 +703,9 @@ impl Simulator {
             let Some(e) = w.resolved_sensitivities[i].value_of.as_ref() else {
                 continue;
             };
+            if w.guard_prev.len() < w.resolved_sensitivities.len() {
+                w.guard_prev.resize(w.resolved_sensitivities.len(), None);
+            }
             w.guard_prev[i] = Some(self.event_value_snapshot(e, &mut last));
         }
     }
@@ -2544,7 +2566,7 @@ impl Simulator {
                     );
                 } else {
                     for &block_idx in &fanout.posedge {
-                        dispatch_block!(block_idx, EdgeKind::Posedge);
+                        dispatch_block!(block_idx as usize, EdgeKind::Posedge);
                     }
                 }
             }
@@ -2559,19 +2581,19 @@ impl Simulator {
                     );
                 } else {
                     for &block_idx in &fanout.negedge {
-                        dispatch_block!(block_idx, EdgeKind::Negedge);
+                        dispatch_block!(block_idx as usize, EdgeKind::Negedge);
                     }
                 }
             }
             if fires_any {
                 for &block_idx in &fanout.anyedge {
-                    dispatch_block!(block_idx, EdgeKind::AnyEdge);
+                    dispatch_block!(block_idx as usize, EdgeKind::AnyEdge);
                 }
             }
             // §9.4.2 `@(edge x)`: an LSB posedge OR negedge (not any change).
             if fires_pos || fires_neg {
                 for &block_idx in &fanout.lsbedge {
-                    dispatch_block!(block_idx, EdgeKind::LsbEdge);
+                    dispatch_block!(block_idx as usize, EdgeKind::LsbEdge);
                 }
             }
             if woke_any && stats_on && sid < self.sensitivity_trigger_count.len() {

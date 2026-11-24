@@ -512,6 +512,7 @@ impl Simulator {
                     span: crate::ast::Span::dummy(),
                     cov: None,
                     time0_effects: false,
+                    alias_t0_reads: None,
                 }),
                 has_unresolved_reads: false,
                 defer_at_time0: false,

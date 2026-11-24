@@ -921,6 +921,13 @@ impl Simulator {
                             // `for (int hart...)` never iterate).
                             if let Some(frame) = self.local_stack.last_mut() {
                                 frame.insert(name.name.clone(), rv);
+                                if let Some(aliases) = self
+                                    .local_iface_aliases
+                                    .last_mut()
+                                    .and_then(Option::as_deref_mut)
+                                {
+                                    aliases.bindings.remove(&name.name);
+                                }
                             } else {
                                 self.set_signal_value_by_name(&name.name, rv);
                             }
@@ -1614,9 +1621,7 @@ impl Simulator {
                         .then(|| self.resolve_vif_rhs_name_strict(e))
                         .flatten()
                     {
-                        self.signals
-                            .insert("__vif_return__".to_string(), Value::from_string(&nm));
-                        self.vif_return_pending = true;
+                        self.pending_vif_return = Some(nm);
                     }
                     // §13.4: `return <collection>` — record the collection's
                     // storage name so the caller's assign can copy elements
@@ -1753,7 +1758,21 @@ impl Simulator {
                             ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
                         ) {
                             const RET_SNAP: &str = "__xz_ret_coll__";
-                            self.populate_queue_from_init(RET_SNAP, e);
+                            // The shared snapshot can still describe an earlier call.
+                            // The literal takes the active function's declared return type.
+                            let dt = self.return_frame_type();
+                            let width = dt.as_ref().map_or(32, |dt| {
+                                resolve_type_width(
+                                    dt,
+                                    Some(&self.module.parameters),
+                                    Some(&self.module.typedefs),
+                                )
+                            });
+                            let expand_rows = dt
+                                .as_ref()
+                                .and_then(|dt| self.fn_ret_coll_dims(dt))
+                                .is_none_or(|dims| dims.len() == 1);
+                            self.store_queue_literal(RET_SNAP, e, dt.as_ref(), width, expand_rows);
                             self.pending_ret_collection = Some(RET_SNAP.to_string());
                         }
                     }

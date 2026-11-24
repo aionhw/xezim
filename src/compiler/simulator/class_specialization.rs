@@ -2069,6 +2069,18 @@ impl Simulator {
         a.name == b.name && a.enclosing == b.enclosing && a.declaring_module == b.declaring_module
     }
 
+    /// A module instance can register both an unqualified class name and
+    /// its instance-qualified spelling for the same declaration (§8.25).
+    pub(super) fn class_names_alias(&self, a: &str, b: &str) -> bool {
+        a == b
+            || self
+                .module
+                .classes
+                .get(a)
+                .zip(self.module.classes.get(b))
+                .is_some_and(|(left, right)| Self::same_class_declaration(left, right))
+    }
+
     /// §8.25: only parameters in the lexical class scope can shadow a module
     /// constant. An unrelated class declaring the same name has no effect.
     fn class_parameter_owner(&self, name: &str) -> Option<&str> {
@@ -4141,14 +4153,12 @@ impl Simulator {
         if self.try_bind_virtual_iface_inner(lvalue, rvalue) {
             return true;
         }
-        // LHS is a PLAIN NAME (subroutine local, formal, static prop): no
-        // (instance, prop) slot exists, so propagate the binding via the
-        // __vif_local__ convention — resolve_vif_rhs_name's read side
-        // already honors it. This is how a virtual interface survives
-        // uvm_config_db's parameterized static set/get round-trip
-        // (issue #113: the driver's vif stayed null so no stimulus ran).
-        // Gated on a CONFIDENT vif RHS; ordinary assigns fall through
-        // untouched (return false → the normal value assign still runs).
+        // LHS is a PLAIN NAME (subroutine local, formal, type-param property):
+        // no declared virtual-interface slot exists, so propagate the binding
+        // into the frame's alias map (`local_iface_aliases`) or the per-object
+        // `prop_vif_bindings` map. Gated on a CONFIDENT vif RHS; ordinary
+        // assigns fall through untouched (return false → the normal value assign
+        // still runs).
         if let ExprKind::Ident(h) = &lvalue.kind {
             if h.path.len() == 1 {
                 // Cheap RHS shape gate FIRST: the strict resolver only ever
@@ -4166,13 +4176,16 @@ impl Simulator {
                     return false;
                 }
                 let lname: &str = h.path[0].name.name.as_str();
-                // `null` acts only on a vif property of `this` or a name that
-                // holds a `__vif_local__` key (the key removal otherwise finds
-                // nothing, and the ordinary assignment notes the name). Any
-                // other RHS must be able to name an interface instance.
+                // `null` acts only on a vif property of `this`, a frame alias,
+                // or a module vif alias. Any other RHS must be able to name an
+                // interface instance.
                 if matches!(&rvalue.kind, ExprKind::Null) {
-                    if !self.class_member_names().vif_props.contains(lname)
-                        && !self.vif_local_names.contains(lname)
+                    if !self.vif_prop_name_possible(lname)
+                        && !self.this_has_prop_vif(lname)
+                        && !self
+                            .local_vif_frame()
+                            .is_some_and(|f| f.bindings.contains_key(lname))
+                        && !self.viface_var_aliases.contains_key(lname)
                     {
                         return false;
                     }
@@ -4181,11 +4194,7 @@ impl Simulator {
                 }
                 // A bare name that is a PROPERTY of `this` stores per-instance
                 // (each uvm_resource's `val` must keep its own interface);
-                // otherwise the flat local/static key.
-                // Classify the bare name against `this`:
-                //   declared vif prop -> the REAL binding map (runtime
-                //   @(vif.sig)/reads consult it), other prop -> per-instance
-                //   string key, otherwise -> flat local/static key.
+                // otherwise the frame alias (or module/package var alias).
                 let mut is_vif_prop_of: Option<usize> = None;
                 let mut is_prop_of: Option<usize> = None;
                 // A local or formal of the current frame shadows a property.
@@ -4232,86 +4241,57 @@ impl Simulator {
                     }
                     return false;
                 }
-                let make_key = |is_prop_of: Option<usize>| -> String {
-                    let mut key = String::with_capacity(lname.len() + 24);
-                    key.push_str("__vif_local__");
-                    if let Some(th) = is_prop_of {
-                        Self::push_i64(&mut key, th as i64);
-                        key.push('#');
+                if is_prop_of.is_none() && !frame_local && self.static_vif_key(lvalue).is_some() {
+                    return false;
+                }
+                let clear =
+                    matches!(&rvalue.kind, ExprKind::Null) || self.vif_operand(rvalue) == Some(None);
+                if let Some(th) = is_prop_of {
+                    if clear {
+                        if let Some(m) = self.prop_vif_bindings.get_mut(&th) {
+                            m.remove(lname);
+                            if m.is_empty() {
+                                self.prop_vif_bindings.remove(&th);
+                            }
+                        }
+                    } else if let Some(nm) = self.resolve_vif_rhs_name_strict(rvalue) {
+                        self.prop_vif_bindings
+                            .entry(th)
+                            .or_default()
+                            .insert(lname.to_string(), nm);
                     }
-                    key.push_str(lname);
-                    key
-                };
-                if matches!(&rvalue.kind, ExprKind::Null) || self.vif_operand(rvalue) == Some(None)
-                {
-                    let key = make_key(is_prop_of);
-                    self.signals.remove(&key);
-                    if frame_local
-                        && let Some(aliases) = self.local_iface_aliases.last_mut()
-                        && let Some(bound) = aliases.get_mut(lname)
-                    {
-                        bound.clear();
+                } else if frame_local && !self.local_iface_aliases.is_empty() {
+                    if clear {
+                        if let Some(f) = self
+                            .local_iface_aliases
+                            .last_mut()
+                            .and_then(Option::as_deref_mut)
+                            && let Some(bound) = f.bindings.get_mut(lname)
+                        {
+                            bound.clear();
+                        }
+                    } else if let Some(nm) = self.resolve_vif_rhs_name_strict(rvalue) {
+                        if let Some(f) = self.local_vif_frame_mut() {
+                            f.bindings.insert(lname.to_string(), nm);
+                        }
                     }
-                } else if let Some(nm) = self.resolve_vif_rhs_name_strict(rvalue) {
-                    let key = make_key(is_prop_of);
-                    self.vif_local_names.insert(lname.to_string());
-                    self.signals.insert(key, Value::from_string(&nm));
-                    if frame_local
-                        && let Some(aliases) = self.local_iface_aliases.last_mut()
-                        && let Some(bound) = aliases.get_mut(lname)
+                } else {
+                    let storage = self.vif_variable_name(lname).into_owned();
+                    if clear {
+                        self.viface_var_aliases.remove(&storage);
+                    } else if self
+                        .module
+                        .var_decl_types
+                        .get(&storage)
+                        .is_some_and(|dt| self.is_virtual_iface_type(dt))
+                        && let Some(nm) = self.resolve_vif_rhs_name_strict(rvalue)
                     {
-                        *bound = nm;
+                        self.viface_var_aliases.insert(storage, nm);
                     }
                 }
             }
         }
         false
-    }
-
-    /// Whether the flat `__vif_local__<name>` key — the binding of a
-    /// subroutine formal or local, keyed by bare name across frames —
-    /// speaks for `name` here. A property of `this` that no local of the
-    /// current frame shadows has its own per-instance key; a caller's
-    /// same-named formal must not leak into it (`val == t` in
-    /// uvm_resource::do_write, called from a `set(..., T val, ...)`).
-    pub(super) fn vif_flat_key_applies(&self, name: &str) -> bool {
-        if self
-            .local_stack
-            .last()
-            .is_some_and(|l| l.contains_key(name))
-        {
-            return true;
-        }
-        // §13.5, §25.9: the running frame does not declare `name`, so it
-        // reads the enclosing scope (a module, interface or package
-        // variable). The key a CALLER's virtual-interface formal of that name
-        // made does not speak for it: no caller frame is visible here. The
-        // running subroutine's own formal (its alias frame is the last one,
-        // read from a nested scope such as an inline constraint) still is.
-        if let Some((own, callers)) = self.local_iface_aliases.split_last()
-            && !own.contains_key(name)
-            && callers.iter().any(|f| f.contains_key(name))
-        {
-            return false;
-        }
-        let Some(th) = self.this_stack.last().copied().flatten() else {
-            return true;
-        };
-        let mut cur = self
-            .heap
-            .get(th)
-            .and_then(|o| o.as_ref())
-            .map(|i| i.class_name.as_str());
-        while let Some(cn) = cur {
-            let Some(cd) = self.module.classes.get(cn) else {
-                break;
-            };
-            if cd.properties.contains_key(name) || cd.virtual_iface_properties.contains_key(name) {
-                return false;
-            }
-            cur = cd.extends.as_deref();
-        }
-        true
     }
 
     /// §8.4: is the bare `name` a property of `this` (own or inherited) that
@@ -4358,13 +4338,12 @@ impl Simulator {
     /// or a non-vif property of `this` (§8.5), is found before any enclosing
     /// scope's instance: a class's `bit irq` read as `irq` in its own method
     /// is that bit, whatever instance `irq` the module holds. A vif local or
-    /// property is bound through `__vif_local__` / the binding map, both
-    /// consulted before this.
+    /// property is bound through the active frame's alias map / the binding map,
+    /// both consulted before this.
     pub(super) fn data_name_shadows_iface(&self, raw: &str) -> bool {
         if self
-            .local_iface_aliases
-            .last()
-            .is_some_and(|frame| frame.contains_key(raw))
+            .local_vif_frame()
+            .is_some_and(|frame| frame.bindings.contains_key(raw))
         {
             return false;
         }

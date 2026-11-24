@@ -34,9 +34,9 @@ module tb;
       `CK("queue literal", q.size() == 3 && q[2] == 30)
     end
     begin // 10.10 unpacked array concat
-      int a[3];
-      a = {1, {2, 3}};
-      `CK("unpacked concat nested", a[0]==1 && a[2]==3)
+      logic [7:0] a[2];
+      a = {8'h01, {4'h2, 4'h3}};
+      `CK("unpacked concat nested", a[0] == 8'h01 && a[1] == 8'h23)
     end
     begin // 10.6/10.7 force-release on variables
       static int fv = 1;

@@ -325,15 +325,16 @@ fn c23_3_3_5_instance_arrays() {
 // §23.3.3: Port connected to a constant (1'b0 / 1'b1): edges at time 0
 #[test]
 fn c23_3_3_const_port_edges() {
-    // Known gap (§23.3.3): `r1` reference `tie0: pe=0 ne=1  tie1: pe=1 ne=0`, xezim `tie0: pe=1 ne=1  tie1: pe=1 ne=1`
-    // Known gap (§23.3.3): `r0`: xezim prints extra `rcp2.e0 posedge at t=0 clk=0`
     check(
         "23.3.3_const_port_edges",
         include_str!("sv/23.3.3_const_port_edges.sv"),
         "rcp2",
         Order::Exact,
-        &["T|r0|rcp2.e1 posedge at t=0 clk=1"],
-        &["T|r1|", "T|r0|rcp2.e0 posedge at t=0 clk=0"],
+        &[
+            "T|r0|rcp2.e1 posedge at t=0 clk=1",
+            "T|r1|tie0: pe=0 ne=1  tie1: pe=1 ne=0",
+        ],
+        &[],
     );
 }
 

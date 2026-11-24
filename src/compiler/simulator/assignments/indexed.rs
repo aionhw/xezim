@@ -656,6 +656,13 @@ impl Simulator {
                 }
             }
         }
+        // A packed member of a class collection element has no signal of
+        // its own. Resolve the packed select within the stored element.
+        if !self.no_class_objects()
+            && let Some(changed) = self.class_collection_member_index_write(expr, index, val)
+        {
+            return changed;
+        }
         // BIT-select write into a PACKED-STRUCT MEMBER
         // (`t.f2[3] = 1'b1`): the member is a bit-slice of the parent
         // signal, and no arm below handles a MemberAccess base — the
@@ -1765,6 +1772,40 @@ impl Simulator {
             }
         }
         false
+    }
+
+    fn class_collection_member_index_write(
+        &mut self,
+        expr: &Expression,
+        index: &Expression,
+        value: &Value,
+    ) -> Option<bool> {
+        let ExprKind::MemberAccess { .. } = expr.kind else {
+            return None;
+        };
+        let mut steps = vec![PendingSel::Index(index)];
+        let mut elem = expr;
+        while let ExprKind::MemberAccess { expr, member } = &elem.kind {
+            steps.push(PendingSel::Member(&member.name));
+            elem = expr;
+        }
+        if !matches!(elem.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+        let ty = DataType::Struct(self.packed_struct_elem_type(elem)?);
+        steps.reverse();
+        let (hops, width, two_state) = self.packed_hops(&ty, &steps)?;
+        let (selected_width, range) = self.packed_hops_eval(&hops, &steps);
+        let Some((lsb, src, len)) = range else {
+            return Some(false);
+        };
+        let mut current = self.eval_expr(elem).resize(width);
+        let fitted = if two_state { value.to_two_state() } else { value.clone() }
+            .resize_for_assign(selected_width);
+        for bit in 0..len {
+            current.set_bit((lsb + bit) as usize, fitted.get_bit((src + bit) as usize));
+        }
+        Some(self.assign_value(elem, &current))
     }
 
     /// `pkg::x`, `pkg::arr[i]`, `pkg::v[h:l]` as an assignment TARGET: package

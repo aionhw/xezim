@@ -724,7 +724,9 @@ impl Simulator {
     /// a child instance's processes at its instantiation, a bound instance's
     /// after all of its host's own items — except that the `initial` blocks
     /// that cannot suspend all run as one group, at the position of the
-    /// first of them. Static initializers keep running first. Clock
+    /// first of them. Within each root, unguarded event-headed always
+    /// processes arm before the ordinary start batch. Static initializers
+    /// run first. Clock
     /// generators take their slot in the same order (`ClockGen::t0_rank`).
     pub(super) fn order_time0_processes(&mut self) {
         let pids = self.event_queue.slot_pids(0);
@@ -795,24 +797,24 @@ impl Simulator {
                 };
                 placed.push((pid, info));
             }
-            type Key = (u8, usize, Vec<usize>, Vec<usize>, usize);
-            let key_of = |i: usize, info: &Option<(usize, Vec<usize>, bool)>| -> Key {
+            type Key = (u8, usize, bool, Vec<usize>, Vec<usize>, usize);
+            let key_of = |i: usize, pid: usize, info: &Option<(usize, Vec<usize>, bool)>| -> Key {
                 match info {
-                    None => (0, 0, Vec::new(), Vec::new(), i),
+                    None => (0, 0, false, Vec::new(), Vec::new(), i),
                     Some((root, pos, grouped)) => {
                         let at = if *grouped {
                             anchor[root].clone()
                         } else {
                             pos.clone()
                         };
-                        (1, *root, at, pos.clone(), i)
+                        (1, *root, !self.t0_event_heads.contains(&pid), at, pos.clone(), i)
                     }
                 }
             };
             let mut keyed: Vec<(Key, usize)> = placed
                 .iter()
                 .enumerate()
-                .map(|(i, (pid, info))| (key_of(i, info), *pid))
+                .map(|(i, (pid, info))| (key_of(i, *pid, info), *pid))
                 .collect();
             keyed.sort();
             let gen_ranks: Vec<(usize, usize)> = self
@@ -820,7 +822,7 @@ impl Simulator {
                 .iter()
                 .map(|(gi, scope, span)| {
                     let (root, pos) = position(scope, *span);
-                    let k: Key = (1, root, pos.clone(), pos, usize::MAX);
+                    let k: Key = (1, root, true, pos.clone(), pos, usize::MAX);
                     (*gi, keyed.partition_point(|(kk, _)| *kk < k))
                 })
                 .collect();
@@ -839,6 +841,7 @@ impl Simulator {
         }
         self.t0_pid_ord = rank;
         self.t0_timing_free = HashSet::default();
+        self.t0_event_heads = HashSet::default();
     }
 
     /// Account one event popped from the current slot against the FIFO rank
@@ -1329,12 +1332,23 @@ impl Simulator {
             StatementKind::Case { items, .. } => items
                 .iter()
                 .any(|it| Self::stmt_contains_delay_control(&it.stmt)),
-            StatementKind::For { body, .. }
-            | StatementKind::While { body, .. }
-            | StatementKind::DoWhile { body, .. }
-            | StatementKind::Repeat { body, .. }
-            | StatementKind::Forever { body }
-            | StatementKind::Foreach { body, .. } => Self::stmt_contains_delay_control(body),
+            StatementKind::RandCase { items } => items
+                .iter()
+                .any(|(_, s)| Self::stmt_contains_delay_control(s)),
+            StatementKind::Wait { stmt: inner, .. }
+            | StatementKind::RsAction { body: inner }
+            | StatementKind::For { body: inner, .. }
+            | StatementKind::While { body: inner, .. }
+            | StatementKind::DoWhile { body: inner, .. }
+            | StatementKind::Repeat { body: inner, .. }
+            | StatementKind::Forever { body: inner }
+            | StatementKind::Foreach { body: inner, .. } => {
+                Self::stmt_contains_delay_control(inner)
+            }
+            StatementKind::WaitOrder { pass, fail, .. } => [pass, fail]
+                .into_iter()
+                .flatten()
+                .any(|b| Self::stmt_contains_delay_control(b)),
             _ => false,
         }
     }
@@ -1380,12 +1394,23 @@ impl Simulator {
             StatementKind::Case { items, .. } => items
                 .iter()
                 .any(|it| Self::stmt_contains_event_control(&it.stmt)),
-            StatementKind::For { body, .. }
-            | StatementKind::While { body, .. }
-            | StatementKind::DoWhile { body, .. }
-            | StatementKind::Repeat { body, .. }
-            | StatementKind::Forever { body }
-            | StatementKind::Foreach { body, .. } => Self::stmt_contains_event_control(body),
+            StatementKind::RandCase { items } => items
+                .iter()
+                .any(|(_, s)| Self::stmt_contains_event_control(s)),
+            StatementKind::Wait { stmt: inner, .. }
+            | StatementKind::RsAction { body: inner }
+            | StatementKind::For { body: inner, .. }
+            | StatementKind::While { body: inner, .. }
+            | StatementKind::DoWhile { body: inner, .. }
+            | StatementKind::Repeat { body: inner, .. }
+            | StatementKind::Forever { body: inner }
+            | StatementKind::Foreach { body: inner, .. } => {
+                Self::stmt_contains_event_control(inner)
+            }
+            StatementKind::WaitOrder { pass, fail, .. } => [pass, fail]
+                .into_iter()
+                .flatten()
+                .any(|b| Self::stmt_contains_event_control(b)),
             _ => false,
         }
     }
@@ -1735,7 +1760,67 @@ impl Simulator {
         }
     }
 
+    fn leading_event(stmt: &Statement) -> Option<&EventControl> {
+        match &stmt.kind {
+            StatementKind::TimingControl {
+                control: TimingControl::Event(event),
+                ..
+            } => Some(event),
+            StatementKind::SeqBlock { stmts, .. } => stmts.first().and_then(Self::leading_event),
+            _ => None,
+        }
+    }
+
+    fn early_event_head<'a>(&self, mut stmt: &'a Statement) -> Option<&'a EventControl> {
+        loop {
+            match &stmt.kind {
+                StatementKind::SeqBlock { stmts, .. } => {
+                    let (first, rest) = stmts.split_first()?;
+                    if rest.iter().any(|s| self.stmt_needs_process_context(s, 0)) {
+                        return None;
+                    }
+                    stmt = first;
+                }
+                StatementKind::TimingControl {
+                    control: TimingControl::Event(event),
+                    stmt: body,
+                } if !self.stmt_needs_process_context(body, 0)
+                    && !matches!(event, EventControl::EventExpr(terms) if terms.iter().any(|t| t.iff.is_some())) =>
+                {
+                    return Some(event);
+                }
+                _ => return None,
+            }
+        }
+    }
+
     pub(super) fn classify_one_always_block(
+        &mut self,
+        ab: AlwaysBlock,
+        lazy: Option<LazyAlways>,
+    ) -> Option<AlwaysBlock> {
+        // §4.4.2, §9.2.2: arm simple event heads before startup writes.
+        // Guarded events and bodies that perform another wait keep their
+        // source-order starts.
+        let event_head = ab.kind == AlwaysKind::Always
+            && self.early_event_head(&ab.stmt).is_some_and(|event| {
+                let saved = self.name_resolve_hint.borrow().clone();
+                if !ab.scope.is_empty() {
+                    *self.name_resolve_hint.borrow_mut() = Some(ab.scope.clone());
+                }
+                let clocking = self.is_clocking_event(event);
+                *self.name_resolve_hint.borrow_mut() = saved;
+                !clocking
+            });
+        let first_pid = self.next_pid;
+        let remaining = self.classify_always_block(ab, lazy);
+        if event_head {
+            self.t0_event_heads.extend(first_pid..self.next_pid);
+        }
+        remaining
+    }
+
+    fn classify_always_block(
         &mut self,
         ab: AlwaysBlock,
         lazy: Option<LazyAlways>,
@@ -1770,22 +1855,20 @@ impl Simulator {
         }
         Self::take_star_kept_own_write();
         let extracted = self.extract_sensitivity(&ab.stmt);
-        let star_reads_own_nba = Self::take_star_kept_own_write();
+        let star_kept_own_write = Self::take_star_kept_own_write();
         // §14.13: a clocking event is delivered after sampling/NBA, rather
         // than as the raw clock edge returned by extract_sensitivity.
-        fn leading_event(stmt: &Statement) -> Option<&EventControl> {
-            match &stmt.kind {
-                StatementKind::TimingControl {
-                    control: TimingControl::Event(event),
-                    ..
-                } => Some(event),
-                StatementKind::SeqBlock { stmts, .. } => stmts.first().and_then(leading_event),
-                _ => None,
-            }
-        }
         let clocking_head =
-            leading_event(&ab.stmt).is_some_and(|event| self.is_clocking_event(event));
+            Self::leading_event(&ab.stmt).is_some_and(|event| self.is_clocking_event(event));
         *self.name_resolve_hint.borrow_mut() = saved_hint;
+        if ab.kind == AlwaysKind::Always
+            && matches!(Self::leading_event(&ab.stmt), Some(EventControl::Star | EventControl::ParenStar))
+            && extracted.as_ref().is_some_and(|(sens, body)| {
+                sens.is_empty() && self.stmt_is_blocking(body)
+            })
+        {
+            return None;
+        }
         if let Some((sens, body)) = extracted {
             if !sens.is_empty() {
                 let all_level = sens.iter().all(|s| s.edge == EdgeKind::AnyEdge);
@@ -1860,7 +1943,7 @@ impl Simulator {
                     && !clocking_head
                     && !has_named_event
                     && !self_ref
-                    && !star_reads_own_nba
+                    && !star_kept_own_write
                     && !self.stmt_is_blocking(&body)
                     && !self.stmt_calls_blocking_task(&body, &ab.scope, 3)
                     && !sens.iter().any(|s| self.sens_unnamed_cell(s))
@@ -1963,8 +2046,41 @@ impl Simulator {
                                 // for an unusual shape and follows §9.4.2 exactly.
                                 let sens_covered =
                                     sens_ids.iter().all(|id| read_id_union.contains(id));
+                                let alias_agree = self.collapsed_port_children.is_empty() || {
+                                    let resolve_alias = |name: &str| -> Vec<(usize, u8)> {
+                                        let mut out: Vec<(usize, u8)> = Vec::new();
+                                        if let Some(scope) = &scope_hint {
+                                            let scoped = format!("{}.{}", scope, name);
+                                            if let Some(&id) = name_to_id.get(scoped.as_str()) {
+                                                out.push((id, self.alias_t0_kind(&scoped, id)));
+                                            }
+                                        }
+                                        if let Some(&id) = name_to_id.get(name) {
+                                            out.push((id, self.alias_t0_kind(name, id)));
+                                        } else if let Some(stripped) = name.strip_prefix(&top_prefix)
+                                        {
+                                            if let Some(&id) = name_to_id.get(stripped) {
+                                                out.push((id, self.alias_t0_kind(stripped, id)));
+                                            }
+                                        }
+                                        out
+                                    };
+                                    let mut sens_pairs: HashSet<(usize, u8)> = HashSet::default();
+                                    for s in &sens {
+                                        for pair in resolve_alias(s.signal_name.as_str()) {
+                                            sens_pairs.insert(pair);
+                                        }
+                                    }
+                                    let read_pairs: HashSet<(usize, u8)> = b_reads
+                                        .difference(&b_writes)
+                                        .filter(|r| !is_param(r.as_str()))
+                                        .flat_map(|r| resolve_alias(r.as_str()))
+                                        .collect();
+                                    sens_pairs == read_pairs
+                                };
                                 reads_covered
                                     && sens_covered
+                                    && alias_agree
                                     && (select_masks.is_empty()
                                         || self.body_reads_within_masks(
                                             &body,
@@ -1982,13 +2098,14 @@ impl Simulator {
                         scope: ab.scope,
                     });
                 }
-                // `star_reads_own_nba`: a process arms `@*` only after the
+                // `star_kept_own_write`: a process arms `@*` only after the
                 // body has run, so the body's own blocking writes (`x[7:4] =
                 // x[7:4] + 1` beside `x[3:0] <= b`) cannot wake it, while the
-                // NBA update does. An edge block re-detects writes made while
-                // it runs and would wake itself on them again and again.
+                // NBA update (or external write after suspension) does. An edge
+                // block re-detects writes made while it runs and would wake
+                // itself on them again and again.
                 if clocking_head
-                    || star_reads_own_nba
+                    || star_kept_own_write
                     || self.event_needs_value_waiter(&sens, &ab.scope)
                 {
                     if self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
@@ -2224,11 +2341,73 @@ impl Simulator {
                 });
                 return None;
             }
-            return Some(AlwaysBlock {
-                kind: ab.kind,
-                stmt: body,
-                scope: ab.scope,
-            });
+            if Self::event_list_shape(&ab.stmt) == EventListShape::Implicit {
+                // §9.4.2.2: a suspending `@*` whose inferred sensitivity is empty
+                // can never trigger, so do not strip `@*` into a combinational block.
+                if self.stmt_is_blocking(&body)
+                    || Self::stmt_contains_delay_control(&body)
+                    || Self::stmt_contains_event_control(&body)
+                    || self.stmt_calls_blocking_task(&body, &ab.scope, 3)
+                {
+                    return None;
+                }
+                return Some(AlwaysBlock {
+                    kind: ab.kind,
+                    stmt: body,
+                    scope: ab.scope,
+                });
+            }
+            // §23.3.3: an explicit event control whose expressions have no
+            // signal references (e.g. `always @(posedge clk)` inside a module
+            // where `.clk(1'b0)` / `.clk(1'b1)` was constant-substituted) fires
+            // at time 0 when an actual's value differs from the port's pre-t0
+            // default (`X` for 4-state, `0` for 2-state). Plain literal controls
+            // (`always @(posedge 1'b1)`) never fire.
+            if !ab.scope.is_empty()
+                && !self.module.input_port_actuals.is_empty()
+                && let Some(EventControl::EventExpr(items)) = Self::leading_event(&ab.stmt)
+            {
+                let top_prefix = format!("{}.", self.module.name);
+                let inst = ab.scope.strip_prefix(&top_prefix).unwrap_or(&ab.scope);
+                let matching: Vec<(EdgeKind, Expression, bool)> = items
+                    .iter()
+                    .filter(|ee| ee.iff.is_none() && ee.expr.span != crate::ast::Span::dummy())
+                    .filter_map(|ee| {
+                        let port = self.module.input_port_actuals.iter().find(|port| {
+                            Self::port_formal_inst(port.formal()) == inst
+                                && port.actual().span == ee.expr.span
+                        })?;
+                        let edge = match ee.edge {
+                            Some(Edge::Posedge) => EdgeKind::Posedge,
+                            Some(Edge::Negedge) => EdgeKind::Negedge,
+                            Some(Edge::Edge) => EdgeKind::LsbEdge,
+                            None => EdgeKind::AnyEdge,
+                        };
+                        Some((edge, ee.expr.clone(), port.two_state()))
+                    })
+                    .collect();
+                let fires = matching.into_iter().any(|(edge, expr, two_state)| {
+                    let cur = self.eval_expr(&expr);
+                    let prev = if two_state {
+                        Value::zero(cur.width)
+                    } else {
+                        Value::all_x(cur.width)
+                    };
+                    value_event_fires(edge, &prev, &cur)
+                });
+                if fires {
+                    let stmts = match body.kind {
+                        StatementKind::SeqBlock { stmts, .. } => stmts,
+                        other => vec![Statement::new(other, body.span)].into(),
+                    };
+                    let pid = self.next_pid;
+                    self.next_pid += 1;
+                    self.process_scope_hint.insert(pid, ab.scope.clone());
+                    self.process_origin.insert(pid, (ab.stmt.span, "always block"));
+                    self.event_queue.schedule(0, pid, stmts.into_vec().into());
+                }
+            }
+            return None;
         }
         if ab.kind == AlwaysKind::Always {
             if let StatementKind::TimingControl {

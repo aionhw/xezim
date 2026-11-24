@@ -779,17 +779,8 @@ impl Simulator {
                 if self.assign_struct_concat(name, exprs.iter().collect()) {
                     return true;
                 }
-                let mut flat: Vec<&Expression> = exprs.iter().collect();
-                while let Some(i) = flat
-                    .iter()
-                    .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
-                {
-                    if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
-                        flat.splice(i..i, c);
-                    }
-                }
                 let expand_rows = self.concat_has_non_array_elements(name);
-                let vals = self.unpacked_concat_operand_values(flat, expand_rows, None);
+                let vals = self.unpacked_concat_operand_values(exprs.iter().collect(), expand_rows, None);
                 self.set_queue_size(name, vals.len() as u64);
                 for (i, v) in vals.into_iter().enumerate() {
                     let v = self.fit_queue_push_elem(name, v);
@@ -3807,39 +3798,82 @@ impl Simulator {
     /// instance context and written to `<queue>[i]`, then the queue size is
     /// set to the number of items. Mirrors the AssignmentPattern assignment
     /// path in `assign_value`.
-    pub(super) fn populate_queue_from_init(&mut self, scoped_q: &str, init: &Expression) {
+    pub(super) fn populate_queue_from_init(
+        &mut self,
+        scoped_q: &str,
+        init: &Expression,
+        elem_type: Option<DataType>,
+    ) {
+        let width = self.module.arrays.get(scoped_q).map_or(32, |a| a.2);
+        let expand_rows = self.concat_has_non_array_elements(scoped_q);
+        self.store_queue_literal(scoped_q, init, elem_type.as_ref(), width, expand_rows);
+    }
+
+    pub(super) fn store_queue_literal(
+        &mut self,
+        scoped_q: &str,
+        init: &Expression,
+        elem_type: Option<&DataType>,
+        w: u32,
+        expand_rows: bool,
+    ) {
         // §7.10.1: both the pattern form `'{1,2,3}` and the queue
         // concatenation form `{1,2,3}` initialize element-wise.
-        let vals: Vec<Value> = match &self.unpacked_pattern(init).kind {
-            ExprKind::AssignmentPattern(items) => {
-                items.iter().map(|it| self.eval_expr(it.expr())).collect()
-            }
-            // §10.10: an array operand of the concatenation (`{w, 5}`, a
-            // row `m[1]`, a slice `a[0 +: 2]`) contributes all its elements,
-            // and a nested concatenation splices its own.
-            ExprKind::Concatenation(parts) => {
-                let mut flat: Vec<&Expression> = parts.iter().collect();
-                while let Some(i) = flat
-                    .iter()
-                    .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
-                {
-                    if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
-                        flat.splice(i..i, c);
+        let vals: Vec<Value> = match (&self.unpacked_pattern(init).kind, elem_type) {
+            // §10.9.1: a positional `N{...}` item stands for its items
+            // repeated N times (`'{3{5}}` is three elements). §11.4.12.1:
+            // each operand is evaluated exactly once, even for N = 0, and
+            // its value is copied, as a runtime assignment of the pattern
+            // does (`'{3{f()}}` calls `f` once).
+            (ExprKind::AssignmentPattern(items), None) => {
+                let mut vals = Vec::with_capacity(items.len());
+                for it in items {
+                    match it {
+                        AssignmentPatternItem::Ordered(e) => match &e.kind {
+                            ExprKind::Replication { count, exprs } => {
+                                let n = self.eval_expr(count).to_u64().unwrap_or(0) as usize;
+                                let once: Vec<Value> =
+                                    exprs.iter().map(|x| self.eval_expr(x)).collect();
+                                for _ in 0..n {
+                                    vals.extend(once.iter().cloned());
+                                }
+                            }
+                            _ => vals.push(self.eval_expr(e)),
+                        },
+                        _ => vals.push(self.eval_expr(it.expr())),
                     }
                 }
-                let expand_rows = self.concat_has_non_array_elements(scoped_q);
-                self.unpacked_concat_operand_values(flat, expand_rows, None)
+                vals
+            }
+            (ExprKind::AssignmentPattern(items), Some(dt)) => {
+                let mut vals = Vec::with_capacity(items.len());
+                for item in items {
+                    if let AssignmentPatternItem::Ordered(e) = item
+                        && let ExprKind::Replication { count, exprs } = &e.kind
+                    {
+                        let n = self.eval_expr(count).to_u64().unwrap_or(0);
+                        let once: Vec<_> = exprs
+                            .iter()
+                            .map(|e| self.eval_pattern_leaf_value(dt, e, Some(w)))
+                            .collect();
+                        for _ in 0..n {
+                            vals.extend(once.iter().cloned());
+                        }
+                    } else {
+                        vals.push(self.eval_pattern_leaf_value(dt, item.expr(), Some(w)));
+                    }
+                }
+                vals
+            }
+            (ExprKind::Concatenation(parts), _) => {
+                self.unpacked_concat_operand_values(parts.iter().collect(), expand_rows, None)
             }
             _ => return,
         };
-        let (_lo, _hi, w) = self
-            .module
-            .arrays
-            .get(scoped_q)
-            .copied()
-            .unwrap_or((0, 63, 32));
+        let integral = elem_type.and_then(|dt| self.integral_queue_type(dt, w));
         let n = vals.len();
-        for (i, mut v) in vals.into_iter().enumerate() {
+        for (i, v) in vals.into_iter().enumerate() {
+            let mut v = Self::fit_queue_elem_to(integral, v);
             // §5.7.1: an unsized fill element takes the element width.
             if v.is_fill && !v.is_real {
                 v = v.resize(w.max(1));
@@ -4914,17 +4948,12 @@ impl Simulator {
         else {
             return self.static_integral_queue_elem(coll);
         };
-        if !integral(self.resolve_dt_ref(dt)) {
-            return None;
-        }
-        let w = self
-            .module
-            .arrays
-            .get(coll)
-            .map(|t| t.2)
-            .filter(|w| *w > 0)?;
-        Some((
-            w,
+        self.integral_queue_type(dt, self.module.arrays.get(coll)?.2)
+    }
+
+    fn integral_queue_type(&self, dt: &DataType, width: u32) -> Option<(u32, bool, bool)> {
+        (width > 0 && Self::integral_dt(self.resolve_dt_ref(dt))).then(|| (
+            width,
             self.type_is_signed_concrete(dt),
             super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types),
         ))

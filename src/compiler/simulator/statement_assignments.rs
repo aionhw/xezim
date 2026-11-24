@@ -761,37 +761,8 @@ impl Simulator {
         first_row: Option<(&'e Expression, super::unpacked_slices::UnpackedLayout<'e>)>,
     ) {
         let is_dyn = self.module.dynamic_arrays.contains(lname) || self.class_queue_prop(lname);
-        // IEEE 1800 §10.10.1: in an unpacked-array
-        // concatenation each item is read in the context of
-        // the ELEMENT type, so a nested plain-brace concat
-        // is itself an array value whose elements SPLICE
-        // into the outer one — `a = {1, {2, 3}}` assigns
-        // `{1, 2, 3}` — i.e. nested braces flatten. Only
-        // flatten when the element type is not itself an
-        // array (for a multi-dimensional target an inner
-        // brace denotes one whole sub-array element).
-        // Assignment patterns `'{...}` never flatten; they
-        // are handled separately.
-        fn flatten_unpacked_concat<'a>(
-            exprs: &'a [Expression],
-            out: &mut Vec<&'a Expression>,
-        ) {
-            for e in exprs {
-                if let ExprKind::Concatenation(inner) = &e.kind {
-                    flatten_unpacked_concat(inner, out);
-                } else {
-                    out.push(e);
-                }
-            }
-        }
         let elem_is_scalar = self.foreach_dims(lname).is_none_or(|d| d.len() == 1);
-        let items: Vec<&Expression> = if elem_is_scalar {
-            let mut v = Vec::new();
-            flatten_unpacked_concat(exprs, &mut v);
-            v
-        } else {
-            exprs.iter().collect()
-        };
+        let items: Vec<_> = exprs.iter().collect();
         // §10.10 / §7.8: in a queue (or array) of ASSOCIATIVE
         // arrays, an associative operand (`q = {src}`) is one
         // whole element: its entries are copied into it.
@@ -4353,9 +4324,7 @@ impl Simulator {
                     // A conditional or cast item can stand for a row too.
                     nested |= matches!(
                         Self::unparen(part).kind,
-                        ExprKind::Concatenation(_)
-                            | ExprKind::Conditional { .. }
-                            | ExprKind::SystemCall { .. }
+                        ExprKind::Conditional { .. } | ExprKind::SystemCall { .. }
                     );
                     self.fixed_row_concat_shape(part).map(|row| (part, row))
                 });

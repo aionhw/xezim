@@ -471,6 +471,11 @@ impl Simulator {
             }
         } else if let Some(frame) = self.local_stack.last_mut().filter(|_| in_frame) {
             frame.insert(d.name.name.clone(), v);
+            if d.dimensions.is_empty() && !plain && self.is_virtual_iface_type(data_type) {
+                if let Some(aliases) = self.local_vif_frame_mut() {
+                    aliases.bindings.insert(d.name.name.clone(), String::new());
+                }
+            }
         } else {
             self.signals.insert(d.name.name.clone(), v);
             // §7.2: an unpacked-struct local of an `initial`/`always`
@@ -522,15 +527,17 @@ impl Simulator {
         // assignment arm binds the interface instance and builds the
         // tag + member value; evaluated as a plain expression the
         // vif read x and the union matched no tag.
+        let is_vif = d.dimensions.is_empty() && !plain && self.is_virtual_iface_type(data_type);
         if let Some(init_expr) = d.init.as_ref().filter(|_| !plain) {
             // Followed through the typedef table by reference: this
             // runs for every non-scalar declaration with an
             // initializer, so no resolved-type clone.
-            let via_assign = match self.typedef_chain_end(data_type) {
-                crate::ast::types::DataType::Interface { .. } => true,
-                crate::ast::types::DataType::Struct(su) => su.tagged,
-                _ => false,
-            };
+            let via_assign = is_vif
+                || match self.typedef_chain_end(data_type) {
+                    crate::ast::types::DataType::Interface { .. } => true,
+                    crate::ast::types::DataType::Struct(su) => su.tagged,
+                    _ => false,
+                };
             if via_assign {
                 let lvalue = crate::ast::expr::Expression::new(
                     crate::ast::expr::ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
@@ -1604,8 +1611,14 @@ impl Simulator {
                         self.resolve_dt(data_type),
                         crate::ast::types::DataType::Struct(su) if Self::spreads_member_wise(&su)
                     );
+                let vif_init_later = d.init.is_some()
+                    && d.dimensions.is_empty()
+                    && !plain
+                    && self.is_virtual_iface_type(data_type);
                 let eff_w = w;
-                let v = if let Some(init_expr) = d.init.as_ref().filter(|_| !struct_init_later) {
+                let v = if let Some(init_expr) =
+                    d.init.as_ref().filter(|_| !struct_init_later && !vif_init_later)
+                {
                     let produced = self.init_class_or_covergroup_local(
                         data_type,
                         class_name.as_deref(),

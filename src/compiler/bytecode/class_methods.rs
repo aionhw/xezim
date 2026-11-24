@@ -177,6 +177,19 @@ impl<'a> BytecodeCompiler<'a> {
                         self.local_kind_of(dt, None)
                     }
                 }) {
+                    // §13.5.1: the binding plan has sized the formal in the
+                    // receiver's specialization. Use that same width when
+                    // materializing its register for an interpreter fallback.
+                    let kind = match kind {
+                        LocalKind::Int {
+                            signed, two_state, ..
+                        } => LocalKind::Int {
+                            width: w,
+                            signed,
+                            two_state,
+                        },
+                        kind => kind,
+                    };
                     self.local_kinds.insert(r, kind);
                     // Direct VM calls may skip the AST argument binder. Make
                     // the two-state fact true before optimizers trust this

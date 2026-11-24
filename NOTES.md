@@ -10,6 +10,31 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Time-zero changes on collapsed nets and tied input ports reach their
+  event and combinational readers (§10.3, §23.3.3, #1532).
+- Runtime SystemVerilog declaration initializers execute before time zero
+  (§6.8, #1533).
+
+- Nested braces in unpacked array concatenations contribute one packed or
+  string element. Outer array and queue operands still contribute their
+  elements (§10.10.3, #1544).
+
+- Timed `always @*` blocks wait on inferred inputs, and event-headed
+  `always` blocks with unguarded events arm before time-zero procedural
+  writes (#1539, #1545).
+
+- Class-scoped task calls keep their receiver during waits, and writes to
+  selected packed members update the owning class array element (#1570, #1569).
+- Delayed continuous assignments drive each net in an unpacked array (#1584).
+- A compilation-unit parameter keeps precedence over an unimported package
+  enum member when elaborating bounds and generate conditions (#1591).
+- Collection literals use their declared element type, and factory-created
+  objects retain their class specialization inside module instances
+  (#1581, #1582, #1583).
+
+- A cross's `iff` no longer gates the implicit coverpoint of a crossed
+  variable, and that coverpoint takes one hit per `sample()` however many
+  crosses name it (§19.6, #1603).
 - Real-valued `inside` constraints and weighted `dist` ranges retain
   fractional bounds during randomization (§18.5.3, #1485).
 - `$typename` of a packed vector declared through a typedef lists the outer
@@ -26,6 +51,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   read or write the connected interface's array (§25.9, §7.6, #1311).
 
 **Performance**
+
+- Edge fanouts use compact entries and event waiters allocate wide-value
+  storage only when needed.
 
 - Delay loops with a delayed nonblocking assignment compile their surrounding
   code and retain the assignment's scheduling semantics (§9.4.5, #1327).
@@ -55,6 +83,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   queries for plain reads compared with known integer literals.
 
 **Command line**
+
+- `--verilog-2005-initializers` schedules module variable declaration
+  assignments in `.v` inputs as time-zero procedures (#1545).
 
 * A `-v`/`-y` library file is preprocessed with the command-line defines
   (`+define+`, `-D`) only, as in the reference simulator, so library files no

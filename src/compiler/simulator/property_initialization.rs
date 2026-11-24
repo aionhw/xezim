@@ -343,7 +343,11 @@ impl Simulator {
                     }
                     continue;
                 }
-                self.populate_queue_from_init(&scoped_q, &init);
+                self.populate_queue_from_init(
+                    &scoped_q,
+                    &init,
+                    self.class_member_coll_type(&scoped_q).cloned(),
+                );
                 continue;
             }
             // §10.9.1: a pattern initializing a MULTIDIMENSIONAL fixed
@@ -569,7 +573,7 @@ impl Simulator {
     }
 }
 
-fn prop_ident_expr(name: &str) -> Expression {
+pub(super) fn prop_ident_expr(name: &str) -> Expression {
     Expression::new(
         ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
             root: None,

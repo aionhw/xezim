@@ -734,6 +734,7 @@ impl Simulator {
         // `dist` geometry memoized under a stable constraint-item pointer.
         self.dist_geometry_memo.borrow_mut().clear();
         self.push_local_frame(HashMap::default());
+        self.local_iface_aliases.push(None);
         self.method_local_base.push(self.local_stack.len() - 1);
         let scopes = std::mem::take(&mut self.constraint_scopes);
         // §18.5.9: a sub-object's solve extends the chain of the call that
@@ -773,6 +774,7 @@ impl Simulator {
         }
         self.constraint_scopes = scopes;
         self.method_local_base.pop();
+        self.local_iface_aliases.pop();
         self.pop_local_frame();
         r
     }

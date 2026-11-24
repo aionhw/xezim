@@ -58,7 +58,7 @@ endmodule
 }
 
 /// The concatenation write converts each item to the member's element type,
-/// runs operand calls once, and splices nested braces into the member.
+/// runs operand calls once, and appends a nested packed value as one element.
 #[test]
 fn concat_write_through_handle_member_element_type_calls_and_nesting() {
     let result = xezim::simulate(
@@ -80,8 +80,10 @@ class top_c;
     $display("A %p", cfg.r);
     cfg.q = {next_value()};
     $display("B %0d %p", calls, cfg.q);
-    cfg.q = {1, {2, {3}}};
+    cfg.q = {cfg.q, {4'h2, {4'h3}}};
     $display("C %p", cfg.q);
+    cfg.q = {cfg.q[1:$], {4'h4, 4'h5}};
+    $display("D %p", cfg.q);
   endfunction
 endclass
 module t;
@@ -100,5 +102,5 @@ endmodule
         .iter()
         .map(|entry| entry.message.as_str())
         .collect();
-    assert_eq!(lines, ["A '{'h1f, 'h0}", "B 1 '{10}", "C '{1, 2, 3}"]);
+    assert_eq!(lines, ["A '{'h1f, 'h0}", "B 1 '{10}", "C '{10, 35}", "D '{35, 69}"]);
 }
