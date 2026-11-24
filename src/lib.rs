@@ -1191,6 +1191,13 @@ pub(crate) fn serialized_len<T: serde::Serialize>(v: &T) -> usize {
 /// `XEZIM_MEM_CENSUS`: the elaborated design as elaboration hands it over —
 /// serialized size per field (a stand-in for heap size that ranks them) and
 /// the sizes of the AST node types that make up most of it.
+///
+/// Emits only internal table names, counts, and byte sizes — no proprietary
+/// source paths, module names, or signal identifiers.
+pub fn print_elab_census(elab: &elaborate::ElaboratedModule) {
+    elab_census(elab);
+}
+
 fn elab_census(elab: &elaborate::ElaboratedModule) {
     fn ser<T: serde::Serialize>(v: &T) -> usize {
         serialized_len(v)
@@ -1204,30 +1211,48 @@ fn elab_census(elab: &elaborate::ElaboratedModule) {
         ("tasks", ser(&elab.tasks)),
         ("classes", ser(&elab.classes)),
         ("var_decl_types", ser(&elab.var_decl_types)),
+        ("typedef_types", ser(&elab.typedef_types)),
         ("parameters", ser(&elab.parameters)),
         ("instances", ser(&elab.instances)),
         ("nets", ser(&elab.nets)),
+        ("vector_nets", ser(&elab.vector_nets)),
+        ("resolved_net_kinds", ser(&elab.resolved_net_kinds)),
         ("port_aliases", ser(&elab.port_aliases)),
+        ("input_port_actuals", ser(&elab.input_port_actuals)),
         ("decl_sites", ser(&elab.decl_sites)),
         ("source_texts", ser(&elab.source_texts)),
         ("arrays", ser(&elab.arrays)),
+        ("unpacked_decl_dims", ser(&elab.unpacked_decl_dims)),
+        ("packed_full_dims", ser(&elab.packed_full_dims)),
+        ("packed_struct_fields", ser(&elab.packed_struct_fields)),
+        (
+            "packed_signal_elem_widths",
+            ser(&elab.packed_signal_elem_widths),
+        ),
+        ("property_decls", ser(&elab.property_decls)),
+        ("property_params", ser(&elab.property_params)),
         ("two_state_signals", ser(&elab.two_state_signals)),
     ];
     rows.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
     eprintln!(
-        "[MEM-CENSUS] === elaborated design (serialized MB) — {} signals, {} always, {} pending always, {} pending initial, {} pending CA ===",
+        "[MEM-CENSUS] === elaborated design (serialized MB) — {} signals, {} CA, {} always, {} pending always, {} pending initial, {} pending CA, {} deferred fns, {} deferred tasks ===",
         elab.signals.len(),
+        elab.continuous_assigns.len(),
         elab.always_blocks.len(),
         elab.pending_always.len(),
         elab.pending_initial.len(),
-        elab.pending_cont_assign.len()
+        elab.pending_cont_assign.len(),
+        elab.deferred_function_bodies.len(),
+        elab.deferred_task_bodies.len(),
     );
-    for (name, b) in rows.iter().take(12) {
-        eprintln!("[MEM-CENSUS] {:>9.1} MB  {}", *b as f64 / 1048576.0, name);
+    for (name, b) in rows.iter().take(16) {
+        if *b > 0 {
+            eprintln!("[MEM-CENSUS] {:>9.1} MB  {}", *b as f64 / 1048576.0, name);
+        }
     }
     use std::mem::size_of;
     eprintln!(
-        "[MEM-CENSUS] node sizes: Expression={} ExprKind={} HierarchicalIdentifier={} HierPathSegment={} Identifier={} Statement={} StatementKind={} Span={} Signal={} Value={}",
+        "[MEM-CENSUS] node sizes: Expression={} ExprKind={} HierarchicalIdentifier={} HierPathSegment={} Identifier={} Statement={} StatementKind={} Span={} ContinuousAssignment={} PendingContAssign={} ElabInstance={} Signal={} Value={}",
         size_of::<ast::expr::Expression>(),
         size_of::<ast::expr::ExprKind>(),
         size_of::<ast::expr::HierarchicalIdentifier>(),
@@ -1236,6 +1261,9 @@ fn elab_census(elab: &elaborate::ElaboratedModule) {
         size_of::<ast::stmt::Statement>(),
         size_of::<ast::stmt::StatementKind>(),
         size_of::<ast::Span>(),
+        size_of::<elaborate::ContinuousAssignment>(),
+        size_of::<elaborate::PendingContAssign>(),
+        size_of::<elaborate::ElabInstance>(),
         size_of::<elaborate::Signal>(),
         size_of::<xezim_core::Value>(),
     );

@@ -695,6 +695,14 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Memory diagnostics: stream JSONL phase/source/instance and RSS samples to a file (1 = stderr; 0 = off)",
     ),
     (
+        "XEZIM_OOM_TRACE_MIN_DELTA_KIB",
+        "Memory diagnostics: skip high-frequency per-instance OOM trace records unless RSS moved by at least N KiB (0 = all)",
+    ),
+    (
+        "XEZIM_OOM_TRACE_REDACT",
+        "Memory diagnostics: redact source paths, definition names, instance paths, and byte offsets to opaque per-session IDs (1 enables)",
+    ),
+    (
         "XEZIM_OPCODE_CENSUS",
         "Print executed-insn opcode histogram at end of sim",
     ),

@@ -4217,6 +4217,9 @@ suppressed but the explicit SDF annotation still applies."
                     print_design_summary(&_defs, &elab);
                     print_resource_usage(compile_wall_start);
                 }
+                if std::env::var_os("XEZIM_MEM_CENSUS").is_some() {
+                    xezim::print_elab_census(&elab);
+                }
                 emit_run_stats(report_mode, compile_wall_start, None);
                 // §6.21: keep compiled artifacts consistent with the simulate
                 // path — re-issue static initializers that call simulation-time
