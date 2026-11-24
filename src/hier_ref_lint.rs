@@ -541,7 +541,7 @@ fn segments(e: &Expression) -> Option<Vec<Seg>> {
 }
 
 /// Where a dotted name's first component starts.
-fn start(e: &Expression) -> usize {
+fn start(e: &Expression) -> u32 {
     match &e.kind {
         ExprKind::Ident(h) => h.path.first().map_or(e.span.start, |s| s.name.span.start),
         ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => start(expr),

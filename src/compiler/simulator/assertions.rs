@@ -2182,6 +2182,7 @@ impl Simulator {
             Some(Edge::Negedge) => 1,
             _ => 2,
         };
+        let span_key = span_key as usize;
         let stat_key = Self::assert_stat_key(span_key, src);
         self.note_assert_label(stat_key, label);
         let async_abort = Self::sva_has_async_abort(&node);

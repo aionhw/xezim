@@ -705,7 +705,7 @@ impl<'a> Ck<'a> {
             _ => None,
         };
         if let Some(w) = why
-            && self.seen.insert(et.span.start)
+            && self.seen.insert(et.span.start as usize)
         {
             self.report(
                 et.span,
@@ -743,7 +743,7 @@ impl<'a> Ck<'a> {
                 _ => None,
             };
             if let Some(w) = why
-                && self.seen.insert(d.span.start)
+                && self.seen.insert(d.span.start as usize)
             {
                 self.report(
                     d.span,
@@ -1155,7 +1155,7 @@ impl<'a> Ck<'a> {
                 // provided by a package may be visible through one, so its
                 // visibility is uncertain here; only reject unknown names.
                 && !self.env.packages.values().any(|p| p.types.contains_key(n))
-                && self.seen.insert(actual.span.start)
+                && self.seen.insert(actual.span.start as usize)
             {
                 self.report(
                     actual.span,
@@ -1618,7 +1618,7 @@ impl<'a> Ck<'a> {
             receiver = inner;
         }
         if matches!(self.ty_of(receiver), Ty::Struct(_)) {
-            if self.seen.insert(e.span.start) {
+            if self.seen.insert(e.span.start as usize) {
                 self.report(
                     e.span,
                     "member select cannot follow a parenthesized expression (IEEE 1800-2017 A.8.3)"
@@ -2087,7 +2087,7 @@ impl<'a> Ck<'a> {
             ),
             _ => false,
         };
-        if invalid && self.seen.insert(span.start) {
+        if invalid && self.seen.insert(span.start as usize) {
             self.report(span, format!("method '{method}' is not defined for {} (IEEE 1800-2017 §15.5.3, §7.10.2, §7.12)", receiver.describe()));
         }
     }

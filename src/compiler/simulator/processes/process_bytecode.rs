@@ -306,7 +306,7 @@ impl Simulator {
             }
             return false;
         }
-        let key = (pid, stmt.span.start, stmt.span.end);
+        let key = (pid, stmt.span.start as usize, stmt.span.end as usize);
         if !self.process_loop_bytecode.contains_key(&key) {
             let scope_hint = self.process_scope_hint.get(&pid).cloned();
             let mut compiler = super::bytecode::BytecodeCompiler::new(
@@ -576,7 +576,7 @@ impl Simulator {
         if !self.local_stack.is_empty() {
             return None;
         }
-        let key = (pid, cond.span.start, cond.span.end);
+        let key = (pid, cond.span.start as usize, cond.span.end as usize);
         if !self.process_cond_bytecode.contains_key(&key) {
             self.exec_cache_pids.insert(pid);
             // Side effects would DOUBLE-FIRE during the self-audit below —

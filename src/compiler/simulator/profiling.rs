@@ -3036,7 +3036,7 @@ impl Simulator {
             let (off, place) = match st.loc {
                 Some((src, off)) => (
                     off,
-                    self.span_file_and_line(crate::ast::Span::new(off, off + 1), src)
+                    self.span_file_and_line(crate::ast::Span::from_usize(off, off + 1), src)
                         .map(|(f, l)| {
                             format!("\"file\": \"{}\", \"line\": {}, ", json_escape(&f), l)
                         })

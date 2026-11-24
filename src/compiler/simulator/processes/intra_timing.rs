@@ -45,7 +45,9 @@ impl Simulator {
             // value (an IEEE-754 pattern read as a ~1e18 number) or a divide that
             // produced inf/NaN. Warn once per site so the offending delay names
             // itself in the log instead of silently freezing a clock.
-            if (!f.is_finite() || f >= 1e15) && self.warned_delay_spikes.insert(d.span.start) {
+            if (!f.is_finite() || f >= 1e15)
+                && self.warned_delay_spikes.insert(d.span.start as usize)
+            {
                 let loc = self
                     .span_file_line_in(d.span, None)
                     .map(|l| format!(" at {}", l))

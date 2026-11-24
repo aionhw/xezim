@@ -1603,10 +1603,9 @@ fn simulate_multi_inner(
         phase("parsed AST dropped");
 
         if let Some((config, key)) = cache.as_ref().zip(cache_key.as_deref()) {
-            // Pending rewrite contexts are intentionally omitted from the
-            // artifact format; materialize them before publishing a complete
-            // elaborated design.
-            elab.materialize_pending();
+            // `ElaboratedModule`'s serializer streams pending bodies directly
+            // into the cache artifact without eagerly materializing them in
+            // memory, so `Simulator::new` keeps lazy pending drains too (#721).
             // Fold the captured elaboration diagnostics into the artifact so a
             // later warm hit replays them instead of running silent.
             elab.elab_diagnostics = xezim_core::elab_diag_capture_take();

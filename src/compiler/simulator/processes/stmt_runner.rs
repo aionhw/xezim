@@ -2590,7 +2590,8 @@ impl Simulator {
                         };
                         self.set_loop_var_aliased(var_scope.as_deref(), vn, kv);
                     }
-                    let body_id = body.span.start;
+                    let body_id =
+                        crate::compiler::simulator::checkpoint::decode_foreach_body_id(body.span);
                     let body_frame = self
                         .blocking_cont_cache
                         .get(&(body_id, 8u8))
@@ -2713,10 +2714,9 @@ impl Simulator {
                             let body_id = (&**body) as *const Statement as usize;
                             let marker = Box::new(Statement::new(
                                 StatementKind::Null,
-                                crate::ast::Span {
-                                    start: body_id,
-                                    end: 0,
-                                },
+                                crate::compiler::simulator::checkpoint::encode_foreach_body_id(
+                                    body_id,
+                                ),
                             ));
                             let mut tail_stmts = vec![Statement::new(
                                 StatementKind::ForeachTail {
@@ -2792,7 +2792,7 @@ impl Simulator {
                 // its source offset turns an unbounded hang into one line.
                 if is_foreach_fallback {
                     if self.parked_from_exec {
-                        let key = (pid, stmt.span.start);
+                        let key = (pid, stmt.span.start as usize);
                         let n = self.foreach_replay_parks.entry(key).or_insert(0);
                         *n += 1;
                         if self.foreach_replay_limit > 0 && *n > self.foreach_replay_limit {
@@ -2827,7 +2827,8 @@ impl Simulator {
                     } else {
                         // Completed without parking — clear any earlier streak
                         // so a foreach inside an outer loop cannot accumulate.
-                        self.foreach_replay_parks.remove(&(pid, stmt.span.start));
+                        self.foreach_replay_parks
+                            .remove(&(pid, stmt.span.start as usize));
                     }
                 }
                 self.exec_park_cont = None;

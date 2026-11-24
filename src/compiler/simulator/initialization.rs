@@ -2008,7 +2008,7 @@ impl Simulator {
         // class-local aliases. A generic `typedef C#(N) own_type` is not a
         // reference to C's DEFAULT specialization; resolve it only when its
         // declaring class has concrete parameter bindings.
-        let generic_alias_spans: HashSet<(&str, usize, usize)> = module
+        let generic_alias_spans: HashSet<(&str, u32, u32)> = module
             .classes
             .values()
             .filter(|cd| !cd.param_order.is_empty() || !cd.type_param_names.is_empty())

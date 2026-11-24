@@ -201,7 +201,7 @@ impl Simulator {
                     .module
                     .source_texts
                     .get(i)
-                    .is_some_and(|t| span.end <= t.len()) =>
+                    .is_some_and(|t| span.end as usize <= t.len()) =>
             {
                 i
             }
@@ -212,7 +212,7 @@ impl Simulator {
                     .source_texts
                     .iter()
                     .enumerate()
-                    .filter(|(_, t)| span.end <= t.len());
+                    .filter(|(_, t)| span.end as usize <= t.len());
                 let (i, _) = fits.next()?;
                 if fits.next().is_some() {
                     return None;
@@ -220,7 +220,7 @@ impl Simulator {
                 i
             }
         };
-        let text = self.module.source_texts[i].get(span.start..span.end)?;
+        let text = self.module.source_texts[i].get(span.start as usize..span.end as usize)?;
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         let loc = match self.span_file_and_line(span, Some(i as u32)) {
             Some((f, l)) => format!(

@@ -808,7 +808,7 @@ impl Simulator {
             if !self.clocking_meta.contains_key("__xz_default_clocking") {
                 let (ec, cid) = Self::sampled_site_lookup(
                     &self.sampled_site_clock,
-                    expr.span.start,
+                    expr.span.start as usize,
                     self.activation_scope.borrow().as_deref().unwrap_or(""),
                     !self.sampled_registering,
                 )?;
@@ -827,7 +827,7 @@ impl Simulator {
         }
         let clk_id = clk_id?;
         let operand = args.first()?.clone();
-        let site = expr.span.start;
+        let site = expr.span.start as usize;
         let widx = self.sampled_watch_for(
             site,
             &operand,
@@ -1465,7 +1465,7 @@ impl Simulator {
                     "$rose" | "$fell" | "$stable" | "$changed" | "$past"
                 ) =>
             {
-                out.push(e.span.start);
+                out.push(e.span.start as usize);
                 for a in args {
                     Self::collect_sampled_sites_expr(a, out);
                 }

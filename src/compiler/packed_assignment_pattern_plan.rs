@@ -1385,7 +1385,11 @@ impl PlanBuilder<'_> {
                         .collect();
                     return Some(TypeSig {
                         dims,
-                        leaf: TypeSigLeaf::Struct(su.span.start, su.span.end, members),
+                        leaf: TypeSigLeaf::Struct(
+                            su.span.start as usize,
+                            su.span.end as usize,
+                            members,
+                        ),
                     });
                 }
                 DataType::Enum(e) if e.dimensions.is_empty() => {
@@ -1395,7 +1399,11 @@ impl PlanBuilder<'_> {
                     let members = e.members.iter().map(|m| m.name.name.clone()).collect();
                     return Some(TypeSig {
                         dims,
-                        leaf: TypeSigLeaf::Enum(e.span.start, e.span.end, members),
+                        leaf: TypeSigLeaf::Enum(
+                            e.span.start as usize,
+                            e.span.end as usize,
+                            members,
+                        ),
                     });
                 }
                 // A packed array: its outer dimension, then its element.

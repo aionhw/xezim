@@ -475,7 +475,7 @@ impl Simulator {
             return;
         };
         let origin = MetaOrigin {
-            span: (stmt.span.start, stmt.span.end),
+            span: (stmt.span.start as usize, stmt.span.end as usize),
             class: self.class_context_stack.last().cloned().flatten(),
             spec: self.current_spec.clone(),
         };

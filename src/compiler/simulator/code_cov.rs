@@ -840,14 +840,14 @@ impl Lines<'_> {
         let texts = &self.module.source_texts;
         let i = match src
             .map(|s| s as usize)
-            .filter(|&s| texts.get(s).is_some_and(|t| span.start < t.len()))
+            .filter(|&s| texts.get(s).is_some_and(|t| (span.start as usize) < t.len()))
         {
             Some(i) => i,
             None => {
                 let mut fits = texts
                     .iter()
                     .enumerate()
-                    .filter(|(_, t)| span.start < t.len());
+                    .filter(|(_, t)| (span.start as usize) < t.len());
                 let (i, _) = fits.next()?;
                 if fits.next().is_some() {
                     return None;
@@ -863,7 +863,7 @@ impl Lines<'_> {
                 .map(|(p, _)| p)
                 .collect()
         });
-        let out_line = nl.partition_point(|&p| p < span.start);
+        let out_line = nl.partition_point(|&p| p < span.start as usize);
         if let Some(m) = self.module.source_line_maps.get(i).and_then(|m| m.as_ref()) {
             if let Some((f, l)) = m.file_line(out_line) {
                 return Some((f.to_string(), l));
@@ -1218,11 +1218,13 @@ impl Simulator {
                 .chain(self.module.tasks.iter().map(|(k, t)| (k, t.span)))
                 .filter_map(|(k, sp)| {
                     let (_, leaf) = k.rsplit_once('.')?;
-                    Some((leaf.to_string(), sp.start))
+                    Some((leaf.to_string(), sp.start as usize))
                 })
                 .collect();
             let copy = |k: &str, sp: Span| {
-                !k.contains('.') && !k.contains("::") && dotted.contains(&(k.to_string(), sp.start))
+                !k.contains('.')
+                    && !k.contains("::")
+                    && dotted.contains(&(k.to_string(), sp.start as usize))
             };
             // Materialize any deferred instance-scoped callable bodies before
             // instrumenting so per-instance signal references are in place.
@@ -1348,7 +1350,7 @@ impl Simulator {
         ins.expr(&mut ca.rhs);
         let mut counter = None;
         if kinds & KIND_STATEMENT != 0 {
-            let key = (span.start, span.end, scope);
+            let key = (span.start as usize, span.end as usize, scope);
             counter = Some(match ins.cov.ca_counter.get(&key) {
                 Some(&c) => c,
                 None => {
@@ -1857,7 +1859,7 @@ impl Simulator {
             reports[s.scope as usize].stmts.push(StmtRow {
                 file,
                 line,
-                start: s.span.start,
+                start: s.span.start as usize,
                 kind: s.kind,
                 count: count(s.counter),
             });
@@ -1881,7 +1883,7 @@ impl Simulator {
             reports[b.scope as usize].branches.push(BranchRow {
                 file,
                 line,
-                start: b.span.start,
+                start: b.span.start as usize,
                 kind: b.kind,
                 arms,
             });

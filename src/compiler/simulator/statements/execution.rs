@@ -2257,7 +2257,7 @@ impl Simulator {
                         },
                     };
                     if let Some((events, body)) = clocked {
-                        let span_key = a.span.start;
+                        let span_key = a.span.start as usize;
                         let existing = self.sva_sites.iter().position(|s| {
                             s.span_key == span_key && s.dedup_scope == self.current_scope
                         });
@@ -2293,7 +2293,7 @@ impl Simulator {
                     // own entry (file, line, kind and label), not on a
                     // locationless one keyed by a synthetic name.
                     let src = self.current_src_file();
-                    let stat_key = Self::assert_stat_key(a.span.start, src);
+                    let stat_key = Self::assert_stat_key(a.span.start as usize, src);
                     self.note_assert_label(stat_key, site_label.as_deref());
                     let kind: u8 = match a.kind {
                         AssertionKind::Assert => 0,
@@ -2303,7 +2303,7 @@ impl Simulator {
                     let this_handle = self.this_stack.last().and_then(|t| *t);
                     self.pending_observed.push(ObservedProbe {
                         stat_key,
-                        loc: (src, a.span.start),
+                        loc: (src, a.span.start as usize),
                         kind,
                         predicate: resolved_expr,
                         this_handle,
@@ -2332,14 +2332,14 @@ impl Simulator {
                     AssertionKind::Cover => 2,
                 };
                 let src = self.current_src_file();
-                let stat_key = Self::assert_stat_key(a.span.start, src);
+                let stat_key = Self::assert_stat_key(a.span.start as usize, src);
                 self.note_assert_label(stat_key, site_label.as_deref());
                 let entry = self
                     .assertion_stats
                     .entry(stat_key)
                     .or_insert(AssertionStat {
                         kind: kind_tag,
-                        loc: Some((src, a.span.start)),
+                        loc: Some((src, a.span.start as usize)),
                         pass_count: 0,
                         fail_count: 0,
                     });

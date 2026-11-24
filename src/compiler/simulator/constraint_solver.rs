@@ -2557,7 +2557,7 @@ impl Simulator {
                     let rank = if con.name.name == "__inline__" {
                         (0, usize::MAX, ii)
                     } else {
-                        (constraint_depth[bi], con.span.start, ii)
+                        (constraint_depth[bi], con.span.start as usize, ii)
                     };
                     let wins = match soft_rank.get(&v) {
                         None => true,

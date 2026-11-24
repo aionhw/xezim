@@ -4578,8 +4578,8 @@ impl Simulator {
                     let item_key = (
                         handle,
                         item as *const ConstraintItem as usize,
-                        span.start,
-                        span.end,
+                        span.start as usize,
+                        span.end as usize,
                         cr.len(),
                     );
                     self.pick_dist_value_memoized(item_key, Some(key), &cr, &dw)

@@ -36,8 +36,8 @@ impl BytecodeCompiler<'_> {
         let facts = self.method_admission.as_ref().map(|a| &a.fn_facts);
         let key = (
             fd.name.name.name.clone(),
-            fd.span.start,
-            fd.span.end,
+            fd.span.start as usize,
+            fd.span.end as usize,
             prefix.map(str::to_string),
             allow_ext_reads,
         );

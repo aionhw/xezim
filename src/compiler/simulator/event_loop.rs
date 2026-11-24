@@ -1142,14 +1142,14 @@ impl Simulator {
         let texts = &self.module.source_texts;
         let i = match src_file
             .map(|s| s as usize)
-            .filter(|&s| texts.get(s).is_some_and(|t| span.start < t.len()))
+            .filter(|&s| texts.get(s).is_some_and(|t| (span.start as usize) < t.len()))
         {
             Some(i) => i,
             None => {
                 let mut fits = texts
                     .iter()
                     .enumerate()
-                    .filter(|(_, t)| span.start < t.len());
+                    .filter(|(_, t)| (span.start as usize) < t.len());
                 let (i, _) = fits.next()?;
                 if fits.next().is_some() {
                     return None;
@@ -1166,7 +1166,7 @@ impl Simulator {
         {
             return Some((loc.file, loc.line as usize));
         }
-        let line = 1 + texts[i].as_bytes()[..span.start]
+        let line = 1 + texts[i].as_bytes()[..span.start as usize]
             .iter()
             .filter(|&&b| b == b'\n')
             .count();
@@ -1198,14 +1198,14 @@ impl Simulator {
         let texts = &self.module.source_texts;
         let i = match src_file
             .map(|s| s as usize)
-            .filter(|&s| texts.get(s).is_some_and(|t| span.start < t.len()))
+            .filter(|&s| texts.get(s).is_some_and(|t| (span.start as usize) < t.len()))
         {
             Some(i) => i,
             None => {
                 // Exact-fit fallback: unambiguous only.
                 let mut hit: Option<usize> = None;
                 for (i, t) in texts.iter().enumerate() {
-                    if span.start < t.len() {
+                    if (span.start as usize) < t.len() {
                         if hit.is_some() {
                             return None; // ambiguous across files
                         }
@@ -1226,7 +1226,7 @@ impl Simulator {
         {
             return Some(loc.short());
         }
-        let line = 1 + texts[i].as_bytes()[..span.start]
+        let line = 1 + texts[i].as_bytes()[..span.start as usize]
             .iter()
             .filter(|&&b| b == b'\n')
             .count();
@@ -1270,13 +1270,13 @@ impl Simulator {
         let texts = &self.module.source_texts;
         let i = match src_file
             .map(|s| s as usize)
-            .filter(|&s| texts.get(s).is_some_and(|t| span.end <= t.len()))
+            .filter(|&s| texts.get(s).is_some_and(|t| span.end as usize <= t.len()))
         {
             Some(i) => i,
             None => {
                 let mut hit: Option<usize> = None;
                 for (i, t) in texts.iter().enumerate() {
-                    if span.end <= t.len() {
+                    if span.end as usize <= t.len() {
                         if hit.is_some() {
                             return None;
                         }
@@ -1286,7 +1286,7 @@ impl Simulator {
                 hit?
             }
         };
-        let raw = texts[i].get(span.start..span.end)?;
+        let raw = texts[i].get(span.start as usize..span.end as usize)?;
         let mut s = raw.split_whitespace().collect::<Vec<_>>().join(" ");
         if s.len() > 60 {
             s.truncate(57);

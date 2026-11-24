@@ -780,7 +780,7 @@ impl Simulator {
                 let info = match self.process_origin.get(&pid) {
                     Some((span, kind @ ("initial block" | "always block"))) => {
                         let scope = self.process_scope_hint.get(&pid).map_or("", String::as_str);
-                        let (root, pos) = position(scope, span.start);
+                        let (root, pos) = position(scope, span.start as usize);
                         let grouped =
                             *kind == "initial block" && self.t0_timing_free.contains(&pid);
                         if grouped {
@@ -2258,7 +2258,7 @@ impl Simulator {
                         self.clock_gen_src.push((
                             self.clock_generators.len(),
                             ab.scope.clone(),
-                            ab.stmt.span.start,
+                            ab.stmt.span.start as usize,
                         ));
                         self.clock_generators.push(clock_gen);
                         return None;

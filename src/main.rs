@@ -1816,13 +1816,14 @@ fn strip_duplicate_unit_typedefs(
         if td.forward || matches!(td.data_type, xezim::ast::types::DataType::Void(_)) {
             continue;
         }
+        let (start, end) = (td.span.start as usize, td.span.end as usize);
         if !seen.insert(td.name.name.clone())
-            && td.span.start < td.span.end
-            && td.span.end <= text.len()
-            && text.is_char_boundary(td.span.start)
-            && text.is_char_boundary(td.span.end)
+            && start < end
+            && end <= text.len()
+            && text.is_char_boundary(start)
+            && text.is_char_boundary(end)
         {
-            spans.push((td.span.start, td.span.end, td.name.name.clone()));
+            spans.push((start, end, td.name.name.clone()));
         }
     }
     if spans.is_empty() {
@@ -4222,11 +4223,12 @@ suppressed but the explicit SDF annotation still applies."
                 // system functions as time-0 assignments (issue #26).
                 xezim::defer_static_syscall_inits(&_defs, &mut elab);
                 if let Some(ref out) = _output_file {
-                    // The serialized artifact format flattens always_blocks /
-                    // initial_blocks / continuous_assigns; pending_* are
-                    // `#[serde(skip)]` and would be silently dropped.
-                    // Materialize before serialize so the artifact is complete.
-                    elab.materialize_pending();
+                    // Release the parsed AST before streaming the elaborated
+                    // module into the artifact; `ElaboratedModule`'s serializer
+                    // streams `pending_*` and deferred callable bodies one item
+                    // at a time without materializing them in memory (#721).
+                    drop(_defs);
+                    xezim_core::release_free_memory();
                     match xezim::write_compiled(&elab, out) {
                         Ok(()) => println!("Wrote compiled artifact to {}", out),
                         Err(e) => {

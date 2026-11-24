@@ -117,7 +117,7 @@ impl Simulator {
         if plan.uncovered
             && self
                 .warned_uncovered_patterns
-                .insert((e.span.start, e.span.end))
+                .insert((e.span.start as usize, e.span.end as usize))
         {
             eprintln!(
                 "[xezim][warning] assignment pattern leaves an element or member uncovered; \
@@ -258,7 +258,10 @@ impl Simulator {
             _ => return ReturnPatternType::NotPacked,
         };
         let name = fd.name.name.name.as_str();
-        let entries = self.fn_ret_types.entry((span.start, span.end)).or_default();
+        let entries = self
+            .fn_ret_types
+            .entry((span.start as usize, span.end as usize))
+            .or_default();
         if let Some((_, t)) = entries.iter().find(|(n, _)| n == name) {
             return ReturnPatternType::Func(t.clone());
         }

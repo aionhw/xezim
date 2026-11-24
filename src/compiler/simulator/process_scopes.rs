@@ -3142,7 +3142,7 @@ impl Simulator {
         if !needs_frame {
             return None;
         }
-        let key = (declaration, call_span.start, call_span.end);
+        let key = (declaration, call_span.start as usize, call_span.end as usize);
         if let Some((_, frame)) = self.task_frame_cache.get(&key) {
             if let Some(frame) = frame {
                 return Some(frame.clone());
@@ -3170,7 +3170,11 @@ impl Simulator {
         tm: &Arc<crate::ast::decl::ClassMethod>,
         call_span: crate::ast::Span,
     ) -> Arc<[Statement]> {
-        let key = (Arc::as_ptr(tm) as usize, call_span.start, call_span.end);
+        let key = (
+            Arc::as_ptr(tm) as usize,
+            call_span.start as usize,
+            call_span.end as usize,
+        );
         if let Some((_, f)) = self.class_task_frame_cache.get(&key) {
             return f.clone();
         }
@@ -3196,7 +3200,7 @@ impl Simulator {
         kind: u8,
         first: &Statement,
     ) -> Arc<[Statement]> {
-        let key = (pid, body.span.start, body.span.end, i, kind);
+        let key = (pid, body.span.start as usize, body.span.end as usize, i, kind);
         if let Some(cont) = self.forever_cont_cache.get(&key) {
             return cont.clone();
         }

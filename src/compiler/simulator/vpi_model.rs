@@ -1497,7 +1497,7 @@ impl<'a> Builder<'a> {
                 _ => return (NONE, 0),
             },
         };
-        if span.start >= text.len() {
+        if span.start as usize >= text.len() {
             return (NONE, 0);
         }
         let starts = self.line_starts[fi].get_or_insert_with(|| {
@@ -1511,7 +1511,7 @@ impl<'a> Builder<'a> {
             v
         });
         let out = starts
-            .partition_point(|&s| s <= span.start)
+            .partition_point(|&s| s <= span.start as usize)
             .saturating_sub(1);
         if fi >= nsrc {
             let path = self.lib_texts[fi - nsrc].0.clone();
@@ -2035,7 +2035,7 @@ impl<'a> Builder<'a> {
             a.span,
             AssertRole::Directive,
             lab.clone(),
-            a.span.start,
+            a.span.start as usize,
             kind,
             ctx,
         );
@@ -2064,7 +2064,7 @@ impl<'a> Builder<'a> {
                 a.span,
                 AssertRole::PropertyInst,
                 lab,
-                a.span.start,
+                a.span.start as usize,
                 kind,
                 ctx,
             );

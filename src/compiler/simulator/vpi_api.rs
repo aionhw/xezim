@@ -126,7 +126,7 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
     /// Source span of the system task call statement being executed; read
     /// back when that task turns out to be a registered `$systf`.
-    static TASK_CALL_SPAN: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    static TASK_CALL_SPAN: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
 }
 
 /// Remember the span of the system-task statement about to execute.
@@ -154,7 +154,12 @@ pub(super) fn systf_site(sim: &Simulator, name: &str, span: crate::ast::Span) ->
     } else {
         sim.current_scope.clone()
     };
-    let key = (name.to_string(), span.start, span.end, scope);
+    let key = (
+        name.to_string(),
+        span.start as usize,
+        span.end as usize,
+        scope,
+    );
     SITES.with(|t| {
         let mut t = t.borrow_mut();
         let next = t.sites.len();

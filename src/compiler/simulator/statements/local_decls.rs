@@ -616,7 +616,7 @@ impl Simulator {
                 // after the first.)
                 let names = self
                     .static_block_decls
-                    .entry((d.name.span.start, d.name.span.end))
+                    .entry((d.name.span.start as usize, d.name.span.end as usize))
                     .or_default();
                 if names.iter().any(|n| *n == d.name.name) {
                     continue;

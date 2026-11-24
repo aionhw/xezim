@@ -1102,7 +1102,7 @@ impl Simulator {
             crate::ast::stmt::AssertionKind::Cover => 2,
         };
         let src = self.current_src_file();
-        let stat_key = Self::assert_stat_key(a.span.start, src);
+        let stat_key = Self::assert_stat_key(a.span.start as usize, src);
         self.note_assert_label(stat_key, label);
         // An `always_comb` / `always @*` the settle runs as a comb entry is
         // not the process that happens to be current (whose resumption, a
@@ -1140,7 +1140,7 @@ impl Simulator {
             ctl,
             stat_key,
             stat_kind: kind_tag,
-            stat_loc: (src, a.span.start),
+            stat_loc: (src, a.span.start as usize),
         });
     }
 

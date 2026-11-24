@@ -734,7 +734,12 @@ impl Simulator {
                 let name = classes
                     .get(cn)
                     .map_or_else(|| cn.clone(), |cd| cd.name.clone());
-                (name, prop.clone(), init.span.start, init.span.end)
+                (
+                    name,
+                    prop.clone(),
+                    init.span.start as usize,
+                    init.span.end as usize,
+                )
             };
         let mut spellings: HashMap<(String, String, usize, usize), Vec<String>> =
             HashMap::default();
@@ -1906,7 +1911,7 @@ impl Simulator {
                     self.clock_gen_src.push((
                         self.clock_generators.len(),
                         scope.clone(),
-                        span.start,
+                        span.start as usize,
                     ));
                     self.clock_generators.push(cg);
                     if !self.sva_sites.is_empty() {
