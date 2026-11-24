@@ -315,7 +315,9 @@ impl Simulator {
     }
 
     /// §19.7 `cg.option.<name>`: the value set at run time, else by the
-    /// covergroup body, else the option's default.
+    /// covergroup body, else the option's default. A body option is read in
+    /// the instance's own scope (`cg_bin_scope`), so one set from a
+    /// constructor argument reads back as the value the coverage uses.
     pub(super) fn cg_option_read(&mut self, idx: usize, field: &str) -> Option<Value> {
         let inst = self.cg_heap.get(idx)?.as_ref()?;
         if let Some(v) = inst.options.get(field) {
@@ -328,6 +330,14 @@ impl Simulator {
             })
         });
         if let Some(e) = body {
+            let scope = Self::cg_bin_scope(inst);
+            if !scope.is_empty()
+                && let Some(n) = self.cg_const_i64(&e, &scope)
+            {
+                let mut v = Value::from_u64(n as u64, 32);
+                v.is_signed = true;
+                return Some(v);
+            }
             return Some(self.eval_expr(&e));
         }
         let n = match field {
