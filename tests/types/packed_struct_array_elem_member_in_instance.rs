@@ -72,3 +72,26 @@ fn elem_member_select_ignores_same_named_top_param_and_nests() {
     assert_line(&msgs, "loop a1 100000000000");
     assert_line(&msgs, "c 100000000000");
 }
+
+/// §23.6, §27.4: a packed struct array keeps its member layout in a generate scope.
+#[test]
+fn packed_member_of_element_in_an_indexed_generate_scope() {
+    let src = r#"
+module top;
+  typedef struct packed { logic a; logic [3:0] d; logic u; } s_t;
+  for (genvar g = 0; g < 2; g++) begin : gb
+    s_t [2:0] q;
+  end
+  initial begin
+    gb[0].q = '0;
+    gb[1].q = '0;
+    gb[0].q[2].d = 4'h5;
+    gb[0].q[1] = 6'b100001;
+    gb[1].q[0].a = 1'b1;
+    $display("GEN %b %b %h %b", gb[0].q, gb[1].q, gb[0].q[2].d, gb[1].q[0].a);
+  end
+endmodule
+"#;
+    let sim = xezim::simulate(src, 20).expect("simulate generated packed arrays");
+    assert!(sim.output.iter().any(|line| line.message == "GEN 001010100001000000 000000000000100000 5 1"));
+}
