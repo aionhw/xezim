@@ -83,3 +83,49 @@ endmodule
         msgs
     );
 }
+
+/// §5.6.1 and §23.6. An escaped port and an identically spelled
+/// hierarchical path can coexist in one child module.
+#[test]
+fn escaped_dotted_port_does_not_capture_a_hierarchical_path() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("escaped_dotted_port_actual");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("top.sv");
+    std::fs::write(
+        &path,
+        r#"
+module source #(parameter bit VALUE = 0)(output wire data);
+  assign data = VALUE;
+endmodule
+module child(input logic \node.data );
+  source node();
+  initial #1 $display("PORT %b PATH %b", \node.data , node.data);
+endmodule
+module top;
+  source #(.VALUE(1)) node();
+  child u(.\node.data (node.data));
+  child v(.\node.data (1'b0));
+  initial #2 $finish;
+endmodule
+"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .env("XEZIM_KEEP_PORTS", "0")
+        .arg("--no-cache")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut messages: Vec<_> = text
+        .lines()
+        .filter(|line| line.starts_with("PORT "))
+        .collect();
+    messages.sort_unstable();
+    assert_eq!(messages, ["PORT 0 PATH 0", "PORT 1 PATH 0"]);
+}
