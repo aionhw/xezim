@@ -1949,6 +1949,36 @@ impl Simulator {
                         value
                     } else if (plain_class || is_vif_formal) && port.direction == PortDirection::Output {
                         Value::zero(32)
+                    } else if port.direction == PortDirection::Output {
+                        let concrete = match &port.data_type {
+                            DataType::TypeReference { name, .. } if !name.has_scope() => self
+                                .obj_type_param(handle, cname, &name.name.name)
+                                .and_then(|b| self.resolve_type_binding_dt(&b)),
+                            _ => None,
+                        };
+                        let dt = concrete.as_ref().unwrap_or(&port.data_type);
+                        if concrete
+                            .as_ref()
+                            .is_some_and(|dt| self.type_ref_is_class_handle(dt))
+                        {
+                            Value::zero(32)
+                        } else if self.method_dt_is_real(handle, cname, dt) {
+                            Value::from_f64(0.0)
+                        } else {
+                            let width = match plan.ports[i].fixed_width.filter(|w| *w > 0) {
+                                Some(w) => w,
+                                None => self
+                                    .method_formal_param_width(handle, cname, dt)
+                                    .unwrap_or_else(|| {
+                                        super::elaborate::resolve_type_width(
+                                            dt,
+                                            Some(&self.module.parameters),
+                                            Some(&self.module.typedefs),
+                                        )
+                                    }),
+                            };
+                            self.formal_type_default(dt, width.max(1))
+                        }
                     } else if arg_supplied(i) {
                         let value = match self.formal_pattern_value(port, &args[i]) {
                             Some(v) => v,
