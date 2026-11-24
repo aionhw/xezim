@@ -10,6 +10,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Input-port substitution distinguishes escaped names containing dots from
+  hierarchical references with the same spelling (§5.6.1, §23.6, PR #727).
 - Queue and array slices reached through object properties preserve their
   elements and evaluate the receiver once (§7.4.6, §7.10.1, #1540).
 - An unconnected interface port reports the instance and port at elaboration

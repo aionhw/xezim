@@ -237,6 +237,8 @@ fn design_cache_key_for(
     // §25.3, §26.3: validate interface connections and wildcard references.
     hash.text("interface-port-and-wildcard-validation-v1");
     hash.bytes(&[sv_parser::strict_checks() as u8]);
+    // §5.6.1, §23.6: distinguish escaped ports from hierarchical paths.
+    hash.text("escaped-port-path-resolution-v1");
     hash.text(env!("CARGO_PKG_VERSION"));
     hash.text(&config.semantic_salt);
     hash.bytes(&xezim_core::elaborate::max_packed_width().to_le_bytes());
