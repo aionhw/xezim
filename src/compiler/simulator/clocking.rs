@@ -1441,7 +1441,7 @@ impl Simulator {
                         .instances
                         .iter()
                         .filter(|i| i.def_name == enc)
-                        .map(|i| i.path.clone())
+                        .map(|i| i.path.to_string())
                         .collect::<Vec<_>>();
                     // §8.3 / §23.6: canonical module-class names already
                     // include their owner. Adding it again made reads miss
@@ -1576,7 +1576,7 @@ impl Simulator {
                     .chain(m.dynamic_arrays.iter())
                     .chain(m.queue_vars.iter())
                     .chain(m.struct_members.keys())
-                    .chain(m.instances.iter().map(|i| &i.path))
+                    .chain(m.instances.iter().map(|i| &*i.path))
                     .filter_map(|k| k.strip_prefix(pre.as_str()))
                     .filter(|r| !r.contains('.') && !r.contains('['))
                     .map(str::to_string)

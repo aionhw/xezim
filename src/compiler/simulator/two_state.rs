@@ -4562,7 +4562,7 @@ impl Simulator {
         for (lhs_name, rhs_name) in &port_candidates {
             let (child, parent): (&str, &str) = (lhs_name, rhs_name);
             if self.module.sampled_input_ports.contains(child)
-                || self.module.port_aliases.get(child).map(String::as_str) != Some(parent)
+                || self.module.port_aliases.get(child).map(|s| s.as_str()) != Some(parent)
                 || ca_driver_counts.get(child).copied().unwrap_or(0) != 1
                 || self.module.events.contains(child)
                 || self.module.events.contains(parent)
@@ -4854,8 +4854,8 @@ impl Simulator {
             .filter(|ca| {
                 ca.rhs_parent_scoped
                     && ca.delay == 0
-                    && ca.delay_fall.is_none()
-                    && ca.delay_off.is_none()
+                    && ca.delay_fall().is_none()
+                    && ca.delay_off().is_none()
                     && matches!(ca.lhs.kind, ExprKind::Index { .. })
             })
             .filter_map(|ca| {

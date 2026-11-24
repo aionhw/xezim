@@ -104,7 +104,7 @@ struct Names<'a> {
 impl<'a> Names<'a> {
     fn new(defs: &[&SourceDefinition], elab: &'a ElaboratedModule) -> Self {
         let mut items: HashSet<&'a str> = HashSet::new();
-        let keys: [&mut dyn Iterator<Item = &'a String>; 36] = [
+        let keys: [&mut dyn Iterator<Item = &'a String>; 35] = [
             &mut elab.signals.keys(),
             &mut elab.parameters.keys(),
             &mut elab.arrays.keys(),
@@ -140,11 +140,11 @@ impl<'a> Names<'a> {
             &mut elab.array_elem_class.keys(),
             &mut elab.pkg_var_decls.keys(),
             &mut elab.port_aliases.keys(),
-            &mut elab.port_aliases.values(),
         ];
         for it in keys {
             items.extend(it.map(|k| k.as_str()));
         }
+        items.extend(elab.port_aliases.values().map(|v| v.as_str()));
         let insts: HashMap<&'a str, &'a str> = elab
             .instances
             .iter()
@@ -222,7 +222,7 @@ impl<'a> Names<'a> {
         self.elab
             .signals
             .get(n)
-            .is_some_and(|s| s.type_name.as_deref() == Some("$genblock"))
+            .is_some_and(|s| s.type_name.as_deref().map(String::as_str) == Some("$genblock"))
     }
 
     /// `n` names a scope: an instance, a generate or named block, or
@@ -965,7 +965,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
     for ca in &elab.continuous_assigns {
         // Only assignments the source spells out; port connections and
         // gates are elaboration's own.
-        if let Some((_, scope)) = &ca.origin {
+        if let Some((_, scope)) = ca.origin() {
             let mut refs = Vec::new();
             expr_refs(&ca.lhs, &mut refs);
             expr_refs(&ca.rhs, &mut refs);

@@ -1412,18 +1412,10 @@ impl Simulator {
                         );
                         let alias = allocate_edge_alias();
                         new_signals.push((alias.clone(), width));
-                        new_assigns.push(super::elaborate::ContinuousAssignment {
-                            gate_delay_fall: None,
-                            delay_select: None,
-                            origin: None,
-                            lhs: mk_ident(&alias, span),
+                        new_assigns.push(super::elaborate::ContinuousAssignment::plain(
+                            mk_ident(&alias, span),
                             rhs,
-                            delay_exprs: None,
-                            delay: 0,
-                            rhs_parent_scoped: false,
-                            delay_fall: None,
-                            delay_off: None,
-                        });
+                        ));
                         alias
                     });
                     if dbg {
@@ -1573,18 +1565,10 @@ impl Simulator {
                 let alias = aliases.entry(canon).or_insert_with(|| {
                     let alias = allocate_edge_alias();
                     new_signals.push((alias.clone(), 1));
-                    new_assigns.push(super::elaborate::ContinuousAssignment {
-                        delay_exprs: None,
-                        gate_delay_fall: None,
-                        delay_select: None,
-                        origin: None,
-                        lhs: mk_ident(&alias, span),
+                    new_assigns.push(super::elaborate::ContinuousAssignment::plain(
+                        mk_ident(&alias, span),
                         rhs,
-                        delay: 0,
-                        rhs_parent_scoped: false,
-                        delay_fall: None,
-                        delay_off: None,
-                    });
+                    ));
                     alias
                 });
                 if dbg {
@@ -2669,18 +2653,10 @@ impl Simulator {
                     });
                 module
                     .continuous_assigns
-                    .push(super::elaborate::ContinuousAssignment {
-                        delay_exprs: None,
-                        gate_delay_fall: None,
-                        delay_select: None,
-                        origin: None,
-                        lhs: mk_ident(&nm, rhs.span),
+                    .push(super::elaborate::ContinuousAssignment::plain(
+                        mk_ident(&nm, rhs.span),
                         rhs,
-                        delay: 0,
-                        rhs_parent_scoped: false,
-                        delay_fall: None,
-                        delay_off: None,
-                    });
+                    ));
             }
         }
         // The passes over always-block headers are done: keep only the
@@ -2953,9 +2929,11 @@ impl Simulator {
                 if sig.is_real {
                     val.is_real = true;
                     let declared = module.var_decl_types.get(name).or_else(|| {
-                        sig.type_name.as_ref().and_then(|ty| module.typedef_types.get(ty))
+                        sig.type_name
+                            .as_ref()
+                            .and_then(|ty| module.typedef_types.get(ty.as_str()))
                     });
-                    if sig.type_name.as_deref() == Some("shortreal")
+                    if sig.type_name.as_deref().map(String::as_str) == Some("shortreal")
                         || declared.is_some_and(|dt| matches!(
                             super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
                             DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }
@@ -2988,7 +2966,7 @@ impl Simulator {
                 signal_signed_vec.push(sig.is_signed);
                 signal_real_vec.push(sig.is_real);
                 if let Some(ref tn) = sig.type_name {
-                    signal_type_names.insert(id, tn.clone());
+                    signal_type_names.insert(id, tn.to_string());
                 }
             } else if let Some(val) = module.parameters.get(name) {
                 sim_dbg_eprintln!(

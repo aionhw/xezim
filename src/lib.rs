@@ -916,7 +916,7 @@ pub fn defer_static_syscall_inits(
     //     is not an AST item in its host, so an AST walk never sees them;
     //   * `program` instances (§24), which are not `SourceDefinition::Module`.
     for inst in &elab.instances {
-        let items = match defs.get(&inst.def_name) {
+        let items = match defs.get(inst.def_name.as_str()) {
             Some(SourceDefinition::Module(m)) => &m.items,
             Some(SourceDefinition::Interface(i)) => &i.items,
             Some(SourceDefinition::Program(p)) => &p.items,

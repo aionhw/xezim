@@ -1755,7 +1755,8 @@ impl Simulator {
                 if let Some(sig) = class_def.properties.get(prop) {
                     return sig
                         .type_name
-                        .clone()
+                        .as_deref()
+                        .cloned()
                         .filter(|tn| self.module.enum_members.contains_key(tn));
                 }
                 cur = class_def.extends.clone();

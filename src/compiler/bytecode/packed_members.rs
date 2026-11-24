@@ -997,7 +997,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// memory cell. A bracket in an indexed instance prefix is not a cell.
     pub(super) fn packed_shape_at<'t, T>(
         &self,
-        table: &'t HashMap<String, T>,
+        table: &'t xezim_core::shared_names::SharedNameMap<T>,
         name: &str,
     ) -> Option<&'t T> {
         table.get(name).or_else(|| {

@@ -218,7 +218,7 @@ impl Simulator {
                 let prop_tn = self.class_prop_type_name(handle, &slot).or_else(|| {
                     cdef.properties
                         .get(&pname)
-                        .and_then(|s| s.type_name.clone())
+                        .and_then(|s| s.type_name.as_deref().cloned())
                 });
                 if let Some(tn) = prop_tn {
                     // §8.25: a bound type can itself name a specialization.

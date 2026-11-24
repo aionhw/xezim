@@ -844,7 +844,7 @@ impl Simulator {
                     || sig
                         .type_name
                         .as_ref()
-                        .is_some_and(|t| self.module.classes.contains_key(t))
+                        .is_some_and(|t| self.module.classes.contains_key(t.as_str()))
                 {
                     return None;
                 }
@@ -936,7 +936,7 @@ impl Simulator {
             || sig
                 .type_name
                 .as_ref()
-                .is_some_and(|t| self.module.classes.contains_key(t))
+                .is_some_and(|t| self.module.classes.contains_key(t.as_str()))
             || cd.string_properties.contains(prop)
         {
             return Some(None);

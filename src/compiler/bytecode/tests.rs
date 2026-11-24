@@ -806,7 +806,7 @@ fn genuine_array_shapes_do_not_resolve_as_flattened_signals() {
     assert_eq!(compiler.flattened_outer_const_signal_id(&expr), None);
 
     let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
-    let mut packed_elem_widths: HashMap<String, u32> = HashMap::default();
+    let mut packed_elem_widths: xezim_core::shared_names::SharedNameMap<u32> = Default::default();
     packed_elem_widths.insert("flat".to_owned(), 32);
     let mut compiler = BytecodeCompiler::new(&signals, &[false], &[160], &arrays, &widths);
     compiler.set_packed_elem_widths(&packed_elem_widths);

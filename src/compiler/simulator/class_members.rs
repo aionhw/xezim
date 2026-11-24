@@ -1104,7 +1104,7 @@ impl Simulator {
                     match self.module.classes.get(cn) {
                         Some(cd) => {
                             if let Some(sig) = cd.properties.get(member) {
-                                break sig.type_name.clone();
+                                break sig.type_name.as_deref().cloned();
                             }
                             cur = cd.extends.as_deref();
                         }
@@ -1188,7 +1188,7 @@ impl Simulator {
                     if sig
                         .type_name
                         .as_deref()
-                        .is_some_and(|t| params.contains(t) || dimmed.contains(t))
+                        .is_some_and(|t| params.contains(t.as_str()) || dimmed.contains(t.as_str()))
                     {
                         names.insert(p.clone());
                     }

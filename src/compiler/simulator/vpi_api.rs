@@ -1076,7 +1076,7 @@ fn array_dims(sim: &Simulator, base: &str) -> Option<Vec<(i64, i64)>> {
                 if d.len() == norm.len()
                     && d.iter().zip(&norm).all(|(&a, &b)| dim_len(a) == dim_len(b)) =>
             {
-                d.clone()
+                d.to_vec()
             }
             _ => norm,
         }
@@ -1855,7 +1855,7 @@ fn delay_obj_def(sim: &Simulator, obj: &DelayObj) -> String {
             .instances
             .iter()
             .find(|i| i.path == scope)
-            .map_or_else(|| sim.module.name.clone(), |i| i.def_name.clone())
+            .map_or_else(|| sim.module.name.clone(), |i| i.def_name.to_string())
     };
     match obj {
         DelayObj::Net(id) | DelayObj::ModPath(id, _) | DelayObj::InterMod(id) => {

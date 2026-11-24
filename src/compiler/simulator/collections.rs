@@ -1484,7 +1484,7 @@ impl Simulator {
                                 .filter(|s| {
                                     s.type_name
                                         .as_ref()
-                                        .map(|t| sim.module.classes.contains_key(t))
+                                        .map(|t| sim.module.classes.contains_key(t.as_str()))
                                         .unwrap_or(false)
                                 })
                                 .is_some());

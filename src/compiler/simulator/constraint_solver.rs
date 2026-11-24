@@ -875,7 +875,7 @@ impl Simulator {
                     let enum_t = class_def
                         .properties
                         .get(prop)
-                        .and_then(|sig| sig.type_name.clone())
+                        .and_then(|sig| sig.type_name.as_deref().cloned())
                         .filter(|tn| self.module.enum_members.contains_key(tn));
                     // A member typed by a class (a handle, or a collection of
                     // handles) holds object references, not random values.
@@ -960,7 +960,7 @@ impl Simulator {
                             }
                         }
                         if let Some(tn) = &sig.type_name {
-                            prop_type_names.insert(prop.clone(), tn.clone());
+                            prop_type_names.insert(prop.clone(), tn.to_string());
                             // §7.4.1: the DECLARED type keeps the packed
                             // dimensions written before the declarator
                             // (`cand_t [0:2] a`); the type name alone is one
@@ -4427,7 +4427,7 @@ impl Simulator {
             || ps
                 .type_name
                 .as_ref()
-                .is_some_and(|t| self.module.classes.contains_key(t))
+                .is_some_and(|t| self.module.classes.contains_key(t.as_str()))
             || cd.queue_properties.contains_key(prop)
             || cd.assoc_properties.contains_key(prop)
             || cd.array_properties.contains_key(prop)

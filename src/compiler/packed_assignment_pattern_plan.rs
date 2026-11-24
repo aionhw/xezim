@@ -409,14 +409,14 @@ pub(crate) fn is_packed(ty: &DataType, r: &mut dyn PatternTypeResolver) -> bool 
 pub(crate) fn declared_type<'t>(
     name: &str,
     types: &'t xezim_core::decl_types::DeclTypeMap,
-    aliases: Option<&std::collections::HashMap<String, String, impl std::hash::BuildHasher>>,
+    aliases: Option<&xezim_core::shared_names::SharedNameMap<xezim_core::shared_names::SharedName>>,
 ) -> Option<&'t DataType> {
     let mut cur = name;
     for _ in 0..64 {
         if let Some(dt) = types.get(cur) {
             return Some(dt);
         }
-        cur = aliases?.get(cur)?;
+        cur = aliases?.get(cur)?.as_str();
     }
     None
 }

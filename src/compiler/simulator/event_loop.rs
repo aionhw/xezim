@@ -1092,7 +1092,7 @@ impl Simulator {
                 .instances
                 .iter()
                 .find(|inst| inst.path == scope)
-                .map(|inst| inst.def_name.clone()),
+                .map(|inst| inst.def_name.to_string()),
         }
     }
 

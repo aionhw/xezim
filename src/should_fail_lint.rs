@@ -730,7 +730,7 @@ impl InstanceViews {
         // Instance path -> (definition, index of its view in `by_def`).
         let mut slots: HashMap<&str, (&str, usize)> = HashMap::default();
         for inst in &elab.instances {
-            let views = by_def.entry(inst.def_name.clone()).or_default();
+            let views = by_def.entry(inst.def_name.to_string()).or_default();
             views.push(ParamMap::default());
             slots.insert(
                 inst.path.as_str(),
@@ -2731,7 +2731,7 @@ fn elaborated_definitions(
     }
     let mut seen: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = std::iter::once(elab.name.clone())
-        .chain(elab.instances.iter().map(|i| i.def_name.clone()))
+        .chain(elab.instances.iter().map(|i| i.def_name.to_string()))
         .chain(bound)
         .chain(
             elab.resolved_binds

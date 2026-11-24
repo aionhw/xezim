@@ -855,7 +855,11 @@ fn vpi_module_handle(sim: &Simulator, inst_idx: isize) -> *mut libc::c_void {
             .next()
             .unwrap_or(&inst.path)
             .to_string();
-        (leaf, vpi_full_name(sim, &inst.path), inst.def_name.clone())
+        (
+            leaf,
+            vpi_full_name(sim, &inst.path),
+            inst.def_name.to_string(),
+        )
     };
     VpiHandle {
         kind: VpiKind::Module,
@@ -881,7 +885,7 @@ pub(super) fn vpi_scope_path(sim: &Simulator, h: &VpiHandle) -> String {
     if h.inst_idx < 0 {
         String::new()
     } else {
-        sim.module.instances[h.inst_idx as usize].path.clone()
+        sim.module.instances[h.inst_idx as usize].path.to_string()
     }
 }
 
@@ -2111,7 +2115,7 @@ fn dpi_scope_timescale(sim: &Simulator, scope: *mut libc::c_void) -> (i32, i32) 
     let def = if rel.is_empty() || name == sim.module.name {
         sim.module.name.clone()
     } else if let Some(inst) = sim.instance_by_path(&rel) {
-        inst.def_name.clone()
+        inst.def_name.to_string()
     } else if sim.module.module_timescale_exp.contains_key(name.as_str()) {
         name
     } else {

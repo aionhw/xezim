@@ -495,7 +495,7 @@ impl Simulator {
                     return None;
                 }
                 if let Some(inst) = self.instance_by_path(cur) {
-                    break inst.def_name.clone();
+                    break inst.def_name.to_string();
                 }
                 match cur.rsplit_once('.') {
                     Some((p, _)) => cur = p,
@@ -725,7 +725,7 @@ impl Simulator {
                 // §3.12.1: the unit's storage has this flat name; a scope
                 // hint must not find a module's declaration of the name.
                 if self.unit_scope_decl_exists(bare) {
-                    stripped.root = Some("$root".to_string());
+                    stripped.root = Some(crate::ast::expr::HierRoot::Root);
                 }
                 stripped.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                 stripped.cached_resolved_name = crate::ast::cache::NameCache::new();
@@ -805,7 +805,7 @@ impl Simulator {
             let is_modport = self.instance_by_path(&prefix).is_some_and(|inst| {
                 self.module
                     .modport_member_dirs
-                    .contains_key(&(inst.def_name.clone(), segs[i].to_string()))
+                    .contains_key(&(inst.def_name.to_string(), segs[i].to_string()))
             });
             if is_modport {
                 segs.remove(i);

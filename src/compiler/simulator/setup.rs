@@ -3156,7 +3156,7 @@ impl Simulator {
                     return self.module.name.clone();
                 }
                 if let Some(inst) = self.instance_by_path(p) {
-                    return inst.def_name.clone();
+                    return inst.def_name.to_string();
                 }
                 match p.rsplit_once('.') {
                     Some((up, _)) => p = up,

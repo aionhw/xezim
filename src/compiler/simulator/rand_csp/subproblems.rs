@@ -590,7 +590,7 @@ impl Simulator {
                 let enum_dom = sig
                     .type_name
                     .as_ref()
-                    .and_then(|tn| self.module.enum_members.get(tn))
+                    .and_then(|tn| self.module.enum_members.get(tn.as_str()))
                     .filter(|m| !m.is_empty())
                     .map(|m| dom_norm(m.iter().map(|e| (e.1 as i128, e.1 as i128)).collect()));
                 if width > 64 {

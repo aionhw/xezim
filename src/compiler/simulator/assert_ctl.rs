@@ -431,7 +431,7 @@ impl Simulator {
                 ..Default::default()
             };
             for inst in &self.module.instances {
-                c.insts.insert(inst.path.clone());
+                c.insts.insert(inst.path.to_string());
             }
             self.assert_ctl = Some(Box::new(c));
         }

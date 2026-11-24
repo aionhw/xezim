@@ -2382,13 +2382,13 @@ impl Simulator {
         }
         if let Some(&(r0, r1, _)) = self.module.arrays_2d.get(name) {
             return Some(match self.module.unpacked_decl_dims.get(name) {
-                Some(d) if d.len() == 2 => d.clone(),
+                Some(d) if d.len() == 2 => d.to_vec(),
                 _ => vec![r0, r1],
             });
         }
         let (shape, _) = self.module.arrays_nd.get(name)?;
         Some(match self.module.unpacked_decl_dims.get(name) {
-            Some(d) if d.len() == shape.len() => d.clone(),
+            Some(d) if d.len() == shape.len() => d.to_vec(),
             _ => shape.clone(),
         })
     }
@@ -6813,7 +6813,7 @@ impl Simulator {
     /// (`<handle>#prop`). A dynamic dimension may be listed or left out.
     pub(super) fn unpacked_decl_dims_of(&self, name: &str) -> Option<Vec<(i64, i64)>> {
         if let Some(d) = self.module.unpacked_decl_dims.get(name) {
-            return Some(d.clone());
+            return Some(d.to_vec());
         }
         let (h, prop) = name.split_once('#')?;
         let handle = h.parse::<usize>().ok()?;

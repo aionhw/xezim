@@ -981,7 +981,7 @@ impl Simulator {
         // A struct-typed property (declared via typedef) is a real struct
         // copy target, not an integral scalar.
         if let Some(tn) = prop.type_name.as_ref() {
-            if self.module.typedef_types.get(tn).is_some_and(|dt| {
+            if self.module.typedef_types.get(tn.as_str()).is_some_and(|dt| {
                 matches!(
                     Self::resolve_type_ref(dt, &self.module.typedef_types),
                     crate::ast::types::DataType::Struct(_)
@@ -2651,7 +2651,7 @@ impl Simulator {
                                 if let Some(tn) = cd
                                     .properties
                                     .get(&member_name)
-                                    .and_then(|s| s.type_name.clone())
+                                    .and_then(|s| s.type_name.as_deref().cloned())
                                 {
                                     mtn = Some(tn);
                                     decl_cn = Some(cn);
@@ -2776,7 +2776,7 @@ impl Simulator {
                                         if let Some(tn) = cd
                                             .properties
                                             .get(&bname)
-                                            .and_then(|sig| sig.type_name.clone())
+                                            .and_then(|sig| sig.type_name.as_deref().cloned())
                                         {
                                             break Some(tn);
                                         }
@@ -2810,8 +2810,10 @@ impl Simulator {
                             }
                             match self.module.classes.get(&cn) {
                                 Some(cd) => {
-                                    if let Some(tn) =
-                                        cd.properties.get(&bname).and_then(|s| s.type_name.clone())
+                                    if let Some(tn) = cd
+                                        .properties
+                                        .get(&bname)
+                                        .and_then(|s| s.type_name.as_deref().cloned())
                                     {
                                         found = Some(tn);
                                         break;
@@ -2876,8 +2878,10 @@ impl Simulator {
                             let mut cur = self.class_context_stack.last().cloned().flatten();
                             while let Some(cn) = cur {
                                 if let Some(cd) = self.module.classes.get(&cn) {
-                                    if let Some(tn) =
-                                        cd.properties.get(&bname).and_then(|s| s.type_name.clone())
+                                    if let Some(tn) = cd
+                                        .properties
+                                        .get(&bname)
+                                        .and_then(|s| s.type_name.as_deref().cloned())
                                     {
                                         return Some(tn);
                                     }
@@ -2913,8 +2917,10 @@ impl Simulator {
                             let mut cur = hcn;
                             while let Some(cn) = cur {
                                 if let Some(cd) = self.module.classes.get(&cn) {
-                                    if let Some(tn) =
-                                        cd.properties.get(&member).and_then(|s| s.type_name.clone())
+                                    if let Some(tn) = cd
+                                        .properties
+                                        .get(&member)
+                                        .and_then(|s| s.type_name.as_deref().cloned())
                                     {
                                         found = Some(tn);
                                         break;

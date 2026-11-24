@@ -760,7 +760,7 @@ impl Simulator {
         let alias_snapshot = self.module.port_aliases.clone();
         let alias_widths: HashMap<String, u32> = alias_snapshot
             .iter()
-            .flat_map(|(k, v)| [k.clone(), v.clone()])
+            .flat_map(|(k, v)| [k.clone(), v.to_string()])
             .filter_map(|n| {
                 self.module
                     .signals
@@ -825,10 +825,10 @@ impl Simulator {
                     )
                 })
                 .map(|mut parts| {
-                    if ca.delay_exprs.is_some() {
+                    if ca.delay_exprs().is_some() {
                         for part in &mut parts {
-                            part.delay_exprs.clone_from(&ca.delay_exprs);
-                            part.origin.clone_from(&ca.origin);
+                            part.set_delay_exprs(ca.delay_exprs().cloned());
+                            part.set_origin(ca.origin().cloned());
                         }
                     }
                     parts
@@ -854,11 +854,13 @@ impl Simulator {
                                 let Some(p) = alias_snapshot.get(&cur) else {
                                     break;
                                 };
-                                if alias_widths.get(p).copied() != w0 || names.contains(p) {
+                                if alias_widths.get(p.as_str()).copied() != w0
+                                    || names.iter().any(|n| n == p)
+                                {
                                     break;
                                 }
-                                names.push(p.clone());
-                                cur = p.clone();
+                                names.push(p.to_string());
+                                cur = p.to_string();
                             }
                             (names.len() > 1).then_some(names)
                         } else {
@@ -1229,8 +1231,8 @@ impl Simulator {
             // §28.16: primitive fall delays have already had the structural
             // delay-mode override applied. Keep that value when recording the
             // assignment's per-driver transition delays below.
-            if ca.gate_delay_fall.is_some()
-                && ca.delay_fall.is_some()
+            if ca.gate_delay_fall().is_some()
+                && ca.delay_fall().is_some()
                 && wids.len() == 1
                 && lhs_is_bare_ident
                 && self
@@ -1238,7 +1240,7 @@ impl Simulator {
                     .gate_fall_delays
                     .contains_key(self.name_for_id(wids[0]))
             {
-                ca.delay_fall = self.gate_fall_delay_by_id.get(&wids[0]).copied();
+                ca.set_delay_fall(self.gate_fall_delay_by_id.get(&wids[0]).copied());
             }
             // Try fused-gate fast path first: recognizes yosys patterns like
             // `assign d[0] = a & b` or `assign d[0] = ~(a & b)` — executes
@@ -1247,7 +1249,7 @@ impl Simulator {
             // its fall delay in the name map alone, so one with a zero rise
             // delay (`buf #(0, 5)`) shows no delay of its own here; it took
             // the undelayed gate path and fell at once.
-            let primitive_fall = ca.gate_delay_fall.is_some()
+            let primitive_fall = ca.gate_delay_fall().is_some()
                 && wids.len() == 1
                 && lhs_is_bare_ident
                 && self
@@ -1261,24 +1263,24 @@ impl Simulator {
                 ca.lhs.kind,
                 ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
             );
-            let select_fall = ca.delay_fall.or_else(|| {
-                ca.gate_delay_fall
+            let select_fall = ca.delay_fall().or_else(|| {
+                ca.gate_delay_fall()
                     .filter(|_| select_target && delay_mode() != 1)
                     .map(apply_delay_mode)
             });
             let has_transition_delay = explicit_delay > 0
                 || primitive_fall
-                || ca.delay_fall.is_some_and(|d| d > 0)
-                || ca.delay_off.is_some_and(|d| d > 0)
-                || ca.delay_exprs.is_some()
+                || ca.delay_fall().is_some_and(|d| d > 0)
+                || ca.delay_off().is_some_and(|d| d > 0)
+                || ca.delay_exprs().is_some()
                 || (select_target && select_fall.is_some_and(|d| d > 0));
             // §10.3.3 versus §28.16: use the assignment's origin, not the
             // target's gate marker. Multi-driver lowering can give a gate
             // and an assignment separate, unmarked driver nets.
             let delay_target = if has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
-                ca.delay_select
+                ca.delay_select()
                     .or_else(|| {
-                        ca.origin.as_ref().and_then(|_| {
+                        ca.origin().and_then(|_| {
                             xezim_core::elaborate::continuous_assign_delay_select(
                                 &ca.lhs,
                                 &self.module,
@@ -1289,13 +1291,13 @@ impl Simulator {
                     .map(|(lo, width, vector)| DelayTarget {
                         lo,
                         width,
-                        vector: ca.origin.is_some() && vector,
+                        vector: ca.origin().is_some() && vector,
                         select_delays: None,
                     })
             } else if has_transition_delay
                 && select_target
-                && (ca.delay_exprs.is_some() || select_fall.is_some_and(|f| f != explicit_delay)
-                    || ca.delay_off.is_some_and(|t| t != explicit_delay))
+                && (ca.delay_exprs().is_some() || select_fall.is_some_and(|f| f != explicit_delay)
+                    || ca.delay_off().is_some_and(|t| t != explicit_delay))
             {
                 // §10.3.3 / §28.16: a constant select keeps a select target
                 // (no other driver overlaps it), so the per-driver maps of
@@ -1306,9 +1308,9 @@ impl Simulator {
                 Some(DelayTarget {
                     lo: 0,
                     width: 0,
-                    vector: ca.origin.is_some()
+                    vector: ca.origin().is_some()
                         && matches!(ca.lhs.kind, ExprKind::RangeSelect { .. }),
-                    select_delays: Some((select_fall, ca.delay_off)),
+                    select_delays: Some((select_fall, ca.delay_off())),
                 })
             } else {
                 None
@@ -1324,13 +1326,13 @@ impl Simulator {
             // the one point where both the target and the new value are
             // known. Whole-net targets only, including widened overlapping
             // selects, like the gate form (§28.16).
-            if ca.delay_exprs.is_none() && has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
-                if let Some(f) = ca.delay_fall {
+            if ca.delay_exprs().is_none() && has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
+                if let Some(f) = ca.delay_fall() {
                     if f != explicit_delay {
                         self.gate_fall_delay_by_id.insert(wids[0], f);
                     }
                 }
-                if let Some(t) = ca.delay_off {
+                if let Some(t) = ca.delay_off() {
                     if t != explicit_delay {
                         self.gate_off_delay_by_id.insert(wids[0], t);
                     }
@@ -1349,7 +1351,7 @@ impl Simulator {
                     rhs: Box::new(ca.rhs.clone()),
                     delay: explicit_delay,
                     delay_target: delay_target.map(Box::new),
-                    delay_exprs: ca.delay_exprs.take(),
+                    delay_exprs: ca.take_delay_exprs(),
                 }
             } else if let Some(op) = fused {
                 CombItem::FusedGate { op }
@@ -1987,7 +1989,11 @@ impl Simulator {
             let rhs_time_scope = if matches!(&item, CombItem::ContAssign { .. })
                 || matches!(&item, CombItem::CompiledContAssign { compiled } if compiled.has_fallback)
             {
-                ca.origin.map(|(_, scope)| scope).or_else(|| {
+                ca.extras
+                    .take()
+                    .and_then(|e| e.origin)
+                    .map(|(_, scope)| scope)
+                    .or_else(|| {
                     let name = self.name_opt(*wids.first()?)?;
                     let (owner, _) = name.rsplit_once('.')?;
                     let input_port = ca.rhs_parent_scoped
@@ -5640,7 +5646,7 @@ impl Simulator {
     fn row_pattern_assign_parts(
         module: &ElaboratedModule,
         ca: &crate::compiler::elaborate::ContinuousAssignment,
-        decl_dims: &HashMap<String, Vec<(i64, i64)>>,
+        decl_dims: &xezim_core::shared_names::SharedSliceMap<(i64, i64)>,
         params: &HashMap<String, Value>,
     ) -> Option<Vec<crate::compiler::elaborate::ContinuousAssignment>> {
         if !matches!(ca.rhs.kind, ExprKind::AssignmentPattern(_)) {
@@ -5676,8 +5682,8 @@ impl Simulator {
         }
         // The row's remaining dimensions, under the array's own name: the
         // parts come back as `name[j]...`, and only their indices are kept.
-        let row_dims: HashMap<String, Vec<(i64, i64)>> =
-            std::iter::once((name.clone(), dims[k..].to_vec())).collect();
+        let mut row_dims = xezim_core::shared_names::SharedSliceMap::default();
+        row_dims.insert(name.clone(), dims[k..].to_vec());
         let parts = module.whole_array_driver_parts(cur, &ca.rhs, ca.delay, &row_dims)?;
         Some(
             parts

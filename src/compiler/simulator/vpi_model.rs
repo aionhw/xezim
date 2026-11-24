@@ -1640,7 +1640,7 @@ impl<'a> Builder<'a> {
         let mut def_name = if inst_idx < 0 {
             sim.module.name.clone()
         } else {
-            sim.module.instances[inst_idx as usize].def_name.clone()
+            sim.module.instances[inst_idx as usize].def_name.to_string()
         };
         // §23.11 / §37: bind specializations retain the host's source
         // definition, so its declarations and bound port connections exist.

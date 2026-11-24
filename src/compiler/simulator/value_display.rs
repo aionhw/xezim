@@ -570,7 +570,7 @@ impl Simulator {
     fn p_static_prop_type_name(&mut self, arg: &Expression, cls: &str, prop: &str) -> Option<String> {
         let owners = self.prop_owners(cls);
         let (_, cd) = owners.get(prop)?;
-        let tn = cd.properties.get(prop)?.type_name.clone()?;
+        let tn = cd.properties.get(prop)?.type_name.as_deref()?.clone();
         if !cd.type_param_names.iter().any(|t| *t == tn) {
             return Some(tn);
         }
@@ -987,7 +987,7 @@ impl Simulator {
         }
         // §21.2.1.7: each dimension lists its elements left bound first.
         let dims = match self.module.unpacked_decl_dims.get(&scoped) {
-            Some(dd) if dd.len() == dims.len() => dd.clone(),
+            Some(dd) if dd.len() == dims.len() => dd.to_vec(),
             _ => dims,
         };
         Some(self.render_p_class_elems(handle, prop, "", &dims, &dt, su.as_ref()))

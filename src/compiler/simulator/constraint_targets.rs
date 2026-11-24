@@ -335,7 +335,7 @@ impl Simulator {
         while let Some(cn) = cur {
             let cd = self.module.classes.get(&cn)?;
             if let Some(sig) = cd.properties.get(prop) {
-                let mut tn = sig.type_name.clone();
+                let mut tn = sig.type_name.as_deref().cloned();
                 // A member whose declared type is a class TYPE PARAMETER
                 // (e.g. `REQ req` in `uvm_sequence #(trans)`) is not itself a
                 // registered class — `classes.contains_key` below would drop
@@ -443,7 +443,7 @@ impl Simulator {
         while let Some(cn) = cur {
             let cd = self.module.classes.get(cn)?;
             if let Some(sig) = cd.properties.get(prop) {
-                let mut tn = sig.type_name.clone();
+                let mut tn = sig.type_name.as_deref().cloned();
                 if let Some(raw) = &tn {
                     let resolved = owner
                         .and_then(|h| self.ancestor_type_param_binding(h, &cn, raw))

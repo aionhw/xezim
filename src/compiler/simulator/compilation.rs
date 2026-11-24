@@ -869,7 +869,7 @@ impl Simulator {
                         args.iter().map(|e| self.expr_to_spec_fragment(e)).collect();
                     if let Some(frags) = frags {
                         referenced_specs.push((
-                            base.clone(),
+                            base.to_string(),
                             self.canonicalize_spec_sig(base, &frags.join(",")),
                         ));
                     }

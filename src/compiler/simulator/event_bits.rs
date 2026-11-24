@@ -415,7 +415,7 @@ fn int_literal(v: i64, span: crate::ast::Span) -> Expression {
 fn rooted_ident(name: &str, span: crate::ast::Span) -> Expression {
     Expression::new(
         ExprKind::Ident(HierarchicalIdentifier {
-            root: Some("$root".to_string()),
+            root: Some(crate::ast::expr::HierRoot::Root),
             path: vec![HierPathSegment {
                 name: crate::ast::Identifier {
                     name: name.to_string(),

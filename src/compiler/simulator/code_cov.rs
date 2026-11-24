@@ -1130,7 +1130,7 @@ impl Simulator {
             .module
             .instances
             .iter()
-            .map(|i| i.path.clone())
+            .map(|i| i.path.to_string())
             .collect();
         let mut cov = CodeCov {
             kinds,
@@ -1326,7 +1326,7 @@ impl Simulator {
         hits: &mut Vec<u64>,
         ca: &mut crate::compiler::elaborate::ContinuousAssignment,
     ) -> Option<u32> {
-        let (span, scope) = ca.origin.clone()?;
+        let (span, scope) = ca.origin().cloned()?;
         let cov = code_cov.as_mut()?;
         let kinds = cov.kinds;
         let scope = if scope.is_empty() {
@@ -1437,7 +1437,7 @@ impl Simulator {
                 .instances
                 .iter()
                 .find(|i| i.path == inst)
-                .map(|i| i.def_name.clone())
+                .map(|i| i.def_name.to_string())
                 .unwrap_or_default()
         };
         let src = module.src_file_of_module.get(&unit).copied();
@@ -1685,7 +1685,9 @@ impl Simulator {
                     return false;
                 }
                 if let Some(t) = &sig.type_name {
-                    if module.classes.contains_key(t) || module.interfaces.contains(t) {
+                    if module.classes.contains_key(t.as_str())
+                        || module.interfaces.contains(t.as_str())
+                    {
                         return false;
                     }
                     // Instances and generate blocks are scopes, not signals

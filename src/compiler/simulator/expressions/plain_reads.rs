@@ -1292,7 +1292,7 @@ impl Simulator {
                     self.module
                         .signals
                         .get(name)
-                        .and_then(|s| s.type_name.clone())
+                        .and_then(|s| s.type_name.as_deref().cloned())
                 })
                 .or_else(|| {
                     self.signal_name_to_id

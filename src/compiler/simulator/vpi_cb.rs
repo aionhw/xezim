@@ -1614,7 +1614,7 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut c_void {
                     sim.module
                         .instances
                         .get(h.inst_idx as usize)
-                        .map(|i| i.path.clone())
+                        .map(|i| i.path.to_string())
                         .unwrap_or_default()
                 };
                 e.target = CbTarget::Scope(scope);

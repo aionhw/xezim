@@ -639,7 +639,7 @@ impl Simulator {
             self.module
                 .unpacked_decl_dims
                 .get(n)
-                .cloned()
+                .map(|d| d.to_vec())
                 .or_else(|| self.foreach_dims(n))
         }) {
             dims.into_iter()
@@ -1156,7 +1156,7 @@ impl Simulator {
                 }
                 self.module
                     .unpacked_decl_dims
-                    .insert(name.into(), shape.clone());
+                    .insert(name.to_string(), shape.clone());
                 if shape[0].0 > shape[0].1 {
                     self.module.descending_arrays.insert(name.into());
                 }

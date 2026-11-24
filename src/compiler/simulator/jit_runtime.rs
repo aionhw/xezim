@@ -915,8 +915,8 @@ impl Simulator {
                 return None;
             }
             let tn = type_name?;
-            if self.module.classes.contains_key(&tn) {
-                cls = tn;
+            if self.module.classes.contains_key(tn.as_str()) {
+                cls = tn.to_string();
                 i += 1;
                 continue;
             }

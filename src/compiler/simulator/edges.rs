@@ -335,7 +335,7 @@ impl Simulator {
             .module
             .instances
             .iter()
-            .filter(|i| self.module.interfaces.contains(&i.def_name))
+            .filter(|i| self.module.interfaces.contains(i.def_name.as_str()))
             .map(|i| i.path.as_str())
             .collect();
         let port_step = |formal: &str| -> u8 {
@@ -1734,7 +1734,7 @@ impl Simulator {
         } else if self.module.arrays_2d.contains_key(name)
             || self.module.arrays_nd.contains_key(name)
         {
-            self.module.unpacked_decl_dims.get(name)?.clone()
+            self.module.unpacked_decl_dims.get(name)?.to_vec()
         } else {
             return None;
         };

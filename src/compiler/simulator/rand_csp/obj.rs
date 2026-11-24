@@ -596,7 +596,7 @@ impl Simulator {
                 let is_obj = sig
                     .type_name
                     .as_ref()
-                    .is_some_and(|tn| self.module.classes.contains_key(tn))
+                    .is_some_and(|tn| self.module.classes.contains_key(tn.as_str()))
                     || (is_arr && self.prop_class_type(sub, &m).is_some());
                 if !is_obj {
                     continue;

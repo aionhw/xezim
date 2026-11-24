@@ -2053,7 +2053,7 @@ impl Simulator {
             .def_name;
         self.module
             .modport_member_dirs
-            .contains_key(&(def.clone(), mp))
+            .contains_key(&(def.to_string(), mp))
             .then_some(inst)
     }
 
@@ -3711,7 +3711,7 @@ impl Simulator {
     ) -> Expression {
         let mut expr = Self::hier_ident_expr(path, span);
         if let ExprKind::Ident(h) = &mut expr.kind {
-            h.root = Some("$root".to_string());
+            h.root = Some(crate::ast::expr::HierRoot::Root);
         }
         expr
     }
@@ -3799,7 +3799,11 @@ impl Simulator {
         // keep their shape and stay with the machinery that owns them. An
         // inner segment must be spelled like some modport: the common chain
         // leaves here without allocating.
-        let (root, names, span): (Option<String>, Vec<String>, crate::ast::Span) = match &e.kind {
+        let (root, names, span): (
+            Option<crate::ast::expr::HierRoot>,
+            Vec<String>,
+            crate::ast::Span,
+        ) = match &e.kind {
             ExprKind::Ident(h)
                 if h.path.len() >= 3
                     && h.path.iter().all(|s| s.selects.is_empty())
@@ -4306,7 +4310,7 @@ impl Simulator {
                 .module
                 .instances
                 .iter()
-                .filter(|i| self.module.interfaces.contains(&i.def_name))
+                .filter(|i| self.module.interfaces.contains(i.def_name.as_str()))
             {
                 let p = inst.path.as_str();
                 tails.insert(p.to_string());
@@ -4659,11 +4663,11 @@ impl Simulator {
             .module
             .instances
             .iter()
-            .filter(|i| self.module.interfaces.contains(&i.def_name))
+            .filter(|i| self.module.interfaces.contains(i.def_name.as_str()))
             .filter_map(|i| {
                 let rest = i.path.strip_prefix(base)?.strip_prefix('[')?;
                 let idx: i64 = rest.strip_suffix(']')?.parse().ok()?;
-                Some((idx, i.path.clone()))
+                Some((idx, i.path.to_string()))
             })
             .collect();
         if found.is_empty() {
@@ -4681,8 +4685,8 @@ impl Simulator {
             self.module
                 .instances
                 .iter()
-                .filter(|i| self.module.interfaces.contains(&i.def_name))
-                .map(|i| i.path.clone())
+                .filter(|i| self.module.interfaces.contains(i.def_name.as_str()))
+                .map(|i| i.path.to_string())
                 .collect()
         });
         set.contains(path)
@@ -4710,8 +4714,8 @@ impl Simulator {
                 self.module
                     .instances
                     .iter()
-                    .filter(|i| self.module.interfaces.contains(&i.def_name))
-                    .map(|i| (Self::iface_handle_token(&i.path), i.path.clone()))
+                    .filter(|i| self.module.interfaces.contains(i.def_name.as_str()))
+                    .map(|i| (Self::iface_handle_token(&i.path), i.path.to_string()))
                     .collect()
             })
             .get(&token)

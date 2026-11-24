@@ -54,7 +54,7 @@ impl Simulator {
             .module
             .unpacked_decl_dims
             .get(&name)
-            .map_or(0, Vec::len);
+            .map_or(0, |d| d.len());
         if depth == 0 {
             // A scalar's pattern is shaped by its packed type, earlier.
             return match self.item_shape(&elem) {

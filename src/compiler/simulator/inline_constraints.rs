@@ -114,12 +114,12 @@ impl Simulator {
                 (vec![d], ew)
             } else if let Some(&(r0, r1, ew)) = self.module.arrays_2d.get(name) {
                 match self.module.unpacked_decl_dims.get(name) {
-                    Some(d) if d.len() == 2 => (d.clone(), ew),
+                    Some(d) if d.len() == 2 => (d.to_vec(), ew),
                     _ => (vec![r0, r1], ew),
                 }
             } else if let Some((shape, ew)) = self.module.arrays_nd.get(name) {
                 match self.module.unpacked_decl_dims.get(name) {
-                    Some(d) if d.len() == shape.len() => (d.clone(), *ew),
+                    Some(d) if d.len() == shape.len() => (d.to_vec(), *ew),
                     _ => (shape.clone(), *ew),
                 }
             } else {
@@ -4117,7 +4117,7 @@ impl Simulator {
         }
         if let Some(sig) = self.module.signals.get(vname) {
             if let Some(tn) = &sig.type_name {
-                return Some(tn.clone());
+                return Some(tn.to_string());
             }
         }
         if let Some(&id) = self.signal_name_to_id.get(vname) {
@@ -4311,8 +4311,8 @@ impl Simulator {
         let mut seen: std::collections::HashSet<String> =
             std::iter::once(self.module.name.clone()).collect();
         for inst in &self.module.instances {
-            if seen.insert(inst.def_name.clone()) {
-                defs.push(inst.def_name.clone());
+            if seen.insert(inst.def_name.to_string()) {
+                defs.push(inst.def_name.to_string());
             }
         }
         defs.sort();

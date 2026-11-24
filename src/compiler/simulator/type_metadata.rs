@@ -333,13 +333,24 @@ impl Simulator {
                 members,
                 known.map(|k| &k.packed_fields[..]),
             ),
-            elem_widths: pick(
-                &m.packed_signal_elem_widths,
-                name,
-                &pfx,
-                members,
-                known.map(|k| &k.elem_widths[..]),
-            ),
+            elem_widths: {
+                let map = &m.packed_signal_elem_widths;
+                let bare = map.get(name).map(|v| (name.to_string(), *v));
+                match known.map(|k| &k.elem_widths[..]) {
+                    _ if !members => bare.into_iter().collect(),
+                    Some(keys) => bare
+                        .into_iter()
+                        .chain(keys.iter().filter(|(k, _)| k != name).filter_map(|(k, _)| {
+                            map.get(k.as_str()).map(|v| (k.clone(), *v))
+                        }))
+                        .collect(),
+                    None => map
+                        .iter()
+                        .filter(|(k, _)| *k == name || k.starts_with(&pfx))
+                        .map(|(k, v)| (k.clone(), *v))
+                        .collect(),
+                }
+            },
             full_dims: pick_shared(
                 &m.packed_full_dims,
                 name,
@@ -373,18 +384,6 @@ impl Simulator {
             } else {
                 set.remove(k);
             }
-        }
-        fn keyed<V: Clone>(
-            map: &mut HashMap<String, V>,
-            name: &str,
-            out: &[(String, V)],
-            v: &[(String, V)],
-        ) {
-            map.remove(name);
-            for (k, _) in out {
-                map.remove(k.as_str());
-            }
-            map.extend(v.iter().cloned());
         }
         put(&mut self.var_typedef_types, name, &meta.typedef);
         put(&mut self.var_class_types, name, &meta.class);
@@ -430,12 +429,13 @@ impl Simulator {
             &out.packed_fields,
             &meta.packed_fields,
         );
-        keyed(
-            &mut m.packed_signal_elem_widths,
-            name,
-            &out.elem_widths,
-            &meta.elem_widths,
-        );
+        m.packed_signal_elem_widths.remove(name);
+        for (k, _) in &out.elem_widths {
+            m.packed_signal_elem_widths.remove(k.as_str());
+        }
+        for (k, v) in &meta.elem_widths {
+            m.packed_signal_elem_widths.insert(k.clone(), *v);
+        }
         keyed_shared(
             &mut m.packed_full_dims,
             name,
@@ -1231,8 +1231,8 @@ impl Simulator {
         }
         if let Some(sig) = self.module.signals.get(vname) {
             if let Some(tn) = &sig.type_name {
-                if self.module.classes.contains_key(tn) {
-                    return Some(tn.clone());
+                if self.module.classes.contains_key(tn.as_str()) {
+                    return Some(tn.to_string());
                 }
             }
         }
@@ -1427,7 +1427,7 @@ impl Simulator {
         }
         if let Some(sig) = self.module.signals.get(dotted.as_str()) {
             if let Some(tn) = &sig.type_name {
-                if self.module.classes.contains_key(tn) {
+                if self.module.classes.contains_key(tn.as_str()) {
                     return true;
                 }
             }
@@ -1537,7 +1537,7 @@ impl Simulator {
                         }
                         if let Some(sig) = self.module.signals.get(flat.as_str()) {
                             if let Some(tn) = &sig.type_name {
-                                if self.module.classes.contains_key(tn) {
+                                if self.module.classes.contains_key(tn.as_str()) {
                                     return true;
                                 }
                             }

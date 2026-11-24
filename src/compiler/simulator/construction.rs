@@ -2171,7 +2171,7 @@ impl Simulator {
                     name: crate::ast::types::TypeName {
                         scopes: Vec::new(),
                         name: crate::ast::Identifier {
-                            name: tn,
+                            name: tn.to_string(),
                             span: crate::ast::Span::dummy(),
                         },
                         span: crate::ast::Span::dummy(),

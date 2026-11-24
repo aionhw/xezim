@@ -141,13 +141,13 @@ impl Simulator {
         }
         if let Some(&(r0, r1, ew)) = self.module.arrays_2d.get(name) {
             return Some(match self.module.unpacked_decl_dims.get(name) {
-                Some(d) if d.len() == 2 => (d.clone(), ew),
+                Some(d) if d.len() == 2 => (d.to_vec(), ew),
                 _ => (vec![r0, r1], ew),
             });
         }
         let (shape, ew) = self.module.arrays_nd.get(name)?;
         Some(match self.module.unpacked_decl_dims.get(name) {
-            Some(d) if d.len() == shape.len() => (d.clone(), *ew),
+            Some(d) if d.len() == shape.len() => (d.to_vec(), *ew),
             _ => (shape.clone(), *ew),
         })
     }

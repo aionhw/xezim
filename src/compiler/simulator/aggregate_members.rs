@@ -624,7 +624,7 @@ impl Simulator {
                         }
                         // `extends comp_base` with the argument left out:
                         // the parameter's declared default (§6.20.2).
-                        if let Some(b) = inst.type_bindings.get(tn) {
+                        if let Some(b) = inst.type_bindings.get(tn.as_str()) {
                             return Some(b.clone());
                         }
                         return cd
@@ -634,9 +634,9 @@ impl Simulator {
                             .map(|(_, d)| d.trim().to_string())
                             .filter(|d| !d.is_empty() && !cd.type_param_names.contains(d));
                     }
-                    return inst.type_bindings.get(tn).cloned();
+                    return inst.type_bindings.get(tn.as_str()).cloned();
                 }
-                return Some(tn.clone());
+                return Some(tn.to_string());
             }
             let e = cd.extends.as_deref()?;
             if n == buf.len() || chain.iter().any(|c| c.name == e) {
@@ -1349,7 +1349,7 @@ impl Simulator {
                 || cd.queue_properties.contains_key(&member)
                 || cd.assoc_properties.contains_key(&member)
             {
-                let mut tn = cd.properties.get(&member)?.type_name.clone()?;
+                let mut tn = cd.properties.get(&member)?.type_name.as_deref()?.clone();
                 // §8.25: an element typed by a class type parameter has the
                 // type this object bound to it.
                 if cd.type_param_names.contains(&tn) {
@@ -3674,7 +3674,7 @@ impl Simulator {
             .unpacked_decl_dims
             .get(&name)
             .filter(|dims| dims.len() == shape.len())
-            .cloned()
+            .map(|dims| dims.to_vec())
             .unwrap_or(shape);
         let first = dims
             .iter()
