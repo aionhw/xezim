@@ -2065,11 +2065,18 @@ impl Simulator {
                 Some(access)
             }
             ExprKind::MemberAccess { expr: base, member } => {
-                // §23.6, §27.4: an indexed generate scope can be part of
-                // the backing signal's name. Resolve the declared signal
-                // before treating this step as a packed member.
-                if let Some(root) = self.fold_indexed_hier_path(expr) {
-                    return self.declared_packed_access(&root);
+                // §23.6, §27.4: a declaration under an indexed generate
+                // scope has a stored hierarchical name. A flattened member
+                // of an unpacked struct may also match that spelling, but
+                // must resolve through its own variable or call-frame root.
+                if Self::select_entered_member_shape(expr)
+                    && let Some(name) = self.constant_selected_storage(expr)
+                    && let Some((owner, _)) = name.rsplit_once('.')
+                    && !self.module.struct_members.contains_key(owner)
+                    && let Some(access) =
+                        self.declared_packed_access(&Self::flat_name_ident(name, expr.span))
+                {
+                    return Some(access);
                 }
                 if !self.class_member_names().statics.is_empty()
                     && let Some(access) = self.declared_static_packed_root(expr)
