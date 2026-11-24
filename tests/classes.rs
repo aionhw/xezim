@@ -380,6 +380,8 @@ mod covergroup_implicit_names;
 mod covergroup_cross_implicit_points;
 #[path = "classes/covergroup_options.rs"]
 mod covergroup_options;
+#[path = "classes/covergroup_class_options.rs"]
+mod covergroup_class_options;
 #[path = "classes/covergroup_placement.rs"]
 mod covergroup_placement;
 #[path = "classes/covergroup_queries.rs"]
