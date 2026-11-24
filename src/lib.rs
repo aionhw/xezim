@@ -1487,20 +1487,34 @@ fn simulate_multi_inner(
     // (`lhs = #d rhs`); canonicalize them into a marker call the simulator
     // implements (see `intra_delay`) before parsing.
     let raw_sources = sources;
-    let sources: Vec<String> = sources
-        .iter()
-        .map(|s| intra_delay::rewrite_intra_assignment_delays(s))
-        .collect();
+    let rewritten_sources: Option<Vec<String>> = {
+        let mut owned: Option<Vec<String>> = None;
+        for (idx, s) in raw_sources.iter().enumerate() {
+            if let std::borrow::Cow::Owned(rewritten) =
+                intra_delay::rewrite_intra_assignment_delays_cow(s)
+            {
+                let vec = owned.get_or_insert_with(|| raw_sources[..idx].to_vec());
+                vec.push(rewritten);
+            } else if let Some(vec) = owned.as_mut() {
+                vec.push(s.clone());
+            }
+        }
+        owned
+    };
+    let sources: &[String] = rewritten_sources.as_deref().unwrap_or(raw_sources);
     // The driver's own preprocessing pass (main.rs), reusable when the
     // rewrite above left every source untouched.
-    let mut pre = take_preprocessed(raw_sources, source_paths, include_dirs, defines)
-        .filter(|_| sources.as_slice() == raw_sources);
+    let mut pre = if rewritten_sources.is_none() {
+        take_preprocessed(raw_sources, source_paths, include_dirs, defines)
+    } else {
+        None
+    };
     let cache = design_cache_config();
     if pre.is_none() {
         // One pass serves the cache key, the intra-assignment delay rewrite
         // below and (on a miss) elaboration.
         pre = Some(xezim_core::preprocess_design(
-            &sources,
+            sources,
             source_paths,
             include_dirs,
             defines,
@@ -1513,8 +1527,9 @@ fn simulate_multi_inner(
     // a delay already rewritten is left alone.
     if let Some(p) = pre.as_mut() {
         for t in p.texts.iter_mut() {
-            let rewritten = intra_delay::rewrite_intra_assignment_delays(t);
-            if rewritten != *t {
+            if let std::borrow::Cow::Owned(rewritten) =
+                intra_delay::rewrite_intra_assignment_delays_cow(t)
+            {
                 *t = rewritten;
             }
         }
@@ -1524,7 +1539,7 @@ fn simulate_multi_inner(
     let cache_key = cache.as_ref().map(|config| {
         let (key, texts, maps) = design_cache_key(
             config,
-            &sources,
+            sources,
             source_paths,
             top_module_name,
             include_dirs,
@@ -1541,7 +1556,7 @@ fn simulate_multi_inner(
         .and_then(|(config, key)| read_design_cache(config, key));
 
     let elab = if let Some(mut elab) = cached_elab {
-        drop(sources);
+        drop(rewritten_sources);
         // The artifact skips the (large) preprocessed texts; refill them from
         // the cache-key pass so runtime diagnostics keep `file:line`
         // resolution on cache hits. `source_files` / `src_file_of_module`
@@ -1567,6 +1582,8 @@ fn simulate_multi_inner(
         }
         elab
     } else {
+        drop(cache_pp_texts);
+        drop(cache_line_maps);
         // Capture elaboration diagnostics so a future warm hit can replay them.
         if cache.is_some() {
             xezim_core::elab_diag_capture_begin();
@@ -1575,7 +1592,7 @@ fn simulate_multi_inner(
         // run in the same process/thread reports its own first five.
         xezim_core::elab_diag_reset_counts();
         let (definitions, mut elab) = xezim_core::parse_and_elaborate_multi_preprocessed(
-            &sources,
+            sources,
             top_module_name,
             include_dirs,
             source_paths,
@@ -1601,11 +1618,11 @@ fn simulate_multi_inner(
 
         // §18.5.1: recover any out-of-class constraint body that the class-table
         // repopulation in `inline_instantiations` dropped.
-        reinstall_ooc_constraint_bodies(&sources, source_paths, include_dirs, defines, &mut elab);
+        reinstall_ooc_constraint_bodies(sources, source_paths, include_dirs, defines, &mut elab);
         // The rewritten source texts are dead from here on (the elaborated
         // design keeps its own preprocessed copies for diagnostics); don't
         // carry a second copy of the whole design through simulation.
-        drop(sources);
+        drop(rewritten_sources);
 
         // Second-pass `should_fail` lint (additive — reuses the elaboration above,
         // no extra cost; does not alter elaborate/simulate behavior). Rejecting
@@ -1625,11 +1642,13 @@ fn simulate_multi_inner(
         defer_static_syscall_inits(&definitions, &mut elab);
         phase("constraint bodies, lint, static inits");
 
-        // Drop the parsed AST before constructing runtime state, and hand
-        // its pages back at once: the allocator would otherwise keep them
-        // resident for its purge delay, right while `Simulator::new` makes
-        // its largest fresh allocations, and peak RSS would carry both.
+        // Drop the parsed AST and scope trees before constructing runtime
+        // state, and hand their pages back at once: the allocator would
+        // otherwise keep them resident for its purge delay, right while
+        // `Simulator::new` makes its largest fresh allocations, and peak RSS
+        // would carry both.
         drop(definitions);
+        xezim_core::scope_tree::clear();
         xezim_core::release_free_memory();
         rss_trace("parsed AST dropped");
         phase("parsed AST dropped");

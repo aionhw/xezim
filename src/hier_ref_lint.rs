@@ -965,10 +965,12 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
     for ca in &elab.continuous_assigns {
         // Only assignments the source spells out; port connections and
         // gates are elaboration's own.
-        if let Some((_, scope)) = ca.origin() {
+        if let Some(f) = ca.as_full()
+            && let Some((_, scope)) = f.origin()
+        {
             let mut refs = Vec::new();
-            expr_refs(&ca.lhs, &mut refs);
-            expr_refs(&ca.rhs, &mut refs);
+            expr_refs(&f.lhs, &mut refs);
+            expr_refs(&f.rhs, &mut refs);
             add(Rc::new(refs), scope.to_string(), None, None);
         }
     }

@@ -888,7 +888,7 @@ impl Simulator {
                 .classes
                 .get(&cn)
                 .and_then(|cd| cd.properties.get(&prop))
-                .map(|p| p.value.clone())
+                .map(|p| p.value.to_value())
                 .unwrap_or_else(|| Value::zero(32));
             let cells: Vec<String> = names
                 .iter()

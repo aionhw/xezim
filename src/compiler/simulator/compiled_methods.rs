@@ -2402,7 +2402,7 @@ impl Simulator {
                         for (vname, tp_name) in tp_locals {
                             let span = crate::ast::Span::dummy();
                             let dt = crate::ast::types::DataType::TypeReference {
-                                name: crate::ast::types::TypeName {
+                                name: Box::new(crate::ast::types::TypeName {
                                     scopes: Vec::new(),
                                     name: crate::ast::Identifier {
                                         name: tp_name.clone(),
@@ -2410,7 +2410,7 @@ impl Simulator {
                                     },
                                     span,
                                     bound: Default::default(),
-                                },
+                                }),
                                 dimensions: Vec::new(),
                                 type_args: Vec::new(),
                                 span,
@@ -2715,7 +2715,7 @@ impl Simulator {
                                 .or_else(|| cd.static_assoc_key_types.get(member))
                             {
                                 let dt = crate::ast::types::DataType::TypeReference {
-                                    name: crate::ast::types::TypeName {
+                                    name: Box::new(crate::ast::types::TypeName {
                                         scopes: Vec::new(),
                                         name: crate::ast::Identifier {
                                             name: kt.clone(),
@@ -2723,7 +2723,7 @@ impl Simulator {
                                         },
                                         span: crate::ast::Span::dummy(),
                                         bound: Default::default(),
-                                    },
+                                    }),
                                     dimensions: Vec::new(),
                                     type_args: Vec::new(),
                                     span: crate::ast::Span::dummy(),
@@ -3269,7 +3269,7 @@ impl Simulator {
                             local_typedef_types.entry(name.clone()).or_insert_with(|| {
                                 let span = crate::ast::Span::dummy();
                                 DataType::TypeReference {
-                                    name: crate::ast::types::TypeName {
+                                    name: Box::new(crate::ast::types::TypeName {
                                         scopes: vec![crate::ast::types::TypeScope {
                                             name: crate::ast::Identifier {
                                                 name: cn.clone(),
@@ -3283,7 +3283,7 @@ impl Simulator {
                                         },
                                         span,
                                         bound: Default::default(),
-                                    },
+                                    }),
                                     dimensions: vec![],
                                     type_args: vec![],
                                     span,

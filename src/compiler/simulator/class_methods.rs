@@ -499,7 +499,7 @@ impl Simulator {
                     x.is_signed = prop_sig.is_signed;
                     x
                 } else {
-                    prop_sig.value.clone()
+                    prop_sig.value.to_value()
                 };
                 if let Some(keys) = &mut property_seed_keys {
                     keys[ci].push(key.clone());
@@ -1750,7 +1750,7 @@ impl Simulator {
                             // §13.5.3: a default is in the METHOD's scope, so
                             // `output int o = p` names this object's `p`:
                             // copied back while `this` is still current.
-                            default_out_bindings.push((port.name.name.clone(), d.clone()));
+                            default_out_bindings.push((port.name.name.clone(), d.as_ref().clone()));
                         }
                     }
                     if let Some(actual) = actual.filter(|_| !plain) {

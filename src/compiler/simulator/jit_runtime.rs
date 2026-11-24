@@ -903,7 +903,7 @@ impl Simulator {
                 .or_else(|| cd.queue_properties.get(&name).map(|(w, _)| *w))
                 .or_else(|| cd.assoc_index_props.get(&name).map(|(w, _)| *w));
             let type_name = cd.properties.get(&name).and_then(|s| s.type_name.clone());
-            let whole_w = cd.properties.get(&name).map(|s| s.value.width);
+            let whole_w = cd.properties.get(&name).map(|s| s.value.width());
             if last {
                 return if seg.selects.is_empty() && !indexed_last {
                     whole_w.filter(|w| *w > 0)

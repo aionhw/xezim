@@ -2134,7 +2134,7 @@ impl Simulator {
                 .and_then(|cd| match cd.property_inits.get(name) {
                     Some(init) => super::elaborate::const_eval_i64_with_params(init, None)
                         .map(|v| Value::from_u64(v as u64, 64)),
-                    None => cd.properties.get(name).map(|sig| sig.value.clone()),
+                    None => cd.properties.get(name).map(|sig| sig.value.to_value()),
                 });
             if seed.is_some() {
                 return seed;

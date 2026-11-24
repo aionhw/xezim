@@ -3959,7 +3959,7 @@ impl Simulator {
                         // specialization's value parameters.
                         if let Some(leaf) = hier.path.last().map(|s| s.name.name.clone()) {
                             let as_ty = crate::ast::types::DataType::TypeReference {
-                                name: crate::ast::types::TypeName {
+                                name: Box::new(crate::ast::types::TypeName {
                                     scopes: Vec::new(),
                                     name: crate::ast::Identifier {
                                         name: leaf,
@@ -3967,7 +3967,7 @@ impl Simulator {
                                     },
                                     span: arg.span,
                                     bound: Default::default(),
-                                },
+                                }),
                                 dimensions: Vec::new(),
                                 type_args: Vec::new(),
                                 span: arg.span,

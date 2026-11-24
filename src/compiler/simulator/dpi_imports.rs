@@ -1237,7 +1237,7 @@ impl Simulator {
             let v = out.get_or_insert_with(|| args.to_vec());
             for p in &ports[have..] {
                 match &p.default {
-                    Some(d) => v.push(d.clone()),
+                    Some(d) => v.push(d.as_ref().clone()),
                     None => break,
                 }
             }

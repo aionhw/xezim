@@ -440,9 +440,16 @@ pub(super) mod edgesel_writers {
                 }
             }
             for (i, ca) in module.continuous_assigns.iter().enumerate() {
-                for t in targets(&ca.lhs) {
-                    if let Some(b) = base_ident(t) {
-                        ix.cont.entry(leaf(&b).to_string()).or_default().push(i);
+                match ca {
+                    crate::compiler::elaborate::ContinuousAssignment::PlainLink { lhs, .. } => {
+                        ix.cont.entry(leaf(lhs.as_str()).to_string()).or_default().push(i);
+                    }
+                    crate::compiler::elaborate::ContinuousAssignment::Full(f) => {
+                        for t in targets(&f.lhs) {
+                            if let Some(b) = base_ident(t) {
+                                ix.cont.entry(leaf(&b).to_string()).or_default().push(i);
+                            }
+                        }
                     }
                 }
             }

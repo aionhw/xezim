@@ -222,15 +222,16 @@ fn extract_event_and_rhs(b: &[u8], src: &str, i: usize) -> Option<(u8, String, u
 }
 
 /// Rewrite `= #d rhs;` / `<= #d rhs;` into the `$__xz_intra_delay(d, rhs)`
-/// marker form (see module docs). Returns the input unchanged when no
-/// intra-assignment delay is present.
-pub fn rewrite_intra_assignment_delays(src: &str) -> String {
+/// marker form (see module docs). Returns `Cow::Borrowed(src)` with zero
+/// allocations when no intra-assignment delay is present (#721).
+pub fn rewrite_intra_assignment_delays_cow(src: &str) -> std::borrow::Cow<'_, str> {
     if !src.contains('#') && !src.contains('@') {
-        return src.to_string();
+        return std::borrow::Cow::Borrowed(src);
     }
     let b = src.as_bytes();
     let n = b.len();
-    let mut out = String::with_capacity(n + 64);
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
     let mut i = 0usize;
     // Last three significant chars (outside comments/strings), newest first.
     let (mut p1, mut p2, mut p3) = (b' ', b' ', b' ');
@@ -249,29 +250,22 @@ pub fn rewrite_intra_assignment_delays(src: &str) -> String {
         }
         let c = b[i];
         if c >= 0x80 {
-            // Copy a multi-byte UTF-8 char whole (byte-wise push would
-            // re-encode it as Latin-1 and corrupt it).
             let len = match c {
                 0xC0..=0xDF => 2,
                 0xE0..=0xEF => 3,
                 _ => 4,
             }
             .min(n - i);
-            out.push_str(&src[i..i + len]);
             i += len;
             push_sig(&mut p1, &mut p2, &mut p3, c);
             continue;
         }
         if c == b'/' && i + 1 < n && (b[i + 1] == b'/' || b[i + 1] == b'*') {
-            let end = skip_ws_comments(b, i);
-            out.push_str(&src[i..end]);
-            i = end;
+            i = skip_ws_comments(b, i);
             continue;
         }
         if c == b'"' {
-            let end = skip_string(b, i);
-            out.push_str(&src[i..end]);
-            i = end;
+            i = skip_string(b, i);
             push_sig(&mut p1, &mut p2, &mut p3, b'"');
             continue;
         }
@@ -337,16 +331,19 @@ pub fn rewrite_intra_assignment_delays(src: &str) -> String {
                         extract_event_and_rhs(b, src, at_pos)
                     {
                         if define_end.is_none_or(|e| semi < e) {
-                            out.push_str(INTRA_EVENT_MARKER);
-                            out.push('(');
-                            out.push_str(&count_txt);
-                            out.push(',');
-                            out.push_str(&edge.to_string());
-                            out.push(',');
-                            out.push_str(&sig);
-                            out.push(',');
-                            out.push_str(&src[rhs_start..semi]);
-                            out.push(')');
+                            let buf = out.get_or_insert_with(|| String::with_capacity(n + 64));
+                            buf.push_str(&src[copied..i]);
+                            buf.push_str(INTRA_EVENT_MARKER);
+                            buf.push('(');
+                            buf.push_str(&count_txt);
+                            buf.push(',');
+                            buf.push_str(&edge.to_string());
+                            buf.push(',');
+                            buf.push_str(&sig);
+                            buf.push(',');
+                            buf.push_str(&src[rhs_start..semi]);
+                            buf.push(')');
+                            copied = semi;
                             i = semi; // main loop copies the `;`
                             continue;
                         }
@@ -377,12 +374,15 @@ pub fn rewrite_intra_assignment_delays(src: &str) -> String {
             if blocking_c || nba_c {
                 if let Some((cnt_end, semi)) = extract_delay_and_rhs(b, i + 1) {
                     if define_end.is_none_or(|e| semi < e) {
-                        out.push_str(INTRA_CYCLE_MARKER);
-                        out.push('(');
-                        out.push_str(&src[i + 2..cnt_end]);
-                        out.push(',');
-                        out.push_str(&src[cnt_end..semi]);
-                        out.push(')');
+                        let buf = out.get_or_insert_with(|| String::with_capacity(n + 64));
+                        buf.push_str(&src[copied..i]);
+                        buf.push_str(INTRA_CYCLE_MARKER);
+                        buf.push('(');
+                        buf.push_str(&src[i + 2..cnt_end]);
+                        buf.push(',');
+                        buf.push_str(&src[cnt_end..semi]);
+                        buf.push(')');
+                        copied = semi;
                         i = semi;
                         continue;
                     }
@@ -414,25 +414,40 @@ pub fn rewrite_intra_assignment_delays(src: &str) -> String {
             if blocking || nba {
                 if let Some((delay_end, semi)) = extract_delay_and_rhs(b, i) {
                     if define_end.is_none_or(|e| semi < e) {
-                        out.push_str(INTRA_DELAY_MARKER);
-                        out.push('(');
-                        out.push_str(&src[i + 1..delay_end]);
-                        out.push(',');
-                        out.push_str(&src[delay_end..semi]);
-                        out.push(')');
+                        let buf = out.get_or_insert_with(|| String::with_capacity(n + 64));
+                        buf.push_str(&src[copied..i]);
+                        buf.push_str(INTRA_DELAY_MARKER);
+                        buf.push('(');
+                        buf.push_str(&src[i + 1..delay_end]);
+                        buf.push(',');
+                        buf.push_str(&src[delay_end..semi]);
+                        buf.push(')');
+                        copied = semi;
                         i = semi; // main loop copies the `;`
                         continue;
                     }
                 }
             }
         }
-        out.push(c as char);
         if !c.is_ascii_whitespace() {
             push_sig(&mut p1, &mut p2, &mut p3, c);
         }
         i += 1;
     }
-    out
+    match out {
+        Some(mut buf) => {
+            buf.push_str(&src[copied..]);
+            std::borrow::Cow::Owned(buf)
+        }
+        None => std::borrow::Cow::Borrowed(src),
+    }
+}
+
+/// Rewrite `= #d rhs;` / `<= #d rhs;` into the `$__xz_intra_delay(d, rhs)`
+/// marker form (see module docs). Returns the input unchanged when no
+/// intra-assignment delay is present.
+pub fn rewrite_intra_assignment_delays(src: &str) -> String {
+    rewrite_intra_assignment_delays_cow(src).into_owned()
 }
 
 #[cfg(test)]

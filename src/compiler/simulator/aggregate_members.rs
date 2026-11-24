@@ -812,7 +812,7 @@ impl Simulator {
         }
         if self.module.typedef_types.contains_key(b) {
             return Some(DataType::TypeReference {
-                name: crate::ast::types::TypeName {
+                name: Box::new(crate::ast::types::TypeName {
                     scopes: Vec::new(),
                     name: crate::ast::Identifier {
                         name: b.to_string(),
@@ -820,7 +820,7 @@ impl Simulator {
                     },
                     span,
                     bound: Default::default(),
-                },
+                }),
                 dimensions: Vec::new(),
                 type_args: Vec::new(),
                 span,
@@ -874,7 +874,7 @@ impl Simulator {
         let mut parts: Vec<&str> = b.split("::").collect();
         let leaf = parts.pop()?;
         Some(DataType::TypeReference {
-            name: crate::ast::types::TypeName {
+            name: Box::new(crate::ast::types::TypeName {
                 scopes: parts
                     .into_iter()
                     .map(|s| crate::ast::types::TypeScope {
@@ -891,7 +891,7 @@ impl Simulator {
                 },
                 span,
                 bound: Default::default(),
-            },
+            }),
             dimensions: Vec::new(),
             type_args: Vec::new(),
             span,

@@ -1348,13 +1348,23 @@ impl Simulator {
         for ca in &module.continuous_assigns {
             reads.clear();
             writes.clear();
-            expr_names(&ca.rhs, module, &mut reads);
-            let mut lhs = Vec::new();
-            expr_names(&ca.lhs, module, &mut lhs);
-            if let Some(first) = lhs.first() {
-                writes.push(first.clone());
+            match ca {
+                crate::compiler::elaborate::ContinuousAssignment::PlainLink {
+                    lhs, rhs, ..
+                } => {
+                    reads.push(rhs.to_string());
+                    writes.push(lhs.to_string());
+                }
+                crate::compiler::elaborate::ContinuousAssignment::Full(f) => {
+                    expr_names(&f.rhs, module, &mut reads);
+                    let mut lhs = Vec::new();
+                    expr_names(&f.lhs, module, &mut lhs);
+                    if let Some(first) = lhs.first() {
+                        writes.push(first.clone());
+                    }
+                    reads.extend(lhs.into_iter().skip(1));
+                }
             }
-            reads.extend(lhs.into_iter().skip(1));
             link(&reads, &writes, &mut adj);
         }
         for ab in &module.always_blocks {

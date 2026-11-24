@@ -316,8 +316,8 @@ impl Simulator {
         match dt {
             crate::ast::types::DataType::TypeReference {
                 name, dimensions, ..
-            } if !dimensions.is_empty() => Some(name.clone()),
-            crate::ast::types::DataType::TypeReference { name, .. } => Some(name.clone()),
+            } if !dimensions.is_empty() => Some(name.as_ref().clone()),
+            crate::ast::types::DataType::TypeReference { name, .. } => Some(name.as_ref().clone()),
             _ => None,
         }
     }

@@ -1326,7 +1326,7 @@ impl Simulator {
         module: &ElaboratedModule,
         code_cov: &mut Option<Box<CodeCov>>,
         hits: &mut Vec<u64>,
-        ca: &mut crate::compiler::elaborate::ContinuousAssignment,
+        ca: &mut crate::compiler::elaborate::FullContinuousAssignment,
     ) -> Option<u32> {
         let (span, scope) = ca.origin().cloned()?;
         let cov = code_cov.as_mut()?;

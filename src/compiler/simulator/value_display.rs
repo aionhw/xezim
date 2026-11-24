@@ -633,7 +633,7 @@ impl Simulator {
         }
         if self.module.enum_members.contains_key(tn) {
             return Some(DataType::TypeReference {
-                name: crate::ast::types::TypeName {
+                name: Box::new(crate::ast::types::TypeName {
                     scopes: Vec::new(),
                     name: crate::ast::Identifier {
                         name: tn.to_string(),
@@ -641,7 +641,7 @@ impl Simulator {
                     },
                     span: crate::ast::Span::dummy(),
                     bound: Default::default(),
-                },
+                }),
                 dimensions: Vec::new(),
                 type_args: Vec::new(),
                 span: crate::ast::Span::dummy(),

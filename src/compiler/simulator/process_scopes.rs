@@ -956,10 +956,19 @@ impl Simulator {
             }
         }
         for assign in &module.continuous_assigns {
-            let mut names = HashSet::default();
-            expr_names(&assign.lhs, &mut names);
-            expr_names(&assign.rhs, &mut names);
-            insert(&names.into_iter().collect::<Vec<_>>(), "");
+            match assign {
+                crate::compiler::elaborate::ContinuousAssignment::PlainLink {
+                    lhs, rhs, ..
+                } => {
+                    insert(&[lhs.to_string(), rhs.to_string()], "");
+                }
+                crate::compiler::elaborate::ContinuousAssignment::Full(f) => {
+                    let mut names = HashSet::default();
+                    expr_names(&f.lhs, &mut names);
+                    expr_names(&f.rhs, &mut names);
+                    insert(&names.into_iter().collect::<Vec<_>>(), "");
+                }
+            }
         }
         for assign in &module.pending_cont_assign {
             let mut names = HashSet::default();

@@ -1464,7 +1464,7 @@ impl Simulator {
             let seed = self
                 .get_class_def(&cname)
                 .and_then(|cd| cd.properties.get(&prop))
-                .map(|p| p.value.clone())
+                .map(|p| p.value.to_value())
                 .unwrap_or_else(|| Value::zero(32));
             self.class_statics.insert(spec_key.clone(), seed);
             self.class_context_stack.push(Some(cname.clone()));
@@ -3967,7 +3967,7 @@ impl Simulator {
                     Option<Expression>,
                 ) = match self.module.classes.get(decl_class) {
                     Some(cd) => (
-                        cd.properties.get(prop).map(|sig| sig.value.clone()),
+                        cd.properties.get(prop).map(|sig| sig.value.to_value()),
                         cd.property_inits
                             .iter()
                             .find(|(p, _)| p.as_str() == prop)

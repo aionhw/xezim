@@ -2774,7 +2774,7 @@ impl<'a> Builder<'a> {
                 // §10.3.1 net declaration assignment.
                 let lhs = self.var_expr(o);
                 let rhs = self.expr_obj(init, ctx.scope, ctx.file);
-                let delay = match &nd.delay {
+                let delay = match nd.delay() {
                     Some(e) => self.expr_obj(e, ctx.scope, ctx.file),
                     None => NONE,
                 };
@@ -3274,7 +3274,7 @@ impl<'a> Builder<'a> {
                 prim_type,
                 def,
                 &terms,
-                gi.delay.as_ref(),
+                gi.delay.as_deref(),
                 inputs,
                 g.span,
                 ctx,

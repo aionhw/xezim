@@ -4464,18 +4464,24 @@ impl Simulator {
         // exactly one continuous driver — the connect itself — collapse.
         let mut ca_driver_counts: HashMap<Cow<'_, str>, u32> = HashMap::default();
         for ca in &self.module.continuous_assigns {
-            let base = match &ca.lhs.kind {
-                ExprKind::Ident(h) => Some(h),
-                ExprKind::Index { expr, .. } => match &expr.kind {
-                    ExprKind::Ident(h) => Some(h),
-                    _ => None,
-                },
-                _ => None,
+            let name = match ca {
+                crate::compiler::elaborate::ContinuousAssignment::PlainLink { lhs, .. } => {
+                    Cow::Borrowed(lhs.as_str())
+                }
+                crate::compiler::elaborate::ContinuousAssignment::Full(f) => {
+                    let base = match &f.lhs.kind {
+                        ExprKind::Ident(h) => Some(h),
+                        ExprKind::Index { expr, .. } => match &expr.kind {
+                            ExprKind::Ident(h) => Some(h),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let Some(h) = base else { continue };
+                    flat_name(h, &self.module)
+                }
             };
-            let Some(h) = base else { continue };
-            *ca_driver_counts
-                .entry(flat_name(h, &self.module))
-                .or_insert(0) += 1;
+            *ca_driver_counts.entry(name).or_insert(0) += 1;
         }
         // INPUT identity connects only (`u1.din = src`, rhs in parent
         // scope): the child name re-points at the parent's id. Output
@@ -4490,22 +4496,29 @@ impl Simulator {
             .module
             .continuous_assigns
             .iter()
-            .filter_map(|ca| {
-                if ca.delay != 0 {
-                    return None;
+            .filter_map(|ca| match ca {
+                crate::compiler::elaborate::ContinuousAssignment::PlainLink {
+                    lhs,
+                    rhs,
+                    rhs_parent_scoped,
+                } => (*rhs_parent_scoped).then(|| (lhs.as_str(), Cow::Borrowed(rhs.as_str()))),
+                crate::compiler::elaborate::ContinuousAssignment::Full(f) => {
+                    if f.delay != 0 {
+                        return None;
+                    }
+                    let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&f.lhs.kind, &f.rhs.kind)
+                    else {
+                        return None;
+                    };
+                    if lh.path.len() != 1
+                        || !lh.path[0].selects.is_empty()
+                        || !rh.path.iter().all(|s| s.selects.is_empty())
+                        || !f.rhs_parent_scoped
+                    {
+                        return None;
+                    }
+                    Some((lh.path[0].name.name.as_str(), flat_name(rh, &self.module)))
                 }
-                let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&ca.lhs.kind, &ca.rhs.kind)
-                else {
-                    return None;
-                };
-                if lh.path.len() != 1
-                    || !lh.path[0].selects.is_empty()
-                    || !rh.path.iter().all(|s| s.selects.is_empty())
-                    || !ca.rhs_parent_scoped
-                {
-                    return None;
-                }
-                Some((lh.path[0].name.name.as_str(), flat_name(rh, &self.module)))
             })
             .collect();
         // The passes below re-point names in `signal_name_to_id` and read
@@ -4683,19 +4696,29 @@ impl Simulator {
                 .continuous_assigns
                 .iter()
                 .filter_map(|ca| {
-                    if ca.delay != 0 {
-                        return None;
-                    }
-                    let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&ca.lhs.kind, &ca.rhs.kind)
-                    else {
-                        return None;
+                    let (ln, rn) = match ca {
+                        crate::compiler::elaborate::ContinuousAssignment::PlainLink {
+                            lhs,
+                            rhs,
+                            ..
+                        } => (Cow::Borrowed(lhs.as_str()), Cow::Borrowed(rhs.as_str())),
+                        crate::compiler::elaborate::ContinuousAssignment::Full(f) => {
+                            if f.delay != 0 {
+                                return None;
+                            }
+                            let (ExprKind::Ident(lh), ExprKind::Ident(rh)) =
+                                (&f.lhs.kind, &f.rhs.kind)
+                            else {
+                                return None;
+                            };
+                            if !lh.path.iter().all(|s| s.selects.is_empty())
+                                || !rh.path.iter().all(|s| s.selects.is_empty())
+                            {
+                                return None;
+                            }
+                            (flat_name(lh, &self.module), flat_name(rh, &self.module))
+                        }
                     };
-                    if !lh.path.iter().all(|s| s.selects.is_empty())
-                        || !rh.path.iter().all(|s| s.selects.is_empty())
-                    {
-                        return None;
-                    }
-                    let (ln, rn) = (flat_name(lh, &self.module), flat_name(rh, &self.module));
                     if self.module.sampled_input_ports.contains(ln.as_ref())
                         // Cached designs materialize assigns before this pass.
                         // Keep storage for each specify destination (§30.5).
@@ -4787,23 +4810,35 @@ impl Simulator {
             let mut identity_single = 0usize;
             for ca in &self.module.continuous_assigns {
                 total_ca += 1;
-                if ca.delay != 0 {
-                    continue;
-                }
-                let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&ca.lhs.kind, &ca.rhs.kind)
-                else {
-                    continue;
+                let (ln, rn): (Cow<'_, str>, Cow<'_, str>) = match ca {
+                    crate::compiler::elaborate::ContinuousAssignment::PlainLink {
+                        lhs,
+                        rhs,
+                        ..
+                    } => (Cow::Borrowed(lhs.as_str()), Cow::Borrowed(rhs.as_str())),
+                    crate::compiler::elaborate::ContinuousAssignment::Full(f) => {
+                        if f.delay != 0 {
+                            continue;
+                        }
+                        let (ExprKind::Ident(lh), ExprKind::Ident(rh)) =
+                            (&f.lhs.kind, &f.rhs.kind)
+                        else {
+                            continue;
+                        };
+                        if !lh.path.iter().all(|s| s.selects.is_empty())
+                            || !rh.path.iter().all(|s| s.selects.is_empty())
+                        {
+                            continue;
+                        }
+                        (
+                            Cow::Owned(Self::resolve_hier_name_static(lh, &self.module)),
+                            Cow::Owned(Self::resolve_hier_name_static(rh, &self.module)),
+                        )
+                    }
                 };
-                if !lh.path.iter().all(|s| s.selects.is_empty())
-                    || !rh.path.iter().all(|s| s.selects.is_empty())
-                {
-                    continue;
-                }
-                let ln = Self::resolve_hier_name_static(lh, &self.module);
-                let rn = Self::resolve_hier_name_static(rh, &self.module);
                 let (Some(&lid), Some(&rid)) = (
-                    self.signal_name_to_id.get(ln.as_str()),
-                    self.signal_name_to_id.get(rn.as_str()),
+                    self.signal_name_to_id.get(ln.as_ref()),
+                    self.signal_name_to_id.get(rn.as_ref()),
                 ) else {
                     continue;
                 };
@@ -4811,7 +4846,7 @@ impl Simulator {
                     continue;
                 }
                 identity += 1;
-                if ca_driver_counts.get(ln.as_str()).copied().unwrap_or(0) == 1 {
+                if ca_driver_counts.get(ln.as_ref()).copied().unwrap_or(0) == 1 {
                     identity_single += 1;
                 }
             }
@@ -4856,16 +4891,18 @@ impl Simulator {
             .module
             .continuous_assigns
             .iter()
-            .filter(|ca| {
-                ca.rhs_parent_scoped
-                    && ca.delay == 0
-                    && ca.delay_fall().is_none()
-                    && ca.delay_off().is_none()
-                    && matches!(ca.lhs.kind, ExprKind::Index { .. })
-            })
             .filter_map(|ca| {
-                let (port, pi) = Self::const_elem_ref(&ca.lhs, &self.module)?;
-                let (actual, ai) = Self::const_elem_ref(&ca.rhs, &self.module)?;
+                let f = ca.as_full()?;
+                if !(f.rhs_parent_scoped
+                    && f.delay == 0
+                    && f.delay_fall().is_none()
+                    && f.delay_off().is_none()
+                    && matches!(f.lhs.kind, ExprKind::Index { .. }))
+                {
+                    return None;
+                }
+                let (port, pi) = Self::const_elem_ref(&f.lhs, &self.module)?;
+                let (actual, ai) = Self::const_elem_ref(&f.rhs, &self.module)?;
                 // §23.3.3.7 merges nets. A variable formal or actual keeps
                 // its implicit continuous assignment (§23.3.3.3): aliasing
                 // it would expose a blocking write before propagation.
@@ -4886,7 +4923,15 @@ impl Simulator {
         // Continuous drivers of each port array, its connects included.
         let mut drivers = vec![0usize; ports.len()];
         for ca in &self.module.continuous_assigns {
-            if let Some(b) = base_of(&ca.lhs, &self.module) {
+            let base = match ca {
+                crate::compiler::elaborate::ContinuousAssignment::PlainLink { lhs, .. } => {
+                    Some(std::borrow::Cow::Borrowed(lhs.as_str()))
+                }
+                crate::compiler::elaborate::ContinuousAssignment::Full(f) => {
+                    base_of(&f.lhs, &self.module)
+                }
+            };
+            if let Some(b) = base {
                 if let Ok(k) = ports.binary_search_by(|(p, _)| (*p).cmp(b.as_ref())) {
                     drivers[k] += 1;
                 }

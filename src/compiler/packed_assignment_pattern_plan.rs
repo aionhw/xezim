@@ -1526,7 +1526,7 @@ pub(crate) fn keyed_type_name(
 pub(crate) fn scoped_type_ref(name: &str) -> DataType {
     let span = crate::ast::Span::dummy();
     DataType::TypeReference {
-        name: parse_type_name_str(name),
+        name: Box::new(parse_type_name_str(name)),
         dimensions: Vec::new(),
         type_args: Vec::new(),
         span,
@@ -1536,7 +1536,7 @@ pub(crate) fn scoped_type_ref(name: &str) -> DataType {
 pub(crate) fn type_ref(name: &str) -> DataType {
     let span = crate::ast::Span::dummy();
     DataType::TypeReference {
-        name: TypeName {
+        name: Box::new(TypeName {
             scopes: Vec::new(),
             name: crate::ast::Identifier {
                 name: name.to_string(),
@@ -1544,7 +1544,7 @@ pub(crate) fn type_ref(name: &str) -> DataType {
             },
             span,
             bound: Default::default(),
-        },
+        }),
         dimensions: Vec::new(),
         type_args: Vec::new(),
         span,

@@ -49,8 +49,10 @@ fn scan_sources(module: &ElaboratedModule, walk: &mut Walk) -> Result<(), Stop> 
         }
     }
     for assignment in &module.continuous_assigns {
-        walk.expression(&assignment.lhs)?;
-        walk.expression(&assignment.rhs)?;
+        if let Some(f) = assignment.as_full() {
+            walk.expression(&f.lhs)?;
+            walk.expression(&f.rhs)?;
+        }
     }
     for routine in module.tasks.values() {
         walk.visit(&routine.ports)?;

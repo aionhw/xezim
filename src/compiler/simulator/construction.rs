@@ -2168,7 +2168,7 @@ impl Simulator {
             // `G#(T) m;`: the arguments resolved through `obj`'s bindings.
             Some(type_args) => {
                 let dt = DataType::TypeReference {
-                    name: crate::ast::types::TypeName {
+                    name: Box::new(crate::ast::types::TypeName {
                         scopes: Vec::new(),
                         name: crate::ast::Identifier {
                             name: tn.to_string(),
@@ -2176,7 +2176,7 @@ impl Simulator {
                         },
                         span: crate::ast::Span::dummy(),
                         bound: Default::default(),
-                    },
+                    }),
                     dimensions: Vec::new(),
                     type_args,
                     span: crate::ast::Span::dummy(),
@@ -2836,7 +2836,7 @@ impl Simulator {
                         instance.properties.insert(key, v);
                         continue;
                     }
-                    instance.properties.insert(key, prop_sig.value.clone());
+                    instance.properties.insert(key, prop_sig.value.to_value());
                 }
             }
             // Bind class VALUE parameters (§8.25): each parameter gets the

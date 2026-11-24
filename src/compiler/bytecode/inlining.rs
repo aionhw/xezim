@@ -501,7 +501,7 @@ impl<'a> BytecodeCompiler<'a> {
             full_args.extend(
                 fd.ports[args.len()..]
                     .iter()
-                    .filter_map(|p| p.default.clone()),
+                    .filter_map(|p| p.default.as_deref().cloned()),
             );
             owned_args = full_args;
             &owned_args

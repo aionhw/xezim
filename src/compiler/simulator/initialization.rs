@@ -1001,13 +1001,25 @@ impl Simulator {
         let mut best_scopes: HashMap<Vec<String>, Option<String>> = HashMap::default();
         for ca in &module.continuous_assigns {
             let mut leaves = HashSet::default();
-            let mut reads = HashSet::default();
-            let mut writes = HashSet::default();
-            Self::collect_expr_reads(&ca.rhs, module, &mut reads);
-            collect_lhs_leaves(&ca.lhs, &mut writes);
-            for name in reads.iter().chain(writes.iter()) {
-                if !name.contains('.') && !name.contains('[') {
-                    leaves.insert(name.clone());
+            match ca {
+                crate::compiler::elaborate::ContinuousAssignment::PlainLink { lhs, rhs, .. } => {
+                    if !lhs.contains('.') && !lhs.contains('[') {
+                        leaves.insert(lhs.to_string());
+                    }
+                    if !rhs.contains('.') && !rhs.contains('[') {
+                        leaves.insert(rhs.to_string());
+                    }
+                }
+                crate::compiler::elaborate::ContinuousAssignment::Full(f) => {
+                    let mut reads = HashSet::default();
+                    let mut writes = HashSet::default();
+                    Self::collect_expr_reads(&f.rhs, module, &mut reads);
+                    collect_lhs_leaves(&f.lhs, &mut writes);
+                    for name in reads.iter().chain(writes.iter()) {
+                        if !name.contains('.') && !name.contains('[') {
+                            leaves.insert(name.clone());
+                        }
+                    }
                 }
             }
             // Only a bare (unscoped) leaf can need an implicit net; a
@@ -1025,10 +1037,22 @@ impl Simulator {
                 (Some(leaf), None) => Some(leaf.as_str()),
                 _ => None,
             };
-            let lhs_raw = ident_raw(&ca.lhs);
-            let rhs_raw = ident_raw(&ca.rhs);
-            let lhs_leaf = ident_leaf(&ca.lhs);
-            let rhs_leaf = ident_leaf(&ca.rhs);
+            let (lhs_raw, rhs_raw, lhs_leaf, rhs_leaf) = match ca {
+                crate::compiler::elaborate::ContinuousAssignment::PlainLink {
+                    lhs, rhs, ..
+                } => (
+                    Some(lhs.to_string()),
+                    Some(rhs.to_string()),
+                    (!lhs.contains('.')).then(|| lhs.to_string()),
+                    (!rhs.contains('.')).then(|| rhs.to_string()),
+                ),
+                crate::compiler::elaborate::ContinuousAssignment::Full(f) => (
+                    ident_raw(&f.lhs),
+                    ident_raw(&f.rhs),
+                    ident_leaf(&f.lhs),
+                    ident_leaf(&f.rhs),
+                ),
+            };
 
             let scope = if lhs_leaf.is_none() && rhs_leaf.is_some() {
                 lhs_raw.as_deref().and_then(|raw| parent_n(raw, 1))
@@ -1090,7 +1114,7 @@ impl Simulator {
                     is_real: false,
                     is_const: false,
                     direction: None,
-                    value: Value::new(1),
+                    value: Value::new(1).into(),
                     type_name: None,
                 },
             );
@@ -1593,7 +1617,7 @@ impl Simulator {
                     is_real: false,
                     is_const: false,
                     direction: None,
-                    value: Value::new(width),
+                    value: Value::new(width).into(),
                     type_name: None,
                 },
             );
@@ -1738,7 +1762,9 @@ impl Simulator {
         let none: Vec<usize> = Vec::new();
         for &i in index.cont.get(vleaf).unwrap_or(&none) {
             let ca = &module.continuous_assigns[i];
-            classify(&ca.lhs, Some(&ca.rhs));
+            let lhs = ca.lhs_expr();
+            let rhs = ca.rhs_expr();
+            classify(&lhs, Some(&rhs));
         }
         for &i in index.pend.get(vleaf).unwrap_or(&none) {
             let p = &module.pending_cont_assign[i];
@@ -2660,7 +2686,7 @@ impl Simulator {
                         is_real: false,
                         is_const: false,
                         direction: None,
-                        value: Value::new(1),
+                        value: Value::new(1).into(),
                         type_name: None,
                     });
                 module
@@ -2721,7 +2747,7 @@ impl Simulator {
         for n in &vif_vars {
             if let Some(sig) = module.signals.get_mut(n) {
                 if sig.value.has_xz() {
-                    sig.value = Value::zero(sig.value.width.max(1));
+                    sig.value = Value::zero(sig.value.width().max(1)).into();
                 }
             }
         }
@@ -2761,13 +2787,13 @@ impl Simulator {
                         is_real: false,
                         is_const: false,
                         direction: None,
-                        value: Value::zero(32),
+                        value: Value::zero(32).into(),
                         type_name: None,
                     });
             // It is also what a paren-less `q.size` / `a.num` reads, and
             // those return `int` (§7.5.2, §7.9.1, §7.10.2.1): SIGNED.
             sig.is_signed = true;
-            sig.value.is_signed = true;
+            sig.value.set_signed(true);
         }
         let materialize_ms = phase_materialize.elapsed().as_secs_f64() * 1000.0;
         crate::rss_trace("sim::new materialize");
@@ -2934,7 +2960,7 @@ impl Simulator {
             }
             id_to_name.push(arc_name);
             if let Some(sig) = sig {
-                let mut val = sig.value.clone();
+                let mut val = sig.value.to_value();
                 if sig.is_signed {
                     val.is_signed = true;
                 }
@@ -3256,7 +3282,7 @@ impl Simulator {
                 k.rsplit_once('[')
                     .is_some_and(|(b, _)| module.arrays.contains_key(b))
             })
-            .map(|(k, s)| (k.clone(), s.value.clone()))
+            .map(|(k, s)| (k.clone(), s.value.to_value()))
             .collect();
         let arrays_with_elab_values: HashSet<String> = array_elem_inits
             .iter()

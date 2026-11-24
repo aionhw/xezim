@@ -251,8 +251,8 @@ impl Simulator {
             m.struct_members.contains_key(name) || m.packed_struct_fields.contains_key(name);
         let known = known.filter(|k| k.members == members);
         let pfx = format!("{name}.");
-        fn pick<V: Clone, W>(
-            map: &HashMap<String, V>,
+        fn pick_name_map<V: Clone, W>(
+            map: &xezim_core::shared_names::SharedNameMap<V>,
             name: &str,
             pfx: &str,
             members: bool,
@@ -311,7 +311,7 @@ impl Simulator {
                     .map(|(key, ty)| (key.clone(), ty.clone()))
                     .collect()
             } else {
-                pick(
+                pick_name_map(
                     m.var_decl_types.as_map(),
                     name,
                     &pfx,
@@ -2203,7 +2203,7 @@ impl Simulator {
     pub(super) fn class_type_ref(cn: &str) -> DataType {
         let span = crate::ast::Span::dummy();
         DataType::TypeReference {
-            name: crate::ast::types::TypeName {
+            name: Box::new(crate::ast::types::TypeName {
                 scopes: Vec::new(),
                 name: crate::ast::Identifier {
                     name: cn.to_string(),
@@ -2211,7 +2211,7 @@ impl Simulator {
                 },
                 span,
                 bound: Default::default(),
-            },
+            }),
             dimensions: Vec::new(),
             type_args: Vec::new(),
             span,

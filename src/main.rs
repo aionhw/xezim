@@ -4116,66 +4116,40 @@ suppressed but the explicit SDF annotation still applies."
     }
 
     if mode == Mode::Compile {
-        let mut total_desc = 0;
-        let mut total_err = 0;
-        let mut total_warn = 0;
-
-        for (fi, (label, source)) in file_labels
-            .iter()
-            .zip(preprocessed_sources.iter())
-            .enumerate()
-        {
-            xezim::progress_status(&format!(
-                "[{}] parsing {}/{}: {}",
-                if mode == Mode::Parse {
-                    "parse"
-                } else {
-                    "compile"
-                },
-                fi + 1,
-                file_labels.len(),
-                label.rsplit('/').next().unwrap_or(label)
-            ));
-            let tokens = xezim::lexer::Lexer::new(source).tokenize();
-            let mut parser = sv_parser::parse::Parser::new(tokens);
-            let source_ast = parser.parse_source_text();
-            let diags = parser.diagnostics().to_vec();
-            drop(parser);
-            report_parse_diagnostics(&diags, source, line_maps[fi].as_ref(), label);
-            total_desc += source_ast.descriptions.len();
-            total_err += diags
-                .iter()
-                .filter(|d| d.severity == xezim::diagnostics::Severity::Error)
-                .count();
-            total_warn += diags
-                .iter()
-                .filter(|d| d.severity == xezim::diagnostics::Severity::Warning)
-                .count();
-        }
-        xezim::progress_clear();
-        println!(
-            "Parsed {} file(s): {} descriptions, {} errors, {} warnings",
-            preprocessed_sources.len(),
-            total_desc,
-            total_err,
-            total_warn
-        );
-        if total_err > 0 {
-            std::process::exit(1);
-        }
-
         // §9.4.5 intra-assignment delay canonicalization — keep the compiled
         // artifact consistent with the simulate path (see xezim::intra_delay):
-        // rewrite the PREPROCESSED texts too, so a delay spliced in by
+        // rewrite in-place without cloning unchanged files, and reuse the
+        // front-end preprocessing pass when no raw source changed instead of
+        // holding duplicate preprocessed copies or parsing every file twice
+        // (#721).
+        let mut any_src_changed = false;
+        for s in sources.iter_mut() {
+            if let std::borrow::Cow::Owned(rewritten) =
+                xezim::intra_delay::rewrite_intra_assignment_delays_cow(s)
+            {
+                *s = rewritten;
+                any_src_changed = true;
+            }
+        }
+        let mut pre = if !any_src_changed && dump_merged_sv.is_none() {
+            pp_state.texts = std::mem::take(&mut preprocessed_sources);
+            pp_state.line_maps = std::mem::take(&mut line_maps);
+            pp_state
+        } else {
+            if dump_merged_sv.is_none() {
+                preprocessed_sources.clear();
+                preprocessed_sources.shrink_to_fit();
+            }
+            line_maps.clear();
+            line_maps.shrink_to_fit();
+            xezim_core::preprocess_design(&sources, &source_files, &include_dirs, &defines)
+        };
+        // Rewrite the PREPROCESSED texts too, so a delay spliced in by
         // `include or a macro is a timing control here as well (#567).
-        let sources: Vec<String> = sources
-            .iter()
-            .map(|s| xezim::intra_delay::rewrite_intra_assignment_delays(s))
-            .collect();
-        let mut pre = xezim_core::preprocess_design(&sources, &source_files, &include_dirs, &defines);
         for t in pre.texts.iter_mut() {
-            let rewritten = xezim::intra_delay::rewrite_intra_assignment_delays(t);
-            if rewritten != *t {
+            if let std::borrow::Cow::Owned(rewritten) =
+                xezim::intra_delay::rewrite_intra_assignment_delays_cow(t)
+            {
                 *t = rewritten;
             }
         }
@@ -4192,6 +4166,7 @@ suppressed but the explicit SDF annotation still applies."
             Some(pre),
         ) {
             Ok((_defs, mut elab)) => {
+                drop(sources);
                 // Second-pass `should_fail` lint (additive — does not alter the
                 // elaboration above): reject illegal SV the main path accepts.
                 let dv: Vec<&xezim::SourceDefinition> = _defs.values().collect();
@@ -4231,11 +4206,17 @@ suppressed but the explicit SDF annotation still applies."
                 // system functions as time-0 assignments (issue #26).
                 xezim::defer_static_syscall_inits(&_defs, &mut elab);
                 if let Some(ref out) = _output_file {
-                    // Release the parsed AST before streaming the elaborated
-                    // module into the artifact; `ElaboratedModule`'s serializer
-                    // streams `pending_*` and deferred callable bodies one item
-                    // at a time without materializing them in memory (#721).
+                    // Release the parsed AST, scope trees, and skipped
+                    // preprocessed texts/line maps before streaming the
+                    // elaborated module into the artifact (#721).
                     drop(_defs);
+                    preprocessed_sources.clear();
+                    preprocessed_sources.shrink_to_fit();
+                    elab.source_texts.clear();
+                    elab.source_texts.shrink_to_fit();
+                    elab.source_line_maps.clear();
+                    elab.source_line_maps.shrink_to_fit();
+                    xezim_core::scope_tree::clear();
                     xezim_core::release_free_memory();
                     match xezim::write_compiled(&elab, out) {
                         Ok(()) => println!("Wrote compiled artifact to {}", out),

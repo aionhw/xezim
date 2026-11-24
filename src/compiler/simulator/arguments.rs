@@ -3433,7 +3433,7 @@ impl Simulator {
         for (i, p) in ports.iter().enumerate().take(last + 1) {
             out.push(match bound[i].take() {
                 Some(e) => e,
-                None => p.default.clone().unwrap_or_else(zero),
+                None => p.default.as_deref().cloned().unwrap_or_else(zero),
             });
         }
         Some(out)

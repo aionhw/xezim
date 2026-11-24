@@ -91,7 +91,7 @@ fn concrete_typedef_kinds_keep_scopes_and_runtime_type_parameters() {
     use crate::ast::types::{DataType as D, IntegerAtomType as A, TypeName};
     let span = crate::ast::Span::dummy();
     let alias = |name: &str| D::TypeReference {
-        name: TypeName {
+        name: Box::new(TypeName {
             scopes: vec![],
             name: crate::ast::Identifier {
                 name: name.into(),
@@ -99,7 +99,7 @@ fn concrete_typedef_kinds_keep_scopes_and_runtime_type_parameters() {
             },
             span,
             bound: Default::default(),
-        },
+        }),
         dimensions: vec![],
         type_args: vec![],
         span,

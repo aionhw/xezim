@@ -788,13 +788,22 @@ impl Simulator {
                     .into_iter()
                     .map(|p| p.materialize(&params_snapshot)),
             )
-            .flat_map(|ca| {
-                self.module.whole_array_driver_parts(&ca.lhs, &ca.rhs, ca.delay, &decl_dims_snapshot)
+            .flat_map(|mut ca| {
+                if let crate::compiler::elaborate::ContinuousAssignment::PlainLink { lhs, .. } = &ca
+                    && !decl_dims_snapshot.contains_key(lhs.as_str())
+                    && !arrays_snapshot.contains_key(lhs.as_str())
+                    && !arrays_2d_snapshot.contains_key(lhs.as_str())
+                {
+                    return vec![ca.into_full()];
+                }
+                ca.make_full_mut();
+                let f = ca.as_full().expect("promoted to Full above");
+                self.module.whole_array_driver_parts(&f.lhs, &f.rhs, f.delay, &decl_dims_snapshot)
                 .or_else(|| {
                     crate::compiler::elaborate::whole_array_row_assign_parts(
-                        &ca.lhs,
-                        &ca.rhs,
-                        ca.delay,
+                        &f.lhs,
+                        &f.rhs,
+                        f.delay,
                         &arrays_snapshot,
                         &arrays_2d_snapshot,
                         &params_snapshot,
@@ -804,9 +813,9 @@ impl Simulator {
                 })
                 .or_else(|| {
                     crate::compiler::elaborate::slice_array_assign_parts(
-                        &ca.lhs,
-                        &ca.rhs,
-                        ca.delay,
+                        &f.lhs,
+                        &f.rhs,
+                        f.delay,
                         &arrays_snapshot,
                         Some(&descending_snapshot),
                         Some(&decl_dims_snapshot),
@@ -818,19 +827,22 @@ impl Simulator {
                 })
                 .or_else(|| {
                     crate::compiler::elaborate::concat_array_assign_parts(
-                        &ca.lhs,
-                        &ca.rhs,
-                        ca.delay,
+                        &f.lhs,
+                        &f.rhs,
+                        f.delay,
                         &concat_tables,
                     )
                 })
-                .map(|mut parts| {
-                    for part in &mut parts {
-                        part.inherit_driver_metadata(&ca);
-                    }
+                .map(|parts| {
                     parts
+                        .into_iter()
+                        .map(|mut part| {
+                            part.inherit_driver_metadata(&ca);
+                            part.into_full()
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .unwrap_or_else(|| vec![ca])
+                .unwrap_or_else(|| vec![ca.into_full()])
             })
             .flat_map(|ca| {
                 let chain: Option<Vec<String>> = match &ca.lhs.kind {
@@ -5680,11 +5692,12 @@ impl Simulator {
         decl_dims: &xezim_core::shared_names::SharedSliceMap<(i64, i64)>,
         params: &HashMap<String, Value>,
     ) -> Option<Vec<crate::compiler::elaborate::ContinuousAssignment>> {
-        if !matches!(ca.rhs.kind, ExprKind::AssignmentPattern(_)) {
+        let f = ca.as_full()?;
+        if !matches!(f.rhs.kind, ExprKind::AssignmentPattern(_)) {
             return None;
         }
         let mut idx_exprs: Vec<&Expression> = Vec::new();
-        let mut cur = &ca.lhs;
+        let mut cur = &f.lhs;
         while let ExprKind::Index { expr, index } = &cur.kind {
             idx_exprs.push(index);
             cur = expr;
@@ -5715,31 +5728,34 @@ impl Simulator {
         // parts come back as `name[j]...`, and only their indices are kept.
         let mut row_dims = xezim_core::shared_names::SharedSliceMap::default();
         row_dims.insert(name.clone(), dims[k..].to_vec());
-        let parts = module.whole_array_driver_parts(cur, &ca.rhs, ca.delay, &row_dims)?;
+        let parts = module.whole_array_driver_parts(cur, &f.rhs, f.delay, &row_dims)?;
         Some(
             parts
                 .into_iter()
                 .map(|p| {
+                    let p_full = p.into_full();
                     let mut elem_idx: Vec<Expression> = Vec::new();
-                    let mut e = p.lhs;
+                    let mut e = p_full.lhs;
                     while let ExprKind::Index { expr, index } = e.kind {
                         elem_idx.push(*index);
                         e = *expr;
                     }
-                    let lhs = elem_idx.into_iter().rev().fold(ca.lhs.clone(), |acc, ix| {
+                    let lhs = elem_idx.into_iter().rev().fold(f.lhs.clone(), |acc, ix| {
                         Expression::new(
                             ExprKind::Index {
                                 expr: Box::new(acc),
                                 index: Box::new(ix),
                             },
-                            ca.lhs.span,
+                            f.lhs.span,
                         )
                     });
-                    crate::compiler::elaborate::ContinuousAssignment {
-                        lhs,
-                        rhs: p.rhs,
-                        ..ca.clone()
-                    }
+                    crate::compiler::elaborate::ContinuousAssignment::Full(Box::new(
+                        crate::compiler::elaborate::FullContinuousAssignment {
+                            lhs,
+                            rhs: p_full.rhs,
+                            ..f.clone()
+                        },
+                    ))
                 })
                 .collect(),
         )
