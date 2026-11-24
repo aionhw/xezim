@@ -10,6 +10,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Event controls on an indexed class object's property follow changes to the
+  selected object and its property value (§9.4.2, #1472).
+- Nested assignment patterns preserve element values and row sizes in dynamic
+  arrays and queues of queues (§10.9.1, #1531).
+
 - Wide products use hard bounds when a conflicting soft constraint is
   discarded (§18.5.14).
 
@@ -66,6 +71,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   read or write the connected interface's array (§25.9, §7.6, #1311).
 
 **Performance**
+
+- Packed declaration selects look up instance parameters by name, avoiding
+  repeated scans of the design-wide parameter table (§23.10, #1563).
 
 - Edge fanouts use compact entries and event waiters allocate wide-value
   storage only when needed.
