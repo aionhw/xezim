@@ -295,6 +295,10 @@ impl Simulator {
         // path — collect their `(local_key, caller_lvalue)` pairs to copy
         // each member back to the caller's actual on return.
         let struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
+        // §8.6: class methods have automatic lifetime.
+        let static_fn = !matches!(fd.lifetime, Some(crate::ast::types::Lifetime::Automatic))
+            && self.module.functions.contains_key(&fd.name.name.name);
+        let mut static_outputs = Vec::new();
         for (i, port) in fd.ports.iter().enumerate() {
             let is_out = matches!(
                 port.direction,
@@ -424,7 +428,38 @@ impl Simulator {
                     }
                 }
             }
-            let mut val = if arg_supplied(i) {
+            let mut val = if port.direction == PortDirection::Output {
+                let default = if self.port_class_ref(port).is_some()
+                    || self.is_virtual_iface_type(&port.data_type)
+                {
+                    Value::zero(32)
+                } else {
+                    let width = super::elaborate::resolve_type_width(
+                        &port.data_type,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    );
+                    self.formal_type_default(&port.data_type, width.max(1))
+                };
+                // §13.4.2: all invocations of a static function share the
+                // formal. The sync frame stores it back on return.
+                if static_fn {
+                    let (func, name) = (&fd.name.name.name, &port.name.name);
+                    let key = match self.subroutine_decl_scope(func, fd.span, false) {
+                        Some(pkg) => format!("{pkg}::{func}::{name}"),
+                        None => format!("{func}::{name}"),
+                    };
+                    let value = self
+                        .static_local_vars
+                        .entry(key.clone())
+                        .or_insert(default)
+                        .clone();
+                    static_outputs.push((name.clone(), key));
+                    value
+                } else {
+                    default
+                }
+            } else if arg_supplied(i) {
                 // §11.6.1/§11.8.2: the ACTUAL is context-determined by this
                 // formal's declared width (see `actual_ctx_shape`), so
                 // `fwide9(x + y)` over 8-bit x, y adds at 9 bits. `fit_scalar_-
@@ -812,7 +847,7 @@ impl Simulator {
         let saved_m_scope_fn = std::mem::replace(&mut self.m_scope_stack, m_fn_entry);
         // §6.21: open a static-local sync frame keyed by this subroutine name.
         let sync_name = self.sync_frame_name(&fd.name.name.name);
-        self.static_local_syncs.push((sync_name, Vec::new()));
+        self.static_local_syncs.push((sync_name, static_outputs));
         // class-perf free-function tier: a package/module-scope function may
         // run as bytecode exactly like a class method. `this` is null here
         // (pushed above), mirroring the interpreter's frame; the plan is
