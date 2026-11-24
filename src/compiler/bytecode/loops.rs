@@ -3,6 +3,88 @@
 use super::*;
 
 impl<'a> BytecodeCompiler<'a> {
+    /// Bounds of a local `for (int i = a; i < b; i++)` counter that the body
+    /// cannot modify. Calls may write a ref argument, so only the recognized
+    /// expression casts are allowed.
+    pub(super) fn proven_loop_index(
+        &mut self,
+        init: &[ForInit],
+        condition: Option<&Expression>,
+        step: &[Expression],
+        body: &Statement,
+    ) -> Option<(RegId, (i64, i64))> {
+        if !self.for_body_is_simple(body) {
+            return None;
+        }
+        let [ForInit::VarDecl { name, init, .. }] = init else {
+            return None;
+        };
+        let name = name.name.as_str();
+        let &(reg, width) = self.local_var_regs.get(name)?;
+        if width != 32
+            || !matches!(self.local_kinds.get(&reg), Some(LocalKind::Int { signed: true, .. }))
+        {
+            return None;
+        }
+        let ExprKind::Binary { op, left, right } = &condition?.kind else {
+            return None;
+        };
+        let is_counter = |expr: &Expression| {
+            matches!(&expr.kind, ExprKind::Ident(h) if h.root.is_none()
+                && self.local_var_reg_of(h) == Some((reg, width)))
+        };
+        if !matches!(op, BinaryOp::Lt | BinaryOp::Leq) || !is_counter(left) {
+            return None;
+        }
+        let [step] = step else { return None };
+        let ExprKind::Unary {
+            op: UnaryOp::PreIncr | UnaryOp::PostIncr,
+            operand,
+        } = &step.kind else {
+            return None;
+        };
+        if !is_counter(operand) {
+            return None;
+        }
+        let first = self.fold_const_i64(init)?;
+        let last = self.fold_const_i64(right)?.checked_sub(i64::from(*op == BinaryOp::Lt))?;
+        if first < 0 || last < first || last >= i64::from(i32::MAX) {
+            return None;
+        }
+
+        fn may_target(expr: &Expression, name: &str) -> bool {
+            match &expr.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. }
+                | ExprKind::Paren(expr) => may_target(expr, name),
+                ExprKind::Concatenation(parts) => parts.iter().any(|e| may_target(e, name)),
+                _ => BytecodeCompiler::plain_loop_ident(expr) == Some(name),
+            }
+        }
+        let mut preserved = true;
+        crate::compiler::elaborate::for_each_stmt_expr(body, &mut |expr| {
+            // The walker also supplies assignment destinations as roots.
+            preserved &= !may_target(expr, name);
+            crate::type_lint::visit_expr(expr, &mut |part| {
+                preserved &= match &part.kind {
+                    ExprKind::AssignExpr { lvalue, .. } => !may_target(lvalue, name),
+                    ExprKind::Unary {
+                        op: UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr,
+                        operand,
+                    } => !may_target(operand, name),
+                    ExprKind::Call { .. } => false,
+                    ExprKind::SystemCall { name, .. } => matches!(
+                        name.as_str(),
+                        "$__xz_size_cast" | "$__xz_type_cast" | "$__xz_named_cast" | "$signed" | "$unsigned"
+                    ),
+                    _ => true,
+                };
+            });
+        });
+        preserved.then_some((reg, (first, last)))
+    }
+
     /// Does this statement read or write a register-bank local array? Such a
     /// body needs CONSTANT indexes, i.e. the unroller — a register-backed
     /// runtime loop variable can never address the bank.

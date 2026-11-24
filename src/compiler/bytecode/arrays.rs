@@ -925,7 +925,7 @@ impl<'a> BytecodeCompiler<'a> {
         Some((plans, pruned))
     }
 
-    fn plain_loop_ident(expr: &Expression) -> Option<&str> {
+    pub(super) fn plain_loop_ident(expr: &Expression) -> Option<&str> {
         match &expr.kind {
             ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
                 Some(h.path[0].name.name.as_str())

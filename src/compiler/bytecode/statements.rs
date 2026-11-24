@@ -1695,7 +1695,15 @@ impl<'a> BytecodeCompiler<'a> {
                 } else {
                     None
                 };
-                if !self.compile_stmt(body_to_compile) {
+                let bounds = self.proven_loop_index(init, condition.as_ref(), step, body_to_compile);
+                if let Some((reg, range)) = bounds {
+                    self.loop_index_bounds.insert(reg, range);
+                }
+                let compiled = self.compile_stmt(body_to_compile);
+                if let Some((reg, _)) = bounds {
+                    self.loop_index_bounds.remove(&reg);
+                }
+                if !compiled {
                     // Bail path — pop patches so they don't leak.
                     self.loop_break_patches.pop();
                     self.loop_continue_patches.pop();
