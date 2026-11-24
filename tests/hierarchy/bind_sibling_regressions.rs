@@ -56,21 +56,25 @@ module monitor;
     #2 b[0].valid = 1'b0;
   end
 endmodule
-module sink(input logic valid);
+module sink(input logic direct, nested, absolute);
   initial begin
-    #2 $display("T|first %b", valid);
-    #2 $display("T|second %b", valid);
+    #2 $display("T|first %b%b%b", direct, nested, absolute);
+    #2 $display("T|second %b%b%b", direct, nested, absolute);
   end
 endmodule
 module host; endmodule
 bind top.h monitor u_mon();
-bind top.h sink u_sink(.valid(u_mon.b[0].source.valid));
+bind top.h sink u_sink(
+  .direct(u_mon.b[0].source.valid),
+  .nested((u_mon.b[0].source.valid ^ 1'b0)),
+  .absolute($root.top.h.u_mon.b[0].source.valid)
+);
 module top;
   host h();
   initial #5 $finish;
 endmodule
 "#,
-        &["T|first 1", "T|second 0"],
+        &["T|first 111", "T|second 000"],
     );
 }
 
