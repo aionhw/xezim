@@ -31,3 +31,47 @@ endmodule
         assert!(out.iter().any(|m| m == w), "missing {:?}; got {:?}", w, out);
     }
 }
+
+/// §7.4.6, §7.10.1, §11.3.2 (#1540).
+#[test]
+fn slice_object_collections_and_evaluate_each_receiver_once() {
+    let src = r#"
+module top;
+  class obj_t;
+    int q[$], copy[$], dyn[];
+    int fixed[0:3];
+    function void read_this();
+      int tmp[$];
+      tmp = this.q[0:1];
+      this.copy = q[2-:2];
+      $display("METHOD %p %p", tmp, copy);
+    endfunction
+  endclass
+  obj_t obj;
+  int gets;
+  int got[$];
+  function obj_t receiver(); gets++; return obj; endfunction
+  initial begin
+    obj = new;
+    obj.q = {7,8,9,10}; obj.dyn = {11,12,13,14}; obj.fixed = '{21,22,23,24};
+    got = receiver().q[1:$]; $display("TAIL %p %0d", got, gets);
+    got = {receiver().q[0+:2],receiver().q[2-:2]}; $display("CONCAT %p %0d", got, gets);
+    got = receiver().dyn[1:2]; $display("DYN %p %0d", got, gets);
+    got = receiver().fixed[1:2]; $display("FIXED %p %0d", got, gets);
+    got = obj.q[9:$]; $display("EMPTY %p", got);
+    obj.read_this();
+  end
+endmodule
+"#;
+    assert_eq!(
+        line(src),
+        [
+            "TAIL '{8, 9, 10} 1",
+            "CONCAT '{7, 8, 8, 9} 3",
+            "DYN '{12, 13} 4",
+            "FIXED '{22, 23} 5",
+            "EMPTY '{}",
+            "METHOD '{7, 8} '{8, 9}"
+        ]
+    );
+}

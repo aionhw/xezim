@@ -1042,6 +1042,8 @@ pub struct BytecodeCompiler<'a> {
     /// inside such a loop silently reads the loop var as X. Any unsupported
     /// construct must instead fail the whole loop back to the AST path.
     reg_var_loop_depth: u32,
+    /// Ranges of active register-backed loop counters proven unmodified in the body.
+    loop_index_bounds: HashMap<RegId, (i64, i64)>,
     /// class-perf Step 9d: number of runtime key slots this compiled block
     /// needs — one per `foreach` over a member collection. The arena itself
     /// lives on the Simulator (swapped per method run so nested compiled
@@ -1287,6 +1289,7 @@ pub struct BytecodeCompiler<'a> {
 
 /// Where `packed_path_dyn_range` places a store in its root signal.
 enum PackedPathTarget {
+    Ignore,
     /// `width` bits from the bit in register `lo`.
     Range(RegId, u32),
     /// A part-select with a run-time base, which may run past either end of
@@ -1400,6 +1403,7 @@ impl<'a> BytecodeCompiler<'a> {
             local_kinds: HashMap::default(),
             inline_foreign: 0,
             reg_var_loop_depth: 0,
+            loop_index_bounds: HashMap::default(),
             allow_expr_fallback: false,
             tasks: None,
             functions: None,

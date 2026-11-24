@@ -1822,6 +1822,19 @@ impl Simulator {
         }
         // §7.4.6, §7.6: a slice of an unpacked array on either side pairs
         // its elements left to right with the other side's (#867).
+        if matches!(rvalue.kind, ExprKind::RangeSelect { .. })
+            && let Some(dst) = self.expr_assoc_name(lvalue).or_else(|| self.pending_coll_dst(lvalue))
+            && (self.module.dynamic_arrays.contains(&dst) || self.class_queue_prop(&dst))
+            && let Some((values, _)) = self.collection_slice_values(rvalue)
+        {
+            self.set_queue_size(&dst, values.len() as u64);
+            for (index, value) in values.into_iter().enumerate() {
+                let value = self.fit_queue_push_elem(&dst, value);
+                self.set_signal_value_by_name(&Self::name_with_index(&dst, index as i64), value);
+            }
+            self.settle_after_proc_write();
+            return;
+        }
         if self.assign_unpacked_slice(lvalue, rvalue) {
             self.settle_after_proc_write();
             return;

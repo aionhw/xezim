@@ -6,6 +6,62 @@
 //! reference are still an error (#620, reported by git-hevangel).
 use xezim::simulate_multi;
 
+/// §6.24.1, §26.3 (#1542).
+#[test]
+fn wildcard_type_conflict_in_cast_names_the_packages_and_scope() {
+    let source = format!(
+        "{PKGS}\nmodule top;
+        import pkg_one::*; import pkg_two::*;
+        initial $display(\"%0d\", $bits(mode_t'(0)));
+        endmodule"
+    );
+    let err = xezim::simulate(&source, 10)
+        .err()
+        .expect("ambiguous cast accepted");
+    for part in [
+        "mode_t",
+        "wildcard-imported package",
+        "pkg_one",
+        "pkg_two",
+        "scope 'top'",
+    ] {
+        assert!(err.contains(part), "{err}");
+    }
+    let explicit = source.replace(
+        "initial $display",
+        "import pkg_two::mode_t; initial $display",
+    );
+    let sim = xezim::simulate(&explicit, 10).expect("explicit import disambiguates the cast");
+    assert!(sim.output.iter().any(|line| line.message == "4"));
+}
+
+/// §26.3 (#1542).
+#[test]
+fn wildcard_value_conflicts_name_the_packages_and_scope() {
+    for (reference, name) in [
+        ("localparam int W=N;", "N"),
+        ("initial $display(\"%0d\", f());", "f"),
+    ] {
+        let source = format!(
+            "package p1; parameter int N=1; function int f(); return 1; endfunction endpackage
+            package p2; parameter int N=2; function int f(); return 2; endfunction endpackage
+            module top; import p1::*; import p2::*; {reference} endmodule"
+        );
+        let err = xezim::simulate(&source, 10)
+            .err()
+            .expect("ambiguous value accepted");
+        for part in [
+            name,
+            "wildcard-imported package",
+            "'p1'",
+            "'p2'",
+            "scope 'top'",
+        ] {
+            assert!(err.contains(part), "{err}");
+        }
+    }
+}
+
 const PKGS: &str = r#"// Two packages that declare a type with the same name but a different width.
 package pkg_one;
   typedef enum logic [1:0] { ONE_A, ONE_B, ONE_C } mode_t;

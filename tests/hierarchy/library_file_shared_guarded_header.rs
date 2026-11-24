@@ -89,3 +89,91 @@ fn each_library_file_sees_the_body_of_a_shared_guarded_header() {
     assert!(carried.contains("wrap_get"), "{carried}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// §3.12.1: library declarations resolve in each file that includes the header.
+#[test]
+fn library_files_see_their_own_typedefs_and_constants() {
+    let dir = std::env::temp_dir().join(format!("xezim_lib_unit_types_{}", std::process::id()));
+    for (file, text) in [
+        ("inc/types.vh", r#"
+`ifndef TYPES_VH
+`define TYPES_VH
+localparam ID_SZ = 6;
+typedef enum logic [1:0] { R_OK = 2'd0, R_ERR = 2'd2 } resp_t;
+typedef struct packed { resp_t resp; logic [ID_SZ-1:0] id; } rsp_t;
+function automatic logic is_err(resp_t r); return r == R_ERR; endfunction
+`endif
+"#),
+        ("lib/mid.v", r#"
+`include "types.vh"
+module mid(output rsp_t rsp, output logic err);
+  leaf l(.rsp(rsp));
+  assign err = is_err(rsp.resp);
+endmodule
+"#),
+        ("lib/leaf.v", r#"
+`include "types.vh"
+module leaf(output rsp_t rsp);
+  assign rsp = {R_ERR, ID_SZ'(5)};
+endmodule
+"#),
+        ("top.sv", r#"
+module top;
+  wire [7:0] rsp;
+  wire err;
+  mid m(.rsp(rsp), .err(err));
+  initial begin #1; $display("top rsp=%h err=%b", rsp, err); $finish; end
+endmodule
+"#),
+    ] {
+        let path = dir.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    for args in [
+        &["top.sv", "-y", "lib", "+libext+.v"][..],
+        &["top.sv", "-v", "lib/mid.v", "-v", "lib/leaf.v"][..],
+    ] {
+        assert_eq!(xezim(&dir, args), "top rsp=85 err=1");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §3.12.1: different library compilation units can use the same type name.
+#[test]
+fn library_unit_types_remain_local_to_each_file() {
+    let dir = std::env::temp_dir().join(format!("xezim_lib_unit_isolation_{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    let library = r#"
+localparam LEN = WIDTH;
+typedef logic [LEN-1:0] word_t;
+module MODULE_NAME(output word_t out, output logic ok);
+  localparam LEN = 11;
+  assign out = '1;
+  assign ok = (LEN == 11);
+endmodule
+"#;
+    for (name, width) in [("narrow", "4"), ("wide", "9")] {
+        let src = library.replace("MODULE_NAME", name).replace("WIDTH", width);
+        std::fs::write(dir.join("lib").join(format!("{name}.v")), src).unwrap();
+    }
+    std::fs::write(
+        dir.join("top.sv"),
+        r#"
+module top;
+  logic [3:0] a;
+  logic [8:0] b;
+  logic a_ok, b_ok;
+  narrow u0(a, a_ok);
+  wide u1(b, b_ok);
+  initial #1 $display("top %h %h %b%b", a, b, a_ok, b_ok);
+endmodule
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        xezim(&dir, &["top.sv", "-y", "lib", "+libext+.v"]),
+        "top f 1ff 11"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -70,7 +70,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// stands. An x/z index poisons the offset arithmetic, so the
     /// dynamic-range store discards the write exactly as the single-level
     /// arms do (§11.5.1).
-    fn packed_path_dyn_range(&mut self, lhs: &Expression) -> Option<(usize, PackedPathTarget)> {
+    fn packed_path_dyn_range(&mut self, lhs: &Expression) -> Option<(usize, PackedPathTarget, Option<RegId>)> {
         // A member or part-select may only sit at the LEAF; everything above
         // it must be an index chain over a packed root.
         let mut tail_member: Option<&str> = None;
@@ -160,6 +160,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
 
         let mut acc: Option<RegId> = None;
+        let mut valid: Option<RegId> = None;
         let mut slots: Option<(RegId, u64, u32, u64)> = None;
         let add_term = |c: &mut Self, term: RegId, acc: &mut Option<RegId>| match *acc {
             None => *acc = Some(term),
@@ -178,7 +179,7 @@ impl<'a> BytecodeCompiler<'a> {
             if elem_w == 0 {
                 return None;
             }
-            if let Some(k) = self.eval_const_bound(index) {
+            if let Some(k) = self.fold_const_i64(index) {
                 let lsb = Self::packed_elem_lsb(Some(dims[level]), k, elem_w);
                 if lsb < 0 {
                     return None;
@@ -186,8 +187,33 @@ impl<'a> BytecodeCompiler<'a> {
                 const_off = const_off.checked_add(u32::try_from(lsb).ok()?)?;
                 continue;
             }
-            let idx_reg = self.compile_expr(index, 0)?;
-            let slot = self.emit_packed_slot_index(Some(dims[level]), idx_reg);
+            let dim = dims[level];
+            let proven = self.packed_index_bounds(index)
+                .is_some_and(|(lo, hi)| lo >= dim.0.min(dim.1) && hi <= dim.0.max(dim.1));
+            let slot = if proven {
+                if (0..=i64::from(i32::MAX)).contains(&dim.1) {
+                    let index = self.compile_expr(index, 0)?;
+                    self.emit_packed_slot_index(Some(dim), index)
+                } else {
+                    self.compile_packed_store_slot(index, dim)?
+                }
+            } else {
+                let slot = self.compile_packed_store_slot(index, dim)?;
+                // §7.4.6: a subscript outside this dimension cannot address
+                // a neighbouring element, even if its combined offset is valid.
+                let count = self.alloc_reg();
+                self.emit(Insn::LoadConst(count, Box::new(Value::from_u64(counts[level], 64))));
+                let in_bounds = self.alloc_reg();
+                self.emit(Insn::Lt(in_bounds, slot, count));
+                valid = Some(if let Some(previous) = valid {
+                    let both = self.alloc_reg();
+                    self.emit(Insn::LogAnd(both, previous, in_bounds));
+                    both
+                } else {
+                    in_bounds
+                });
+                slot
+            };
             let term = if elem_w == 1 {
                 slot
             } else {
@@ -214,7 +240,7 @@ impl<'a> BytecodeCompiler<'a> {
             const_off = const_off.checked_add(off)?;
             mw
         } else if let Some((left, right, kind)) = tail_range
-            && idx_nodes.len() + 1 < dims.len()
+            && idx_nodes.len() < dims.len()
         {
             // §7.4.3, §11.5.1: the part-select addresses the NEXT declared
             // dimension, whose elements are `ew` bits wide — on
@@ -231,6 +257,9 @@ impl<'a> BytecodeCompiler<'a> {
                     let b = Self::label_to_phys(dim, self.eval_const_bound(right)?);
                     // A partly out-of-range select keeps the interpreter's
                     // per-bit placement (§11.5.1).
+                    if a.min(b) >= count || a.max(b) < 0 {
+                        return Some((id, PackedPathTarget::Ignore, None));
+                    }
                     if !in_dim(a) || !in_dim(b) {
                         return None;
                     }
@@ -245,10 +274,14 @@ impl<'a> BytecodeCompiler<'a> {
                         .filter(|&w| w > 0 && w <= count as u64)?;
                     // On an ascending dimension `+:` runs down the slots.
                     let up = (*kind == RangeKind::IndexedUp) != Self::dim_is_ascending(Some(dim));
-                    if let Some(b) = self.eval_const_bound(left) {
+                    if let Some(b) = self.fold_const_i64(left) {
                         let first = Self::label_to_phys(dim, b);
                         let low = if up { first } else { first - (w as i64 - 1) };
-                        if !in_dim(low) || !in_dim(low + w as i64 - 1) {
+                        let high = low.checked_add(w as i64 - 1)?;
+                        if low >= count || high < 0 {
+                            return Some((id, PackedPathTarget::Ignore, None));
+                        }
+                        if !in_dim(low) || !in_dim(high) {
                             return None;
                         }
                         let lsb = u32::try_from(low).ok()?.checked_mul(ew)?;
@@ -257,9 +290,7 @@ impl<'a> BytecodeCompiler<'a> {
                         // §11.5.1: a run-time base can run past either end
                         // of the dimension; only the slots inside it are
                         // written (see `emit_slot_run_store`).
-                        let base = self.compile_expr(left, 0)?;
-                        let base = self.widen_part_select_base(left, base);
-                        let slot = self.emit_packed_slot_index(Some(dim), base);
+                        let slot = self.compile_packed_store_slot(left, dim)?;
                         let low = if up {
                             slot
                         } else {
@@ -272,59 +303,29 @@ impl<'a> BytecodeCompiler<'a> {
                             ));
                             out
                         };
-                        slots = Some((low, w, ew, count as u64));
+                        let offset = w as i64 - 1;
+                        let inside = self.packed_index_bounds(left).is_some_and(|(a, b)| {
+                            let a = Self::label_to_phys(dim, a);
+                            let b = Self::label_to_phys(dim, b);
+                            if up {
+                                in_dim(a.min(b)) && b.max(a).checked_add(offset).is_some_and(in_dim)
+                            } else {
+                                in_dim(a.max(b)) && a.min(b).checked_sub(offset).is_some_and(in_dim)
+                            }
+                        });
+                        if inside {
+                            let scaled = if ew == 1 { low } else { self.emit_slot_bit(low, ew, 0) };
+                            add_term(self, scaled, &mut acc);
+                        } else {
+                            slots = Some((low, w, ew, count as u64));
+                        }
                     }
                     w
                 }
             };
             u32::try_from(n).ok()?.checked_mul(ew)?
-        } else if let Some((left, right, kind)) = tail_range {
-            match kind {
-                RangeKind::Constant => {
-                    let hi = self.eval_const_bound(left)?;
-                    let lo = self.eval_const_bound(right)?;
-                    if lo < 0 || hi < lo {
-                        return None;
-                    }
-                    const_off = const_off.checked_add(u32::try_from(lo).ok()?)?;
-                    u32::try_from(hi - lo + 1).ok()?
-                }
-                RangeKind::IndexedUp | RangeKind::IndexedDown => {
-                    let w = self
-                        .fold_const(right)
-                        .and_then(|v| v.to_u64())
-                        .filter(|&w| w > 0)?;
-                    let w = u32::try_from(w).ok()?;
-                    if let Some(b) = self.eval_const_bound(left) {
-                        // `b -: w` runs down from b, so its low bit is b-w+1.
-                        let lo = if matches!(kind, RangeKind::IndexedUp) {
-                            b
-                        } else {
-                            b - (w as i64) + 1
-                        };
-                        if lo < 0 {
-                            return None;
-                        }
-                        const_off = const_off.checked_add(u32::try_from(lo).ok()?)?;
-                    } else {
-                        let base = self.compile_expr(left, 0)?;
-                        let lo_reg = if matches!(kind, RangeKind::IndexedUp) {
-                            base
-                        } else {
-                            let d = self.alloc_reg();
-                            self.emit(Insn::LoadConst(
-                                d,
-                                Box::new(Value::from_u64((w - 1) as u64, 32)),
-                            ));
-                            let out = self.alloc_reg();
-                            self.emit(Insn::Sub(out, base, d));
-                            out
-                        };
-                        add_term(self, lo_reg, &mut acc);
-                    }
-                    w
-                }
-            }
+        } else if tail_range.is_some() {
+            return None;
         } else {
             u32::try_from(stride(idx_nodes.len() - 1)).ok()?
         };
@@ -363,9 +364,63 @@ impl<'a> BytecodeCompiler<'a> {
                     ew,
                     count,
                 }),
+                valid,
             ),
-            None => (id, PackedPathTarget::Range(lo_reg, width)),
+            None => (id, PackedPathTarget::Range(lo_reg, width), valid),
         })
+    }
+
+    /// Bounds implied by an unsigned width or a constant-count loop.
+    fn packed_index_bounds(&mut self, expr: &Expression) -> Option<(i64, i64)> {
+        if let Some(index) = self.fold_const_i64(expr) {
+            return Some((index, index));
+        }
+        if let ExprKind::Ident(h) = &expr.kind
+            && let Some((reg, _)) = self.local_var_reg_of(h)
+            && let Some(&range) = self.loop_index_bounds.get(&reg)
+        {
+            return Some(range);
+        }
+        let width = self.lrm_self_width(expr);
+        if let ExprKind::Binary { op: BinaryOp::Mul, left, right } = &expr.kind
+            && let Some((a, b)) = self.packed_index_bounds(left)
+            && let Some((c, d)) = self.packed_index_bounds(right)
+            && a >= 0 && c >= 0 && width > 0
+        {
+            let high = b.checked_mul(d)?;
+            let magnitude = width - u32::from(self.expr_signedness(expr)?);
+            if magnitude >= 63 || high < (1i64 << magnitude) {
+                return Some((a.checked_mul(c)?, high));
+            }
+        }
+        (width > 0 && width < 63 && self.expr_signedness(expr) == Some(false))
+            .then(|| (0, (1i64 << width) - 1))
+    }
+
+    /// Translate a signed or unsigned label to its LSB-first slot before any
+    /// truncation. Widen small signed indices before subtracting the origin.
+    fn compile_packed_store_slot(&mut self, expr: &Expression, dim: (i64, i64)) -> Option<RegId> {
+        let index = self.compile_expr(expr, 0)?;
+        let index = if self.lrm_self_width(expr) < 64 {
+            let wide = self.alloc_reg();
+            self.emit(Insn::MoveResize(wide, index, 64));
+            wide
+        } else {
+            index
+        };
+        let (left, right) = dim;
+        if left >= right && right == 0 {
+            return Some(index);
+        }
+        let origin = self.alloc_reg();
+        self.emit(Insn::LoadConst(origin, Box::new(Value::from_u64(right as u64, 64))));
+        let slot = self.alloc_reg();
+        self.emit(if left >= right {
+            Insn::Sub(slot, index, origin)
+        } else {
+            Insn::Sub(slot, origin, index)
+        });
+        Some(slot)
     }
 
     /// §11.5.1: store a part-select whose base is only known at run time,
@@ -556,21 +611,28 @@ impl<'a> BytecodeCompiler<'a> {
         let start = self.insns.len();
         let start_reg = self.next_reg;
         let saved_reason = self.bail_reason;
-        if let Some((id, target)) = self.packed_path_dyn_range(lhs) {
+        if let Some((id, target, valid)) = self.packed_path_dyn_range(lhs) {
             let sig = as_sig_id(id);
-            let (lo_reg, w) = match target {
-                PackedPathTarget::Range(lo, w) => (lo, w),
-                PackedPathTarget::Slots(run) => {
-                    self.emit_slot_run_store(sig, run, val_reg, nba);
-                    return true;
-                }
-            };
-            let (hi_reg, resized) = self.packed_path_store_regs(lo_reg, w, val_reg);
-            self.emit(if nba {
-                Insn::NbaAssignRangeDyn(sig, hi_reg, lo_reg, resized)
-            } else {
-                Insn::BlockingAssignRangeDyn(sig, hi_reg, lo_reg, resized)
+            let guard = valid.map(|condition| {
+                let branch = self.insns.len();
+                self.emit(Insn::BranchIfFalse(condition, 0));
+                (branch, condition)
             });
+            match target {
+                PackedPathTarget::Ignore => {}
+                PackedPathTarget::Range(lo, width) => {
+                    let (hi, resized) = self.packed_path_store_regs(lo, width, val_reg);
+                    self.emit(if nba {
+                        Insn::NbaAssignRangeDyn(sig, hi, lo, resized)
+                    } else {
+                        Insn::BlockingAssignRangeDyn(sig, hi, lo, resized)
+                    });
+                }
+                PackedPathTarget::Slots(run) => self.emit_slot_run_store(sig, run, val_reg, nba),
+            }
+            if let Some((branch, condition)) = guard {
+                self.insns[branch] = Insn::BranchIfFalse(condition, self.insns.len() as u32);
+            }
             return true;
         }
         self.truncate_insns(start);

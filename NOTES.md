@@ -10,6 +10,22 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Queue and array slices reached through object properties preserve their
+  elements and evaluate the receiver once (§7.4.6, §7.10.1, #1540).
+- An unconnected interface port reports the instance and port at elaboration
+  (§25.3, #1541).
+- Ambiguous wildcard imports name their candidate packages and the scope.
+  Procedurally assigned untyped ANSI output ports explain their implicit net
+  kind (§26.3, §23.2.2.3, #1542, #1543).
+- Compiled packed stores ignore out-of-range indices and clip part-selects to
+  their own dimension (§7.4.6, §11.5.1, #1534).
+- Packed declarations can use `$bits` of an earlier local. Parameter overrides
+  can use `$bits` of concatenated untyped ANSI ports (§20.6.2, #1535, #1537).
+- Packed struct members reached through indexed generate scopes can be read
+  and written (§23.6, §27.4, #1536).
+- Modules found through `-y` and `-v` can use typedefs, enum members, and
+  constants declared at the top of their own file (§3.12.1, #1538).
+
 - Event controls on an indexed class object's property follow changes to the
   selected object and its property value (§9.4.2, #1472).
 - Nested assignment patterns preserve element values and row sizes in dynamic

@@ -232,6 +232,11 @@ fn design_cache_key_for(
     // §26.3: cached expressions retain the scope of imported enum members.
     hash.text("imported-enum-value-scope-v1");
     hash.text("unpacked-concat-packed-elements-v1");
+    // §3.12.1, §20.6.2: re-elaborate library units and implicit port widths.
+    hash.text("library-unit-and-implicit-port-widths-v1");
+    // §25.3, §26.3: validate interface connections and wildcard references.
+    hash.text("interface-port-and-wildcard-validation-v1");
+    hash.bytes(&[sv_parser::strict_checks() as u8]);
     hash.text(env!("CARGO_PKG_VERSION"));
     hash.text(&config.semantic_salt);
     hash.bytes(&xezim_core::elaborate::max_packed_width().to_le_bytes());

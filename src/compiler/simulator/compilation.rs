@@ -1785,26 +1785,41 @@ impl Simulator {
             // A local claimed elsewhere: by a top item, or by another
             // process (another instance of the module included).
             let mut counts: HashMap<&str, usize> = HashMap::default();
-            for st in pending_initial
-                .iter()
-                .map(|p| &*p.source)
-                .chain(initial_blocks.iter().map(|b| &b.stmt))
-            {
-                Self::for_each_decl_name(st, &mut |n, _| *counts.entry(n).or_insert(0) += 1);
-            }
+            let mut scoped_conflicts = HashSet::default();
             let m = &self.module;
-            counts
-                .into_iter()
-                .filter(|&(n, c)| {
-                    c >= 2
-                        || self.signal_name_to_id.contains_key(n)
-                        || m.arrays.contains_key(n)
-                        || m.associative_arrays.contains_key(n)
-                        || m.dynamic_arrays.contains(n)
-                        || m.queue_vars.contains(n)
-                })
-                .map(|(n, _)| n.to_string())
-                .collect()
+            for p in &pending_initial {
+                Self::for_each_decl_name(&p.source, &mut |name, _| {
+                    *counts.entry(name).or_insert(0) += 1;
+                    // A local may shadow an instance parameter even when
+                    // its bare name is unused anywhere else in the design.
+                    if m.parameters.contains_key(&format!("{}{name}", p.ctx.prefix))
+                        || (!p.gen_scope.is_empty()
+                            && m.parameters.contains_key(&format!(
+                                "{}{}.{name}", p.ctx.prefix, p.gen_scope
+                            )))
+                    {
+                        scoped_conflicts.insert(name.to_string());
+                    }
+                });
+            }
+            for b in &initial_blocks {
+                Self::for_each_decl_name(&b.stmt, &mut |n, _| *counts.entry(n).or_insert(0) += 1);
+            }
+            scoped_conflicts.extend(
+                counts
+                    .into_iter()
+                    .filter(|&(n, c)| {
+                        c >= 2
+                            || self.signal_name_to_id.contains_key(n)
+                            || m.parameters.contains_key(n)
+                            || m.arrays.contains_key(n)
+                            || m.associative_arrays.contains_key(n)
+                            || m.dynamic_arrays.contains(n)
+                            || m.queue_vars.contains(n)
+                    })
+                    .map(|(n, _)| n.to_string()),
+            );
+            scoped_conflicts
         };
         let claims = |nm: &str| claim_set.contains(nm);
         let mut rename_pending = |p: super::elaborate::PendingInitial| {

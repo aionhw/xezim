@@ -276,3 +276,36 @@ endmodule
     );
     assert_compiled(&text);
 }
+
+/// §7.4.6, §11.5.1: each index or slice stays within its own packed dimension.
+#[test]
+fn packed_path_stores_respect_each_dimension() {
+    let text = run(
+        "packed_path_stores_respect_each_dimension",
+        r#"
+module t;
+  logic [2:0] k5 = 3'd5, k6 = 3'd6;
+  logic [3:0][5:0][7:0] a;
+  logic [1:0][2:0][7:0] b;
+  always_comb begin
+    a = '0;
+    a[1][k6] = 8'hee;
+  end
+  always_comb begin
+    b = '0;
+    b[0][1][k5 + 3'd1 +: 4] = 4'hf;
+  end
+  initial begin
+    #1;
+    $display("BOUNDS %h %h", a, b);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(
+        text.contains("BOUNDS 000000000000000000000000000000000000000000000000 00000000c000"),
+        "{text}"
+    );
+    assert_compiled(&text);
+}

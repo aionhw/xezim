@@ -23,6 +23,28 @@ fn procedural_assignment_to_an_output_net_is_rejected() {
 }
 
 #[test]
+fn untyped_ansi_output_diagnoses_its_implicit_net_kind() {
+    let source = "module worker(output p, output [1:0] q, r, output wire s);
+        initial begin p = 0; q = 0; r = 0; s = 0; end
+        endmodule module top; worker u(); endmodule";
+    let err = simulate(source, 10).err().expect("reject net assignments");
+    for port in ['p', 'q', 'r'] {
+        assert!(
+            err.contains(&format!("Output port '{port}' in module 'worker'")),
+            "{err}"
+        );
+    }
+    assert!(
+        err.contains("no explicit data type") && err.contains("output logic"),
+        "{err}"
+    );
+    assert!(
+        err.contains("net 's' is the target") && !err.contains("Output port 's'"),
+        "{err}"
+    );
+}
+
+#[test]
 fn output_variable_ports_take_procedural_assignments() {
     let src = r#"
 module sub(input clk, output logic q, output reg [3:0] r, output int n, output var v);

@@ -13,6 +13,8 @@ impl<'a> BytecodeCompiler<'a> {
                 if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() {
                     if let Some(v) = self.local_const_vars.get(&h.path[0].name.name) {
                         v.clone()
+                    } else if self.local_var_reg_of(h).is_some() {
+                        return None;
                     } else {
                         self.lookup_param_value(h)?
                     }

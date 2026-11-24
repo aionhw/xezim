@@ -113,3 +113,34 @@ module top; child u(); endmodule"#;
         assert!(got.contains("T|nested width 4 value 15 copies 16"), "{got}");
     }
 }
+
+/// §20.6.2: a declaration may use the fixed width of an earlier local.
+#[test]
+fn bits_of_a_local_sizes_a_later_declaration() {
+    let got = output(
+        r#"
+module child #(parameter int W = 8);
+  localparam int a = 0;
+  function automatic int fill(input logic [4:0] v);
+    logic [$bits(v)-1:0] b;
+    b = '1;
+    return int'(b);
+  endfunction
+  function automatic int fill_from_local();
+    logic [5:0] src;
+    logic [$bits(src)-1:0] val;
+    val = '1;
+    return int'(val);
+  endfunction
+  initial begin
+    logic [W-1:0] a;
+    logic [$bits(a)-1:0] b;
+    b = '1;
+    $display("T|width %0d value %0d formal %0d local %0d", $bits(b), b, fill('0), fill_from_local());
+  end
+endmodule
+module top; child #(.W(11)) u(); endmodule
+"#,
+    );
+    assert!(got.contains("T|width 11 value 2047 formal 31 local 63"), "{got}");
+}
