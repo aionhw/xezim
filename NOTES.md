@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Nested braces in unpacked array concatenations contribute one packed or
+  string element. Outer array and queue operands still contribute their
+  elements (§10.10.3, #1544).
+
 - Timed `always @*` blocks wait on inferred inputs, and event-headed
   `always` blocks with unguarded events arm before time-zero procedural
   writes (#1539, #1545).

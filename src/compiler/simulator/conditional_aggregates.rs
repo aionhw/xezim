@@ -158,12 +158,6 @@ impl Simulator {
         values: &mut Vec<AggregateValue>,
     ) {
         let item = Self::unparen(item);
-        if let ExprKind::Concatenation(parts) = &item.kind {
-            for part in parts {
-                self.snapshot_struct_concat_item(part, dt, values);
-            }
-            return;
-        }
         if let Some(selected) = self.selected_aggregate_rhs(None, item) {
             self.snapshot_struct_concat_item(&selected, dt, values);
             return;

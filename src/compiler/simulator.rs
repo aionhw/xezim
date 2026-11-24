@@ -562,7 +562,8 @@ macro_rules! write_sig {
 // §7.4.5: signed constant labels of packed array elements.
 // Indexed packed-struct write regions and delayed unpacked-array drivers.
 // Timed implicit event controls retain their inferred sensitivity.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB085";
+// Continuous assignments lower nested packed concatenations as array elements.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB086";
 
 mod aggregate_assignments;
 mod pattern_array_items;

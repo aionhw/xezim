@@ -779,17 +779,8 @@ impl Simulator {
                 if self.assign_struct_concat(name, exprs.iter().collect()) {
                     return true;
                 }
-                let mut flat: Vec<&Expression> = exprs.iter().collect();
-                while let Some(i) = flat
-                    .iter()
-                    .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
-                {
-                    if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
-                        flat.splice(i..i, c);
-                    }
-                }
                 let expand_rows = self.concat_has_non_array_elements(name);
-                let vals = self.unpacked_concat_operand_values(flat, expand_rows, None);
+                let vals = self.unpacked_concat_operand_values(exprs.iter().collect(), expand_rows, None);
                 self.set_queue_size(name, vals.len() as u64);
                 for (i, v) in vals.into_iter().enumerate() {
                     let v = self.fit_queue_push_elem(name, v);
@@ -3874,20 +3865,8 @@ impl Simulator {
                 }
                 vals
             }
-            // §10.10: an array operand of the concatenation (`{w, 5}`, a
-            // row `m[1]`, a slice `a[0 +: 2]`) contributes all its elements,
-            // and a nested concatenation splices its own.
             (ExprKind::Concatenation(parts), _) => {
-                let mut flat: Vec<&Expression> = parts.iter().collect();
-                while let Some(i) = flat
-                    .iter()
-                    .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
-                {
-                    if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
-                        flat.splice(i..i, c);
-                    }
-                }
-                self.unpacked_concat_operand_values(flat, expand_rows, None)
+                self.unpacked_concat_operand_values(parts.iter().collect(), expand_rows, None)
             }
             _ => return,
         };
