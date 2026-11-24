@@ -387,10 +387,19 @@ impl Simulator {
             let ragged = self.coll_shape_at(&scoped).is_some_and(|(shape, depth)| {
                 matches!(shape.dims.get(depth + 1), Some(Dim::Dyn | Dim::Queue))
             });
+            let elem_dt = self.class_member_coll_type(&scoped).cloned();
+            let struct_elem = elem_dt.as_ref().filter(|dt| {
+                matches!(
+                    self.resolve_dt_ref(dt),
+                    DataType::Struct(su) if Self::spreads_member_wise(su)
+                )
+            });
             for (i, e) in exprs.iter().enumerate() {
                 let elem = format!("{scoped}[{i}]");
                 if ragged {
                     self.queue_store_elem(&scoped, &elem, e);
+                } else if let Some(dt) = struct_elem {
+                    self.assign_pattern_or_leaf(&elem, dt, e);
                 } else {
                     self.pattern_leaf_at_elem_width(&elem, e, ew);
                 }
@@ -435,8 +444,20 @@ impl Simulator {
             return true;
         }
         let exprs = self.pattern_ordered(items);
+        let elem_dt = self.class_member_coll_type(key).cloned();
+        let struct_elem = elem_dt.as_ref().filter(|dt| {
+            matches!(
+                self.resolve_dt_ref(dt),
+                DataType::Struct(su) if Self::spreads_member_wise(su)
+            )
+        });
         for (i, e) in exprs.iter().enumerate() {
-            self.pattern_leaf_at_elem_width(&format!("{}[{}]", key, i), e, w);
+            let elem = format!("{}[{}]", key, i);
+            if let Some(dt) = struct_elem {
+                self.assign_pattern_or_leaf(&elem, dt, e);
+            } else {
+                self.pattern_leaf_at_elem_width(&elem, e, w);
+            }
         }
         self.set_queue_size(key, exprs.len() as u64);
         true

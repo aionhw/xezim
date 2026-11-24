@@ -622,10 +622,26 @@ impl Simulator {
                 // §7.6: whole-array assignment pairs elements in each
                 // declaration's order, including descending/nonzero ranges.
                 let descending = self.module.descending_arrays.contains(&dst);
-                for pos in 0..=(hi - lo) {
-                    let idx = if descending { hi - pos } else { lo + pos };
-                    if let Some(v) = self.get_signal_value_by_name(&format!("{src}[{pos}]")) {
-                        self.set_signal_value_by_name(&format!("{dst}[{idx}]"), v);
+                if src == Self::RET_STRUCT_SNAP
+                    && let Some(su) = self.queue_elem_struct(&src)
+                {
+                    let avail = self.get_queue_size(&src);
+                    if avail == (hi - lo + 1) as u64 {
+                        for pos in 0..=(hi - lo) {
+                            let idx = if descending { hi - pos } else { lo + pos };
+                            self.copy_unpacked_struct(
+                                &Self::name_with_index(&dst, idx),
+                                &Self::name_with_index(&src, pos),
+                                &su,
+                            );
+                        }
+                    }
+                } else {
+                    for pos in 0..=(hi - lo) {
+                        let idx = if descending { hi - pos } else { lo + pos };
+                        if let Some(v) = self.get_signal_value_by_name(&format!("{src}[{pos}]")) {
+                            self.set_signal_value_by_name(&format!("{dst}[{idx}]"), v);
+                        }
                     }
                 }
             } else {
@@ -1834,6 +1850,57 @@ impl Simulator {
             }
             self.settle_after_proc_write();
             return;
+        }
+        if matches!(rvalue.kind, ExprKind::RangeSelect { .. })
+            && let Some(dst) = self.expr_assoc_name(lvalue).or_else(|| self.pending_coll_dst(lvalue))
+        {
+            let dst_is_dyn =
+                self.module.dynamic_arrays.contains(&dst) || self.class_queue_prop(&dst);
+            let dst_fixed = (!dst_is_dyn)
+                .then(|| self.module.arrays.get(&dst).copied())
+                .flatten();
+            if (dst_is_dyn || (dst_fixed.is_some() && self.queue_elem_struct(&dst).is_some()))
+                && let Some((src, idx, su)) = self.collection_struct_slice(rvalue)
+            {
+                let (copy_src, staged) = if dst == src {
+                    let saved = self.pending_ret_collection.take();
+                    self.snapshot_ret_structs(&src, &idx, &su);
+                    self.pending_ret_collection = saved;
+                    (Self::RET_STRUCT_SNAP, true)
+                } else {
+                    (src.as_str(), false)
+                };
+                if dst_is_dyn {
+                    for (pos, i) in idx.iter().enumerate() {
+                        let si = if staged { pos as i64 } else { *i };
+                        self.copy_unpacked_struct(
+                            &Self::name_with_index(&dst, pos as i64),
+                            &Self::name_with_index(copy_src, si),
+                            &su,
+                        );
+                    }
+                    self.set_queue_size(&dst, idx.len() as u64);
+                } else if let Some((lo, hi, _)) = dst_fixed
+                    && idx.len() as i64 == hi - lo + 1
+                {
+                    let descending = self.module.descending_arrays.contains(&dst);
+                    for (pos, i) in idx.iter().enumerate() {
+                        let di = if descending {
+                            hi - pos as i64
+                        } else {
+                            lo + pos as i64
+                        };
+                        let si = if staged { pos as i64 } else { *i };
+                        self.copy_unpacked_struct(
+                            &Self::name_with_index(&dst, di),
+                            &Self::name_with_index(copy_src, si),
+                            &su,
+                        );
+                    }
+                }
+                self.settle_after_proc_write();
+                return;
+            }
         }
         if self.assign_unpacked_slice(lvalue, rvalue) {
             self.settle_after_proc_write();
