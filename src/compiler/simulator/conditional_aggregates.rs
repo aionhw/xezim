@@ -479,6 +479,14 @@ impl Simulator {
                     index: Box::new(literal(value, index.span)),
                 }
             }
+            ExprKind::RangeSelect { expr, kind, left, right } => ExprKind::RangeSelect {
+                expr: Box::new(self.freeze_conditional_path(expr, evaluate)),
+                kind: *kind,
+                // A collection slice evaluates its bounds with `$` bound
+                // to the selected object's live final index.
+                left: left.clone(),
+                right: right.clone(),
+            },
             ExprKind::MemberAccess { expr, member } => {
                 let memo = matches!(expr.kind, ExprKind::Call { .. })
                     .then(|| self.recv_call_memo_hit(expr))

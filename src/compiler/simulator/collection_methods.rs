@@ -2931,7 +2931,7 @@ impl Simulator {
     /// §7.10 / §7.4.6: the elements of a SLICE of an unpacked collection
     /// used as a value (`q[1:$]`, `q[a+:n]`, `fixed[1:3]`), with the
     /// element width; `None` when `arg` is not such a slice (or one this
-    /// helper does not model: a descending fixed array, struct elements).
+    /// helper does not model: an array of unpacked structs).
     /// For a queue or dynamic array an empty or reversed range (`q[3:1]`,
     /// `q[4:$]` on four elements) yields no elements, and bounds beyond
     /// either end are clamped (§7.10.1).
@@ -2948,40 +2948,53 @@ impl Simulator {
         else {
             return None;
         };
-        let name = self.queue_actual_storage(base)?;
-        if self.module.descending_arrays.contains(&*name) || self.queue_elem_struct(&name).is_some()
-        {
+        let name = match &base.kind {
+            ExprKind::Index { .. } | ExprKind::Call { .. } => self.queue_actual_storage(base),
+            ExprKind::Ident(h) if h.path.len() > 1 => self.expr_assoc_name(base).or_else(|| self.array_operand_name(base)),
+            _ => self.array_operand_name(base),
+        }?;
+        if self.queue_elem_struct(&name).is_some() {
             return None;
         }
         let (lo_a, hi_a, w) = *self.module.arrays.get(&*name)?;
-        let is_dyn = self.module.dynamic_arrays.contains(&*name);
-        let upper = if is_dyn {
-            self.get_queue_size(&name) as i64 - 1
-        } else {
-            hi_a
-        };
+        let live_size = self.live_coll_size(&name);
+        let is_dyn = live_size.is_some();
+        let upper = live_size.map_or(hi_a, |n| n as i64 - 1);
         self.dollar_bound.push(upper);
-        let l = self.eval_expr(left).to_i64();
-        let r = self.eval_expr(right).to_i64();
+        let l = self.eval_expr(left).to_index();
+        let r = self.eval_expr(right).to_index();
         self.dollar_bound.pop();
-        let (l, r) = (l?, r?);
+        let Some((l, r)) = l.zip(r) else {
+            return Some((Vec::new(), w));
+        };
         let (from, to) = match kind {
             RangeKind::Constant => (l, r),
-            RangeKind::IndexedUp => (l, l + r - 1),
-            RangeKind::IndexedDown => (l - r + 1, l),
+            RangeKind::IndexedUp if r > 0 => (l, l.saturating_add(r - 1)),
+            RangeKind::IndexedDown if r > 0 => (l.saturating_sub(r - 1), l),
+            _ => return Some((Vec::new(), w)),
         };
         let lo_b = if is_dyn { 0 } else { lo_a };
-        let (from, to) = (from.max(lo_b), to.min(upper));
-        let vals = if from > to {
+        let descending = !is_dyn && self.module.descending_arrays.contains(&name);
+        let (lo, hi) = if descending && *kind == RangeKind::Constant {
+            (to, from)
+        } else {
+            (from, to)
+        };
+        let (lo, hi) = (lo.max(lo_b), hi.min(upper));
+        let mut vals = if lo > hi {
             Vec::new()
         } else {
-            (from..=to)
+            (lo..=hi)
                 .map(|idx| {
-                    self.get_signal_value_by_name(&format!("{}[{}]", name, idx))
+                    self.get_signal_value_by_name(&Self::name_with_index(&name, idx))
+                        .or_else(|| self.coll_missing_elem_value(&name))
                         .unwrap_or_else(|| Value::zero(w))
                 })
                 .collect()
         };
+        if descending {
+            vals.reverse();
+        }
         Some((vals, w))
     }
 

@@ -10,6 +10,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Queue and array slices reached through object properties preserve their
+  elements and evaluate the receiver once (§7.4.6, §7.10.1, #1540).
+- An unconnected interface port reports the instance and port at elaboration
+  (§25.3, #1541).
+- Ambiguous wildcard imports name their candidate packages and the scope.
+  Procedurally assigned untyped ANSI output ports explain their implicit net
+  kind (§26.3, §23.2.2.3, #1542, #1543).
 - Compiled packed stores ignore out-of-range indices and clip part-selects to
   their own dimension (§7.4.6, §11.5.1, #1534).
 - Packed declarations can use `$bits` of an earlier local. Parameter overrides

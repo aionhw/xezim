@@ -87,7 +87,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     &local_types,
                     &mut errs,
                 );
-                check_proc_net_assign(&m.ports, &m.items, &mut errs);
+                check_proc_net_assign(&m.name.name, &m.ports, &m.items, &mut errs);
                 check_monitor_automatic(&m.items, &mut errs);
                 check_unpacked_pattern_counts(&m.items, &mut errs);
                 check_stream_widths(&m.items, scope, &mut errs);
@@ -230,7 +230,7 @@ fn check_unit<'a>(
     }
     check_generate_block_names(u.items, errs);
     check_system_task_values(u.items, errs);
-    check_wildcard_import_conflicts(u.ports, u.params, u.items, pkg_decls, errs);
+    check_wildcard_import_conflicts(u.name, u.ports, u.params, u.items, pkg_decls, errs);
     check_imported_hier_refs(defs, u.items, pkg_decls, errs);
     let classes = visible_classes(global, u.items);
     check_inherited_local_access(&classes, u.items, errs);
@@ -489,9 +489,10 @@ fn check_array_flat_init(d: &VarDeclarator, scope: ConstScope, errs: &mut Vec<St
 /// the ports inheriting from one); `output logic q` / `output reg q` are
 /// variables. Only `=`/`<=` targets are checked (force/release/assign are
 /// separate statement kinds).
-fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<String>) {
+fn check_proc_net_assign(module: &str, ports: &PortList, items: &[ModuleItem], errs: &mut Vec<String>) {
     use std::collections::HashSet;
     let mut nets: HashSet<String> = HashSet::new();
+    let mut implicit_output_nets = HashSet::new();
     for it in items {
         if let ModuleItem::NetDeclaration(nd) = it {
             for d in &nd.declarators {
@@ -501,6 +502,7 @@ fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<
     }
     if let PortList::Ansi(ps) = ports {
         let mut prev_net = false;
+        let mut prev_implicit_net = false;
         for p in ps {
             let omitted =
                 p.direction.is_none() && p.net_type.is_none() && !p.var_kw && p.data_type.is_none();
@@ -518,7 +520,13 @@ fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<
             if net {
                 nets.insert(p.name.name.clone());
             }
+            let implicit_net = net
+                && if omitted { prev_implicit_net } else { p.net_type.is_none() };
+            if implicit_net {
+                implicit_output_nets.insert(p.name.name.as_str());
+            }
             prev_net = net;
+            prev_implicit_net = implicit_net;
         }
         // A body declaration of the same name is not a net port (and is
         // diagnosed elsewhere if illegal).
@@ -544,11 +552,18 @@ fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<
         for_each_proc_assign_lhs(stmt, &mut |lv| {
             if let Some(b) = base_ident(lv) {
                 if nets.contains(&b) && flagged.insert(b.clone()) {
-                    errs.push(format!(
+                    let mut message = format!(
                         "net '{}' is the target of a procedural assignment (LRM 1800-2017 \
                          §6.5 — nets need a continuous assignment)",
                         b
-                    ));
+                    );
+                    if implicit_output_nets.contains(b.as_str()) {
+                        use std::fmt::Write;
+                        let _ = write!(message,
+                            ". Output port '{b}' in module '{module}' is a net because its declaration has no explicit data type (§23.2.2.3). Use an explicit variable type such as `output logic` for procedural assignments"
+                        );
+                    }
+                    errs.push(message);
                 }
             }
         });
@@ -4920,6 +4935,7 @@ fn collect_stmt_exprs<'a>(st: &'a Statement, f: &mut dyn FnMut(&'a Expression)) 
 /// visible through either import; referencing it without a local declaration
 /// or an explicit import is an error.
 fn check_wildcard_import_conflicts(
+    scope: &str,
     ports: &PortList,
     params: &[xezim_core::ast::decl::ParameterDeclaration],
     items: &[ModuleItem],
@@ -4935,7 +4951,7 @@ fn check_wildcard_import_conflicts(
     let mut uniq: Vec<&str> = wild.clone();
     uniq.sort();
     uniq.dedup();
-    for p in uniq {
+    for &p in &uniq {
         for n in pkgs.get(p).into_iter().flatten() {
             *count.entry(n.as_str()).or_default() += 1;
         }
@@ -4971,6 +4987,7 @@ fn check_wildcard_import_conflicts(
         for_each_expr(e, &mut |x| {
             if let ExprKind::Ident(h) = &x.kind
                 && h.path.len() == 1
+                && h.root.is_none()
                 && ambiguous(&h.path[0].name.name)
                 && !locals.contains(&h.path[0].name.name)
             {
@@ -4981,9 +4998,15 @@ fn check_wildcard_import_conflicts(
     hits.sort();
     hits.dedup();
     for n in hits {
+        let packages = uniq
+            .iter()
+            .filter(|p| pkgs.get(**p).is_some_and(|names| names.contains(&n)))
+            .map(|p| format!("'{p}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
         errs.push(format!(
-            "'{n}' is declared by more than one wildcard-imported package, so it is not \
-             visible here (LRM 1800-2017 §26.3)"
+            "'{n}' is declared by more than one wildcard-imported package ({packages}), so it is not \
+             visible in scope '{scope}' (IEEE 1800-2023 §26.3)"
         ));
     }
 }

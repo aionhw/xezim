@@ -71,44 +71,15 @@ impl Simulator {
                 }
                 continue;
             }
-            // Slice of a queue: q[a:b]
-            if let ExprKind::RangeSelect {
-                expr: rbase,
-                left,
-                right,
-                ..
-            } = &expr.kind
-            {
-                let rname = self.array_operand_name(rbase);
-                // Fixed slices retain their declared direction. A live
-                // queue/dynamic array, including an object property, takes
-                // its upper bound from its current length.
-                let live_size = rname.as_deref().and_then(|n| self.live_coll_size(n));
-                if live_size.is_none() && self.append_fixed_slice_concat_values(expr, &mut all_vals) {
+            if let ExprKind::RangeSelect { expr: base, .. } = &expr.kind {
+                // A computed object receiver must be resolved only once.
+                let computed = Self::recv_chain_call(base).is_some();
+                if !computed && self.append_fixed_slice_concat_values(expr, &mut all_vals) {
                     continue;
                 }
-                if let Some(rname) = rname {
-                    if let Some(&(r_lo_a, r_hi_a, _)) = self.module.arrays.get(&rname) {
-                        let r_upper = live_size.map_or(r_hi_a, |size| r_lo_a + size as i64 - 1);
-                        self.dollar_bound.push(r_upper);
-                        let l = self.eval_expr(left).to_i64().unwrap_or(0);
-                        let r = self.eval_expr(right).to_i64().unwrap_or(0);
-                        self.dollar_bound.pop();
-                        if l <= r {
-                            let lo = l.max(r_lo_a);
-                            let hi = r.min(r_upper);
-                            if hi >= lo {
-                                for idx in lo..=hi {
-                                    if let Some(v) = self
-                                        .get_signal_value_by_name(&format!("{}[{}]", rname, idx))
-                                    {
-                                        all_vals.push(v);
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
+                if let Some((values, _)) = self.collection_slice_values(expr) {
+                    all_vals.extend(values);
+                    continue;
                 }
             }
             // §10.10, §11.4.11, §6.24.1: a conditional choosing between two
