@@ -4063,7 +4063,7 @@ impl Simulator {
         }
         let (handle, prop) = self.class_prop_receiver(base)?;
         let (elem_w, total, left, right) = self.class_prop_packed_shape(handle, &prop)?;
-        let idx = self.eval_expr(index).to_i64()?;
+        let idx = self.eval_expr(index).to_index()?;
         if idx < left.min(right) || idx > left.max(right) {
             return None;
         }

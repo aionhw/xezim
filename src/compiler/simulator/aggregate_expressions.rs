@@ -1714,15 +1714,31 @@ impl Simulator {
                 {
                     (h.path[0].name.name.clone(), None, member.name.clone())
                 } else {
-                    let handle = match &recv.kind {
-                        ExprKind::This => self.this_stack.last().copied().flatten()?,
-                        ExprKind::Ident(h) if h.path.len() == 1 => {
-                            self.eval_ident_handle(&h.path[0].name.name)?
-                        }
+                    let (handle, var, resolved) = match &recv.kind {
+                        ExprKind::This => (
+                            self.this_stack.last().copied().flatten()?,
+                            Some("this".to_string()),
+                            None,
+                        ),
+                        ExprKind::Ident(h) if h.path.len() == 1 => (
+                            self.eval_ident_handle(&h.path[0].name.name)?,
+                            Some(h.path[0].name.name.clone()),
+                            Some(self.resolve_hier_name(h).into_owned()),
+                        ),
                         _ => return None,
                     };
-                    let (class, spec) =
-                        self.static_member_target(handle, None, None, &member.name)?;
+                    if var.as_deref() == Some("this")
+                        && let Some(ctx) = self.lexical_class()
+                        && !self.member_is_static_prop(&ctx, &member.name)
+                    {
+                        return None;
+                    }
+                    let (class, spec) = self.static_member_target(
+                        handle,
+                        var.as_deref(),
+                        resolved.as_deref(),
+                        &member.name,
+                    )?;
                     (class, spec, member.name.clone())
                 }
             }
@@ -1760,8 +1776,10 @@ impl Simulator {
                 offset: 0,
                 width,
                 dimensions,
-                element_type,
+                element_type: std::rc::Rc::new(element_type),
                 unpacked: 0,
+                invalid: false,
+                from_unpacked: false,
             })
         })();
         Some(match access {
@@ -1863,22 +1881,24 @@ impl Simulator {
                 // index into it (`s.m[1][2:1]`) selects whole elements. It
                 // fell to the generic select, which read the labels as bits.
                 if h.path.len() >= 2 && !self.module.var_decl_types.contains_key(&name) {
-                    let mut head = h.clone();
-                    head.path.truncate(1);
-                    head.cached_signal_id = crate::ast::cache::SignalCache::new(None);
-                    head.cached_resolved_name = crate::ast::cache::NameCache::new();
-                    let mut chain = Expression::new(ExprKind::Ident(head), expr.span);
-                    for seg in &h.path[1..] {
-                        chain = Expression::new(
-                            ExprKind::MemberAccess {
-                                expr: Box::new(chain),
-                                member: seg.name.clone(),
-                            },
-                            expr.span,
-                        );
-                    }
-                    if let Some(access) = self.declared_packed_access(&chain) {
-                        return Some(access);
+                    for split in (1..h.path.len()).rev() {
+                        let mut head = h.clone();
+                        head.path.truncate(split);
+                        head.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                        head.cached_resolved_name = crate::ast::cache::NameCache::new();
+                        let mut chain = Expression::new(ExprKind::Ident(head), expr.span);
+                        for seg in &h.path[split..] {
+                            chain = Expression::new(
+                                ExprKind::MemberAccess {
+                                    expr: Box::new(chain),
+                                    member: seg.name.clone(),
+                                },
+                                expr.span,
+                            );
+                        }
+                        if let Some(access) = self.declared_packed_access(&chain) {
+                            return Some(access);
+                        }
                     }
                 }
                 let recorded_type;
@@ -1950,8 +1970,10 @@ impl Simulator {
                     offset: 0,
                     width,
                     dimensions,
-                    element_type,
+                    element_type: std::rc::Rc::new(element_type),
                     unpacked,
+                    invalid: false,
+                    from_unpacked: unpacked > 0,
                 })
             }
             ExprKind::Paren(inner) => self.declared_packed_access(inner),
@@ -1960,14 +1982,38 @@ impl Simulator {
                     return None;
                 }
                 let mut access = self.declared_packed_access(base)?;
-                let index = self.eval_expr(index).to_index()?;
+                let idx = self.eval_expr(index).to_index();
                 if access.unpacked > 0
                     || self.module.dynamic_arrays.contains(&access.storage)
                     || self.module.queue_vars.contains(&access.storage)
                 {
-                    access.storage.push('[');
-                    Self::push_i64(&mut access.storage, index);
-                    access.storage.push(']');
+                    access.from_unpacked = true;
+                    if !access.invalid {
+                        match idx {
+                            Some(i) => {
+                                let in_bounds = if self.module.dynamic_arrays.contains(&access.storage)
+                                    || self.module.queue_vars.contains(&access.storage)
+                                {
+                                    i >= 0 && (i as u64) < self.get_queue_size(&access.storage)
+                                } else if access.unpacked == 1
+                                    && let Some(&(lo, hi, _)) =
+                                        self.module.arrays.get(&access.storage)
+                                {
+                                    i >= lo.min(hi) && i <= lo.max(hi)
+                                } else {
+                                    true
+                                };
+                                if in_bounds {
+                                    access.storage.push('[');
+                                    Self::push_i64(&mut access.storage, i);
+                                    access.storage.push(']');
+                                } else {
+                                    access.invalid = true;
+                                }
+                            }
+                            None => access.invalid = true,
+                        }
+                    }
                     access.unpacked = access.unpacked.saturating_sub(1);
                     return Some(access);
                 }
@@ -1976,15 +2022,23 @@ impl Simulator {
                     .first()
                     .copied()
                     .unwrap_or((access.width as i64 - 1, 0));
-                if index < left.min(right) || index > left.max(right) {
-                    return None;
-                }
                 let count = u32::try_from(left.abs_diff(right) + 1).ok()?;
                 if access.width % count != 0 {
                     return None;
                 }
                 access.width /= count;
                 access.is_signed = false;
+                if !access.dimensions.is_empty() {
+                    access.dimensions.remove(0);
+                }
+                if access.invalid {
+                    return Some(access);
+                }
+                let Some(index) = idx.filter(|&i| i >= left.min(right) && i <= left.max(right))
+                else {
+                    access.invalid = true;
+                    return Some(access);
+                };
                 let slot = if left >= right {
                     index - right
                 } else {
@@ -1993,9 +2047,6 @@ impl Simulator {
                 access.offset = access
                     .offset
                     .checked_add((slot as u32).checked_mul(access.width)?)?;
-                if !access.dimensions.is_empty() {
-                    access.dimensions.remove(0);
-                }
                 Some(access)
             }
             ExprKind::RangeSelect {
@@ -2018,8 +2069,61 @@ impl Simulator {
                     .first()
                     .copied()
                     .unwrap_or((access.width as i64 - 1, 0));
-                let a = self.eval_expr(left).to_index()?;
-                let b = self.eval_expr(right).to_index()?;
+                let count = u32::try_from(dl.abs_diff(dr) + 1).ok()?;
+                if access.width % count != 0 {
+                    return None;
+                }
+                let stride = access.width / count;
+                let a = self.eval_expr(left).to_index();
+                let b = self.eval_expr(right).to_index();
+                let invalid_range_width = || -> Option<u32> {
+                    let elems = match kind {
+                        RangeKind::Constant => {
+                            if let Some((a, b)) = a.zip(b) {
+                                u32::try_from(a.abs_diff(b) + 1).ok()?
+                            } else {
+                                let ca = a.or_else(|| {
+                                    super::elaborate::const_eval_i64_with_params(
+                                        left,
+                                        Some(&self.module.parameters),
+                                    )
+                                });
+                                let cb = b.or_else(|| {
+                                    super::elaborate::const_eval_i64_with_params(
+                                        right,
+                                        Some(&self.module.parameters),
+                                    )
+                                });
+                                ca.zip(cb)
+                                    .and_then(|(x, y)| u32::try_from(x.abs_diff(y) + 1).ok())
+                                    .unwrap_or(1)
+                            }
+                        }
+                        RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                            b.filter(|&n| n > 0).and_then(|n| u32::try_from(n).ok())?
+                        }
+                    };
+                    elems.checked_mul(stride)
+                };
+                if access.invalid || a.is_none() || b.is_none() {
+                    let w = invalid_range_width()?;
+                    if w == 0 {
+                        return None;
+                    }
+                    access.invalid = true;
+                    access.is_signed = false;
+                    access.width = w;
+                    let elems = w / stride.max(1);
+                    if elems > 0 {
+                        if access.dimensions.is_empty() {
+                            access.dimensions.push((elems as i64 - 1, 0));
+                        } else {
+                            access.dimensions[0] = (elems as i64 - 1, 0);
+                        }
+                    }
+                    return Some(access);
+                }
+                let (a, b) = (a?, b?);
                 let (l, r) = match kind {
                     RangeKind::Constant => (a, b),
                     RangeKind::IndexedUp if b > 0 => {
@@ -2046,11 +2150,6 @@ impl Simulator {
                 {
                     return None;
                 }
-                let count = u32::try_from(dl.abs_diff(dr) + 1).ok()?;
-                if access.width % count != 0 {
-                    return None;
-                }
-                let stride = access.width / count;
                 access.is_signed = false;
                 let slot = if dl >= dr { r - dr } else { dr - r };
                 access.offset = access
@@ -2090,37 +2189,43 @@ impl Simulator {
                 if access.unpacked != 0 || !access.dimensions.is_empty() {
                     return None;
                 }
-                let DataType::Struct(su) = &access.element_type else {
+                let DataType::Struct(su) = access.element_type.as_ref() else {
                     return None;
                 };
-                // Memoized per declaration position: the root variable, the
-                // offset and width already selected into it, and the member.
-                // (A source span alone is not unique across files.) Not for
-                // instance-parameterized or static roots.
-                let memo_key = (access.params.is_none()
+                // Memoized per declaration root + member + struct span/width:
+                // element indices in `storage` are stripped so large unpacked
+                // arrays of packed structs share one entry per member instead
+                // of allocating per element, and hits allocate nothing.
+                let root_base = access
+                    .storage
+                    .split('[')
+                    .next()
+                    .unwrap_or(&access.storage);
+                let can_memo = access.params.is_none()
                     && access.static_target.is_none()
-                    && !access.storage.is_empty())
-                .then(|| {
-                    (
-                        access.storage.clone(),
-                        access.offset,
-                        access.width,
-                        member.name.clone(),
-                    )
-                });
-                if let Some(memo_key) = &memo_key {
-                    if let Some(cached) = self.packed_struct_member_memo.borrow().get(memo_key) {
-                        if let Some((offset, width, is_signed, element, dimensions)) = cached {
-                            access.offset = access.offset.checked_add(*offset)?;
+                    && !root_base.is_empty()
+                    && !(su.span.start == 0 && su.span.end == 0);
+                let span_key = (su.span.start, su.span.end, access.width);
+                if can_memo
+                    && let Some(by_member) = self.packed_struct_member_memo.borrow().get(root_base)
+                    && let Some(entries) = by_member.get(member.name.as_str())
+                    && let Some((_, _, _, cached)) = entries
+                        .iter()
+                        .find(|&&(s, e, w, _)| s == span_key.0 && e == span_key.1 && w == span_key.2)
+                {
+                    return match cached {
+                        Some((offset, width, is_signed, element, dimensions)) => {
+                            if !access.invalid {
+                                access.offset = access.offset.checked_add(*offset)?;
+                            }
                             access.width = *width;
                             access.is_signed = *is_signed;
-                            access.dimensions = dimensions.clone();
-                            access.element_type = element.clone();
-                            return Some(access);
-                        } else {
-                            return None;
+                            access.dimensions = dimensions.to_vec();
+                            access.element_type = std::rc::Rc::clone(element);
+                            Some(access)
                         }
-                    }
+                        None => None,
+                    };
                 }
                 let mut remaining = access.width;
                 for m in &su.members {
@@ -2147,31 +2252,46 @@ impl Simulator {
                                 &m.data_type,
                                 &self.module.typedef_types,
                             );
-                            if let Some(memo_key) = memo_key {
-                                self.packed_struct_member_memo.borrow_mut().insert(
-                                    memo_key,
+                            let element_rc = std::rc::Rc::new(element);
+                            if can_memo {
+                                let dims_rc: std::rc::Rc<[(i64, i64)]> =
+                                    std::rc::Rc::from(dimensions.as_slice());
+                                let mut memo = self.packed_struct_member_memo.borrow_mut();
+                                let by_member = memo
+                                    .entry(root_base.into())
+                                    .or_default();
+                                let entries = by_member
+                                    .entry(member.name.as_str().into())
+                                    .or_default();
+                                entries.push((
+                                    span_key.0,
+                                    span_key.1,
+                                    span_key.2,
                                     Some((
                                         offset,
                                         width,
                                         is_signed,
-                                        element.clone(),
-                                        dimensions.clone(),
+                                        std::rc::Rc::clone(&element_rc),
+                                        dims_rc,
                                     )),
-                                );
+                                ));
                             }
-                            access.offset = access.offset.checked_add(offset)?;
+                            if !access.invalid {
+                                access.offset = access.offset.checked_add(offset)?;
+                            }
                             access.width = width;
                             access.is_signed = is_signed;
                             access.dimensions = dimensions;
-                            access.element_type = element;
+                            access.element_type = element_rc;
                             return Some(access);
                         }
                     }
                 }
-                if let Some(memo_key) = memo_key {
-                    self.packed_struct_member_memo
-                        .borrow_mut()
-                        .insert(memo_key, None);
+                if can_memo {
+                    let mut memo = self.packed_struct_member_memo.borrow_mut();
+                    let by_member = memo.entry(root_base.into()).or_default();
+                    let entries = by_member.entry(member.name.as_str().into()).or_default();
+                    entries.push((span_key.0, span_key.1, span_key.2, None));
                 }
                 None
             }
@@ -2180,48 +2300,65 @@ impl Simulator {
     }
 
     pub(super) fn needs_declared_packed_access(&self, expr: &Expression) -> bool {
-        match &expr.kind {
-            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
-                match &base.kind {
-                    ExprKind::MemberAccess { .. } => true,
-                    ExprKind::Index { .. } => {
-                        let mut root = base.as_ref();
-                        while let ExprKind::Index { expr, .. } = &root.kind {
-                            root = expr;
-                        }
-                        let ExprKind::Ident(h) = &root.kind else {
-                            return false;
-                        };
-                        let name = self
-                            .frame_bound_bare_name(h)
-                            .map(std::borrow::Cow::Borrowed)
-                            .unwrap_or_else(|| self.resolve_hier_name(h));
-                        // Ordinary vectors in unpacked memories already use the
-                        // existing fast element path. Only packed geometry needs
-                        // the declaration walk below the unpacked boundary.
-                        self.module
-                            .packed_full_dims
-                            .get(name.as_ref())
-                            .is_some_and(|d| d.len() > 1)
-                            || self.module.packed_struct_fields.contains_key(name.as_ref())
-                    }
-                    _ => false,
+        let mut cur = expr;
+        let mut has_member = false;
+        let mut select_count = 0usize;
+        let h = loop {
+            match &cur.kind {
+                ExprKind::Paren(inner) => cur = inner,
+                ExprKind::Index { expr: base, .. }
+                | ExprKind::RangeSelect { expr: base, .. } => {
+                    select_count += 1;
+                    cur = base;
                 }
+                ExprKind::MemberAccess { expr: base, .. } => {
+                    has_member = true;
+                    cur = base;
+                }
+                ExprKind::Ident(h) => break h,
+                _ => return false,
             }
-            ExprKind::MemberAccess { expr: base, .. } => {
-                matches!(base.kind, ExprKind::Index { .. })
-            }
-            _ => false,
+        };
+        if select_count == 0 || h.path.is_empty() {
+            return false;
         }
+        let head = h.path[0].name.name.as_str();
+        if matches!(head, "this" | "super") {
+            return false;
+        }
+        if !self.no_class_objects()
+            && h.path.len() == 1
+            && (self.this_prop_hides(head) || self.bare_name_is_class_channel(head))
+        {
+            return false;
+        }
+        if has_member {
+            return true;
+        }
+        if select_count == 1 && h.path.len() < 2 {
+            return false;
+        }
+        let name = self
+            .frame_bound_bare_name(h)
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| self.resolve_hier_name(h));
+        self.module
+            .packed_full_dims
+            .get(name.as_ref())
+            .is_some_and(|d| d.len() > 1)
+            || self.module.packed_struct_fields.contains_key(name.as_ref())
+            || (h.path.len() >= 2 && self.packed_leaf_of_hier(name.as_ref()).is_some())
     }
 
     pub(super) fn needs_static_packed_access(&self, expr: &Expression) -> bool {
-        let mut base = match &expr.kind {
-            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => expr.as_ref(),
+        let (mut base, mut had_select) = match &expr.kind {
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                (expr.as_ref(), true)
+            }
             // §8.9: a member (not a whole-property) target of a static packed
             // struct (`Cls::sp.m = v`, `sp.m = v` in a method).
-            ExprKind::MemberAccess { .. } => expr,
-            ExprKind::Ident(h) if h.path.len() >= 3 => expr,
+            ExprKind::MemberAccess { .. } => (expr, false),
+            ExprKind::Ident(h) if h.path.len() >= 3 => (expr, false),
             _ => return false,
         };
         // Values are seeded lazily: an empty value map must not discard the
@@ -2236,33 +2373,35 @@ impl Simulator {
                 .is_some_and(|&b| names.static_first[b as usize])
                 && names.statics.contains(name)
         };
+        let mut in_member = false;
         loop {
             match &base.kind {
-                ExprKind::Index { expr, .. }
-                | ExprKind::RangeSelect { expr, .. }
-                | ExprKind::Paren(expr) => base = expr,
+                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                    had_select = true;
+                    base = expr;
+                }
+                ExprKind::Paren(expr) => base = expr,
+                ExprKind::MemberAccess { expr, member } => {
+                    if (had_select || in_member) && candidate(&member.name) {
+                        return true;
+                    }
+                    in_member = true;
+                    base = expr;
+                }
                 _ => break,
             }
         }
-        // A member chain (`sp.a.b`, `Cls::sp.a`): the static is its root.
-        let mut in_member = false;
-        while let ExprKind::MemberAccess { expr, member } = &base.kind {
-            if candidate(&member.name) {
-                return true;
-            }
-            in_member = true;
-            base = expr;
-        }
         match &base.kind {
             ExprKind::Ident(h) if h.path.len() == 1 => {
-                (self.class_context_stack.last().is_some_and(Option::is_some)
-                    || self.this_stack.last().copied().flatten().is_some())
+                (had_select || in_member)
+                    && (self.class_context_stack.last().is_some_and(Option::is_some)
+                        || self.this_stack.last().copied().flatten().is_some())
                     && candidate(&h.path[0].name.name)
             }
-            ExprKind::Ident(h) if h.path.len() == 2 => candidate(&h.path[1].name.name),
-            ExprKind::Ident(h) if h.path.len() >= 3 || in_member => {
-                h.path.len() >= 2 && candidate(&h.path[1].name.name)
+            ExprKind::Ident(h) if h.path.len() == 2 => {
+                (had_select || in_member) && candidate(&h.path[1].name.name)
             }
+            ExprKind::Ident(h) if h.path.len() >= 3 => candidate(&h.path[1].name.name),
             _ => false,
         }
     }
@@ -2282,6 +2421,19 @@ impl Simulator {
         self.get_local_or_signal(name)
     }
 
+    fn invalid_packed_access_val(&self, access: &DeclaredPackedAccess) -> Value {
+        let mut out = if super::elaborate::is_type_two_state_resolved(
+            &access.element_type,
+            &self.module.typedef_types,
+        ) {
+            Value::zero(access.width)
+        } else {
+            Value::new(access.width)
+        };
+        out.is_signed = access.is_signed;
+        out
+    }
+
     pub(super) fn read_declared_packed_access(&mut self, expr: &Expression) -> Option<Value> {
         let Some(access) = self.declared_packed_access(expr) else {
             return self.read_partial_packed_range(expr);
@@ -2289,10 +2441,19 @@ impl Simulator {
         if access.unpacked != 0 || access.width == 0 {
             return None;
         }
+        if access.invalid {
+            return Some(self.invalid_packed_access_val(&access));
+        }
         let value = if let Some((class, spec, member)) = &access.static_target {
             self.static_read_in(class, spec.clone(), member)?
         } else {
-            self.packed_local_value(&access.storage)?
+            match self.packed_local_value(&access.storage) {
+                Some(v) => v,
+                None if access.from_unpacked => {
+                    return Some(self.invalid_packed_access_val(&access));
+                }
+                None => return None,
+            }
         };
         let end = access.offset.checked_add(access.width)?;
         if end > value.width {
@@ -2331,19 +2492,11 @@ impl Simulator {
         if access.unpacked != 0 || fit_w == 0 {
             return None;
         }
+        if access.invalid {
+            return Some(false);
+        }
         let single = [(access.offset, 0, access.width)];
         let pieces: &[(u32, u32, u32)] = partial.as_deref().unwrap_or(&single);
-        let mut stored = if let Some((class, spec, member)) = &access.static_target {
-            self.static_read_in(class, spec.clone(), member)?
-        } else {
-            self.packed_local_value(&access.storage)?
-        };
-        for &(dst, _, w) in pieces {
-            if dst.checked_add(w)? > stored.width {
-                return None;
-            }
-        }
-        let before = stored.clone();
         if access.static_target.is_none() && self.forced_names.contains(&access.storage) {
             return Some(false);
         }
@@ -2356,19 +2509,68 @@ impl Simulator {
         } else {
             value.resize_for_assign(fit_w)
         };
-        for &(dst, src, w) in pieces {
-            for bit in 0..w {
-                stored.set_bit((dst + bit) as usize, fitted.get_bit((src + bit) as usize));
+        if access.static_target.is_none() && pieces.len() == 1 {
+            let (dst, src, w) = pieces[0];
+            if let Some(store) = self.whole_var_store(&access.storage) {
+                match store {
+                    VarStore::Table(id) if src == 0 && w == fit_w => {
+                        if let Some(changed) = self.splice_signal_bits(id, dst as usize, &fitted) {
+                            if changed {
+                                self.touch_elem_base(&access.storage);
+                            }
+                            return Some(changed);
+                        }
+                    }
+                    VarStore::Frame
+                        if self.packed_local_static_key(&access.storage).is_none() =>
+                    {
+                        if let Some(cur) = self
+                            .local_stack
+                            .last_mut()
+                            .and_then(|f| f.get_mut(&access.storage))
+                        {
+                            if dst.checked_add(w)? > cur.width {
+                                return None;
+                            }
+                            return Some(cur.copy_bits_from(
+                                dst as usize,
+                                &fitted,
+                                src as usize,
+                                w as usize,
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
-        let changed = stored != before;
-        if let Some((class, spec, member)) = access.static_target {
-            self.static_write_in(&class, spec, &member, stored);
+        let mut stored = if let Some((class, spec, member)) = &access.static_target {
+            self.static_read_in(class, spec.clone(), member)?
         } else {
-            if let Some(key) = self.packed_local_static_key(&access.storage) {
-                self.static_local_vars.insert(key, stored.clone());
+            match self.packed_local_value(&access.storage) {
+                Some(v) => v,
+                None if access.from_unpacked => return Some(false),
+                None => return None,
             }
-            self.set_local_or_signal(&access.storage, stored);
+        };
+        for &(dst, _, w) in pieces {
+            if dst.checked_add(w)? > stored.width {
+                return None;
+            }
+        }
+        let mut changed = false;
+        for &(dst, src, w) in pieces {
+            changed |= stored.copy_bits_from(dst as usize, &fitted, src as usize, w as usize);
+        }
+        if changed {
+            if let Some((class, spec, member)) = access.static_target {
+                self.static_write_in(&class, spec, &member, stored);
+            } else {
+                if let Some(key) = self.packed_local_static_key(&access.storage) {
+                    self.static_local_vars.insert(key, stored.clone());
+                }
+                self.set_local_or_signal(&access.storage, stored);
+            }
         }
         Some(changed)
     }
@@ -2381,19 +2583,42 @@ impl Simulator {
         if fit_w == 0 {
             return None;
         }
+        if access.invalid {
+            let mut out = if super::elaborate::is_type_two_state_resolved(
+                &access.element_type,
+                &self.module.typedef_types,
+            ) {
+                Value::zero(fit_w)
+            } else {
+                Value::new(fit_w)
+            };
+            out.is_signed = false;
+            return Some(out);
+        }
         let stored = if let Some((class, spec, member)) = &access.static_target {
             self.static_read_in(class, spec.clone(), member)?
         } else {
-            self.packed_local_value(&access.storage)?
+            match self.packed_local_value(&access.storage) {
+                Some(v) => v,
+                None if access.from_unpacked => {
+                    return Some(if super::elaborate::is_type_two_state_resolved(
+                        &access.element_type,
+                        &self.module.typedef_types,
+                    ) {
+                        Value::zero(fit_w)
+                    } else {
+                        Value::new(fit_w)
+                    });
+                }
+                None => return None,
+            }
         };
         let mut out = Value::new(fit_w);
         for (src, dst, w) in pieces {
             if src.checked_add(w)? > stored.width {
                 return None;
             }
-            for bit in 0..w {
-                out.set_bit((dst + bit) as usize, stored.get_bit((src + bit) as usize));
-            }
+            out.copy_bits_from(dst as usize, &stored, src as usize, w as usize);
         }
         // A two-state element reads its missing bits as 0 (§7.4.6).
         if super::elaborate::is_type_two_state_resolved(
@@ -2436,10 +2661,14 @@ impl Simulator {
             return None;
         }
         let access = self.declared_packed_access(base)?;
-        if access.unpacked != 0 {
+        if access.unpacked != 0 || access.width == 0 {
             return None;
         }
-        let &(dl, dr) = access.dimensions.first()?;
+        let (dl, dr) = access
+            .dimensions
+            .first()
+            .copied()
+            .unwrap_or((access.width as i64 - 1, 0));
         let a = self.eval_expr(left).to_index()?;
         let b = self.eval_expr(right).to_index()?;
         let (l, r) = match kind {
@@ -2470,6 +2699,9 @@ impl Simulator {
         let stride = access.width / count;
         let n = u32::try_from(l.abs_diff(r) + 1).ok()?;
         let fit_w = n.checked_mul(stride)?;
+        if access.invalid {
+            return Some((access, fit_w, Vec::new()));
+        }
         // Element `k` of the value (from its least significant end) has
         // label `r + k*step`.
         let step: i64 = if l >= r { 1 } else { -1 };

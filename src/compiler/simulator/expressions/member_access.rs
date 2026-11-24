@@ -578,27 +578,24 @@ impl Simulator {
                 }
                 return v;
             }
-            if let Some(fields) = self.module.packed_struct_fields.get(&base_flat).cloned() {
-                if let Some((_, off, w)) =
-                    fields.iter().find(|(m, _, _)| *m == member.name).cloned()
-                {
-                    if let Some(cur) = self.get_local_or_signal(&base_flat) {
-                        let mut out = Value::zero(w.max(1));
-                        for i in 0..w {
-                            out.set_bit(i as usize, cur.get_bit((off + i) as usize));
-                        }
-                        if w == 64 && self.union_real_member(&base_flat, &member.name) {
-                            return Self::union_real_read(out);
-                        }
-                        // §7.2.1: a 2-state member of a 4-state struct.
-                        if out.has_xz()
-                            && !self.mixed_packed_vars.is_empty()
-                            && self.packed_member_two_state(&base_flat, &member.name)
-                        {
-                            out = out.to_two_state();
-                        }
-                        return out;
+            if let Some((off, w)) = self.module.packed_struct_fields.get(&base_flat).and_then(|fs| {
+                fs.iter()
+                    .find(|(m, _, _)| *m == member.name)
+                    .map(|&(_, o, w)| (o, w))
+            }) {
+                if let Some(cur) = self.get_local_or_signal(&base_flat) {
+                    let mut out = cur.range_select((off + w - 1) as usize, off as usize);
+                    if w == 64 && self.union_real_member(&base_flat, &member.name) {
+                        return Self::union_real_read(out);
                     }
+                    // §7.2.1: a 2-state member of a 4-state struct.
+                    if out.has_xz()
+                        && !self.mixed_packed_vars.is_empty()
+                        && self.packed_member_two_state(&base_flat, &member.name)
+                    {
+                        out = out.to_two_state();
+                    }
+                    return out;
                 }
             }
         }
@@ -978,15 +975,18 @@ impl Simulator {
                 if !self.local_stack.is_empty() {
                     if let Some(locals) = self.local_stack.last() {
                         if let Some(struct_val) = locals.get(base_name) {
-                            if let Some(fields) =
-                                self.module.packed_struct_fields.get(base_name).cloned()
+                            if let Some((off, w)) = self
+                                .module
+                                .packed_struct_fields
+                                .get(base_name)
+                                .and_then(|fs| {
+                                    fs.iter()
+                                        .find(|(m, _, _)| m == &member.name)
+                                        .map(|&(_, o, w)| (o, w))
+                                })
                             {
-                                if let Some((_, off, w)) =
-                                    fields.iter().find(|(m, _, _)| m == &member.name).cloned()
-                                {
-                                    return struct_val
-                                        .range_select((off + w - 1) as usize, off as usize);
-                                }
+                                return struct_val
+                                    .range_select((off + w - 1) as usize, off as usize);
                             }
                         }
                     }
@@ -1032,7 +1032,34 @@ impl Simulator {
                     // flattened name misses the storage, so a
                     // class-member `slices[t].path` read x while the
                     // write (fixed above) landed correctly.
-                    let i = self.eval_expr(index).to_u64().unwrap_or(0);
+                    let Some(i) = self.eval_expr(index).to_index() else {
+                        if let Some(su) = self.queue_elem_struct(&an) {
+                            for m in &su.members {
+                                if m.declarators.iter().any(|d| d.name.name == member.name) {
+                                    let w = resolve_type_width(
+                                        &m.data_type,
+                                        Some(&self.module.parameters),
+                                        Some(&self.module.typedefs),
+                                    )
+                                    .max(1);
+                                    let mut v = if super::elaborate::is_type_two_state_resolved(
+                                        &m.data_type,
+                                        &self.module.typedef_types,
+                                    ) {
+                                        Value::zero(w)
+                                    } else {
+                                        Value::new(w)
+                                    };
+                                    v.is_signed = super::elaborate::is_type_signed_resolved(
+                                        &m.data_type,
+                                        &self.module.typedef_types,
+                                    );
+                                    return v;
+                                }
+                            }
+                        }
+                        return Value::new(1);
+                    };
                     let target = format!("{}[{}].{}", an, i, member.name);
                     if let Some(v) = self.get_signal_value_by_name(&target) {
                         return v;
@@ -1058,11 +1085,15 @@ impl Simulator {
                 }
             }
             field_path.reverse();
-            let mut indices: Vec<u64> = Vec::new();
+            let mut indices: Vec<i64> = Vec::new();
+            let mut invalid_idx = false;
             let root_name: Option<String> = loop {
                 match &cur_expr.kind {
                     ExprKind::Index { expr: b, index } => {
-                        indices.push(self.eval_expr(index).to_u64().unwrap_or(0));
+                        match self.eval_expr(index).to_index() {
+                            Some(i) => indices.push(i),
+                            None => invalid_idx = true,
+                        }
                         cur_expr = b.as_ref();
                     }
                     // Same bare-name fallback as the write side: a
@@ -1103,62 +1134,95 @@ impl Simulator {
                 }
             };
             if let Some(arr_name) = root_name {
-                if !indices.is_empty() {
+                if !indices.is_empty() || invalid_idx {
                     indices.reverse();
-                    if let Some(fields) = self.module.packed_struct_fields.get(&arr_name).cloned() {
-                        let field_key = field_path.join(".");
-                        if let Some((_, off, w)) =
-                            fields.iter().find(|(m, _, _)| m == &field_key).cloned()
-                        {
-                            let mut elem_name = arr_name.clone();
-                            for i in &indices {
-                                elem_name.push_str(&format!("[{}]", i));
-                            }
-                            if let Some(sig) = self.get_signal_value_by_name(&elem_name) {
-                                return sig.range_select((off + w - 1) as usize, off as usize);
-                            }
-                            // §7.4.2: PACKED array of packed structs —
-                            // `arr[i]` is a bit SLICE of one backing
-                            // vector, not a signal of its own, so the
-                            // `elem_name` lookup above finds nothing.
-                            // The write path already had this fallback;
-                            // without it here the read silently returned
-                            // the default, so a correctly-stored value
-                            // read back as 0 (and `$bits` as 32).
-                            //
-                            // `struct_w` comes from the field layout, NOT
-                            // `packed_signal_elem_widths[arr_name]`: that
-                            // is the width of an element of the OUTERMOST
-                            // dimension, which for `t [0:0][1:0]` is the
-                            // whole `[1:0]` sub-array rather than one
-                            // struct.
-                            let struct_w =
-                                fields.iter().map(|(_, o, fw)| o + fw).max().unwrap_or(0);
-                            let dims = self.module.packed_full_dims.get(&arr_name).cloned();
-                            // A package parameter (`p::ENC[f].man_bits` in a
-                            // class method reaches here as `p.ENC`) is no
-                            // signal: read its value from the parameters.
-                            if struct_w > 0
-                                && let Some(slot) =
-                                    Self::flatten_packed_slot(&indices, dims.as_deref())
-                                && let Some(sig) =
-                                    self.get_local_or_signal(&arr_name).or_else(|| {
-                                        self.module
-                                            .parameters
-                                            .get(&arr_name)
-                                            .or_else(|| {
-                                                self.module
-                                                    .parameters
-                                                    .get(&arr_name.replacen('.', "::", 1))
-                                            })
-                                            .cloned()
-                                    })
+                    let field_key = field_path.join(".");
+                    if let Some((off, w, struct_w)) = self
+                        .module
+                        .packed_struct_fields
+                        .get(&arr_name)
+                        .and_then(|fs| {
+                            let (_, off, w) = fs.iter().find(|(m, _, _)| m == &field_key)?;
+                            let struct_w = fs.iter().map(|(_, o, fw)| o + fw).max().unwrap_or(0);
+                            Some((*off, *w, struct_w))
+                        })
+                    {
+                        let oob_val = |sim: &Self| -> Value {
+                            let mut v = if sim.packed_array_two_state(&arr_name)
+                                || sim.packed_member_two_state(&arr_name, &field_key)
                             {
-                                let lo = slot * struct_w + off;
-                                if lo + w <= sig.width {
-                                    return sig.range_select((lo + w - 1) as usize, lo as usize);
-                                }
+                                Value::zero(w)
+                            } else {
+                                Value::new(w)
+                            };
+                            v.is_signed = sim.struct_member_signed(&arr_name, &field_key);
+                            v
+                        };
+                        if invalid_idx {
+                            return oob_val(self);
+                        }
+                        let mut elem_name = arr_name.clone();
+                        for i in &indices {
+                            elem_name.push('[');
+                            Self::push_i64(&mut elem_name, *i);
+                            elem_name.push(']');
+                        }
+                        if let Some(sig) = self.get_signal_value_by_name(&elem_name) {
+                            let mut v = sig.range_select((off + w - 1) as usize, off as usize);
+                            if self.struct_member_signed(&arr_name, &field_key) {
+                                v.is_signed = true;
                             }
+                            if v.has_xz() && self.packed_member_two_state(&arr_name, &field_key) {
+                                let signed = v.is_signed;
+                                v = v.to_two_state();
+                                v.is_signed = signed;
+                            }
+                            return v;
+                        }
+                        let slot = Self::flatten_packed_slot_iter(
+                            indices.iter().copied(),
+                            self.module
+                                .packed_full_dims
+                                .get(&arr_name)
+                                .map(|d| d.as_slice()),
+                        );
+                        if struct_w > 0
+                            && let Some(slot) = slot
+                            && let Some(sig) =
+                                self.get_local_or_signal(&arr_name).or_else(|| {
+                                    self.module
+                                        .parameters
+                                        .get(&arr_name)
+                                        .or_else(|| {
+                                            self.module
+                                                .parameters
+                                                .get(&arr_name.replacen('.', "::", 1))
+                                        })
+                                        .cloned()
+                                })
+                        {
+                            let lo = slot * struct_w + off;
+                            if lo + w <= sig.width {
+                                let mut v = sig.range_select((lo + w - 1) as usize, lo as usize);
+                                if self.struct_member_signed(&arr_name, &field_key) {
+                                    v.is_signed = true;
+                                }
+                                if v.has_xz()
+                                    && self.packed_member_two_state(&arr_name, &field_key)
+                                {
+                                    let signed = v.is_signed;
+                                    v = v.to_two_state();
+                                    v.is_signed = signed;
+                                }
+                                return v;
+                            }
+                        }
+                        if self.module.arrays.contains_key(&arr_name)
+                            || self.module.dynamic_arrays.contains(&arr_name)
+                            || self.module.packed_full_dims.contains_key(&arr_name)
+                            || self.get_local_or_signal(&arr_name).is_some()
+                        {
+                            return oob_val(self);
                         }
                     }
                 }
@@ -1166,20 +1230,20 @@ impl Simulator {
         }
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
-            if let Some(fields) = self.module.packed_struct_fields.get(&*name).cloned() {
-                if let Some((_, off, w)) =
-                    fields.iter().find(|(m, _, _)| m == &member.name).cloned()
-                {
-                    if let Some(sig) = self.get_local_or_signal(&name) {
-                        let mut v = sig.range_select((off + w - 1) as usize, off as usize);
-                        if w == 64 && self.union_real_member(&name, &member.name) {
-                            return Self::union_real_read(v);
-                        }
-                        if self.struct_member_signed(&name, &member.name) {
-                            v.is_signed = true;
-                        }
-                        return v;
+            if let Some((off, w)) = self.module.packed_struct_fields.get(&*name).and_then(|fs| {
+                fs.iter()
+                    .find(|(m, _, _)| *m == member.name)
+                    .map(|&(_, o, w)| (o, w))
+            }) {
+                if let Some(sig) = self.get_local_or_signal(&name) {
+                    let mut v = sig.range_select((off + w - 1) as usize, off as usize);
+                    if w == 64 && self.union_real_member(&name, &member.name) {
+                        return Self::union_real_read(v);
                     }
+                    if self.struct_member_signed(&name, &member.name) {
+                        v.is_signed = true;
+                    }
+                    return v;
                 }
             }
             if self.is_associative_array(&name) {
