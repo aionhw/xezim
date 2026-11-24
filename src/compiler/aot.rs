@@ -686,6 +686,9 @@ fn emit_insn_rust(
     };
     match insn {
         Nop | SetSigned(_) | ClearSigned(_) => {}
+        DropXz(reg) => {
+            let _ = writeln!(w, "r{reg}v &= !r{reg}x; r{reg}x = 0;");
+        }
         LoadConst(d, v) => {
             if v.is_fill || v.is_real || v.width > 64 {
                 return None;

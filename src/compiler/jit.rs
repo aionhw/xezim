@@ -2231,6 +2231,13 @@ mod enabled {
                 // val_bits. The interpreter / bridge re-applies signedness
                 // when materialising results into signal_table.
             }
+            DropXz(reg) => {
+                let (v, x) = ld2(builder, pointer_type, regs, xz, *reg);
+                let not_x = builder.ins().bnot(x);
+                let nv = builder.ins().band(v, not_x);
+                let zero = builder.ins().iconst(types::I64, 0);
+                st2(builder, pointer_type, regs, xz, *reg, nv, zero);
+            }
             BlockingAssign(sig_id, val_reg, width) => {
                 let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
@@ -3520,6 +3527,7 @@ mod enabled {
                 | ReduceOr(..)
                 | ReduceXor(..)
                 | SetSigned(..)
+                | DropXz(..)
                 | Resize(..)
                 | BitSelect(..)
                 | BitSelectConst(..)

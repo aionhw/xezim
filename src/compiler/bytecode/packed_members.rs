@@ -1184,8 +1184,7 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         let raw = Self::hier_raw_name(hier);
-        let splits: Vec<usize> = raw.match_indices('.').map(|(i, _)| i).collect();
-        for &dot in splits.iter().rev() {
+        for (dot, _) in raw.rmatch_indices('.') {
             let (base, member) = (&raw[..dot], &raw[dot + 1..]);
             let scoped = self
                 .scope_hint
@@ -1359,27 +1358,50 @@ impl<'a> BytecodeCompiler<'a> {
         depth == Some(selects)
     }
 
-    /// §6.11.2: can a range store into the packed container `var` (signal
-    /// `id`) skip the 2-state conversion? A 2-state variable stores x/z as 0
-    /// across its whole value on the interpreter's path, which a range store
-    /// does not do, so the compiled store is taken only when neither the
-    /// runtime's mark for the signal nor its declared type is 2-state. Without
-    /// the runtime table the answer is no, which keeps the interpreter.
-    pub(super) fn packed_container_four_state(&self, id: usize, var: &str) -> bool {
-        let Some(marks) = self.signal_two_state else {
-            return false;
-        };
+    /// §6.11.2, §7.2.1: whether a static member-path store (`member` of
+    /// packed container `var`, signal `id`) must coerce x/z bits to 0 (`Some(true)`
+    /// for 2-state container or 2-state member, `Some(false)` for 4-state
+    /// member). Returns `None` when runtime 2-state tracking is absent or the
+    /// member path cannot be resolved cleanly against a packed struct layout.
+    pub(super) fn packed_member_store_two_state(
+        &self,
+        id: usize,
+        var: &str,
+        member: &str,
+    ) -> Option<bool> {
+        let marks = self.signal_two_state?;
         if marks.get(id).copied().unwrap_or(true) {
-            return false;
+            return Some(true);
         }
         let (Some(decls), Some(types)) = (self.var_decl_types, self.typedef_types) else {
-            return true;
+            return Some(false);
         };
         let leaf = var.rsplit_once('.').map_or(var, |(_, leaf)| leaf);
-        decls
-            .get(var)
-            .or_else(|| decls.get(leaf))
-            .is_none_or(|dt| !crate::compiler::elaborate::is_type_two_state_resolved(dt, types))
+        let Some(mut dt) = decls.get(var).or_else(|| decls.get(leaf)) else {
+            return Some(false);
+        };
+        if crate::compiler::elaborate::is_type_two_state_resolved(dt, types) {
+            return Some(true);
+        }
+        for segment in member.split('.') {
+            let field = segment.split('[').next().unwrap_or(segment);
+            let crate::ast::types::DataType::Struct(su) =
+                crate::compiler::elaborate::resolve_typedef_chain(dt, types)
+            else {
+                return None;
+            };
+            if !su.packed {
+                return None;
+            }
+            dt = &su
+                .members
+                .iter()
+                .find(|m| m.declarators.iter().any(|d| d.name.name == field))?
+                .data_type;
+        }
+        Some(crate::compiler::elaborate::is_type_two_state_resolved(
+            dt, types,
+        ))
     }
 
     /// §7.2.1, §6.11.3: the signedness of `member` (a dotted path) of the

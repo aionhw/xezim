@@ -1149,12 +1149,17 @@ impl<'a> BytecodeCompiler<'a> {
                     return true;
                 }
                 // `s.e[1].dw[0].value <= v`: one static range of `s`.
-                if let Some((base_id, key, _, off, mw)) = self.packed_const_member_path_target(lhs)
-                    && self.packed_container_four_state(base_id, &key)
+                if let Some((base_id, key, member, off, mw)) =
+                    self.packed_const_member_path_target(lhs)
+                    && let Some(two_state) =
+                        self.packed_member_store_two_state(base_id, &key, &member)
                 {
                     let resized = self.alloc_reg();
                     self.emit(Insn::Move(resized, val_reg));
                     self.emit(Insn::Resize(resized, mw));
+                    if two_state && !self.stored_value_two_state(resized) {
+                        self.emit(Insn::DropXz(resized));
+                    }
                     self.emit(Insn::NbaAssignRange(
                         as_sig_id(base_id),
                         off + mw - 1,
@@ -1819,12 +1824,17 @@ impl<'a> BytecodeCompiler<'a> {
                     return true;
                 }
                 // `s.e[1].dw[0].value = v`: one static range of `s`.
-                if let Some((base_id, key, _, off, mw)) = self.packed_const_member_path_target(lhs)
-                    && self.packed_container_four_state(base_id, &key)
+                if let Some((base_id, key, member, off, mw)) =
+                    self.packed_const_member_path_target(lhs)
+                    && let Some(two_state) =
+                        self.packed_member_store_two_state(base_id, &key, &member)
                 {
                     let resized = self.alloc_reg();
                     self.emit(Insn::Move(resized, val_reg));
                     self.emit(Insn::Resize(resized, mw));
+                    if two_state && !self.stored_value_two_state(resized) {
+                        self.emit(Insn::DropXz(resized));
+                    }
                     self.emit(Insn::BlockingAssignRange(
                         as_sig_id(base_id),
                         off + mw - 1,
