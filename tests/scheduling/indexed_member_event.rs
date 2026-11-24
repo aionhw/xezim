@@ -38,7 +38,6 @@ endmodule"#,
 /// A property of a selected class handle (`ca[1].v`), including a
 /// replacement of the handle in the array.
 #[test]
-#[ignore = "open: an always block on a property of a selected class handle does not track the property or the handle (§9.4.2, #1472)"]
 fn indexed_member_event_tracks_values_and_receiver_replacement() {
     let lines = delta(
         r#"

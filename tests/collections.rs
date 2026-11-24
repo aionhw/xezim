@@ -135,6 +135,8 @@ mod with_clause_class_receivers;
 
 #[path = "collections/queue_dyn_write_semantics.rs"]
 mod queue_dyn_write_semantics;
+#[path = "collections/nested_collection_patterns.rs"]
+mod nested_collection_patterns;
 
 #[path = "collections/assoc_of_struct.rs"]
 mod assoc_of_struct;
