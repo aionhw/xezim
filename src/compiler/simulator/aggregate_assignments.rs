@@ -384,8 +384,16 @@ impl Simulator {
             if exprs.is_empty() {
                 return false;
             }
+            let ragged = self.coll_shape_at(&scoped).is_some_and(|(shape, depth)| {
+                matches!(shape.dims.get(depth + 1), Some(Dim::Dyn | Dim::Queue))
+            });
             for (i, e) in exprs.iter().enumerate() {
-                self.pattern_leaf_at_elem_width(&format!("{}[{}]", scoped, i), e, ew);
+                let elem = format!("{scoped}[{i}]");
+                if ragged {
+                    self.queue_store_elem(&scoped, &elem, e);
+                } else {
+                    self.pattern_leaf_at_elem_width(&elem, e, ew);
+                }
             }
             self.set_queue_size(&scoped, exprs.len() as u64);
             return true;
@@ -4585,36 +4593,51 @@ impl Simulator {
         // item is one element, and a collection operand contributes all of
         // its elements. Evaluated as one packed value it left the row empty.
         let pattern = self.unpacked_pattern(arg);
-        if matches!(
-            pattern.kind,
-            ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
-        ) && self.is_queue_or_dyn_row(elem)
+        if matches!(pattern.kind, ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_))
+            && let Some((shape, depth)) = self.coll_shape_at(elem)
+            && depth > 0
+            && let Some(kind) = match shape.dims.get(depth) {
+                Some(Dim::Dyn) => Some(StructCollKind::Dynamic),
+                Some(Dim::Queue) => Some(StructCollKind::Queue),
+                _ => None,
+            }
         {
-            let vals = match &pattern.kind {
-                // §10.9.1: a replicated item (`'{3{7}}`) is that many items.
+            let nested = matches!(shape.dims.get(depth + 1), Some(Dim::Dyn | Dim::Queue));
+            let width = self
+                .module
+                .arrays
+                .get(obj_name)
+                .map(|&(_, _, w)| w)
+                .or_else(|| self.integral_queue_elem(obj_name).map(|(w, _, _)| w))
+                .unwrap_or(32);
+            self.register_coll_name(elem, kind, width, false);
+
+            let values = match &pattern.kind {
                 ExprKind::AssignmentPattern(items) => {
                     let items = self.pattern_ordered(items);
-                    Some(items.iter().map(|e| self.eval_expr(e)).collect::<Vec<_>>())
+                    if nested {
+                        for (j, value) in items.iter().enumerate() {
+                            self.queue_store_elem(elem, &format!("{elem}[{j}]"), value);
+                        }
+                        self.set_queue_size(elem, items.len() as u64);
+                        return;
+                    }
+                    // Snapshot the row's expressions before overwriting its cells.
+                    items.iter().map(|e| self.eval_expr(e)).collect::<Vec<_>>()
                 }
                 ExprKind::Concatenation(parts) => {
                     let expand_rows = self.concat_has_non_array_elements(elem);
-                    Some(self.unpacked_concat_operand_values(
-                        parts.iter().collect(),
-                        expand_rows,
-                        None,
-                    ))
+                    self.unpacked_concat_operand_values(parts.iter().collect(), expand_rows, None)
                 }
-                _ => None,
+                _ => unreachable!("validated collection value"),
             };
-            if let Some(vals) = vals {
-                let n = vals.len();
-                for (j, v) in vals.into_iter().enumerate() {
-                    let v = self.fit_queue_push_elem(elem, v);
-                    self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);
-                }
-                self.set_queue_size(elem, n as u64);
-                return;
+            let size = values.len();
+            for (j, value) in values.into_iter().enumerate() {
+                let value = self.fit_queue_push_elem(elem, value);
+                self.set_signal_value_by_name(&format!("{elem}[{j}]"), value);
             }
+            self.set_queue_size(elem, size as u64);
+            return;
         }
         // §7.10 / §7.8: pushing an ASSOCIATIVE-array value (a queue of
         // associative arrays, `int q[$][string]`) copies the source's entries
@@ -6014,6 +6037,10 @@ impl Simulator {
         dt: &DataType,
         item: &Expression,
     ) -> bool {
+        if self.is_queue_or_dyn_row(elem) {
+            self.queue_store_elem(coll, elem, item);
+            return true;
+        }
         let Some((dims, descending)) = self.coll_fixed_row_dims(coll) else {
             return false;
         };
